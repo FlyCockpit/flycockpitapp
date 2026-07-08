@@ -245,6 +245,17 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
+    /// The provider's immutable vendor/template identity: the id of the
+    /// [`ProviderTemplate`](crate::providers::ProviderTemplate) this provider
+    /// was created from. Unlike the config-map key (which the user may rename
+    /// freely — e.g. `anthropic-work` for a second Anthropic connection), this
+    /// records the underlying vendor and is what keys the known-frontier
+    /// defaults ([`is_frontier_default_provider_template`]). Not user-editable.
+    /// Absent on pre-field configs; [`ProviderEntry::effective_template`] falls
+    /// back to the map key when it matches a known template id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+
     /// Base URL. The `/models` endpoint is `{url}/models`; chat lives at
     /// `{url}/chat/completions`. Stored without a trailing slash.
     pub url: String,
@@ -337,6 +348,15 @@ pub struct ProviderEntry {
     /// provider-settings sub-dialog (implementation note).
     #[serde(default)]
     pub context: ContextConfig,
+
+    /// Per-provider auto-prune master switch. `Some(false)` turns the
+    /// automatic prune trigger off entirely for every model on this provider
+    /// that doesn't pin its own `auto_prune` — both the cache-cold branch and
+    /// the ctx%-threshold branch; manual `/prune` is unaffected. `None` means
+    /// "inherit" — resolves to on. A per-model `auto_prune` overrides this in
+    /// turn. Skipped on serialize so providers that never pin it stay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_prune: Option<bool>,
 
     /// Inference-stream warning thresholds for this provider: the first-token
     /// (TTFT) and idle/inter-token waits that surface a visible slow-stream
@@ -766,6 +786,14 @@ pub struct ModelEntry {
     /// (implementation note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
+    /// Per-model auto-prune master switch. `Some(false)` turns the automatic
+    /// prune trigger off entirely for this model — both the cache-cold branch
+    /// and the ctx%-threshold branch; manual `/prune` is unaffected. The top
+    /// tier of the resolution (this → provider `auto_prune` → on). `None`
+    /// means "inherit". Skipped on serialize so models that never pin it stay
+    /// clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_prune: Option<bool>,
     /// Per-model inference-stream timeout override. When set, takes precedence
     /// over the provider-level [`ProviderEntry::timeout`]
     /// (implementation note).
@@ -1215,11 +1243,38 @@ pub enum ModelMergePolicy {
 }
 
 pub const KNOWN_FRONTIER_MODEL_IDS: &[&str] = &[
-    "glm-5.2", "gpt-5.4", "gpt-5.5", "opus-4.6", "opus-4.7", "opus-4.8",
+    "claude-fable-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "glm-5.2",
+    "gpt-5.4",
+    "gpt-5.5",
+    "gpt-5.6",
+    "grok-4.5",
 ];
+
+/// The standard first-party provider **templates** whose models receive the
+/// known-frontier defaults ([`apply_known_frontier_model_defaults`]). These
+/// endpoints are known to serve the frontier ids verbatim and to prompt-cache,
+/// so the defaults are correct there; the same id served through an
+/// aggregator (OpenRouter/Copilot/…) is left alone. Matched against a
+/// provider's persisted [`ProviderEntry::template`] identity (with a map-key
+/// fallback via [`ProviderEntry::effective_template`]), **not** its config-map
+/// key — so a renamed connection like `anthropic-work` still gets the defaults.
+pub const FRONTIER_DEFAULT_PROVIDER_IDS: &[&str] =
+    &["anthropic", "codex-oauth", "grok-oauth", "openai", "z-ai"];
 
 pub fn is_known_frontier_model_id(model_id: &str) -> bool {
     KNOWN_FRONTIER_MODEL_IDS.contains(&model_id)
+}
+
+/// Whether a provider `template` id gates the known-frontier defaults
+/// ([`FRONTIER_DEFAULT_PROVIDER_IDS`]). Callers pass the provider's effective
+/// template identity ([`ProviderEntry::effective_template`]), not the config-map
+/// key, so renaming e.g. `anthropic` to `anthropic-work` keeps the defaults.
+pub fn is_frontier_default_provider_template(template: &str) -> bool {
+    FRONTIER_DEFAULT_PROVIDER_IDS.contains(&template)
 }
 
 /// Merge a freshly-fetched `/models` list into an existing model list,
@@ -1235,14 +1290,24 @@ pub fn is_known_frontier_model_id(model_id: &str) -> bool {
 /// entry collides with an existing entry's id, the fetched metadata is used as
 /// the base but the existing entry's overrides are carried over. That includes
 /// favorites, manual markers, policy fields, endpoint pins,
-/// cache/context/shrink/timeout, backup, mode, inline-think, repair/recovery
-/// settings, and thinking params.
-/// If no model-level mode remains after that preservation, a small
-/// product-approved exact-id list defaults fetched frontier models to
-/// [`LlmMode::Frontier`].
+/// cache/context/shrink/timeout, auto-prune, backup, mode, inline-think,
+/// repair/recovery settings, and thinking params — plus, for manual entries,
+/// the hand-set display `name` and `context_length`.
+/// The known-frontier defaults ([`apply_known_frontier_model_defaults`]:
+/// `mode: frontier`, `auto_prune: off`, `cache: ephemeral`) are applied only to
+/// ids that are **newly discovered** by this fetch — i.e. absent from
+/// `existing` — and only on the standard first-party providers
+/// ([`FRONTIER_DEFAULT_PROVIDER_IDS`]) for ids on the product-approved exact-id
+/// list ([`KNOWN_FRONTIER_MODEL_IDS`]). A previously-configured known id is
+/// never re-defaulted, so a user who clears e.g. `mode` back to inherit keeps
+/// that state across refreshes.
 ///
-/// Policy-aware merge helper for CLI and TUI refreshes.
+/// Policy-aware merge helper for CLI and TUI refreshes. `template` is the
+/// refreshed provider's effective template identity
+/// ([`ProviderEntry::effective_template`]) and only scopes the known-frontier
+/// defaults; pass `None` for providers that map to no known template.
 pub fn merge_fetched_models_with_policy(
+    template: Option<&str>,
     existing: &[ModelEntry],
     fetched: Vec<ModelEntry>,
     policy: ModelMergePolicy,
@@ -1251,8 +1316,13 @@ pub fn merge_fetched_models_with_policy(
     for mut m in fetched {
         if let Some(prev) = existing.iter().find(|e| e.id == m.id) {
             preserve_model_overrides(prev, &mut m);
+        } else {
+            // Only genuinely newly-discovered ids receive the known-frontier
+            // defaults. A previously-configured id keeps whatever the user
+            // left it as — including an intentionally-cleared `mode` back to
+            // inherit — so a `/models` refresh never re-pins it.
+            apply_known_frontier_model_defaults(template, &mut m);
         }
-        apply_known_frontier_model_default(&mut m);
         merged.push(m);
     }
     for old in existing {
@@ -1268,15 +1338,55 @@ pub fn merge_fetched_models_with_policy(
     merged
 }
 
-fn apply_known_frontier_model_default(model: &mut ModelEntry) {
-    if model.mode.is_none() && is_known_frontier_model_id(&model.id) {
+/// Default a known frontier model on a standard first-party provider to the
+/// product-approved frontier settings: `mode: frontier` (top-tier steering),
+/// `auto_prune: off` and `cache: ephemeral` (these endpoints all prompt-cache,
+/// so automatic pruning would bust a real upstream cache). Each field is only
+/// filled in when still unset, so user-pinned values always win. Applied on
+/// `/models` merge and on manual model add (z.ai has no `/models` endpoint).
+pub fn apply_known_frontier_model_defaults(template: Option<&str>, model: &mut ModelEntry) {
+    let Some(template) = template else {
+        return;
+    };
+    if !is_frontier_default_provider_template(template) || !is_known_frontier_model_id(&model.id) {
+        return;
+    }
+    if model.mode.is_none() {
         model.mode = Some(LlmMode::Frontier);
+    }
+    if model.auto_prune.is_none() {
+        model.auto_prune = Some(false);
+    }
+    if model.cache.is_none() {
+        model.cache = Some(CacheConfig {
+            mode: CacheMode::Ephemeral,
+            ttl_secs: default_cache_ttl_secs(),
+        });
     }
 }
 
+/// Carry an existing entry's user-owned fields onto a colliding fetched entry
+/// (which is used as the base). Favorites, manual markers, policy fields,
+/// endpoint pins, cache/context/shrink/timeout, auto-prune, backup, mode,
+/// inline-think, repair/recovery settings, thinking params, and preserved
+/// metadata all survive. For **manual** entries the hand-set display `name`
+/// and `context_length` are preserved too (when set) — those are the only
+/// metadata fields the UI lets you hand-edit, so a later upstream collision
+/// must not silently overwrite them. Non-manual (fetched) entries keep taking
+/// upstream `name`/`context_length` on refresh, which is the correct behavior.
 fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     fetched.favorite = existing.favorite;
     fetched.manual = existing.manual;
+    // Manual entries own their hand-set display name and context window; keep
+    // them (when set) rather than letting the fetched metadata clobber them.
+    if existing.manual {
+        if existing.name.is_some() {
+            fetched.name = existing.name.clone();
+        }
+        if existing.context_length.is_some() {
+            fetched.context_length = existing.context_length;
+        }
+    }
     if existing.trust.is_some() {
         fetched.trust = existing.trust;
     }
@@ -1306,6 +1416,9 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     }
     if existing.context.is_some() {
         fetched.context = existing.context.clone();
+    }
+    if existing.auto_prune.is_some() {
+        fetched.auto_prune = existing.auto_prune;
     }
     if existing.timeout.is_some() {
         fetched.timeout = existing.timeout.clone();
@@ -1381,6 +1494,21 @@ impl ProviderEntry {
     #[allow(dead_code)]
     pub fn label<'a>(&'a self, id: &'a str) -> &'a str {
         self.name.as_deref().unwrap_or(id)
+    }
+
+    /// The provider's effective template identity, used to key the
+    /// known-frontier defaults. Returns the persisted [`Self::template`] when
+    /// present; otherwise falls back to the config-map `key` when that key
+    /// itself names a known [`ProviderTemplate`](crate::providers) — which
+    /// recovers pre-`template`-field configs that were never renamed (e.g. a
+    /// stock `anthropic`). A renamed pre-field config, or a custom provider,
+    /// resolves to `None`.
+    pub fn effective_template<'a>(&'a self, key: &'a str) -> Option<&'a str> {
+        match self.template.as_deref() {
+            Some(t) => Some(t),
+            None if crate::providers::template_by_id(key).is_some() => Some(key),
+            None => None,
+        }
     }
 
     pub fn mark_model_fetch_success(&mut self, catalog: ProviderModelCatalog) {
@@ -1715,6 +1843,24 @@ impl ProvidersConfig {
             .find(|m| m.id == model)
             .and_then(|m| m.cache.clone())
             .unwrap_or_else(|| entry.cache.clone())
+    }
+
+    /// Resolve the effective auto-prune master switch for
+    /// `(provider, model)`: the model-level override if present, else the
+    /// provider-level override, else on. `false` turns the automatic prune
+    /// trigger off entirely (both the cache-cold and the ctx%-threshold
+    /// branch); manual `/prune` is unaffected.
+    pub fn resolve_auto_prune(&self, provider: &str, model: &str) -> bool {
+        let Some(entry) = self.providers.get(provider) else {
+            return true;
+        };
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.auto_prune)
+            .or(entry.auto_prune)
+            .unwrap_or(true)
     }
 
     /// Resolve the effective delegation-shrink config for
@@ -2892,6 +3038,7 @@ mod tests {
             "opencode-zen".to_string(),
             ProviderEntry {
                 name: Some("OpenCode Zen".into()),
+                template: Some("opencode-zen".into()),
                 url: "https://opencode.ai/zen/v1".into(),
                 headers: vec![HeaderSpec {
                     name: "Authorization".into(),
@@ -2912,6 +3059,7 @@ mod tests {
                 cache: CacheConfig::default(),
                 shrink: ShrinkConfig::default(),
                 context: ContextConfig::default(),
+                auto_prune: None,
                 timeout: TimeoutConfig::default(),
                 wire_api: WireApi::default(),
                 backup: None,
@@ -2936,6 +3084,7 @@ mod tests {
                     cache: None,
                     shrink: None,
                     context: None,
+                    auto_prune: None,
                     timeout: None,
                     backup: None,
                     mode: None,
@@ -3130,6 +3279,7 @@ mod tests {
             }),
             shrink: None,
             context: None,
+            auto_prune: None,
             timeout: None,
             backup: None,
             mode: None,
@@ -3684,6 +3834,7 @@ mod tests {
             cache: None,
             shrink: None,
             context: None,
+            auto_prune: None,
             timeout: None,
             backup: None,
             mode: None,
@@ -4513,8 +4664,12 @@ mod tests {
         // A refetch returns a fresh fetched list that no longer includes
         // the old fetched id and never knew about the manual one.
         let fetched = vec![model("fetched-new", false)];
-        let merged =
-            merge_fetched_models_with_policy(&existing, fetched, ModelMergePolicy::KeepUnlisted);
+        let merged = merge_fetched_models_with_policy(
+            Some("p"),
+            &existing,
+            fetched,
+            ModelMergePolicy::KeepUnlisted,
+        );
 
         let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
         // The default safe merge keeps unlisted configured entries and adds
@@ -4531,8 +4686,12 @@ mod tests {
         let existing = vec![model("shared", true)];
         // The refetch returns an id that collides with the manual entry.
         let fetched = vec![model("shared", false), model("other", false)];
-        let merged =
-            merge_fetched_models_with_policy(&existing, fetched, ModelMergePolicy::KeepUnlisted);
+        let merged = merge_fetched_models_with_policy(
+            Some("p"),
+            &existing,
+            fetched,
+            ModelMergePolicy::KeepUnlisted,
+        );
 
         // Exactly one `shared` row, and it's the manual one.
         let shared: Vec<&ModelEntry> = merged.iter().filter(|m| m.id == "shared").collect();
@@ -4546,8 +4705,12 @@ mod tests {
     fn merge_policy_remove_drops_unlisted_fetched_entries_but_retains_manual() {
         let existing = vec![model("fetched-old", false), model("hand-added", true)];
         let fetched = vec![model("fetched-new", false)];
-        let merged =
-            merge_fetched_models_with_policy(&existing, fetched, ModelMergePolicy::RemoveUnlisted);
+        let merged = merge_fetched_models_with_policy(
+            Some("p"),
+            &existing,
+            fetched,
+            ModelMergePolicy::RemoveUnlisted,
+        );
 
         let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["fetched-new", "hand-added"]);
@@ -4556,51 +4719,334 @@ mod tests {
 
     #[test]
     fn known_frontier_model_ids_are_exact_matches() {
+        assert!(is_known_frontier_model_id("gpt-5.4"));
         assert!(is_known_frontier_model_id("gpt-5.5"));
+        assert!(is_known_frontier_model_id("gpt-5.6"));
         assert!(is_known_frontier_model_id("glm-5.2"));
-        assert!(is_known_frontier_model_id("opus-4.8"));
+        assert!(is_known_frontier_model_id("claude-opus-4-6"));
+        assert!(is_known_frontier_model_id("claude-opus-4-7"));
+        assert!(is_known_frontier_model_id("claude-opus-4-8"));
+        assert!(is_known_frontier_model_id("claude-fable-5"));
+        assert!(is_known_frontier_model_id("grok-4.5"));
         assert!(!is_known_frontier_model_id("gpt-5.5-mini"));
+        assert!(!is_known_frontier_model_id("grok-4.5-fast"));
         assert!(!is_known_frontier_model_id("openai/gpt-5.5"));
+        assert!(!is_known_frontier_model_id("claude-opus-4-5-20251101"));
         assert!(!is_known_frontier_model_id("kimi-for-coding"));
     }
 
+    /// The frontier-defaults gate is an exact-**template** match. A renamed
+    /// connection keeps its template identity (so the gate stays keyed to the
+    /// vendor, not the config-map key), but an unrelated template id is not a
+    /// member.
     #[test]
-    fn merge_defaults_known_fetched_models_to_frontier_only_when_unpinned() {
+    fn frontier_default_provider_ids_are_exact_matches() {
+        assert!(is_frontier_default_provider_template("anthropic"));
+        assert!(is_frontier_default_provider_template("codex-oauth"));
+        assert!(is_frontier_default_provider_template("openai"));
+        assert!(is_frontier_default_provider_template("grok-oauth"));
+        assert!(is_frontier_default_provider_template("z-ai"));
+        // A config-map key rename is not a template, so it is not a member —
+        // the caller resolves the template identity before consulting the gate.
+        assert!(!is_frontier_default_provider_template("anthropic-work"));
+        assert!(!is_frontier_default_provider_template("openrouter"));
+    }
+
+    /// Frontier defaults are applied only to ids this fetch newly discovers.
+    /// Pre-existing ids keep whatever mode they had (here both are pinned);
+    /// only the genuinely-new known id (`glm-5.2`) is defaulted to frontier,
+    /// and non-known new ids are left alone.
+    #[test]
+    fn merge_defaults_known_fetched_models_to_frontier_only_when_newly_discovered() {
         let mut existing_normal = model("gpt-5.5", false);
         existing_normal.mode = Some(LlmMode::Normal);
-        let mut existing_defensive = model("opus-4.7", false);
+        let mut existing_defensive = model("claude-opus-4-7", false);
         existing_defensive.mode = Some(LlmMode::Defensive);
 
         let fetched = vec![
             model("glm-5.2", false),
             model("gpt-5.5", false),
-            model("opus-4.7", false),
+            model("claude-opus-4-7", false),
             model("gpt-5.5-mini", false),
             model("ordinary", false),
         ];
         let merged = merge_fetched_models_with_policy(
+            Some("codex-oauth"),
             &[existing_normal, existing_defensive],
             fetched,
             ModelMergePolicy::RemoveUnlisted,
         );
         let mode_for = |id: &str| merged.iter().find(|m| m.id == id).and_then(|m| m.mode);
 
+        // Newly-discovered known id → frontier default.
         assert_eq!(mode_for("glm-5.2"), Some(LlmMode::Frontier));
+        // Pre-existing ids keep their pinned modes (no re-default).
         assert_eq!(mode_for("gpt-5.5"), Some(LlmMode::Normal));
-        assert_eq!(mode_for("opus-4.7"), Some(LlmMode::Defensive));
+        assert_eq!(mode_for("claude-opus-4-7"), Some(LlmMode::Defensive));
+        // New but non-known ids are untouched.
         assert_eq!(mode_for("gpt-5.5-mini"), None);
         assert_eq!(mode_for("ordinary"), None);
+    }
+
+    /// An existing known-frontier id whose `mode` the user cleared back to
+    /// inherit stays `None` after a `/models` re-merge — the frontier default
+    /// is not re-applied to already-configured ids.
+    #[test]
+    fn merge_does_not_repin_cleared_mode_on_existing_known_frontier_id() {
+        // gpt-5.5 already configured with mode explicitly cleared to inherit.
+        let existing = model("gpt-5.5", false);
+        assert_eq!(existing.mode, None);
+
+        let merged = merge_fetched_models_with_policy(
+            Some("codex-oauth"),
+            &[existing],
+            vec![model("gpt-5.5", false)],
+            ModelMergePolicy::KeepUnlisted,
+        );
+
+        let out = merged.iter().find(|m| m.id == "gpt-5.5").unwrap();
+        assert_eq!(out.mode, None, "cleared mode must survive a refresh");
+    }
+
+    /// A manual entry's hand-set display name and context window survive an
+    /// upstream `/models` collision, while a non-manual entry in the same merge
+    /// takes the fresh upstream name/context_length.
+    #[test]
+    fn merge_preserves_manual_name_and_context_length_across_refresh() {
+        let mut manual = model("hand", true);
+        manual.name = Some("My Handle".to_string());
+        manual.context_length = Some(8_192);
+        let non_manual = model("auto", false);
+
+        let mut fetched_manual = model("hand", false);
+        fetched_manual.name = Some("Upstream Hand".to_string());
+        fetched_manual.context_length = Some(200_000);
+        let mut fetched_non_manual = model("auto", false);
+        fetched_non_manual.name = Some("Upstream Auto".to_string());
+        fetched_non_manual.context_length = Some(128_000);
+
+        let merged = merge_fetched_models_with_policy(
+            Some("p"),
+            &[manual, non_manual],
+            vec![fetched_manual, fetched_non_manual],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
+
+        // Manual entry keeps its hand-set name + context window.
+        let hand = by_id("hand");
+        assert!(hand.manual);
+        assert_eq!(hand.name.as_deref(), Some("My Handle"));
+        assert_eq!(hand.context_length, Some(8_192));
+
+        // Non-manual entry takes the fresh upstream metadata.
+        let auto = by_id("auto");
+        assert!(!auto.manual);
+        assert_eq!(auto.name.as_deref(), Some("Upstream Auto"));
+        assert_eq!(auto.context_length, Some(128_000));
+    }
+
+    /// The frontier defaults are provider-scoped: the same known id fetched
+    /// from an aggregator (OpenRouter etc.) is left completely alone.
+    #[test]
+    fn frontier_defaults_do_not_apply_outside_the_standard_providers() {
+        let merged = merge_fetched_models_with_policy(
+            Some("openrouter"),
+            &[],
+            vec![model("gpt-5.5", false), model("claude-fable-5", false)],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        for m in &merged {
+            assert_eq!(m.mode, None, "{}", m.id);
+            assert_eq!(m.auto_prune, None, "{}", m.id);
+            assert_eq!(m.cache, None, "{}", m.id);
+        }
+    }
+
+    /// Discovered known-frontier models on the standard providers get the
+    /// full default set: frontier mode, auto-prune off, ephemeral cache —
+    /// each only when the field is still unset.
+    #[test]
+    fn frontier_defaults_set_auto_prune_off_and_ephemeral_cache() {
+        let mut pinned = model("claude-fable-5", false);
+        pinned.auto_prune = Some(true);
+        pinned.cache = Some(CacheConfig {
+            mode: CacheMode::None,
+            ttl_secs: 60,
+        });
+
+        let merged = merge_fetched_models_with_policy(
+            Some("anthropic"),
+            &[pinned.clone()],
+            vec![
+                model("claude-fable-5", false),
+                model("claude-opus-4-8", false),
+                model("claude-haiku-4-5-20251001", false),
+            ],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
+
+        // Fresh known id → all three defaults.
+        let opus = by_id("claude-opus-4-8");
+        assert_eq!(opus.mode, Some(LlmMode::Frontier));
+        assert_eq!(opus.auto_prune, Some(false));
+        assert_eq!(
+            opus.cache,
+            Some(CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: 300,
+            })
+        );
+
+        // A pre-existing known id is never re-defaulted: its pinned values
+        // survive and its unset `mode` stays `None` (no re-pin to frontier).
+        let fable = by_id("claude-fable-5");
+        assert_eq!(fable.auto_prune, Some(true));
+        assert_eq!(fable.cache, pinned.cache);
+        assert_eq!(fable.mode, None);
+
+        // Non-frontier ids on the same provider stay untouched.
+        let haiku = by_id("claude-haiku-4-5-20251001");
+        assert_eq!(haiku.mode, None);
+        assert_eq!(haiku.auto_prune, None);
+        assert_eq!(haiku.cache, None);
+    }
+
+    /// The plain OpenAI API-key template and the SuperGrok OAuth template both
+    /// serve their frontier ids verbatim and prompt-cache, so a fresh known id
+    /// discovered on either gets the frontier defaults.
+    #[test]
+    fn merge_applies_frontier_defaults_for_openai_and_grok_templates() {
+        for (template, id) in [("openai", "gpt-5.6"), ("grok-oauth", "grok-4.5")] {
+            let merged = merge_fetched_models_with_policy(
+                Some(template),
+                &[],
+                vec![model(id, false)],
+                ModelMergePolicy::KeepUnlisted,
+            );
+            let m = merged.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(m.mode, Some(LlmMode::Frontier), "{template}/{id} mode");
+            assert_eq!(m.auto_prune, Some(false), "{template}/{id} auto_prune");
+            assert_eq!(
+                m.cache.as_ref().map(|c| c.mode),
+                Some(CacheMode::Ephemeral),
+                "{template}/{id} cache"
+            );
+        }
+    }
+
+    /// `effective_template` prefers the stored `template`, otherwise falls back
+    /// to the config-map key when that key itself names a known template — and
+    /// resolves to `None` for a renamed/custom provider with no stored template.
+    #[test]
+    fn effective_template_prefers_stored_then_falls_back_to_known_key() {
+        // Stored template wins even under a renamed key.
+        let renamed = ProviderEntry {
+            template: Some("anthropic".into()),
+            url: "https://x".into(),
+            ..ProviderEntry::default()
+        };
+        assert_eq!(
+            renamed.effective_template("anthropic-work"),
+            Some("anthropic")
+        );
+
+        // Pre-`template` config whose key still names a known template.
+        let legacy = ProviderEntry {
+            url: "https://x".into(),
+            ..ProviderEntry::default()
+        };
+        assert_eq!(legacy.effective_template("anthropic"), Some("anthropic"));
+
+        // Custom provider with no stored template and a non-template key.
+        let custom = ProviderEntry {
+            url: "https://x".into(),
+            ..ProviderEntry::default()
+        };
+        assert_eq!(custom.effective_template("my-endpoint"), None);
+    }
+
+    /// A renamed first-party connection (custom key, stored `template`) still
+    /// gets the frontier defaults, while a genuinely custom provider (no
+    /// template, non-template key) does not.
+    #[test]
+    fn frontier_defaults_follow_template_identity_not_the_config_key() {
+        // Second Anthropic connection under a custom key.
+        let work = ProviderEntry {
+            template: Some("anthropic".into()),
+            url: "https://api.anthropic.com".into(),
+            ..ProviderEntry::default()
+        };
+        let merged = merge_fetched_models_with_policy(
+            work.effective_template("anthropic-work"),
+            &[],
+            vec![model("claude-opus-4-8", false)],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|m| m.id == "claude-opus-4-8")
+                .unwrap()
+                .mode,
+            Some(LlmMode::Frontier),
+        );
+
+        // Custom provider that merely serves a known id gets nothing.
+        let custom = ProviderEntry {
+            url: "https://example.com".into(),
+            ..ProviderEntry::default()
+        };
+        let merged = merge_fetched_models_with_policy(
+            custom.effective_template("my-endpoint"),
+            &[],
+            vec![model("claude-opus-4-8", false)],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        let m = merged.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+        assert_eq!(m.mode, None);
+        assert_eq!(m.auto_prune, None);
+        assert_eq!(m.cache, None);
+    }
+
+    #[test]
+    fn resolve_auto_prune_prefers_model_then_provider_then_on() {
+        let mut cfg = ProvidersConfig::default();
+        let mut off_model = model("frontier-ish", false);
+        off_model.auto_prune = Some(false);
+        cfg.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: "https://x".into(),
+                auto_prune: Some(true),
+                models: vec![off_model, model("bare", false)],
+                ..ProviderEntry::default()
+            },
+        );
+
+        // Model override wins over the provider value.
+        assert!(!cfg.resolve_auto_prune("p", "frontier-ish"));
+        // Bare model inherits the provider override.
+        assert!(cfg.resolve_auto_prune("p", "bare"));
+        // Unknown provider/model resolves to on.
+        assert!(cfg.resolve_auto_prune("nope", "x"));
+
+        // Provider-level off applies to models without their own pin.
+        cfg.providers.get_mut("p").unwrap().auto_prune = Some(false);
+        assert!(!cfg.resolve_auto_prune("p", "bare"));
     }
 
     #[test]
     fn fetched_known_frontier_model_gets_model_mode_even_with_provider_mode() {
         let mut cfg = ProvidersConfig::default();
         cfg.providers.insert(
-            "p".into(),
+            "codex-oauth".into(),
             ProviderEntry {
                 url: "https://x".into(),
                 mode: Some(LlmMode::Defensive),
                 models: merge_fetched_models_with_policy(
+                    Some("codex-oauth"),
                     &[],
                     vec![model("gpt-5.5", false)],
                     ModelMergePolicy::KeepUnlisted,
@@ -4609,10 +5055,10 @@ mod tests {
             },
         );
 
-        let row = &cfg.providers["p"].models[0];
+        let row = &cfg.providers["codex-oauth"].models[0];
         assert_eq!(row.mode, Some(LlmMode::Frontier));
         assert_eq!(
-            cfg.resolve_mode("p", "gpt-5.5", LlmMode::Normal),
+            cfg.resolve_mode("codex-oauth", "gpt-5.5", LlmMode::Normal),
             LlmMode::Frontier
         );
     }
@@ -4647,12 +5093,14 @@ mod tests {
         existing.inline_think = Some(false);
         existing.hint_tool_call_corrections = Some(false);
         existing.wire_api = WireApi::Responses;
+        existing.auto_prune = Some(false);
 
         let mut fetched = model("shared", false);
         fetched.name = Some("Fresh remote name".to_string());
         fetched.context_length = Some(123_456);
 
         let merged = merge_fetched_models_with_policy(
+            Some("p"),
             &[existing.clone()],
             vec![fetched],
             ModelMergePolicy::RemoveUnlisted,
@@ -4677,6 +5125,7 @@ mod tests {
         assert_eq!(out.inline_think, Some(false));
         assert_eq!(out.hint_tool_call_corrections, Some(false));
         assert_eq!(out.wire_api, WireApi::Responses);
+        assert_eq!(out.auto_prune, Some(false));
     }
 
     // --- wire-API endpoint routing (implementation note)
@@ -4868,8 +5317,12 @@ mod tests {
         // The refetch returns the same id, freshly `auto` (upstream never
         // carries wire_api), plus a new unrelated model.
         let fetched = vec![model("gpt-5.4-mini", false), model("gpt-4o", false)];
-        let merged =
-            merge_fetched_models_with_policy(&existing, fetched, ModelMergePolicy::KeepUnlisted);
+        let merged = merge_fetched_models_with_policy(
+            Some("p"),
+            &existing,
+            fetched,
+            ModelMergePolicy::KeepUnlisted,
+        );
 
         let healed = merged.iter().find(|m| m.id == "gpt-5.4-mini").unwrap();
         assert_eq!(
@@ -5243,6 +5696,7 @@ mod tests {
             .insert("upstream".into(), serde_json::json!(true));
 
         let merged = merge_fetched_models_with_policy(
+            Some("p"),
             &[existing],
             vec![fetched],
             ModelMergePolicy::KeepUnlisted,

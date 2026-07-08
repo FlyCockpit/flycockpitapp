@@ -136,7 +136,7 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
         match outcome {
             Ok(FetchOutcome::Models { models, catalog }) => {
                 let entry = cfg.providers.get_mut(&id).expect("populated");
-                apply_models(entry, models, catalog, None, decision);
+                apply_models(&id, entry, models, catalog, None, decision);
                 persist_provider(&cwd, &id, entry.clone())?;
             }
             Ok(FetchOutcome::FallbackAvailable {
@@ -145,7 +145,7 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
                 reason,
             }) if args.allow_fallback || fallback_uses.contains(&id) => {
                 let entry = cfg.providers.get_mut(&id).expect("populated");
-                apply_models(entry, models, catalog, Some(reason), decision);
+                apply_models(&id, entry, models, catalog, Some(reason), decision);
                 persist_provider(&cwd, &id, entry.clone())?;
             }
             Ok(FetchOutcome::FallbackAvailable { reason, .. }) => {
@@ -399,6 +399,7 @@ pub(crate) fn persist_unlisted_policy(
 }
 
 fn apply_models(
+    provider_id: &str,
     entry: &mut ProviderEntry,
     remote: Vec<crate::config::providers::ModelEntry>,
     catalog: ProviderModelCatalog,
@@ -414,7 +415,12 @@ fn apply_models(
             ModelMergePolicy::RemoveUnlisted
         }
     };
-    entry.models = merge_fetched_models_with_policy(&entry.models, remote, policy);
+    entry.models = merge_fetched_models_with_policy(
+        entry.effective_template(provider_id),
+        &entry.models,
+        remote,
+        policy,
+    );
     entry.models_fetched_at = Some(chrono::Utc::now());
     entry.model_catalog = catalog;
     if let Some(reason) = fallback_reason {
@@ -663,6 +669,7 @@ mod tests {
         };
 
         apply_models(
+            "codex-oauth",
             &mut entry,
             vec![model("fallback")],
             ProviderModelCatalog::CodexFallback,
@@ -706,6 +713,7 @@ mod tests {
         };
 
         apply_models(
+            "codex-oauth",
             &mut entry,
             vec![model("gpt-5.5"), model("gpt-5.5-mini")],
             ProviderModelCatalog::Live,

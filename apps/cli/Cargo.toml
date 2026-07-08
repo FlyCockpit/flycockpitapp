@@ -55,6 +55,13 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # the build lean; we never decode other formats ourselves (arboard hands
 # us raw RGBA, we only encode).
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Best-effort native desktop notifications for the attention subsystem on
+# local sessions (zbus/D-Bus on Linux via the default `z` feature, the native
+# notification centre on macOS/Windows). Fired on a detached thread with all
+# errors ignored; over SSH we skip it and rely on terminal notification
+# escapes instead. We only set a summary + body, so the default features are
+# all we need.
+notify-rust = "4.11"
 # Embedded-PTY panes for `/editor` + `/lazygit`. `portable-pty`
 # (wezterm's pure-Rust PTY layer) spawns + resizes
 # the child; `vt100` is the terminal-screen state machine fed by the

@@ -234,6 +234,36 @@ pub fn decide(
     }
 }
 
+/// Strip control characters (ESC, BEL, and every other C0/C1 control and
+/// DEL) from notification text so an odd or hostile summary cannot inject a
+/// string terminator / control byte and break out of the OSC string it is
+/// embedded in. Printable text passes through unchanged.
+fn sanitize_notification_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Build the terminal notification escape sequences for a desktop-style
+/// notification, as a single string carrying two best-effort OSC commands
+/// back-to-back (each terminated by ST = `ESC \`):
+///
+/// - **OSC 777** (`ESC ] 777 ; notify ; <title> ; <body> ST`) — the
+///   kitty / WezTerm / foot notification protocol.
+/// - **OSC 9** (`ESC ] 9 ; <title>: <body> ST`) — the iTerm2 / Ghostty
+///   growl-style notification (single message field, so title and body are
+///   joined).
+///
+/// Terminals that understand either turn it into a native notification;
+/// everything else silently ignores an unknown OSC, and both travel fine over
+/// SSH. The sequences contain no cursor movement or visible glyphs, so
+/// emitting them mid-frame under ratatui is safe. `title` and `body` are run
+/// through [`sanitize_notification_text`] first so their content cannot alter
+/// the framing. Pure (no I/O) so it can be unit-tested.
+pub(crate) fn desktop_notification_escapes(title: &str, body: &str) -> String {
+    let title = sanitize_notification_text(title);
+    let body = sanitize_notification_text(body);
+    format!("\x1b]777;notify;{title};{body}\x1b\\\x1b]9;{title}: {body}\x1b\\")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +446,37 @@ mod tests {
             &mut st,
         );
         assert!(d.desktop);
+    }
+
+    #[test]
+    fn desktop_escapes_frame_both_osc_sequences() {
+        let s = desktop_notification_escapes("Cockpit", "Question waiting");
+        // OSC 777 for kitty/WezTerm/foot, terminated by ST (ESC \).
+        assert!(s.starts_with("\x1b]777;notify;Cockpit;Question waiting\x1b\\"));
+        // Followed immediately by OSC 9 for iTerm2/Ghostty, also ST-terminated.
+        assert!(s.ends_with("\x1b]9;Cockpit: Question waiting\x1b\\"));
+        assert_eq!(
+            s,
+            "\x1b]777;notify;Cockpit;Question waiting\x1b\\\x1b]9;Cockpit: Question waiting\x1b\\"
+        );
+    }
+
+    #[test]
+    fn desktop_escapes_strip_control_characters() {
+        // An embedded ESC / BEL / ST would otherwise break out of the OSC
+        // string; every control byte must be dropped.
+        let s = desktop_notification_escapes("Cock\x07pit", "evil\x1bbody\x07here\nline");
+        // The only ESC bytes left are our own framing (start ESC ] and ST ESC \).
+        assert_eq!(s.matches('\x1b').count(), 4);
+        assert!(!s.contains('\x07'));
+        assert!(!s.contains('\n'));
+        assert!(s.contains("Cockpit"));
+        assert!(s.contains("evilbodyhereline"));
+    }
+
+    #[test]
+    fn sanitize_keeps_printable_and_unicode() {
+        assert_eq!(sanitize_notification_text("héllo · ok"), "héllo · ok");
+        assert_eq!(sanitize_notification_text("a\x00b\x1bc"), "abc");
     }
 }

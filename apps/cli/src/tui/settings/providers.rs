@@ -31,9 +31,10 @@ use crate::auth::{
 };
 use crate::config::providers::{
     AuthKind, HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy,
-    OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
-    merge_fetched_models_with_policy, provider_model_fetch_display_state,
-    provider_model_fetch_reason_display, redact_model_fetch_reason,
+    OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog, WireApi,
+    apply_known_frontier_model_defaults, format_model_fetch_age, merge_fetched_models_with_policy,
+    provider_model_fetch_display_state, provider_model_fetch_reason_display,
+    redact_model_fetch_reason,
 };
 use crate::envref;
 use crate::providers::models_fetch::{self, FetchOutcome};
@@ -102,13 +103,18 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
         Some(crate::config::extended::LlmMode::Defensive) => "defensive",
         Some(crate::config::extended::LlmMode::Normal) => "normal",
         Some(crate::config::extended::LlmMode::Frontier) => "frontier",
-        None => "undefined",
+        None => "inherit",
+    };
+    let prune = match entry.auto_prune {
+        Some(false) => "prune off".to_string(),
+        _ => format!(
+            "prune {}%/{}%",
+            ctx.auto_prune_pct, ctx.auto_prune_prunable_pct
+        ),
     };
     let mut summary = format!(
-        "compact {}% · prune {}%/{}% · cache {}s · ttft {}s · idle {}s · mode {mode}",
+        "compact {}% · {prune} · cache {}s · ttft {}s · idle {}s · mode {mode}",
         ctx.auto_compact_pct,
-        ctx.auto_prune_pct,
-        ctx.auto_prune_prunable_pct,
         entry.cache.ttl_secs,
         entry.timeout.ttft_secs,
         entry.timeout.idle_secs,
@@ -385,9 +391,11 @@ pub(super) enum ProvidersPage {
     /// `parent`. Reached by Enter on the "Models" row of the Edit page.
     /// Browse rows; add a manual entry; edit a manual entry; delete any
     /// entry. Back navigation returns to `Edit(parent)` with
-    /// `parent.entry.models` set from `editor.rows`.
+    /// `parent.entry.models` set from `editor.rows`. The editor is boxed
+    /// because [`ModelEditor`] is large enough to bloat the settings
+    /// `Page` enum otherwise.
     Models {
-        editor: ModelEditor,
+        editor: Box<ModelEditor>,
         parent: Box<EditState>,
     },
     /// Edit a single model's `Option<…>` settings overrides
@@ -397,7 +405,7 @@ pub(super) enum ProvidersPage {
     /// override fields written back into the editor's rows.
     ModelSettings {
         editor: SettingsEditor,
-        models: ModelEditor,
+        models: Box<ModelEditor>,
         parent: Box<EditState>,
     },
     /// Edit the provider's concrete settings values
@@ -984,6 +992,13 @@ impl HeaderEditor {
 /// fetched or manual — can be deleted; a deleted fetched entry reappears
 /// on the next `/models` refetch.
 pub(super) struct ModelEditor {
+    /// Effective template identity of the provider whose models are being
+    /// edited ([`ProviderEntry::effective_template`]), resolved from the
+    /// loaded config at construction. Only scopes the known-frontier defaults
+    /// applied to newly added manual entries
+    /// ([`apply_known_frontier_model_defaults`]); `None` for providers with no
+    /// known template.
+    pub(super) template: Option<String>,
     pub(super) rows: Vec<ModelEntry>,
     pub(super) cursor: usize,
     pub(super) mode: ModelMode,
@@ -1025,8 +1040,9 @@ pub(super) enum ModelResult {
 }
 
 impl ModelEditor {
-    pub(super) fn new(rows: Vec<ModelEntry>) -> Self {
+    pub(super) fn new(template: Option<String>, rows: Vec<ModelEntry>) -> Self {
         Self {
+            template,
             rows,
             cursor: 0,
             mode: ModelMode::Browse,
@@ -1150,7 +1166,7 @@ impl ModelEditor {
                 }
             }
             None => {
-                self.rows.push(ModelEntry {
+                let mut entry = ModelEntry {
                     id,
                     name,
                     thinking_modes: Vec::new(),
@@ -1167,6 +1183,7 @@ impl ModelEditor {
                     cache: None,
                     shrink: None,
                     context: None,
+                    auto_prune: None,
                     timeout: None,
                     backup: None,
                     mode: None,
@@ -1178,7 +1195,12 @@ impl ModelEditor {
                     extra: Default::default(),
                     capabilities: Default::default(),
                     provider_metadata: Default::default(),
-                });
+                };
+                // A hand-added known frontier id on a standard provider gets
+                // the same defaults a `/models` discovery would apply (z.ai
+                // has no `/models` endpoint, so manual add IS its discovery).
+                apply_known_frontier_model_defaults(self.template.as_deref(), &mut entry);
+                self.rows.push(entry);
                 self.cursor = self.rows.len() - 1;
             }
         }
@@ -1471,6 +1493,7 @@ fn provider_entry_from_add(
     };
     ProviderEntry {
         name: Some(template.display.to_string()),
+        template: Some(template.id.to_string()),
         url: s.url_field.text().trim_end_matches('/').to_string(),
         headers,
         models_fetched_at: None,
@@ -1488,6 +1511,7 @@ fn provider_entry_from_add(
         cache: Default::default(),
         shrink: Default::default(),
         context: Default::default(),
+        auto_prune: None,
         timeout: Default::default(),
         wire_api: template.default_wire_api,
         backup: None,
@@ -1558,7 +1582,12 @@ impl SettingsDialog {
                 }
             };
             if let Some(entry) = self.config.providers.get_mut(provider_id) {
-                entry.models = merge_fetched_models_with_policy(&pre_fetch_models, models, policy);
+                entry.models = merge_fetched_models_with_policy(
+                    entry.effective_template(provider_id),
+                    &pre_fetch_models,
+                    models,
+                    policy,
+                );
                 entry.models_fetched_at = Some(Utc::now());
                 entry.model_catalog = catalog;
                 entry.mark_model_fetch_success(catalog);
@@ -1780,7 +1809,12 @@ impl SettingsDialog {
     ) {
         for (provider_id, pre_fetch_models, remote, catalog) in merges {
             if let Some(entry) = self.config.providers.get_mut(&provider_id) {
-                entry.models = merge_fetched_models_with_policy(&pre_fetch_models, remote, policy);
+                entry.models = merge_fetched_models_with_policy(
+                    entry.effective_template(&provider_id),
+                    &pre_fetch_models,
+                    remote,
+                    policy,
+                );
                 entry.models_fetched_at = Some(Utc::now());
                 entry.model_catalog = catalog;
                 entry.mark_model_fetch_success(catalog);
@@ -2053,6 +2087,7 @@ impl SettingsDialog {
                         templates::default_headers_for(t),
                         /* show_continue */ true,
                     );
+                    s.error = None;
                     s.step = AddStep::EditId;
                 }
                 _ => {}
@@ -2130,39 +2165,11 @@ impl SettingsDialog {
                         // save + fetch.
                         let template = s.template.expect("template chosen");
                         let id = s.id_field.text().trim().to_string();
-                        let headers = templates::default_headers_for(template);
-                        let entry = ProviderEntry {
-                            name: Some(template.display.to_string()),
-                            url: s.url_field.text().trim_end_matches('/').to_string(),
-                            headers,
-                            models_fetched_at: None,
-                            model_catalog: ProviderModelCatalog::Live,
-                            favorite: None,
-                            allow_insecure_http: false,
-                            credential_ref: None,
-                            auth: Some(template.auth),
-                            trust: None,
-                            location: None,
-                            quality_rank: None,
-                            cost_rank: None,
-                            subagent_invokable: None,
-                            availability: Default::default(),
-                            cache: Default::default(),
-                            shrink: Default::default(),
-                            context: Default::default(),
-                            timeout: Default::default(),
-                            wire_api: template.default_wire_api,
-                            backup: None,
-                            mode: None,
-                            inline_think: None,
-                            hint_tool_call_corrections: None,
-                            text_embedded_recovery: None,
-                            thinking_params: Default::default(),
-                            models: vec![],
-                            capabilities: Default::default(),
-                            provider_metadata: Default::default(),
-                            last_model_fetch: None,
-                        };
+                        let entry = provider_entry_from_add(
+                            s,
+                            template,
+                            templates::default_headers_for(template),
+                        );
                         self.save_and_fetch_provider(s, id, entry, template);
                         return Nav::Stay;
                     }
@@ -2180,39 +2187,11 @@ impl SettingsDialog {
                         // Skip — move to save + fetch.
                         let template = s.template.expect("template chosen");
                         let id = s.id_field.text().trim().to_string();
-                        let headers = templates::default_headers_for(template);
-                        let entry = ProviderEntry {
-                            name: Some(template.display.to_string()),
-                            url: s.url_field.text().trim_end_matches('/').to_string(),
-                            headers,
-                            models_fetched_at: None,
-                            model_catalog: ProviderModelCatalog::Live,
-                            favorite: None,
-                            allow_insecure_http: false,
-                            credential_ref: None,
-                            auth: Some(template.auth),
-                            trust: None,
-                            location: None,
-                            quality_rank: None,
-                            cost_rank: None,
-                            subagent_invokable: None,
-                            availability: Default::default(),
-                            cache: Default::default(),
-                            shrink: Default::default(),
-                            context: Default::default(),
-                            timeout: Default::default(),
-                            wire_api: template.default_wire_api,
-                            backup: None,
-                            mode: None,
-                            inline_think: None,
-                            hint_tool_call_corrections: None,
-                            text_embedded_recovery: None,
-                            thinking_params: Default::default(),
-                            models: vec![],
-                            capabilities: Default::default(),
-                            provider_metadata: Default::default(),
-                            last_model_fetch: None,
-                        };
+                        let entry = provider_entry_from_add(
+                            s,
+                            template,
+                            templates::default_headers_for(template),
+                        );
                         self.save_and_fetch_provider(s, id, entry, template);
                     }
                 }
@@ -2222,39 +2201,11 @@ impl SettingsDialog {
                     // elsewhere (e.g. via direnv).
                     let template = s.template.expect("template chosen");
                     let id = s.id_field.text().trim().to_string();
-                    let headers = templates::default_headers_for(template);
-                    let entry = ProviderEntry {
-                        name: Some(template.display.to_string()),
-                        url: s.url_field.text().trim_end_matches('/').to_string(),
-                        headers,
-                        models_fetched_at: None,
-                        model_catalog: ProviderModelCatalog::Live,
-                        favorite: None,
-                        allow_insecure_http: false,
-                        credential_ref: None,
-                        auth: Some(template.auth),
-                        trust: None,
-                        location: None,
-                        quality_rank: None,
-                        cost_rank: None,
-                        subagent_invokable: None,
-                        availability: Default::default(),
-                        cache: Default::default(),
-                        shrink: Default::default(),
-                        context: Default::default(),
-                        timeout: Default::default(),
-                        wire_api: template.default_wire_api,
-                        backup: None,
-                        mode: None,
-                        inline_think: None,
-                        hint_tool_call_corrections: None,
-                        text_embedded_recovery: None,
-                        thinking_params: Default::default(),
-                        models: vec![],
-                        capabilities: Default::default(),
-                        provider_metadata: Default::default(),
-                        last_model_fetch: None,
-                    };
+                    let entry = provider_entry_from_add(
+                        s,
+                        template,
+                        templates::default_headers_for(template),
+                    );
                     self.save_and_fetch_provider(s, id, entry, template);
                 }
                 _ => {}
@@ -2498,7 +2449,12 @@ impl SettingsDialog {
                         // Hand off to the Models sub-page, moving the
                         // EditState out so the sub-page can return it
                         // intact on back (mirrors the Headers row).
-                        let editor = ModelEditor::new(s.entry.models.clone());
+                        let editor = Box::new(ModelEditor::new(
+                            s.entry
+                                .effective_template(&s.provider_id)
+                                .map(str::to_owned),
+                            s.entry.models.clone(),
+                        ));
                         let owned = std::mem::replace(
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
@@ -2682,7 +2638,10 @@ impl SettingsDialog {
                 seed_entry.models = editor.rows.clone();
                 let settings =
                     SettingsEditor::for_model(&parent.provider_id, &seed_entry, &model_id);
-                let models = std::mem::replace(editor, ModelEditor::new(Vec::new()));
+                let models = Box::new(std::mem::replace(
+                    editor,
+                    ModelEditor::new(None, Vec::new()),
+                ));
                 let owned = std::mem::replace(
                     parent.as_mut(),
                     EditState::new(String::new(), ProviderEntry::default()),
@@ -2745,7 +2704,13 @@ impl SettingsDialog {
                 // we save rather than wait for the Edit page's `s`.
                 owned.entry.models = tmp.models.clone();
                 owned.status = self.commit_edit_entry(&owned);
-                let new_models = ModelEditor::new(tmp.models);
+                let new_models = Box::new(ModelEditor::new(
+                    owned
+                        .entry
+                        .effective_template(&owned.provider_id)
+                        .map(str::to_owned),
+                    tmp.models,
+                ));
                 Nav::Replace(Page::Providers(ProvidersPage::Models {
                     editor: new_models,
                     parent: Box::new(owned),
@@ -2924,6 +2889,7 @@ impl SettingsDialog {
                 };
                 if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
                     entry.models = merge_fetched_models_with_policy(
+                        entry.effective_template(&s.provider_id),
                         &s.pre_fetch_models,
                         s.remote.clone(),
                         policy,
@@ -3015,6 +2981,7 @@ impl SettingsDialog {
                 2 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
                         entry.models = merge_fetched_models_with_policy(
+                            entry.effective_template(&s.provider_id),
                             &entry.models,
                             s.models.clone(),
                             ModelMergePolicy::KeepUnlisted,
@@ -5052,7 +5019,12 @@ pub(super) fn active_model_settings_page(
         ));
     }
     let settings = SettingsEditor::for_model(&active.provider, entry, &active.model);
-    let models = ModelEditor::new(entry.models.clone());
+    let models = Box::new(ModelEditor::new(
+        entry
+            .effective_template(&active.provider)
+            .map(str::to_owned),
+        entry.models.clone(),
+    ));
     let parent = EditState::new(active.provider.clone(), entry.clone());
     ProvidersPage::ModelSettings {
         editor: settings,
@@ -5367,7 +5339,8 @@ mod tests {
 
     #[test]
     fn model_editor_enter_hints_match_selected_row_actions() {
-        let mut editor = ModelEditor::new(vec![model("fetched", false), model("manual", true)]);
+        let mut editor =
+            ModelEditor::new(None, vec![model("fetched", false), model("manual", true)]);
 
         editor.cursor = 0;
         assert_eq!(editor.selected_enter_hint(), "enter: read-only settings");
@@ -5384,7 +5357,8 @@ mod tests {
 
     #[test]
     fn enter_on_fetched_and_manual_model_rows_opens_settings() {
-        let mut editor = ModelEditor::new(vec![model("fetched", false), model("manual", true)]);
+        let mut editor =
+            ModelEditor::new(None, vec![model("fetched", false), model("manual", true)]);
 
         editor.cursor = 0;
         assert!(matches!(
@@ -5401,7 +5375,7 @@ mod tests {
 
     #[test]
     fn enter_on_model_action_rows_matches_hints() {
-        let mut editor = ModelEditor::new(vec![model("manual", true)]);
+        let mut editor = ModelEditor::new(None, vec![model("manual", true)]);
 
         editor.cursor = editor.add_row_idx();
         assert_eq!(editor.selected_enter_hint(), "enter: add model");
@@ -5422,7 +5396,8 @@ mod tests {
 
     #[test]
     fn model_delete_requires_second_press_on_same_row() {
-        let mut editor = ModelEditor::new(vec![model("fetched", false), model("manual", true)]);
+        let mut editor =
+            ModelEditor::new(None, vec![model("fetched", false), model("manual", true)]);
 
         editor.handle_key(press(KeyCode::Delete));
         assert_eq!(editor.rows().len(), 2, "first press only arms");
@@ -6327,5 +6302,108 @@ mod tests {
                 "{template_id} should advance past the OAuth confirmation step"
             );
         }
+    }
+
+    fn template_cursor(template_id: &str) -> usize {
+        templates::TEMPLATES
+            .iter()
+            .position(|t| t.id == template_id)
+            .unwrap()
+    }
+
+    /// Every template — including the frontier-defaults ones — now goes through
+    /// the editable-id step. The id is no longer locked, so a user can rename a
+    /// first-party connection (e.g. `anthropic-work`) and still add a second one.
+    #[test]
+    fn all_templates_offer_edit_id_step() {
+        for t in templates::TEMPLATES {
+            let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+            let mut state = AddState::new();
+            state.step = AddStep::PickTemplate {
+                cursor: template_cursor(t.id),
+            };
+
+            dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+
+            assert!(
+                matches!(state.step, AddStep::EditId),
+                "{} should land on the EditId step",
+                t.id
+            );
+            // The chosen template is committed and the id is pre-filled for
+            // single-vendor templates.
+            assert_eq!(state.template.map(|c| c.id), Some(t.id));
+            let expected_id = if t.use_id_as_default { t.id } else { "" };
+            assert_eq!(state.id_field.text(), expected_id, "{}", t.id);
+            assert!(state.error.is_none(), "{}: {:?}", t.id, state.error);
+        }
+    }
+
+    /// A second connection to a first-party vendor is allowed: the EditId step
+    /// rejects the exact-duplicate default id but accepts a renamed key, so the
+    /// user can keep e.g. separate work and personal Anthropic keys.
+    #[test]
+    fn second_first_party_connection_under_custom_id_works() {
+        let mut providers = BTreeMap::new();
+        providers.insert("anthropic".to_string(), provider_with_models(Vec::new()));
+        let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig {
+            providers,
+            ..Default::default()
+        });
+        let mut state = AddState::new();
+        state.step = AddStep::PickTemplate {
+            cursor: template_cursor("anthropic"),
+        };
+
+        // Pick the template — lands on EditId with the default `anthropic` id.
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(matches!(state.step, AddStep::EditId));
+        assert_eq!(state.id_field.text(), "anthropic");
+
+        // The default id collides with the existing provider.
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(
+            matches!(state.step, AddStep::EditId),
+            "collision keeps EditId"
+        );
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("already exists"),
+            "{:?}",
+            state.error
+        );
+
+        // Renaming to a unique key advances past EditId with no error.
+        state.id_field.set("anthropic-work");
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(
+            matches!(state.step, AddStep::EditUrl),
+            "unique renamed id advances the wizard"
+        );
+        assert!(state.error.is_none(), "{:?}", state.error);
+    }
+
+    /// The committed entry records the template identity (not the config-map
+    /// key), so a renamed first-party connection still resolves to its vendor
+    /// template and receives the frontier defaults.
+    #[test]
+    fn committed_entry_records_template_identity() {
+        let anthropic = templates::template_by_id("anthropic").unwrap();
+        let mut state = AddState::new();
+        state.template = Some(anthropic);
+        state.url_field.set(anthropic.url);
+
+        let entry =
+            provider_entry_from_add(&state, anthropic, templates::default_headers_for(anthropic));
+
+        assert_eq!(entry.template.as_deref(), Some("anthropic"));
+        // Even under a renamed config key the vendor identity is preserved.
+        assert_eq!(
+            entry.effective_template("anthropic-work"),
+            Some("anthropic")
+        );
     }
 }

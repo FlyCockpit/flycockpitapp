@@ -1,1 +1,0 @@
--- Legacy graph merge schema removed before release.

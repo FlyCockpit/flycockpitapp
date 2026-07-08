@@ -4347,14 +4347,31 @@ impl Driver {
         let depth = self.stack.len();
         let history_len = self.stack.last().expect("stack never empty").history.len();
         // Short-circuit: nothing new since the last prune at this depth.
+        // Checked before anything touching the layered config so the common
+        // no-growth boundary stays a pure in-memory lookup.
         if self.prune_watermark.get(&depth).copied() == Some(history_len) {
+            return false;
+        }
+        // One layered-config load feeds every resolve below (auto-prune
+        // switch, cache config, context config) — `active_providers_config`
+        // walks the on-disk config chain, so don't load it three times.
+        let providers_cfg = self.active_providers_config();
+        // Master switch: auto-prune off for this (provider, model) means no
+        // automatic pruning at all — neither the cache-cold branch nor the
+        // ctx%-threshold branch. Manual `/prune` is unaffected.
+        if !Self::auto_prune_enabled_from(providers_cfg.as_ref()) {
+            // Advance the watermark so we don't re-walk the config chain until
+            // growth. Flipping auto-prune back on mid-session won't re-evaluate
+            // until history grows past the watermark, matching the sibling
+            // no-op branches (empty plan / below-min savings).
+            self.prune_watermark.insert(depth, history_len);
             return false;
         }
         // Cache-cold? Resolve the active provider/model cache config and
         // evaluate the predicate. `upstream_bust = false` here: v1 has no
         // mid-prefix tool-result edit path that busts the anchor before a
         // send, so cases (a) and (b) carry the predicate.
-        let cache = self.resolve_cache_config();
+        let cache = Self::cache_config_from(providers_cfg.as_ref());
         let secs = self.session.seconds_since_last_send();
         let cache_state = prune::cache_state(&cache, secs, false);
 
@@ -4371,7 +4388,7 @@ impl Driver {
 
         // The ctx%-threshold branch (inert when context_length is unknown):
         // prune above the configured ctx% AND prunable% even on a warm cache.
-        let ctx_cfg = self.resolve_context_config();
+        let ctx_cfg = Self::context_config_from(providers_cfg.as_ref());
         let usage = self.session.last_usage();
         let metrics = context_metrics(
             self.active_model_context_length(),
@@ -4483,10 +4500,19 @@ impl Driver {
     /// (cold) when the config can't be loaded — the conservative choice
     /// is "pruning is free," matching local/no-cache providers.
     fn resolve_cache_config(&self) -> crate::config::providers::CacheConfig {
-        let Some((providers, provider, model)) = self.active_providers_config() else {
+        Self::cache_config_from(self.active_providers_config().as_ref())
+    }
+
+    /// [`Self::resolve_cache_config`] against a pre-loaded providers config
+    /// (from one [`Self::active_providers_config`] call shared across
+    /// several resolves).
+    fn cache_config_from(
+        cfg: Option<&(crate::config::providers::ProvidersConfig, String, String)>,
+    ) -> crate::config::providers::CacheConfig {
+        let Some((providers, provider, model)) = cfg else {
             return crate::config::providers::CacheConfig::default();
         };
-        providers.resolve_cache(&provider, &model)
+        providers.resolve_cache(provider, model)
     }
 
     /// Resolve the delegation-shrink config for the session's active
@@ -4500,14 +4526,38 @@ impl Driver {
         providers.resolve_shrink(&provider, &model)
     }
 
+    /// Resolve the auto-prune master switch for the session's active
+    /// (provider, model): model override → provider override → on. Defaults
+    /// to on when the config can't be loaded, matching the historical
+    /// behavior. Takes a pre-loaded providers config (from one
+    /// [`Self::active_providers_config`] call shared across several
+    /// resolves).
+    fn auto_prune_enabled_from(
+        cfg: Option<&(crate::config::providers::ProvidersConfig, String, String)>,
+    ) -> bool {
+        let Some((providers, provider, model)) = cfg else {
+            return true;
+        };
+        providers.resolve_auto_prune(provider, model)
+    }
+
     /// Resolve the context-threshold config for the session's active
     /// (provider, model). Defaults to (80/50/30) when the config can't be
     /// loaded (implementation note).
     fn resolve_context_config(&self) -> crate::config::providers::ContextConfig {
-        let Some((providers, provider, model)) = self.active_providers_config() else {
+        Self::context_config_from(self.active_providers_config().as_ref())
+    }
+
+    /// [`Self::resolve_context_config`] against a pre-loaded providers config
+    /// (from one [`Self::active_providers_config`] call shared across
+    /// several resolves).
+    fn context_config_from(
+        cfg: Option<&(crate::config::providers::ProvidersConfig, String, String)>,
+    ) -> crate::config::providers::ContextConfig {
+        let Some((providers, provider, model)) = cfg else {
             return crate::config::providers::ContextConfig::default();
         };
-        providers.resolve_context(&provider, &model)
+        providers.resolve_context(provider, model)
     }
 
     /// The active model's declared context window (`context_length`), or
@@ -13752,6 +13802,73 @@ mod tests {
         while rx.recv().await.is_some() {}
     }
 
+    /// The auto-prune master switch: `auto_prune: off` on the provider
+    /// suppresses the automatic prune entirely — even with a cold/no-cache
+    /// provider and a material prunable plan, which would otherwise always
+    /// fire. Flipping it back on lets the same state prune.
+    #[tokio::test]
+    async fn auto_prune_master_switch_off_suppresses_auto_prune() {
+        use crate::config::providers::{CacheMode, ContextConfig};
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        install_test_providers(
+            &mut driver,
+            CacheMode::None,
+            ContextConfig::default(),
+            100_000,
+        );
+        driver
+            .test_providers_override
+            .as_mut()
+            .unwrap()
+            .0
+            .providers
+            .get_mut("lmstudio")
+            .unwrap()
+            .auto_prune = Some(false);
+        driver.stack[0].history = dup_read_history_big();
+        let plan = prune::dedup_plan(&driver.stack[0].history);
+        assert!(!plan.is_empty(), "test requires a prunable plan");
+        let history_len = driver.stack[0].history.len();
+
+        assert!(
+            !driver.maybe_auto_prune(&tx).await,
+            "auto-prune off must suppress the automatic prune"
+        );
+        assert!(rx.try_recv().is_err(), "no Pruned event is emitted");
+        // The master-switch-off branch advances the watermark like the sibling
+        // no-op branches, so the next boundary short-circuits the config load.
+        assert_eq!(
+            driver.prune_watermark.get(&1).copied(),
+            Some(history_len),
+            "switch-off must advance the watermark to history_len"
+        );
+
+        driver
+            .test_providers_override
+            .as_mut()
+            .unwrap()
+            .0
+            .providers
+            .get_mut("lmstudio")
+            .unwrap()
+            .auto_prune = Some(true);
+        // Flipping back on with no growth stays short-circuited by the
+        // watermark — matching sibling-branch semantics.
+        assert!(
+            !driver.maybe_auto_prune(&tx).await,
+            "auto-prune on with no history growth stays watermark-short-circuited"
+        );
+        // Growing history past the watermark re-evaluates and fires.
+        driver.stack[0].history.extend(dup_read_history_big());
+        assert!(
+            driver.maybe_auto_prune(&tx).await,
+            "auto-prune on fires once history grows past the watermark"
+        );
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
     #[tokio::test]
     async fn auto_prune_skips_zero_savings_plan_without_pruned_event() {
         use crate::config::providers::{CacheMode, ContextConfig};
@@ -14033,6 +14150,7 @@ mod tests {
             cache: None,
             shrink: None,
             context: None,
+            auto_prune: None,
             timeout: None,
             backup: None,
             mode: None,
@@ -14386,6 +14504,7 @@ mod tests {
             cache: None,
             shrink: None,
             context: None,
+            auto_prune: None,
             timeout: None,
             backup: None,
             mode: None,

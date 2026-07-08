@@ -1,1 +1,0 @@
--- Legacy graph metrics schema removed before release.

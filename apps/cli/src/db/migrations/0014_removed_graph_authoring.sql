@@ -1,1 +1,0 @@
--- Legacy graph authoring schema removed before release.

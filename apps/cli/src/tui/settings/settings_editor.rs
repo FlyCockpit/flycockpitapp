@@ -23,21 +23,24 @@
 //!   5. Cost rank
 //!   6. Subagent available
 //!   7. Auto-compact ctx % (default 80)
-//!   8. Auto-prune ctx % (default 50)
-//!   9. Auto-prune prunable % (default 30)
-//!   10. Cache time (seconds) (default 300)
-//!   11. Cache mode (none | ephemeral)
-//!   12. Shrink strategy (prune | compact)
-//!   13. First-token threshold (seconds)
-//!   14. Idle threshold (seconds)
-//!   15. Wire API (auto | completions | responses; hidden for native Anthropic)
-//!   16. Backup model (provider:model)
-//!   17. Mode (defensive | normal | frontier | undefined)
-//!   18. Inline `<think>` (on | off | inherit) — the inline-`<think>`
+//!   8. Auto-prune (on | off | inherit; default on) — the master switch for
+//!      automatic pruning; off protects the provider prompt cache entirely
+//!   9. Auto-prune ctx % (default 50)
+//!   10. Auto-prune prunable % (default 30)
+//!   11. Cache time (seconds) (default 300)
+//!   12. Cache mode (none | ephemeral)
+//!   13. Shrink strategy (prune | compact)
+//!   14. First-token threshold (seconds)
+//!   15. Idle threshold (seconds)
+//!   16. Wire API (auto | completions | responses; hidden for native Anthropic)
+//!   17. xAI multi-agent tools beta access (on | off; xAI/Grok providers only)
+//!   18. Backup model (provider:model)
+//!   19. Mode (defensive | normal | frontier | inherit)
+//!   20. Inline `<think>` (on | off | inherit) — the inline-`<think>`
 //!       reasoning-extraction toggle, a tri-state at **both** scopes (model
 //!       override → provider override → global default,
 //!       implementation note).
-//!   19. Hint tool-call corrections (on | off | inherit)
+//!   21. Hint tool-call corrections (on | off | inherit)
 //!
 //! Percentages, cache time, and timeout thresholds are inline numeric text edits
 //! (`Enter` opens the edit, validated/clamped on commit). Cache mode, shrink
@@ -79,6 +82,10 @@ pub(super) enum SettingsField {
     CostRank,
     SubagentInvokable,
     AutoCompactPct,
+    /// Auto-prune master switch (on | off | inherit). `off` disables the
+    /// automatic prune trigger entirely — both branches; manual `/prune`
+    /// still works. Tri-state at both scopes (model → provider → on).
+    AutoPruneEnabled,
     AutoPrunePct,
     AutoPrunePrunablePct,
     CacheTtlSecs,
@@ -118,6 +125,7 @@ impl SettingsField {
             Self::CostRank => "Cost rank",
             Self::SubagentInvokable => "Subagent available",
             Self::AutoCompactPct => "Auto-compact ctx %",
+            Self::AutoPruneEnabled => "Auto-prune",
             Self::AutoPrunePct => "Auto-prune ctx %",
             Self::AutoPrunePrunablePct => "Auto-prune prunable %",
             Self::CacheTtlSecs => "Cache time (seconds)",
@@ -162,6 +170,7 @@ impl SettingsField {
             Self::AutoCompactPct | Self::AutoPrunePct | Self::AutoPrunePrunablePct => {
                 SettingsGroup::Context
             }
+            Self::AutoPruneEnabled => SettingsGroup::AutoPrune,
             Self::CacheTtlSecs | Self::CacheMode => SettingsGroup::Cache,
             Self::ShrinkStrategy => SettingsGroup::Shrink,
             Self::TimeoutTtftSecs | Self::TimeoutIdleSecs => SettingsGroup::Timeout,
@@ -185,7 +194,28 @@ impl SettingsField {
                 "extract strips literal <think> blocks from assistant text, stores them as reasoning, and leaves display to Interface -> Thinking display. It does not request more reasoning from the model.",
             ),
             Self::Mode => Some(
-                "Provider/model request mode for new turns; it is separate from Interface -> Thinking display.",
+                "Steering tier for new turns: defensive (weaker models, explicit guidance), normal (strong models, terse), frontier (top-tier models, high autonomy). inherit falls through to the provider, then the global llm mode. Separate from Interface -> Thinking display.",
+            ),
+            Self::AutoPruneEnabled => Some(
+                "Master switch for automatic context pruning (lossless dedup of stale tool results). off never auto-prunes, protecting the provider's prompt cache; manual /prune still works. inherit falls through to the provider, then on.",
+            ),
+            Self::AutoCompactPct => Some(
+                "At or above this % of the context window, the conversation is auto-compacted (LLM summarization, same as /compact). Unrelated to the prune thresholds below.",
+            ),
+            Self::AutoPrunePct => Some(
+                "Warm-cache prune threshold: above this ctx% (and the prunable % below), auto-prune fires even though it breaks the warm prompt cache. When the cache is cold or Cache mode is none, auto-prune ignores these thresholds — set Auto-prune off to stop it entirely.",
+            ),
+            Self::AutoPrunePrunablePct => Some(
+                "Second warm-cache condition: prunable tokens must also exceed this % of the context window before the warm-cache prune fires.",
+            ),
+            Self::CacheTtlSecs => Some(
+                "Seconds the provider keeps the cached prompt prefix between requests; after expiry pruning is free. 3600+ opts native Anthropic into the 1-hour extended cache.",
+            ),
+            Self::CacheMode => Some(
+                "Whether this endpoint caches the prompt prefix. none means pruning is treated as always free, so auto-prune may fire at any boundary; ephemeral protects a warm cache (Anthropic, OpenAI/Codex, and z.ai all cache — use ephemeral there).",
+            ),
+            Self::ShrinkStrategy => Some(
+                "How the parent context is shrunk while a subagent runs: prune (lossless dedup) or compact (LLM summarization; heavier, saves more). Separate from the Auto-prune/Auto-compact triggers above.",
             ),
             Self::WireApi => Some(
                 "Provider request endpoint: auto uses the learned/default endpoint; completions uses /chat/completions; responses uses /responses.",
@@ -225,6 +255,7 @@ enum SettingsGroup {
     CostRank,
     SubagentInvokable,
     Context,
+    AutoPrune,
     Cache,
     Shrink,
     Timeout,
@@ -244,6 +275,11 @@ pub(super) struct SettingsEditor {
     /// override-or-provider-or-default chain so an inherited field shows its
     /// effective value; editing a field flips the group's `present` flag.
     context: ContextConfig,
+    /// Auto-prune master switch. `None` = inherit (provider scope: global
+    /// default on; model scope: provider, then on); `Some(true/false)` pins
+    /// it. Cycles on→off→inherit. Tracks its own override via `is_some()`,
+    /// mirroring `inline_think`.
+    auto_prune: Option<bool>,
     cache: CacheConfig,
     shrink: ShrinkConfig,
     /// Working inference-stream timeouts (TTFT + idle), seeded from the
@@ -293,6 +329,13 @@ pub(super) struct SettingsEditor {
     timeout_present: bool,
     wire_api_present: bool,
     show_wire_api: bool,
+    /// The derived, ordered field list for this editor. Computed once at
+    /// construction from `scope` / `show_wire_api` /
+    /// `show_xai_multi_agent_tools_beta` — the only inputs that shape it, all
+    /// of which are fixed for the editor's lifetime — so per-keystroke and
+    /// per-frame accessors (`field_count`, `selected_field`, the render loop)
+    /// borrow this slice instead of reallocating.
+    fields: Vec<SettingsField>,
     /// Inline numeric edit buffer; `Some` while a numeric field is open.
     pub(super) editing: Option<SettingsField>,
     pub(super) buf: TextField,
@@ -305,10 +348,13 @@ impl SettingsEditor {
     pub(super) fn for_provider(provider_id: &str, entry: &ProviderEntry) -> Self {
         let xai_multi_agent_tools_beta =
             tools_entitlement_enabled(&entry.capabilities.client_side_tools);
+        let show_wire_api = !is_anthropic_native_base_url(&entry.url);
+        let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
             scope: SettingsScope::Provider,
             cursor: 0,
             context: entry.context.clone(),
+            auto_prune: entry.auto_prune,
             cache: entry.cache.clone(),
             shrink: entry.shrink.clone(),
             timeout: entry.timeout.clone(),
@@ -323,7 +369,7 @@ impl SettingsEditor {
             hint_tool_call_corrections: entry.hint_tool_call_corrections,
             xai_multi_agent_tools_beta,
             xai_multi_agent_tools_beta_present: !entry.capabilities.client_side_tools.is_empty(),
-            show_xai_multi_agent_tools_beta: is_xai_grok_provider(provider_id, entry),
+            show_xai_multi_agent_tools_beta,
             allow_insecure_http: entry.allow_insecure_http,
             trust: entry.trust,
             location: entry.location,
@@ -336,7 +382,8 @@ impl SettingsEditor {
             shrink_present: true,
             timeout_present: true,
             wire_api_present: true,
-            show_wire_api: !is_anthropic_native_base_url(&entry.url),
+            show_wire_api,
+            fields: Self::derive_fields(false, show_wire_api, show_xai_multi_agent_tools_beta),
             editing: None,
             buf: TextField::default(),
             status: None,
@@ -373,12 +420,18 @@ impl SettingsEditor {
             .filter(|capability| !capability.is_empty())
             .unwrap_or(&entry.capabilities.client_side_tools);
         let xai_multi_agent_tools_beta = tools_entitlement_enabled(effective_client_side_tools);
+        let show_wire_api = !is_anthropic_native_base_url(&entry.url);
+        let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
             scope: SettingsScope::Model {
                 model_id: model_id.to_string(),
             },
             cursor: 0,
             context,
+            // Auto-prune tracks its override via `is_some()` (like `mode`):
+            // seed from the model's own override only, so an unset model
+            // shows "inherit".
+            auto_prune: model.and_then(|m| m.auto_prune),
             cache,
             shrink,
             timeout,
@@ -392,7 +445,7 @@ impl SettingsEditor {
             hint_tool_call_corrections: model.and_then(|m| m.hint_tool_call_corrections),
             xai_multi_agent_tools_beta,
             xai_multi_agent_tools_beta_present,
-            show_xai_multi_agent_tools_beta: is_xai_grok_provider(provider_id, entry),
+            show_xai_multi_agent_tools_beta,
             allow_insecure_http: entry.allow_insecure_http,
             trust: model.and_then(|m| m.trust),
             location: model.and_then(|m| m.location),
@@ -405,7 +458,8 @@ impl SettingsEditor {
             shrink_present: model.is_some_and(|m| m.shrink.is_some()),
             timeout_present: model.is_some_and(|m| m.timeout.is_some()),
             wire_api_present: model.is_some_and(|m| !m.wire_api.is_auto()),
-            show_wire_api: !is_anthropic_native_base_url(&entry.url),
+            show_wire_api,
+            fields: Self::derive_fields(true, show_wire_api, show_xai_multi_agent_tools_beta),
             editing: None,
             buf: TextField::default(),
             status: None,
@@ -420,194 +474,58 @@ impl SettingsEditor {
         self.show_xai_multi_agent_tools_beta
     }
 
-    /// The ordered field list. Provider scope includes provider-only transport
-    /// security; model scope only includes fields that can be overridden per
-    /// model.
-    pub(super) fn fields(&self) -> &'static [SettingsField] {
-        const PROVIDER_FIELDS: &[SettingsField] = &[
-            SettingsField::AllowInsecureHttp,
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::WireApi,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const PROVIDER_FIELDS_XAI: &[SettingsField] = &[
-            SettingsField::AllowInsecureHttp,
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::WireApi,
-            SettingsField::XaiMultiAgentToolsBeta,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const PROVIDER_FIELDS_NO_WIRE_API: &[SettingsField] = &[
-            SettingsField::AllowInsecureHttp,
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const PROVIDER_FIELDS_XAI_NO_WIRE_API: &[SettingsField] = &[
-            SettingsField::AllowInsecureHttp,
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::XaiMultiAgentToolsBeta,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const MODEL_FIELDS: &[SettingsField] = &[
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::WireApi,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const MODEL_FIELDS_XAI: &[SettingsField] = &[
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::WireApi,
-            SettingsField::XaiMultiAgentToolsBeta,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const MODEL_FIELDS_NO_WIRE_API: &[SettingsField] = &[
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        const MODEL_FIELDS_XAI_NO_WIRE_API: &[SettingsField] = &[
-            SettingsField::TrustPolicy,
-            SettingsField::Location,
-            SettingsField::QualityRank,
-            SettingsField::CostRank,
-            SettingsField::SubagentInvokable,
-            SettingsField::AutoCompactPct,
-            SettingsField::AutoPrunePct,
-            SettingsField::AutoPrunePrunablePct,
-            SettingsField::CacheTtlSecs,
-            SettingsField::CacheMode,
-            SettingsField::ShrinkStrategy,
-            SettingsField::TimeoutTtftSecs,
-            SettingsField::TimeoutIdleSecs,
-            SettingsField::XaiMultiAgentToolsBeta,
-            SettingsField::Backup,
-            SettingsField::Mode,
-            SettingsField::InlineThink,
-            SettingsField::HintToolCallCorrections,
-        ];
-        if self.is_model_scope() {
-            return if self.show_xai_multi_agent_tools_beta && self.show_wire_api {
-                MODEL_FIELDS_XAI
-            } else if self.show_xai_multi_agent_tools_beta {
-                MODEL_FIELDS_XAI_NO_WIRE_API
-            } else if self.show_wire_api {
-                MODEL_FIELDS
-            } else {
-                MODEL_FIELDS_NO_WIRE_API
-            };
+    /// The ordered field list for this editor. Cached at construction (see
+    /// [`Self::derive_fields`]) and borrowed here, since the inputs that shape
+    /// it are fixed for the editor's lifetime. Provider scope leads with the
+    /// provider-only transport security row (`AllowInsecureHttp`); model scope
+    /// omits it. The wire-API row is hidden for native Anthropic providers, and
+    /// the xAI multi-agent tools opt-in only appears for xAI/Grok providers.
+    pub(super) fn fields(&self) -> &[SettingsField] {
+        &self.fields
+    }
+
+    /// Build the ordered field list from the three inputs that shape it. Called
+    /// once per constructor; the result is cached in the `fields` field. Keeping
+    /// the derivation in one place means a new row is added once, not once per
+    /// scope/flag variant.
+    fn derive_fields(
+        is_model_scope: bool,
+        show_wire_api: bool,
+        show_xai_multi_agent_tools_beta: bool,
+    ) -> Vec<SettingsField> {
+        use SettingsField::*;
+        let mut fields = Vec::with_capacity(21);
+        // Provider-only transport security opt-in leads the list; model scope
+        // cannot override it.
+        if !is_model_scope {
+            fields.push(AllowInsecureHttp);
         }
-        if self.show_xai_multi_agent_tools_beta && self.show_wire_api {
-            PROVIDER_FIELDS_XAI
-        } else if self.show_xai_multi_agent_tools_beta {
-            PROVIDER_FIELDS_XAI_NO_WIRE_API
-        } else if self.show_wire_api {
-            PROVIDER_FIELDS
-        } else {
-            PROVIDER_FIELDS_NO_WIRE_API
+        fields.extend([
+            TrustPolicy,
+            Location,
+            QualityRank,
+            CostRank,
+            SubagentInvokable,
+            AutoCompactPct,
+            AutoPruneEnabled,
+            AutoPrunePct,
+            AutoPrunePrunablePct,
+            CacheTtlSecs,
+            CacheMode,
+            ShrinkStrategy,
+            TimeoutTtftSecs,
+            TimeoutIdleSecs,
+        ]);
+        // Wire API precedes the xAI opt-in; both sit between the timeout rows
+        // and the backup/mode tail.
+        if show_wire_api {
+            fields.push(WireApi);
         }
+        if show_xai_multi_agent_tools_beta {
+            fields.push(XaiMultiAgentToolsBeta);
+        }
+        fields.extend([Backup, Mode, InlineThink, HintToolCallCorrections]);
+        fields
     }
 
     /// Number of editable field rows in the current scope.
@@ -650,6 +568,7 @@ impl SettingsEditor {
             SettingsGroup::CostRank => self.cost_rank.is_some(),
             SettingsGroup::SubagentInvokable => self.subagent_invokable.is_some(),
             SettingsGroup::Context => self.context_present,
+            SettingsGroup::AutoPrune => self.auto_prune.is_some(),
             SettingsGroup::Cache => self.cache_present,
             SettingsGroup::Shrink => self.shrink_present,
             SettingsGroup::Timeout => self.timeout_present,
@@ -707,6 +626,12 @@ impl SettingsEditor {
                 None => "off (default)".to_string(),
             },
             SettingsField::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
+            SettingsField::AutoPruneEnabled => match self.auto_prune {
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+                None if self.is_model_scope() => "inherit".to_string(),
+                None => "on (default)".to_string(),
+            },
             SettingsField::AutoPrunePct => format!("{}%", self.context.auto_prune_pct),
             SettingsField::AutoPrunePrunablePct => {
                 format!("{}%", self.context.auto_prune_prunable_pct)
@@ -741,7 +666,8 @@ impl SettingsEditor {
                 Some(LlmMode::Defensive) => "defensive".to_string(),
                 Some(LlmMode::Normal) => "normal".to_string(),
                 Some(LlmMode::Frontier) => "frontier".to_string(),
-                None => "undefined".to_string(),
+                None if self.is_model_scope() => "inherit".to_string(),
+                None => "inherit (global llm mode)".to_string(),
             },
             SettingsField::InlineThink => match self.inline_think {
                 Some(true) => "extract".to_string(),
@@ -777,10 +703,11 @@ impl SettingsEditor {
             SettingsGroup::Shrink => self.shrink_present = true,
             SettingsGroup::Timeout => self.timeout_present = true,
             SettingsGroup::WireApi => self.wire_api_present = true,
-            // Backup / Mode / InlineThink / HintToolCallCorrections track
-            // presence via their `Option`.
+            // Backup / Mode / AutoPrune / InlineThink /
+            // HintToolCallCorrections track presence via their `Option`.
             SettingsGroup::Backup
             | SettingsGroup::Mode
+            | SettingsGroup::AutoPrune
             | SettingsGroup::InlineThink
             | SettingsGroup::HintToolCallCorrections => {}
             SettingsGroup::XaiMultiAgentToolsBeta => self.xai_multi_agent_tools_beta_present = true,
@@ -813,6 +740,7 @@ impl SettingsEditor {
             }
             SettingsGroup::Backup => self.backup = None,
             SettingsGroup::Mode => self.mode = None,
+            SettingsGroup::AutoPrune => self.auto_prune = None,
             SettingsGroup::InlineThink => self.inline_think = None,
             SettingsGroup::HintToolCallCorrections => self.hint_tool_call_corrections = None,
             SettingsGroup::XaiMultiAgentToolsBeta => {
@@ -894,6 +822,14 @@ impl SettingsEditor {
                         Some(true) => None,
                         _ => Some(true),
                     }
+                };
+            }
+            SettingsField::AutoPruneEnabled => {
+                // on → off → inherit(None) → on
+                self.auto_prune = match self.auto_prune {
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                    None => Some(true),
                 };
             }
             SettingsField::CacheMode => {
@@ -1097,7 +1033,23 @@ impl SettingsEditor {
             _ => {}
         }
         self.editing = None;
-        self.status = None;
+        // Coherence note for the two prune/compact ctx-% thresholds: auto-prune
+        // is meant to fire below auto-compact. If the prune ctx% lands at or
+        // above the compact ctx%, compaction triggers first and the prune
+        // threshold is probably unintended — the values are still valid, so we
+        // warn rather than reject. Other numeric fields just clear the status.
+        if matches!(
+            field,
+            SettingsField::AutoPrunePct | SettingsField::AutoCompactPct
+        ) && self.context.auto_prune_pct >= self.context.auto_compact_pct
+        {
+            self.status = Some(
+                "note: auto-prune ctx % ≥ auto-compact ctx % — compaction will trigger first"
+                    .to_string(),
+            );
+        } else {
+            self.status = None;
+        }
     }
 
     /// The inline numeric edit buffer when a field is open, else `None`
@@ -1179,6 +1131,7 @@ impl SettingsEditor {
         match &self.scope {
             SettingsScope::Provider => {
                 entry.context = self.context.clone();
+                entry.auto_prune = self.auto_prune;
                 entry.cache = self.cache.clone();
                 entry.shrink = self.shrink.clone();
                 entry.timeout = self.timeout.clone();
@@ -1244,6 +1197,7 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     // Backup tracks presence via its `Option` directly (like `mode`).
     m.backup = e.backup.clone();
     m.mode = e.mode;
+    m.auto_prune = e.auto_prune;
     m.trust = e.trust;
     m.location = e.location;
     m.quality_rank = e.quality_rank;
@@ -1331,6 +1285,7 @@ mod tests {
             cache: None,
             shrink: None,
             context: None,
+            auto_prune: None,
             timeout: None,
             backup: None,
             mode: None,
@@ -1445,7 +1400,42 @@ mod tests {
     }
 
     #[test]
-    fn mode_cycles_defensive_normal_frontier_undefined() {
+    fn prune_ge_compact_warns_but_commits_and_coherent_value_clears() {
+        let entry = provider_with_model();
+        let mut e = SettingsEditor::for_provider("p", &entry);
+        // Provider auto-compact starts at 85; set prune to 90 (≥ compact).
+        e.cursor = e
+            .fields()
+            .iter()
+            .position(|f| *f == SettingsField::AutoPrunePct)
+            .unwrap();
+        e.handle_key(press(KeyCode::Enter));
+        e.buf = TextField::new("90".to_string());
+        e.handle_key(press(KeyCode::Enter));
+        // Commit succeeded and closed the edit.
+        assert!(e.editing.is_none(), "coherence warning still commits");
+        assert_eq!(e.value_str(SettingsField::AutoPrunePct), "90%");
+        // …but a warning is surfaced.
+        assert!(
+            e.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("compaction will trigger first"),
+            "expected coherence warning, got {:?}",
+            e.status
+        );
+
+        // Now bring prune back below compact — status clears.
+        e.handle_key(press(KeyCode::Enter));
+        e.buf = TextField::new("40".to_string());
+        e.handle_key(press(KeyCode::Enter));
+        assert!(e.editing.is_none());
+        assert_eq!(e.value_str(SettingsField::AutoPrunePct), "40%");
+        assert_eq!(e.status, None, "coherent value clears the warning");
+    }
+
+    #[test]
+    fn mode_cycles_defensive_normal_frontier_inherit() {
         let entry = provider_with_model();
         let mut e = SettingsEditor::for_provider("p", &entry);
         // Move to the Mode row (computed from the field order).
@@ -1454,7 +1444,10 @@ mod tests {
             .iter()
             .position(|f| *f == SettingsField::Mode)
             .unwrap();
-        assert_eq!(e.value_str(SettingsField::Mode), "undefined");
+        assert_eq!(
+            e.value_str(SettingsField::Mode),
+            "inherit (global llm mode)"
+        );
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(SettingsField::Mode), "defensive");
         e.handle_key(press(KeyCode::Enter));
@@ -1462,11 +1455,64 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(SettingsField::Mode), "frontier");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::Mode), "undefined");
-        // Writeback: undefined → None.
+        assert_eq!(
+            e.value_str(SettingsField::Mode),
+            "inherit (global llm mode)"
+        );
+        // Writeback: inherit → None.
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
         assert!(entry2.mode.is_none());
+    }
+
+    /// Auto-prune master-switch row: tri-state at both scopes, tracked via
+    /// its own Option (no context-group coupling), written back per scope.
+    #[test]
+    fn auto_prune_row_cycles_and_writes_back() {
+        let entry = provider_with_model();
+
+        // Provider scope: on(default/inherit) → on → off → inherit.
+        let mut e = SettingsEditor::for_provider("p", &entry);
+        e.cursor = e
+            .fields()
+            .iter()
+            .position(|f| *f == SettingsField::AutoPruneEnabled)
+            .unwrap();
+        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "on (default)");
+        e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "on");
+        e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "off");
+        let mut entry2 = entry.clone();
+        e.write_into(&mut entry2);
+        assert_eq!(entry2.auto_prune, Some(false));
+
+        // Model scope: unset shows inherit and is dimmed; cycling to off
+        // pins the override; clearing with `x` returns to inherit. The
+        // context-group pct rows are untouched by the switch.
+        let mut e = SettingsEditor::for_model("p", &entry, "m1");
+        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "inherit");
+        assert!(!e.is_overridden(SettingsField::AutoPruneEnabled));
+        e.cursor = e
+            .fields()
+            .iter()
+            .position(|f| *f == SettingsField::AutoPruneEnabled)
+            .unwrap();
+        e.handle_key(press(KeyCode::Enter)); // on
+        e.handle_key(press(KeyCode::Enter)); // off
+        assert!(e.is_overridden(SettingsField::AutoPruneEnabled));
+        let mut entry3 = entry.clone();
+        e.write_into(&mut entry3);
+        let m = entry3.models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m.auto_prune, Some(false));
+        assert!(m.context.is_none(), "switch must not pin the ctx% group");
+
+        e.handle_key(press(KeyCode::Char('x')));
+        assert!(!e.is_overridden(SettingsField::AutoPruneEnabled));
+        let mut entry4 = entry.clone();
+        e.write_into(&mut entry4);
+        let m = entry4.models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m.auto_prune, None);
     }
 
     #[test]
@@ -1475,7 +1521,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 18);
+        assert_eq!(e.field_count(), 19);
         assert_eq!(
             *e.fields().last().unwrap(),
             SettingsField::HintToolCallCorrections
@@ -1525,7 +1571,7 @@ mod tests {
         // mirroring the `mode` tri-state.
         let mut prov = SettingsEditor::for_provider("p", &entry);
         assert!(prov.fields().contains(&SettingsField::InlineThink));
-        assert_eq!(prov.field_count(), 19);
+        assert_eq!(prov.field_count(), 20);
         // Seeded from the provider's (unset) override → inherit default.
         assert_eq!(
             prov.value_str(SettingsField::InlineThink),
@@ -1939,5 +1985,66 @@ mod tests {
         e.write_into(&mut entry2);
         let m = entry2.models.iter().find(|m| m.id == "m1").unwrap();
         assert!(m.context.is_none(), "cleared override writes None");
+    }
+
+    #[test]
+    fn field_lists_match_expected_for_every_scope_and_flag_variant() {
+        use SettingsField::*;
+        // Independent oracle: the single canonical maximal ordering, each row
+        // tagged with the condition under which it appears. `derive_fields`
+        // (the single source of truth, cached per editor and returned by
+        // `fields()`) must equal this table filtered by scope + the two
+        // visibility flags, for every one of the eight variants — this pins row
+        // order and membership so a future row can't silently go missing from
+        // one variant.
+        //
+        // (field, provider_only, wire_api_only, xai_only)
+        let canonical: &[(SettingsField, bool, bool, bool)] = &[
+            (AllowInsecureHttp, true, false, false),
+            (TrustPolicy, false, false, false),
+            (Location, false, false, false),
+            (QualityRank, false, false, false),
+            (CostRank, false, false, false),
+            (SubagentInvokable, false, false, false),
+            (AutoCompactPct, false, false, false),
+            (AutoPruneEnabled, false, false, false),
+            (AutoPrunePct, false, false, false),
+            (AutoPrunePrunablePct, false, false, false),
+            (CacheTtlSecs, false, false, false),
+            (CacheMode, false, false, false),
+            (ShrinkStrategy, false, false, false),
+            (TimeoutTtftSecs, false, false, false),
+            (TimeoutIdleSecs, false, false, false),
+            (WireApi, false, true, false),
+            (XaiMultiAgentToolsBeta, false, false, true),
+            (Backup, false, false, false),
+            (Mode, false, false, false),
+            (InlineThink, false, false, false),
+            (HintToolCallCorrections, false, false, false),
+        ];
+
+        // Drive the visibility flags directly so the assertion covers all eight
+        // combinations regardless of provider detection.
+        for is_model in [false, true] {
+            for wire in [false, true] {
+                for xai in [false, true] {
+                    let expected: Vec<SettingsField> = canonical
+                        .iter()
+                        .filter(|(_, provider_only, wire_only, xai_only)| {
+                            (!provider_only || !is_model)
+                                && (!wire_only || wire)
+                                && (!xai_only || xai)
+                        })
+                        .map(|(f, ..)| *f)
+                        .collect();
+
+                    assert_eq!(
+                        SettingsEditor::derive_fields(is_model, wire, xai),
+                        expected,
+                        "mismatch for is_model={is_model} wire={wire} xai={xai}"
+                    );
+                }
+            }
+        }
     }
 }

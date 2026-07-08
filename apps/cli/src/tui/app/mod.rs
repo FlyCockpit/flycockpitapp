@@ -2208,20 +2208,54 @@ fn ring_terminal_bell() {
 
 /// Post a best-effort desktop notification with a terse, secret-safe summary.
 ///
-/// No cross-platform desktop-notification crate could be verified via
-/// `kcl ask <package>` (the prompt's hard gate before adding such a
-/// dependency — `kcl` has no notification package registered, and project guidance
-/// forbids unverified deps), so this is the decision-layer-only stub the spec
-/// authorizes: it logs at debug and returns. The setting (`tui.attention.
-/// desktop`) and the whole decision path are fully wired, so dropping in a
-/// verified backend later is a one-function change with no policy rework.
-/// Failure here is non-fatal by construction.
+/// Two mutually exclusive layers, both non-fatal by construction — emitting
+/// both would double-notify, since OSC-honoring terminals post their own
+/// popups on top of the `notify-rust` one:
+///
+/// 1. **Terminal notification escapes**, over SSH only. We write OSC 777 +
+///    OSC 9 (built by [`crate::tui::attention::desktop_notification_escapes`])
+///    straight to the raw terminal. Supporting terminals (kitty / WezTerm /
+///    foot / Ghostty) turn them into native notifications; others ignore the
+///    unknown OSC; and they carry over SSH — which `notify-rust` can't. The
+///    bytes contain no cursor movement or visible glyphs, so emitting them
+///    mid-frame under crossterm raw mode + ratatui is safe.
+/// 2. **The OS notification service** via `notify-rust`, for local sessions
+///    only. Over SSH it would post on the *remote* host (useless), so we skip
+///    it when an SSH session is detected. It can block on D-Bus, so it runs on
+///    a detached thread and every error is swallowed (logged at debug for
+///    observability).
 fn post_desktop_notification(summary: &str) {
-    tracing::debug!(
-        target: "cockpit::attention",
-        summary,
-        "desktop notification requested but no backend is wired (stubbed)"
-    );
+    use std::io::Write;
+
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+
+    // Layer 1 — terminal escapes, SSH sessions only. The terminal is the only
+    // path back to the user's desktop; locally we'd double-notify terminals
+    // that honor the OSC (and WezTerm honors both 777 and 9).
+    if over_ssh {
+        let escapes = crate::tui::attention::desktop_notification_escapes("Cockpit", summary);
+        let mut out = stdout();
+        let _ = out.write_all(escapes.as_bytes());
+        let _ = out.flush();
+        return;
+    }
+
+    // Layer 2 — OS notification service, local sessions only.
+    let summary = summary.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = notify_rust::Notification::new()
+            .summary("Cockpit")
+            .body(&summary)
+            .show()
+        {
+            tracing::debug!(
+                target: "cockpit::attention",
+                error = %e,
+                "desktop notification backend failed (best-effort, ignored)"
+            );
+        }
+    });
 }
 
 /// Args cached at `ToolStart` for an `edit` / `editunlock` call so the
@@ -9820,6 +9854,7 @@ impl App {
                             }
                         };
                         entry_mut.models = merge_fetched_models_with_policy(
+                            entry_mut.effective_template(id),
                             &entry_mut.models,
                             remote,
                             merge_policy,

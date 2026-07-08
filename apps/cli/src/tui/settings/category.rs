@@ -330,10 +330,8 @@ pub(super) enum SettingId {
     AgentChoosesSubagentModel,
     DeepthinkEnabled,
     AutoTitleModel,
-    PromptInjectionCheckModel,
     SkillInjectionModel,
     PredictNextMessageModel,
-    PreflightUtilityModel,
     HarnessReportSummarizationModel,
     CompactModel,
     CompactPrompt,
@@ -420,7 +418,7 @@ impl SettingId {
             SettingId::ApprovalMode => "approval mode",
             SettingId::PredictNextMessage => "predict next message",
             SettingId::ShellCompression => "shell compression",
-            SettingId::InlineThink => "strip inline <think>",
+            SettingId::InlineThink => "extract inline <think>",
             SettingId::HintToolCallCorrections => "hint tool-call corrections",
             SettingId::TextEmbeddedRecovery => "text-embedded recovery",
             SettingId::UtilityModel => "utility model",
@@ -431,10 +429,8 @@ impl SettingId {
             SettingId::AgentChoosesSubagentModel => "allow agent to determine subagent model",
             SettingId::DeepthinkEnabled => "deepthink subagent",
             SettingId::AutoTitleModel => "auto-title model",
-            SettingId::PromptInjectionCheckModel => "prompt-injection check model",
             SettingId::SkillInjectionModel => "skill injection model",
             SettingId::PredictNextMessageModel => "prediction model",
-            SettingId::PreflightUtilityModel => "preflight utility model",
             SettingId::HarnessReportSummarizationModel => "harness-report summarization model",
             SettingId::CompactModel => "compact model",
             SettingId::CompactPrompt => "compact prompt",
@@ -561,11 +557,13 @@ impl SettingId {
                  at most once. Requires attention notifications on."
             }
             SettingId::AttentionDesktop => {
-                "Post a best-effort desktop notification for action-required events \
-                 and long-running turn completions. Off by default. No desktop \
-                 backend is wired in this build, so this currently has no effect \
-                 even when on; the setting persists for when one lands. Requires \
-                 attention notifications on."
+                "Post a native desktop notification for action-required events and \
+                 long-running turn completions when you haven't recently interacted. \
+                 Off by default. Best-effort on two layers: terminal notification \
+                 escapes (which supporting terminals like kitty, WezTerm, foot, or \
+                 Ghostty turn into native popups, and which work over SSH) plus the \
+                 OS notification service on local sessions. Repeated identical events \
+                 are debounced. Requires attention notifications on."
             }
             SettingId::ExitTailLines => {
                 "How many lines of the conversation tail are dumped back into your \
@@ -591,7 +589,11 @@ impl SettingId {
                  uses explicit, spelled-out tool descriptions and more task \
                  decomposition — tuned for weaker ~120k-context models; `normal` \
                  uses terse descriptions and episode-sequencing delegation for \
-                 strong models. This is not auto-detected from the model."
+                 strong models; `frontier` uses the leanest steering and \
+                 high-autonomy prompts for top-tier models. This global default is \
+                 not auto-detected — a provider or model Mode override wins over \
+                 it (known frontier models on standard providers are pinned to \
+                 `frontier` at discovery)."
             }
             SettingId::ApprovalMode => {
                 "When a command, web fetch, or MCP call needs approval before it \
@@ -674,10 +676,6 @@ impl SettingId {
                 "Model used specifically for session auto-titling. Unset falls back \
                  to the shared utility model."
             }
-            SettingId::PromptInjectionCheckModel => {
-                "Model used for prompt-injection classification. This reuses \
-                 prompt_injection_guard.model; unset falls back to utility."
-            }
             SettingId::SkillInjectionModel => {
                 "Model used to rank skills for automatic injection. Unset falls \
                  back to the shared utility model."
@@ -685,10 +683,6 @@ impl SettingId {
             SettingId::PredictNextMessageModel => {
                 "Model used for next-message prediction. Unset falls back to the \
                  shared utility model."
-            }
-            SettingId::PreflightUtilityModel => {
-                "Model used for request preflight rewrites. This reuses \
-                 preflight.model; unset falls back to utility."
             }
             SettingId::HarnessReportSummarizationModel => {
                 "Model used to summarize over-budget external harness reports. \
@@ -911,10 +905,8 @@ impl SettingId {
             | SettingId::SmartCodeModel
             | SettingId::ReasoningModel
             | SettingId::AutoTitleModel
-            | SettingId::PromptInjectionCheckModel
             | SettingId::SkillInjectionModel
             | SettingId::PredictNextMessageModel
-            | SettingId::PreflightUtilityModel
             | SettingId::HarnessReportSummarizationModel
             | SettingId::CompactModel
             | SettingId::Instructions
@@ -1125,14 +1117,14 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::DeepthinkEnabled),
             Heading {
                 title: "Utility",
-                blurb: "Background models; extra utility rows fall back to utility if unset.",
+                blurb: "Background models; extra utility rows fall back to utility if \
+                        unset. The injection-guard and preflight models live under \
+                        Privacy & Safety.",
             },
             Setting(S::UtilityModel),
             Setting(S::AutoTitleModel),
-            Setting(S::PromptInjectionCheckModel),
             Setting(S::SkillInjectionModel),
             Setting(S::PredictNextMessageModel),
-            Setting(S::PreflightUtilityModel),
             Setting(S::HarnessReportSummarizationModel),
             Setting(S::CompactModel),
             Setting(S::CompactPrompt),
@@ -1251,8 +1243,8 @@ impl SettingsDialog {
             ),
             S::AttentionDesktop => on_off(
                 e.tui.attention.desktop,
-                "on (no backend wired yet — no-op)",
-                "off (default)",
+                "on (desktop notification on attention events)",
+                "off (default — no desktop notifications)",
             ),
             S::ExitTailLines => format!(
                 "{} (lines of tail dumped to scrollback on exit; 0 none, -1 all)",
@@ -1310,12 +1302,8 @@ impl SettingsDialog {
                 "off (hidden)",
             ),
             S::AutoTitleModel => model_role_value(e.auto_title.as_deref()),
-            S::PromptInjectionCheckModel => {
-                model_role_value(e.prompt_injection_guard.model.as_deref())
-            }
             S::SkillInjectionModel => model_role_value(e.skill_injection.as_deref()),
             S::PredictNextMessageModel => model_role_value(e.predict_next_message_model.as_deref()),
-            S::PreflightUtilityModel => model_role_value(e.preflight.model.as_deref()),
             S::HarnessReportSummarizationModel => {
                 model_role_value(e.harness_report_summarization.as_deref())
             }
@@ -1972,10 +1960,8 @@ impl SettingsDialog {
             | S::SmartCodeModel
             | S::ReasoningModel
             | S::AutoTitleModel
-            | S::PromptInjectionCheckModel
             | S::SkillInjectionModel
             | S::PredictNextMessageModel
-            | S::PreflightUtilityModel
             | S::HarnessReportSummarizationModel
             | S::CompactModel => {
                 p.utility_picker = Some(Box::new(UtilityModelPicker::new(
@@ -2017,10 +2003,8 @@ impl SettingsDialog {
             S::SmartCodeModel => e.smart_code.clone(),
             S::ReasoningModel => e.reasoning.clone(),
             S::AutoTitleModel => e.auto_title.clone(),
-            S::PromptInjectionCheckModel => e.prompt_injection_guard.model.clone(),
             S::SkillInjectionModel => e.skill_injection.clone(),
             S::PredictNextMessageModel => e.predict_next_message_model.clone(),
-            S::PreflightUtilityModel => e.preflight.model.clone(),
             S::HarnessReportSummarizationModel => e.harness_report_summarization.clone(),
             S::CompactModel => e.compact_model.clone(),
             _ => None,
@@ -2038,10 +2022,8 @@ impl SettingsDialog {
             S::SmartCodeModel => e.smart_code = value,
             S::ReasoningModel => e.reasoning = value,
             S::AutoTitleModel => e.auto_title = value,
-            S::PromptInjectionCheckModel => e.prompt_injection_guard.model = value,
             S::SkillInjectionModel => e.skill_injection = value,
             S::PredictNextMessageModel => e.predict_next_message_model = value,
-            S::PreflightUtilityModel => e.preflight.model = value,
             S::HarnessReportSummarizationModel => e.harness_report_summarization = value,
             S::CompactModel => e.compact_model = value,
             _ => {}
@@ -2332,10 +2314,8 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         | S::SmartCodeModel
         | S::ReasoningModel
         | S::AutoTitleModel
-        | S::PromptInjectionCheckModel
         | S::SkillInjectionModel
         | S::PredictNextMessageModel
-        | S::PreflightUtilityModel
         | S::HarnessReportSummarizationModel
         | S::AgentDirs
         | S::GitignoreAllow

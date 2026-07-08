@@ -1,1 +1,0 @@
--- Legacy graph harness schema removed before release.

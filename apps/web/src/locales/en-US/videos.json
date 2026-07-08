@@ -1,0 +1,52 @@
+{
+  "uploader": {
+    "dropOrClick": "Drop a video here, or click to choose a file",
+    "acceptedFormats": "(MP4, MOV, MKV, WebM)",
+    "titleLabel": "Title",
+    "descriptionLabel": "Description (optional)",
+    "sourceLocaleLabel": "Language of the original audio",
+    "visibilityLabel": "Visibility",
+    "visibilityRestricted": "Restricted — only you and admins",
+    "visibilityPublic": "Public — anyone with the link",
+    "startUpload": "Start upload",
+    "uploading": "Uploading…",
+    "progress": "Uploaded {{percent}}%",
+    "missingFile": "Pick a video file to upload.",
+    "missingTitle": "Give the video a title.",
+    "missingAudioFile": "Pick an audio or video file to upload.",
+    "missingLocale": "Pick a language."
+  },
+  "list": {
+    "title": "Videos",
+    "empty": "You haven't uploaded any videos yet.",
+    "uploadCta": "Upload a video",
+    "statusPending": "Pending upload",
+    "statusTranscoding": "Transcoding…",
+    "statusReady": "Ready",
+    "statusFailed": "Failed"
+  },
+  "detail": {
+    "audioTracksHeading": "Audio tracks",
+    "subtitleTracksHeading": "Subtitles",
+    "addAudioTrack": "Add a dub",
+    "addSubtitleTrack": "Add subtitles",
+    "renditionsHeading": "Renditions",
+    "deleteVideo": "Delete video",
+    "deleteVideoConfirm": "Type the title to confirm",
+    "transcodingHint": "We're processing your video — usually under a few minutes.",
+    "failedHint": "Transcoding failed. {{reason}}",
+    "defaultTrack": "(default)",
+    "trackLabel": "Label",
+    "subtitleFormat": "Format",
+    "subtitleContent": "Content",
+    "vttPlaceholder": "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nHello",
+    "srtPlaceholder": "1\n00:00:00,000 --> 00:00:03,000\nHello"
+  },
+  "watch": {
+    "playerUnavailable": "This video isn't available."
+  },
+  "admin": {
+    "reprocess": "Re-run transcoding",
+    "reprocessed": "Re-queued"
+  }
+}

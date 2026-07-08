@@ -1,0 +1,7 @@
+{
+  "script": "dev:raw",
+  "apps": {
+    "apps/web": { "name": "flycockpit" },
+    "apps/server": { "name": "api.flycockpit" }
+  }
+}

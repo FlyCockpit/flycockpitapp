@@ -1,0 +1,1 @@
+-- Legacy graph lifecycle schema removed before release.

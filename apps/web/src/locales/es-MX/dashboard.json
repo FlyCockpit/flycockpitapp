@@ -1,0 +1,5 @@
+{
+  "appSettingsLoadFailed": "No se pudieron cargar las configuraciones de la aplicación.",
+  "loadFailed": "No se pudo cargar el panel de control.",
+  "welcomeBack": "Bienvenido de vuelta, {{name}}"
+}

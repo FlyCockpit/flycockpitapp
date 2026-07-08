@@ -1,0 +1,166 @@
+enum EnterpriseOrgMemberRole {
+  ORG_ADMIN
+  MEMBER
+}
+
+enum EnterpriseLogEventKind {
+  SESSION
+  MESSAGE
+  TOOL_CALL
+  TOOL_RESULT
+  INFERENCE
+  TRUNCATION
+}
+
+enum EnterpriseLogExportFormat {
+  RAW_NDJSON
+  CHAT_JSONL
+}
+
+enum EnterpriseLogExportStatus {
+  QUEUED
+  RUNNING
+  READY
+  FAILED
+}
+
+model EnterpriseOrg {
+  id                   String                @id @default(cuid(2))
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @default(now()) @updatedAt
+  name                 String
+  slug                 String                @unique
+  policyVersion        Int                   @default(1)
+  logSyncMandated      Boolean               @default(false)
+  syncSessionEvents    Boolean               @default(true)
+  syncMessageEvents    Boolean               @default(true)
+  syncToolCallEvents   Boolean               @default(true)
+  syncInferenceEvents  Boolean               @default(true)
+  syncTruncationEvents Boolean               @default(true)
+  includeLocalModels   Boolean               @default(false)
+  backfill             Boolean               @default(false)
+  backlogPolicy        String                @default("since_join")
+  retentionDays        Int                   @default(365)
+  Members              EnterpriseOrgMember[]
+  LogBatches           EnterpriseLogBatch[]
+  LogEvents            EnterpriseLogEvent[]
+  LogExports           EnterpriseLogExport[]
+  AuditLogs            EnterpriseAuditLog[]
+
+  @@map("enterprise_org")
+}
+
+model EnterpriseOrgMember {
+  id            String                  @id @default(cuid(2))
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @default(now()) @updatedAt
+  orgId         String
+  userId        String
+  role          EnterpriseOrgMemberRole @default(MEMBER)
+  EnterpriseOrg EnterpriseOrg           @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  User          User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId, role])
+  @@map("enterprise_org_member")
+}
+
+model EnterpriseLogBatch {
+  id              String               @id @default(cuid(2))
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @default(now()) @updatedAt
+  orgId           String
+  instanceId      String
+  userId          String
+  schemaVersion   Int
+  idempotencyKey  String?
+  firstSeq        Int
+  lastSeq         Int
+  eventCount      Int
+  policyVersion   Int
+  storageKey      String?
+  receivedAt      DateTime             @default(now())
+  EnterpriseOrg   EnterpriseOrg        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  CockpitInstance CockpitInstance      @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  User            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Events          EnterpriseLogEvent[]
+
+  @@unique([instanceId, firstSeq, lastSeq])
+  @@index([orgId, receivedAt])
+  @@index([instanceId, lastSeq])
+  @@index([userId, receivedAt])
+  @@map("enterprise_log_batch")
+}
+
+model EnterpriseLogEvent {
+  id                 String                 @id @default(cuid(2))
+  createdAt          DateTime               @default(now())
+  orgId              String
+  batchId            String
+  instanceId         String
+  userId             String
+  seq                Int
+  sessionId          String
+  projectRoot        String?
+  kind               EnterpriseLogEventKind
+  occurredAt         DateTime?
+  model              String?
+  role               String?
+  content            String?
+  payload            Json
+  redactionVersion   String
+  truncated          Boolean                @default(false)
+  EnterpriseOrg      EnterpriseOrg          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  EnterpriseLogBatch EnterpriseLogBatch     @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  CockpitInstance    CockpitInstance        @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  User               User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([instanceId, seq])
+  @@index([orgId, sessionId, seq])
+  @@index([orgId, kind, createdAt])
+  @@index([userId, createdAt])
+  @@index([instanceId, seq])
+  @@map("enterprise_log_event")
+}
+
+model EnterpriseLogExport {
+  id                 String                    @id @default(cuid(2))
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @default(now()) @updatedAt
+  orgId              String
+  requestedById      String
+  status             EnterpriseLogExportStatus @default(QUEUED)
+  format             EnterpriseLogExportFormat
+  filters            Json
+  manifest           Json?
+  artifactStorageKey String?
+  artifactSizeBytes  Int?
+  failureReason      String?
+  completedAt        DateTime?
+  EnterpriseOrg      EnterpriseOrg             @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  RequestedBy        User                      @relation("EnterpriseLogExportRequestedBy", fields: [requestedById], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@index([requestedById, createdAt])
+  @@index([status, createdAt])
+  @@map("enterprise_log_export")
+}
+
+model EnterpriseAuditLog {
+  id            String        @id @default(cuid(2))
+  createdAt     DateTime      @default(now())
+  orgId         String
+  userId        String
+  action        String
+  entity        String?
+  entityId      String?
+  metadata      Json?
+  EnterpriseOrg EnterpriseOrg @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  User          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([entity, entityId])
+  @@map("enterprise_audit_log")
+}

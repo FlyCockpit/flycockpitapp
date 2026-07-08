@@ -1,0 +1,27 @@
+{
+  "name": "@flycockpit/env",
+  "license": "Apache-2.0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./shared": "./src/shared.ts",
+    "./server": "./src/server.ts",
+    "./web": "./src/web.ts",
+    "./native": "./src/native.ts",
+    "./relay": "./src/relay.ts"
+  },
+  "dependencies": {
+    "@t3-oss/env-core": "^0.13.11",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

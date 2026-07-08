@@ -1,0 +1,39 @@
+[
+  {
+    "type": "history_entry",
+    "sessionId": "s1",
+    "entry": {
+      "id": "h5",
+      "seq": 5,
+      "ts": 1783296040,
+      "kind": "assistant_text",
+      "text": "Continuing after approval."
+    }
+  },
+  {
+    "type": "assistant_delta",
+    "sessionId": "s1",
+    "seq": 6,
+    "entryId": "h5",
+    "delta": " Done."
+  },
+  {
+    "type": "usage",
+    "sessionId": "s1",
+    "usage": {
+      "inputTokens": 100,
+      "outputTokens": 50,
+      "totalTokens": 150
+    }
+  },
+  {
+    "type": "interrupt_resolved",
+    "sessionId": "s1",
+    "interruptId": "int1",
+    "seq": 7
+  },
+  {
+    "type": "idle",
+    "sessionId": "s1"
+  }
+]

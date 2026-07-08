@@ -1,0 +1,28 @@
+pre-commit:
+  parallel: true
+  commands:
+    biome:
+      glob: "*.{ts,tsx,js,jsx,json,css}"
+      run: pnpm biome check --write --no-errors-on-unmatched --files-ignore-unknown=true {staged_files} && git add {staged_files}
+      stage_fixed: true
+      fail_text: |
+        Biome check failed (lint/format).
+        Fix: run `pnpm check` to auto-fix and see remaining issues, or `pnpm lint` to list them.
+        Then `git add` the changes and commit again.
+        Emergency bypass: `git commit --no-verify` (WARNING: CI runs the same checks and will still fail).
+    typecheck:
+      glob: "*.{ts,tsx}"
+      run: pnpm check-types
+      fail_text: |
+        TypeScript check failed.
+        Fix: run `pnpm check-types` to see all type errors across the monorepo.
+        Resolve the errors in the reported files, then commit again.
+        Emergency bypass: `git commit --no-verify` (WARNING: CI runs the same checks and will still fail).
+    prisma-validate:
+      glob: "packages/db/prisma/**/*.prisma"
+      run: pnpm db:validate
+      fail_text: |
+        Prisma schema validation failed.
+        Fix: run `pnpm db:validate` to see the error, then correct the schema files in `packages/db/prisma/schema/`.
+        Emergency bypass: `git commit --no-verify` (WARNING: CI runs the same checks and will still fail).
+

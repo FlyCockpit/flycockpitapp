@@ -1,0 +1,496 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main, master]
+
+# Cancel superseded runs when a PR is force-pushed.
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege token: PR checks only read the repo.
+permissions:
+  contents: read
+
+jobs:
+  # Shared setup: install dependencies once and cache for downstream jobs.
+  setup:
+    name: Install dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache workspace
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+  # ── Validation jobs (all depend on setup) ──────────────────────────
+
+  lint:
+    name: Lint & format
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Lint & format check
+        run: pnpm check:ci
+
+  typecheck:
+    name: Type check
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Type check
+        run: pnpm check-types
+
+  build:
+    name: Build
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Build
+        run: pnpm build
+
+  test:
+    name: Test
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Test
+        run: pnpm test
+
+  # ── Policy checks (grep-based, enforce AGENTS.md rules) ───────────
+
+  policy-checks:
+    name: Policy checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      # Forbid transition-all — must explicitly list animated properties.
+      # AGENTS.md: "Never use transition: all"
+      - name: Forbid transition-all
+        run: |
+          if grep -rn --include='*.css' --include='*.tsx' --include='*.ts' \
+            -E '(transition:\s*["'\''`]?all|transition-all)' \
+            apps/ packages/ \
+            | grep -v 'node_modules' \
+            | grep -v '/dist/'; then
+            echo "::error::Found 'transition-all' — explicitly list properties instead."
+            exit 1
+          fi
+
+      # Forbid .useQuery() / .useMutation() directly on oRPC — must use queryOptions() / mutationOptions().
+      # AGENTS.md: "Queries: useQuery(orpc...queryOptions(...))"
+      - name: Forbid orpc.*.useQuery / useMutation
+        run: |
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            -E 'orpc\.[a-zA-Z]+\.[a-zA-Z]+\.(useQuery|useMutation)\(' \
+            apps/ packages/ \
+            | grep -v 'node_modules'; then
+            echo "::error::Use queryOptions() / mutationOptions() instead of .useQuery() / .useMutation()."
+            exit 1
+          fi
+
+      # Forbid @ts-ignore — must use @ts-expect-error with a reason.
+      - name: Forbid @ts-ignore
+        run: |
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            '@ts-ignore' \
+            apps/ packages/ \
+            | grep -v 'node_modules'; then
+            echo "::error::Use @ts-expect-error with a reason instead of @ts-ignore."
+            exit 1
+          fi
+
+      # Forbid raw useEffect in components and routes without effect:audited tag.
+      # AGENTS.md: "Direct useEffect calls are banned in component files."
+      - name: Forbid unaudited useEffect in components/routes
+        run: |
+          violations=$(awk '
+            FNR == 1 { prev = "" }
+            /useEffect\(/ && $0 !~ /import.*useEffect/ && prev !~ /effect:audited/ && $0 !~ /\/\/ eslint-disable/ {
+              print FILENAME ":" FNR ":" $0
+            }
+            { prev = $0 }
+          ' $(find apps/web/src/components apps/web/src/routes -type f \( -name '*.ts' -o -name '*.tsx' \)))
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo "::error::Found unaudited useEffect in components/routes. Move to a custom hook or add '// effect:audited — <reason>' comment."
+            exit 1
+          fi
+
+      # Forbid mutationFn pattern — must use mutationOptions().
+      # AGENTS.md: "useMutation(orpc...mutationOptions(...)) — not useMutation({ mutationFn: ... })"
+      - name: Forbid mutationFn with oRPC
+        run: |
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            -E 'mutationFn:\s*.*\.(call|mutate)\(' \
+            apps/ packages/ \
+            | grep -v 'node_modules'; then
+            echo "::error::Use mutationOptions() instead of mutationFn with .call()."
+            exit 1
+          fi
+
+      # Forbid isLoading destructured from useQuery/useMutation — use isPending instead.
+      # AGENTS.md: "Use isPending (not isLoading) for first-load gating"
+      # Only flags the destructure pattern `{ isLoading } = useQuery(` — not local useState.
+      - name: Forbid isLoading from useQuery/useMutation
+        run: |
+          if grep -rn --include='*.tsx' --include='*.ts' \
+            -P 'isLoading.+= use(Query|Mutation|InfiniteQuery|Suspense)\b' \
+            apps/web/src/ \
+            | grep -v 'node_modules'; then
+            echo "::error::Use isPending instead of isLoading from TanStack Query hooks."
+            exit 1
+          fi
+
+      # Forbid destructive Prisma commands in Dockerfile and package.json scripts.
+      # AGENTS.md: "Dangerous Commands — Never Run These"
+      # apps/cli is excluded: the Rust CLI manages its own local SQLite store,
+      # and its migrations/queries legitimately contain DELETE FROM statements.
+      - name: Forbid destructive Prisma commands
+        run: |
+          if grep -rnE \
+            '(migrate reset|migrate dev|migrate deploy|db push --force-reset|db drop|--accept-data-loss|DROP TABLE|DROP DATABASE|TRUNCATE|DELETE FROM[[:space:]]+[^;]+;)' \
+            Dockerfile Dockerfile.dev Dockerfile.worker package.json docker-compose*.yml render.yaml scripts/ apps/ packages/ .github/workflows/ \
+            | grep -v 'scripts/docker-entrypoint.sh:' \
+            | grep -v 'scripts/db-push-dangerous-local.sh:' \
+            | grep -v '.github/workflows/pr-checks.yml:' \
+            | grep -v '^apps/cli/' \
+            | grep -v '/dist/' \
+            | grep -v 'node_modules'; then
+            echo "::error::Found forbidden destructive Prisma or SQL command. Use the documented db:push flow and explicit local-only dangerous script instead."
+            exit 1
+          fi
+
+  # ── Prisma schema validation ──────────────────────────────────────
+
+  prisma-validate:
+    name: Prisma validate
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Validate schema
+        run: pnpm -F @flycockpit/db exec prisma validate
+
+      - name: Check schema formatting
+        run: pnpm -F @flycockpit/db exec prisma format --check
+
+  # ── React Doctor (React health scan: hooks, a11y, perf, security) ─
+
+  react-doctor:
+    name: React Doctor
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          # Required for --scope changed: react-doctor uses `git merge-base` to find
+          # the common ancestor with the base branch.
+          fetch-depth: 0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Run react-doctor (changed files only)
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          pnpm exec react-doctor . \
+            --scope changed \
+            --base "origin/${BASE_REF}" \
+            --annotations \
+            --offline \
+            -y
+
+  # ── Knip (unused exports & dependencies) ───────────────────────────
+
+  knip:
+    name: Unused code check
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      - name: Restore workspace
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+
+      - name: Knip
+        run: pnpm knip
+
+  # ── pnpm audit (known-CVE check against the lockfile) ─────────────
+
+  pnpm-audit:
+    name: pnpm audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 24
+
+      # pnpm audit reads pnpm-lock.yaml directly — no install needed.
+      #
+      # Threshold is `high`: lockfile is clean of high+ advisories. The
+      # remaining moderates are tracked via Dependabot. Bump to `moderate`
+      # once those are cleared.
+      - name: pnpm audit
+        run: pnpm audit --audit-level=high
+
+  # ── Secret scanning (always-on for non-draft PRs) ─────────────────
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@37b77001d0174ebec2fcca2bd83ff83a6d45a3ab  # v3.95.3
+        with:
+          extra_args: --results=verified,unknown
+
+      - name: Template secret patterns
+        run: |
+          set -euo pipefail
+          matches="$(
+            {
+              git grep -nE '(^|[[:space:]])(BETTER_AUTH_SECRET|VAPID_PRIVATE_KEY)[[:space:]]*=[[:space:]]*[^[:space:]#]+' -- \
+                ':!*.example' ':!.env.docker.defaults' ':!*.md' || true
+              git grep -nE 'DATABASE_URL[[:space:]]*=[[:space:]]*postgres(ql)?://[^[:space:]]+:[^[:space:]@]+@' -- \
+                ':!*.example' ':!.env.docker.defaults' ':!docker-compose.agent.yml' ':!*.md' || true
+              git grep -nE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' -- \
+                ':!*.example' ':!.env.docker.defaults' || true
+            } | grep -v 'generateValue: true' || true
+          )"
+          if [ -n "$matches" ]; then
+            echo "$matches"
+            echo "::error::Potential private secret committed. Rotate the secret and remove it from git history if it was real."
+            exit 1
+          fi
+
+  # ── Docker image build ────────────────────────────────────────────
+
+  docker:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: app
+            dockerfile: ./Dockerfile
+          - image: worker
+            dockerfile: ./Dockerfile.worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
+
+      - name: Build image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ github.event.repository.name }}-${{ matrix.image }}-pr:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: false
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@314ff8b43182423b84c50b1670b0e10f858f2d98  # v0.36.0
+        with:
+          image-ref: ${{ github.event.repository.name }}-${{ matrix.image }}-pr:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table

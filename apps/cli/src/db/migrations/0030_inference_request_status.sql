@@ -1,0 +1,19 @@
+-- 0030_inference_request_status.sql — dispatch-time inference recording
+-- (implementation note).
+--
+-- Records the inference attempt's terminal lifecycle status alongside the
+-- captured request body. Previously `inference_requests` rows were written
+-- only AFTER a call returned, so a hung or failed turn persisted nothing and
+-- its export was empty. The attempt is now written at DISPATCH with status
+-- `pending`, then updated to its terminal value on settle:
+--
+--   pending → completed | errored | timed_out | cancelled
+--
+-- so an export of a hung/failed turn contains an inference attempt record
+-- with a non-`completed` status. The phase timestamps + error class ride in
+-- `payload_json` (the always-on capture body), keeping the schema stable.
+--
+-- Defaults to `completed` so pre-migration rows (which were only ever written
+-- post-success) read back with the status they implicitly had — no backfill,
+-- no false `pending`/`errored` on historical data.
+ALTER TABLE inference_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'completed';

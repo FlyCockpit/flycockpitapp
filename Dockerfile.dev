@@ -1,0 +1,58 @@
+# Dockerfile.dev — thin image for the port-parameterized local dev stack used
+# by agents (see docker-compose.agent.yml).
+#
+# Source is bind-mounted at runtime; this image only provides the node + pnpm
+# toolchain. Dependencies are installed at container start into named volumes
+# that are scoped per compose project, so multi-agent runs do not collide.
+#
+# The container is launched with `user: "${HOST_UID}:${HOST_GID}"` from compose
+# so that files written to the bind-mounted source tree (turbo cache, vite
+# cache, generated prisma client, dist output, etc.) end up owned by the host
+# user rather than root. Every path the runtime needs to write to is created
+# here with world-writable perms so any UID works.
+#
+# NOT a production image. Use the root Dockerfile for that.
+FROM node:24-slim
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+  openssl \
+  ca-certificates \
+  procps \
+  && rm -rf /var/lib/apt/lists/*
+
+# Toolchain caches live under /opt so they are reachable regardless of the
+# runtime UID's $HOME. Each path is world-writable (a+rwX) so an arbitrary
+# host UID can populate it on first install.
+ENV PNPM_HOME=/pnpm
+ENV COREPACK_HOME=/opt/corepack
+ENV HOME=/home/agent
+ENV PATH="$PNPM_HOME:$PATH"
+
+# Pre-create every node_modules mount point listed in docker-compose.agent.yml.
+# A fresh named volume mounted on a path that exists in the image is seeded
+# with that path's perms — pre-creating these dirs with a+rwX is what lets
+# the non-root container user write to them on first boot. (Stale volumes
+# from older root-owned runs need `pnpm dev:docker <port> --reset` once to
+# pick up the new perms.)
+RUN mkdir -p \
+    /app/node_modules \
+    /app/apps/web/node_modules \
+    /app/apps/server/node_modules \
+    /app/apps/worker/node_modules \
+    /app/apps/docs/node_modules \
+    /app/packages/api/node_modules \
+    /app/packages/auth/node_modules \ \
+    /app/packages/config/node_modules \
+    /app/packages/db/node_modules \
+    /app/packages/env/node_modules \
+    /app/packages/i18n-translate/node_modules \
+    /app/packages/mailer/node_modules \
+    /app/packages/queue/node_modules \
+    /app/packages/test-utils/node_modules \
+    /app/packages/ui/node_modules \
+    "$PNPM_HOME" "$COREPACK_HOME" "$HOME" \
+  && chmod -R a+rwX /app "$PNPM_HOME" "$COREPACK_HOME" "$HOME" \
+  && corepack enable --install-directory "$PNPM_HOME" \
+  && corepack prepare pnpm@11.1.2 --activate
+
+WORKDIR /app

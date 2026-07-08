@@ -1,0 +1,181 @@
+// Video model — HLS-native multi-rendition / multi-audio / multi-subtitle.
+//
+// Why one Video with many AudioTrack/SubtitleTrack rows (instead of one Video
+// per language): HLS's master playlist lets a single video stream switch audio
+// tracks at runtime. The video frames are shared bytes across languages —
+// only the audio segments differ. Storage stays linear in renditions, not
+// renditions × languages. Keep ffmpeg/ffprobe available to the worker process.
+//
+// Storage layout under the configured S3 bucket:
+//   rawVideos/<videoId>/source        — the user-uploaded original (multipart)
+//   videos/<videoId>/playlist.m3u8    — the master playlist (entry point)
+//   videos/<videoId>/v/<height>/...   — per-rendition video segments + playlist
+//   videos/<videoId>/a/<locale>/...   — per-audio-track segments + playlist
+//   videos/<videoId>/t/<locale>.vtt   — subtitle tracks
+//   videos/<videoId>/thumbs.vtt       — sprite-sheet thumbnail manifest
+//   videos/<videoId>/thumbs/...       — sprite-sheet JPEGs
+//   videos/<videoId>/poster.jpg       — generated poster (or user-supplied Asset)
+
+enum VideoVisibility {
+  PUBLIC
+  RESTRICTED
+}
+
+enum VideoStatus {
+  // The Video row exists but the raw upload hasn't completed. Multipart parts
+  // are in flight; orphaned PENDING rows get reaped the same way orphan Asset
+  // rows do — see packages/api/src/lib/video-cleanup.ts.
+  PENDING
+  // Raw upload landed; the transcode-video worker is generating renditions.
+  TRANSCODING
+  // Master playlist + all default-track renditions are ready to stream.
+  READY
+  // Transcode failed terminally (after BullMQ retries). `failureReason` carries
+  // the operator-facing message; the row is kept so the admin UI can show it.
+  FAILED
+}
+
+enum VideoSubtitleKind {
+  SUBTITLES
+  CAPTIONS
+  DESCRIPTIONS
+}
+
+enum VideoLadderPolicy {
+  STANDARD
+  INCLUDE_4K
+}
+
+model Video {
+  id                String               @id @default(cuid(2))
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @default(now()) @updatedAt
+  title             String
+  description       String?              @db.Text
+  status            VideoStatus          @default(PENDING)
+  failureReason     String?              @db.Text
+  visibility        VideoVisibility      @default(RESTRICTED)
+  ownerId           String?
+  Owner             User?                @relation("VideoOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  // The locale of the canonical audio track (DEFAULT=YES in the HLS master
+  // playlist). Free-form String to mirror the i18n convention — validated at
+  // the API boundary against SUPPORTED_LOCALES.
+  sourceLocale      String               @default("en-US")
+  // Total runtime in seconds (decimal — segments can land on fractional
+  // boundaries). Populated by the transcode worker; null while PENDING.
+  durationSeconds   Float?
+  width             Int?
+  height            Int?
+  // Source S3 storage key (rawVideos/<id>/source). Heartbeat is bumped by the
+  // upload client and read by the cleanup sweep, mirroring Asset semantics.
+  sourceKey         String?              @unique
+  sourceSize        BigInt?
+  sourceMimeType    String?
+  uploadHeartbeatAt DateTime?
+  // Optional Asset row for a user-supplied poster. If null, the transcode
+  // worker generates one at videos/<id>/poster.jpg from a midpoint frame.
+  posterAssetId     String?
+  PosterAsset       Asset?               @relation("VideoPoster", fields: [posterAssetId], references: [id], onDelete: SetNull)
+  // ENABLE_4K controls the *default* ladder; per-video policy lives here so
+  // one upload can request 4K without setting a global flag. Worker treats
+  // this as advisory — it never upscales a source past its native height.
+  ladderPolicy      VideoLadderPolicy?
+  // Legacy transition column for the expand-contract move to `ladderPolicy`.
+  // Keep until every deployed DB has backfilled the enum.
+  ladderIncludes4k  Boolean              @default(false)
+  AudioTracks       VideoAudioTrack[]    @relation("VideoAudioTracks")
+  SubtitleTracks    VideoSubtitleTrack[] @relation("VideoSubtitleTracks")
+  Renditions        VideoRendition[]     @relation("VideoRenditions")
+
+  @@index([status])
+  @@index([status, uploadHeartbeatAt])
+  @@index([ownerId])
+  @@index([visibility, status])
+  @@map("video")
+}
+
+// Each rendition is one row in the HLS master playlist's video EXT-X-STREAM-INF
+// list. We persist them so the playlist generator can emit consistent
+// BANDWIDTH/RESOLUTION/CODECS tags without re-probing S3 on every request.
+// No `updatedAt` — renditions are immutable post-encode. They're written once
+// by the transcode worker and never mutated; if the parameters of an encode
+// change, the worker emits a new row (and the old one is cascade-deleted with
+// its parent Video). This deliberately deviates from the repo's "every model
+// has updatedAt" rule.
+model VideoRendition {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  videoId   String
+  Video     Video    @relation("VideoRenditions", fields: [videoId], references: [id], onDelete: Cascade)
+  // Vertical pixel count — 360, 540, 720, 1080, 2160. Used in the S3 path
+  // (videos/<id>/v/<height>/...) and in the master playlist's RESOLUTION tag.
+  height    Int
+  width     Int
+  // Average bitrate in bits/sec, as measured by the worker after encode.
+  // HLS adaptive bitrate switching reads this from BANDWIDTH=.
+  bandwidth Int
+  // Codec string for the CODECS= tag. avc1.* for H.264, mp4a.* for AAC audio.
+  // Per-rendition because different heights occasionally land on slightly
+  // different H.264 profiles depending on input characteristics.
+  codecs    String
+
+  @@unique([videoId, height])
+  @@index([videoId])
+  @@map("video_rendition")
+}
+
+model VideoAudioTrack {
+  id                String      @id @default(cuid(2))
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @default(now()) @updatedAt
+  videoId           String
+  Video             Video       @relation("VideoAudioTracks", fields: [videoId], references: [id], onDelete: Cascade)
+  // BCP 47 locale tag. Validated at the API boundary against SUPPORTED_LOCALES.
+  // Two rows per (videoId, locale) are forbidden — replace, don't duplicate.
+  locale            String
+  // Display label shown in the player's audio menu — kept in the track's own
+  // language (e.g. "Español (México)", not "Spanish (Mexico)"). The "language"
+  // attribute in the HLS playlist carries the BCP 47 tag separately.
+  label             String
+  // True for the canonical audio track. Exactly one row per video has this
+  // flipped; the transcode-video worker seeds it on initial encode.
+  isDefault         Boolean     @default(false)
+  // Status mirrors Video.status but at the per-track granularity — dubs are
+  // uploaded after the source video and transcoded independently.
+  status            VideoStatus @default(PENDING)
+  failureReason     String?     @db.Text
+  // Source upload — either an audio file or a video file we extract audio
+  // from. Stored at rawVideos/<videoId>/a/<trackId>/source.
+  sourceKey         String?     @unique
+  sourceSize        BigInt?
+  sourceMimeType    String?
+  uploadHeartbeatAt DateTime?
+
+  @@unique([videoId, locale])
+  @@index([videoId])
+  @@index([status, uploadHeartbeatAt])
+  @@index([status, createdAt])
+  @@map("video_audio_track")
+}
+
+model VideoSubtitleTrack {
+  id         String            @id @default(cuid(2))
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @default(now()) @updatedAt
+  videoId    String
+  Video      Video             @relation("VideoSubtitleTracks", fields: [videoId], references: [id], onDelete: Cascade)
+  locale     String
+  label      String
+  kind       VideoSubtitleKind @default(SUBTITLES)
+  // True for the track that should display by default (typically the one
+  // matching sourceLocale). The player still honors user preference if the
+  // viewer has selected a different track previously.
+  isDefault  Boolean           @default(false)
+  // S3 key for the .vtt file. We store WebVTT only — SRT uploads are converted
+  // on the way in by the subtitle-import procedure.
+  storageKey String
+
+  @@unique([videoId, locale, kind])
+  @@index([videoId])
+  @@map("video_subtitle_track")
+}

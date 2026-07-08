@@ -1,0 +1,28 @@
+name: flycockpit
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: flycockpit-postgres
+    environment:
+      POSTGRES_DB: flycockpit
+      POSTGRES_USER: postgres
+      # DEV ONLY — do not use this password in production.
+      POSTGRES_PASSWORD: password
+    ports:
+      # Bind to loopback only. A bare "5432:5432" binds 0.0.0.0 and, because
+      # Docker writes its own iptables rules ahead of ufw/firewalld, would
+      # expose Postgres to the public internet on a VPS — with the dev password
+      # above — even behind a closed host firewall. localhost dev is unaffected.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - starter_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  starter_postgres_data:

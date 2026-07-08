@@ -1,0 +1,101 @@
+{
+  "name": "@flycockpit/api",
+  "license": "Apache-2.0 AND LicenseRef-FlyCockpit-Enterprise",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./context": {
+      "default": "./src/context.ts"
+    },
+    "./routers/index": {
+      "default": "./src/routers/index.ts"
+    },
+    "./lib/push-subscription": {
+      "default": "./src/lib/push-subscription.ts"
+    },
+    "./lib/assets": {
+      "default": "./src/lib/assets.ts"
+    },
+    "./lib/images": {
+      "default": "./src/lib/images.ts"
+    },
+    "./lib/storage": {
+      "default": "./src/lib/storage.ts"
+    },
+    "./lib/asset-client": {
+      "default": "./src/lib/asset-client.ts"
+    },
+    "./lib/asset-cleanup": {
+      "default": "./src/lib/asset-cleanup.ts"
+    },
+    "./lib/two-factor-policy": {
+      "default": "./src/lib/two-factor-policy.ts"
+    },
+    "./lib/asset-image-hint": {
+      "default": "./src/lib/asset-image-hint.ts"
+    },
+    "./lib/videos": {
+      "default": "./src/lib/videos.ts"
+    },
+    "./lib/video-client": {
+      "default": "./src/lib/video-client.ts"
+    },
+    "./lib/video-cleanup": {
+      "default": "./src/lib/video-cleanup.ts"
+    },
+    "./lib/deployment-profile": {
+      "default": "./src/lib/deployment-profile.ts"
+    },
+    "./lib/entitlements": {
+      "default": "./src/lib/entitlements.ts"
+    },
+    "./enterprise/contracts": {
+      "default": "./src/enterprise/contracts.ts"
+    },
+    "./enterprise/log-export": {
+      "default": "./src/enterprise/log-export.ts"
+    },
+    "./enterprise/log-transform": {
+      "default": "./src/enterprise/log-transform.ts"
+    },
+    "./lib/relay-tokens": {
+      "default": "./src/lib/relay-tokens.ts"
+    },
+    "./lib/notifications": {
+      "default": "./src/lib/notifications.ts"
+    }
+  },
+  "scripts": {
+    "check-types": "tsc -p tsconfig.check-types.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@orpc/client": "catalog:",
+    "@orpc/openapi": "catalog:",
+    "@orpc/server": "catalog:",
+    "@orpc/zod": "catalog:",
+    "@aws-sdk/client-s3": "catalog:",
+    "@aws-sdk/s3-request-presigner": "catalog:",
+    "@flycockpit/auth": "workspace:*",
+    "@flycockpit/config": "workspace:*",
+    "@flycockpit/db": "workspace:*",
+    "@flycockpit/env": "workspace:*",
+    "@flycockpit/mailer": "workspace:*",
+    "@flycockpit/queue": "workspace:*",
+    "blurhash": "catalog:",
+    "dotenv": "catalog:",
+    "sharp": "catalog:",
+    "web-push": "^3.6.7",
+    "zod": "catalog:",
+    "@flycockpit/relay-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/web-push": "^3.6.4",
+    "hono": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "vitest-mock-extended": "catalog:"
+  }
+}

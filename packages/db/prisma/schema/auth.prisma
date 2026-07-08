@@ -1,0 +1,206 @@
+enum UserPlan {
+  FREE
+  PRO
+}
+
+model User {
+  id                            String                        @id @default(cuid(2))
+  createdAt                     DateTime                      @default(now())
+  updatedAt                     DateTime                      @default(now()) @updatedAt
+  name                          String
+  email                         String
+  emailVerified                 Boolean                       @default(false)
+  image                         String?
+  // Better-Auth's admin plugin stores role as a string and supports arbitrary
+  // custom roles plus comma-separated multi-role values. Do not narrow this to
+  // a Prisma enum unless you also drop those Better-Auth capabilities.
+  role                          String                        @default("user")
+  // Preferred UI locale (BCP 47 tag). Synced into the i18n detection chain
+  // ahead of localStorage / navigator so a signed-in user's choice follows
+  // them across devices. Stored as String (not enum) because the supported-
+  // locale set evolves outside the schema; new locales are added in
+  // apps/web/src/i18n/config.ts without a Prisma migration.
+  locale                        String                        @default("en-US")
+  banned                        Boolean?
+  banReason                     String?
+  banExpires                    DateTime?
+  twoFactorEnabled              Boolean?
+  operationalAlerts             Boolean                       @default(true)
+  notificationAlerts            Boolean                       @default(true)
+  terminalStepUpRelaxed         Boolean                       @default(false)
+  plan                          UserPlan                      @default(FREE)
+  hostedTrialEndsAt             DateTime?
+  sessions                      Session[]
+  accounts                      Account[]
+  twoFactors                    TwoFactor[]
+  pushSubscriptions             PushSubscription[]
+  NativePushTokens              NativePushToken[]
+  Notifications                 Notification[]
+  NotificationPreferences       NotificationPreference[]
+  NotificationInstanceSettings  NotificationInstanceSetting[]
+  UserPresenceLeases            UserPresenceLease[]
+  apiKeys                       ApiKey[]
+  deviceCodes                   DeviceCode[]
+  CockpitInstances              CockpitInstance[]
+  OwnedInstanceAccessGrants     InstanceAccessGrant[]         @relation("InstanceAccessGrantOwner")
+  ReceivedInstanceAccessGrants  InstanceAccessGrant[]         @relation("InstanceAccessGrantGrantee")
+  CreatedInstanceAccessGrants   InstanceAccessGrant[]         @relation("InstanceAccessGrantCreatedBy")
+  InstanceAuditEvents           InstanceAuditEvent[]          @relation("InstanceAuditEventActor")
+  EnterpriseOrgMemberships      EnterpriseOrgMember[]
+  EnterpriseLogBatches          EnterpriseLogBatch[]
+  EnterpriseLogEvents           EnterpriseLogEvent[]
+  EnterpriseLogExportsRequested EnterpriseLogExport[]         @relation("EnterpriseLogExportRequestedBy")
+  EnterpriseAuditLogs           EnterpriseAuditLog[]
+  Assets                        Asset[]
+  Videos                        Video[]                       @relation("VideoOwner")
+  ConsentRecords                ConsentRecord[]               @relation("UserConsentRecords")
+
+  @@unique([email])
+  @@index([role])
+  @@map("user")
+}
+
+model Session {
+  id                   String   @id @default(cuid(2))
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @default(now()) @updatedAt
+  expiresAt            DateTime
+  token                String
+  ipAddress            String?
+  userAgent            String?
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  impersonatedBy       String?
+  activeOrganizationId String?
+
+  @@unique([token])
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id @default(cuid(2))
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @default(now()) @updatedAt
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id @default(cuid(2))
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
+  identifier String
+  value      String
+  expiresAt  DateTime
+
+  @@index([identifier])
+  @@index([expiresAt])
+  @@map("verification")
+}
+
+model TwoFactor {
+  id          String   @id @default(cuid(2))
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+  secret      String
+  backupCodes String
+  verified    Boolean  @default(true)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId])
+  @@map("two_factor")
+}
+
+model AppSetting {
+  // `key` is the natural primary key — every read/write looks rows up by it,
+  // so a separate cuid `id` would be dead weight. Deliberately deviates from
+  // the repo's "every model has an id" rule for this single-column lookup table.
+  key       String   @id
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  value     String
+
+  @@map("app_setting")
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_subscription")
+}
+
+model ApiKey {
+  id                  String    @id @default(cuid(2))
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @default(now()) @updatedAt
+  configId            String    @default("default")
+  name                String?
+  start               String?
+  prefix              String?
+  key                 String
+  referenceId         String
+  userId              String?
+  refillInterval      Int?
+  refillAmount        Int?
+  lastRefillAt        DateTime?
+  enabled             Boolean   @default(true)
+  rateLimitEnabled    Boolean   @default(true)
+  rateLimitTimeWindow Int?
+  rateLimitMax        Int?
+  requestCount        Int       @default(0)
+  remaining           Int?
+  lastRequest         DateTime?
+  expiresAt           DateTime?
+  permissions         String?
+  metadata            String?
+  user                User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([configId])
+  @@index([key])
+  @@index([referenceId])
+  @@index([userId])
+  @@map("api_key")
+}
+
+model DeviceCode {
+  id              String    @id @default(cuid(2))
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @default(now()) @updatedAt
+  deviceCode      String    @unique
+  userCode        String    @unique
+  userId          String?
+  expiresAt       DateTime
+  status          String
+  lastPolledAt    DateTime?
+  pollingInterval Int?
+  clientId        String?
+  scope           String?
+  user            User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("device_code")
+}

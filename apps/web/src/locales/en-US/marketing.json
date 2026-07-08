@@ -1,0 +1,16 @@
+{
+  "about": {
+    "title": "About Flycockpit",
+    "body": "Flycockpit is the authenticated control plane for hosted and enterprise remote development instances."
+  },
+  "home": {
+    "title": "Flycockpit operations console",
+    "subtitle": "Access remote instances, browser terminals, file tools, device authorization, and enterprise controls from one authenticated cockpit.",
+    "signIn": "Sign in",
+    "device": "Approve device"
+  },
+  "cookiePolicy": {
+    "title": "Cookie policy",
+    "body": "Flycockpit stores strictly necessary cookies for authentication, security, language, theme, and consent preferences. Optional categories can be changed at any time."
+  }
+}

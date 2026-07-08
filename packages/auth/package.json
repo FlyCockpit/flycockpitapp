@@ -1,0 +1,33 @@
+{
+  "name": "@flycockpit/auth",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./roles": {
+      "default": "./src/roles.ts"
+    },
+    "./user-creation-policy": {
+      "default": "./src/user-creation-policy.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@better-auth/api-key": "catalog:",
+    "@flycockpit/db": "workspace:*",
+    "@flycockpit/env": "workspace:*",
+    "@flycockpit/mailer": "workspace:*",
+    "better-auth": "catalog:",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -1,0 +1,1 @@
+-- Legacy graph model metadata removed before release.

@@ -1,0 +1,422 @@
+name: Release CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to publish, for example v0.1.0. Must match apps/cli/Cargo.toml.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - id: release
+        name: Validate version and branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Run releases from the main branch. Current ref is $GITHUB_REF."
+            exit 1
+          fi
+
+          tag="${{ inputs.version }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release version must be a SemVer tag like v0.1.0 without build metadata."
+            exit 1
+          fi
+
+          version="${tag#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/cli/Cargo.toml | head -n 1)"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error::apps/cli/Cargo.toml version is $cargo_version, expected $version."
+            exit 1
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  release-preflight:
+    name: CLI release preflight
+    needs: validate
+    uses: ./.github/workflows/release-preflight.yml
+    secrets: inherit
+
+  plan-cli-release:
+    name: Plan CLI release
+    needs:
+      - validate
+      - release-preflight
+    runs-on: ubuntu-22.04
+    outputs:
+      val: ${{ steps.plan.outputs.manifest }}
+      tag: ${{ needs.validate.outputs.tag }}
+      tag-flag: --tag=${{ needs.validate.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Create local release tag
+        working-directory: apps/cli
+        run: git tag --force "${{ needs.validate.outputs.tag }}" "${{ github.sha }}"
+
+      - name: Install dist
+        shell: bash
+        working-directory: apps/cli
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+      - name: Cache dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/dist
+
+      - id: plan
+        name: Plan dist release
+        working-directory: apps/cli
+        run: |
+          dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > plan-dist-manifest.json
+          echo "dist ran successfully"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist-manifest.json
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: artifacts-plan-dist-manifest
+          path: apps/cli/plan-dist-manifest.json
+
+  build-cli-local-artifacts:
+    name: build-cli-local-artifacts (${{ join(matrix.targets, ', ') }})
+    needs: plan-cli-release
+    if: ${{ fromJson(needs.plan-cli-release.outputs.val).ci.github.artifacts_matrix.include != null }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan-cli-release.outputs.val).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    steps:
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Create local release tag
+        working-directory: apps/cli
+        run: git tag --force "${{ needs.plan-cli-release.outputs.tag }}" "${{ github.sha }}"
+
+      - name: Install Rust non-interactively if not already installed
+        if: ${{ matrix.container }}
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          pattern: artifacts-*
+          path: apps/cli/target/distrib/
+          merge-multiple: true
+
+      - name: Install dependencies
+        working-directory: apps/cli
+        run: |
+          ${{ matrix.packages_install }}
+
+      - name: Build artifacts
+        working-directory: apps/cli
+        run: |
+          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo "dist ran successfully"
+
+      - id: cargo-dist
+        name: Post-build
+        shell: bash
+        working-directory: apps/cli
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            apps/cli/${{ env.BUILD_MANIFEST_NAME }}
+
+  build-cli-global-artifacts:
+    name: build-cli-global-artifacts
+    needs:
+      - plan-cli-release
+      - build-cli-local-artifacts
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Create local release tag
+        working-directory: apps/cli
+        run: git tag --force "${{ needs.plan-cli-release.outputs.tag }}" "${{ github.sha }}"
+
+      - name: Install cached dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          pattern: artifacts-*
+          path: apps/cli/target/distrib/
+          merge-multiple: true
+
+      - id: cargo-dist
+        shell: bash
+        working-directory: apps/cli
+        run: |
+          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
+          echo "dist ran successfully"
+
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            apps/cli/${{ env.BUILD_MANIFEST_NAME }}
+
+  publish-cli-release:
+    name: Publish CLI GitHub Release
+    needs:
+      - plan-cli-release
+      - build-cli-local-artifacts
+      - build-cli-global-artifacts
+    if: ${{ always() && needs.plan-cli-release.result == 'success' && (needs.build-cli-global-artifacts.result == 'skipped' || needs.build-cli-global-artifacts.result == 'success') && (needs.build-cli-local-artifacts.result == 'skipped' || needs.build-cli-local-artifacts.result == 'success') }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-22.04
+    outputs:
+      val: ${{ steps.host.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Create local release tag
+        working-directory: apps/cli
+        run: git tag --force "${{ needs.plan-cli-release.outputs.tag }}" "${{ github.sha }}"
+
+      - name: Install cached dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          pattern: artifacts-*
+          path: apps/cli/target/distrib/
+          merge-multiple: true
+
+      - id: host
+        shell: bash
+        working-directory: apps/cli
+        run: |
+          dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > dist-manifest.json
+          echo "artifacts uploaded and released successfully"
+          cat dist-manifest.json
+          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist-manifest.json
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: artifacts-dist-manifest
+          path: apps/cli/dist-manifest.json
+
+      - name: Download GitHub Artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          pattern: artifacts-*
+          path: apps/cli/artifacts
+          merge-multiple: true
+
+      - name: Cleanup
+        run: rm -f apps/cli/artifacts/*-dist-manifest.json
+
+      - name: Create or update GitHub Release
+        env:
+          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
+          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
+          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
+          RELEASE_COMMIT: "${{ github.sha }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
+          tag="${{ needs.plan-cli-release.outputs.tag }}"
+
+          mapfile -t release_files < <(find apps/cli/artifacts -type f ! -name '*-dist-manifest.json' | sort)
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "::error::No release files found in apps/cli/artifacts."
+            find apps/cli/artifacts -maxdepth 3 -print | sort
+            exit 1
+          fi
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release edit "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
+            gh release upload "$tag" --clobber "${release_files[@]}"
+          else
+            gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" "${release_files[@]}"
+          fi
+
+  publish-homebrew-formula:
+    name: Publish Homebrew formula
+    needs:
+      - validate
+      - publish-cli-release
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - name: Validate tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN to a token with contents:write access to FlyCockpit/homebrew-tap."
+            exit 1
+          fi
+
+      - name: Download generated formula
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+
+      - id: formula
+        name: Find generated formula
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          formula_path="$(find artifacts -type f -name cockpit.rb -print -quit)"
+          if [ -z "$formula_path" ]; then
+            echo "::error::Generated cockpit.rb formula was not found in downloaded artifacts."
+            find artifacts -maxdepth 3 -print | sort
+            exit 1
+          fi
+
+          echo "path=$formula_path" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: FlyCockpit/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+          fetch-depth: 0
+
+      - name: Commit formula to tap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p homebrew-tap/Formula
+          cp "${{ steps.formula.outputs.path }}" homebrew-tap/Formula/cockpit.rb
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Formula/cockpit.rb
+          if git diff --cached --quiet -- Formula/cockpit.rb; then
+            echo "Formula/cockpit.rb already matches ${{ needs.validate.outputs.tag }}."
+            exit 0
+          fi
+
+          git commit -m "cockpit ${{ needs.validate.outputs.tag }}"
+          git push origin HEAD:main
+
+  release-summary:
+    name: Release summary
+    needs:
+      - validate
+      - publish-cli-release
+      - publish-homebrew-formula
+    if: ${{ always() && needs.publish-cli-release.result == 'success' && needs.publish-homebrew-formula.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        shell: bash
+        run: |
+          {
+            echo '## Release ${{ needs.validate.outputs.tag }}'
+            echo
+            echo '- CLI artifacts: GitHub Release ${{ needs.validate.outputs.tag }}'
+            echo '- Shell installer: `curl --proto "=https" --tlsv1.2 -LsSf https://github.com/FlyCockpit/flycockpitapp/releases/latest/download/cockpit-cli-installer.sh | sh`'
+            echo '- Homebrew: `brew install flycockpit/tap/cockpit`'
+          } >> "$GITHUB_STEP_SUMMARY"

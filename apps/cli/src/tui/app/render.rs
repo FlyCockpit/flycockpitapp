@@ -1,0 +1,4866 @@
+//! Rendering: every `render_*` method on `App` plus the small free
+//! helpers they call (token formatting, wrap math, row-estimate, the
+//! toast overlay). Cluster moved here so `mod.rs` reads as event-loop
+//! plumbing instead of paragraph wrangling.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
+
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::tui::chrome;
+use crate::tui::composer::{
+    INPUT_PREFIX, VimMode, display_width, input_prefix_width, truncate_display_width,
+    visual_position_for_byte, wrap_display_chunks,
+};
+use crate::tui::history::{
+    AGENT_INDENT, HistoryEntry, PendingMsg, Rendered, SubagentOutcome, ToolCall,
+    agent_display_label, format_status_elapsed, render_entry, render_pending, thinking_dots_padded,
+};
+use crate::tui::theme::{
+    BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
+    MUTED_COLOR_INDEX, MUTED_TEXT, SHELL_MODE_BADGE_BG, SHELL_MODE_BORDER, SUCCESS_TEXT,
+    WARNING_TEXT,
+};
+
+use super::{
+    AUTOCOMPLETE_ROWS, App, HistoryRenderCacheEntry, INPUT_BORDER, MAX_INPUT_CONTENT,
+    MIN_INPUT_CONTENT, PaneSide, PendingRenderCacheEntry, Selection, Toast, ToastKind,
+    TranscriptFind, WORKING_MESSAGES,
+};
+
+/// Startup grace before the working indicator first appears — prevents
+/// quick turns from flashing it on and off.
+const STATUS_GRACE: Duration = Duration::from_secs(2);
+/// A reasoning block must last at least this long before the indicator
+/// flips from the working line to the yellow `Thinking` override.
+const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
+
+/// The per-row render slices computed by the chat-layout pass: visible
+/// lines plus one authoritative metadata record per visible row.
+type VisibleRows = (Vec<Line<'static>>, Vec<ChatRowMeta>);
+
+type ChatRows = (Vec<Line<'static>>, Vec<ChatRowMeta>, HashMap<usize, usize>);
+
+fn hash_tool_call(hasher: &mut DefaultHasher, call: &ToolCall) {
+    call.call_id.hash(hasher);
+    call.tool.hash(hasher);
+    call.summary.hash(hasher);
+    call.full_input.hash(hasher);
+    call.output.hash(hasher);
+    format!("{:?}", call.state).hash(hasher);
+    call.hint.hash(hasher);
+}
+
+fn hash_subagent_outcome(hasher: &mut DefaultHasher, outcome: &SubagentOutcome) {
+    outcome.report.hash(hasher);
+    outcome.failed.hash(hasher);
+    outcome.duration.hash(hasher);
+    outcome.status.hash(hasher);
+}
+
+fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, preflight_dots_ms: u128) {
+    std::mem::discriminant(entry).hash(hasher);
+    match entry {
+        HistoryEntry::User {
+            text,
+            cleaned,
+            expanded,
+            timestamp,
+            seq,
+            preflight_pending,
+            persist_failed,
+        } => {
+            text.hash(hasher);
+            cleaned.hash(hasher);
+            expanded.hash(hasher);
+            timestamp.hash(hasher);
+            seq.hash(hasher);
+            preflight_pending.hash(hasher);
+            persist_failed.hash(hasher);
+            if *preflight_pending {
+                ((preflight_dots_ms / 333) % 4).hash(hasher);
+            }
+        }
+        HistoryEntry::Plain { line }
+        | HistoryEntry::CommandError { line }
+        | HistoryEntry::Maintenance { line }
+        | HistoryEntry::BackupWarning { line }
+        | HistoryEntry::InferenceWarning { line } => line.hash(hasher),
+        HistoryEntry::UserNote { text, timestamp } => {
+            text.hash(hasher);
+            timestamp.hash(hasher);
+        }
+        HistoryEntry::SkillAutoInjected { name, reason } => {
+            name.hash(hasher);
+            reason.hash(hasher);
+        }
+        HistoryEntry::InferenceError {
+            summary,
+            detail,
+            expanded,
+        } => {
+            summary.hash(hasher);
+            detail.hash(hasher);
+            expanded.hash(hasher);
+        }
+        HistoryEntry::Agent {
+            name,
+            text,
+            reasoning,
+            timestamp,
+            expanded,
+            think_duration,
+            seq,
+        } => {
+            name.hash(hasher);
+            text.hash(hasher);
+            reasoning.hash(hasher);
+            timestamp.hash(hasher);
+            expanded.hash(hasher);
+            think_duration.hash(hasher);
+            seq.hash(hasher);
+        }
+        HistoryEntry::Diff {
+            tool,
+            path,
+            old,
+            new,
+        } => {
+            tool.hash(hasher);
+            path.hash(hasher);
+            old.hash(hasher);
+            new.hash(hasher);
+        }
+        HistoryEntry::ToolBox {
+            calls,
+            view_offset,
+            follow,
+            expanded,
+        } => {
+            view_offset.hash(hasher);
+            follow.hash(hasher);
+            expanded.hash(hasher);
+            calls.len().hash(hasher);
+            for call in calls {
+                hash_tool_call(hasher, call);
+            }
+        }
+        HistoryEntry::ToolLine {
+            call_id,
+            tool,
+            summary,
+            state,
+        } => {
+            call_id.hash(hasher);
+            tool.hash(hasher);
+            summary.hash(hasher);
+            format!("{state:?}").hash(hasher);
+        }
+        HistoryEntry::LocalCommand {
+            label,
+            output,
+            failed,
+        } => {
+            label.hash(hasher);
+            output.hash(hasher);
+            failed.hash(hasher);
+        }
+        HistoryEntry::Subagent {
+            parent,
+            child,
+            task_call_id,
+            label,
+            trusted_only,
+            model_trusted,
+            routing,
+            spawned_at,
+            outcome,
+            expanded,
+        } => {
+            parent.hash(hasher);
+            child.hash(hasher);
+            task_call_id.hash(hasher);
+            label.hash(hasher);
+            trusted_only.hash(hasher);
+            model_trusted.hash(hasher);
+            routing.model.hash(hasher);
+            routing.location.hash(hasher);
+            routing.fallback.hash(hasher);
+            expanded.hash(hasher);
+            match outcome {
+                Some(outcome) => hash_subagent_outcome(hasher, outcome),
+                None => {
+                    let elapsed = spawned_at.elapsed();
+                    ((elapsed.as_millis() / 333) % 4).hash(hasher);
+                    elapsed.as_secs().hash(hasher);
+                }
+            }
+        }
+        HistoryEntry::CompactBoundary {
+            predecessor_short_id,
+            seed_tool_count,
+            seed_tool_tokens,
+            brief,
+            expanded,
+        } => {
+            predecessor_short_id.hash(hasher);
+            seed_tool_count.hash(hasher);
+            seed_tool_tokens.hash(hasher);
+            brief.hash(hasher);
+            expanded.hash(hasher);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn history_render_signature(
+    entry: &HistoryEntry,
+    width: u16,
+    thinking: crate::config::extended::ThinkingDisplay,
+    md: crate::tui::history::MarkdownOpts,
+    diff_style: crate::config::extended::DiffStyle,
+    emojis: bool,
+    elided: &std::collections::HashSet<String>,
+    preflight_dots_ms: u128,
+    pin: Option<crate::tui::history::PinControl>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_history_entry(&mut hasher, entry, preflight_dots_ms);
+    width.hash(&mut hasher);
+    format!("{thinking:?}").hash(&mut hasher);
+    md.agent.hash(&mut hasher);
+    md.user.hash(&mut hasher);
+    format!("{diff_style:?}").hash(&mut hasher);
+    emojis.hash(&mut hasher);
+
+    if let HistoryEntry::ToolBox { calls, .. } = entry {
+        let mut elided_ids: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| {
+                elided
+                    .contains(&call.call_id)
+                    .then_some(call.call_id.as_str())
+            })
+            .collect();
+        elided_ids.sort_unstable();
+        elided_ids.hash(&mut hasher);
+    }
+
+    pin.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn pending_render_signature(msg: &PendingMsg, width: u16) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    msg.name.hash(&mut hasher);
+    msg.text.hash(&mut hasher);
+    msg.reasoning.hash(&mut hasher);
+    msg.timestamp.hash(&mut hasher);
+    width.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A clickable pin-control region on one chat row: the message seq plus
+/// the half-open `[col_start, col_end)` column range of the `[pin]`/
+/// `[unpin]` glyphs. A left-click toggles the pin only when it lands
+/// inside this range (`pinned-messages`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinHit {
+    pub seq: i64,
+    pub col_start: u16,
+    pub col_end: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatRowKind {
+    Padding,
+    Banner,
+    Gap,
+    Message,
+    Chip,
+    ToolBox,
+    Diff,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatCopyTarget {
+    Message { history_index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatRowMeta {
+    pub history_index: Option<usize>,
+    pub row_kind: ChatRowKind,
+    pub copy_target: Option<ChatCopyTarget>,
+    pub chip_target: Option<usize>,
+    pub tool_box_target: Option<usize>,
+    pub diff_path: Option<String>,
+    pub pin_hit: Option<PinHit>,
+    pub continuation: bool,
+    pub selectable: bool,
+}
+
+impl ChatRowMeta {
+    fn padding() -> Self {
+        Self {
+            history_index: None,
+            row_kind: ChatRowKind::Padding,
+            copy_target: None,
+            chip_target: None,
+            tool_box_target: None,
+            diff_path: None,
+            pin_hit: None,
+            continuation: false,
+            selectable: false,
+        }
+    }
+
+    fn banner() -> Self {
+        Self {
+            row_kind: ChatRowKind::Banner,
+            ..Self::padding()
+        }
+    }
+
+    fn gap() -> Self {
+        Self {
+            row_kind: ChatRowKind::Gap,
+            ..Self::padding()
+        }
+    }
+
+    fn other() -> Self {
+        Self {
+            row_kind: ChatRowKind::Other,
+            ..Self::padding()
+        }
+    }
+}
+
+fn copy_target_for_entry(entry: &HistoryEntry, history_index: usize) -> Option<ChatCopyTarget> {
+    match entry {
+        HistoryEntry::User { text, .. } | HistoryEntry::Agent { text, .. }
+            if !text.trim().is_empty() =>
+        {
+            Some(ChatCopyTarget::Message { history_index })
+        }
+        _ => None,
+    }
+}
+
+fn row_kind_for_entry(entry: &HistoryEntry) -> ChatRowKind {
+    match entry {
+        HistoryEntry::User { .. } | HistoryEntry::Agent { .. } => ChatRowKind::Message,
+        HistoryEntry::ToolBox { .. } => ChatRowKind::ToolBox,
+        HistoryEntry::Diff { .. } => ChatRowKind::Diff,
+        _ => ChatRowKind::Other,
+    }
+}
+
+impl App {
+    pub(super) fn model_summary_history_line(&self) -> String {
+        match &self.launch.active_model {
+            Some((p, m)) => format!(
+                "/model: active model is now {p}/{m}{}",
+                if self.launch.active_model_is_favorite {
+                    " (★)"
+                } else {
+                    ""
+                }
+            ),
+            None => "/model: no active model".to_string(),
+        }
+    }
+
+    pub(super) fn slash_query(&self) -> Option<&str> {
+        let rest = self.composer.text().strip_prefix('/')?;
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    pub(super) fn refresh_slash_menu_cache(&self) {
+        if self.slash_query().is_none() {
+            self.slash_menu_cache.borrow_mut().take();
+            return;
+        }
+        if self.slash_menu_cache.borrow().is_some() {
+            return;
+        }
+        *self.slash_menu_cache.borrow_mut() = Some(super::SlashMenuCache::build(self));
+    }
+
+    pub(super) fn slash_description_for(&self, command: &super::SlashCommand) -> String {
+        if command.name == "mcp" {
+            self.refresh_slash_menu_cache();
+            if let Some(cache) = self.slash_menu_cache.borrow().as_ref() {
+                return cache.mcp_description.clone();
+            }
+        }
+        command.dynamic_description(self)
+    }
+
+    /// The frequency-ranked slash matches for the current query, or an
+    /// empty list when no slash query is active. The returned list is the
+    /// full match set; rendering applies the fixed visible window. The
+    /// first entry is the auto-selected top match.
+    ///
+    /// Discovered skills surface as bare-`/<name>` entries alongside the
+    /// builtins (implementation note); builtins rank first
+    /// (they shadow any same-named skill — colliding skills were dropped from
+    /// `skill_commands` at discovery), then skills in discovery order.
+    pub(super) fn slash_suggestions(&self) -> Vec<super::SlashEntry<'_>> {
+        match self.slash_query() {
+            // While Tab-cycling, the composer holds a completed `/name`
+            // but the candidate set stays anchored on the originally-typed
+            // stem so the full match list remains visible to cycle through
+            // (`slash-command-tab-completion.md`); otherwise match the live
+            // query.
+            Some(query) => {
+                self.refresh_slash_menu_cache();
+                let stem = self.slash_cycle_stem.as_deref().unwrap_or(query);
+                let mut entries: Vec<super::SlashEntry<'_>> = self
+                    .slash_menu_cache
+                    .borrow()
+                    .as_ref()
+                    .map(|cache| super::slash_matches_in(&cache.builtins, stem, &self.usage_slash))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(super::SlashEntry::Builtin)
+                    .collect();
+                entries.extend(
+                    self.skill_commands
+                        .iter()
+                        .filter(|s| s.name.starts_with(stem))
+                        .map(super::SlashEntry::Skill),
+                );
+                entries
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// True when the `@`-popup should be drawn: the composer reports an
+    /// active `@partial` token and the user hasn't dismissed it via Esc.
+    pub(super) fn at_popup_active(&self) -> bool {
+        !self.at_dismissed && self.composer.at_query().is_some()
+    }
+
+    pub(super) fn at_suggestions(&self) -> Vec<crate::tui::file_tag::Suggestion> {
+        let Some(q) = self.composer.at_query() else {
+            self.at_cache.borrow_mut().take();
+            return Vec::new();
+        };
+        // Memo hit: same query as last walk → reuse (cheap clone of a
+        // bounded list; far cheaper than re-walking the tree).
+        if let Some((cached_q, cached)) = self.at_cache.borrow().as_ref()
+            && cached_q == q
+        {
+            return cached.clone();
+        }
+        // The read-allowlist re-includes gitignored-but-allowlisted entries
+        // (implementation note); resolve the persisted
+        // per-layer list for the cwd, then union the daemon-pushed session set
+        // ("Approve for this session" approvals,
+        // implementation note) so session-only
+        // entries render exactly like persisted ones (dimmed, `gitignored`).
+        let mut allow = crate::config::extended::resolve_gitignore_allow(&self.launch.cwd);
+        allow.extend(self.gitignore_session_allow.clone());
+        let walked =
+            crate::tui::file_tag::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
+        *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
+        walked
+    }
+
+    pub(super) fn popup_lines(&self) -> u16 {
+        if self.slash_query().is_some() || self.at_popup_active() {
+            // Always reserve `AUTOCOMPLETE_ROWS` while either popup is
+            // active; the renderer pads with blanks so the composer
+            // doesn't shift as the candidate set narrows.
+            return AUTOCOMPLETE_ROWS;
+        }
+        if self.show_vim_hint() { 1 } else { 0 }
+    }
+
+    /// True when the Normal-mode hint chip should occupy the popup
+    /// strip. Hidden when the user has set `vim_mode` to `enabled`
+    /// (advanced user; doesn't need the prompt) or `disabled` (vim
+    /// off), and when the composer is in Insert mode.
+    pub(super) fn show_vim_hint(&self) -> bool {
+        self.vim_setting.show_hint()
+            && self.composer.vim_enabled()
+            && self.composer.vim_mode() == VimMode::Normal
+    }
+
+    /// Height of the queued-messages strip above the input box. Zero
+    /// when nothing's queued; otherwise top border (1) + N messages +
+    /// shared bottom (1). The shared bottom is the queue's bottom AND
+    /// the input's top, with T-joins where the inset side rails meet
+    /// the input's wider top edge.
+    pub(super) fn queue_lines(&self) -> u16 {
+        if self.queue.is_empty() {
+            0
+        } else {
+            2 + self.queue.len() as u16
+        }
+    }
+
+    pub(super) fn input_height(&self) -> u16 {
+        let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Inner content width = terminal width - 2 side rails.
+        let wrap_width = (term_w as usize).saturating_sub(2).max(1);
+        let prefix = input_prefix_width();
+        // Ghost text (implementation note): when a multi-line
+        // `long` prediction has been expanded, the box grows to fit the
+        // full grey response even though the composer buffer is still
+        // empty. Otherwise the box sizes to the real (typed) content; a
+        // collapsed/short ghost never grows the box (stays single-line).
+        let text = self.composer.text();
+        let measured: String = match self.prediction_state.ghost() {
+            Some(g) if self.composer.is_empty() && g.box_expanded() => g.full_text().to_string(),
+            _ => text.to_string(),
+        };
+        let visual = input_visual_rows(&measured, prefix, wrap_width);
+        (visual as u16).clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT) + INPUT_BORDER
+    }
+
+    /// Elapsed time on the cumulative span clock, but only once the
+    /// agent has been busy past the startup grace. `None` (→ indicator
+    /// hidden) when idle or still inside the grace window.
+    pub(super) fn status_span_elapsed(&self) -> Option<Duration> {
+        if !self.busy {
+            return None;
+        }
+        let elapsed = self.span_started_at?.elapsed();
+        (elapsed >= STATUS_GRACE).then_some(elapsed)
+    }
+
+    /// 1 when the working indicator should occupy a row above the queue
+    /// strip, else 0.
+    pub(super) fn indicator_lines(&self) -> u16 {
+        u16::from(self.status_span_elapsed().is_some())
+    }
+
+    /// Render the "agent is working" status indicator. Ground state is
+    /// the playful working line (muted, span clock); it flips to a
+    /// yellow `Thinking` override only while the current reasoning block
+    /// has itself lasted past [`THINKING_FLIP_AFTER`], reading as
+    /// "working" otherwise so there are no blank gaps after the grace
+    /// period. No-op when the indicator shouldn't show.
+    pub(super) fn render_status_indicator(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(span_elapsed) = self.status_span_elapsed() else {
+            return;
+        };
+        let dots = thinking_dots_padded(self.started_at.elapsed().as_millis());
+        let block_elapsed = self.pending.as_ref().map(|p| p.started_at.elapsed());
+        let thinking =
+            self.in_thinking_block() && block_elapsed.is_some_and(|e| e >= THINKING_FLIP_AFTER);
+
+        // A mid-retry network reconnect overrides everything else
+        // (Thinking and the generic working line both): it's the most
+        // informative state, signals the call isn't hung, and must never
+        // fall back to the generic working spinner while a `Network`-class
+        // retry loop is live. Names the unreachable provider/model/url + the
+        // current attempt.
+        if let Some(reconnect) = &self.reconnect {
+            let text =
+                reconnect_status_text(reconnect, &dots, &format_status_elapsed(span_elapsed));
+            let line = Line::from(vec![
+                Span::raw(" ".repeat(AGENT_INDENT)),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(WARNING_TEXT)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
+        if let Some((parent, child, spawned_at)) =
+            self.history.iter().rev().find_map(|entry| match entry {
+                HistoryEntry::Subagent {
+                    parent,
+                    child,
+                    spawned_at,
+                    outcome: None,
+                    ..
+                } => Some((parent.as_str(), child.as_str(), *spawned_at)),
+                _ => None,
+            })
+        {
+            let delegate_elapsed = spawned_at.elapsed();
+            let mut text = format!(
+                "{parent} waiting on {}{} {}",
+                agent_display_label(child),
+                dots,
+                format_status_elapsed(delegate_elapsed)
+            );
+            if !self.queue.is_empty() {
+                text.push_str(&format!(" · {} queued", self.queue.len()));
+            } else {
+                text.push_str(" · parent continues after report");
+            }
+            let line = Line::from(vec![
+                Span::raw(" ".repeat(AGENT_INDENT)),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
+        let (label, elapsed, color) = if thinking {
+            (
+                "Thinking",
+                block_elapsed.unwrap_or(span_elapsed),
+                WARNING_TEXT,
+            )
+        } else {
+            let msg = WORKING_MESSAGES
+                .get(self.working_msg_idx)
+                .copied()
+                .unwrap_or("Working");
+            (msg, span_elapsed, Color::Indexed(MUTED_COLOR_INDEX))
+        };
+        let text = format!("{label}{dots} {}", format_status_elapsed(elapsed));
+        let line = Line::from(vec![
+            // Match the original in-body "Thinking…" placeholder's left
+            // indent so the live status reads as a continuation of the
+            // agent column rather than jumping a column.
+            Span::raw(" ".repeat(AGENT_INDENT)),
+            Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    pub(super) fn total_history_lines(&self) -> u16 {
+        // We can't perfectly compute the rendered line count without
+        // the area width, but the history geometry caller doesn't have
+        // that yet either. Approximate: 1 row per Plain, 3 rows per
+        // User (padding + body + padding; multi-line bodies cost more
+        // but for sizing this is fine), 2 rows per Agent, plus pending.
+        let mut total: u16 = 0;
+        let mut prev_agent = false;
+        for (idx, entry) in self.history.iter().enumerate() {
+            total = total.saturating_add(match entry {
+                HistoryEntry::Plain { .. }
+                | HistoryEntry::CommandError { .. }
+                | HistoryEntry::Maintenance { .. } => 1,
+                HistoryEntry::InferenceError {
+                    detail, expanded, ..
+                } => {
+                    if *expanded {
+                        detail.lines().count().max(1).saturating_add(1) as u16
+                    } else {
+                        1
+                    }
+                }
+                HistoryEntry::BackupWarning { .. } | HistoryEntry::InferenceWarning { .. } => 1,
+                HistoryEntry::CompactBoundary {
+                    brief, expanded, ..
+                } => compact_boundary_row_estimate(brief.as_deref(), *expanded).saturating_add(1),
+                HistoryEntry::ToolLine { .. } => 2, // line + trailing gap
+                HistoryEntry::LocalCommand { output, .. } => {
+                    // label row + output rows + trailing gap.
+                    (output.lines().count() as u16).saturating_add(2)
+                }
+                HistoryEntry::ToolBox {
+                    calls, expanded, ..
+                } => toolbox_row_estimate(calls, *expanded).saturating_add(1),
+                HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
+                HistoryEntry::User {
+                    text,
+                    cleaned,
+                    expanded,
+                    ..
+                } => {
+                    // Size against the *displayed* body: the cleaned form at
+                    // rest, the original when revealed (`request-
+                    // preflight.md`).
+                    let shown = match cleaned {
+                        Some(c) if !*expanded => c.as_str(),
+                        _ => text.as_str(),
+                    };
+                    let body = shown.matches('\n').count() as u16 + 1;
+                    // Bubble = top border + body + bottom border (+2);
+                    // plus the trailing gap row inserted in render_history
+                    // (+1) so the chat area gets sized to fit the box.
+                    body.saturating_add(3)
+                }
+                HistoryEntry::UserNote { text, .. } => {
+                    // Header row + one row per (unwrapped) body line + trailing
+                    // gap. Wrapping costs more, but for sizing this is fine.
+                    let body = text.matches('\n').count() as u16 + 1;
+                    body.saturating_add(2)
+                }
+                // The `/{name} · injected by agent` row, plus the muted
+                // `  └ <reason>` sub-line when a reason is present (single
+                // logical line — wrapping costs more but, like the other
+                // estimates here, that's fine for sizing). No trailing gap —
+                // it hugs the user message it precedes.
+                HistoryEntry::SkillAutoInjected { reason, .. } => 1 + reason.is_some() as u16,
+                HistoryEntry::Agent {
+                    text,
+                    reasoning,
+                    expanded,
+                    ..
+                } => {
+                    let body = text.matches('\n').count() as u16 + 1;
+                    // When reasoning is collapsed, the chip shares the
+                    // first text row (see render_agent), so no extra
+                    // chip row to count. When expanded, +1 for chip
+                    // plus all the reasoning lines.
+                    let mut rows = body;
+                    if !reasoning.trim().is_empty() && *expanded {
+                        rows = rows.saturating_add(1);
+                        rows = rows.saturating_add(reasoning.lines().count() as u16);
+                    }
+                    // Trailing gap row after agent — skipped when the
+                    // previous entry was also an agent and when an immediate
+                    // ToolBox continues the assistant turn.
+                    if !prev_agent
+                        && !self
+                            .history
+                            .get(idx + 1)
+                            .is_some_and(|next| matches!(next, HistoryEntry::ToolBox { .. }))
+                    {
+                        rows = rows.saturating_add(1);
+                    }
+                    rows
+                }
+                HistoryEntry::Subagent {
+                    outcome, expanded, ..
+                } => match outcome {
+                    // Running: one live line + trailing gap.
+                    None => 2,
+                    // Settled: header + body lines (capped to the preview
+                    // unless expanded) + possible expand chip + trailing gap.
+                    Some(o) => {
+                        let body = if o.report.trim().is_empty() {
+                            0
+                        } else {
+                            let lines = o.report.lines().count() as u16;
+                            if *expanded {
+                                lines.saturating_add(1)
+                            } else {
+                                lines
+                                    .min(crate::tui::history::SUBAGENT_PREVIEW_LINES as u16)
+                                    .saturating_add(1)
+                            }
+                        };
+                        body.saturating_add(2)
+                    }
+                },
+            });
+            prev_agent = matches!(entry, HistoryEntry::Agent { .. });
+        }
+        if self.pending.is_some() {
+            total = total.saturating_add(1);
+        }
+        total
+    }
+
+    pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
+        let geom = self.geometry();
+        let rects = geom.layout(frame.area());
+        if self.footer_agent_picker.is_none() && self.footer_mode_picker.is_none() {
+            self.footer_picker_row_hits.clear();
+        }
+
+        if let Some(prompt) = self.daemon_prompt.as_ref() {
+            prompt.render(frame, rects.body);
+        } else if self.question_dialog.is_some() {
+            // Answering dialog (GOALS §3b): a compact, bottom-anchored
+            // overlay above the status row. History stays visible above
+            // it (codex bottom-pane style), so render the chat into `body`
+            // and the dialog into the `compact` slot. The dialog owns the
+            // cursor while it's open.
+            self.render_history(frame, rects.body);
+            if let Some(dialog) = self.question_dialog.as_mut() {
+                // Sync both body regions' scroll viewports to the real
+                // overlay geometry so a long prompt and a long option list
+                // each stay in view (region split, GOALS §3b). The terminal
+                // height drives the Ctrl+E expanded cap.
+                dialog.sync_viewport(rects.compact, frame.area().height);
+                dialog.render(frame, rects.compact);
+            }
+        } else if self.dialog.is_active() {
+            self.dialog.render(frame, rects.body);
+        } else if let Some(picker) = self.model_picker.as_mut() {
+            picker.render(frame, rects.body);
+        } else if let Some(dialog) = self.multireview_dialog.as_ref() {
+            dialog.render(frame, rects.body);
+        } else if self.footer_agent_picker.is_some() {
+            self.render_footer_agent_picker(frame, rects.body);
+        } else if self.footer_mode_picker.is_some() {
+            self.render_footer_mode_picker(frame, rects.body);
+        } else if self.stats_pane.is_some() {
+            // Take the pane out to satisfy the borrow checker (render is
+            // `&mut self` and the pane's render is `&mut self`), then put
+            // it back. The pane has no side effects beyond updating its
+            // own scroll-clamp state.
+            let mut pane = self.stats_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.stats_pane = pane;
+        } else if self.usage_pane.is_some() {
+            let mut pane = self.usage_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.usage_pane = pane;
+        } else if self.sessions_pane.is_some() {
+            // Same take/render/restore as `stats_pane` (both renders are
+            // `&mut self`). Renders into `rects.body` so the fixed chrome
+            // (cwd + git branch + context + active agent) stays visible.
+            let mut pane = self.sessions_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.sessions_pane = pane;
+        } else if self.skills_pane.is_some() {
+            // Same take/render/restore as the other panes. Renders into
+            // `rects.body` so the fixed chrome (cwd + git branch + context
+            // + active agent) stays visible — the overlay is a view, not a
+            // chrome change.
+            let mut pane = self.skills_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.skills_pane = pane;
+        } else if self.permissions_pane.is_some() {
+            // Same take/render/restore as the other panes. Renders into
+            // `rects.body` so the fixed chrome (cwd + git branch + context
+            // + active agent) stays visible — the overlay is a view, not a
+            // chrome change.
+            let mut pane = self.permissions_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.permissions_pane = pane;
+        } else if self.resources_pane.is_some() {
+            let mut pane = self.resources_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.resources_pane = pane;
+        } else if let Some(dialog) = self.quick_dialog.as_ref() {
+            dialog.render(frame, rects.body);
+        } else if self.context_pane.is_some() {
+            // Same take/render/restore as the other panes. Renders into
+            // `rects.body` so the fixed chrome (cwd + git branch + context
+            // + active agent) stays visible — the overlay is a view, not a
+            // chrome change.
+            let mut pane = self.context_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.context_pane = pane;
+        } else if self.notes_pane.is_some() {
+            // `/scratchpad`. Same take/render/restore as the other
+            // panes. Renders into `rects.body` so the fixed chrome stays
+            // visible — the overlay is a view, not a chrome change.
+            let mut pane = self.notes_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.notes_pane = pane;
+        } else if self.diff_pane.is_some() {
+            // `/diff`. Same take/render/restore as the other panes. Renders
+            // into `rects.body` so the fixed chrome (cwd + git branch +
+            // context + active agent) stays visible — the overlay is a view,
+            // not a chrome change.
+            let mut pane = self.diff_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.diff_pane = pane;
+        } else {
+            // Carve the body for an embedded pane (GOALS §1i) when one
+            // is open: fullscreen fills the body, splits divide it. The
+            // chat history renders into whatever's left (or nowhere when
+            // fullscreen). Returns the chat rect, or `None` if hidden.
+            let chat_rect = self.render_pane(frame, rects.body);
+            match chat_rect {
+                Some(chat) => self.render_history(frame, chat),
+                None => self.chat_area = None,
+            }
+            if geom.indicator > 0 {
+                self.render_status_indicator(frame, rects.indicator);
+            }
+            if geom.queue > 0 {
+                self.render_queue(frame, rects.queue);
+            }
+            let cursor_pos = self.render_input(frame, rects.input, geom.queue > 0);
+            if geom.popup > 0 {
+                self.render_popup(frame, rects.popup);
+            }
+            // Below-input pin-count indicator (`pinned-messages`). Only
+            // shown when the session has ≥1 pin (geometry gives it a row).
+            if geom.pins > 0 {
+                self.render_pins_indicator(frame, rects.pins);
+            }
+            // Persistent below-input sandbox-down notice (§6.5). Shown while
+            // the shell sandbox can't initialize; geometry gives it rows.
+            // Persistent — it does not time out like a toast.
+            if geom.sandbox_notice > 0 {
+                self.render_sandbox_notice(frame, rects.sandbox_notice);
+            }
+            // Park the real cursor: in the focused pane (when the child
+            // shows one), otherwise in the composer.
+            if self.pane.is_some() && self.pane_focused {
+                if let (Some(rect), Some(pane)) = (self.pane_rect, self.pane.as_ref())
+                    && let Some((x, y)) = pane.cursor_in(rect)
+                {
+                    frame.set_cursor_position(Position::new(x, y));
+                }
+            } else {
+                frame.set_cursor_position(cursor_pos);
+            }
+        }
+        self.render_status(frame, rects.status);
+
+        // Toast sits on top of the status line. Rendered before the
+        // context menu / text popup so those still cover it if both
+        // happen to be active at the same time.
+        if let Some(toast) = self.toast.clone() {
+            render_toast(frame, rects.status, &toast);
+        }
+
+        // `/pins` review checklist overlay (`pinned-messages`): a compact
+        // bottom-anchored box listing the session's pinned messages, drawn
+        // over the chat while review mode is open. The transcript jumps to
+        // the highlighted pin underneath.
+        if self.pins_review.is_some() {
+            self.render_pins_review(frame, rects.body);
+        }
+
+        // Context menu overlay renders LAST so it sits on top of
+        // every other pane. The Clear widget inside the renderer
+        // wipes the cells under the overlay so the chat / status
+        // line don't bleed through.
+        if let Some(menu) = self.context_menu.as_ref() {
+            crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
+        }
+
+        // Which-key overlay (`which-key-overlay.md`): a bottom-anchored,
+        // scrollable, informational panel over the chat body. Rendered last so
+        // it sits on top, but anchored to the body so the fixed chrome (status
+        // line below, header above) is never permanently covered. Take/restore
+        // to satisfy the borrow checker (its render is `&mut self`), like the
+        // other panes. It's only ever open when no required-decision dialog is
+        // up (the leader is guarded; `/keys` can't be typed during a dialog),
+        // so it never obscures a required decision.
+        if self.keys_overlay.is_some() {
+            let mut overlay = self.keys_overlay.take();
+            if let Some(o) = overlay.as_mut() {
+                o.render(frame, rects.body);
+            }
+            self.keys_overlay = overlay;
+        }
+    }
+
+    /// Render the below-input pin-count indicator (`pinned-messages`):
+    /// `📌 N pinned · /pins to review`. Hidden by the geometry when the
+    /// session has no pins.
+    fn render_pins_indicator(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let n = self.pin_count;
+        let glyph = if self.use_emojis { "📌 " } else { "" };
+        let text = format!("{glyph}{n} pinned · /pins to review");
+        let line = Line::from(vec![Span::styled(
+            text,
+            Style::default().fg(crate::tui::pins_overlay::PIN_YELLOW),
+        )]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    /// Render the persistent below-input sandbox-down notice (`implementation notes`
+    /// §6.5): a red, wrapped, model-independent remedy telling the user to run
+    /// `/sandbox off` (plus the `sudo sysctl …=0` command when diagnosed). Stays
+    /// until the sandbox is usable / dismissed — it does NOT time out like a
+    /// toast. Hidden by the geometry when the sandbox is fine. Pure chrome:
+    /// nothing here ever enters the model's context.
+    fn render_sandbox_notice(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let Some(text) = self.sandbox_down_notice_text() else {
+            return;
+        };
+        let para = Paragraph::new(Line::from(vec![Span::styled(
+            super::sandbox_notice_render_text(&text),
+            Style::default().fg(ERROR_TEXT),
+        )]))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(para, area);
+    }
+
+    /// Render the `/pins` review checklist as a bottom-anchored overlay box
+    /// over the chat body.
+    fn render_pins_review(&self, frame: &mut ratatui::Frame, body: Rect) {
+        let Some(review) = self.pins_review.as_ref() else {
+            return;
+        };
+        let inner_w = body.width.saturating_sub(2);
+        let lines = review.render_lines(inner_w);
+        // Box height: content + top/bottom border, capped to the body.
+        let want = (lines.len() as u16) + 2;
+        let h = want.min(body.height.max(3));
+        let w = body.width;
+        let y = body.y + body.height.saturating_sub(h);
+        let rect = Rect::new(body.x, y, w, h);
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(crate::tui::pins_overlay::PIN_YELLOW));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    /// Border color for the composer/input box and the queue strip,
+    /// keyed on busy + shell mode. Shell mode (leading `!`) tints green;
+    /// while the agent is busy the border is a visibly-grey muted shade
+    /// ([`BUSY_BORDER`]) signalling "hold off typing"; idle is
+    /// white. Shared by `render_input` and `render_queue` so the two
+    /// borders never drift. The queue strip has no shell mode and passes
+    /// `shell_mode = false`.
+    fn input_border_color(busy: bool, shell_mode: bool) -> Color {
+        if shell_mode {
+            SHELL_MODE_BORDER
+        } else if busy {
+            BUSY_BORDER
+        } else {
+            IDLE_BORDER
+        }
+    }
+
+    /// Queued-messages box. Inset one column from each side of the
+    /// input box; rounded top corners (`╭ ╮`); white border throughout;
+    /// shared bottom row with the input box rendered as `╭┴────┴╮`
+    /// (input's rounded top corners with `┴` T-joins where the queue's
+    /// inset side rails terminate). The shared row counts as the
+    /// queue's bottom border AND the input's top border.
+    pub(super) fn render_queue(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.height < 2 || area.width < 5 || self.queue.is_empty() {
+            return;
+        }
+        // Border tracks the input box: visibly-grey for the whole span
+        // the agent is busy (matches the "agent is working, hold off"
+        // cue on the input border), white when idle. No shell mode on
+        // the queue strip, so it reuses the same helper with
+        // `shell_mode = false`.
+        let border_color = Self::input_border_color(self.busy, false);
+        let dim_white = MUTED_TEXT;
+        let outer_w = area.width as usize;
+        // Queue is inset 1 col on each side; inside the inset, 1 col
+        // is the rail and 1 col is padding before/after the text.
+        let inset = 1usize;
+        let queue_w = outer_w.saturating_sub(inset * 2);
+        let inner_w = queue_w.saturating_sub(4); // 1 rail + 1 pad on each side
+        let inner_w = inner_w.max(1);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+
+        // Top row: `  ╭─────────╮  ` — rounded corners, inset.
+        let top_bar = "─".repeat(queue_w.saturating_sub(2));
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(inset)),
+            Span::styled(format!("╭{top_bar}╮"), Style::default().fg(border_color)),
+            Span::raw(" ".repeat(inset)),
+        ]));
+
+        // Content rows: `  │ message │  `.
+        for msg in &self.queue {
+            let body = first_line_truncated(&msg.text, inner_w);
+            let body_w = body.chars().count();
+            let trailing = inner_w.saturating_sub(body_w);
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(inset)),
+                Span::styled("│", Style::default().fg(border_color)),
+                Span::raw(" "),
+                Span::styled(body, Style::default().fg(dim_white)),
+                Span::raw(" ".repeat(trailing)),
+                Span::raw(" "),
+                Span::styled("│", Style::default().fg(border_color)),
+                Span::raw(" ".repeat(inset)),
+            ]));
+        }
+
+        // Shared bottom row: `╭┴────────┴╮`. Spans the full input
+        // width — `╭` and `╮` at the corners (these are the input's
+        // rounded top), and `┴` where the queue's inset side rails
+        // terminate. The horizontal fills between use `─`.
+        let mut shared: String = String::with_capacity(outer_w * 3);
+        for col in 0..outer_w {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == outer_w - 1 {
+                '╮'
+            } else if col == inset || col == outer_w - 1 - inset {
+                '┴'
+            } else {
+                '─'
+            };
+            shared.push(ch);
+        }
+        lines.push(Line::from(vec![Span::styled(
+            shared,
+            Style::default().fg(border_color),
+        )]));
+
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Build the launch-banner box lines for the current pane, or an
+    /// empty `Vec` when the banner is suppressed or doesn't fit. See
+    /// [`crate::tui::banner_box`].
+    fn banner_box_lines(&self, pane_w: u16, pane_h: u16) -> Vec<Line<'static>> {
+        crate::tui::banner_box::build(&self.launch, pane_w, pane_h).unwrap_or_default()
+    }
+
+    pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.chat_area = Some(area);
+        let area_h = area.height as usize;
+        let previous_top = if self.chat_scroll_offset > 0 {
+            Some(chat_visible_top(
+                self.chat_total_lines,
+                self.chat_visible_lines.max(1),
+                self.chat_scroll_offset,
+            ))
+        } else {
+            None
+        };
+
+        let mut all: Vec<Line<'static>> = Vec::new();
+        let mut row_meta: Vec<ChatRowMeta> = Vec::new();
+        // Absolute content line (in `all`) of each pinnable message's first
+        // row, by history index — drives the pick arrow + review jump.
+        let mut msg_abs_line: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (idx, entry) in self.history.iter().enumerate() {
+            // Pinned-message chrome (`pinned-messages`): the pick-mode arrow
+            // (when this entry is the pick selection) and/or the clickable
+            // mouse pin control (`[pin]`/`[unpin]`, only when mouse mode is
+            // on) ride the message itself — inline left of the timestamp for
+            // an agent reply, in the top-right border corner for a user
+            // bubble. They cost no separate vertical space.
+            // The entry's first content line is the next row we push.
+            msg_abs_line.insert(idx, all.len());
+            let pin = Self::entry_pin_seq(entry).and_then(|seq| {
+                let is_pick = self
+                    .pin_pick
+                    .as_ref()
+                    .is_some_and(|p| p.selected_history_index() == idx)
+                    || self
+                        .fork_pick
+                        .as_ref()
+                        .is_some_and(|p| p.selected_history_index() == idx)
+                    || self
+                        .copy_pick_selected_history_index()
+                        .is_some_and(|selected| selected == idx);
+                let show_control = self.mouse_capture;
+                (is_pick || show_control).then_some(crate::tui::history::PinControl {
+                    seq,
+                    pinned: self.is_seq_pinned_for_render(seq),
+                    show_control,
+                    is_pick,
+                })
+            });
+            let entry_base = all.len();
+            let preflight_dots_ms = self.started_at.elapsed().as_millis();
+            let sig = history_render_signature(
+                entry,
+                area.width,
+                self.thinking_setting,
+                self.markdown_opts,
+                self.diff_style,
+                self.use_emojis,
+                &self.elided_event_ids,
+                preflight_dots_ms,
+                pin,
+            );
+            let rendered = match self.history_render_cache.get(&idx) {
+                Some(cached) if cached.sig == sig => cached.rendered.clone(),
+                _ => {
+                    let rendered = render_entry(
+                        entry,
+                        area.width,
+                        self.thinking_setting,
+                        self.markdown_opts,
+                        self.diff_style,
+                        self.use_emojis,
+                        &self.elided_event_ids,
+                        // Same continuously-advancing clock the busy/Thinking spinner
+                        // reads, so a preflight-pending row's `Preflight...` dots animate
+                        // each 100ms tick (implementation note).
+                        preflight_dots_ms,
+                        pin,
+                    );
+                    self.history_render_cache.insert(
+                        idx,
+                        HistoryRenderCacheEntry {
+                            sig,
+                            rendered: rendered.clone(),
+                        },
+                    );
+                    rendered
+                }
+            };
+            let Rendered {
+                lines,
+                chip_row,
+                continuations,
+                pin_region,
+            } = rendered;
+            let chip_abs = chip_row.map(|cr| all.len() + cr);
+            // The clickable pin region (when drawn) lands on `pin_region.row`
+            // within this entry's lines — offset into the `all` buffer.
+            let pin_abs = pin_region.map(|r| entry_base + r.row);
+            let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
+            let diff_path = match entry {
+                HistoryEntry::Diff { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            let base_copy = copy_target_for_entry(entry, idx);
+            let base_kind = row_kind_for_entry(entry);
+            for i in 0..lines.len() {
+                let chip_target = if Some(all.len() + i) == chip_abs {
+                    Some(idx)
+                } else {
+                    None
+                };
+                let pin_hit = match pin_region {
+                    Some(r) if Some(all.len() + i) == pin_abs => Some(PinHit {
+                        seq: r.seq,
+                        col_start: r.col_start,
+                        col_end: r.col_end,
+                    }),
+                    _ => None,
+                };
+                let row_kind = if chip_target.is_some() {
+                    ChatRowKind::Chip
+                } else {
+                    base_kind
+                };
+                row_meta.push(ChatRowMeta {
+                    history_index: Some(idx),
+                    row_kind,
+                    copy_target: if row_kind == ChatRowKind::Chip {
+                        None
+                    } else {
+                        base_copy
+                    },
+                    chip_target,
+                    tool_box_target: is_box.then_some(idx),
+                    diff_path: diff_path.clone(),
+                    pin_hit,
+                    continuation: false,
+                    selectable: row_kind != ChatRowKind::Chip,
+                });
+            }
+            // Each entry's renderer returns one bool per emitted line;
+            // pad if there's any mismatch (defensive — shouldn't
+            // happen but keeps the parallel arrays in lockstep).
+            let mut entry_conts = continuations;
+            entry_conts.resize(lines.len(), false);
+            for (meta, continuation) in row_meta[entry_base..].iter_mut().zip(entry_conts) {
+                meta.continuation = continuation;
+            }
+            all.extend(lines);
+            // One-line gap after a block so it separates from what
+            // follows. Consecutive agents share a block, and an immediate
+            // ToolBox continues the assistant turn without an inter-entry gap.
+            let gap = match entry {
+                HistoryEntry::User { .. }
+                | HistoryEntry::ToolBox { .. }
+                | HistoryEntry::ToolLine { .. }
+                | HistoryEntry::CompactBoundary { .. } => true,
+                // An auto-injected-skill row hugs the user message it was
+                // injected ahead of — no separating gap (it falls through to
+                // the `_ => false` default, called out here for the reader).
+                HistoryEntry::SkillAutoInjected { .. } => false,
+                HistoryEntry::Agent { .. } => {
+                    !idx.checked_sub(1)
+                        .map(|i| matches!(self.history[i], HistoryEntry::Agent { .. }))
+                        .unwrap_or(false)
+                        && !self
+                            .history
+                            .get(idx + 1)
+                            .is_some_and(|next| matches!(next, HistoryEntry::ToolBox { .. }))
+                }
+                // Settled subagent block gets a trailing gap; the live
+                // running line gets none (so it doesn't jump when it
+                // settles in place).
+                HistoryEntry::Subagent { outcome, .. } => outcome.is_some(),
+                _ => false,
+            };
+            if gap {
+                all.push(Line::default());
+                row_meta.push(ChatRowMeta::gap());
+            }
+        }
+        if let Some(pending) = &self.pending {
+            let sig = pending_render_signature(pending, area.width);
+            let pending_lines = match self.pending_render_cache.as_ref() {
+                Some(cached) if cached.sig == sig => cached.lines.clone(),
+                _ => {
+                    let lines = render_pending(pending, area.width);
+                    self.pending_render_cache = Some(PendingRenderCacheEntry {
+                        sig,
+                        lines: lines.clone(),
+                    });
+                    lines
+                }
+            };
+            for _ in 0..pending_lines.len() {
+                row_meta.push(ChatRowMeta::other());
+            }
+            all.extend(pending_lines);
+        } else {
+            self.pending_render_cache = None;
+        }
+        self.history_render_cache
+            .retain(|idx, _| *idx < self.history.len());
+
+        let (mut all, mut row_meta, msg_abs_line) =
+            prewrap_chat_rows(all, row_meta, msg_abs_line, area.width as usize);
+        // Record the abs-line map for pick/review jump after wrapping so
+        // pinned messages target the visual row model used for scrolling.
+        if let Some(idx) = self.pending_fresh_turn_history_idx.take()
+            && let Some(abs) = msg_abs_line.get(&idx).copied()
+        {
+            self.chat_fresh_anchor_top = Some(abs.saturating_sub(2));
+            self.chat_fresh_tail_padding = area_h;
+        }
+        if !(self.busy || self.pending.is_some()) {
+            self.chat_fresh_anchor_top = None;
+            self.chat_fresh_tail_padding = 0;
+        }
+        if self.chat_fresh_anchor_top.is_some()
+            && self.chat_fresh_tail_padding > 0
+            && (self.busy || self.pending.is_some())
+        {
+            for _ in 0..self.chat_fresh_tail_padding {
+                all.push(Line::default());
+                row_meta.push(ChatRowMeta::padding());
+            }
+        }
+        self.msg_abs_line = msg_abs_line;
+
+        // The launch-banner box is the topmost scroll entry (GOALS
+        // §1g): it floats centered in an under-full pane and scrolls
+        // off the top with the oldest messages once the transcript
+        // grows tall enough to reach it.
+        let box_lines = self.banner_box_lines(area.width, area.height);
+        let b = box_lines.len();
+        let m = all.len();
+        self.chat_find_lines = box_lines
+            .iter()
+            .chain(all.iter())
+            .map(rendered_line_text)
+            .collect();
+
+        // Total scrollable content height, box included — drives the
+        // mouse-wheel scrollback clamp.
+        self.chat_total_lines = b + m;
+        self.chat_visible_lines = area_h;
+        self.chat_banner_lines = b;
+
+        let (visible, visible_meta): VisibleRows = if b > 0 && b + m <= area_h {
+            // Fits with room to spare: messages stay bottom-aligned and
+            // the box floats at the vertical center, sliding up to sit
+            // directly above the messages once they'd reach it. Content
+            // fits, so there's no scrollback.
+            self.chat_scroll_offset = 0;
+            let centered_top = (area_h - b) / 2;
+            let box_top = centered_top.min(area_h - m - b);
+            let msg_top = area_h - m;
+            let mut v: Vec<Line<'static>> = (0..area_h).map(|_| Line::default()).collect();
+            let mut meta: Vec<ChatRowMeta> = vec![ChatRowMeta::padding(); area_h];
+            for (i, line) in box_lines.into_iter().enumerate() {
+                v[box_top + i] = line;
+                meta[box_top + i] = ChatRowMeta::banner();
+            }
+            for (i, line) in all.into_iter().enumerate() {
+                v[msg_top + i] = line;
+            }
+            for (i, val) in row_meta.into_iter().enumerate() {
+                meta[msg_top + i] = val;
+            }
+            (v, meta)
+        } else {
+            // No box, or box + messages overflow the pane: the box is
+            // the top of one contiguous, bottom-aligned scroll buffer
+            // and scrolls off the top with the oldest messages. Box rows
+            // are non-interactive (None / false). With no box this is
+            // exactly the previous behavior over `all`.
+            let mut combined = box_lines;
+            let prefix = combined.len();
+            combined.extend(all);
+            let mut combined_meta = vec![ChatRowMeta::banner(); prefix];
+            combined_meta.extend(row_meta);
+
+            let total = combined.len();
+            let max_offset = total.saturating_sub(area_h);
+            if let Some(top) = self.chat_fresh_anchor_top.or(previous_top) {
+                self.chat_scroll_offset = chat_offset_for_top(total, area_h, top);
+            } else if self.chat_scroll_offset > max_offset {
+                self.chat_scroll_offset = max_offset;
+            }
+
+            if total < area_h {
+                let pad = area_h - total;
+                let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
+                let mut meta: Vec<ChatRowMeta> = vec![ChatRowMeta::padding(); pad];
+                v.extend(combined);
+                meta.extend(combined_meta);
+                (v, meta)
+            } else {
+                let drop = total - area_h - self.chat_scroll_offset;
+                let v: Vec<Line<'static>> = combined.into_iter().skip(drop).take(area_h).collect();
+                let meta: Vec<ChatRowMeta> =
+                    combined_meta.into_iter().skip(drop).take(area_h).collect();
+                (v, meta)
+            }
+        };
+        self.chat_row_meta = visible_meta;
+        self.clickable_rows = self.chat_row_meta.iter().map(|m| m.chip_target).collect();
+        self.box_rows = self
+            .chat_row_meta
+            .iter()
+            .map(|m| m.tool_box_target)
+            .collect();
+        self.diff_rows = self
+            .chat_row_meta
+            .iter()
+            .map(|m| m.diff_path.clone())
+            .collect();
+        self.chat_cont_rows = self.chat_row_meta.iter().map(|m| m.continuation).collect();
+        self.pin_control_rows = self.chat_row_meta.iter().map(|m| m.pin_hit).collect();
+
+        frame.render_widget(Paragraph::new(visible), area);
+        if self.selection.is_some() || self.transcript_find.is_some() {
+            // Snapshot the content layer before overlay chrome is rendered.
+            // Selection copy must match selectable chat content, not scroll
+            // indicators or find UI drawn on top of the paragraph.
+            self.chat_text_grid = capture_grid(frame.buffer_mut(), area);
+        } else {
+            self.chat_text_grid.clear();
+        }
+
+        if self.find_owns_bottom_row() {
+            render_transcript_find_bar(
+                frame.buffer_mut(),
+                area,
+                self.transcript_find.as_ref(),
+                Style::default()
+                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .add_modifier(Modifier::DIM),
+            );
+        } else {
+            render_chat_scroll_indicator(
+                frame.buffer_mut(),
+                area,
+                self.chat_scroll_offset,
+                self.busy || self.pending.is_some(),
+                Style::default()
+                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .add_modifier(Modifier::DIM),
+            );
+        }
+
+        if let Some(find) = self.transcript_find.as_ref() {
+            apply_transcript_find_highlight(
+                frame.buffer_mut(),
+                area,
+                find,
+                self.chat_total_lines,
+                self.chat_visible_lines,
+                self.chat_scroll_offset,
+                &self.chat_find_lines,
+            );
+        }
+
+        if let Some(sel) = self.selection {
+            // Skip chip rows from highlight: visually, the
+            // "▶ thought for Xs (ctrl+t to expand)" line is a
+            // control affordance, not message content. Building
+            // the bool mask here so apply_selection_highlight stays
+            // a free function.
+            let chip_row_mask: Vec<bool> = self
+                .chat_row_meta
+                .iter()
+                .map(|meta| !meta.selectable)
+                .collect();
+            apply_selection_highlight(
+                frame.buffer_mut(),
+                area,
+                sel,
+                &chip_row_mask,
+                &self.chat_text_grid,
+            );
+        }
+    }
+
+    pub(super) fn render_input(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        queue_above: bool,
+    ) -> Position {
+        // Stash for the mouse handler so a click can route to
+        // click-to-position-cursor (plan.md T8.d).
+        self.input_area = Some(area);
+        // When the queue strip is above, its shared bottom row IS our
+        // top border — render only sides + bottom here.
+        let borders = if queue_above {
+            Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
+        } else {
+            Borders::ALL
+        };
+        // Visibly-grey border for the whole span the agent is busy;
+        // white when idle. Gated on `busy` (not `pending.is_some()`) so
+        // it stays dim across reasoning, streaming, AND tool execution —
+        // `pending` drops to `None` between tool rounds, which used to
+        // flicker the border white mid-turn. BUSY_BORDER_INDEX is a
+        // mid-grey: clearly dimmer than white so the "agent is working,
+        // hold off typing" signal reads as muted, but never near-black/
+        // invisible against the surrounding chrome.
+        // Shell mode (GOALS §1k): a leading `!` swaps the top border for
+        // a "shell mode" label and tints the border green. Leaves the
+        // moment the `!` is gone.
+        let shell_mode = self.composer.text().starts_with('!');
+        let border_color = Self::input_border_color(self.busy, shell_mode);
+        let mut input_block = Block::default()
+            .borders(borders)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color));
+        if shell_mode && !queue_above {
+            input_block = input_block.title(Line::from(Span::styled(
+                " shell mode ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(SHELL_MODE_BADGE_BG)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        let input_inner = input_block.inner(area);
+
+        let prefix_width = input_prefix_width();
+        let indent: String = " ".repeat(prefix_width);
+        let text = self.composer.text();
+        let buf_lines: Vec<&str> = if text.is_empty() {
+            vec![""]
+        } else {
+            text.split('\n').collect()
+        };
+        // Pre-wrap the composer text ourselves so the rendered visual
+        // rows match what `cursor_visual_pos` assumes — `Paragraph::
+        // wrap`'s word-wrap algorithm doesn't have a clean way to
+        // report the cursor's position back to us, so the two sides
+        // would otherwise drift apart on wrapped input.
+        let inner_w = input_inner.width as usize;
+        let context_chip = self.passive_context_indicator(input_inner);
+        let passive_ghost = text.is_empty()
+            && self
+                .prediction_state
+                .ghost()
+                .is_some_and(|g| !g.box_expanded());
+        let budget = inner_w.saturating_sub(prefix_width).max(1);
+        let first_row_budget = if passive_ghost {
+            context_chip
+                .as_ref()
+                .map(|chip| {
+                    chip.x
+                        .saturating_sub(input_inner.x)
+                        .saturating_sub(prefix_width as u16) as usize
+                })
+                .unwrap_or(budget)
+                .max(1)
+        } else {
+            budget
+        };
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        // Ghost text (implementation note): when the box is
+        // empty and a prediction is pending, render the prediction grey
+        // (muted) after the prompt prefix — the first line while a
+        // multi-line `long` prediction is collapsed, the whole prediction
+        // once expanded. The real cursor stays at the start (row 0, just
+        // past the prefix); typing or Tab dismisses the ghost.
+        let ghost_display = if text.is_empty() {
+            self.prediction_state.ghost().map(|g| g.display_text())
+        } else {
+            None
+        };
+        if let Some(ghost) = ghost_display {
+            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+            for (li, gline) in ghost.split('\n').enumerate() {
+                let chunks = wrap_ghost_line_chunks(
+                    gline,
+                    budget,
+                    if li == 0 { first_row_budget } else { budget },
+                );
+                for (ci, (start, end, _, _)) in chunks.iter().enumerate() {
+                    let chunk_text = gline[*start..*end].to_string();
+                    let pre = if li == 0 && ci == 0 {
+                        INPUT_PREFIX
+                    } else {
+                        indent.as_str()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(pre.to_string(), Style::default().fg(Color::White)),
+                        Span::styled(chunk_text, muted),
+                    ]));
+                }
+            }
+        }
+        // Byte offset of the start of the current logical line within the
+        // full buffer — used to map a wrapped chunk back to absolute byte
+        // ranges so paste-block placeholders render with a distinct style
+        // (composer-paste-handling). Lines are split on '\n', so each
+        // separator adds one byte.
+        let mut line_byte_start = 0usize;
+        for (li, line) in buf_lines.iter().enumerate() {
+            // When a ghost is rendered the empty real-buffer line is
+            // already represented by the ghost's first row (the cursor
+            // sits on it); don't also push a blank white line.
+            if ghost_display.is_some() {
+                break;
+            }
+            let chunks = wrap_display_chunks(line, budget);
+            for (ci, (start, end, _, _)) in chunks.iter().enumerate() {
+                let chunk_text = line[*start..*end].to_string();
+                let pre = if li == 0 && ci == 0 {
+                    INPUT_PREFIX
+                } else {
+                    indent.as_str()
+                };
+                let chunk_byte_start = line_byte_start + *start;
+                let mut spans = vec![Span::styled(
+                    pre.to_string(),
+                    Style::default().fg(Color::White),
+                )];
+                spans.extend(self.paste_styled_spans(&chunk_text, chunk_byte_start));
+                lines.push(Line::from(spans));
+            }
+            // Advance past this line + its '\n' separator.
+            line_byte_start += line.len() + 1;
+        }
+
+        let (vis_row, vis_col) = visual_position_for_byte(
+            self.composer.text(),
+            self.composer.cursor(),
+            prefix_width,
+            inner_w.max(1),
+        );
+        let cursor_row = vis_row as u16;
+        let cursor_col = vis_col as u16;
+
+        let visible_rows = input_inner.height;
+        let scroll_y = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
+        // No `Wrap` modifier — the lines we just emitted are already
+        // visual rows. Letting Paragraph::wrap re-wrap them would
+        // desync the cursor again.
+        let para = Paragraph::new(lines)
+            .block(input_block)
+            .scroll((scroll_y, 0));
+        frame.render_widget(para, area);
+
+        // Vim visual-mode selection highlight: invert each selected cell
+        // (REVERSED), mirroring `apply_selection_highlight`'s approach for
+        // chat drag-select. The selection byte range is mapped to visual
+        // (row, col) via the same wrap math the cursor uses, so it tracks
+        // wrapped lines. Paste blocks are atomic — `visual_range` already
+        // widens through them at the buffer layer, so the cell span here is
+        // correct without extra work.
+        if let Some((lo, hi)) = self.composer.visual_range()
+            && hi > lo
+        {
+            let buf = frame.buffer_mut();
+            apply_composer_visual_highlight(
+                buf,
+                input_inner,
+                self.composer.text(),
+                lo,
+                hi,
+                prefix_width,
+                inner_w.max(1),
+                scroll_y,
+            );
+        }
+
+        // Context indicator on the top-right of the input box. It is normally
+        // fixed chrome, but the composer gets priority: real typed text,
+        // expanded prediction ghosts, and too-narrow input areas intentionally
+        // hide the chip instead of reserving/editing around it.
+        if let Some(chip) = context_chip {
+            let chip_area = Rect::new(chip.x, input_inner.y, chip.width, 1);
+            let chip = Paragraph::new(Line::from(vec![Span::styled(
+                chip.label,
+                Style::default().fg(CHIP_TEXT),
+            )]));
+            frame.render_widget(chip, chip_area);
+        }
+
+        Position::new(
+            input_inner.x + cursor_col,
+            input_inner.y + cursor_row.saturating_sub(scroll_y),
+        )
+    }
+
+    fn passive_context_indicator(&self, input_inner: Rect) -> Option<ContextIndicatorChip> {
+        // Deliberate fixed-chrome exception: active user input owns the whole
+        // composer row, so the passive chip hides instead of colliding with
+        // typed text.
+        if !self.composer.text().is_empty() {
+            return None;
+        }
+        if self
+            .prediction_state
+            .ghost()
+            .is_some_and(|g| g.box_expanded())
+        {
+            return None;
+        }
+        let label = self.context_indicator_text();
+        let width = display_width(&label) as u16;
+        if width + input_prefix_width() as u16 + 1 >= input_inner.width {
+            return None;
+        }
+        Some(ContextIndicatorChip {
+            x: input_inner.x + input_inner.width.saturating_sub(width),
+            width,
+            label,
+        })
+    }
+
+    /// Split a rendered composer chunk (`text`, whose first char is at
+    /// absolute buffer byte `chunk_byte_start`) into styled spans, giving
+    /// any bytes covered by a paste-block placeholder a distinct dim-cyan
+    /// style (composer-paste-handling). Non-block text keeps the default
+    /// white. Returns one span when no block overlaps the chunk (the
+    /// common case), so ordinary typing renders exactly as before.
+    fn paste_styled_spans(&self, text: &str, chunk_byte_start: usize) -> Vec<Span<'static>> {
+        let plain = || {
+            vec![Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::White),
+            )]
+        };
+        if self.paste_registry.is_empty() {
+            return plain();
+        }
+        let blocks = self.paste_registry.blocks();
+        let chunk_end = chunk_byte_start + text.len();
+        // Quick reject: no block overlaps this chunk.
+        if !blocks
+            .iter()
+            .any(|b| b.start < chunk_end && b.end > chunk_byte_start)
+        {
+            return plain();
+        }
+        let block_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+        let normal = Style::default().fg(Color::White);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_in_block = false;
+        let mut byte = chunk_byte_start;
+        for ch in text.chars() {
+            let in_block = blocks.iter().any(|b| byte >= b.start && byte < b.end);
+            if in_block != cur_in_block && !cur.is_empty() {
+                let style = if cur_in_block { block_style } else { normal };
+                spans.push(Span::styled(std::mem::take(&mut cur), style));
+            }
+            cur_in_block = in_block;
+            cur.push(ch);
+            byte += ch.len_utf8();
+        }
+        if !cur.is_empty() {
+            let style = if cur_in_block { block_style } else { normal };
+            spans.push(Span::styled(cur, style));
+        }
+        spans
+    }
+
+    /// Build the chrome's context indicator. Format (GOALS §1a):
+    /// - With known max:   `ctx 12% → 8% prunable` (current fraction →
+    ///   projected fraction after `/prune`)
+    /// - Without:          `1.2k tokens, 320 prunable`
+    ///
+    /// The `prunable` figure is the daemon-authoritative
+    /// `prunable_tokens` (from the same `dedup_plan` `/prune` executes),
+    /// so the projection the user sees equals what `/prune` then removes
+    /// (GOALS §10 stable-contract property).
+    pub(super) fn context_indicator_text(&self) -> String {
+        // Fresh chat (nothing sent, no provider usage yet): replace the
+        // useless `0% prunable` placeholder with the instruction-file
+        // size the daemon estimated. Reverts to the usual form once the
+        // first round-trip returns usage or any history exists. No
+        // guidance file → fall through to the usual form entirely.
+        if let Some(label) = fresh_chat_guidance_label(
+            self.history.is_empty(),
+            self.last_usage.is_some(),
+            self.guidance_estimate
+                .as_ref()
+                .and_then(|e| e.file.as_deref()),
+            self.guidance_estimate
+                .as_ref()
+                .map(|e| e.guidance_tokens)
+                .unwrap_or(0),
+        ) {
+            return label;
+        }
+        let tokens = self.context_tokens();
+        let prunable = self.prunable_tokens;
+        let base = match self.launch.active_model_max_context {
+            Some(max) if max > 0 => {
+                let pct = ((tokens as u64 * 100) / max as u64).min(999) as u32;
+                // Projected fraction after a full prune: subtract the
+                // prunable tokens from the live count, same denominator.
+                let after = (tokens as u64).saturating_sub(prunable);
+                let after_pct = ((after * 100) / max as u64).min(999) as u32;
+                if prunable == 0 {
+                    format!("ctx {pct}%")
+                } else {
+                    format!("ctx {pct}% → {after_pct}% prunable")
+                }
+            }
+            _ => {
+                if prunable == 0 {
+                    format!("{} tokens", format_token_count(tokens))
+                } else {
+                    format!(
+                        "{} tokens, {} prunable",
+                        format_token_count(tokens),
+                        format_token_count(prunable.min(u32::MAX as u64) as u32)
+                    )
+                }
+            }
+        };
+        // Surface cached tokens + hit rate separately (never folded into the
+        // headline) when the last round-trip served cache reads.
+        match self.cached_indicator_suffix() {
+            Some(suffix) => format!("{base} {suffix}"),
+            None => base,
+        }
+    }
+
+    /// Live token count for the current context. Before the first
+    /// round-trip it's the pure local estimate. Once the provider has
+    /// reported usage, it's a hybrid: the provider's last authoritative
+    /// `input + output` total (anchor) plus a local cl100k_base estimate
+    /// of everything streamed since that report. The number therefore
+    /// climbs per streamed token and re-snaps to the exact provider
+    /// count each time fresh usage arrives, correcting any drift.
+    pub(super) fn context_tokens(&self) -> u32 {
+        let estimate = self.estimate_context_tokens();
+        match self.last_usage {
+            Some(u) => {
+                // Anchor on the blended total (cached reads excluded — codex
+                // precedent, prompt `prompt-caching-strategy.md`) so the
+                // headline number reflects freshly-processed tokens, not cache
+                // hits. Cached tokens are surfaced separately in the indicator.
+                let anchor = u.blended_total().min(u32::MAX as u64) as u32;
+                hybrid_context_tokens(anchor, estimate, self.estimate_at_last_usage)
+            }
+            None => estimate,
+        }
+    }
+
+    /// Terse cached-token suffix for the context indicator: `· 8.0k cached
+    /// (80%)`, where the percent is the input cache hit rate. `None` when the
+    /// last round-trip reported no cached reads (so the indicator stays clean
+    /// on no-cache providers / cold first turns). Sourced from `last_usage`,
+    /// the same provider-authoritative usage the headline anchors on.
+    fn cached_indicator_suffix(&self) -> Option<String> {
+        let u = self.last_usage?;
+        if u.cached_input_tokens == 0 {
+            return None;
+        }
+        let cached = format_token_count(u.cached_input_tokens.min(u32::MAX as u64) as u32);
+        match u.hit_rate() {
+            Some(rate) => Some(format!(
+                "· {cached} cached ({}%)",
+                (rate * 100.0).round() as u32
+            )),
+            None => Some(format!("· {cached} cached")),
+        }
+    }
+
+    /// cl100k_base token count over the context sent to the model: the
+    /// composed system prompt baseline (role prompt + OS + session +
+    /// guidance body, resolved at launch into `guidance_estimate`) plus
+    /// visible chat content. Including the system prompt keeps the fresh-
+    /// chat baseline honest rather than reporting ~0 (the provider's
+    /// authoritative usage still re-anchors the count after the first
+    /// round-trip). Provider-native counts will replace the local
+    /// component where available (GOALS §10 / plan §3h); cl100k_base is
+    /// the documented fallback. The finalized-history portion is memoized
+    /// (see `history_estimate_tokens`) so the per-frame live counter only
+    /// re-tokenizes the small, growing `pending` buffer.
+    pub(super) fn estimate_context_tokens(&self) -> u32 {
+        // The full composed system prompt is a fixed baseline for the
+        // session (computed once at launch); it's present on every turn,
+        // so fold it into every estimate, not just the fresh one.
+        let mut tokens = self
+            .guidance_estimate
+            .as_ref()
+            .map(|e| e.system_tokens)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as usize;
+        tokens += self.history_estimate_tokens() as usize;
+        if let Some(p) = &self.pending {
+            tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
+        }
+        // Buffered `<git>` blocks (GOALS §1l) ride the next user
+        // message; surface their cost before the user commits to send.
+        for block in &self.pending_git_blocks {
+            tokens += crate::tokens::count(block);
+        }
+        tokens.min(u32::MAX as usize) as u32
+    }
+
+    /// cl100k_base token count of the conversation-message portion of the
+    /// live context: finalized history + the in-flight `pending` buffer +
+    /// any buffered `<git>` blocks riding the next user message. This is
+    /// exactly the part of [`Self::estimate_context_tokens`] *excluding*
+    /// the composed system prompt — the `messages` category of the
+    /// `/context` overlay.
+    pub(super) fn message_tokens(&self) -> u64 {
+        let mut tokens = self.history_estimate_tokens() as u64;
+        if let Some(p) = &self.pending {
+            tokens +=
+                crate::tokens::count(&p.text) as u64 + crate::tokens::count(&p.reasoning) as u64;
+        }
+        for block in &self.pending_git_blocks {
+            tokens += crate::tokens::count(block) as u64;
+        }
+        tokens
+    }
+
+    /// Capture an immutable snapshot of the live context composition for
+    /// the `/context` overlay. The system prompt is decomposed into its
+    /// real sub-buckets (base prompt + cached system block + guidance/
+    /// memory file) via the engine's own assembler, and the message
+    /// portion is sized the same cl100k_base way the chrome's indicator
+    /// uses. The window size is the active model's context limit (the same
+    /// `active_model_max_context` the chrome percentage uses); `None` there
+    /// drives the unknown-window path (no pct, no free segment).
+    pub(super) fn context_snapshot(&self) -> crate::tui::context_pane::ContextSnapshot {
+        let short_id = self.launch.session_short_id.as_deref().unwrap_or_default();
+        let breakdown =
+            crate::engine::builtin::chat_system_prompt_breakdown(&self.launch.cwd, short_id);
+        let snapshot = crate::tui::context_pane::ContextSnapshot::new(
+            breakdown.base_prompt,
+            breakdown.system_block,
+            breakdown.guidance,
+            self.message_tokens(),
+            self.launch.active_model_max_context,
+        );
+        // Attach the last round-trip's provider cache usage (cached input +
+        // hit rate) as a separate footer stat (prompt
+        // `prompt-caching-strategy.md`); a no-op until cached reads arrive.
+        match self.last_usage {
+            Some(u) => snapshot.with_cache_usage(u.cached_input_tokens, u.hit_rate()),
+            None => snapshot,
+        }
+    }
+
+    /// cl100k_base count over finalized history only, memoized on a cheap
+    /// length signature. History is static while a turn streams, so this
+    /// returns from cache on every draw mid-stream — only re-tokenizing
+    /// when an entry is appended or edited in place.
+    fn history_estimate_tokens(&self) -> u32 {
+        let sig = self.history_signature();
+        if let Some((cached_sig, val)) = self.history_estimate_cache.get()
+            && cached_sig == sig
+        {
+            return val;
+        }
+        let val = self.compute_history_tokens();
+        self.history_estimate_cache.set(Some((sig, val)));
+        val
+    }
+
+    fn compute_history_tokens(&self) -> u32 {
+        let mut tokens: usize = 0;
+        for entry in &self.history {
+            tokens += match entry {
+                HistoryEntry::User { text, .. } => crate::tokens::count(text),
+                HistoryEntry::Plain { line }
+                | HistoryEntry::CommandError { line }
+                | HistoryEntry::Maintenance { line } => crate::tokens::count(line),
+                HistoryEntry::ToolLine { summary, .. } => crate::tokens::count(summary),
+                HistoryEntry::ToolBox { calls, .. } => calls
+                    .iter()
+                    .map(|c| crate::tokens::count(&c.summary) + crate::tokens::count(&c.output))
+                    .sum(),
+                HistoryEntry::Diff { old, new, .. } => {
+                    crate::tokens::count(old) + crate::tokens::count(new)
+                }
+                HistoryEntry::Agent {
+                    text, reasoning, ..
+                } => crate::tokens::count(text) + crate::tokens::count(reasoning),
+                // The child's report is delivered to the parent as its
+                // `task` tool result, so it enters the model's context.
+                HistoryEntry::Subagent { outcome, .. } => outcome
+                    .as_ref()
+                    .map(|o| crate::tokens::count(&o.report))
+                    .unwrap_or(0),
+                // Local-command output is never sent to the agent
+                // (GOALS §1k); `/git`'s agent-bound cost is accounted
+                // via `pending_git_blocks`, not here.
+                HistoryEntry::LocalCommand { .. } => 0,
+                // A TUI-only session-boundary divider; never sent to the
+                // agent (the seed-tools' real cost lands as actual turns).
+                HistoryEntry::CompactBoundary { .. } => 0,
+                // UI-only red error line; never sent to the agent.
+                HistoryEntry::InferenceError { .. } => 0,
+                // UI-only yellow backup-fallback banner; never sent to the
+                // agent (wire-vs-user split, GOALS §14).
+                HistoryEntry::BackupWarning { .. } => 0,
+                // UI-only yellow slow-stream warning; never sent to the agent.
+                HistoryEntry::InferenceWarning { .. } => 0,
+                // A `/note` session-history annotation: local/export state
+                // only, never sent to the model — so it costs zero context
+                // (the critical invariant, mirrored in rehydration).
+                HistoryEntry::UserNote { .. } => 0,
+                // The auto-injected-skill row is the user-facing half of the
+                // wire-vs-user split; the body's real cost lands as the user
+                // message it rides, so this row itself costs zero context.
+                HistoryEntry::SkillAutoInjected { .. } => 0,
+            };
+        }
+        tokens.min(u32::MAX as usize) as u32
+    }
+
+    /// Cheap content-length fingerprint over the same fields
+    /// `compute_history_tokens` reads. Detects appends *and* in-place
+    /// edits (e.g. tool output landing on an existing `ToolBox`) without
+    /// tokenizing; a same-length edit only costs a stale count until the
+    /// next real change — fine for a display estimate.
+    fn history_signature(&self) -> u64 {
+        let mut sig = self.history.len() as u64;
+        for entry in &self.history {
+            let len = match entry {
+                HistoryEntry::User { text, .. } => text.len(),
+                HistoryEntry::Plain { line }
+                | HistoryEntry::CommandError { line }
+                | HistoryEntry::Maintenance { line } => line.len(),
+                HistoryEntry::ToolLine { summary, .. } => summary.len(),
+                HistoryEntry::ToolBox { calls, .. } => {
+                    calls.iter().map(|c| c.summary.len() + c.output.len()).sum()
+                }
+                HistoryEntry::Diff { old, new, .. } => old.len() + new.len(),
+                HistoryEntry::Agent {
+                    text, reasoning, ..
+                } => text.len() + reasoning.len(),
+                // Add 1 for the settled state so the None→Some transition
+                // (which adds the report to context) busts the cache even
+                // for an empty report.
+                HistoryEntry::Subagent { outcome, .. } => {
+                    outcome.as_ref().map(|o| o.report.len() + 1).unwrap_or(0)
+                }
+                HistoryEntry::LocalCommand { .. } => 0,
+                HistoryEntry::CompactBoundary {
+                    predecessor_short_id,
+                    brief,
+                    expanded,
+                    ..
+                } => {
+                    predecessor_short_id.len()
+                        + usize::from(*expanded) * brief.as_ref().map_or(0, |b| b.len())
+                }
+                HistoryEntry::InferenceError {
+                    summary,
+                    detail,
+                    expanded,
+                } => summary.len() + detail.len() + usize::from(*expanded),
+                HistoryEntry::BackupWarning { line } => line.len(),
+                HistoryEntry::InferenceWarning { line } => line.len(),
+                HistoryEntry::UserNote { text, .. } => text.len(),
+                HistoryEntry::SkillAutoInjected { name, reason } => {
+                    name.len() + reason.as_ref().map_or(0, |r| r.len())
+                }
+            };
+            sig = sig.wrapping_mul(31).wrapping_add(len as u64);
+        }
+        sig
+    }
+
+    pub(super) fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
+        // `@`-popup takes precedence over the vim hint when active.
+        if self.at_popup_active() {
+            self.render_at_popup(frame, area);
+            return;
+        }
+        // Vim hint preempts the popup when the composer is in Normal
+        // mode and the user hasn't opted out via the vim_mode setting.
+        if self.slash_query().is_none() {
+            if self.show_vim_hint() {
+                let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Press ", muted),
+                    Span::styled("`i`", Style::default().fg(WARNING_TEXT)),
+                    Span::styled(" to resume typing. Disable vim mode in ", muted),
+                    Span::styled("/settings", muted),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+            }
+            return;
+        }
+        // `slash_suggestions` returns the full match set; this renderer
+        // windows it to the autocomplete-rows budget and pads blanks below
+        // so the popup keeps a stable 6-row footprint regardless of match
+        // count.
+        let matches = self.slash_suggestions();
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+
+        let mut lines: Vec<Line<'static>> = if matches.is_empty() {
+            vec![Line::from(vec![
+                Span::raw("  "),
+                Span::styled("no matching command", Style::default().fg(ERROR_TEXT)),
+            ])]
+        } else {
+            let window = AUTOCOMPLETE_ROWS as usize;
+            // Clamp defensively: the match set can shrink between a
+            // keypress and this render (the user typed another char).
+            let selected = self.slash_selected.min(matches.len().saturating_sub(1));
+            let offset = super::windowed_scroll(selected, self.slash_scroll, matches.len(), window);
+            let name_w = matches.iter().map(|c| c.name().len()).max().unwrap_or(0);
+            matches
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(window)
+                .map(|(i, cmd)| {
+                    let is_sel = i == selected;
+                    let marker = if is_sel { "▸ " } else { "  " };
+                    let name_padded = format!("/{:<width$}", cmd.name(), width = name_w);
+                    let name_style = if is_sel {
+                        Style::default().fg(WARNING_TEXT)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled(name_padded, name_style),
+                        Span::raw("  "),
+                        Span::styled(cmd.description(self), muted),
+                    ])
+                })
+                .collect()
+        };
+        while (lines.len() as u16) < AUTOCOMPLETE_ROWS {
+            lines.push(Line::default());
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    pub(super) fn render_at_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let suggestions = self.at_suggestions();
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines: Vec<Line<'static>> = if suggestions.is_empty() {
+            vec![Line::from(vec![
+                Span::raw("  "),
+                Span::styled("no matching file", Style::default().fg(ERROR_TEXT)),
+            ])]
+        } else {
+            let window = AUTOCOMPLETE_ROWS as usize;
+            let selected = self.at_selected.min(suggestions.len().saturating_sub(1));
+            // Clamp the stored scroll offset defensively (the list can
+            // shrink between a keypress and this render).
+            let offset = crate::tui::app::windowed_scroll(
+                selected,
+                self.at_scroll,
+                suggestions.len(),
+                window,
+            );
+            suggestions
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(window)
+                .map(|(i, sug)| {
+                    let is_sel = i == selected;
+                    let marker = if is_sel { "▸ " } else { "  " };
+                    // Allowlisted-but-gitignored entries render in the subdued
+                    // color even when not selected, marking them as
+                    // normally-gitignored-but-allowed
+                    // (implementation note).
+                    let name_style = if is_sel {
+                        Style::default().fg(WARNING_TEXT)
+                    } else if sug.gitignored {
+                        muted
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let kind = if sug.is_dir { "dir" } else { "file" };
+                    let mut spans = vec![
+                        Span::raw(marker),
+                        Span::styled(format!("@{}", sug.display), name_style),
+                        Span::raw("  "),
+                        Span::styled(kind.to_string(), muted),
+                    ];
+                    if sug.gitignored {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled("gitignored", muted));
+                    }
+                    Line::from(spans)
+                })
+                .collect()
+        };
+        while (lines.len() as u16) < AUTOCOMPLETE_ROWS {
+            lines.push(Line::default());
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Lay out and render the embedded pane (GOALS §1i) inside `body`,
+    /// resizing the PTY to fit. Returns the rect the chat history should
+    /// use (the whole body when no pane, the chat side of a split, or
+    /// `None` when a fullscreen pane covers the body). Also stashes the
+    /// pane/divider/body rects for the mouse handler.
+    pub(super) fn render_pane(&mut self, frame: &mut ratatui::Frame, body: Rect) -> Option<Rect> {
+        if self.pane.is_none() {
+            self.pane_rect = None;
+            self.divider = None;
+            self.pane_body = None;
+            return Some(body);
+        }
+        let (chat_rect, pane_rect, divider) = split_body(self.pane_side, self.pane_ratio, body);
+        if let Some(pane) = self.pane.as_mut() {
+            pane.resize(pane_rect.height, pane_rect.width);
+        }
+        self.pane_rect = Some(pane_rect);
+        self.divider = divider;
+        self.pane_body = Some(body);
+        if let Some((drect, vertical)) = divider {
+            self.render_divider(frame, drect, vertical);
+        }
+        if let Some(pane) = self.pane.as_ref() {
+            pane.render(frame, pane_rect);
+        }
+        chat_rect
+    }
+
+    /// Draw the split divider. Brighter when the pane is focused so the
+    /// divider doubles as a focus indicator.
+    fn render_divider(&self, frame: &mut ratatui::Frame, rect: Rect, vertical: bool) {
+        let color = if self.pane_focused {
+            DIVIDER_FOCUSED
+        } else {
+            DIVIDER_DIM
+        };
+        let style = Style::default().fg(color);
+        if vertical {
+            let lines: Vec<Line<'static>> = (0..rect.height)
+                .map(|_| Line::from(Span::styled("│", style)))
+                .collect();
+            frame.render_widget(Paragraph::new(lines), rect);
+        } else {
+            let bar = "─".repeat(rect.width as usize);
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(bar, style))), rect);
+        }
+    }
+
+    fn render_footer_agent_picker(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.footer_picker_row_hits.clear();
+        let Some(picker) = self.footer_agent_picker.as_ref() else {
+            return;
+        };
+        let block = Block::default().borders(Borders::ALL).title(" agent ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let current = self
+            .agent_path
+            .first()
+            .map(String::as_str)
+            .unwrap_or(self.launch.agent_name.as_str());
+        let window = layout[0].height as usize;
+        let offset = super::windowed_scroll(picker.cursor, 0, picker.entries.len(), window.max(1));
+        let mut lines = Vec::new();
+        for (idx, name) in picker.entries.iter().enumerate().skip(offset).take(window) {
+            let highlighted = idx == picker.cursor;
+            let marker = if highlighted { "▸ " } else { "  " };
+            let style = if highlighted {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut spans = vec![
+                Span::raw(marker.to_string()),
+                Span::styled(name.clone(), style),
+            ];
+            if name == current {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("[current]".to_string(), muted));
+            }
+            lines.push(Line::from(spans));
+            let row = layout[0].y + lines.len() as u16 - 1;
+            if row < layout[0].y + layout[0].height {
+                self.footer_picker_row_hits.push(super::FooterPickerRowHit {
+                    kind: super::FooterPickerKind::Agent,
+                    index: idx,
+                    rect: Rect::new(layout[0].x, row, layout[0].width, 1),
+                });
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled("(no agents)".to_string(), muted)));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "↑/↓  enter: switch  esc: cancel".to_string(),
+                muted,
+            ))),
+            layout[1],
+        );
+    }
+
+    fn render_footer_mode_picker(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.footer_picker_row_hits.clear();
+        let Some(picker) = self.footer_mode_picker else {
+            return;
+        };
+        let block = Block::default().borders(Borders::ALL).title(" llm mode ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines = Vec::new();
+        for (idx, mode) in super::FOOTER_MODE_ORDER.iter().enumerate() {
+            let highlighted = idx == picker.cursor;
+            let marker = if highlighted { "▸ " } else { "  " };
+            let style = if highlighted {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut spans = vec![
+                Span::raw(marker.to_string()),
+                Span::styled(mode.as_str().to_string(), style),
+            ];
+            if *mode == self.llm_mode {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("[current]".to_string(), muted));
+            }
+            lines.push(Line::from(spans));
+            let row = layout[0].y + idx as u16;
+            if row < layout[0].y + layout[0].height {
+                self.footer_picker_row_hits.push(super::FooterPickerRowHit {
+                    kind: super::FooterPickerKind::Mode,
+                    index: idx,
+                    rect: Rect::new(layout[0].x, row, layout[0].width, 1),
+                });
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "↑/↓  enter: switch  esc: cancel".to_string(),
+                muted,
+            ))),
+            layout[1],
+        );
+    }
+
+    pub(super) fn render_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        // Caffeination glyph (☕) leads the right-hand chrome while active,
+        // driven by the daemon-broadcast state (GOALS §1a). Additive to the
+        // fixed cwd + branch chrome — never displaces it.
+        // Side-conversation indicator (`/side`) leads the right-hand chrome
+        // while a throwaway side conversation is open, ahead of the ☕ glyph.
+        // Additive to the fixed cwd + branch chrome — never displaces it.
+        // Plan-status indicator (`plan-status-chrome-and-resolver.md`) leads
+        // the right-hand chrome when this project has unfinished plans, driven
+        // by daemon-broadcast state. Additive to the fixed cwd + branch chrome
+        // (GOALS §1a) — never displaces it, the same pattern as the ☕ glyph.
+        // Transient "waiting for lock" indicator
+        // (`readlock-wait-and-lock-expiry.md`) leads the right-hand chrome
+        // while a `readlock` is blocked on a contended lock. Additive — never
+        // displaces a fixed slot, the same pattern as the ☕ glyph.
+        let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
+        right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
+        right.extend(chrome::org_sync_spans(self.org_sync_disclosure.as_ref()));
+        right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
+        right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
+        right.extend(chrome::status_line_spans(&self.launch));
+        let status = chrome::left_status(
+            &self.launch,
+            self.llm_mode,
+            &self.agent_path,
+            self.footer_selection,
+        );
+        let mut left = status.spans;
+        // Transient async-schedule strip (GOALS §22): only when ≥1 scheduled
+        // task is active, appended to the bottom-left so the fixed chrome
+        // (model/agent) is undisturbed.
+        if !self.active_schedules.is_empty() {
+            let scheduled: Vec<(String, String, u64)> = self
+                .active_schedules
+                .values()
+                .map(|j| (j.kind.clone(), j.label.clone(), j.iteration))
+                .collect();
+            left.extend(chrome::schedule_strip_spans(&scheduled));
+        }
+        if let Some(hint) = self.copy_pick_target_hint() {
+            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
+            left.push(Span::styled(
+                hint,
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            ));
+        }
+        if self.footer_selection.is_some() {
+            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
+            left.push(Span::styled(
+                "←/→ cycle · enter choose · esc clear".to_string(),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            ));
+        }
+        let right_width: u16 = right
+            .iter()
+            .map(|s| s.width() as u16)
+            .sum::<u16>()
+            .min(area.width);
+        let bottom =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
+        self.footer_hit_areas = status
+            .hits
+            .into_iter()
+            .filter_map(|hit| {
+                let start = hit.start.min(bottom[0].width);
+                let end = hit.end.min(bottom[0].width);
+                (end > start).then_some(super::FooterHitArea {
+                    control: hit.control,
+                    rect: Rect::new(bottom[0].x + start, bottom[0].y, end - start, 1),
+                })
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(Line::from(left)), bottom[0]);
+        frame.render_widget(Paragraph::new(Line::from(right)), bottom[1]);
+    }
+}
+
+struct ContextIndicatorChip {
+    x: u16,
+    width: u16,
+    label: String,
+}
+
+fn toast_fg(kind: ToastKind) -> Color {
+    match kind {
+        ToastKind::Success => SUCCESS_TEXT,
+        ToastKind::Warning => WARNING_TEXT,
+        ToastKind::Error => ERROR_TEXT,
+        ToastKind::Info => INFO_TEXT,
+    }
+}
+
+/// Render a toast over the status-line rect. Single line; left-padded
+/// one cell; foreground color encodes intent (green/yellow/red/grey).
+/// Uses `Clear` so the status text underneath doesn't bleed through.
+fn render_toast(frame: &mut ratatui::Frame, status_rect: Rect, toast: &Toast) {
+    use ratatui::widgets::Clear;
+    if status_rect.height == 0 || status_rect.width == 0 {
+        return;
+    }
+    let fg = toast_fg(toast.kind);
+    let text = format!(" {} ", toast.text);
+    // Truncate to fit if the message is longer than the status row.
+    let max = status_rect.width as usize;
+    let display: String = if text.chars().count() > max {
+        let cap = max.saturating_sub(1);
+        let truncated: String = text.chars().take(cap).collect();
+        format!("{truncated}…")
+    } else {
+        text
+    };
+    frame.render_widget(Clear, status_rect);
+    let para = Paragraph::new(Line::from(Span::styled(
+        display,
+        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(para, status_rect);
+}
+
+fn prewrap_chat_rows(
+    lines: Vec<Line<'static>>,
+    row_meta: Vec<ChatRowMeta>,
+    msg_abs_line: HashMap<usize, usize>,
+    width: usize,
+) -> ChatRows {
+    if width == 0 {
+        return (lines, row_meta, msg_abs_line);
+    }
+
+    let mut visual_lines = Vec::new();
+    let mut visual_meta = Vec::new();
+    let mut row_map = HashMap::new();
+
+    for (row, line) in lines.into_iter().enumerate() {
+        let wrapped = wrap_line_to_visual_rows(line, width);
+        let first_visual = visual_lines.len();
+        row_map.insert(row, first_visual);
+
+        for (part_idx, (visual, start_col, end_col)) in wrapped.into_iter().enumerate() {
+            visual_lines.push(visual);
+            let mut meta = row_meta
+                .get(row)
+                .cloned()
+                .unwrap_or_else(ChatRowMeta::padding);
+            meta.continuation = meta.continuation || part_idx > 0;
+            meta.pin_hit = meta
+                .pin_hit
+                .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
+            visual_meta.push(meta);
+        }
+    }
+
+    let msg_abs_line = msg_abs_line
+        .into_iter()
+        .filter_map(|(idx, row)| row_map.get(&row).copied().map(|visual| (idx, visual)))
+        .collect();
+
+    (visual_lines, visual_meta, msg_abs_line)
+}
+
+fn pin_hit_for_visual_row(hit: PinHit, start_col: usize, end_col: usize) -> Option<PinHit> {
+    let hit_start = hit.col_start as usize;
+    let hit_end = hit.col_end as usize;
+    let clipped_start = hit_start.max(start_col);
+    let clipped_end = hit_end.min(end_col);
+    (clipped_start < clipped_end).then_some(PinHit {
+        seq: hit.seq,
+        col_start: (clipped_start - start_col) as u16,
+        col_end: (clipped_end - start_col) as u16,
+    })
+}
+
+fn wrap_line_to_visual_rows(
+    line: Line<'static>,
+    width: usize,
+) -> Vec<(Line<'static>, usize, usize)> {
+    let line_width = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum::<usize>();
+    if line_width <= width {
+        return vec![(line, 0, line_width)];
+    }
+
+    let mut rows = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+    let mut row_start = 0usize;
+    let line_style = line.style;
+    let line_alignment = line.alignment;
+
+    for span in line.spans {
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if current_width > 0 && current_width + ch_width > width {
+                rows.push((
+                    Line {
+                        spans: std::mem::take(&mut current_spans),
+                        style: line_style,
+                        alignment: line_alignment,
+                    },
+                    row_start,
+                    row_start + current_width,
+                ));
+                row_start += current_width;
+                current_width = 0;
+            }
+            current_spans.push(Span {
+                content: Cow::Owned(ch.to_string()),
+                style: span.style,
+            });
+            current_width += ch_width;
+            if current_width >= width {
+                rows.push((
+                    Line {
+                        spans: std::mem::take(&mut current_spans),
+                        style: line_style,
+                        alignment: line_alignment,
+                    },
+                    row_start,
+                    row_start + current_width,
+                ));
+                row_start += current_width;
+                current_width = 0;
+            }
+        }
+    }
+
+    if !current_spans.is_empty() || rows.is_empty() {
+        rows.push((
+            Line {
+                spans: current_spans,
+                style: line_style,
+                alignment: line_alignment,
+            },
+            row_start,
+            row_start + current_width,
+        ));
+    }
+    rows
+}
+
+/// Snapshot the chat-area cells into a `(row, col) → symbol` grid so
+/// the copy path can reconstruct selected plaintext without redoing
+/// ratatui's wrap. Run after `frame.render_widget(...)` so the cells
+/// reflect what the user actually sees.
+fn capture_grid(buf: &ratatui::buffer::Buffer, area: Rect) -> Vec<Vec<String>> {
+    let mut grid = Vec::with_capacity(area.height as usize);
+    for y in 0..area.height {
+        let mut row = Vec::with_capacity(area.width as usize);
+        for x in 0..area.width {
+            let abs_x = area.x + x;
+            let abs_y = area.y + y;
+            if let Some(cell) = buf.cell((abs_x, abs_y)) {
+                row.push(cell.symbol().to_string());
+            } else {
+                row.push(String::new());
+            }
+        }
+        grid.push(row);
+    }
+    grid
+}
+
+fn chat_visible_top(total: usize, visible: usize, offset: usize) -> usize {
+    total.saturating_sub(visible).saturating_sub(offset)
+}
+
+fn chat_offset_for_top(total: usize, visible: usize, top: usize) -> usize {
+    if total <= visible {
+        return 0;
+    }
+    total
+        .saturating_sub(visible)
+        .saturating_sub(top.min(total.saturating_sub(visible)))
+}
+
+/// Apply the drag-select highlight to the chat area. Invert each
+/// selected cell's fg/bg via the `REVERSED` modifier — same visual
+/// affordance terminal selection uses, and it survives any underlying
+/// color theme.
+///
+/// Highlights only the *content range* of each row: from the first
+/// non-whitespace cell to the last non-whitespace cell. Cells outside
+/// that range (left/right padding, end-of-line gap) stay un-inverted.
+/// In-content spaces (between words) are highlighted so the selection
+/// reads as a continuous bar rather than a gappy one. Chip rows
+/// (`chip_row_mask`) are skipped entirely.
+fn render_chat_scroll_indicator(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    scroll_offset: usize,
+    in_progress: bool,
+    style: Style,
+) {
+    if scroll_offset == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let full = if in_progress {
+        format!("↓ streaming ({scroll_offset} more)")
+    } else {
+        format!("↓ {scroll_offset} more")
+    };
+    let text = if area.width as usize > full.width() {
+        full
+    } else if in_progress && area.width as usize > "↓ streaming".width() {
+        "↓ streaming".to_string()
+    } else if area.width as usize > "↓".width() {
+        "↓".to_string()
+    } else {
+        return;
+    };
+    let start_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(1))
+        .saturating_sub(text.width() as u16);
+    let y = area.y.saturating_add(area.height.saturating_sub(1));
+    buf.set_string(start_x, y, text, style);
+}
+
+fn rendered_line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn render_transcript_find_bar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    find: Option<&TranscriptFind>,
+    style: Style,
+) {
+    let Some(find) = find else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let y = area.y.saturating_add(area.height.saturating_sub(1));
+    let counter = if find.query.is_empty() {
+        String::new()
+    } else if let Some(current) = find.current {
+        format!("{}/{}", current + 1, find.matches.len())
+    } else {
+        "no matches".to_string()
+    };
+    let prefix = "find: ";
+    let cursor = "▏";
+    let reserve = if counter.is_empty() {
+        0
+    } else {
+        counter.width() + 1
+    };
+    let usable = width.saturating_sub(prefix.width() + cursor.width() + reserve);
+    let query = if usable == 0 {
+        String::new()
+    } else {
+        tail_ellipsis(&find.query, usable)
+    };
+    let left = format!("{prefix}{query}{cursor}");
+    buf.set_string(area.x, y, left, style);
+    if !counter.is_empty() && width > counter.width() + 1 {
+        let start_x = area
+            .x
+            .saturating_add(area.width.saturating_sub(counter.width() as u16));
+        buf.set_string(start_x, y, counter, style);
+    }
+}
+
+fn tail_ellipsis(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars().rev() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width > max_width - 1 {
+            break;
+        }
+        out.insert(0, ch);
+        width += ch_width;
+    }
+    format!("…{out}")
+}
+
+fn apply_transcript_find_highlight(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    find: &TranscriptFind,
+    total_lines: usize,
+    visible_lines: usize,
+    scroll_offset: usize,
+    lines: &[String],
+) {
+    let Some(current) = find.current else {
+        return;
+    };
+    let Some(&abs) = find.matches.get(current) else {
+        return;
+    };
+    let rel = if total_lines < area.height as usize {
+        area.height as usize - total_lines + abs
+    } else {
+        let top = total_lines
+            .saturating_sub(visible_lines.max(1))
+            .saturating_sub(scroll_offset);
+        let Some(rel) = abs.checked_sub(top) else {
+            return;
+        };
+        rel
+    };
+    if rel >= area.height as usize {
+        return;
+    }
+    let Some(line) = lines.get(abs) else {
+        return;
+    };
+    let query = find.query.to_lowercase();
+    if query.is_empty() {
+        return;
+    }
+    let folded = line.to_lowercase();
+    let Some(start_byte) = folded.find(&query) else {
+        return;
+    };
+    if !line.is_char_boundary(start_byte) {
+        return;
+    }
+    let end_byte = (start_byte + find.query.len()).min(line.len());
+    if !line.is_char_boundary(end_byte) {
+        return;
+    }
+    let start_col = line[..start_byte].width();
+    let width = line[start_byte..end_byte].width().max(1);
+    let y = area.y.saturating_add(rel as u16);
+    let first = area.x.saturating_add(start_col as u16);
+    let last = first
+        .saturating_add(width as u16)
+        .saturating_sub(1)
+        .min(area.x.saturating_add(area.width.saturating_sub(1)));
+    for col in first..=last {
+        if let Some(cell) = buf.cell_mut((col, y)) {
+            let style = cell.style().add_modifier(Modifier::REVERSED);
+            cell.set_style(style);
+        }
+    }
+}
+
+fn apply_selection_highlight(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    sel: Selection,
+    chip_row_mask: &[bool],
+    chat_text_grid: &[Vec<String>],
+) {
+    let (start, end) = sel.ordered();
+    let left = area.x;
+    let right = area.x + area.width.saturating_sub(1);
+    let top = area.y;
+    let bottom = area.y + area.height.saturating_sub(1);
+    for row in start.1..=end.1 {
+        if row < top || row > bottom {
+            continue;
+        }
+        let chat_rel = row.saturating_sub(area.y) as usize;
+        if chip_row_mask.get(chat_rel).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(grid_row) = chat_text_grid.get(chat_rel) else {
+            continue;
+        };
+        let Some((content_first, content_last)) = content_bounds(grid_row) else {
+            // Row is entirely whitespace (bottom-align padding,
+            // blank gap) — nothing to highlight.
+            continue;
+        };
+        let sel_first = if row == start.1 { start.0 } else { left };
+        let sel_last = if row == end.1 { end.0 } else { right };
+        let content_first_abs = (area.x as usize + content_first) as u16;
+        let content_last_abs = (area.x as usize + content_last) as u16;
+        let highlight_first = sel_first.max(content_first_abs);
+        let highlight_last = sel_last.min(content_last_abs);
+        if highlight_first > highlight_last {
+            continue;
+        }
+        for col in highlight_first..=highlight_last {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                let mut style = cell.style();
+                style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// `(first_content_col, last_content_col)` for a row of the chat
+/// grid, or `None` if the row is entirely whitespace. Used by the
+/// highlight pass to draw the inversion only across content cells.
+fn content_bounds(row: &[String]) -> Option<(usize, usize)> {
+    let first = row
+        .iter()
+        .position(|c| !c.chars().all(|ch| ch.is_whitespace()))?;
+    let last = row
+        .iter()
+        .rposition(|c| !c.chars().all(|ch| ch.is_whitespace()))?;
+    Some((first, last))
+}
+
+/// Extract the plaintext under the active drag-selection from the
+/// cached chat grid. Walks the selection in reading order: first row
+/// from start.col to row-end, full intermediate rows, last row from
+/// row-start to end.col.
+///
+/// Two refinements on top of the cell-by-cell extraction:
+///
+/// 1. **Strip the agent-message left padding.** Each row gets at most
+///    `AGENT_INDENT` leading spaces removed, preserving any *extra*
+///    indent (code-block indentation, list nesting) above that base.
+///    `\u{a0}` (NBSP) is intentionally preserved because that's a
+///    user-meaningful character.
+/// 2. **Selection mask parity.** Rows marked non-selectable in
+///    [`ChatRowMeta`] are skipped, matching the highlight pass.
+/// 3. **Soft-wrap rejoin.** When a row is a continuation of the
+///    previous logical line (per [`ChatRowMeta::continuation`]), join it
+///    with a space instead of a newline so a wrapped paragraph pastes as
+///    one paragraph, not a stack of short visual lines. Hard line breaks
+///    (paragraph boundaries) still produce newlines.
+pub(super) fn extract_selection_plaintext(
+    grid: &[Vec<String>],
+    row_meta: &[ChatRowMeta],
+    area: Rect,
+    sel: Selection,
+) -> String {
+    use crate::tui::history::AGENT_INDENT;
+    let (start, end) = sel.ordered();
+    let mut out = String::new();
+    let mut first_emitted = true;
+    for abs_row in start.1..=end.1 {
+        let grid_row = abs_row.saturating_sub(area.y) as usize;
+        let Some(meta) = row_meta.get(grid_row) else {
+            continue;
+        };
+        if !meta.selectable {
+            continue;
+        }
+        let Some(row) = grid.get(grid_row) else {
+            continue;
+        };
+        let first_col = if abs_row == start.1 {
+            start.0.saturating_sub(area.x) as usize
+        } else {
+            0
+        };
+        let last_col = if abs_row == end.1 {
+            end.0.saturating_sub(area.x) as usize
+        } else {
+            row.len().saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in first_col..=last_col {
+            if let Some(symbol) = row.get(col) {
+                line.push_str(symbol);
+            }
+        }
+        // Drop trailing spaces — bottom-align padding and end-of-line
+        // gaps would otherwise turn into ugly trailing whitespace.
+        let trimmed = line.trim_end_matches(' ').to_string();
+        // Strip up to AGENT_INDENT leading spaces. Extra indent
+        // (code blocks, nested lists) survives.
+        let leading_spaces = trimmed.chars().take_while(|c| *c == ' ').count();
+        let strip = leading_spaces.min(AGENT_INDENT);
+        let stripped: String = trimmed.chars().skip(strip).collect();
+        // Join: space for soft-wrap continuations, newline for hard
+        // line boundaries. First emitted row never gets a leading
+        // separator.
+        if first_emitted {
+            first_emitted = false;
+        } else {
+            out.push(if meta.continuation { ' ' } else { '\n' });
+        }
+        out.push_str(&stripped);
+    }
+    out
+}
+
+/// Rough row count for a history entry. Mirrors the breakdown in
+/// `total_history_lines` so the spill math is consistent.
+// Retained for the per-entry spill math; not yet called.
+#[allow(dead_code)]
+fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
+    match entry {
+        HistoryEntry::Plain { .. }
+        | HistoryEntry::CommandError { .. }
+        | HistoryEntry::Maintenance { .. } => 1,
+        HistoryEntry::InferenceError {
+            detail, expanded, ..
+        } => {
+            if *expanded {
+                detail.lines().count().max(1).saturating_add(1) as u16
+            } else {
+                1
+            }
+        }
+        HistoryEntry::BackupWarning { .. } | HistoryEntry::InferenceWarning { .. } => 1,
+        HistoryEntry::CompactBoundary {
+            brief, expanded, ..
+        } => compact_boundary_row_estimate(brief.as_deref(), *expanded),
+        HistoryEntry::ToolLine { .. } => 1,
+        HistoryEntry::LocalCommand { output, .. } => {
+            (output.lines().count() as u16).saturating_add(1)
+        }
+        HistoryEntry::ToolBox {
+            calls, expanded, ..
+        } => toolbox_row_estimate(calls, *expanded),
+        HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
+        HistoryEntry::User { text, .. } => (text.matches('\n').count() as u16 + 1) + 2,
+        // Header row + one row per body line (no bubble borders).
+        HistoryEntry::UserNote { text, .. } => (text.matches('\n').count() as u16 + 1) + 1,
+        // The `/{name} · injected by agent` row, plus the `  └ <reason>`
+        // sub-line when a reason is present.
+        HistoryEntry::SkillAutoInjected { reason, .. } => 1 + reason.is_some() as u16,
+        HistoryEntry::Agent {
+            text,
+            reasoning,
+            expanded,
+            ..
+        } => {
+            let mut rows = text.matches('\n').count() as u16 + 1;
+            if !reasoning.trim().is_empty() {
+                rows = rows.saturating_add(1);
+                if *expanded {
+                    rows = rows.saturating_add(reasoning.lines().count() as u16);
+                }
+            }
+            rows
+        }
+        HistoryEntry::Subagent {
+            outcome, expanded, ..
+        } => match outcome {
+            None => 1,
+            Some(o) => {
+                if o.report.trim().is_empty() {
+                    1
+                } else {
+                    let lines = o.report.lines().count() as u16;
+                    let body = if *expanded {
+                        lines.saturating_add(1)
+                    } else {
+                        lines
+                            .min(crate::tui::history::SUBAGENT_PREVIEW_LINES as u16)
+                            .saturating_add(1)
+                    };
+                    body.saturating_add(1)
+                }
+            }
+        },
+    }
+}
+
+/// `1234 → "1.2k"`, `820 → "820"`. For the context indicator when no
+/// max-context is known.
+fn format_token_count(n: u32) -> String {
+    if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// The fresh-chat context-indicator label (`X tokens in <file>`), or
+/// `None` to fall back to the normal context display. Shown only on a
+/// truly fresh chat — no history and no provider usage yet — and only
+/// when a guidance file was found (`file` is `Some`). `guidance_tokens`
+/// is the guidance-file *body* size; the fallback context display
+/// reflects the full system prompt separately. Pure so the
+/// trigger/revert logic is unit-testable without standing up an `App`.
+fn fresh_chat_guidance_label(
+    history_empty: bool,
+    has_usage: bool,
+    file: Option<&str>,
+    guidance_tokens: u64,
+) -> Option<String> {
+    if !history_empty || has_usage {
+        return None;
+    }
+    let file = file?;
+    let n = guidance_tokens.min(u32::MAX as u64) as u32;
+    Some(format!("{} tokens in {file}", format_token_count(n)))
+}
+
+/// Split `body` for an embedded pane (GOALS §1i). Returns
+/// `(chat_rect, pane_rect, divider)` where `divider` is
+/// `(rect, is_vertical)`. Fullscreen — and bodies too small to split —
+/// give the whole body to the pane with no chat rect and no divider.
+fn split_body(
+    side: PaneSide,
+    ratio: f32,
+    body: Rect,
+) -> (Option<Rect>, Rect, Option<(Rect, bool)>) {
+    let ratio = ratio.clamp(0.15, 0.85);
+    match side {
+        PaneSide::Full => (None, body, None),
+        PaneSide::Left | PaneSide::Right => {
+            if body.width < 3 {
+                return (None, body, None);
+            }
+            // Reserve ≥1 col for chat and 1 for the divider.
+            let max_pane = body.width.saturating_sub(2);
+            let pane_w = ((body.width as f32 * ratio).round() as u16).clamp(1, max_pane);
+            let chat_w = body.width - pane_w - 1;
+            if side == PaneSide::Left {
+                let pane = Rect::new(body.x, body.y, pane_w, body.height);
+                let div = Rect::new(body.x + pane_w, body.y, 1, body.height);
+                let chat = Rect::new(body.x + pane_w + 1, body.y, chat_w, body.height);
+                (Some(chat), pane, Some((div, true)))
+            } else {
+                let chat = Rect::new(body.x, body.y, chat_w, body.height);
+                let div = Rect::new(body.x + chat_w, body.y, 1, body.height);
+                let pane = Rect::new(body.x + chat_w + 1, body.y, pane_w, body.height);
+                (Some(chat), pane, Some((div, true)))
+            }
+        }
+        PaneSide::Top | PaneSide::Bottom => {
+            if body.height < 3 {
+                return (None, body, None);
+            }
+            let max_pane = body.height.saturating_sub(2);
+            let pane_h = ((body.height as f32 * ratio).round() as u16).clamp(1, max_pane);
+            let chat_h = body.height - pane_h - 1;
+            if side == PaneSide::Top {
+                let pane = Rect::new(body.x, body.y, body.width, pane_h);
+                let div = Rect::new(body.x, body.y + pane_h, body.width, 1);
+                let chat = Rect::new(body.x, body.y + pane_h + 1, body.width, chat_h);
+                (Some(chat), pane, Some((div, false)))
+            } else {
+                let chat = Rect::new(body.x, body.y, body.width, chat_h);
+                let div = Rect::new(body.x, body.y + chat_h, body.width, 1);
+                let pane = Rect::new(body.x, body.y + chat_h + 1, body.width, pane_h);
+                (Some(chat), pane, Some((div, false)))
+            }
+        }
+    }
+}
+
+/// First line of `s`, hard-clipped to `width` columns with a trailing
+/// `…` when truncated. Used by the queue strip; only previews the first
+/// line of multi-line queued messages to keep the box compact.
+fn first_line_truncated(s: &str, width: usize) -> String {
+    truncate_display_width(s, width)
+}
+
+fn input_visual_rows(measured: &str, prefix: usize, wrap_width: usize) -> usize {
+    let budget = wrap_width.saturating_sub(prefix).max(1);
+    let lines: Vec<&str> = if measured.is_empty() {
+        vec![""]
+    } else {
+        measured.split('\n').collect()
+    };
+    lines
+        .iter()
+        .map(|line| wrap_display_chunks(line, budget).len().max(1))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Invert (REVERSED) the cells covering the composer's visual selection
+/// byte range `[lo, hi)`. Walks the range char by char, mapping each
+/// char's byte offset to a visual (row, col) via the composer display-width
+/// mapper
+/// and inverting that cell. A linewise selection's trailing `\n` maps to
+/// the line-start of the next row; we stop at `hi` so it's never drawn.
+/// Cells scrolled out of view (above `scroll_y`) or past the inner area
+/// are skipped.
+#[allow(clippy::too_many_arguments)]
+fn apply_composer_visual_highlight(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    text: &str,
+    lo: usize,
+    hi: usize,
+    prefix: usize,
+    inner_w: usize,
+    scroll_y: u16,
+) {
+    let mut byte = lo;
+    while byte < hi {
+        let ch = match text[byte..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        // A `\n` occupies no visible cell; skip it.
+        if ch != '\n' {
+            let (vis_row, vis_col) = visual_position_for_byte(text, byte, prefix, inner_w);
+            let row = vis_row as u16;
+            if row >= scroll_y {
+                let screen_row = inner.y + (row - scroll_y);
+                let width = crate::tui::composer::display_width_char(ch).max(1);
+                for offset in 0..width {
+                    let screen_col = inner.x + vis_col as u16 + offset as u16;
+                    if screen_row < inner.y + inner.height
+                        && screen_col >= inner.x
+                        && screen_col < inner.x + inner.width
+                        && let Some(cell) = buf.cell_mut((screen_col, screen_row))
+                    {
+                        let style = cell.style().add_modifier(Modifier::REVERSED);
+                        cell.set_style(style);
+                    }
+                }
+            }
+        }
+        byte += ch.len_utf8();
+    }
+}
+
+fn wrap_ghost_line_chunks(
+    line: &str,
+    budget: usize,
+    first_row_budget: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    if line.is_empty() {
+        return vec![(0, 0, 0, 0)];
+    }
+    let first = first_row_budget.max(1);
+    if display_width(line) <= first {
+        return vec![(0, line.len(), 0, display_width(line))];
+    }
+
+    let mut out = wrap_display_chunks(line, first);
+    let Some((_, first_end, _, _)) = out.first().copied() else {
+        return vec![(0, 0, 0, 0)];
+    };
+    out.truncate(1);
+    if first_end < line.len() {
+        out.extend(
+            wrap_display_chunks(&line[first_end..], budget.max(1))
+                .into_iter()
+                .map(|(start, end, start_col, end_col)| {
+                    (start + first_end, end + first_end, start_col, end_col)
+                }),
+        );
+    }
+    out
+}
+
+/// True for tools that take an `old_string` / `new_string` pair we
+/// can render as a diff. `write` / `writeunlock` aren't in here yet
+/// because the engine doesn't surface the pre-write file content.
+pub(super) fn is_edit_tool(tool: &str) -> bool {
+    matches!(tool, "edit" | "editunlock")
+}
+
+/// Approximate row count for a `Diff` entry, used by the chat-pane
+/// sizing math. SideBySide ≈ max(old, new); Inline ≈ old + new. The
+/// chat sizer doesn't know which mode is active at this point, so
+/// we use the inline (upper-bound) estimate to avoid undersized
+/// panes — slight over-allocation is cheaper than clipping.
+pub(super) fn diff_row_estimate(old: &str, new: &str) -> u16 {
+    let old_lines = old.matches('\n').count() as u16 + 1;
+    let new_lines = new.matches('\n').count() as u16 + 1;
+    old_lines.saturating_add(new_lines).saturating_add(1) // +1 for header
+}
+
+fn compact_boundary_row_estimate(brief: Option<&str>, expanded: bool) -> u16 {
+    let body = brief.map(str::trim).filter(|s| !s.is_empty());
+    if expanded {
+        1u16.saturating_add(body.map_or(0, |brief| brief.lines().count() as u16))
+    } else {
+        1
+    }
+}
+
+/// Approximate rendered row count for a `ToolBox`. Collapsed caps at
+/// [`crate::tui::history::TOOLBOX_VISIBLE`]; expanded sums each call's
+/// input + (non-empty) output lines. Mirrors `render_toolbox`.
+pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall], expanded: bool) -> u16 {
+    use crate::tui::history::TOOLBOX_VISIBLE;
+    if !expanded {
+        return calls.len().clamp(1, TOOLBOX_VISIBLE) as u16;
+    }
+    let mut rows: u16 = 0;
+    for c in calls {
+        rows = rows.saturating_add(c.full_input.matches('\n').count() as u16 + 1);
+        if !c.output.is_empty() {
+            rows = rows.saturating_add(c.output.matches('\n').count() as u16 + 1);
+        }
+    }
+    rows.max(1)
+}
+
+/// Hybrid live context count: the provider's last authoritative total
+/// (`anchor`) plus the local estimate of tokens streamed since it was
+/// reported (`estimate - estimate_at_anchor`). The delta saturates at
+/// zero so a post-prune estimate dip can't pull the displayed value
+/// below the provider's own count; a fresh provider report re-anchors
+/// and zeroes the delta, correcting any accumulated drift.
+fn hybrid_context_tokens(anchor: u32, estimate: u32, estimate_at_anchor: u32) -> u32 {
+    anchor.saturating_add(estimate.saturating_sub(estimate_at_anchor))
+}
+
+/// `provider/model` for the reconnect status, collapsing the empty cases so
+/// a utility/test target with a blank field still reads cleanly (`provider`,
+/// `model`, or `model` alone — never a stray slash).
+fn reconnect_target_label(provider: &str, model: &str) -> String {
+    match (provider.trim(), model.trim()) {
+        ("", "") => "the model server".to_string(),
+        ("", m) => m.to_string(),
+        (p, "") => p.to_string(),
+        (p, m) => format!("{p}/{m}"),
+    }
+}
+
+/// The full reconnect status line body (sans the agent-column indent): the
+/// distinct, never-the-generic-spinner reconnect message naming the
+/// unreachable target, the attempt count, and the elapsed clock. Pure so the
+/// precedence + formatting is unit-testable.
+fn reconnect_status_text(reconnect: &super::ReconnectStatus, dots: &str, elapsed: &str) -> String {
+    format!(
+        "reconnecting{dots} {} unreachable at {} (attempt {}) {elapsed}",
+        reconnect_target_label(&reconnect.provider, &reconnect.model),
+        reconnect.url,
+        reconnect.attempt,
+    )
+}
+
+#[cfg(test)]
+mod slash_popup_full_list_tests {
+    use super::App;
+    use crate::tui::app::AUTOCOMPLETE_ROWS;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn slash_suggestions_returns_full_match_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+
+        let matches = app.slash_suggestions();
+
+        assert!(
+            matches.len() > AUTOCOMPLETE_ROWS as usize,
+            "bare slash should expose more than the visible window: {}",
+            matches.len()
+        );
+    }
+
+    #[test]
+    fn slash_popup_renders_only_visible_window_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+        assert!(app.slash_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
+
+        let backend = TestBackend::new(100, AUTOCOMPLETE_ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_popup(frame, Rect::new(0, 0, 100, AUTOCOMPLETE_ROWS));
+            })
+            .unwrap();
+
+        let filled_rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .filter(|row| row.iter().any(|cell| cell.symbol() == "/"))
+            .count();
+
+        assert_eq!(filled_rows, AUTOCOMPLETE_ROWS as usize);
+    }
+}
+
+#[cfg(test)]
+mod render_history_spacing_tests {
+    use super::{
+        App, ChatCopyTarget, ChatRowKind, Selection, TranscriptFind, extract_selection_plaintext,
+    };
+    use crate::config::extended::{DiffStyle, ThinkingDisplay};
+    use crate::db::{open_default_call_count, reset_open_default_call_count};
+    use crate::tui::history::{
+        HistoryEntry, MarkdownOpts, PendingMsg, ToolCall, ToolCallState, render_entry_call_count,
+        render_pending_call_count, reset_render_entry_call_count, reset_render_pending_call_count,
+    };
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
+
+    fn agent(text: &str) -> HistoryEntry {
+        HistoryEntry::Agent {
+            name: "Build".to_string(),
+            text: text.to_string(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            expanded: false,
+            think_duration: None,
+            seq: None,
+        }
+    }
+
+    fn user(text: &str) -> HistoryEntry {
+        HistoryEntry::User {
+            text: text.to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            preflight_pending: false,
+            persist_failed: false,
+        }
+    }
+
+    fn pinned_user(text: &str, seq: i64) -> HistoryEntry {
+        HistoryEntry::User {
+            text: text.to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(seq),
+            preflight_pending: false,
+            persist_failed: false,
+        }
+    }
+
+    fn preflight_user(text: &str) -> HistoryEntry {
+        HistoryEntry::User {
+            text: text.to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            preflight_pending: true,
+            persist_failed: false,
+        }
+    }
+
+    fn tool_box() -> HistoryEntry {
+        HistoryEntry::ToolBox {
+            calls: vec![ToolCall {
+                call_id: "call-1".to_string(),
+                tool: "bash".to_string(),
+                summary: "ls".to_string(),
+                full_input: "ls".to_string(),
+                output: String::new(),
+                state: ToolCallState::Success,
+                hint: None,
+            }],
+            view_offset: 0,
+            follow: true,
+            expanded: false,
+        }
+    }
+
+    fn expanded_tool_box(output: &str) -> HistoryEntry {
+        HistoryEntry::ToolBox {
+            calls: vec![ToolCall {
+                call_id: "call-1".to_string(),
+                tool: "bash".to_string(),
+                summary: "printf".to_string(),
+                full_input: "printf".to_string(),
+                output: output.to_string(),
+                state: ToolCallState::Success,
+                hint: None,
+            }],
+            view_offset: 0,
+            follow: true,
+            expanded: true,
+        }
+    }
+
+    fn diff_entry(path: &str) -> HistoryEntry {
+        HistoryEntry::Diff {
+            tool: "edit".to_string(),
+            path: path.to_string(),
+            old: "old line\n".to_string(),
+            new: "new line\n".to_string(),
+        }
+    }
+
+    fn compact_boundary(brief: &str) -> HistoryEntry {
+        HistoryEntry::CompactBoundary {
+            predecessor_short_id: "abc123".to_string(),
+            seed_tool_count: 1,
+            seed_tool_tokens: 0,
+            brief: Some(brief.to_string()),
+            expanded: false,
+        }
+    }
+
+    fn render_history_no_selection(app: &mut App, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| app.render_history(f, Rect::new(0, 0, width, height)))
+            .unwrap();
+    }
+
+    fn render_history(app: &mut App, width: u16, height: u16) {
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            focus: (width.saturating_sub(1), height.saturating_sub(1)),
+            active: false,
+        });
+        render_history_no_selection(app, width, height);
+    }
+
+    fn render_history_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| app.render_history(f, Rect::new(0, 0, width, height)))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<String> {
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn render_calls_after(app: &mut App, width: u16, height: u16) -> usize {
+        reset_render_entry_call_count();
+        render_history_no_selection(app, width, height);
+        render_entry_call_count()
+    }
+
+    fn row_text(app: &App, row: usize) -> String {
+        app.chat_text_grid[row].concat()
+    }
+
+    fn nonblank_rows(app: &App) -> Vec<(usize, String)> {
+        app.chat_text_grid
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| (idx, row.concat()))
+            .filter(|(_, row)| !row.trim().is_empty())
+            .collect()
+    }
+
+    fn find_row(app: &App, needle: &str) -> usize {
+        app.chat_text_grid
+            .iter()
+            .position(|row| row.concat().contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing rendered row containing {needle:?} in:\n{}",
+                    app.chat_text_grid
+                        .iter()
+                        .map(|row| row.concat())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+    }
+
+    fn extract_full_selection(app: &App, width: u16, height: u16) -> String {
+        extract_selection_plaintext(
+            &app.chat_text_grid,
+            &app.chat_row_meta,
+            Rect::new(0, 0, width, height),
+            Selection {
+                anchor: (0, 0),
+                focus: (width.saturating_sub(1), height.saturating_sub(1)),
+                active: false,
+            },
+        )
+    }
+
+    #[test]
+    fn render_history_cache_reuses_unchanged_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![user("question"), agent("answer")];
+
+        assert_eq!(render_calls_after(&mut app, 80, 8), 2);
+        app.working_msg_idx = app.working_msg_idx.wrapping_add(1);
+
+        assert_eq!(
+            render_calls_after(&mut app, 80, 8),
+            0,
+            "unrelated chrome state should not re-render stable history entries"
+        );
+    }
+
+    #[test]
+    fn render_history_uses_cached_pin_state_without_db_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.mouse_capture = true;
+        let session_id = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(session_id);
+        app.pinned_seqs_session = Some(session_id);
+        app.pinned_seqs_cache.insert(42);
+        app.history = vec![pinned_user("pin me", 42)];
+
+        reset_open_default_call_count();
+        assert_eq!(render_calls_after(&mut app, 80, 8), 1);
+        assert_eq!(open_default_call_count(), 0);
+        assert!(
+            app.pin_control_rows
+                .iter()
+                .flatten()
+                .any(|hit| hit.seq == 42),
+            "render should expose the cached pin control hit region"
+        );
+        assert_eq!(render_calls_after(&mut app, 80, 8), 0);
+        assert_eq!(open_default_call_count(), 0);
+    }
+
+    #[test]
+    fn pending_render_cache_reuses_unchanged_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.pending = Some(PendingMsg {
+            name: "Build".to_string(),
+            text: "**streaming**".to_string(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: Some(std::time::Instant::now()),
+            inside_think: false,
+            body_started: true,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: true,
+        });
+
+        reset_render_pending_call_count();
+        render_history_no_selection(&mut app, 80, 8);
+        assert_eq!(render_pending_call_count(), 1);
+        reset_render_pending_call_count();
+        app.working_msg_idx = app.working_msg_idx.wrapping_add(1);
+        render_history_no_selection(&mut app, 80, 8);
+        assert_eq!(render_pending_call_count(), 0);
+
+        app.pending.as_mut().unwrap().text.push_str(" more");
+        render_history_no_selection(&mut app, 80, 8);
+        assert_eq!(render_pending_call_count(), 1);
+        reset_render_pending_call_count();
+        render_history_no_selection(&mut app, 81, 8);
+        assert_eq!(render_pending_call_count(), 1);
+    }
+
+    #[test]
+    fn render_history_cache_invalidates_width_and_render_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![agent("**answer**")];
+
+        assert_eq!(render_calls_after(&mut app, 80, 8), 1);
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.thinking_setting = ThinkingDisplay::Verbose;
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.markdown_opts = MarkdownOpts {
+            agent: !app.markdown_opts.agent,
+            ..app.markdown_opts
+        };
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.diff_style = DiffStyle::Inline;
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.use_emojis = !app.use_emojis;
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+        assert_eq!(render_calls_after(&mut app, 81, 8), 0);
+    }
+
+    #[test]
+    fn render_history_cache_invalidates_entry_pin_and_elision_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![pinned_user("pin me", 42), tool_box()];
+
+        assert_eq!(render_calls_after(&mut app, 80, 8), 2);
+
+        app.mouse_capture = !app.mouse_capture;
+        assert_eq!(
+            render_calls_after(&mut app, 80, 8),
+            1,
+            "pin chrome state should invalidate only the pinnable row"
+        );
+
+        app.elided_event_ids.insert("call-1".to_string());
+        assert_eq!(
+            render_calls_after(&mut app, 80, 8),
+            1,
+            "elided tool-call state should invalidate the affected toolbox row"
+        );
+    }
+
+    #[test]
+    fn render_history_cache_invalidates_expanded_state_and_preflight_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![agent("answer"), preflight_user("pending")];
+
+        assert_eq!(render_calls_after(&mut app, 80, 8), 2);
+        if let HistoryEntry::Agent { expanded, .. } = &mut app.history[0] {
+            *expanded = true;
+        }
+        assert_eq!(render_calls_after(&mut app, 80, 8), 1);
+
+        app.started_at -= std::time::Duration::from_millis(333);
+        assert_eq!(
+            render_calls_after(&mut app, 80, 8),
+            1,
+            "pending preflight row should update as animated dots advance"
+        );
+
+        if let HistoryEntry::User {
+            preflight_pending, ..
+        } = &mut app.history[1]
+        {
+            *preflight_pending = false;
+        }
+        assert_eq!(render_calls_after(&mut app, 80, 8), 1);
+        app.started_at -= std::time::Duration::from_millis(333);
+        assert_eq!(
+            render_calls_after(&mut app, 80, 8),
+            0,
+            "settled preflight row should cache again and ignore elapsed time"
+        );
+    }
+
+    #[test]
+    fn render_history_skips_grid_capture_without_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "visible text".to_string(),
+        }];
+
+        render_history_no_selection(&mut app, 20, 4);
+        assert!(app.chat_text_grid.is_empty());
+
+        render_history(&mut app, 20, 4);
+        assert_eq!(app.chat_text_grid.len(), 4);
+        assert!(
+            nonblank_rows(&app)
+                .iter()
+                .any(|(_, row)| row.contains("visible text"))
+        );
+    }
+
+    #[test]
+    fn render_history_populates_find_lines_without_bottom_padding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![user("findable target")];
+
+        render_history_no_selection(&mut app, 40, 8);
+
+        assert_eq!(app.chat_find_lines.len(), app.chat_total_lines);
+        assert!(
+            app.chat_find_lines
+                .iter()
+                .any(|line| line.contains("findable target"))
+        );
+    }
+
+    #[test]
+    fn chat_row_meta_marks_bottom_padding_and_launch_banner_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = true;
+        app.history = vec![user("short")];
+
+        render_history_no_selection(&mut app, 100, 24);
+
+        assert_eq!(app.chat_row_meta.len(), app.chat_visible_lines);
+        assert!(
+            app.chat_row_meta
+                .iter()
+                .any(|meta| meta.row_kind == ChatRowKind::Padding),
+            "under-full chat pane should expose non-content padding rows"
+        );
+        let banner_rows = app
+            .chat_row_meta
+            .iter()
+            .filter(|meta| meta.row_kind == ChatRowKind::Banner)
+            .count();
+        assert_eq!(banner_rows, app.chat_banner_lines);
+    }
+
+    #[test]
+    fn transcript_find_bar_suppresses_scroll_indicator_and_shows_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "visible text".to_string(),
+        }];
+        app.chat_scroll_offset = 2;
+        app.transcript_find = Some(TranscriptFind {
+            query: "missing".to_string(),
+            matches: Vec::new(),
+            current: None,
+            saved_offset: 2,
+        });
+
+        let buffer = render_history_buffer(&mut app, 40, 4);
+
+        let rows = buffer_rows(&buffer, 40, 4);
+        assert!(rows.iter().any(|row| row.contains("find: missing")));
+        assert!(rows.iter().any(|row| row.contains("no matches")));
+        assert!(rows.iter().all(|row| !row.contains("more")));
+    }
+
+    #[test]
+    fn transcript_find_highlights_current_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "alpha needle omega".to_string(),
+        }];
+        render_history_no_selection(&mut app, 40, 4);
+        let abs = app
+            .chat_find_lines
+            .iter()
+            .position(|line| line.contains("needle"))
+            .unwrap();
+        app.transcript_find = Some(TranscriptFind {
+            query: "needle".to_string(),
+            matches: vec![abs],
+            current: Some(0),
+            saved_offset: 0,
+        });
+
+        let buf = render_history_buffer(&mut app, 40, 4);
+        let row = find_row(&app, "needle") as u16;
+
+        assert!((0..40).any(|col| {
+            buf[(col, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        }));
+    }
+
+    #[test]
+    fn agent_immediately_followed_by_toolbox_has_no_separator_but_toolbox_keeps_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![
+            user("question"),
+            agent("thinking before tool"),
+            tool_box(),
+            agent("after tool"),
+        ];
+
+        render_history(&mut app, 80, 12);
+
+        let user_row = find_row(&app, "question");
+        let first_agent_row = find_row(&app, "thinking before tool");
+        let tool_row = find_row(&app, "bash");
+        let next_agent_row = find_row(&app, "after tool");
+
+        assert!(
+            first_agent_row > user_row + 1,
+            "user-to-agent spacing remains separated"
+        );
+        assert_eq!(
+            tool_row,
+            first_agent_row + 1,
+            "toolbox starts directly after the agent row"
+        );
+        assert!(
+            row_text(&app, tool_row + 1).trim().is_empty(),
+            "toolbox keeps its trailing separator row"
+        );
+        assert_eq!(
+            next_agent_row,
+            tool_row + 2,
+            "next distinct block starts after the toolbox separator"
+        );
+
+        assert_eq!(
+            app.box_rows[tool_row],
+            Some(2),
+            "toolbox row maps to the ToolBox history index"
+        );
+        assert_eq!(
+            app.box_rows[first_agent_row], None,
+            "agent row is not a toolbox click target"
+        );
+        assert_eq!(
+            app.box_rows[tool_row + 1],
+            None,
+            "separator row is not a toolbox click target"
+        );
+    }
+
+    #[test]
+    fn compact_boundary_chip_click_expands_and_collapses_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![compact_boundary("handoff line")];
+
+        render_history(&mut app, 80, 6);
+        let chip_row = find_row(&app, "[compacted]");
+        assert!(
+            !nonblank_rows(&app)
+                .iter()
+                .any(|(_, row)| row.contains("handoff line")),
+            "brief starts collapsed"
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: chip_row as u16,
+            modifiers: KeyModifiers::empty(),
+        });
+        render_history(&mut app, 80, 6);
+        assert!(
+            nonblank_rows(&app)
+                .iter()
+                .any(|(_, row)| row.contains("handoff line")),
+            "chip click expands the compact brief"
+        );
+
+        let chip_row = find_row(&app, "[compacted]");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: chip_row as u16,
+            modifiers: KeyModifiers::empty(),
+        });
+        render_history(&mut app, 80, 6);
+        assert!(
+            !nonblank_rows(&app)
+                .iter()
+                .any(|(_, row)| row.contains("handoff line")),
+            "second chip click collapses the compact brief"
+        );
+    }
+
+    #[test]
+    fn chat_history_prewraps_plain_rows_before_paragraph_rendering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "abcdefghijklmnopqrstuvwxyz".to_string(),
+        }];
+
+        render_history(&mut app, 10, 6);
+
+        let rows = nonblank_rows(&app);
+        assert_eq!(app.chat_total_lines, 3);
+        assert_eq!(app.chat_visible_lines, 6);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].1.contains("abcdefghij"));
+        assert!(rows[1].1.contains("klmnopqrst"));
+        assert!(rows[2].1.contains("uvwxyz"));
+    }
+
+    #[test]
+    fn bottom_pinning_uses_wrapped_visual_rows_for_newest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "abcdefghijklmnopqrstuvwxyz".to_string(),
+        }];
+
+        render_history(&mut app, 10, 5);
+
+        assert_eq!(row_text(&app, 0).trim(), "");
+        assert_eq!(row_text(&app, 1).trim(), "");
+        assert!(row_text(&app, 2).contains("abcdefghij"));
+        assert!(row_text(&app, 3).contains("klmnopqrst"));
+        assert!(row_text(&app, 4).contains("uvwxyz"));
+    }
+
+    #[test]
+    fn wrapped_toolbox_rows_keep_toolbox_hit_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![
+            user("question"),
+            expanded_tool_box("abcdefghijklmnopqrstuv"),
+        ];
+
+        render_history(&mut app, 12, 10);
+
+        let first = find_row(&app, "abcdef");
+        let second = find_row(&app, "mnopqr");
+        assert_eq!(app.box_rows[first], Some(1));
+        assert_eq!(app.box_rows[second], Some(1));
+    }
+
+    #[test]
+    fn chat_row_meta_aligns_with_visible_rows_and_existing_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![
+            user("question"),
+            agent("assistant answer"),
+            expanded_tool_box("tool output"),
+            diff_entry("src/lib.rs"),
+        ];
+
+        render_history(&mut app, 40, 12);
+
+        assert_eq!(app.chat_row_meta.len(), app.chat_visible_lines);
+        assert_eq!(app.chat_row_meta.len(), app.chat_text_grid.len());
+        assert_eq!(
+            app.clickable_rows,
+            app.chat_row_meta
+                .iter()
+                .map(|meta| meta.chip_target)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.box_rows,
+            app.chat_row_meta
+                .iter()
+                .map(|meta| meta.tool_box_target)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.chat_cont_rows,
+            app.chat_row_meta
+                .iter()
+                .map(|meta| meta.continuation)
+                .collect::<Vec<_>>()
+        );
+
+        let user_row = find_row(&app, "question");
+        let agent_row = find_row(&app, "assistant answer");
+        let tool_row = find_row(&app, "bash");
+        let diff_row = find_row(&app, "src/lib.rs");
+        assert_eq!(app.chat_row_meta[user_row].row_kind, ChatRowKind::Message);
+        assert_eq!(
+            app.chat_row_meta[user_row].copy_target,
+            Some(ChatCopyTarget::Message { history_index: 0 })
+        );
+        assert_eq!(app.chat_row_meta[agent_row].row_kind, ChatRowKind::Message);
+        assert_eq!(
+            app.chat_row_meta[agent_row].copy_target,
+            Some(ChatCopyTarget::Message { history_index: 1 })
+        );
+        assert_eq!(app.chat_row_meta[tool_row].row_kind, ChatRowKind::ToolBox);
+        assert_eq!(app.chat_row_meta[tool_row].tool_box_target, Some(2));
+        assert_eq!(app.chat_row_meta[diff_row].row_kind, ChatRowKind::Diff);
+        assert_eq!(
+            app.chat_row_meta[diff_row].diff_path.as_deref(),
+            Some("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn context_copy_resolves_exact_older_assistant_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![agent("older answer"), agent("newer answer")];
+
+        render_history(&mut app, 80, 8);
+        let older = find_row(&app, "older answer");
+
+        assert_eq!(
+            app.message_at_chat_row(older),
+            Some(("Build message".to_string(), "older answer".to_string()))
+        );
+    }
+
+    #[test]
+    fn context_copy_resolves_exact_user_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![user("copy this user message"), agent("assistant")];
+
+        render_history(&mut app, 80, 8);
+        let row = find_row(&app, "copy this user message");
+
+        assert_eq!(
+            app.message_at_chat_row(row),
+            Some((
+                "user message".to_string(),
+                "copy this user message".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn wrapped_message_continuations_resolve_to_same_copy_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![
+            user("userwrapabcdefghijklmnopqrstuvwxyz"),
+            agent("agentwrapabcdefghijklmnopqrstuvwxyz"),
+        ];
+
+        render_history(&mut app, 24, 16);
+
+        let user_second = app
+            .chat_row_meta
+            .iter()
+            .position(|meta| {
+                meta.copy_target == Some(ChatCopyTarget::Message { history_index: 0 })
+                    && meta.continuation
+            })
+            .expect("wrapped user continuation row");
+        assert_eq!(
+            app.message_at_chat_row(user_second),
+            Some((
+                "user message".to_string(),
+                "userwrapabcdefghijklmnopqrstuvwxyz".to_string()
+            ))
+        );
+
+        let agent_second = app
+            .chat_row_meta
+            .iter()
+            .position(|meta| {
+                meta.copy_target == Some(ChatCopyTarget::Message { history_index: 1 })
+                    && meta.continuation
+            })
+            .expect("wrapped assistant continuation row");
+        assert_eq!(
+            app.message_at_chat_row(agent_second),
+            Some((
+                "Build message".to_string(),
+                "agentwrapabcdefghijklmnopqrstuvwxyz".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn blank_separator_row_has_no_context_copy_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![user("question"), agent("answer")];
+
+        render_history(&mut app, 80, 8);
+        let blank = app
+            .chat_text_grid
+            .iter()
+            .position(|row| row.concat().trim().is_empty())
+            .expect("bottom padding or separator row");
+
+        assert_eq!(app.chat_row_meta[blank].copy_target, None);
+        assert_eq!(app.message_at_chat_row(blank), None);
+    }
+
+    #[test]
+    fn diff_rows_resolve_editor_path_through_row_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![diff_entry("src/main.rs")];
+
+        render_history(&mut app, 80, 8);
+        let row = find_row(&app, "src/main.rs");
+
+        assert_eq!(
+            app.chat_row_meta[row].diff_path.as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(app.diff_rows[row].as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn selection_copy_and_highlight_skip_collapsed_compact_chip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![
+            HistoryEntry::Plain {
+                line: "before chip".to_string(),
+            },
+            compact_boundary("hidden brief"),
+            HistoryEntry::Plain {
+                line: "after chip".to_string(),
+            },
+        ];
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            focus: (79, 23),
+            active: false,
+        });
+
+        let buffer = render_history_buffer(&mut app, 80, 24);
+        let chip_row = app
+            .chat_row_meta
+            .iter()
+            .position(|meta| meta.row_kind == ChatRowKind::Chip)
+            .expect("reasoning chip row");
+        let copied = extract_full_selection(&app, 80, 24);
+
+        assert!(copied.contains("before chip"));
+        assert!(copied.contains("after chip"));
+        assert!(!copied.contains("[compacted]"));
+        assert!(!copied.contains("hidden brief"));
+        assert!(
+            (0..80).all(|col| !buffer[(col, chip_row as u16)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)),
+            "chip row should not be highlighted"
+        );
+    }
+
+    #[test]
+    fn selection_copy_uses_content_grid_before_scroll_indicator_chrome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..12)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+        app.chat_scroll_offset = 3;
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            focus: (23, 4),
+            active: false,
+        });
+
+        let buffer = render_history_buffer(&mut app, 24, 5);
+        let rendered = (0..5)
+            .map(|row| {
+                (0..24)
+                    .filter_map(|col| buffer.cell((col, row)).map(|cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let copied = extract_full_selection(&app, 24, 5);
+
+        assert!(
+            rendered.contains("more"),
+            "scroll indicator should be visible"
+        );
+        assert!(!copied.contains("more"));
+        assert!(!copied.contains('↓'));
+    }
+
+    #[test]
+    fn wrapped_rows_are_soft_continuations_for_selection_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "abcdefghijklmnopqrstuv".to_string(),
+        }];
+
+        render_history(&mut app, 10, 4);
+
+        let first = find_row(&app, "abcdefghij");
+        let second = first + 1;
+        assert!(!app.chat_cont_rows[first]);
+        assert!(app.chat_cont_rows[second]);
+
+        let text = extract_selection_plaintext(
+            &app.chat_text_grid,
+            &app.chat_row_meta,
+            Rect::new(0, 0, 10, 4),
+            Selection {
+                anchor: (0, first as u16),
+                focus: (9, second as u16),
+                active: false,
+            },
+        );
+        assert_eq!(text, "abcdefghij klmnopqrst");
+    }
+
+    #[test]
+    fn resize_recomputes_visual_row_count_and_clamps_scroll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![HistoryEntry::Plain {
+            line: "abcdefghijklmnopqrstuvwxyz".to_string(),
+        }];
+
+        render_history(&mut app, 8, 3);
+        let narrow_total = app.chat_total_lines;
+        app.chat_scroll_offset = 99;
+
+        render_history(&mut app, 26, 3);
+
+        assert!(narrow_total > app.chat_total_lines);
+        assert_eq!(app.chat_total_lines, 1);
+        assert_eq!(app.chat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn chat_scroll_indicator_shows_only_when_off_live_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..10)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+
+        let buffer = render_history_buffer(&mut app, 24, 4);
+        let rows = buffer_rows(&buffer, 24, 4);
+        assert!(rows.iter().all(|row| !row.contains('↓')));
+
+        app.chat_scroll_offset = 3;
+        let buffer = render_history_buffer(&mut app, 24, 4);
+        let rows = buffer_rows(&buffer, 24, 4);
+        assert!(rows.iter().any(|row| row.contains("↓ 3 more")));
+
+        app.chat_scroll_offset = 0;
+        let buffer = render_history_buffer(&mut app, 24, 4);
+        let rows = buffer_rows(&buffer, 24, 4);
+        assert!(rows.iter().all(|row| !row.contains('↓')));
+    }
+
+    #[test]
+    fn chat_scroll_indicator_degrades_on_narrow_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..6)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+        app.chat_scroll_offset = 2;
+
+        let buffer = render_history_buffer(&mut app, 2, 3);
+        let rows = buffer_rows(&buffer, 2, 3);
+        assert!(rows.iter().any(|row| row.contains('↓')));
+        assert!(rows.iter().all(|row| !row.contains("more")));
+
+        app.chat_scroll_offset = 2;
+        let buffer = render_history_buffer(&mut app, 1, 3);
+        let rows = buffer_rows(&buffer, 1, 3);
+        assert!(rows.iter().all(|row| !row.contains('↓')));
+    }
+
+    #[test]
+    fn off_live_render_preserves_top_row_when_history_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..10)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+        app.chat_scroll_offset = 3;
+        let before = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
+
+        app.history.push(HistoryEntry::Plain {
+            line: "new below".to_string(),
+        });
+        let after = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
+
+        assert_eq!(before, after);
+        assert!(
+            app.chat_scroll_offset > 3,
+            "offset should grow to preserve top"
+        );
+    }
+
+    #[test]
+    fn off_live_render_preserves_top_row_when_pending_streams() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..10)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+        app.chat_scroll_offset = 3;
+        let before = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
+
+        app.pending = Some(crate::tui::history::PendingMsg {
+            name: "Build".to_string(),
+            text: "partial response".to_string(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: None,
+            inside_think: false,
+            body_started: false,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: true,
+        });
+        let after = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn live_tail_render_follows_appended_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..4)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+        app.chat_scroll_offset = 0;
+        app.history.push(HistoryEntry::Plain {
+            line: "latest".to_string(),
+        });
+
+        let rows = buffer_rows(&render_history_buffer(&mut app, 24, 3), 24, 3);
+
+        assert!(rows.iter().any(|row| row.contains("latest")), "{rows:?}");
+        assert_eq!(app.chat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn fresh_turn_anchor_places_user_near_top_with_tail_room() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..12)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("context {idx}"),
+            })
+            .collect();
+        app.history.push(HistoryEntry::User {
+            text: "new question".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.pending_fresh_turn_history_idx = Some(app.history.len() - 1);
+        app.busy = true;
+
+        let rows = buffer_rows(&render_history_buffer(&mut app, 28, 8), 28, 8);
+        let user_row = rows
+            .iter()
+            .position(|row| row.contains("new question"))
+            .expect("fresh user row visible");
+
+        assert!(user_row <= 3, "fresh row should be near top: {rows:?}");
+        assert!(
+            app.chat_scroll_offset > 0,
+            "fresh turn should leave live-tail mode"
+        );
+        assert!(app.chat_fresh_tail_padding > 0);
+    }
+
+    #[test]
+    fn chat_scroll_indicator_distinguishes_streaming_below_viewport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..10)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("line {idx}"),
+            })
+            .collect();
+        app.chat_scroll_offset = 3;
+        app.busy = true;
+
+        let rows = buffer_rows(&render_history_buffer(&mut app, 32, 4), 32, 4);
+
+        assert!(rows.iter().any(|row| row.contains("streaming")), "{rows:?}");
+    }
+}
+
+#[cfg(test)]
+mod prediction_ghost_context_indicator_tests {
+    use super::{App, first_line_truncated, input_visual_rows, wrap_ghost_line_chunks};
+    use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
+
+    fn render_input_row(app: &mut App, width: u16) -> String {
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                app.render_input(f, Rect::new(0, 0, width, 3), false);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..width).map(|x| buf[(x, 1)].symbol()).collect::<String>()
+    }
+
+    fn render_input_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                app.render_input(f, Rect::new(0, 0, width, height), false);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn input_visual_rows_measure_cjk_and_emoji_by_display_width() {
+        let prefix = input_prefix_width();
+        assert_eq!(input_visual_rows("中中", prefix, prefix + 4), 1);
+        assert_eq!(input_visual_rows("中中中", prefix, prefix + 4), 2);
+        assert_eq!(input_visual_rows("🙂🙂", prefix, prefix + 2), 2);
+    }
+
+    #[test]
+    fn queue_preview_truncates_by_display_width() {
+        let truncated = first_line_truncated("queued: 中中中abc", 14);
+        assert!(display_width(&truncated) <= 14);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn visual_selection_highlight_spans_both_cells_of_wide_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.insert_str("中a");
+        app.composer.set_cursor(0);
+        app.composer.begin_visual(VimMode::Visual);
+
+        let buf = render_input_buffer(&mut app, 20, 3);
+        let wide_start = 1 + input_prefix_width() as u16;
+        assert!(
+            buf[(wide_start, 1)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "ratatui applies the wide glyph's visible style to its leading cell"
+        );
+        assert!(
+            !buf[(wide_start + 2, 1)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "following ASCII cell is outside the visual selection"
+        );
+    }
+
+    #[test]
+    fn empty_composer_shows_context_indicator_when_width_permits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let label = app.context_indicator_text();
+
+        let row = render_input_row(&mut app, 40);
+
+        assert!(row.contains(&label), "context indicator visible:\n{row}");
+    }
+
+    #[test]
+    fn typed_composer_text_hides_context_indicator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let label = app.context_indicator_text();
+        app.composer.insert_str("real input");
+
+        let row = render_input_row(&mut app, 40);
+
+        assert!(
+            !row.contains(&label),
+            "typed text owns the composer row:\n{row}"
+        );
+        assert!(
+            row.contains("real input"),
+            "composer text remains visible:\n{row}"
+        );
+    }
+
+    #[test]
+    fn expanded_passive_ghost_hides_context_indicator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let label = app.context_indicator_text();
+        app.prediction_state.ghost = Some(PredictionGhost::new("first\nsecond".to_string(), true));
+        app.prediction_state.ghost_mut().unwrap().accept();
+
+        let row = render_input_row(&mut app, 40);
+
+        assert!(
+            !row.contains(&label),
+            "expanded ghost hides context chip:\n{row}"
+        );
+        assert!(
+            row.contains("first"),
+            "expanded ghost still renders:\n{row}"
+        );
+    }
+
+    #[test]
+    fn narrow_input_hides_context_indicator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let label = app.context_indicator_text();
+
+        let row = render_input_row(&mut app, 10);
+
+        assert!(
+            !row.contains(&label),
+            "narrow input hides context chip:\n{row}"
+        );
+    }
+
+    #[test]
+    fn passive_ghost_keeps_context_indicator_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prediction_state.begin_turn();
+        app.prediction_state.on_result(
+            app.prediction_state.turn(),
+            Some("run a deliberately lengthy command that would hit the stats".to_string()),
+            false,
+            true,
+        );
+        let label = app.context_indicator_text();
+
+        let row = render_input_row(&mut app, 34);
+        let label_col = row.find(&label).expect("context indicator remains visible");
+        let ghost_col = row.find("run").expect("passive ghost remains visible");
+
+        assert!(ghost_col < label_col, "ghost starts before stats:\n{row}");
+        assert!(
+            row[..label_col].contains("run a deliberately"),
+            "ghost text is preserved before the stats:\n{row}"
+        );
+    }
+
+    #[test]
+    fn passive_ghost_first_row_reserves_context_indicator_columns() {
+        let chunks = wrap_ghost_line_chunks(
+            "run a deliberately lengthy command that would hit the stats",
+            30,
+            18,
+        );
+        assert!(
+            chunks[0].3 <= 18,
+            "first ghost row wraps before the reserved context indicator columns"
+        );
+        assert_eq!(
+            &"run a deliberately lengthy command that would hit the stats"
+                [chunks[0].0..chunks[0].1],
+            "run a ",
+            "keeps the existing word-aware wrap behavior"
+        );
+        assert!(
+            chunks
+                .iter()
+                .skip(1)
+                .all(|(_, _, start_col, end_col)| end_col.saturating_sub(*start_col) <= 30),
+            "later rows use the ordinary composer width"
+        );
+    }
+}
+
+#[cfg(test)]
+mod toast_color_tests {
+    use super::toast_fg;
+    use crate::tui::app::ToastKind;
+    use crate::tui::theme::{ERROR_TEXT, INFO_TEXT, SUCCESS_TEXT, WARNING_TEXT};
+
+    #[test]
+    fn toast_kinds_map_to_distinct_intent_colors() {
+        assert_eq!(toast_fg(ToastKind::Success), SUCCESS_TEXT);
+        assert_eq!(toast_fg(ToastKind::Warning), WARNING_TEXT);
+        assert_eq!(toast_fg(ToastKind::Error), ERROR_TEXT);
+        assert_eq!(toast_fg(ToastKind::Info), INFO_TEXT);
+        assert_ne!(toast_fg(ToastKind::Warning), toast_fg(ToastKind::Error));
+        assert_ne!(toast_fg(ToastKind::Warning), toast_fg(ToastKind::Info));
+    }
+}
+
+#[cfg(test)]
+mod input_border_color_tests {
+    use super::super::App;
+
+    #[test]
+    fn busy_border_is_visible_grey_not_near_black() {
+        // Regression guard (prompt `tui-busy-border-too-dark`): the
+        // busy-state border must be a visibly-grey mid-shade, never the
+        // near-black Indexed(238) that read as invisible. Pin it to the
+        // shared constant so a future darkening can't slip back in.
+        assert_eq!(
+            App::input_border_color(true, false),
+            crate::tui::theme::BUSY_BORDER
+        );
+        // The chosen shade sits in the "visibly grey, dimmer than white"
+        // band — far brighter than the old 238.
+        let idx = crate::tui::theme::BUSY_BORDER_INDEX;
+        assert!(
+            (244..=250).contains(&idx),
+            "busy border must stay in the visible-grey band"
+        );
+    }
+
+    #[test]
+    fn idle_border_is_white_and_shell_is_green() {
+        // Idle (white) and shell-mode (green Indexed(70)) are unchanged.
+        assert_eq!(
+            App::input_border_color(false, false),
+            crate::tui::theme::IDLE_BORDER
+        );
+        assert_eq!(
+            App::input_border_color(true, true),
+            crate::tui::theme::SHELL_MODE_BORDER
+        );
+        // Shell mode wins over busy.
+        assert_eq!(
+            App::input_border_color(false, true),
+            crate::tui::theme::SHELL_MODE_BORDER
+        );
+    }
+}
+
+#[cfg(test)]
+mod guidance_label_tests {
+    use super::fresh_chat_guidance_label;
+
+    #[test]
+    fn shows_on_fresh_chat_with_estimate() {
+        // Daemon-estimate-present path: a guidance file was resolved, so
+        // the label renders its body size with the filename.
+        let label = fresh_chat_guidance_label(true, false, Some("AGENTS.md"), 1234);
+        assert_eq!(label.as_deref(), Some("1.2k tokens in AGENTS.md"));
+    }
+
+    #[test]
+    fn shows_body_tokens_under_one_k() {
+        // Local-fallback path mirrors the daemon path here — the label is
+        // a pure function of `(file, guidance_tokens)`, so a small raw
+        // cl100k count renders without the `k` suffix.
+        let label = fresh_chat_guidance_label(true, false, Some("project guidance"), 820);
+        assert_eq!(label.as_deref(), Some("820 tokens in project guidance"));
+    }
+
+    #[test]
+    fn reverts_once_history_or_usage_exists() {
+        // History present → revert.
+        assert!(fresh_chat_guidance_label(false, false, Some("AGENTS.md"), 1234).is_none());
+        // Usage reported → revert.
+        assert!(fresh_chat_guidance_label(true, true, Some("AGENTS.md"), 1234).is_none());
+    }
+
+    #[test]
+    fn no_guidance_file_falls_back() {
+        // No-guidance-file path: even on a fresh chat, with no resolved
+        // file the label declines so the indicator shows its normal
+        // (now full-system-prompt-inclusive) context form.
+        assert!(fresh_chat_guidance_label(true, false, None, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hybrid_context_tokens_tests {
+    use super::hybrid_context_tokens;
+
+    #[test]
+    fn climbs_as_estimate_grows_past_anchor_baseline() {
+        // Provider reported 1000 total; the local estimate was 800 at
+        // that instant. As streamed tokens push the estimate to 950, the
+        // displayed count climbs by the 150-token delta.
+        assert_eq!(hybrid_context_tokens(1000, 800, 800), 1000);
+        assert_eq!(hybrid_context_tokens(1000, 850, 800), 1050);
+        assert_eq!(hybrid_context_tokens(1000, 950, 800), 1150);
+    }
+
+    #[test]
+    fn delta_floors_at_zero_when_estimate_dips_below_baseline() {
+        // A prune can shrink the estimate below the snapshot; the
+        // displayed value stays pinned to the provider's total rather
+        // than going backwards.
+        assert_eq!(hybrid_context_tokens(1000, 700, 800), 1000);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_status_tests {
+    use super::super::ReconnectStatus;
+    use super::{reconnect_status_text, reconnect_target_label};
+
+    fn status(attempt: u32) -> ReconnectStatus {
+        ReconnectStatus {
+            attempt,
+            provider: "openai-compatible".to_string(),
+            model: "glm-4.6".to_string(),
+            url: "http://localhost:1234/v1".to_string(),
+        }
+    }
+
+    #[test]
+    fn names_provider_model_url_and_attempt() {
+        // The reconnect line reads as a distinct "server unreachable"
+        // message — never a playful working line — naming provider/model,
+        // the base url, and the current attempt.
+        let text = reconnect_status_text(&status(3), "…", "12s");
+        assert_eq!(
+            text,
+            "reconnecting… openai-compatible/glm-4.6 unreachable at \
+             http://localhost:1234/v1 (attempt 3) 12s"
+        );
+        // The attribute the override hinges on: it's NOT a generic working
+        // word — it leads with "reconnecting" and carries "unreachable".
+        assert!(text.starts_with("reconnecting"));
+        assert!(text.contains("unreachable"));
+    }
+
+    #[test]
+    fn attempt_count_updates() {
+        // The same target with a higher attempt renders the incremented
+        // number — the status updates as retries proceed.
+        assert!(reconnect_status_text(&status(1), "…", "1s").contains("(attempt 1)"));
+        assert!(reconnect_status_text(&status(7), "…", "1s").contains("(attempt 7)"));
+    }
+
+    #[test]
+    fn target_label_collapses_empty_fields() {
+        assert_eq!(reconnect_target_label("p", "m"), "p/m");
+        assert_eq!(reconnect_target_label("", "m"), "m");
+        assert_eq!(reconnect_target_label("p", ""), "p");
+        assert_eq!(reconnect_target_label("", ""), "the model server");
+    }
+}

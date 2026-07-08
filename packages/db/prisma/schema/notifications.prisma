@@ -1,0 +1,102 @@
+enum NotificationType {
+  QUESTION_RAISED
+  APPROVAL_NEEDED
+  TURN_DONE
+  TURN_ERROR
+  SCHEDULE_DONE
+}
+
+enum NotificationDeliveryVia {
+  TOAST
+  PUSH
+  SUPPRESSED_DUPLICATE
+}
+
+model Notification {
+  id              String                  @id @default(cuid(2))
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @default(now()) @updatedAt
+  eventId         String
+  userId          String
+  instanceId      String
+  sessionRef      String?
+  projectRoot     String?
+  type            NotificationType
+  title           String
+  body            String?
+  deepLinkUrl     String
+  deliveredVia    NotificationDeliveryVia
+  readAt          DateTime?
+  resolvedAt      DateTime?
+  User            User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  CockpitInstance CockpitInstance         @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId])
+  @@index([userId, createdAt])
+  @@index([instanceId, createdAt])
+  @@index([userId, readAt, createdAt])
+  @@index([userId, instanceId, sessionRef, type, createdAt])
+  @@map("notification")
+}
+
+model NotificationPreference {
+  id        String           @id @default(cuid(2))
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @default(now()) @updatedAt
+  userId    String
+  type      NotificationType
+  enabled   Boolean          @default(true)
+  User      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type])
+  @@index([userId])
+  @@map("notification_preference")
+}
+
+model NotificationInstanceSetting {
+  id                          String          @id @default(cuid(2))
+  createdAt                   DateTime        @default(now())
+  updatedAt                   DateTime        @default(now()) @updatedAt
+  userId                      String
+  instanceId                  String
+  muted                       Boolean         @default(false)
+  ownerReceivesSharedSessions Boolean         @default(false)
+  User                        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  CockpitInstance             CockpitInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, instanceId])
+  @@index([instanceId])
+  @@map("notification_instance_setting")
+}
+
+model NativePushToken {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  token     String   @unique
+  platform  String
+  deviceId  String?
+  enabled   Boolean  @default(true)
+  userId    String
+  User      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, enabled])
+  @@index([deviceId])
+  @@map("native_push_token")
+}
+
+model UserPresenceLease {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  userId    String
+  clientId  String
+  visible   Boolean  @default(false)
+  expiresAt DateTime
+  User      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clientId])
+  @@index([userId, visible, expiresAt])
+  @@index([expiresAt])
+  @@map("user_presence_lease")
+}

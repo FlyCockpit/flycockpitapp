@@ -1,0 +1,48 @@
+{
+  "custom": "Valor no válido.",
+  "invalidDate": "Ingresa una fecha válida.",
+  "invalidElement": "Valor no válido.",
+  "invalidEnum": "Debe ser uno de: {{options}}.",
+  "invalidKey": "Clave no válida.",
+  "invalidLiteral": "Debe ser {{expected}}.",
+  "invalidString": {
+    "email": "Ingresa un correo electrónico válido.",
+    "url": "Ingresa una URL válida.",
+    "uuid": "Debe ser un UUID válido.",
+    "regex": "El formato no es válido.",
+    "emoji": "Debe ser un emoji válido.",
+    "datetime": "Ingresa una fecha y hora válidas.",
+    "date": "Ingresa una fecha válida.",
+    "time": "Ingresa una hora válida.",
+    "ipv4": "Ingresa una dirección IPv4 válida.",
+    "ipv6": "Ingresa una dirección IPv6 válida.",
+    "startsWith": "Debe comenzar con «{{prefix}}».",
+    "endsWith": "Debe terminar con «{{suffix}}».",
+    "includes": "Debe incluir «{{includes}}»."
+  },
+  "invalidType": "Se esperaba {{expected}}.",
+  "invalidUnion": "Valor no válido.",
+  "notMultipleOf": "Debe ser múltiplo de {{multipleOf}}.",
+  "required": "Este campo es obligatorio.",
+  "tooBig": {
+    "string": "Debe tener como máximo {{maximum}} caracteres.",
+    "number": "Debe ser como máximo {{maximum}}.",
+    "int": "Debe ser como máximo {{maximum}}.",
+    "bigint": "Debe ser como máximo {{maximum}}.",
+    "date": "Debe ser en o antes de {{maximum}}.",
+    "array": "Debe contener como máximo {{maximum}} elementos.",
+    "set": "Debe contener como máximo {{maximum}} elementos.",
+    "file": "Debe tener como máximo {{maximum}} bytes."
+  },
+  "tooSmall": {
+    "string": "Debe tener al menos {{minimum}} caracteres.",
+    "number": "Debe ser al menos {{minimum}}.",
+    "int": "Debe ser al menos {{minimum}}.",
+    "bigint": "Debe ser al menos {{minimum}}.",
+    "date": "Debe ser en o después de {{minimum}}.",
+    "array": "Debe contener al menos {{minimum}} elementos.",
+    "set": "Debe contener al menos {{minimum}} elementos.",
+    "file": "Debe tener al menos {{minimum}} bytes."
+  },
+  "unrecognizedKeys": "Campo no reconocido: {{keys}}."
+}

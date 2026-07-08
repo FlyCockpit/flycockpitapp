@@ -1,0 +1,71 @@
+FROM node:24-slim AS base
+
+# Runtime base kept intentionally close to Dockerfile/Dockerfile.worker:
+# pull Debian security patches while avoiding server/worker-only packages such
+# as postgresql-client, Prisma CLI, and ffmpeg. The relay owns no schema work.
+RUN apt-get update -y && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+FROM base AS build-base
+
+RUN apt-get update -y && apt-get install -y \
+  git \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack enable && corepack prepare pnpm@11.1.2 --activate
+
+FROM build-base AS builder
+
+WORKDIR /app
+
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml turbo.json ./
+COPY apps/relay/package.json apps/relay/
+COPY packages/config/package.json packages/config/
+COPY packages/env/package.json packages/env/
+COPY packages/relay-protocol/package.json packages/relay-protocol/
+
+RUN node -e "const f='package.json';const p=JSON.parse(require('fs').readFileSync(f));delete p.scripts.postinstall;require('fs').writeFileSync(f,JSON.stringify(p,null,2))"
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+RUN node -e "const f='package.json';const p=JSON.parse(require('fs').readFileSync(f));delete p.scripts.postinstall;require('fs').writeFileSync(f,JSON.stringify(p,null,2))"
+
+RUN pnpm turbo build --filter=relay
+RUN test -f apps/relay/dist/index.mjs
+
+FROM build-base AS prod-deps
+
+WORKDIR /app
+
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+COPY apps/relay/package.json apps/relay/
+COPY packages/config/package.json packages/config/
+COPY packages/env/package.json packages/env/
+COPY packages/relay-protocol/package.json packages/relay-protocol/
+
+RUN pnpm install --frozen-lockfile --prod --ignore-scripts --filter=relay...
+
+FROM base AS runner
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+COPY apps/relay/package.json apps/relay/
+
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/apps/relay/node_modules ./apps/relay/node_modules
+COPY --from=builder /app/apps/relay/dist ./apps/relay/dist
+
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
+USER node
+
+EXPOSE 3010
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD node -e "const port=process.env.RELAY_PORT||process.env.PORT||3010;fetch('http://localhost:'+port+'/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "apps/relay/dist/index.mjs"]

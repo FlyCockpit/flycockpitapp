@@ -1,0 +1,72 @@
+{
+  "$schema": "https://www.react.doctor/schema.json",
+  "blocking": "error",
+  "ignore": {
+    "overrides": [
+      {
+        "files": ["src/components/async-combobox.tsx"],
+        "rules": [
+          "jsx-a11y/role-has-required-aria-props",
+          "react-doctor/no-render-in-render",
+          "react-doctor/no-cascading-set-state",
+          "react-doctor/rendering-usetransition-loading"
+        ]
+      },
+      {
+        "files": ["src/components/label.tsx"],
+        "rules": ["jsx-a11y/label-has-associated-control"]
+      },
+      {
+        "files": ["src/components/input-group.tsx"],
+        "rules": ["jsx-a11y/click-events-have-key-events"]
+      },
+      {
+        "files": ["src/**/*.tsx"],
+        "rules": ["react-doctor/no-prevent-default"]
+      },
+      {
+        "files": [
+          "src/routes/$lang/admin/**/*.tsx",
+          "src/routes/$lang/_auth/**/*.tsx",
+          "src/routes/$lang/login.tsx",
+          "src/routes/$lang/device.tsx",
+          "src/components/admin/**/*.tsx"
+        ],
+        "rules": ["react-doctor/rendering-hydration-mismatch-time"]
+      },
+      {
+        "files": ["src/routes/$lang/login.tsx"],
+        "rules": [
+          "react-doctor/tanstack-start-no-navigate-in-render",
+          "react-doctor/rerender-state-only-in-handlers"
+        ]
+      },
+      {
+        "files": ["src/routes/$lang/device.tsx"],
+        "rules": ["react-doctor/rerender-state-only-in-handlers"]
+      },
+      {
+        "files": [
+          "src/routes/$lang/_auth/settings/security.tsx",
+          "src/routes/$lang/_auth.tsx",
+          "src/routes/$lang/admin/assets/index.tsx",
+          "src/routes/$lang/admin/users.tsx"
+        ],
+        "rules": [
+          "react-doctor/rerender-state-only-in-handlers",
+          "react-doctor/prefer-useReducer",
+          "react-doctor/rendering-usetransition-loading",
+          "react-doctor/no-giant-component"
+        ]
+      },
+      {
+        "files": ["src/routes/$lang/admin/assets/index.tsx"],
+        "rules": ["react-doctor/async-await-in-loop"]
+      },
+      {
+        "files": ["src/hooks/use-push-notifications.ts"],
+        "rules": ["react-doctor/query-mutation-missing-invalidation"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@flycockpit/test-utils",
+  "license": "Apache-2.0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@flycockpit/api": "workspace:*",
+    "@flycockpit/auth": "workspace:*",
+    "@flycockpit/db": "workspace:*",
+    "vitest": "catalog:",
+    "vitest-mock-extended": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

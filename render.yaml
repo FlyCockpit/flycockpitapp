@@ -1,0 +1,352 @@
+# render.yaml
+#
+# Blueprint for deploying Flycockpit to Render. This file declares every
+# environment variable the app reads, so you can see every knob in one
+# place:
+#
+#   * Tuning vars that have a built-in default in packages/env (rate limiting,
+#     image proxy, asset/video size caps, transcode quality, S3 region, the
+#     translation provider, …) are PREFILLED here with that same default value.
+#     Edit the value to override; the app behaves identically whether the var
+#     is set to its default or left unset.
+#   * Secrets and per-environment values (BETTER_AUTH_URL, SMTP_*, VAPID_*,
+#     S3 credentials, API keys, SSO credentials) are declared as `sync: false`
+#     placeholders — no value lives in the Blueprint; you fill them in the
+#     Render dashboard. `sync: false` also stops a dashboard edit from being
+#     reset by the next Blueprint sync.
+#   * Feature on/off toggles (SIGNUP_ENABLED, SSO_ENABLED, FORCE_SSO) are
+#     prefilled with their SECURE default ("false"). Flip to "true" here (or
+#     convert to `sync: false` and manage in the dashboard) when you enable
+#     the feature.
+#
+# An empty placeholder is inert: the env package treats an empty string as
+# unset (emptyStringAsUndefined), so an unconfigured feature simply stays off
+# until you paste its values in.
+#
+# KEEPING DEFAULTS IN SYNC: the prefilled values below mirror the `.default(…)`
+# calls in packages/env/src/{shared,server}.ts. They are a convenience snapshot,
+# not the source of truth — if you change a default in the env schema, update
+# the matching value here (or delete it to fall back to the schema default).
+#
+# When removing a feature, search this file for the feature name and remove
+# the matching environment keys (VAPID, SMTP, S3_, OPENROUTER, SSO_, VIDEO).
+services:
+  - type: web
+    name: server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    # /ready (not /health) gates deploys + traffic routing: it verifies Postgres
+    # and Redis are reachable so a new instance only goes live once it can serve
+    # real requests. /health is process-liveness only (always 200) and is used
+    # by the container HEALTHCHECK, which must not flap on a transient DB blip.
+    healthCheckPath: /ready
+    autoDeploy: true
+    # Schema sync is applied by the SERVER CONTAINER ENTRYPOINT
+    # (scripts/docker-entrypoint.sh), gated on APPLY_SCHEMA — NOT by a Render
+    # Pre-Deploy Command. Why: Render's Pre-Deploy does its own naive variable
+    # substitution and does NOT run the command through a real POSIX shell, so
+    # `case "${APPLY_SCHEMA:-off}" in … esac` (and any `${VAR:-default}` /
+    # `$(…)`) gets mangled — the step fails with a bare "Exited with status 128"
+    # and no usable logs. (Confirmed: a `${DATABASE_URL:+set}` probe printed the
+    # FULL connection string instead of "set".) The entrypoint runs in a real
+    # /bin/sh on the booting instance and applies the schema under a Postgres
+    # advisory lock — verified working in the deploy logs. The server is the
+    # schema leader (it always exists; the worker is removable), so set
+    # APPLY_SCHEMA=safe on THIS service for a schema-changing deploy and `off`
+    # otherwise; the worker is pinned `off`. numInstances:1 + advisory lock =>
+    # safe. Deliberately no preDeployCommand here.
+    envVars:
+      - fromGroup: app-secrets
+      - key: APPLY_SCHEMA
+        sync: false        # per-deploy toggle — flip in the dashboard; unset behaves as off
+      - key: NODE_ENV
+        value: production
+      - key: BETTER_AUTH_URL
+        sync: false        # set per-environment in the dashboard
+      - key: ADMIN_EMAILS
+        sync: false        # comma-separated; emails are trimmed + lowercased
+      # [server-only] Set only if the web app is served from a different origin
+      # than the API. Leave empty for the default same-origin Render deploy.
+      - key: CORS_ORIGIN
+        sync: false
+      # [server-only] Public signup. DISABLED by default for internal tools.
+      # Customer-facing apps may flip this to "true", but only after SMTP is
+      # configured (Better-Auth requires email verification in production) and
+      # the product intentionally allows public account creation. Bootstrap the
+      # first admin through ADMIN_EMAILS plus the documented invite/provisioning
+      # flow instead of opening registration just to get started.
+      - key: SIGNUP_ENABLED
+        value: "false"
+      # ---- Rate limiting (Redis sliding window). Sane defaults prefilled;
+      # tune per route class. *_POINTS = allowed requests, *_DURATION = window
+      # in seconds, *_BLOCK_DURATION = lockout in seconds after exhausting auth
+      # / signup attempts. See apps/server/src/rate-limit.ts. -----------------
+      - key: RATE_LIMIT_RPC_POINTS
+        value: "100"
+      - key: RATE_LIMIT_RPC_DURATION
+        value: "60"
+      - key: RATE_LIMIT_AUTH_POINTS
+        value: "10"
+      - key: RATE_LIMIT_AUTH_DURATION
+        value: "60"
+      - key: RATE_LIMIT_AUTH_BLOCK_DURATION
+        value: "900"
+      - key: RATE_LIMIT_SIGNUP_POINTS
+        value: "3"
+      - key: RATE_LIMIT_SIGNUP_DURATION
+        value: "3600"
+      - key: RATE_LIMIT_SIGNUP_BLOCK_DURATION
+        value: "3600"
+      # ---- Image proxy (SSRF guard) + upload caps. IMAGE_PROXY_ALLOWED_HOSTS
+      # is empty by default = external URL proxying is OFF (only stored assets
+      # can be transformed); set it to a comma-separated hostname allowlist to
+      # intentionally proxy remote images. The byte/pixel caps have safe
+      # defaults prefilled. See packages/env/src/server.ts. -------------------
+      - key: IMAGE_PROXY_ALLOWED_HOSTS
+        sync: false        # empty = external proxying disabled (the secure default)
+      - key: IMAGE_PROXY_TIMEOUT_MS
+        value: "5000"
+      - key: IMAGE_PROXY_MAX_BYTES
+        value: "10485760"          # 10 MiB
+      - key: IMAGE_TRANSFORM_MAX_INPUT_PIXELS
+        value: "50000000"          # 50 MP decode-bomb guard
+      - key: ASSET_UPLOAD_MAX_BYTES
+        value: "10485760"          # 10 MiB hard cap on a single asset upload
+      # Public WebSocket base returned by instances.mint*Token. Set this to the
+      # relay service URL with /ws, e.g. wss://relay-xxxx.onrender.com/ws.
+      - key: COCKPIT_RELAY_URL
+        sync: false
+      # ---- SSO / enterprise login (opt-in, server-only) ---------------------
+      # SSO_ENABLED/FORCE_SSO are strict booleans ("true"/"false"), prefilled
+      # to the off default. To enable, fill SSO_CLIENT_ID/SSO_CLIENT_SECRET/
+      # SSO_ISSUER (sync:false below) and set SSO_ENABLED=true. SSO_PROVIDER_NAME
+      # is the label shown on the login button. See .env.example for details.
+      - key: SSO_ENABLED
+        value: "false"
+      - key: FORCE_SSO
+        value: "false"
+      - key: SSO_PROVIDER_NAME
+        value: "SSO"
+      - key: SSO_CLIENT_ID
+        sync: false
+      - key: SSO_CLIENT_SECRET
+        sync: false
+      - key: SSO_ISSUER
+        sync: false
+      # ---- Build-time client env (Vite) -------------------------------------
+      # Vite inlines VITE_* into the SPA bundle at `docker build` time. Render
+      # forwards these service env vars into the build as Docker build args
+      # (the Dockerfile declares matching ARGs). They take effect on the next
+      # BUILD, not a restart. Empty = app defaults (name "App", same-origin API,
+      # client-side push disabled).
+      - key: VITE_APP_NAME
+        sync: false
+      - key: VITE_SERVER_URL
+        sync: false
+      # Push, client half. MUST hold the SAME value as VAPID_PUBLIC_KEY in the
+      # app-secrets group — paste the generated public key into both. Remove
+      # alongside the VAPID_* keys if you rip out push (removable/push.md).
+      - key: VITE_VAPID_PUBLIC_KEY
+        sync: false
+      # Deterministic PWA build version. The Dockerfile declares a matching
+      # `ARG BUILD_VERSION`; vite.config.ts (getBuildVersion) prefers it over a
+      # `git rev-parse` that can't run inside the build (`.git` is excluded), so
+      # without a stable value here every rebuild of the SAME commit mints a new
+      # random version. Setting it to the deploy's commit SHA makes the version
+      # stable across rebuilds of one commit. Takes effect on the next BUILD.
+      #
+      # NOTE: confirm the exact Render-provided commit value before relying on
+      # auto-population — Render does not document a render.yaml-native key that
+      # forwards the commit SHA into a Docker build arg. Until confirmed, set
+      # this manually per deploy in the dashboard (paste the commit SHA), e.g.:
+      #   - key: BUILD_VERSION
+      #     value: "<git-commit-sha>"
+      # If/when Render exposes the commit SHA to the build (e.g. RENDER_GIT_COMMIT),
+      # reference it here instead of pasting manually.
+      - key: BUILD_VERSION
+        sync: false        # paste the commit SHA per deploy (see note above)
+      - key: DATABASE_URL
+        fromDatabase:
+          name: postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: keyval
+          property: connectionString
+
+  - type: web
+    name: relay
+    runtime: docker
+    dockerfilePath: ./Dockerfile.relay
+    plan: starter
+    healthCheckPath: /healthz
+    autoDeploy: true
+    # WebSocket relay. It verifies JWTs against the server JWKS endpoint and
+    # stores presence in Redis for multi-relay correctness. No frame bodies are
+    # logged or persisted by the relay. Set BETTER_AUTH_URL to the same origin
+    # used by the server; RELAY_JWKS_URL can stay unset unless the relay must
+    # reach the server through a private/internal URL.
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BETTER_AUTH_URL
+        sync: false
+      - key: RELAY_TOKEN_ISSUER
+        sync: false
+      - key: RELAY_JWKS_URL
+        sync: false
+      - key: RELAY_PORT
+        value: "3010"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: keyval
+          property: connectionString
+
+  - type: worker
+    name: worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: starter
+    autoDeploy: true
+    # The worker imports only @flycockpit/env/shared, so it does not need the
+    # server-only vars (BETTER_AUTH_URL, VAPID_*, SSO_*, rate limits, …). It
+    # pulls app-secrets anyway: the shared S3_* + translation + VIDEO_* keys
+    # it DOES use live there, SMTP_* enables optional worker failure-alert
+    # email, and unused server-only keys are harmless on the worker. ffmpeg
+    # already ships in Dockerfile.worker. The VIDEO_* tuning defaults are
+    # prefilled in the app-secrets group below (both server and worker validate
+    # them via @flycockpit/env/shared). Keep ffmpeg/ffprobe available to the worker process.
+    envVars:
+      - fromGroup: app-secrets
+      # Schema sync is led by the SERVER container entrypoint (see the server
+      # service above). The server always exists; the worker is removable
+      # (removable/queue.md), so the always-present service owns schema. Pinned
+      # OFF here (not sync:false) so the blueprint actively keeps the worker out
+      # of schema sync and it can't be re-enabled by an accidental dashboard
+      # edit. The same entrypoint schema logic runs on every platform — flip
+      # this to safe|dangerous (and set the server's APPLY_SCHEMA back to off)
+      # only if you deliberately make the worker the schema leader instead.
+      - key: APPLY_SCHEMA
+        value: "off"
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: keyval
+          property: connectionString
+
+  # Key Value (Redis) is a service, not a database — Render's `databases:`
+  # block is Postgres-only and has no `type` field. Declaring it here is what
+  # the `fromService: { type: keyvalue }` references above resolve to.
+  # Removing the queue (removable/queue.md) makes this service unused — delete
+  # this block and the two REDIS_URL fromService entries above.
+  - type: keyvalue
+    name: keyval
+    plan: free
+    maxmemoryPolicy: noeviction # BullMQ requires noeviction; eviction can lose/corrupt queue jobs
+    ipAllowList: []          # private only — no public IPs
+
+databases:
+  - name: postgres
+    plan: basic-256mb
+    postgresMajorVersion: "17"
+
+envVarGroups:
+  - name: app-secrets
+    envVars:
+      # Auth (default). Render generates this once and persists it across syncs.
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      # Email / SMTP (default feature). Required in production if signup is
+      # enabled. Remove these if you rip out email — see removable/email.md.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      # Web push (default feature). The public/private keys are a matched pair —
+      # Render canNOT generate them. Mint them yourself with `pnpm generate:vapid`
+      # and paste both here; also paste the PUBLIC key into VITE_VAPID_PUBLIC_KEY
+      # on the server service (it gets baked into the client bundle at build).
+      # Leave the keys empty to ship with push inert. VAPID_SUBJECT is prefilled
+      # with the schema default — change it to your contact mailto:. Remove
+      # these if you rip out push — see removable/push.md.
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: "mailto:admin@example.com"
+      # CMS auto-translate + i18n bundle translation (default). The worker's
+      # translate-content job throws on first run without a key for the chosen
+      # provider. TRANSLATION_PROVIDER defaults to "openrouter" (set
+      # OPENROUTER_API_KEY). To use Anthropic directly, set
+      # TRANSLATION_PROVIDER=anthropic + ANTHROPIC_API_KEY. TRANSLATION_MODEL is
+      # an optional per-call override (defaults to claude-haiku-4-5). Remove the
+      # relevant key if you rip out CMS (removable/cms.md) and i18n
+      # auto-translate (removable/i18n.md).
+      - key: TRANSLATION_PROVIDER
+        value: openrouter
+      - key: TRANSLATION_MODEL
+        sync: false        # empty = provider default (anthropic/claude-haiku-4-5)
+      # Optional public origin metadata used for provider attribution
+      # (OpenRouter HTTP-Referer). Set to the user-facing app URL.
+      - key: PUBLIC_APP_URL
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Object storage (opt-in — uploads, avatars, CMS images, video). Fill
+      # S3_BUCKET + the credentials to enable /api/assets/* and /api/images/*;
+      # empty = those endpoints 503 and the rest of the app boots fine. Shared
+      # by server + worker. Works with AWS S3, Cloudflare R2, Backblaze B2,
+      # MinIO, DigitalOcean Spaces. Video reuses this bucket. S3_REGION and
+      # S3_FORCE_PATH_STYLE are prefilled with their schema defaults. See
+      # the asset pipeline notes and the video pipeline notes.
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        value: auto                # "auto" for R2; set "us-east-1" etc. for AWS
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false        # set for R2/B2/MinIO/Spaces; leave empty for AWS
+      - key: S3_FORCE_PATH_STYLE
+        value: "false"             # "true" for MinIO-style providers
+      # Video transcoding tuning (opt-in feature, but the knobs have safe
+      # defaults validated by both server + worker). These take effect only
+      # once S3 storage is configured and a video is uploaded. Prefilled with
+      # the schema defaults — see packages/env/src/shared.ts and
+      # the video pipeline notes. ffmpeg/ffprobe are on PATH in Dockerfile.worker.
+      - key: VIDEO_FFMPEG_PATH
+        value: ffmpeg
+      - key: VIDEO_FFPROBE_PATH
+        value: ffprobe
+      - key: VIDEO_ENABLE_4K
+        value: "false"             # include the 2160p rung for ≥4K sources
+      - key: VIDEO_UPLOAD_MAX_BYTES
+        value: "10737418240"       # 10 GiB hard cap per raw upload
+      - key: VIDEO_TRANSCODE_CONCURRENCY
+        value: "1"                 # CPU-bound; raise only on an 8+ core worker
+      - key: VIDEO_AUDIO_TRANSCODE_CONCURRENCY
+        value: "2"
+      - key: VIDEO_X264_CRF
+        value: "23"                # lower = higher quality / larger files (0-51)
+      - key: VIDEO_X264_PRESET
+        value: slow                # ultrafast…veryslow; slower = better ratio

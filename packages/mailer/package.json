@@ -1,0 +1,27 @@
+{
+  "name": "@flycockpit/mailer",
+  "license": "Apache-2.0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@flycockpit/env": "workspace:*",
+    "nodemailer": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/nodemailer": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

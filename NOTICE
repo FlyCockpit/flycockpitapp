@@ -1,0 +1,8 @@
+FlyCockpit
+Copyright 2026 FlyCockpit LLC
+
+This product includes software developed at FlyCockpit LLC.
+
+The files under packages/api/src/enterprise/ are not covered by the Apache
+License 2.0; they are licensed under the FlyCockpit Enterprise License. See
+packages/api/src/enterprise/LICENSE.

@@ -1,0 +1,32 @@
+enum CockpitInstanceStatus {
+  ACTIVE
+  REVOKED
+}
+
+model CockpitInstance {
+  id                           String                        @id @default(cuid(2))
+  createdAt                    DateTime                      @default(now())
+  updatedAt                    DateTime                      @default(now()) @updatedAt
+  userId                       String
+  displayName                  String
+  hostname                     String
+  os                           String
+  arch                         String
+  cliVersion                   String
+  status                       CockpitInstanceStatus         @default(ACTIVE)
+  secretPrefix                 String                        @unique
+  secretHash                   String
+  lastSeenAt                   DateTime?
+  revokedAt                    DateTime?
+  User                         User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  EnterpriseLogBatches         EnterpriseLogBatch[]
+  EnterpriseLogEvents          EnterpriseLogEvent[]
+  Notifications                Notification[]
+  NotificationInstanceSettings NotificationInstanceSetting[]
+  InstanceAccessGrants         InstanceAccessGrant[]
+  InstanceAuditEvents          InstanceAuditEvent[]
+
+  @@index([userId, status])
+  @@index([lastSeenAt])
+  @@map("cockpit_instance")
+}

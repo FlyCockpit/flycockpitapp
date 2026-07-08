@@ -1,0 +1,114 @@
+# Production-style single-host compose for the open-source self-host profile.
+# Copy .env.docker.defaults to .env, set real secrets, then run:
+#   docker compose -f docker-compose.selfhost.yml up -d
+
+name: flycockpit-selfhost
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flycockpit}
+      POSTGRES_USER: ${POSTGRES_USER:-flycockpit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - flycockpit_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flycockpit}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - flycockpit_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DEPLOYMENT_PROFILE: oss
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flycockpit}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flycockpit}
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:?set BETTER_AUTH_URL}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      SIGNUP_ENABLED: ${SIGNUP_ENABLED:-false}
+      FORCE_SSO: ${FORCE_SSO:-false}
+      SSO_ENABLED: ${SSO_ENABLED:-false}
+      APPLY_SCHEMA: ${APPLY_SCHEMA:-safe}
+      COCKPIT_INSTANCE_LIMIT: ${COCKPIT_INSTANCE_LIMIT:-10}
+      COCKPIT_RELAY_URL: ${COCKPIT_RELAY_URL:-ws://localhost:3010/ws}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@example.com}
+    ports:
+      - "${HTTP_PORT:-3000}:3000"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flycockpit}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-flycockpit}
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET}
+      APPLY_SCHEMA: off
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    restart: unless-stopped
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+    depends_on:
+      redis:
+        condition: service_healthy
+      server:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:?set BETTER_AUTH_URL}
+      RELAY_TOKEN_ISSUER: ${BETTER_AUTH_URL:?set BETTER_AUTH_URL}
+      RELAY_JWKS_URL: http://server:3000/api/relay/jwks.json
+      RELAY_PORT: 3010
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${RELAY_PORT:-3010}:3010"
+    restart: unless-stopped
+
+volumes:
+  flycockpit_postgres:
+  flycockpit_redis:

@@ -1,0 +1,9 @@
+{
+  "subject": "You've been invited",
+  "heading": "You've been invited",
+  "body": "Hi {{name}}, an admin has created an account for you. You can sign in with the temporary password below — please change it after your first sign-in.",
+  "emailLabel": "Email",
+  "tempPasswordLabel": "Temporary password",
+  "cta": "Sign in",
+  "ignoreFooter": "If you weren't expecting this invitation, you can safely ignore this email."
+}

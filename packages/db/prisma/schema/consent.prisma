@@ -1,0 +1,49 @@
+/// Proof-of-consent log. GDPR accountability (Art. 5(2) / 7(1)) expects
+/// evidence of *what* each visitor consented to and *when*. Append-only, like
+/// the audit log — never edit or update a row.
+///
+/// This whole model is removable; see the consent module notes. The
+/// consent banner and client-side gating work without it (the cookie is the
+/// source of truth for gating); this only adds server-side proof.
+enum ConsentAction {
+  ACCEPT_ALL @map("accept_all")
+  REJECT_ALL @map("reject_all")
+  CUSTOM     @map("custom")
+}
+
+model ConsentRecord {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+
+  /// Stable anonymous id from the consent cookie. Threads a visitor's
+  /// decision history without an account or PII.
+  anonId String
+
+  /// Set when the visitor was signed in at decision time; null for anonymous
+  /// (consent is usually given before any login). `SetNull` (not `Cascade`)
+  /// so consent proof survives user deletion — the point of the log.
+  userId String?
+  user   User?   @relation("UserConsentRecords", fields: [userId], references: [id], onDelete: SetNull)
+
+  /// `CONSENT_POLICY_VERSION` the decision was made under.
+  policyVersion Int
+
+  /// `{ functional, analytics, marketing }` booleans. `necessary` is implied.
+  categories Json
+
+  /// How the decision was made. Closed enum because the writer is owned by this
+  /// repo, unlike Better-Auth role strings.
+  action ConsentAction
+
+  /// Client-reported UA at decision time (advisory evidence, not trusted).
+  userAgent String?
+
+  // No `updatedAt`: consent records are append-only by definition. Repeated
+  // decisions by the same anonId/policyVersion are intentional history, not
+  // duplicates to upsert away. This is the same sanctioned exception to the
+  // "always include updatedAt" rule that the audit-log pattern documents.
+
+  @@index([anonId, createdAt])
+  @@index([userId, createdAt])
+  @@map("consent_record")
+}

@@ -1,0 +1,5 @@
+{
+  "appSettingsLoadFailed": "Failed to load app settings.",
+  "loadFailed": "Failed to load dashboard.",
+  "welcomeBack": "Welcome back, {{name}}"
+}

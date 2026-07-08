@@ -1,0 +1,61 @@
+enum InstanceAccessScope {
+  TERMINAL
+  AGENT
+  AGENT_READONLY
+  PROJECT_FILES
+}
+
+enum InstanceAccessGrantStatus {
+  PENDING
+  ACTIVE
+  REVOKED
+  EXPIRED
+  DECLINED
+}
+
+model InstanceAccessGrant {
+  id             String                    @id @default(cuid(2))
+  createdAt      DateTime                  @default(now())
+  updatedAt      DateTime                  @default(now()) @updatedAt
+  instanceId     String
+  ownerId        String
+  granteeUserId  String?
+  granteeEmail   String
+  scope          InstanceAccessScope
+  projectRoot    String?
+  projectRootKey String                    @default("*")
+  status         InstanceAccessGrantStatus @default(PENDING)
+  invitedAt      DateTime                  @default(now())
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  expiresAt      DateTime?
+  createdBy      String
+  Instance       CockpitInstance           @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Owner          User                      @relation("InstanceAccessGrantOwner", fields: [ownerId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee        User?                     @relation("InstanceAccessGrantGrantee", fields: [granteeUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  CreatedBy      User                      @relation("InstanceAccessGrantCreatedBy", fields: [createdBy], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([instanceId, status])
+  @@index([ownerId, status])
+  @@index([granteeUserId, status])
+  @@index([granteeEmail, status])
+  @@index([expiresAt, status])
+  @@index([instanceId, granteeEmail, scope, projectRootKey, status])
+  @@map("instance_access_grant")
+}
+
+model InstanceAuditEvent {
+  id           String          @id @default(cuid(2))
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @default(now()) @updatedAt
+  instanceId   String
+  actorUserId  String?
+  kind         String
+  metadataJson String
+  Instance     CockpitInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Actor        User?           @relation("InstanceAuditEventActor", fields: [actorUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([instanceId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@map("instance_audit_event")
+}

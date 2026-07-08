@@ -1,0 +1,65 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Build outputs
+dist
+build
+apps/web/dev-dist
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env*.local
+!.env.docker.defaults
+
+# Agent dev-docker port state (written by scripts/dev-docker.sh)
+.agent-ports.json
+
+# Agent dev-docker per-project node_modules bind mounts (see
+# docker-compose.agent.yml). Created by scripts/dev-docker.sh, wiped on
+# `pnpm dev:docker:down`. Never commit.
+.docker-volumes/
+
+# IDEs and editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+.pnpm-store*
+
+# Database backups
+backups/
+
+# Turbo
+.turbo
+.nx
+
+# Better-T-Stack
+.alchemy
+
+# Testing
+coverage
+.nyc_output
+
+# Misc
+*.tgz
+.cache
+tmp
+temp

@@ -1,0 +1,45 @@
+.git
+.gitignore
+.env
+.env.*
+**/.env
+**/.env.*
+*.md
+.vscode
+.idea
+.claude
+.playwright-cli
+
+# Dependency stores
+node_modules
+**/node_modules
+.pnpm-store
+.pnpm-store*
+
+# Rust CLI — not part of any Node image build; a local cargo target/
+# directory can be gigabytes and would bloat the build context.
+apps/cli
+
+# Build outputs and generated artifacts
+dist
+**/dist
+build
+**/build
+coverage
+**/coverage
+packages/db/prisma/generated
+
+# Local framework/tool caches
+.turbo
+**/.turbo
+.cache
+**/.cache
+.vite
+**/.vite
+.next
+**/.next
+.astro
+**/.astro
+apps/web/.tanstack
+*.tsbuildinfo
+**/*.tsbuildinfo

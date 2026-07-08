@@ -1,0 +1,27 @@
+{
+  "items": {
+    "home": "Home",
+    "about": "About",
+    "cookiePolicy": "Cookie Policy",
+    "dashboard": "Dashboard",
+    "settings": "Settings",
+    "admin": "Admin",
+    "instances": "Instances"
+  },
+  "languageLabel": "Language",
+  "mainNav": {
+    "ariaLabel": "Main navigation"
+  },
+  "themeToggle": {
+    "label": "Toggle theme",
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "userMenu": {
+    "myAccount": "My Account",
+    "signIn": "Sign In",
+    "signUp": "Sign Up",
+    "signOut": "Sign Out"
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "$schema": "https://unpkg.com/knip@latest/schema-jsonc.json",
+  "workspaces": {
+    ".": {
+      "entry": [
+        // Invoked by scripts/backup.sh via `node`, not statically imported.
+        // Knip can't trace shell-script entry points, so declare it here.
+        "scripts/upload-backup-to-s3.mjs!"
+      ],
+      "ignoreBinaries": [
+        // Global local-dev CLI. Intentionally not listed in package.json.
+        "portless",
+        // False positive: scripts/theme-apply.ts passes this as `shadcn -c`
+        // config path, not as a command.
+        "apps/web"
+      ]
+    },
+    "apps/web": {
+      "entry": [
+        // SPA/SSR entry points. `!` suffix = production entry (kept when
+        // running `knip --production`, which excludes dev-only files).
+        "src/client.tsx!",
+        "src/server.ts!",
+        "src/sw.ts!",
+        "src/router.tsx!",
+        "src/routes/**/*.tsx!",
+        "src/hooks/*.ts!",
+        "src/stores/*.ts!",
+        // PWA assets generator config — dev-only tooling, no `!` suffix.
+        "pwa-assets.config.ts"
+      ],
+      "ignoreDependencies": [
+        // Imported only via PostCSS/Tailwind CSS pipeline, not statically.
+        "tailwindcss",
+        "postcss",
+        // Consumed indirectly via `@orpc/client` + `createORPCClient`.
+        "@orpc/server",
+        // URL-as-state helpers registered in route config.
+        "nuqs",
+        // Toast primitive re-exported from @flycockpit/ui.
+        "sileo",
+        // Vidstack loads hls.js at runtime; keeping a local copy avoids a
+        // jsDelivr CDN fetch (PWA / offline). No static import in source.
+        "hls.js",
+        // Optional peer of h3 2.x (pulled by TanStack Start); pinned here so the
+        // SSR/oRPC stack binds crossws 0.4.x instead of the 0.3.x h3 1.x dedupes
+        // to. No static import in source — it's a build/runtime transitive.
+        "crossws"
+      ]
+    },
+    "apps/relay": {
+      "entry": ["src/server.ts!"]
+    },
+    "apps/server": {
+      // sharp is consumed lazily through @flycockpit/api (packages/api/src/lib/
+      // images.ts); declared directly so the native binary ships in this app's
+      // deploy image. No static import in apps/server source.
+      "ignoreDependencies": ["better-auth", "dotenv", "sharp"]
+    },
+    "apps/worker": {
+      // Same as apps/server: sharp is used via @flycockpit/api, declared here so
+      // the worker image carries the native binary. No static import in source.
+      "ignoreDependencies": ["ioredis", "sharp"]
+    },
+    "apps/docs": {
+      "entry": ["src/**/*.{ts,tsx,astro,md,mdx}"]
+    },
+    "apps/native": {
+      "entry": ["app/**/*.tsx!", "components/**/*.tsx!", "contexts/**/*.tsx!", "utils/**/*.ts!"],
+      "ignoreDependencies": [
+        // Expo app config probes this optional package even though this
+        // managed template does not import it directly.
+        "expo-updates"
+      ]
+    },
+    "packages/ui": {
+      "entry": ["src/components/**/*.tsx", "src/styles/**/*.css"]
+    },
+    "packages/api": {
+      "ignoreDependencies": ["@orpc/client", "@orpc/openapi", "@orpc/zod", "dotenv"]
+    },
+    "packages/db": {
+      "ignoreDependencies": ["@prisma/client", "pg", "zod"]
+    },
+    "packages/auth": {
+      "ignoreDependencies": ["dotenv", "zod"]
+    }
+  }
+}

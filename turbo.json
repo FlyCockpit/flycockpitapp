@@ -1,0 +1,97 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "env": ["BUILD_VERSION"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": ["dist/**"]
+    },
+    "lint": {
+      "dependsOn": ["^lint"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "src/**/*.test.ts",
+        "src/**/*.test.tsx",
+        "vitest.config.*"
+      ]
+    },
+    "check-types": {
+      "dependsOn": ["^check-types"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "passThroughEnv": [
+        "DATABASE_URL",
+        "REDIS_URL",
+        "RELAY_*",
+        "NODE_ENV",
+        "PORT",
+        "HOST",
+        "SERVER_PORT",
+        "PORTLESS_*",
+        "BETTER_AUTH_*",
+        "CORS_ORIGIN",
+        "SSO_*",
+        "FORCE_SSO",
+        "SIGNUP_ENABLED",
+        "VAPID_*",
+        "S3_*",
+        "ASSET_UPLOAD_MAX_BYTES",
+        "IMAGE_*",
+        "VIDEO_*",
+        "TRUST_PROXY_HOPS",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "TRANSLATION_*",
+        "RATE_LIMIT_*",
+        "SMTP_*",
+        "PUBLIC_APP_URL",
+        "ADMIN_EMAILS",
+        "VITE_*",
+        "EXPO_*",
+        "EXPO_PUBLIC_*",
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "JAVA_HOME"
+      ]
+    },
+    "db:push": {
+      "cache": false
+    },
+    "db:push:dangerous": {
+      "cache": false,
+      "passThroughEnv": ["DATABASE_URL", "ALLOW_NONLOCAL_DANGEROUS_DB_PUSH"]
+    },
+    "db:generate": {
+      "cache": false
+    },
+    "db:validate": {
+      "inputs": ["prisma/schema/**/*.prisma", "prisma.config.ts"]
+    },
+    "db:studio": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:start": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:stop": {
+      "cache": false
+    },
+    "db:watch": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:down": {
+      "cache": false
+    }
+  }
+}

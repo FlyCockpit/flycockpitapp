@@ -1,0 +1,11 @@
+{
+  "subject": "Te invitaron a una instancia de Flycockpit",
+  "heading": "Invitación de acceso a instancia",
+  "body": "{{ownerName}} te invitó a acceder a {{instanceName}} en Flycockpit.",
+  "scopesLabel": "Acceso concedido",
+  "expiresLabel": "Caduca",
+  "neverExpires": "Nunca",
+  "ctaExisting": "Revisar invitación",
+  "ctaNew": "Crear cuenta para aceptar",
+  "ignoreFooter": "Si no esperabas esta invitación, puedes ignorar este correo. El acceso no se concede hasta que lo aceptes con esta dirección de correo."
+}

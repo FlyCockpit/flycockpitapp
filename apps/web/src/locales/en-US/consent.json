@@ -1,0 +1,49 @@
+{
+  "banner": {
+    "title": "We value your privacy",
+    "message": "We use cookies to run this site and, with your consent, to measure traffic and improve it. You can accept all, reject everything non-essential, or choose what to allow.",
+    "acceptAll": "Accept all",
+    "rejectAll": "Reject all",
+    "customize": "Customize",
+    "policyLink": "Read our cookie policy"
+  },
+  "preferences": {
+    "title": "Cookie preferences",
+    "description": "Choose which cookies this site may use. You can change this at any time.",
+    "save": "Save choices",
+    "acceptAll": "Accept all",
+    "rejectAll": "Reject all",
+    "open": "Cookie preferences"
+  },
+  "categories": {
+    "alwaysOn": "Always on",
+    "necessary": {
+      "name": "Strictly necessary",
+      "description": "Required for the site to work — sign-in, security, and remembering your choices. These cannot be switched off."
+    },
+    "functional": {
+      "name": "Functional",
+      "description": "Remembers preferences like language or layout to improve your experience."
+    },
+    "analytics": {
+      "name": "Analytics",
+      "description": "Helps us understand how the site is used so we can improve it. Aggregated, not used to identify you."
+    },
+    "marketing": {
+      "name": "Marketing",
+      "description": "Used to show and measure advertising, including on other websites."
+    }
+  },
+  "status": {
+    "enabled": "On",
+    "disabled": "Off"
+  },
+  "settings": {
+    "navPrivacy": "Privacy",
+    "title": "Privacy & cookies",
+    "description": "Manage what this site is allowed to store on your device.",
+    "manageButton": "Change cookie preferences",
+    "statusDecided": "Choices last updated {{date}}.",
+    "statusUndecided": "You haven't made a choice yet."
+  }
+}

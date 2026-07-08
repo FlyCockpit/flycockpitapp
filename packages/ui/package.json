@@ -1,0 +1,41 @@
+{
+  "name": "@flycockpit/ui",
+  "license": "Apache-2.0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./globals.css": "./src/styles/globals.css",
+    "./lib/*": "./src/lib/*.ts",
+    "./hooks/*": "./src/hooks/*.ts",
+    "./components/*": "./src/components/*.tsx",
+    "./postcss.config": "./postcss.config.mjs"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "build": "node --input-type=module -e 'import fs from \"node:fs/promises\"; import path from \"node:path\"; const cwd = process.cwd(); const pickExport = (entry) => { if (typeof entry === \"string\") return entry; if (entry && typeof entry === \"object\") return entry.style ?? entry.default ?? entry.import ?? entry.require ?? null; return null; }; const resolveStylesheet = async (id, base) => { if (id.startsWith(\".\") || id.startsWith(\"/\")) return path.resolve(base, id); const parts = id.split(\"/\"); const packageName = id.startsWith(\"@\") ? parts.slice(0, 2).join(\"/\") : parts[0]; const subpath = id.startsWith(\"@\") ? parts.slice(2).join(\"/\") : parts.slice(1).join(\"/\"); const packageDir = path.join(cwd, \"node_modules\", packageName); const pkg = JSON.parse(await fs.readFile(path.join(packageDir, \"package.json\"), \"utf8\")); const exportKey = subpath ? \"./\" + subpath : \".\"; const exported = pickExport(pkg.exports?.[exportKey]); const fallback = subpath ? \"./\" + subpath : pkg.main ?? \"index.css\"; return path.resolve(packageDir, exported ?? fallback); }; const entry = path.join(cwd, \"src/styles/globals.css\"); const input = await fs.readFile(entry, \"utf8\"); const tailwind = await import(\"file://\" + path.join(cwd, \"node_modules\", \"tailwindcss\", \"dist\", \"lib.mjs\")); const compiled = await tailwind.compile(input, { from: entry, loadStylesheet: async (id, base) => { const file = await resolveStylesheet(id, base); return { path: file, base: path.dirname(file), content: await fs.readFile(file, \"utf8\") }; } }); const css = compiled.build([]); await fs.mkdir(path.join(cwd, \"dist\"), { recursive: true }); await fs.writeFile(path.join(cwd, \"dist/globals.css\"), css);'"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.5.0",
+    "@fontsource-variable/roboto": "catalog:",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "catalog:",
+    "next-themes": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "shadcn": "^4.11.0",
+    "sileo": "catalog:",
+    "tailwind-merge": "^3.6.0",
+    "tw-animate-css": "^1.4.0",
+    "vaul": "^1.1.2"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "tailwindcss": "catalog:",
+    "typescript": "catalog:"
+  }
+}

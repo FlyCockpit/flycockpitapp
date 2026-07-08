@@ -1,0 +1,1 @@
+-- Legacy graph event schema removed before release.

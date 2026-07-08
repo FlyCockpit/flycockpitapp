@@ -1,0 +1,9 @@
+{
+  "body": "Hola {{name}}, un administrador ha creado una cuenta para ti. Puedes iniciar sesión con la contraseña temporal que aparece a continuación — por favor cámbiala después de tu primer inicio de sesión.",
+  "cta": "Iniciar sesión",
+  "emailLabel": "Correo electrónico",
+  "heading": "Has sido invitado",
+  "ignoreFooter": "Si no esperabas esta invitación, puedes ignorar este correo de forma segura.",
+  "subject": "Has sido invitado",
+  "tempPasswordLabel": "Contraseña temporal"
+}

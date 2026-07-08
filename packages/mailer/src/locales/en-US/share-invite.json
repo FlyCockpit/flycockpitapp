@@ -1,0 +1,11 @@
+{
+  "subject": "You were invited to a Flycockpit instance",
+  "heading": "Instance access invitation",
+  "body": "{{ownerName}} invited you to access {{instanceName}} on Flycockpit.",
+  "scopesLabel": "Granted access",
+  "expiresLabel": "Expires",
+  "neverExpires": "Never",
+  "ctaExisting": "Review invitation",
+  "ctaNew": "Create account to accept",
+  "ignoreFooter": "If you were not expecting this invitation, you can ignore this email. Access is not granted until you accept it with this email address."
+}

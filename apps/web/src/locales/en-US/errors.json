@@ -1,0 +1,6 @@
+{
+  "appUpdateAvailable": "A new version is available. Reloading…",
+  "couldNotCopy": "Couldn't copy — please select and copy manually.",
+  "pageDescription": "{{appName}} is a web application",
+  "rootError": "This page didn't load. Try again, or reload."
+}

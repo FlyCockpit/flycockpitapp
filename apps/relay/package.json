@@ -1,0 +1,28 @@
+{
+  "name": "relay",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run --passWithNoTests",
+    "check-types": "tsc --noEmit",
+    "build": "tsdown",
+    "start": "node dist/index.mjs"
+  },
+  "dependencies": {
+    "@flycockpit/env": "workspace:*",
+    "@flycockpit/relay-protocol": "workspace:*",
+    "ioredis": "catalog:",
+    "ws": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/ws": "catalog:",
+    "tsdown": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

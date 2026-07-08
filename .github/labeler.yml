@@ -1,0 +1,42 @@
+schema-change:
+  - changed-files:
+      - any-glob-to-any-file: "packages/db/prisma/**"
+
+api-contract:
+  - changed-files:
+      - any-glob-to-any-file: "packages/api/src/**"
+
+auth-change:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "packages/auth/**"
+          - "packages/db/prisma/**/*auth*"
+
+env-change:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "packages/env/**"
+          - "**/.env.example"
+
+infra-change:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "Dockerfile"
+          - "Dockerfile.worker"
+          - "**/docker-compose*"
+          - "turbo.json"
+
+new-deps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/package.json"
+          - "pnpm-lock.yaml"
+
+ui-change:
+  - changed-files:
+      - any-glob-to-any-file: "packages/ui/**"
+
+cli-change:
+  - changed-files:
+      - any-glob-to-any-file: "apps/cli/**"

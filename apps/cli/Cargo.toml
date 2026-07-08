@@ -1,0 +1,255 @@
+[package]
+name = "cockpit-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "AI coding harness in Rust with a codex-style TUI, multi-agent file locking, deterministic context pruning, and a meta-harness for orchestrating other coding harnesses"
+license = "Apache-2.0"
+repository = "https://github.com/FlyCockpit/flycockpitapp"
+homepage = "https://github.com/FlyCockpit/flycockpitapp"
+readme = "README.md"
+keywords = ["ai", "coding", "agent", "cli", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+# Opt this package into cargo-dist releases despite `publish = false`
+# (dist skips unpublishable packages by default).
+[package.metadata.dist]
+dist = true
+
+[[bin]]
+name = "cockpit"
+path = "src/main.rs"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4.6", features = ["derive", "wrap_help", "string"] }
+clap_complete = "4.6"
+
+# Async runtime
+tokio = { version = "1.52", features = [
+    "rt-multi-thread", "macros", "process", "io-util", "fs",
+    "net", "signal", "time", "sync",
+] }
+async-trait = "0.1"
+futures = "0.3"
+bytes = "1"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+# Markdown parser for rendering agent (and optionally user) messages as
+# styled ratatui spans. Event-driven; we walk the parser output to emit
+# `Vec<Line>` directly — no HTML/ANSI intermediary. We also use the
+# `html` module to convert agent markdown to HTML for the rich-text
+# clipboard path.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# System clipboard for local sessions. Supports
+# multi-format set (plain text + HTML) which OSC52 cannot do, so
+# rich-text copy goes through arboard when not running over SSH.
+# `image-data` enables `Clipboard::get_image` for composer image paste
+# (composer-paste-handling); it pulls arboard's own `image` dep.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
+# Decode/normalize/encode pasted clipboard images to PNG before they go
+# to a vision model (composer-paste-handling). PNG-only feature set keeps
+# the build lean; we never decode other formats ourselves (arboard hands
+# us raw RGBA, we only encode).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Embedded-PTY panes for `/editor` + `/lazygit`. `portable-pty`
+# (wezterm's pure-Rust PTY layer) spawns + resizes
+# the child; `vt100` is the terminal-screen state machine fed by the
+# reader thread; `tui-term` renders a `vt100::Screen` into a ratatui
+# `PseudoTerminal` widget. `tui-term` 0.3 pins `ratatui ^0.30` — a
+# ratatui bump must be matched by a `tui-term` bump.
+portable-pty = "0.9"
+vt100 = "0.16"
+tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
+
+# HTTP / providers
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# Provider layer — used as request-builder primitives, not as an agent framework.
+# The crate was renamed to `rig_core` in 0.37 (was `rig` through 0.36); we
+# rename it back to `rig` via the `package` key so the existing
+# `use rig::…` imports keep working.
+rig = { version = "0.38", package = "rig-core", features = ["image"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+
+# Storage
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# Session-log export archive writer (`cockpit export <session>` → .zip,
+# session-log-export Part D). `default-features = false` + only `deflate`
+# drops the aes/bzip2/zstd/xz/time extras we don't use — we write a small
+# set of JSON files from in-memory bytes via `ZipWriter` + `start_file` +
+# `write_all` + `finish` (API verified against zip 8.6 docs + a compile
+# probe; kcl lacks the `zip` package).
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+# Codec helpers for the NDJSON daemon wire protocol.
+# `Framed<UnixStream, LinesCodec>` lifts a byte stream into a
+# `Sink<String> + Stream<Item = String>` we can layer serde on top of.
+tokio-util = { version = "0.7", features = ["codec"] }
+# Language Server Protocol client payload types. cockpit hand-rolls the
+# stdio JSON-RPC transport and uses this crate only for protocol structs.
+lsp-types = "0.97"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# TOML parsing for env-file format auto-detection (§7). Used to walk a
+# matched env file's leaf string scalars as redaction candidates.
+toml = "1"
+
+# JSON Schema validation — drives the §12 validate-then-repair layer.
+# Each tool's `parameters()` schema is compiled once and reused to
+# localize a malformed tool call to the exact failing instance paths
+# before the repair catalog spends any budget. `default-features =
+# false` drops the optria/format-assertion + CLI extras we don't use,
+# keeping the dependency surface (and the schemas we validate against,
+# all hand-authored object schemas) minimal.
+jsonschema = { version = "0.46", default-features = false }
+
+# Filesystem helpers
+dirs = "6"
+shellexpand = "3"
+walkdir = "2"
+ignore = "0.4"
+globset = "0.4"
+notify = "8"
+
+# Native (no-subprocess) content search for the sandboxed `grep` tool
+# (docs-agent decision 2). The ripgrep library crates run a regex search
+# over an in-process file handle so the `docs` answerer never gets shell
+# access: `grep-regex` builds the matcher, `grep-searcher` drives the
+# line-by-line search, `grep-matcher` is the shared matcher trait the
+# Sink consumes.
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+
+# Shell-command classification for the command-approval subsystem
+# (sandboxing part 1). A real bash-grammar AST (from the brush shell) —
+# distinguishes pipelines / `&&`-`||` lists / sequences / subshells /
+# simple commands and is quoting-correct, so `echo "a && b"` is one
+# simple command, not a chain. Tokenize-only crates (`shlex`,
+# `shell-words`) can't answer compound-vs-simple; `conch-parser` is
+# unmaintained; `yash-syntax` is GPL-incompatible. We parse in `sh_mode`
+# because `bash.rs` executes commands via `sh -c`.
+brush-parser = "0.4"
+
+# Filesystem sandboxing engine for the `bash` tool (sandboxing part 2).
+# Linux/macOS/WSL only — `Sandbox::...prepare()`
+# yields a `tokio::process::Command` we own (so cockpit keeps its
+# process-group kill + timeout + ctrl-c cancel), confining reads to cwd +
+# the per-session tmp dir while allowing PATH execution. Windows has no
+# backend: the shell runs unconfined with a one-time per-session notice.
+# Native cockpit tools are confined in-process (all platforms), not by
+# zerobox. Linux re-entry requires `arg0::dispatch_linux_sandbox_helper`
+# early in `main` + a PATH-prepend helper guard kept alive for the
+# process lifetime.
+zerobox = "0.3"
+
+# Secret scanning / redaction
+aho-corasick = "1"
+dotenvy = "0.15"
+
+# Tokenizer (cl100k_base) — used as the fallback counter when the
+# active provider doesn't expose its own. Singleton-backed; the BPE
+# vocab is built once on first call.
+tiktoken-rs = "0.12"
+
+# Cross-platform sleep-assertion crate for `/caffeinate` (daemon holds
+# the assertion). Pure-Rust: `SetThreadExecutionState` (Windows),
+# `IOPMAssertionCreateWithName` (macOS), logind `idle`/`sleep`
+# inhibitor locks via blocking zbus (Linux). Default features only —
+# the `bin` feature (clap/ctrlc/sysinfo) is opt-in and we never build
+# its CLI. NB: keepawake's logind path inhibits `idle`+`sleep` but NOT
+# `handle-lid-switch`, which `LidSwitchIgnoreInhibited=yes` (the logind
+# default) causes to be ignored on lid close — so on Linux we add our
+# own `handle-lid-switch` inhibitor (see `daemon::caffeinate::linux`)
+# using the same zbus version to keep one zbus in the tree.
+keepawake = "0.6"
+
+# OAuth device-code flow (Codex login). PKCE = SHA-256 + URL-safe base64
+# (no padding); `urlencoding` is just for the form-encoded body of the
+# RFC 8628 token exchange step.
+base64 = "0.22"
+sha2 = "0.11"
+rand = "0.10"
+urlencoding = "2"
+
+# Subprocess discovery (Windows: gitbash, on every platform: harness commands)
+which = "8"
+
+# Monty — the embedded Python sandbox VM that backs monty-mode MCP.
+# Pure-Rust (ruff parser + VM), edition 2024 / MSRV 1.95;
+# git dep (no crates.io publish). External-function registration +
+# snapshot/resume async dispatch + resource limits (memory/time/stack)
+# let the `mcp` tool run model-authored Python with zero filesystem,
+# network, or env access — only the host-provided mcp.search/mcp.invoke.
+monty = { git = "https://github.com/pydantic/monty.git", rev = "4cae0789864668b6b642a02c1b06d352f5a67313" }
+
+# Time / IDs
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Errors / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Misc
+tempfile = "3"
+regex = "1"
+unicode-width = "0.2"
+# CSV output for `cockpit stats --format=csv`. Used only as
+# a writer over an in-memory buffer; no parsing or serde-record paths.
+csv = "1"
+# Diff rendering for the edit/write tool entries in the TUI history
+# pane (tui.diff_style). Provides line+intraline diff primitives.
+similar = "3"
+
+# Codebase-intelligence outline index. `tree-sitter` core
+# parses; the grammar crates supply per-language `LANGUAGE` consts. The
+# grammar versions span 0.23–0.25 but are mutually compatible: modern
+# grammars depend on the tiny `tree-sitter-language` shim (the
+# `LanguageFn` ABI), not on `tree-sitter` core directly, so there's a
+# single core in the tree. `rayon` drives the parallel parse; the serial
+# SQLite write goes through the bundled `rusqlite` connection.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+rayon = "1"
+
+# Linux-only: logind `handle-lid-switch` inhibitor lock for
+# `/caffeinate` lid-close survival (the high-level inhibitor logind
+# always honors, unlike the `sleep` lock keepawake takes). Blocking
+# zbus matches keepawake's `zbus = "5"` so the dependency graph has a
+# single zbus. Held on a dedicated thread alongside the keepawake
+# assertion (see `daemon::caffeinate`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+# `test-util` enables `tokio::time::{pause, advance}` for deterministic
+# timer tests (e.g. the ephemeral idle watchdog) without sleeping real
+# wall-clock. Dev-only: it never reaches the released binary.
+tokio = { version = "1.52", features = ["test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

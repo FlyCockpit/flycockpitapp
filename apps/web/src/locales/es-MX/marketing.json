@@ -1,0 +1,16 @@
+{
+  "about": {
+    "title": "Acerca de Flycockpit",
+    "body": "Flycockpit es el plano de control autenticado para instancias de desarrollo remoto alojadas y empresariales."
+  },
+  "home": {
+    "title": "Consola de operaciones de Flycockpit",
+    "subtitle": "Accede a instancias remotas, terminales del navegador, herramientas de archivos, autorización de dispositivos y controles empresariales desde un cockpit autenticado.",
+    "signIn": "Iniciar sesión",
+    "device": "Aprobar dispositivo"
+  },
+  "cookiePolicy": {
+    "title": "Política de cookies",
+    "body": "Flycockpit almacena cookies estrictamente necesarias para autenticación, seguridad, idioma, tema y preferencias de consentimiento. Las categorías opcionales se pueden cambiar en cualquier momento."
+  }
+}

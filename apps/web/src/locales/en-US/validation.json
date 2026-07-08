@@ -1,0 +1,48 @@
+{
+  "required": "This field is required.",
+  "invalidType": "Expected {{expected}}.",
+  "tooSmall": {
+    "string": "Must be at least {{minimum}} characters.",
+    "number": "Must be at least {{minimum}}.",
+    "int": "Must be at least {{minimum}}.",
+    "bigint": "Must be at least {{minimum}}.",
+    "date": "Must be on or after {{minimum}}.",
+    "array": "Must contain at least {{minimum}} items.",
+    "set": "Must contain at least {{minimum}} items.",
+    "file": "Must be at least {{minimum}} bytes."
+  },
+  "tooBig": {
+    "string": "Must be at most {{maximum}} characters.",
+    "number": "Must be at most {{maximum}}.",
+    "int": "Must be at most {{maximum}}.",
+    "bigint": "Must be at most {{maximum}}.",
+    "date": "Must be on or before {{maximum}}.",
+    "array": "Must contain at most {{maximum}} items.",
+    "set": "Must contain at most {{maximum}} items.",
+    "file": "Must be at most {{maximum}} bytes."
+  },
+  "invalidString": {
+    "email": "Enter a valid email address.",
+    "url": "Enter a valid URL.",
+    "uuid": "Must be a valid UUID.",
+    "regex": "Format is invalid.",
+    "emoji": "Must be a valid emoji.",
+    "datetime": "Enter a valid date and time.",
+    "date": "Enter a valid date.",
+    "time": "Enter a valid time.",
+    "ipv4": "Enter a valid IPv4 address.",
+    "ipv6": "Enter a valid IPv6 address.",
+    "startsWith": "Must start with \"{{prefix}}\".",
+    "endsWith": "Must end with \"{{suffix}}\".",
+    "includes": "Must include \"{{includes}}\"."
+  },
+  "invalidEnum": "Must be one of: {{options}}.",
+  "invalidLiteral": "Must be {{expected}}.",
+  "invalidDate": "Enter a valid date.",
+  "invalidUnion": "Invalid value.",
+  "invalidKey": "Invalid key.",
+  "invalidElement": "Invalid value.",
+  "unrecognizedKeys": "Unrecognized field: {{keys}}.",
+  "custom": "Invalid value.",
+  "notMultipleOf": "Must be a multiple of {{multipleOf}}."
+}

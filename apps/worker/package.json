@@ -1,0 +1,34 @@
+{
+  "name": "worker",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run --passWithNoTests",
+    "check-types": "tsc --noEmit",
+    "build": "tsdown",
+    "start": "node dist/index.mjs"
+  },
+  "dependencies": {
+    "@flycockpit/api": "workspace:*",
+    "@flycockpit/auth": "workspace:*",
+    "@flycockpit/db": "workspace:*",
+    "@flycockpit/env": "workspace:*",
+    "@flycockpit/i18n-translate": "workspace:*",
+    "@flycockpit/mailer": "workspace:*",
+    "@flycockpit/queue": "workspace:*",
+    "bullmq": "catalog:",
+    "ioredis": "catalog:",
+    "sharp": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/node": "catalog:",
+    "tsdown": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "vitest-mock-extended": "catalog:"
+  }
+}

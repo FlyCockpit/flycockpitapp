@@ -1,0 +1,592 @@
+//! Session-log capture: `inference_requests` + `session_events`.
+//!
+//! Two always-on surfaces (migration `0009_session_log.sql`) that feed
+//! `cockpit export <session>`:
+//!
+//! - [`Db::insert_inference_request`] stores the full post-redaction
+//!   assembled request body keyed by the same `call_id` the
+//!   `inference_calls` metadata row uses.
+//! - [`Db::insert_session_event`] appends one row to the per-session
+//!   event timeline. `seq` (the AUTOINCREMENT rowid) is globally
+//!   monotonic — the authoritative ordering across the whole fork tree —
+//!   and `ts_ms` is millisecond-resolution for human reading.
+//!
+//! The event `type` discriminant aligns with the engine [`TurnEvent`]
+//! vocabulary (see [`SessionEventKind`]); per-type fields ride in a JSON
+//! payload so the schema is stable as the event set grows.
+//!
+//! [`TurnEvent`]: crate::engine::TurnEvent
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, params};
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::db::Db;
+
+/// Event-type discriminants for the session log. The string forms are
+/// the stable on-disk + `events.json` values; keep them aligned with the
+/// engine `TurnEvent` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEventKind {
+    /// The user's input text for a turn.
+    UserMessage,
+    /// A user-authored session-history note (`/note <text>`,
+    /// implementation note). Carries the note `text`. A
+    /// local-only annotation: rendered as a distinct transcript row and
+    /// included in exports, but **never** part of the model-bound history —
+    /// rehydration deliberately skips it (it is not in `rebuild_history`'s
+    /// recognized set), so it never enters outbound context.
+    UserNote,
+    /// Assistant text (and reasoning, when captured).
+    AssistantMessage,
+    /// An inference request was sent. Carries `call_id` + the
+    /// `inference_requests/` `file` name + token usage once known.
+    InferenceRequest,
+    /// A tool call resolved. Carries the wire-vs-user split + recovery, and
+    /// — for `bash` calls only — a `sandbox` sub-object recording the
+    /// confinement state (enabled / confined / escalated / broad-grant skip
+    /// / approval scope) so an export is diagnosable across all four
+    /// sandbox states. Data/export only; never enters the model's context.
+    ToolCall,
+    /// A model-requested tool call passed dispatch validation and entered the
+    /// execution flow. Carries intent/input fields only so exports can measure
+    /// queue/approval/gating time separately from runtime.
+    ToolCallStarted,
+    /// A previously started tool call reached a terminal lifecycle outcome.
+    /// Carries result fields and an explicit status/dispatched flag; loop or
+    /// safety blocks are represented as non-dispatched completions.
+    ToolCallCompleted,
+    /// A `task` delegation spawned a child fork.
+    SubagentSpawned,
+    /// A subagent returned its report to the parent.
+    SubagentReport,
+    /// `/prune` (manual or auto) elided wire-only snapshot bodies.
+    ContextPruned,
+    /// `/compact` started a fresh successor session (a session boundary).
+    SessionCompacted,
+    /// The approval machinery resolved a permission decision (allow at a
+    /// scope, or deny). Carries the trigger (`tool`/`tool_call_id`/the
+    /// command line or path), the offered scope set, the decision, and the
+    /// resolution source (`already_granted` / `user_prompt` /
+    /// `headless_auto_reject` / `loop_guard_rule`). Data/export only.
+    PermissionDecision,
+    /// The dispatcher's validate-then-repair path (GOALS §12) rejected a tool
+    /// call **before** it became a `tool_call` row. Carries the attempted tool
+    /// `name` and a `reason` (`not_in_advertised_set` /
+    /// `schema_invalid_unrepairable`) so a hallucinated / unrepairable call is
+    /// directly queryable instead of inferred from assistant prose.
+    /// Data/export only.
+    ToolRejected,
+    /// The root-frame primary agent was swapped (GOALS §26). Carries `from`/`to`
+    /// agent, the `trigger` (`handoff` tool vs a `/plan`/`/build`/`/swarm`
+    /// slash-command swap), and — preserving the wire-vs-user split (GOALS §14)
+    /// — both the user-facing `display` row and the model-facing wire `kickoff`
+    /// (absent for the slash-command swaps, which inject no kickoff).
+    /// Data/export only.
+    PrimarySwap,
+    /// An inference call failed
+    /// (implementation note): a TTFT /
+    /// idle timeout, a connection error, or a non-retryable HTTP response.
+    /// Carries `provider`, `model`, `phase_reached`
+    /// (`prep`/`dispatched`/`first_token`/`streaming`), `error_class`
+    /// (`timeout_ttft`/`timeout_idle`/`network`/`http_<status>`/`cancelled`),
+    /// and `elapsed_ms`. Keyed by the same `call_id` as the dispatch-time
+    /// `inference_request` record. Data/export only — never enters the model's
+    /// context (the user-facing inline error is a separate UI surface).
+    InferenceFailure,
+    /// A terminal inference failure aborted a turn and the driver captured the
+    /// prompt/progress needed for an explicit retry. Data/export only; the
+    /// model sees the retried prompt only if the user triggers the retry.
+    FailedTurnRecovery,
+    /// The utility-model skill selector skipped or rejected auto-injection
+    /// candidates. Data/export only: never enters the transcript or model
+    /// context.
+    SkillAutoSelect,
+    /// Auto-prune evaluated a candidate plan and skipped it before mutating
+    /// history. Data/export only: never enters the transcript or model
+    /// context.
+    AutoPruneDiagnostic,
+    /// Active-goal continuation finished without a user-visible progress,
+    /// status, tool, or failure event. Data/export only.
+    GoalProgressDiagnostic,
+    /// A user promoted or attempted to promote a queued resource-scheduler
+    /// request. Data/export only.
+    ResourcePromotion,
+}
+
+impl SessionEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionEventKind::UserMessage => "user_message",
+            SessionEventKind::UserNote => "user_note",
+            SessionEventKind::AssistantMessage => "assistant_message",
+            SessionEventKind::InferenceRequest => "inference_request",
+            SessionEventKind::ToolCall => "tool_call",
+            SessionEventKind::ToolCallStarted => "tool_call_started",
+            SessionEventKind::ToolCallCompleted => "tool_call_completed",
+            SessionEventKind::SubagentSpawned => "subagent_spawned",
+            SessionEventKind::SubagentReport => "subagent_report",
+            SessionEventKind::ContextPruned => "context_pruned",
+            SessionEventKind::SessionCompacted => "session_compacted",
+            SessionEventKind::PermissionDecision => "permission_decision",
+            SessionEventKind::ToolRejected => "tool_rejected",
+            SessionEventKind::PrimarySwap => "primary_swap",
+            SessionEventKind::InferenceFailure => "inference_failure",
+            SessionEventKind::FailedTurnRecovery => "failed_turn_recovery",
+            SessionEventKind::SkillAutoSelect => "skill_auto_select",
+            SessionEventKind::AutoPruneDiagnostic => "auto_prune_diagnostic",
+            SessionEventKind::GoalProgressDiagnostic => "goal_progress_diagnostic",
+            SessionEventKind::ResourcePromotion => "resource_promotion",
+        }
+    }
+}
+
+/// Terminal lifecycle status of an inference attempt's dispatch-time record
+/// (implementation note). Written
+/// `Pending` at dispatch and updated to a terminal value on settle so a hung
+/// or failed turn still exports a record with a non-`completed` status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceRequestStatus {
+    /// Dispatched; not yet settled (the state a hung turn is frozen in).
+    Pending,
+    /// Returned successfully.
+    Completed,
+    /// Failed with a non-timeout error (network / non-retryable HTTP).
+    Errored,
+    /// Aborted by a TTFT or idle stream timeout.
+    TimedOut,
+    /// Aborted by the user (ctrl+c).
+    Cancelled,
+}
+
+impl InferenceRequestStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InferenceRequestStatus::Pending => "pending",
+            InferenceRequestStatus::Completed => "completed",
+            InferenceRequestStatus::Errored => "errored",
+            InferenceRequestStatus::TimedOut => "timed_out",
+            InferenceRequestStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A row read back from `session_events`.
+#[derive(Debug, Clone)]
+pub struct SessionEventRow {
+    pub seq: i64,
+    pub session_id: Uuid,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub agent: Option<String>,
+    pub call_id: Option<String>,
+    pub origin_principal: Option<String>,
+    pub data: Value,
+}
+
+/// Current epoch milliseconds. One helper so every session-log timestamp
+/// uses the same clock + resolution.
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+impl Db {
+    /// Store the full assembled (post-redaction) request body for one
+    /// inference call with its lifecycle `status`. `call_id` must match the
+    /// `inference_calls` row's `call_id` so the export can join usage onto the
+    /// payload. Uses `INSERT OR REPLACE` so the dispatch-time write
+    /// (status `pending`) and the terminal update (status
+    /// `completed`/`errored`/`timed_out`/`cancelled`) for the same `call_id`
+    /// land on one row — the terminal write supersedes the pending one
+    /// (implementation note). The
+    /// dispatch `ts_ms` is preserved across the update via `COALESCE` so the
+    /// recorded timestamp is when the request went out, not when it settled.
+    pub fn insert_inference_request(
+        &self,
+        call_id: &str,
+        session_id: Uuid,
+        payload: &Value,
+        status: InferenceRequestStatus,
+    ) -> Result<()> {
+        let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
+        let ts_ms = now_ms();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO inference_requests
+                   (call_id, session_id, ts_ms, payload_json, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(call_id) DO UPDATE SET
+                   payload_json = excluded.payload_json,
+                   status       = excluded.status",
+                params![
+                    call_id,
+                    session_id.to_string(),
+                    ts_ms,
+                    payload_json,
+                    status.as_str()
+                ],
+            )
+            .context("inserting inference_request")?;
+            Ok(())
+        })
+    }
+
+    /// Append one event to the per-session timeline. Returns the assigned
+    /// monotonic `seq` (the rowid). `data` carries the per-type payload.
+    pub fn insert_session_event(
+        &self,
+        session_id: Uuid,
+        kind: SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        data: &Value,
+    ) -> Result<i64> {
+        self.insert_session_event_with_origin(session_id, kind, agent, call_id, None, data)
+    }
+
+    pub fn insert_session_event_with_origin(
+        &self,
+        session_id: Uuid,
+        kind: SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        origin_principal: Option<&str>,
+        data: &Value,
+    ) -> Result<i64> {
+        let data_json = serde_json::to_string(data).context("serializing event data")?;
+        let ts_ms = now_ms();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO session_events
+                 (session_id, ts_ms, type, agent, call_id, origin_principal, data_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    session_id.to_string(),
+                    ts_ms,
+                    kind.as_str(),
+                    agent,
+                    call_id,
+                    origin_principal,
+                    data_json,
+                ],
+            )
+            .context("inserting session_event")?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// All events for one session, ordered by `seq` (oldest first). Used
+    /// by the exporter to merge per-fork timelines.
+    pub fn list_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEventRow>> {
+        self.with_conn(|conn| Self::list_session_events_conn(conn, session_id))
+    }
+
+    pub fn list_session_events_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<SessionEventRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, origin_principal, data_json
+                   FROM session_events
+                  WHERE session_id = ?1
+                  ORDER BY seq ASC",
+            )
+            .context("preparing list_session_events")?;
+        let rows = stmt
+            .query_map([session_id.to_string()], decode_event_row)
+            .context("querying session_events")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("decoding session_event row")??);
+        }
+        Ok(out)
+    }
+
+    /// Look up the stored (post-redaction) request payload + lifecycle
+    /// `status` for one `call_id`. `None` when no payload was captured (e.g. a
+    /// pre-0009 call). The export writes the payload verbatim and surfaces the
+    /// status on the emitted file so a hung/failed turn's record carries its
+    /// non-`completed` status.
+    pub fn get_inference_request(&self, call_id: &str) -> Result<Option<(Value, String)>> {
+        self.with_conn(|conn| {
+            let result: rusqlite::Result<(String, String)> = conn.query_row(
+                "SELECT payload_json, status FROM inference_requests WHERE call_id = ?1",
+                [call_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            match result {
+                Ok((payload_json, status)) => {
+                    let payload: Value = serde_json::from_str(&payload_json)
+                        .context("deserializing payload_json")?;
+                    Ok(Some((payload, status)))
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e).context("querying inference_request"),
+            }
+        })
+    }
+}
+
+type DecodeResult<T> = rusqlite::Result<Result<T>>;
+
+fn decode_event_row(row: &rusqlite::Row<'_>) -> DecodeResult<SessionEventRow> {
+    let sid: String = row.get("session_id")?;
+    let data_json: String = row.get("data_json")?;
+    Ok((|| {
+        let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
+        let data: Value = serde_json::from_str(&data_json).context("deserializing data_json")?;
+        Ok(SessionEventRow {
+            seq: row.get("seq").map_err(anyhow::Error::from)?,
+            session_id,
+            ts_ms: row.get("ts_ms").map_err(anyhow::Error::from)?,
+            kind: row.get("type").map_err(anyhow::Error::from)?,
+            agent: row.get("agent").map_err(anyhow::Error::from)?,
+            call_id: row.get("call_id").map_err(anyhow::Error::from)?,
+            origin_principal: row.get("origin_principal").map_err(anyhow::Error::from)?,
+            data,
+        })
+    })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn inference_request_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        let payload = json!({
+            "model": "claude-opus-4-7",
+            "provider": "anthropic",
+            "system": "you are a builder",
+            "tools": [{"name": "read"}],
+            "history": [{"role": "user", "content": "hi"}],
+        });
+        db.insert_inference_request(
+            &call_id,
+            s.session_id,
+            &payload,
+            InferenceRequestStatus::Completed,
+        )
+        .unwrap();
+        let (got, status) = db.get_inference_request(&call_id).unwrap().unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(status, "completed");
+        // Unknown call_id resolves to None.
+        assert!(db.get_inference_request("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn inference_request_dispatch_then_terminal_update_supersedes() {
+        // The dispatch-time write (status `pending`) and the terminal update
+        // (status `timed_out`) for one call_id collapse onto a single row,
+        // with the terminal status + payload winning — the
+        // dispatch-time-recording lifecycle
+        // (implementation note).
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        let pending_payload = json!({ "model": "m", "status_hint": "pre-dispatch" });
+        db.insert_inference_request(
+            &call_id,
+            s.session_id,
+            &pending_payload,
+            InferenceRequestStatus::Pending,
+        )
+        .unwrap();
+        let (_, status) = db.get_inference_request(&call_id).unwrap().unwrap();
+        assert_eq!(status, "pending");
+
+        // Terminal update: a hung turn that timed out.
+        let final_payload = json!({ "model": "m", "phases": { "dispatched_ms": 0 } });
+        db.insert_inference_request(
+            &call_id,
+            s.session_id,
+            &final_payload,
+            InferenceRequestStatus::TimedOut,
+        )
+        .unwrap();
+        let (got, status) = db.get_inference_request(&call_id).unwrap().unwrap();
+        assert_eq!(status, "timed_out");
+        assert_eq!(got, final_payload, "terminal payload supersedes pending");
+
+        // Exactly one row — the update collapsed onto the dispatch row.
+        let count: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM inference_requests WHERE call_id = ?1",
+                    [&call_id],
+                    |r| r.get(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn permission_decision_event_round_trips() {
+        // The `permission_decision` variant persists with its stable
+        // discriminant string and its data payload flows back verbatim.
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let data = json!({
+            "tool": "bash",
+            "tool_call_id": null,
+            "target": "rm file",
+            "offered_scopes": ["once", "session", "project", "global"],
+            "decision": "deny",
+            "scope": null,
+            "source": "user_prompt",
+        });
+        db.insert_session_event(
+            s.session_id,
+            SessionEventKind::PermissionDecision,
+            Some("builder"),
+            None,
+            &data,
+        )
+        .unwrap();
+        let events = db.list_session_events(s.session_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "permission_decision");
+        assert_eq!(events[0].data, data);
+    }
+
+    #[test]
+    fn tool_rejected_and_primary_swap_events_round_trip() {
+        // The two export-audit-fidelity event kinds persist with their stable
+        // discriminant strings and flow their data payloads back verbatim.
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "Build").unwrap();
+        let sid = s.session_id;
+
+        let rejected = json!({"tool": "handoff", "reason": "not_in_advertised_set"});
+        db.insert_session_event(
+            sid,
+            SessionEventKind::ToolRejected,
+            Some("Build"),
+            Some("tc-1"),
+            &rejected,
+        )
+        .unwrap();
+        let swap = json!({
+            "from": "Auto",
+            "to": "Build",
+            "trigger": "handoff",
+            "display": "Handed off to `Build`.",
+            "kickoff": "User's request:\nfix it\n\nBegin now.",
+        });
+        db.insert_session_event(
+            sid,
+            SessionEventKind::PrimarySwap,
+            Some("Auto"),
+            None,
+            &swap,
+        )
+        .unwrap();
+
+        let events = db.list_session_events(sid).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "tool_rejected");
+        assert_eq!(events[0].data, rejected);
+        assert_eq!(events[0].call_id.as_deref(), Some("tc-1"));
+        assert_eq!(events[1].kind, "primary_swap");
+        assert_eq!(events[1].data, swap);
+    }
+
+    #[test]
+    fn user_note_event_persists_with_stable_discriminant() {
+        // `/note` records a `user_note` session event that persists durably
+        // (survives a fresh Db handle to the same file) with its stable
+        // discriminant string and verbatim text payload — the basis for both
+        // resume and `/export debug` inclusion. No truncation in storage.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cockpit.db");
+        let long = "x".repeat(10_000);
+        let sid;
+        let seq;
+        {
+            let db = Db::open(&path).unwrap();
+            let s = db.create_session("p", "/x", "Build").unwrap();
+            sid = s.session_id;
+            assert_eq!(SessionEventKind::UserNote.as_str(), "user_note");
+            seq = db
+                .insert_session_event(
+                    sid,
+                    SessionEventKind::UserNote,
+                    Some("Build"),
+                    None,
+                    &json!({ "text": long }),
+                )
+                .unwrap();
+            assert!(seq > 0, "a monotonic seq is assigned");
+        }
+        // A fresh handle (a restart / resume) still sees the note in place.
+        {
+            let db = Db::open(&path).unwrap();
+            let events = db.list_session_events(sid).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "user_note");
+            assert_eq!(events[0].seq, seq);
+            assert_eq!(
+                events[0].data.get("text").and_then(|v| v.as_str()),
+                Some(long.as_str()),
+                "the full note text is stored untruncated"
+            );
+        }
+    }
+
+    #[test]
+    fn session_events_seq_is_monotonic_across_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_session("p", "/x", "builder").unwrap();
+        let b = db.create_fork(a.session_id, None).unwrap();
+        // Interleave inserts across two sessions; seq must be globally
+        // monotonic so the export's unified timeline orders correctly.
+        let s1 = db
+            .insert_session_event(
+                a.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "first"}),
+            )
+            .unwrap();
+        let s2 = db
+            .insert_session_event(
+                b.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("explore"),
+                None,
+                &json!({"text": "second"}),
+            )
+            .unwrap();
+        let s3 = db
+            .insert_session_event(
+                a.session_id,
+                SessionEventKind::InferenceRequest,
+                Some("builder"),
+                Some("call-1"),
+                &json!({"file": "00003_x_call-1.json"}),
+            )
+            .unwrap();
+        assert!(s1 < s2 && s2 < s3, "seq must be globally monotonic");
+
+        let a_events = db.list_session_events(a.session_id).unwrap();
+        assert_eq!(a_events.len(), 2);
+        assert_eq!(a_events[0].kind, "user_message");
+        assert_eq!(a_events[1].kind, "inference_request");
+        assert_eq!(a_events[1].call_id.as_deref(), Some("call-1"));
+
+        let b_events = db.list_session_events(b.session_id).unwrap();
+        assert_eq!(b_events.len(), 1);
+        assert_eq!(b_events[0].kind, "assistant_message");
+        assert_eq!(b_events[0].data, json!({"text": "second"}));
+    }
+}

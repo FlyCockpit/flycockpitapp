@@ -1,0 +1,34 @@
+{
+  "actions": {
+    "back": "Atrás",
+    "cancel": "Cancelar",
+    "clear": "Limpiar",
+    "close": "Cerrar",
+    "copy": "Copiar",
+    "copied": "Copiado",
+    "delete": "Eliminar",
+    "deleting": "Eliminando…",
+    "edit": "Editar",
+    "manage": "Administrar",
+    "reload": "Recargar",
+    "refresh": "Actualizar",
+    "retry": "Reintentar",
+    "save": "Guardar",
+    "saveChanges": "Guardar cambios",
+    "saving": "Guardando…",
+    "tryAgain": "Intentar de nuevo",
+    "viewAll": "Ver todo",
+    "open": "Abrir"
+  },
+  "appName": "{{name}}",
+  "loading": "Cargando…",
+  "somethingWentWrong": "Algo salió mal",
+  "welcome": "Bienvenido",
+  "notifications": {
+    "openInbox": "Abrir notificaciones",
+    "inbox": "Notificaciones",
+    "loading": "Cargando notificaciones",
+    "empty": "Aun no hay notificaciones",
+    "resolved": "Ya atendida"
+  }
+}

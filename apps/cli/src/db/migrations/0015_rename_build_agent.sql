@@ -1,0 +1,23 @@
+-- 0015_rename_build_agent.sql — rename the primary agent
+-- `orchestrator-build` → `Build` (naming convention: primary agents are
+-- Capitalized, subagents lowercase).
+--
+-- Existing rows: any session persisted before the rename still carries
+-- `active_agent = 'orchestrator-build'`, a name that no longer dispatches
+-- in `engine::builtin::load`. Rewrite them so resumed sessions load and
+-- dispatch correctly.
+UPDATE sessions SET active_agent = 'Build' WHERE active_agent = 'orchestrator-build';
+
+-- Column default: 0001_initial.sql declared
+-- `active_agent TEXT NOT NULL DEFAULT 'orchestrator-build'`. That default
+-- is NEVER relied upon at runtime — both INSERT paths in
+-- `db::sessions` (`insert_session_row`, `create_fork`) always supply
+-- `active_agent` explicitly (the app sets it from the config-resolved
+-- default primary agent — `DefaultPrimaryAgent::agent_name()` — or inherits
+-- the parent's value on fork). No code reads
+-- the column default. A full table rebuild solely to restate a dead
+-- default would mean dropping/recreating the FK-referenced `sessions`
+-- table plus its three indexes for zero behavioral change — net tech-debt
+-- risk, not a fix. The UPDATE above is the complete, correct change; the
+-- stale default literal in 0001 is inert and intentionally left untouched
+-- (shipped migrations are immutable).

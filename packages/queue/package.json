@@ -1,0 +1,28 @@
+{
+  "name": "@flycockpit/queue",
+  "license": "Apache-2.0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./connection": {
+      "default": "./src/connection.ts"
+    },
+    "./jobs": {
+      "default": "./src/jobs.ts"
+    }
+  },
+  "dependencies": {
+    "@flycockpit/env": "workspace:*",
+    "bullmq": "catalog:",
+    "ioredis": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

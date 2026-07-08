@@ -1,0 +1,35 @@
+{
+  "name": "@flycockpit/relay-protocol",
+  "license": "Apache-2.0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./envelopes": {
+      "default": "./src/envelopes.ts"
+    },
+    "./tokens": {
+      "default": "./src/tokens.ts"
+    },
+    "./terminal": {
+      "default": "./src/terminal.ts"
+    }
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "jose": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "banner": {
+    "title": "Valoramos tu privacidad",
+    "message": "Usamos cookies para ejecutar este sitio y, con tu consentimiento, para medir el tráfico y mejorarlo. Puedes aceptar todo, rechazar lo no esencial, o elegir qué permitir.",
+    "acceptAll": "Aceptar todo",
+    "rejectAll": "Rechazar todo",
+    "customize": "Personalizar",
+    "policyLink": "Lee nuestra política de cookies"
+  },
+  "categories": {
+    "alwaysOn": "Siempre activas",
+    "necessary": {
+      "name": "Estrictamente necesarias",
+      "description": "Requeridas para que el sitio funcione — inicio de sesión, seguridad y recordar tus opciones. Estas no se pueden desactivar."
+    },
+    "functional": {
+      "name": "Funcionales",
+      "description": "Recuerda preferencias como idioma o diseño para mejorar tu experiencia."
+    },
+    "analytics": {
+      "name": "Análisis",
+      "description": "Nos ayuda a entender cómo se usa el sitio para poder mejorarlo. Agregados, no se usan para identificarte."
+    },
+    "marketing": {
+      "name": "Mercadotecnia",
+      "description": "Se usan para mostrar y medir publicidad, incluyendo en otros sitios web."
+    }
+  },
+  "preferences": {
+    "title": "Preferencias de cookies",
+    "description": "Elige qué cookies puede usar este sitio. Puedes cambiar esto en cualquier momento.",
+    "save": "Guardar opciones",
+    "acceptAll": "Aceptar todo",
+    "rejectAll": "Rechazar todo",
+    "open": "Preferencias de cookies"
+  },
+  "settings": {
+    "navPrivacy": "Privacidad",
+    "title": "Privacidad y cookies",
+    "description": "Administra qué puede almacenar este sitio en tu dispositivo.",
+    "manageButton": "Cambiar preferencias de cookies",
+    "statusDecided": "Opciones actualizadas por última vez {{date}}.",
+    "statusUndecided": "Aún no has tomado una decisión."
+  },
+  "status": {
+    "enabled": "Activado",
+    "disabled": "Desactivado"
+  }
+}

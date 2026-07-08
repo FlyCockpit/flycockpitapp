@@ -1,0 +1,77 @@
+{
+  "session": {
+    "sessionId": "s1",
+    "projectRoot": "/work/app",
+    "title": "Fix checkout",
+    "shortId": "s1",
+    "status": "needs_attention",
+    "archived": false,
+    "pinned": true,
+    "forkCount": 1,
+    "turnCount": 2,
+    "attention": {
+      "kind": "approval",
+      "interruptId": "int1"
+    },
+    "updatedAt": 1783296000,
+    "createdBy": {
+      "userId": "u1",
+      "displayName": "Chris",
+      "origin": "web"
+    },
+    "agent": "codex",
+    "model": "gpt-5"
+  },
+  "history": [
+    {
+      "id": "h1",
+      "seq": 1,
+      "ts": 1783296000,
+      "kind": "user_message",
+      "text": "Please fix checkout",
+      "actor": {
+        "userId": "u1",
+        "displayName": "Chris",
+        "origin": "web"
+      },
+      "attachments": []
+    },
+    {
+      "id": "h2",
+      "seq": 2,
+      "ts": 1783296010,
+      "kind": "assistant_text",
+      "text": "I will inspect the failing path."
+    },
+    {
+      "id": "h3",
+      "seq": 3,
+      "ts": 1783296020,
+      "kind": "tool_call",
+      "callId": "tool1",
+      "name": "shell",
+      "status": "succeeded",
+      "durationMs": 230,
+      "userFacing": true,
+      "output": {
+        "summary": "tests failed"
+      }
+    },
+    {
+      "id": "h4",
+      "seq": 4,
+      "ts": 1783296030,
+      "kind": "interrupt",
+      "interrupt": {
+        "interruptId": "int1",
+        "kind": "approval",
+        "title": "Run migration?",
+        "body": "Approve running db push?",
+        "choices": ["approve", "deny"],
+        "resolved": false
+      }
+    }
+  ],
+  "nextSeq": 5,
+  "schedules": []
+}

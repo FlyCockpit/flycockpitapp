@@ -1,0 +1,3 @@
+{
+  "extends": "@flycockpit/config/tsconfig.base.json"
+}

@@ -1,0 +1,76 @@
+enum AssetVisibility {
+  PUBLIC
+  RESTRICTED
+}
+
+enum AssetStatus {
+  PENDING
+  READY
+}
+
+enum AssetMetadataState {
+  CLIENT_HINT
+  SERVER_VERIFIED
+}
+
+// A Folder is one distinct path in the admin Finder UI. Normalizes the old
+// free-form `Asset.path` column so listings can be a single indexed lookup
+// (and a count) rather than a `groupBy` over every asset row.
+//
+// Hierarchy is encoded in the `path` string itself (each `/`-delimited segment
+// is implicit), not via a `parentId` self-reference — the admin UI derives
+// the tree from the flat `{ path, count }` list, and no caller currently
+// needs database-level tree traversal. Keeps `path` as the single source of
+// truth; no second column to drift.
+model Folder {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  // Canonical path string, e.g. "/images/blog/". Must start and end with `/`.
+  // The root folder is represented by `Asset.folderId = null`, not a Folder
+  // row with `path = "/"`. Folder rows always describe non-root paths.
+  path      String   @unique
+  Assets    Asset[]
+
+  @@map("folder")
+}
+
+model Asset {
+  id                 String              @id @default(cuid(2))
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @default(now()) @updatedAt
+  storageKey         String              @unique
+  mimeType           String
+  size               BigInt
+  visibility         AssetVisibility     @default(RESTRICTED)
+  ownerId            String?
+  Owner              User?               @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  width              Int?
+  height             Int?
+  blurhash           String?
+  folderId           String?
+  Folder             Folder?             @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  // status defaults to READY so existing rows (uploaded via the synchronous
+  // streaming path) are correct after `pnpm db:push`. Presigned uploads must
+  // explicitly set status: PENDING and flip to READY in the finalize handler.
+  status             AssetStatus         @default(READY)
+  // Legacy transition column for the expand-contract move to `metadataState`.
+  // Keep until every deployed DB has backfilled metadataState.
+  isMetadataVerified Boolean             @default(true)
+  // Whether width/height/blurhash are client-supplied hints or values
+  // computed server-side from the stored bytes by the analyze-asset worker.
+  metadataState      AssetMetadataState?
+  // Heartbeat from the upload client. PENDING rows whose heartbeat is older
+  // than the cleanup threshold (default 5 minutes) are eligible for reaping.
+  // Null on rows created before heartbeats existed and on synchronous uploads
+  // — the cleanup job falls back to `createdAt` in that case.
+  uploadHeartbeatAt  DateTime?
+  PosterForVideos    Video[]             @relation("VideoPoster")
+
+  @@index([folderId])
+  @@index([ownerId])
+  @@index([status])
+  @@index([status, uploadHeartbeatAt])
+  @@index([visibility])
+  @@map("asset")
+}

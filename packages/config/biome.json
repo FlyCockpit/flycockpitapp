@@ -1,0 +1,66 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+  "root": false,
+  "files": {
+    "includes": [
+      "**",
+      "!!**/node_modules/**",
+      "!!**/dist/**",
+      "!!**/dev-dist/**",
+      "!!**/.pnpm-store/**",
+      "!!**/.turbo/**",
+      "!!**/.next/**",
+      "!!**/build/**",
+      "!!**/coverage/**",
+      "!!**/.vinxi/**",
+      "!!**/.output/**",
+      "!!**/.tanstack/**",
+      "!!**/generated/**",
+      "!!**/routeTree.gen.ts",
+      "!!**/.astro/**"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "none",
+      "a11y": "off",
+      "complexity": {
+        "preset": "recommended",
+        "noImportantStyles": "off"
+      },
+      "correctness": {
+        "preset": "recommended",
+        "noUnknownTypeSelector": "off"
+      },
+      "nursery": "off",
+      "performance": "off",
+      "security": {
+        "preset": "recommended"
+      },
+      "style": "off",
+      "suspicious": {
+        "preset": "recommended",
+        "useBiomeIgnoreFolder": "off"
+      }
+    }
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all"
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "@flycockpit/db",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./seed": {
+      "default": "./prisma/seed.ts"
+    }
+  },
+  "scripts": {
+    "db:push": "prisma db push",
+    "db:push:dangerous": "bash ../../scripts/db-push-dangerous-local.sh",
+    "db:seed": "prisma db seed",
+    "db:generate": "prisma generate",
+    "db:validate": "prisma validate && prisma format && prisma format --check",
+    "postinstall": "prisma generate",
+    "db:studio": "prisma studio",
+    "db:start": "bash ../../scripts/compose.sh up -d",
+    "db:watch": "bash ../../scripts/compose.sh up",
+    "db:stop": "bash ../../scripts/compose.sh stop",
+    "db:down": "bash ../../scripts/compose.sh down"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "catalog:",
+    "@flycockpit/env": "workspace:*",
+    "dotenv": "catalog:",
+    "pg": "^8.21.0",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@flycockpit/config": "workspace:*",
+    "prisma": "^7.8.0",
+    "tsx": "catalog:",
+    "typescript": "catalog:"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.cli.ts"
+  }
+}

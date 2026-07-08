@@ -1,0 +1,1727 @@
+//! TUI ↔ daemon glue.
+//!
+//! Phase 4 of the daemon migration: the TUI no longer owns the
+//! engine. Instead [`try_spawn`] probes (or auto-promotes) the daemon
+//! via [`crate::daemon::client`], attaches a session at the cwd, and
+//! pipes the per-tick event stream from the daemon's broadcast back
+//! to the TUI in the same `Arc<Mutex<Vec<TurnEvent>>>` shape the rest
+//! of `app.rs` already consumes. The wire-shape of events is
+//! [`crate::daemon::proto::Event`]; we translate to [`TurnEvent`] at
+//! the boundary so the TUI rendering paths don't need to know they
+//! talk to a daemon.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::daemon::client::{LifecycleMode, probe_or_spawn};
+use crate::daemon::proto::{self, ErrorCode, Request, Response};
+use crate::engine::TurnEvent;
+
+/// The three 30-day autocomplete count maps fetched at session start.
+/// `models` and `slash` are global; `tags` is scoped to this session's
+/// project. Empty when the daemon predates `GetUsageCounts`.
+#[derive(Default, Clone)]
+pub struct UsageCounts {
+    pub models: HashMap<String, u64>,
+    pub slash: HashMap<String, u64>,
+    pub tags: HashMap<String, u64>,
+}
+
+/// Handle the TUI keeps to talk to the engine (now via the daemon).
+pub struct AgentRunner {
+    /// Send user submissions here (text + any pasted image parts). Each
+    /// becomes one `SendUserMessage` request; the daemon's queue-folding
+    /// (GOALS §1c) is performed inside the worker, not here.
+    pub input_tx: mpsc::Sender<crate::engine::message::UserSubmission>,
+    /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
+    pub record_tx: mpsc::Sender<Request>,
+    /// Drained per tick into [`crate::tui::app::App::history`].
+    pub events: Arc<Mutex<Vec<TurnEvent>>>,
+    /// Name of whoever's currently on top of the agent stack. The
+    /// chrome reads this for the active-agent slot (GOALS §1a).
+    pub active_agent: Arc<Mutex<String>>,
+    /// Root primary plus any active interactive subagent path. Depth one is
+    /// the current runtime behavior, but a vector avoids baking that into
+    /// the footer model.
+    pub active_agent_path: Arc<Mutex<Vec<String>>>,
+    /// This session's full id. Shown in the startup graphic and printed on
+    /// exit (session-id-display-and-lazy-persist). Assigned by the daemon at
+    /// attach, before the `sessions` row is persisted.
+    pub session_id: uuid::Uuid,
+    /// This session's 6-char display id (GOALS §17b). The TUI captures
+    /// it as the predecessor short-id when this session spawns a
+    /// `/compact` handoff, so the fresh session can draw a "compacted
+    /// from <short-id>" boundary marker.
+    pub short_id: String,
+    /// This session's project id — the scope for `tag` usage records.
+    pub project_id: String,
+    /// Frequency counts fetched at attach; the TUI seeds its in-memory
+    /// maps from these once.
+    pub usage: UsageCounts,
+    /// `true` when this TUI *spawned* the daemon it's attached to (the
+    /// daemonless `AlwaysEphemeral` path) and therefore owns its teardown
+    /// — the app builds an [`crate::daemon::ephemeral_guard::EphemeralDaemonGuard`]
+    /// from this. `false` when it attached to a pre-existing (canonical or
+    /// auto-promoted persistent) daemon, which it must never stop.
+    pub owns_daemon: bool,
+    /// The socket of the daemon this runner is attached to. Carried so an
+    /// owned ephemeral daemon can be reaped on exit via the guard.
+    pub socket: PathBuf,
+    /// The daemon's chronological history snapshot for the attached session
+    /// (implementation note). On a `/sessions` resume the
+    /// app converts these wire entries into TUI `HistoryEntry` rows so the
+    /// full prior transcript renders; empty for a freshly-created session.
+    pub history: Vec<proto::HistoryEntry>,
+    /// Durable work paused during daemon shutdown for this session. Non-empty
+    /// only after reattaching to a session that needs an explicit resume/cancel
+    /// decision.
+    pub paused_work: Vec<proto::PausedWorkSummary>,
+    /// Responses resume repair state, when the daemon opened the session
+    /// read-only because provider replay cannot be rebuilt safely.
+    pub repair_required: Option<proto::ResumeRepairState>,
+    /// Version advertised by the daemon at attach.
+    pub daemon_version: String,
+    /// Whether this client is compatible with the daemon protocol/version.
+    pub daemon_compatible: bool,
+    /// Client-side forwarding/event tasks owned by this runner. Dropping a TUI
+    /// runner must only tear down this socket-side plumbing; daemon-side
+    /// session work keeps running until an explicit daemon request stops it.
+    pub(crate) client_tasks: ClientTasks,
+}
+
+#[derive(Default)]
+pub(crate) struct ClientTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl ClientTasks {
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    fn shutdown(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for ClientTasks {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl AgentRunner {
+    /// Stop this runner's socket-side client tasks. This intentionally sends no
+    /// daemon request: abandoning a TUI handle must not cancel or discard the
+    /// daemon-owned session.
+    pub fn shutdown(&mut self) {
+        self.client_tasks.shutdown();
+    }
+}
+
+fn push_turn_event(events: &Arc<Mutex<Vec<TurnEvent>>>, event: TurnEvent) {
+    let mut guard = events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.push(event);
+}
+
+pub(crate) fn drain_turn_events(events: &Arc<Mutex<Vec<TurnEvent>>>) -> Vec<TurnEvent> {
+    let mut guard = events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *guard)
+}
+
+fn is_global_event(event: &proto::Event) -> bool {
+    matches!(
+        event,
+        proto::Event::CaffeinateState { .. }
+            | proto::Event::DaemonDraining { .. }
+            | proto::Event::ConnectorStatus { .. }
+            | proto::Event::LspNotice { .. }
+            | proto::Event::EnvDriftWarning { .. }
+    )
+}
+
+impl Drop for AgentRunner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Probe for the daemon (auto-promoting one if needed), attach a
+/// fresh session at `cwd`, and return the runner handle.
+///
+/// Returns `Err(String)` instead of `anyhow::Error` so `app.rs` can
+/// render the message in its fallback "input captured" stub without
+/// having to format an anyhow chain.
+pub fn try_spawn(cwd: &Path, no_sandbox: bool, mode: LifecycleMode) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, None, no_sandbox, mode)
+}
+
+/// Re-attach to an existing session by id (the `/compact` commit path,
+/// T6.e). Same as [`try_spawn`] but resumes `session_id` instead of
+/// creating a fresh one, so the TUI switches its event stream + input
+/// channel onto the new compaction-handoff session. `no_sandbox` is
+/// ignored by the daemon on resume (the session keeps its own state),
+/// passed only to keep the attach shape uniform.
+pub fn attach_to_session(
+    cwd: &Path,
+    session_id: uuid::Uuid,
+    no_sandbox: bool,
+    mode: LifecycleMode,
+) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, Some(session_id), no_sandbox, mode)
+}
+
+fn try_spawn_inner(
+    cwd: &Path,
+    session_id: Option<uuid::Uuid>,
+    no_sandbox: bool,
+    mode: LifecycleMode,
+) -> Result<AgentRunner, String> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
+
+    // probe_or_spawn is async; we block the (async) caller on it so
+    // try_spawn returns a fully-attached handle to the TUI. We're
+    // already in a tokio context (`main` is `#[tokio::main]`), so we
+    // use `block_in_place` to run a `block_on` without panicking.
+    let attached = tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let mut timer = crate::startup::PhaseTimer::start("agent_runner::try_spawn");
+            let daemon = probe_or_spawn(mode)
+                .await
+                .map_err(|e| format!("daemon probe: {e}"))?;
+            timer.phase("probe_or_spawn");
+            let owns_daemon = daemon.owns_daemon;
+            let socket = daemon.socket.clone();
+            let project_root = cwd.to_string_lossy().into_owned();
+            let (env_snapshot, _env_diagnostic) = crate::env_snapshot::capture_tui_shell_env();
+            let attached = match daemon
+                .client
+                .request(Request::Attach {
+                    session_id,
+                    project_root: Some(project_root),
+                    no_sandbox,
+                    // The TUI can answer interrupts (approval / loop-guard /
+                    // `question` prompts) — mark this attach interactive so
+                    // the loop guard prompts here instead of auto-rejecting.
+                    interactive: true,
+                    // The interactive TUI uses the session's active model; the
+                    // plan-level override is only for the headless plan-run
+                    // path (`cockpit run --model`).
+                    model_override: None,
+                    client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+                    env_snapshot: Some(env_snapshot.to_wire()),
+                    env_policy: crate::env_snapshot::EnvDriftPolicy::Client,
+                })
+                .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) if error.code == ErrorCode::ProtocolVersion => {
+                    return Err(incompatible_protocol_chip().to_string());
+                }
+                Ok(Err(error)) => return Err(format!("attach: daemon error: {error}")),
+                Err(e) => return Err(format!("attach: {e}")),
+            };
+            let (
+                session_id,
+                short_id,
+                active_agent_name,
+                active_agent_path,
+                project_id,
+                history,
+                paused_work,
+                repair_required,
+                daemon_version,
+                daemon_compatible,
+            ) = match attached {
+                Response::Attached {
+                    session_id,
+                    short_id,
+                    active_agent,
+                    active_agent_path,
+                    project_id,
+                    history,
+                    paused_work,
+                    repair_required,
+                    daemon_version,
+                    compatible,
+                    ..
+                } => (
+                    session_id,
+                    short_id,
+                    active_agent,
+                    active_agent_path,
+                    project_id,
+                    history,
+                    paused_work,
+                    repair_required.map(|repair| *repair),
+                    daemon_version,
+                    compatible,
+                ),
+                other => return Err(format!("unexpected attach response: {other:?}")),
+            };
+            // Fetch the autocomplete frequency maps for this session's
+            // project. Best-effort: a daemon that doesn't speak
+            // `GetUsageCounts` just leaves the maps empty (no ranking).
+            let usage = match daemon
+                .client
+                .request_ok(Request::GetUsageCounts {
+                    project_id: Some(project_id.clone()),
+                })
+                .await
+            {
+                Ok(Response::UsageCounts {
+                    models,
+                    slash,
+                    tags,
+                }) => UsageCounts {
+                    models,
+                    slash,
+                    tags,
+                },
+                _ => UsageCounts::default(),
+            };
+            timer.phase("attach_and_usage");
+            timer.done();
+            Ok::<_, String>((
+                daemon.client,
+                session_id,
+                short_id,
+                active_agent_name,
+                active_agent_path,
+                project_id,
+                usage,
+                owns_daemon,
+                socket,
+                history,
+                paused_work,
+                repair_required,
+                daemon_version,
+                daemon_compatible,
+            ))
+        })
+    })?;
+    let (
+        client,
+        session_id,
+        short_id,
+        initial_active_agent,
+        active_agent_path,
+        project_id,
+        usage,
+        owns_daemon,
+        socket,
+        history,
+        paused_work,
+        repair_required,
+        daemon_version,
+        daemon_compatible,
+    ) = attached;
+
+    let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
+    let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let initial_active_agent_path = if active_agent_path.is_empty() {
+        vec![initial_active_agent.clone()]
+    } else {
+        active_agent_path
+    };
+    let active_agent = Arc::new(Mutex::new(initial_active_agent));
+    let active_agent_path = Arc::new(Mutex::new(initial_active_agent_path));
+    let mut client_tasks = ClientTasks::default();
+
+    // Outbound: TUI sends a submission (text + any image parts) → upload image
+    // attachments first, then forward refs in SendUserMessage.
+    {
+        let client = client.clone();
+        let events = events.clone();
+        client_tasks.push(tokio::spawn(async move {
+            while let Some(sub) = input_rx.recv().await {
+                let refs = match upload_submission_images(&client, &sub.images).await {
+                    Ok(refs) => refs,
+                    Err(error) => {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push(TurnEvent::UserMessageDispatchFailed { error });
+                        continue;
+                    }
+                };
+                match client
+                    .request(Request::SendUserMessage {
+                        text: sub.text,
+                        image_refs: refs,
+                        forced_skill: sub.forced_skill,
+                    })
+                    .await
+                {
+                    Ok(Ok(Response::UserMessageQueued { queue, .. })) => {
+                        push_turn_event(
+                            &events,
+                            TurnEvent::QueueUpdated {
+                                queue: queue.into_iter().map(queue_item_from_proto).collect(),
+                            },
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push(TurnEvent::UserMessageDispatchFailed { error: e.message });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "send_user_message transport failed");
+                        events
+                            .lock()
+                            .unwrap()
+                            .push(TurnEvent::UserMessageDispatchFailed {
+                                error: e.to_string(),
+                            });
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+
+    // Outbound: fire-and-forget autocomplete usage records.
+    {
+        let client = client.clone();
+        client_tasks.push(tokio::spawn(async move {
+            while let Some(req) = record_rx.recv().await {
+                if let Err(e) = client.request(req).await {
+                    tracing::warn!(error = ?e, "record_usage transport failed");
+                }
+            }
+        }));
+    }
+
+    // Inbound: daemon events → translate → push into the shared
+    // buffer and update active-agent tracker.
+    {
+        let events = events.clone();
+        let active_agent = active_agent.clone();
+        let active_agent_path = active_agent_path.clone();
+        let client = client.clone();
+        // The current primary (root-frame) agent, tracked so a subagent pop
+        // returns the active-agent slot to the right primary after a `/plan`
+        // or `/build` swap (not a hardcoded `Build`). Seeded from the
+        // attach-time active agent.
+        let primary_agent = Arc::new(Mutex::new(
+            active_agent_path
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| active_agent.lock().unwrap().clone()),
+        ));
+        client_tasks.push(tokio::spawn(async move {
+            while let Some(event) = client.next_event().await {
+                // Daemon-global events carry no session_id and must reach this
+                // client regardless of which session it's attached to.
+                if !is_global_event(&event) && event_session(&event) != Some(session_id) {
+                    continue;
+                }
+                update_active_agent(&event, &active_agent, &active_agent_path, &primary_agent);
+                if let Some(translated) = proto_event_to_turn_event(event) {
+                    push_turn_event(&events, translated);
+                }
+            }
+        }));
+    }
+
+    Ok(AgentRunner {
+        input_tx,
+        record_tx,
+        events,
+        active_agent,
+        active_agent_path,
+        session_id,
+        short_id,
+        project_id,
+        usage,
+        owns_daemon,
+        socket,
+        history,
+        paused_work,
+        repair_required,
+        daemon_version,
+        daemon_compatible,
+        client_tasks,
+    })
+}
+
+pub(crate) fn incompatible_protocol_chip() -> &'static str {
+    "daemon speaks an incompatible protocol; relaunch / upgrade cockpit"
+}
+
+/// Pre-flight sizing for the fresh-chat context indicator (Feature 1).
+/// `file` is the basename of the matched guidance file (`None` when the
+/// project has none); `guidance_tokens` is its body size (the `… in
+/// <file>` label); `system_tokens` is the composed system prompt
+/// (role prompt + OS + session).
+#[derive(Debug, Clone)]
+pub struct GuidanceEstimate {
+    pub file: Option<String>,
+    pub guidance_tokens: u64,
+    pub system_tokens: u64,
+}
+
+/// Resolve the fresh-chat sizing for `cwd` and the active model. Prefers
+/// an already-running daemon's calibrated estimate (no attach, no spawn —
+/// calling it at launch never creates a session); on any miss (no daemon,
+/// connect/request error, or the daemon couldn't answer) it falls back to
+/// a local raw-cl100k computation via [`crate::engine::builtin`]. The two
+/// modes may differ by the calibration factor; each is the best available
+/// for its mode. Best-effort and non-blocking for launch.
+pub async fn fetch_guidance_estimate(
+    cwd: &Path,
+    provider: Option<String>,
+    model: Option<String>,
+) -> GuidanceEstimate {
+    if let Some(est) = daemon_guidance_estimate(cwd, provider, model).await {
+        return est;
+    }
+    local_guidance_estimate(cwd)
+}
+
+/// Ask an already-running daemon for the calibrated estimate. Returns
+/// `None` on any failure (no daemon, transport error, or a malformed
+/// response) so the caller can fall back to the local computation.
+async fn daemon_guidance_estimate(
+    cwd: &Path,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Option<GuidanceEstimate> {
+    use crate::daemon::{DaemonStatus, discover};
+    let probe = discover().await;
+    if !matches!(probe.status, DaemonStatus::Running) {
+        return None;
+    }
+    let client = crate::daemon::client::DaemonClient::connect(&probe.paths.socket)
+        .await
+        .ok()?;
+    let resp = client
+        .request_ok(Request::GuidanceEstimate {
+            project_root: cwd.to_string_lossy().into_owned(),
+            provider,
+            model,
+        })
+        .await
+        .ok()?;
+    match resp {
+        Response::GuidanceEstimate {
+            file,
+            tokens,
+            system_tokens,
+        } => Some(GuidanceEstimate {
+            file,
+            guidance_tokens: tokens,
+            system_tokens,
+        }),
+        _ => None,
+    }
+}
+
+/// Daemonless fallback: size the guidance file body and the full composed
+/// system prompt in-process with raw cl100k (`crate::tokens::count`).
+/// Cheap and synchronous — `load_agent_guidance` only stats/reads one
+/// small file along the cwd→git-root walk — so it never blocks launch.
+fn local_guidance_estimate(cwd: &Path) -> GuidanceEstimate {
+    let file = crate::engine::builtin::load_agent_guidance(cwd).map(|(path, body)| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (name, crate::tokens::count(&body) as u64)
+    });
+    // No session exists yet at the fresh-chat indicator, so the system
+    // prompt omits the `Session:` line — matching what the engine sends.
+    let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
+    let system_tokens = crate::tokens::count(&system_prompt) as u64;
+    match file {
+        Some((name, guidance_tokens)) => GuidanceEstimate {
+            file: Some(name),
+            guidance_tokens,
+            system_tokens,
+        },
+        None => GuidanceEstimate {
+            file: None,
+            guidance_tokens: 0,
+            system_tokens,
+        },
+    }
+}
+
+/// Run one blocking daemon request against an already-running daemon and
+/// return the typed response. Connects only — never spawns — so the
+/// `/sessions` browser degrades gracefully (no live data, no DB writes,
+/// no crash) when the daemon isn't up. Mirrors `try_spawn_inner`'s
+/// `block_in_place` pattern so it's callable from the synchronous TUI
+/// key handlers. `Err(String)` for any transport/typed failure.
+pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
+    use crate::daemon::{DaemonStatus, discover};
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let probe = discover().await;
+            if !matches!(probe.status, DaemonStatus::Running) {
+                return Err("daemon not running".to_string());
+            }
+            let client = crate::daemon::client::DaemonClient::connect(&probe.paths.socket)
+                .await
+                .map_err(|e| format!("daemon connect: {e}"))?;
+            client
+                .request_ok(req)
+                .await
+                .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+/// Run one blocking request against the daemon at a *known* `socket` —
+/// the socket the attached [`AgentRunner`] is already bound to. Unlike
+/// [`daemon_request_blocking`], this never re-resolves the canonical path,
+/// so it reaches an owned pid+nonce ephemeral daemon (the daemonless and
+/// auto-spawn paths) whose socket env is set only in the daemon child, not
+/// in this client process. Connects only — never spawns. `Err(String)` on
+/// any transport/typed failure.
+pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    let socket = socket.to_path_buf();
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let client = crate::daemon::client::DaemonClient::connect(&socket)
+                .await
+                .map_err(|e| format!("daemon connect: {e}"))?;
+            client
+                .request_ok(req)
+                .await
+                .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+/// Run one request-response RPC against the daemon at `socket`. Unlike
+/// [`daemon_request_blocking`] (which probes the *canonical* daemon paths),
+/// this targets a specific socket — the one the live runner is attached to.
+/// That matters in daemonless mode, where the runner owns a pid+nonce
+/// ephemeral daemon the canonical paths don't point at.
+fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    let socket = socket.to_path_buf();
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let client = crate::daemon::client::DaemonClient::connect(&socket)
+                .await
+                .map_err(|e| format!("daemon connect: {e}"))?;
+            client
+                .request_ok(req)
+                .await
+                .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+/// Fork `parent_session_id` at its tail into a fresh session on the daemon
+/// at `socket`, returning `(session_id, short_id)`. `ephemeral` marks it a
+/// throwaway `/side` side-conversation fork (excluded from lists, never
+/// auto-titled, discarded on end/exit).
+pub fn fork_session_blocking(
+    socket: &Path,
+    parent_session_id: uuid::Uuid,
+    fork_point_turn_id: Option<String>,
+    ephemeral: bool,
+) -> Result<(uuid::Uuid, String), String> {
+    match request_on_socket(
+        socket,
+        Request::ForkSession {
+            parent_session_id,
+            fork_point_turn_id,
+            ephemeral,
+        },
+    )? {
+        Response::Forked {
+            session_id,
+            short_id,
+            ..
+        } => Ok((session_id, short_id)),
+        other => Err(format!("unexpected fork response: {other:?}")),
+    }
+}
+
+/// Discard an ephemeral side-conversation (`/side`) on the daemon at
+/// `socket`: stops its worker and deletes its row + descendant forks. A
+/// non-ephemeral session is left untouched (daemon-side guard).
+pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result<(), String> {
+    match request_on_socket(socket, Request::DiscardSession { session_id })? {
+        Response::Ack => Ok(()),
+        other => Err(format!("unexpected discard response: {other:?}")),
+    }
+}
+
+/// List sessions for the `/sessions` browser. `project_id = Some(p)` +
+/// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
+/// forks of `s`; both `None` → every open session (all-projects scope).
+pub fn list_sessions_blocking(
+    project_id: Option<String>,
+    parent_session_id: Option<uuid::Uuid>,
+) -> Result<Vec<proto::SessionSummary>, String> {
+    match daemon_request_blocking(Request::ListSessions {
+        project_id,
+        parent_session_id,
+    })? {
+        Response::Sessions { sessions } => Ok(sessions),
+        other => Err(format!("unexpected list_sessions response: {other:?}")),
+    }
+}
+
+pub fn resource_snapshot_blocking() -> Result<proto::Response, String> {
+    match daemon_request_blocking(Request::ResourceSnapshot)? {
+        response @ Response::ResourceSnapshot { .. } => Ok(response),
+        other => Err(format!("unexpected resource_snapshot response: {other:?}")),
+    }
+}
+
+pub fn promote_resource_blocking(
+    request_id: String,
+    session_id: Option<uuid::Uuid>,
+) -> Result<proto::Response, String> {
+    match daemon_request_blocking(Request::PromoteResource {
+        request_id,
+        session_id,
+    })? {
+        response @ Response::PromoteResourceResult { .. } => Ok(response),
+        other => Err(format!("unexpected promote_resource response: {other:?}")),
+    }
+}
+
+/// Fetch live `(has_active_schedules, processing)` status for the candidate
+/// session ids. Daemon down / no live worker → empty map; callers treat
+/// absent ids as not-processing / no-jobs.
+pub fn session_live_status_blocking(
+    session_ids: Vec<uuid::Uuid>,
+) -> std::collections::HashMap<uuid::Uuid, (bool, bool)> {
+    match daemon_request_blocking(Request::SessionLiveStatus { session_ids }) {
+        Ok(Response::SessionLiveStatus { statuses }) => statuses
+            .into_iter()
+            .map(|s| (s.session_id, (s.has_active_schedules, s.processing)))
+            .collect(),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
+fn update_active_agent(
+    event: &proto::Event,
+    slot: &Arc<Mutex<String>>,
+    path: &Arc<Mutex<Vec<String>>>,
+    primary: &Arc<Mutex<String>>,
+) {
+    match event {
+        proto::Event::PrimarySwapped { name, .. } => {
+            // The root-frame primary changed (`/plan` ↔ `/build`). Track it
+            // and, since a swap only happens at idle (no subagent on top),
+            // reflect it in the live slot immediately.
+            *primary.lock().unwrap() = name.clone();
+            *slot.lock().unwrap() = name.clone();
+            *path.lock().unwrap() = vec![name.clone()];
+        }
+        proto::Event::SubagentSpawned { parent, child, .. } => {
+            *slot.lock().unwrap() = child.clone();
+            let mut path = path.lock().unwrap();
+            if let Some(parent_idx) = path.iter().position(|name| name == parent) {
+                path.truncate(parent_idx + 1);
+            } else {
+                path.clear();
+                path.push(primary.lock().unwrap().clone());
+            }
+            path.push(child.clone());
+        }
+        proto::Event::SubagentReport { agent, .. } => {
+            // Pop back to the current primary. v1 supports a depth-1 stack
+            // (`Build`/`Plan` → one subagent); deeper trees need a proper
+            // stack to track properly.
+            *slot.lock().unwrap() = primary.lock().unwrap().clone();
+            let mut path = path.lock().unwrap();
+            if let Some(agent_idx) = path.iter().position(|name| name == agent) {
+                path.truncate(agent_idx);
+            } else {
+                path.pop();
+            }
+            if path.is_empty() {
+                path.push(primary.lock().unwrap().clone());
+            }
+        }
+        proto::Event::AgentIdle { .. } => {
+            let primary = primary.lock().unwrap().clone();
+            *slot.lock().unwrap() = primary.clone();
+            *path.lock().unwrap() = vec![primary];
+        }
+        _ => {}
+    }
+}
+
+fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
+    use proto::Event::*;
+    Some(match event {
+        ThinkingStarted { session_id, .. }
+        | QueueUpdated { session_id, .. }
+        | Reconnecting { session_id, .. }
+        | AssistantTextDelta { session_id, .. }
+        | ReasoningDelta { session_id, .. }
+        | AssistantText { session_id, .. }
+        | UserMessageRecorded { session_id, .. }
+        | QueuedUserMessagesFolded { session_id, .. }
+        | SessionPersistFailed { session_id, .. }
+        | SessionDriverFailed { session_id, .. }
+        | PreflightStarted { session_id, .. }
+        | UserMessageRetracted { session_id, .. }
+        | Notice { session_id, .. }
+        | SkillAutoInjected { session_id, .. }
+        | ToolStart { session_id, .. }
+        | ToolEnd { session_id, .. }
+        | ResourceWait { session_id, .. }
+        | ResourceStart { session_id, .. }
+        | ResourceClear { session_id, .. }
+        | ToolError { session_id, .. }
+        | InferenceFailed { session_id, .. }
+        | InferenceWarning { session_id, .. }
+        | BackupUsed { session_id, .. }
+        | SubagentSpawned { session_id, .. }
+        | SubagentReport { session_id, .. }
+        | Usage { session_id, .. }
+        | InterruptRaised { session_id, .. }
+        | InterruptResolved { session_id, .. }
+        | AgentIdle { session_id, .. }
+        | PrimarySwapped { session_id, .. }
+        | LlmModeChanged { session_id, .. }
+        | SessionEnded { session_id, .. }
+        | ScheduleStarted { session_id, .. }
+        | ScheduleProgress { session_id, .. }
+        | ScheduleNote { session_id, .. }
+        | ScheduleCompleted { session_id, .. }
+        | ContextProjection { session_id, .. }
+        | Pruned { session_id, .. }
+        | CompactReady { session_id, .. }
+        | SandboxState { session_id, .. }
+        | SandboxUnavailable { session_id, .. }
+        | RedactionState { session_id, .. }
+        | PreflightState { session_id, .. }
+        | TrustedOnlyState { session_id, .. }
+        | ApprovalModeState { session_id, .. }
+        | DelegationRecursionState { session_id, .. }
+        | TandemState { session_id, .. }
+        | GitignoreAllow { session_id, .. }
+        | PausedWorkAvailable { session_id, .. }
+        | WaitingForLock { session_id, .. } => *session_id,
+        // Daemon-global events carry no session_id: they reach every
+        // client regardless of attachment.
+        CaffeinateState { .. }
+        | DaemonDraining { .. }
+        | ConnectorStatus { .. }
+        | TerminalOutput { .. }
+        | TerminalClipboard { .. }
+        | TerminalViewers { .. }
+        | TerminalClosed { .. }
+        | LspNotice { .. }
+        | EnvDriftWarning { .. } => return None,
+    })
+}
+
+fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
+    use proto::Event::*;
+    Some(match event {
+        ThinkingStarted { agent, turn_id, .. } => TurnEvent::ThinkingStarted { agent, turn_id },
+        Reconnecting {
+            agent,
+            attempt,
+            provider,
+            model,
+            url,
+            ..
+        } => TurnEvent::Reconnecting {
+            agent,
+            attempt,
+            provider,
+            model,
+            url,
+        },
+        InferenceWarning {
+            agent,
+            provider,
+            model,
+            phase,
+            waited_secs,
+            ..
+        } => TurnEvent::InferenceWarning {
+            agent,
+            provider,
+            model,
+            phase,
+            waited_secs,
+        },
+        AssistantTextDelta { agent, delta, .. } => TurnEvent::AssistantTextDelta { agent, delta },
+        ReasoningDelta { agent, delta, .. } => TurnEvent::ReasoningDelta { agent, delta },
+        AssistantText {
+            agent,
+            text,
+            reasoning,
+            seq,
+            ..
+        } => TurnEvent::AssistantText {
+            agent,
+            text,
+            reasoning,
+            seq,
+        },
+        UserMessageRecorded {
+            seq,
+            preflight_cleaned,
+            ..
+        } => TurnEvent::UserMessageRecorded {
+            seq,
+            preflight_cleaned,
+        },
+        QueuedUserMessagesFolded {
+            text,
+            queue_item_ids,
+            target,
+            seq,
+            preflight_cleaned,
+            ..
+        } => TurnEvent::QueuedUserMessagesFolded {
+            text,
+            queue_item_ids,
+            target: queue_target_from_proto(target),
+            seq,
+            preflight_cleaned,
+        },
+        SessionPersistFailed { error, .. } => TurnEvent::SessionPersistFailed { error },
+        SessionDriverFailed { error, .. } => TurnEvent::SessionDriverFailed { error },
+        PreflightStarted { .. } => TurnEvent::PreflightStarted,
+        UserMessageRetracted { .. } => TurnEvent::UserMessageRetracted,
+        Notice { text, .. } | LspNotice { text } => TurnEvent::Notice { text },
+        EnvDriftWarning { diff, policy, .. } => TurnEvent::Notice {
+            text: format!(
+                "environment differs from daemon baseline (policy: {policy:?}; {} added, {} removed, {} changed keys)",
+                diff.added_keys, diff.removed_keys, diff.changed_keys
+            ),
+        },
+        SkillAutoInjected { name, reason, .. } => TurnEvent::SkillAutoInjected { name, reason },
+        ToolStart {
+            agent,
+            call_id,
+            tool,
+            args,
+            ..
+        } => TurnEvent::ToolStart {
+            agent,
+            call_id,
+            tool,
+            args,
+        },
+        ToolEnd {
+            agent,
+            call_id,
+            tool,
+            output,
+            truncated,
+            hint,
+            ..
+        } => TurnEvent::ToolEnd {
+            agent,
+            call_id,
+            tool,
+            output,
+            truncated,
+            hint,
+        },
+        ResourceWait {
+            agent,
+            request_id,
+            display_id,
+            resources,
+            queue_position,
+            command_label,
+            ..
+        } => TurnEvent::ResourceWait {
+            agent,
+            request_id,
+            display_id,
+            resources,
+            queue_position,
+            command_label,
+        },
+        ResourceStart {
+            agent,
+            request_id,
+            display_id,
+            resources,
+            wait_ms,
+            command_label,
+            ..
+        } => TurnEvent::ResourceStart {
+            agent,
+            request_id,
+            display_id,
+            resources,
+            wait_ms,
+            command_label,
+        },
+        ResourceClear {
+            agent,
+            request_id,
+            display_id,
+            resources,
+            command_label,
+            ..
+        } => TurnEvent::ResourceClear {
+            agent,
+            request_id,
+            display_id,
+            resources,
+            command_label,
+        },
+        ToolError {
+            agent,
+            call_id,
+            tool,
+            error,
+            kind,
+            ..
+        } => TurnEvent::ToolError {
+            agent,
+            call_id,
+            tool,
+            error,
+            kind,
+        },
+        InferenceFailed {
+            agent,
+            provider,
+            model,
+            error_class,
+            detail,
+            ..
+        } => TurnEvent::InferenceFailed {
+            agent,
+            provider,
+            model,
+            error_class,
+            detail,
+        },
+        BackupUsed {
+            agent,
+            primary_model,
+            error_class,
+            backup_model,
+            ..
+        } => TurnEvent::BackupUsed {
+            agent,
+            primary_model,
+            error_class,
+            backup_model,
+        },
+        SubagentSpawned {
+            parent,
+            child,
+            task_call_id,
+            label,
+            prompt,
+            requested_cwd,
+            resolved_cwd,
+            trusted_only,
+            model_trusted,
+            routing,
+            ..
+        } => TurnEvent::SubagentSpawned {
+            parent,
+            child,
+            task_call_id,
+            label,
+            prompt,
+            requested_cwd,
+            resolved_cwd,
+            trusted_only,
+            model_trusted,
+            routing,
+        },
+        SubagentReport {
+            agent,
+            task_call_id,
+            label,
+            report,
+            trusted_only,
+            model_trusted,
+            routing,
+            ..
+        } => TurnEvent::SubagentReport {
+            agent,
+            task_call_id,
+            label,
+            report,
+            trusted_only,
+            model_trusted,
+            routing,
+        },
+        Usage {
+            agent,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            ..
+        } => TurnEvent::Usage {
+            agent,
+            usage: crate::tokens::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+            },
+        },
+        AgentIdle { turn_id, .. } => TurnEvent::AgentIdle { turn_id },
+        PausedWorkAvailable { .. } => return None,
+        ScheduleStarted {
+            session_id,
+            job_id,
+            label,
+            kind,
+        } => TurnEvent::ScheduleStarted {
+            session_id,
+            job_id,
+            label,
+            kind,
+        },
+        ScheduleProgress { job_id, .. } => TurnEvent::ScheduleProgress { job_id },
+        ScheduleNote { job_id, text, .. } => TurnEvent::ScheduleNote { job_id, text },
+        ScheduleCompleted {
+            job_id,
+            label,
+            kind,
+            failed,
+            ..
+        } => TurnEvent::ScheduleCompleted {
+            job_id,
+            label,
+            kind,
+            failed,
+        },
+        ContextProjection {
+            prunable_tokens,
+            cache_cold,
+            ..
+        } => TurnEvent::ContextProjection {
+            prunable_tokens,
+            cache_cold,
+        },
+        Pruned {
+            auto,
+            bodies,
+            tokens_saved,
+            elided,
+            trigger_reason,
+            cache_break,
+            ..
+        } => TurnEvent::Pruned {
+            auto,
+            bodies,
+            tokens_saved,
+            elided,
+            trigger_reason,
+            cache_break,
+        },
+        CompactReady {
+            new_session_id,
+            handoff,
+            brief,
+            seed_tool_count,
+            seed_tool_tokens,
+            ..
+        } => TurnEvent::CompactReady {
+            new_session_id,
+            handoff,
+            brief,
+            seed_tool_count,
+            seed_tool_tokens,
+        },
+        // A question-tool interrupt (GOALS §3b) carries a question batch;
+        // surface it so the TUI opens the answering dialog. A bare
+        // `InterruptRaised` with no batch (the `schedule` needs-attention
+        // nudge) has no dialog and stays a no-op here. `InterruptResolved`
+        // / `SessionEnded` have no TurnEvent analogue.
+        InterruptRaised {
+            interrupt_id,
+            description,
+            questions: Some(questions),
+            ..
+        } => TurnEvent::InterruptRaised {
+            interrupt_id,
+            description,
+            questions,
+        },
+        SandboxState { enabled, .. } => TurnEvent::SandboxState { enabled },
+        SandboxUnavailable { remedy, .. } => TurnEvent::SandboxUnavailable { remedy },
+        RedactionState {
+            scan_environment,
+            scan_dotenv,
+            scan_ssh_keys,
+            ..
+        } => TurnEvent::RedactionState {
+            scan_environment,
+            scan_dotenv,
+            scan_ssh_keys,
+        },
+        PreflightState { enabled, .. } => TurnEvent::PreflightState { enabled },
+        TrustedOnlyState { enabled, .. } => TurnEvent::TrustedOnlyState { enabled },
+        ApprovalModeState { mode, .. } => TurnEvent::ApprovalModeState { mode },
+        DelegationRecursionState {
+            enabled,
+            default_depth,
+            ..
+        } => TurnEvent::DelegationRecursionState {
+            enabled,
+            default_depth,
+        },
+        TandemState {
+            models, warning, ..
+        } => TurnEvent::TandemState { models, warning },
+        GitignoreAllow { allow, .. } => TurnEvent::GitignoreAllow { allow },
+        CaffeinateState {
+            active,
+            lid_close_guaranteed,
+            message,
+        } => TurnEvent::CaffeinateState {
+            active,
+            lid_close_guaranteed,
+            message,
+        },
+        ConnectorStatus {
+            enabled,
+            status,
+            relay_url,
+            last_error,
+        } => TurnEvent::ConnectorStatus {
+            enabled,
+            status,
+            relay_url,
+            last_error,
+        },
+        DaemonDraining { forced } => TurnEvent::DaemonDraining { forced },
+        // The blocked-`readlock` waiting indicator
+        // (`readlock-wait-and-lock-expiry.md`): surfaced so the app's chrome
+        // shows/clears the transient "waiting for lock" indicator.
+        WaitingForLock {
+            path,
+            holder_agent,
+            waiting,
+            ..
+        } => TurnEvent::WaitingForLock {
+            path,
+            holder_agent,
+            waiting,
+        },
+        QueueUpdated { queue, .. } => TurnEvent::QueueUpdated {
+            queue: queue.into_iter().map(queue_item_from_proto).collect(),
+        },
+        InterruptRaised { .. }
+        | InterruptResolved { .. }
+        | SessionEnded { .. }
+        | TerminalOutput { .. }
+        | TerminalClipboard { .. }
+        | TerminalViewers { .. }
+        | TerminalClosed { .. } => return None,
+        // The chrome's active-agent slot is updated directly in
+        // `update_active_agent`; the swap needs no history-stream entry.
+        PrimarySwapped { .. } => return None,
+        // The live `/llm-mode` switch: surfaced to the app so it tracks the
+        // authoritative current mode (its `/llm-mode` toggle + cache-break
+        // warning resolve against it).
+        LlmModeChanged { mode, .. } => TurnEvent::LlmModeChanged { mode },
+    })
+}
+
+async fn upload_submission_images(
+    client: &crate::daemon::client::DaemonClient,
+    images: &[Vec<u8>],
+) -> Result<Vec<proto::ImageAttachmentRef>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    if images.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
+        return Err(format!(
+            "too many images: {} exceeds {} image limit",
+            images.len(),
+            proto::MAX_IMAGES_PER_USER_MESSAGE
+        ));
+    }
+    let total: usize = images.iter().map(Vec::len).sum();
+    if total > proto::MAX_TOTAL_IMAGE_BYTES {
+        return Err(format!(
+            "total image data is too large: {} bytes exceeds {} byte limit",
+            total,
+            proto::MAX_TOTAL_IMAGE_BYTES
+        ));
+    }
+
+    let mut refs = Vec::with_capacity(images.len());
+    for png in images {
+        refs.push(upload_one_image(client, png).await?);
+    }
+    Ok(refs)
+}
+
+async fn upload_one_image(
+    client: &crate::daemon::client::DaemonClient,
+    png: &[u8],
+) -> Result<proto::ImageAttachmentRef, String> {
+    if png.is_empty() {
+        return Err("image attachment is empty".to_string());
+    }
+    if png.len() > proto::MAX_SINGLE_IMAGE_BYTES {
+        return Err(format!(
+            "image is too large: {} bytes exceeds {} byte limit",
+            png.len(),
+            proto::MAX_SINGLE_IMAGE_BYTES
+        ));
+    }
+    let sha256 = crate::intel::hex_lower(&Sha256::digest(png));
+    let upload_id = match request_or_error(
+        client,
+        Request::BeginAttachmentUpload {
+            mime: proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
+            byte_len: png.len(),
+            sha256,
+            purpose: proto::AttachmentPurpose::UserMessageImage,
+        },
+    )
+    .await?
+    {
+        Response::AttachmentUploadStarted { upload_id, .. } => upload_id,
+        other => return Err(format!("unexpected attachment upload response: {other:?}")),
+    };
+
+    let result = upload_one_image_chunks(client, upload_id, png).await;
+    match result {
+        Ok(image_ref) => Ok(image_ref),
+        Err(error) => {
+            let _ = client
+                .request(Request::CancelAttachmentUpload { upload_id })
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn upload_one_image_chunks(
+    client: &crate::daemon::client::DaemonClient,
+    upload_id: Uuid,
+    png: &[u8],
+) -> Result<proto::ImageAttachmentRef, String> {
+    let max_raw = (proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4) * 3;
+    let chunk_len = max_raw.max(1);
+    let mut offset = 0usize;
+    while offset < png.len() {
+        let end = (offset + chunk_len).min(png.len());
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(&png[offset..end]);
+        if data_base64.len() > proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES {
+            return Err("encoded attachment chunk exceeded configured frame budget".to_string());
+        }
+        match request_or_error(
+            client,
+            Request::UploadAttachmentChunk {
+                upload_id,
+                offset,
+                data_base64,
+            },
+        )
+        .await?
+        {
+            Response::AttachmentChunkAccepted { next_offset, .. } => {
+                if next_offset != end {
+                    return Err(format!(
+                        "attachment upload ack offset mismatch: got {next_offset}, expected {end}"
+                    ));
+                }
+                offset = next_offset;
+            }
+            other => return Err(format!("unexpected attachment chunk response: {other:?}")),
+        }
+    }
+    match request_or_error(client, Request::FinishAttachmentUpload { upload_id }).await? {
+        Response::AttachmentUploaded { image_ref } => Ok(image_ref),
+        other => Err(format!("unexpected attachment finish response: {other:?}")),
+    }
+}
+
+async fn request_or_error(
+    client: &crate::daemon::client::DaemonClient,
+    request: Request,
+) -> Result<Response, String> {
+    match client.request(request).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(error.message),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn queue_item_from_proto(item: proto::QueueItem) -> crate::engine::message::QueuedUserMessage {
+    crate::engine::message::QueuedUserMessage {
+        id: item.id,
+        status: match item.status {
+            proto::QueueItemStatus::Queued => crate::engine::message::QueueItemStatus::Queued,
+            proto::QueueItemStatus::Folding => crate::engine::message::QueueItemStatus::Folding,
+        },
+        text: item.text,
+        target: queue_target_from_proto(item.target),
+    }
+}
+
+fn queue_target_from_proto(target: proto::QueueTarget) -> crate::engine::message::QueueTarget {
+    crate::engine::message::QueueTarget {
+        id: target.id,
+        agent: target.agent,
+        depth: target.depth,
+        task_call_id: target.task_call_id,
+    }
+}
+
+/// One-line summary of a tool call's args for the `→ tool(...)`
+/// affordance the TUI renders. Public so [`crate::tui::app`] can
+/// reuse it when projecting [`TurnEvent::ToolStart`] into history.
+pub fn short_args(v: &serde_json::Value) -> String {
+    if let Some(map) = v.as_object() {
+        let mut out = String::new();
+        for (k, val) in map {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            let rendered = match val {
+                serde_json::Value::String(s) if s.len() <= 40 => format!("{k}=\"{s}\""),
+                serde_json::Value::String(s) => format!("{k}=<{}c>", s.len()),
+                serde_json::Value::Bool(b) => format!("{k}={b}"),
+                serde_json::Value::Number(n) => format!("{k}={n}"),
+                other => format!(
+                    "{k}={}",
+                    other.to_string().chars().take(40).collect::<String>()
+                ),
+            };
+            out.push_str(&rendered);
+            if out.chars().count() > 80 {
+                out.push('…');
+                break;
+            }
+        }
+        out
+    } else {
+        v.to_string()
+    }
+}
+
+/// First non-empty trimmed line of `s`, capped at `max_chars`. Used
+/// for tool-output snippets and subagent prompt previews.
+pub fn first_line(s: &str, max_chars: usize) -> String {
+    let first = s.lines().next().unwrap_or("").trim();
+    if first.chars().count() > max_chars {
+        let truncated: String = first.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    } else {
+        first.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn protocol_version_attach_error_uses_incompatible_chip() {
+        let chip = incompatible_protocol_chip();
+        assert_eq!(
+            chip,
+            "daemon speaks an incompatible protocol; relaunch / upgrade cockpit"
+        );
+        assert!(!chip.contains("unexpected attach response"));
+    }
+
+    /// Daemonless / pre-spawn resolution: the local fallback (the only
+    /// source feeding the fresh-chat indicator before any daemon exists)
+    /// must detect a guidance file sitting in `cwd` and report its basename
+    /// plus a non-zero body size. `AGENTS.md` is in the shipped default
+    /// `agent_guidance_files`, so this resolves regardless of any host
+    /// override that only *adds* names (e.g. `project guidance`). Pins the
+    /// no-daemon launch state against silent regression.
+    #[test]
+    fn local_guidance_estimate_detects_file_in_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "PROJECT RULES\nmore lines\n").unwrap();
+
+        let est = local_guidance_estimate(tmp.path());
+        assert_eq!(
+            est.file.as_deref(),
+            Some("AGENTS.md"),
+            "local fallback must detect the guidance file by basename"
+        );
+        assert!(
+            est.guidance_tokens > 0,
+            "a non-empty guidance body must size to a non-zero token count"
+        );
+        // The full composed system prompt is always non-empty (role prompt +
+        // identity lines), so the baseline the running estimate folds in is
+        // never zero — the refresh-on-connect adopt-guard relies on this.
+        assert!(
+            est.system_tokens > 0,
+            "system prompt baseline must be non-zero"
+        );
+    }
+
+    /// No guidance file present anywhere on the walk: the local fallback
+    /// reports `file = None` (the indicator falls through to the usual
+    /// context form) while still sizing the system-prompt baseline. Walks
+    /// from a tempdir that has no `AGENTS.md`/`project guidance`.
+    #[test]
+    fn local_guidance_estimate_none_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("empty-project");
+        std::fs::create_dir(&sub).unwrap();
+
+        let est = local_guidance_estimate(&sub);
+        assert!(
+            est.file.is_none(),
+            "no guidance file should resolve to None"
+        );
+        assert_eq!(est.guidance_tokens, 0);
+        assert!(est.system_tokens > 0);
+    }
+
+    fn runner_with_client_task(handle: JoinHandle<()>) -> AgentRunner {
+        runner_with_client_task_and_events(handle, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn runner_with_client_task_and_events(
+        handle: JoinHandle<()>,
+        events: Arc<Mutex<Vec<TurnEvent>>>,
+    ) -> AgentRunner {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let mut client_tasks = ClientTasks::default();
+        client_tasks.push(handle);
+        AgentRunner {
+            input_tx,
+            record_tx,
+            events,
+            active_agent: Arc::new(Mutex::new("Build".to_string())),
+            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            session_id: uuid::Uuid::new_v4(),
+            short_id: "abc123".to_string(),
+            project_id: "project".to_string(),
+            usage: UsageCounts::default(),
+            owns_daemon: false,
+            socket: PathBuf::from("/tmp/cockpit-test.sock"),
+            history: Vec::new(),
+            paused_work: Vec::new(),
+            repair_required: None,
+            daemon_version: "test".to_string(),
+            daemon_compatible: true,
+            client_tasks,
+        }
+    }
+
+    async fn assert_task_future_dropped(dropped: Arc<AtomicBool>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner drop should abort and drop client task futures");
+    }
+
+    #[tokio::test]
+    async fn dropping_agent_runner_aborts_client_tasks() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let runner = runner_with_client_task(handle);
+        drop(runner);
+
+        assert_task_future_dropped(dropped).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_agent_runner_stops_late_event_buffer_writes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let task_events = events.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            task_events.lock().unwrap().push(TurnEvent::Notice {
+                text: "late".into(),
+            });
+        });
+
+        let runner = runner_with_client_task_and_events(handle, events.clone());
+        drop(runner);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "aborted client task must not append late events after runner drop"
+        );
+    }
+
+    #[test]
+    fn proto_lifecycle_turn_id_maps_to_turn_events() {
+        let session_id = uuid::Uuid::new_v4();
+
+        let event = proto_event_to_turn_event(proto::Event::ThinkingStarted {
+            session_id,
+            agent: "Build".to_string(),
+            turn_id: Some("turn-1".to_string()),
+        })
+        .expect("thinking event maps");
+        assert!(matches!(
+            event,
+            TurnEvent::ThinkingStarted {
+                agent,
+                turn_id: Some(turn_id),
+            } if agent == "Build" && turn_id == "turn-1"
+        ));
+
+        let event = proto_event_to_turn_event(proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some("turn-1".to_string()),
+        })
+        .expect("idle event maps");
+        assert!(matches!(
+            event,
+            TurnEvent::AgentIdle {
+                turn_id: Some(turn_id),
+            } if turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn daemon_global_events_bypass_session_filter_and_translate() {
+        let draining = proto::Event::DaemonDraining { forced: true };
+        assert!(event_session(&draining).is_none());
+        assert!(is_global_event(&draining));
+        assert!(matches!(
+            proto_event_to_turn_event(draining),
+            Some(TurnEvent::DaemonDraining { forced: true })
+        ));
+
+        let meta = crate::env_snapshot::EnvSnapshotMeta {
+            source: crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            digest: "digest".into(),
+            key_count: 3,
+            path_entry_count: 1,
+        };
+        let drift = crate::env_snapshot::EnvDiffSummary {
+            baseline_digest: "base".into(),
+            candidate_digest: "candidate".into(),
+            added_keys: 1,
+            removed_keys: 2,
+            changed_keys: 3,
+            changed_secret_keys: vec!["TOKEN".into()],
+            path_added: Vec::new(),
+            path_removed: Vec::new(),
+        };
+        let warning = proto::Event::EnvDriftWarning {
+            baseline: meta.clone(),
+            candidate: meta,
+            diff: drift,
+            policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+        };
+        assert!(event_session(&warning).is_none());
+        assert!(is_global_event(&warning));
+        match proto_event_to_turn_event(warning) {
+            Some(TurnEvent::Notice { text }) => {
+                assert!(text.contains("environment differs"), "{text}");
+                assert!(text.contains("1 added, 2 removed, 3 changed"), "{text}");
+            }
+            other => panic!("expected env drift notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_event_buffer_push_and_drain_recover_from_poison() {
+        let events = Arc::new(Mutex::new(vec![TurnEvent::Notice {
+            text: "before".into(),
+        }]));
+        let poison_events = events.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_events.lock().unwrap();
+            panic!("poison event buffer");
+        })
+        .join();
+
+        push_turn_event(
+            &events,
+            TurnEvent::Notice {
+                text: "after".into(),
+            },
+        );
+        let drained = drain_turn_events(&events);
+
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(&drained[0], TurnEvent::Notice { text } if text == "before"));
+        assert!(matches!(&drained[1], TurnEvent::Notice { text } if text == "after"));
+        assert!(drain_turn_events(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_agent_runner_shutdown_is_idempotent() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let mut runner = runner_with_client_task(handle);
+        runner.shutdown();
+        runner.shutdown();
+        drop(runner);
+
+        assert_task_future_dropped(dropped).await;
+    }
+}

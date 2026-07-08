@@ -1,0 +1,53 @@
+version: 2
+
+# Supply-chain guardrail: `cooldown.default-days: 3` makes Dependabot ignore
+# any release younger than 72 hours when opening version-update PRs. This is a
+# cheap mitigation for compromised-release / typosquat-style attacks, which are
+# usually yanked within a day or two of publication. Notes:
+#   - Cooldown applies to VERSION updates only. Dependabot SECURITY updates are
+#     NOT delayed, so a real CVE fix still lands immediately.
+#   - With grouped updates, cooldown is evaluated per dependency: a too-young
+#     package is simply held back and folded into a later PR; the rest of the
+#     group still ships on schedule.
+#   - Keep this aligned with the pnpm `minimumReleaseAge` hardening in
+#     pnpm-workspace.yaml (that gate is stricter at 7 days; this is the
+#     lighter-weight gate for the ecosystems pnpm does not cover).
+
+updates:
+  # GitHub Actions — keeps SHA-pinned actions current. Dependabot rewrites the
+  # SHA in the `uses:` and updates the trailing `# vN` comment so the pin
+  # pattern stays readable in PR diffs.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Docker base images (node:24-slim in Dockerfile, Dockerfile.worker,
+  # Dockerfile.dev). Scans every Dockerfile under the repo root.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+
+  # npm — covers package.json files across the pnpm workspace.
+  #
+  # NOTE: Versions in pnpm-workspace.yaml#catalog are NOT updated automatically.
+  # The catalog uses pnpm's `catalog:` protocol and Dependabot does not rewrite
+  # those entries. Bump catalog versions manually.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

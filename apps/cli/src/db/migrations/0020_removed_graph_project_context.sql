@@ -1,0 +1,1 @@
+-- Legacy graph project context schema removed before release.

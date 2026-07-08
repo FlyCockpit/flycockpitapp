@@ -1,0 +1,403 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/roboto";
+@source "../../../apps/**/*.{ts,tsx}";
+@source "../**/*.{ts,tsx}";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.148 0.004 228.8);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.148 0.004 228.8);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.148 0.004 228.8);
+  --primary: oklch(0.5 0.134 242.749);
+  --primary-foreground: oklch(0.977 0.013 236.62);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.963 0.002 197.1);
+  --muted-foreground: oklch(0.56 0.021 213.5);
+  --accent: oklch(0.963 0.002 197.1);
+  --accent-foreground: oklch(0.218 0.008 223.9);
+  --destructive: oklch(0.577 0.245 27.325);
+  --state-success: oklch(0.52 0.17 152);
+  --state-success-foreground: oklch(0.985 0 0);
+  --state-success-bg: color-mix(in oklch, oklch(0.52 0.17 152) 12%, transparent);
+  --state-warning: oklch(0.75 0.18 85);
+  --state-warning-foreground: oklch(0.3 0.07 70);
+  --state-warning-bg: color-mix(in oklch, oklch(0.75 0.18 85) 12%, transparent);
+  --state-info: oklch(0.58 0.16 250);
+  --state-info-foreground: oklch(0.985 0 0);
+  --state-info-bg: color-mix(in oklch, oklch(0.58 0.16 250) 12%, transparent);
+  --state-action: var(--accent);
+  --state-action-foreground: var(--accent-foreground);
+  --state-action-bg: color-mix(in oklch, var(--accent) 12%, transparent);
+  --state-loading: var(--muted-foreground);
+  --state-loading-foreground: var(--foreground);
+  --state-loading-bg: color-mix(in oklch, var(--muted-foreground) 12%, transparent);
+  --border: oklch(0.925 0.005 214.3);
+  --input: oklch(0.925 0.005 214.3);
+  --ring: oklch(0.723 0.014 214.4);
+  --grey-50: oklch(0.985 0.002 228);
+  --grey-100: oklch(0.96 0.004 228);
+  --grey-200: oklch(0.92 0.005 228);
+  --grey-300: oklch(0.84 0.008 228);
+  --grey-400: oklch(0.72 0.012 228);
+  --grey-500: oklch(0.56 0.015 228);
+  --grey-600: oklch(0.44 0.014 228);
+  --grey-700: oklch(0.35 0.012 228);
+  --grey-800: oklch(0.27 0.009 228);
+  --grey-900: oklch(0.2 0.006 228);
+  --primary-50: oklch(0.97 0.015 242);
+  --primary-100: oklch(0.93 0.035 242);
+  --primary-200: oklch(0.87 0.065 242);
+  --primary-300: oklch(0.78 0.1 242);
+  --primary-400: oklch(0.67 0.13 242);
+  --primary-500: oklch(0.56 0.145 242);
+  --primary-600: oklch(0.5 0.134 242);
+  --primary-700: oklch(0.42 0.11 242);
+  --primary-800: oklch(0.35 0.09 242);
+  --primary-900: oklch(0.28 0.07 242);
+  --chart-1: oklch(0.65 0.2 25);
+  --chart-2: oklch(0.65 0.2 55);
+  --chart-3: oklch(0.65 0.2 90);
+  --chart-4: oklch(0.65 0.2 150);
+  --chart-5: oklch(0.65 0.2 250);
+  --duration-fast: 150ms;
+  --duration-base: 250ms;
+  --duration-slow: 400ms;
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --radius: 0.45rem;
+  --sidebar: oklch(0.987 0.002 197.1);
+  --sidebar-foreground: oklch(0.148 0.004 228.8);
+  --sidebar-primary: oklch(0.588 0.158 241.966);
+  --sidebar-primary-foreground: oklch(0.977 0.013 236.62);
+  --sidebar-accent: oklch(0.963 0.002 197.1);
+  --sidebar-accent-foreground: oklch(0.218 0.008 223.9);
+  --sidebar-border: oklch(0.925 0.005 214.3);
+  --sidebar-ring: oklch(0.723 0.014 214.4);
+}
+
+.dark {
+  --background: oklch(0.148 0.004 228.8);
+  --foreground: oklch(0.987 0.002 197.1);
+  --card: oklch(0.218 0.008 223.9);
+  --card-foreground: oklch(0.987 0.002 197.1);
+  --popover: oklch(0.218 0.008 223.9);
+  --popover-foreground: oklch(0.987 0.002 197.1);
+  --primary: oklch(0.443 0.11 240.79);
+  --primary-foreground: oklch(0.977 0.013 236.62);
+  --secondary: oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.275 0.011 216.9);
+  --muted-foreground: oklch(0.723 0.014 214.4);
+  --accent: oklch(0.275 0.011 216.9);
+  --accent-foreground: oklch(0.987 0.002 197.1);
+  --destructive: oklch(0.704 0.191 22.216);
+  --state-success: oklch(0.65 0.2 152);
+  --state-success-foreground: oklch(0.985 0 0);
+  --state-success-bg: color-mix(in oklch, oklch(0.65 0.2 152) 15%, transparent);
+  --state-warning: oklch(0.8 0.16 85);
+  --state-warning-foreground: oklch(0.2 0.05 70);
+  --state-warning-bg: color-mix(in oklch, oklch(0.8 0.16 85) 15%, transparent);
+  --state-info: oklch(0.68 0.16 250);
+  --state-info-foreground: oklch(0.985 0 0);
+  --state-info-bg: color-mix(in oklch, oklch(0.68 0.16 250) 15%, transparent);
+  --state-action: var(--accent);
+  --state-action-foreground: var(--accent-foreground);
+  --state-action-bg: color-mix(in oklch, var(--accent) 15%, transparent);
+  --state-loading: var(--muted-foreground);
+  --state-loading-foreground: var(--foreground);
+  --state-loading-bg: color-mix(in oklch, var(--muted-foreground) 15%, transparent);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.56 0.021 213.5);
+  --grey-50: oklch(0.25 0.004 228);
+  --grey-100: oklch(0.3 0.006 228);
+  --grey-200: oklch(0.35 0.008 228);
+  --grey-300: oklch(0.44 0.01 228);
+  --grey-400: oklch(0.56 0.013 228);
+  --grey-500: oklch(0.65 0.014 228);
+  --grey-600: oklch(0.75 0.012 228);
+  --grey-700: oklch(0.84 0.009 228);
+  --grey-800: oklch(0.92 0.006 228);
+  --grey-900: oklch(0.96 0.003 228);
+  --primary-50: oklch(0.25 0.04 242);
+  --primary-100: oklch(0.3 0.06 242);
+  --primary-200: oklch(0.35 0.08 242);
+  --primary-300: oklch(0.42 0.1 242);
+  --primary-400: oklch(0.5 0.12 242);
+  --primary-500: oklch(0.58 0.14 242);
+  --primary-600: oklch(0.65 0.15 242);
+  --primary-700: oklch(0.74 0.12 242);
+  --primary-800: oklch(0.84 0.08 242);
+  --primary-900: oklch(0.93 0.04 242);
+  --chart-1: oklch(0.75 0.18 25);
+  --chart-2: oklch(0.75 0.18 55);
+  --chart-3: oklch(0.75 0.18 90);
+  --chart-4: oklch(0.75 0.18 150);
+  --chart-5: oklch(0.75 0.18 250);
+  --sidebar: oklch(0.218 0.008 223.9);
+  --sidebar-foreground: oklch(0.987 0.002 197.1);
+  --sidebar-primary: oklch(0.685 0.169 237.323);
+  --sidebar-primary-foreground: oklch(0.293 0.066 243.157);
+  --sidebar-accent: oklch(0.275 0.011 216.9);
+  --sidebar-accent-foreground: oklch(0.987 0.002 197.1);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.56 0.021 213.5);
+}
+
+@theme inline {
+  --font-sans: "Roboto Variable", sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-grey-50: var(--grey-50);
+  --color-grey-100: var(--grey-100);
+  --color-grey-200: var(--grey-200);
+  --color-grey-300: var(--grey-300);
+  --color-grey-400: var(--grey-400);
+  --color-grey-500: var(--grey-500);
+  --color-grey-600: var(--grey-600);
+  --color-grey-700: var(--grey-700);
+  --color-grey-800: var(--grey-800);
+  --color-grey-900: var(--grey-900);
+  --color-primary-50: var(--primary-50);
+  --color-primary-100: var(--primary-100);
+  --color-primary-200: var(--primary-200);
+  --color-primary-300: var(--primary-300);
+  --color-primary-400: var(--primary-400);
+  --color-primary-500: var(--primary-500);
+  --color-primary-600: var(--primary-600);
+  --color-primary-700: var(--primary-700);
+  --color-primary-800: var(--primary-800);
+  --color-primary-900: var(--primary-900);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-state-success: var(--state-success);
+  --color-state-success-foreground: var(--state-success-foreground);
+  --color-state-success-bg: var(--state-success-bg);
+  --color-state-warning: var(--state-warning);
+  --color-state-warning-foreground: var(--state-warning-foreground);
+  --color-state-warning-bg: var(--state-warning-bg);
+  --color-state-info: var(--state-info);
+  --color-state-info-foreground: var(--state-info-foreground);
+  --color-state-info-bg: var(--state-info-bg);
+  --color-state-action: var(--state-action);
+  --color-state-action-foreground: var(--state-action-foreground);
+  --color-state-action-bg: var(--state-action-bg);
+  --color-state-loading: var(--state-loading);
+  --color-state-loading-foreground: var(--state-loading-foreground);
+  --color-state-loading-bg: var(--state-loading-bg);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --ease-out: var(--ease-out);
+  --ease-in: var(--ease-in);
+  --ease-in-out: var(--ease-in-out);
+  --ease-spring: var(--ease-spring);
+  --ease-emphasized: var(--ease-emphasized);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    -webkit-tap-highlight-color: transparent;
+  }
+  html {
+    @apply font-sans;
+    overscroll-behavior: none;
+    /* Defense-in-depth backstop: never let a child produce page-level
+       horizontal scroll. `clip` (not `hidden`) so it doesn't create a scroll
+       container that would break position: sticky / scroll anchoring. */
+    overflow-x: clip;
+  }
+  body {
+    @apply font-sans bg-background text-foreground;
+    overscroll-behavior: none;
+    overflow-x: clip;
+  }
+  button,
+  a,
+  [role="button"],
+  input[type="submit"],
+  input[type="button"],
+  select {
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  select {
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+
+  /* Safe area padding for notched devices */
+  :root {
+    --safe-area-top: env(safe-area-inset-top, 0px);
+    --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-area-left: env(safe-area-inset-left, 0px);
+    --safe-area-right: env(safe-area-inset-right, 0px);
+  }
+
+  /* View Transitions API animations */
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes fade-out {
+    to {
+      opacity: 0;
+    }
+  }
+  @keyframes slide-from-right {
+    from {
+      transform: translateX(20px);
+    }
+  }
+  @keyframes slide-to-left {
+    to {
+      transform: translateX(-20px);
+    }
+  }
+  @keyframes slide-from-left {
+    from {
+      transform: translateX(-20px);
+    }
+  }
+  @keyframes slide-to-right {
+    to {
+      transform: translateX(20px);
+    }
+  }
+
+  /* Persistent chrome (Header, BottomNav, settings sub-nav) carries its own
+     stable view-transition-name, so it stays static. Neutralize the implicit
+     `root` snapshot's default cross-fade so any unnamed leftover chrome does
+     not flicker on navigation. */
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+
+  ::view-transition-old(page) {
+    animation:
+      var(--duration-fast) var(--ease-in) both fade-out,
+      calc(var(--duration-fast) + 50ms) var(--ease-in-out) both slide-to-left;
+  }
+  ::view-transition-new(page) {
+    animation:
+      calc(var(--duration-fast) + 60ms) var(--ease-out) 90ms both fade-in,
+      calc(var(--duration-fast) + 50ms) var(--ease-in-out) both slide-from-right;
+  }
+
+  /* Back navigation: slide from left */
+  html[data-nav-direction="back"]::view-transition-old(page) {
+    animation:
+      var(--duration-fast) var(--ease-in) both fade-out,
+      calc(var(--duration-fast) + 50ms) var(--ease-in-out) both slide-to-right;
+  }
+  html[data-nav-direction="back"]::view-transition-new(page) {
+    animation:
+      calc(var(--duration-fast) + 60ms) var(--ease-out) 90ms both fade-in,
+      calc(var(--duration-fast) + 50ms) var(--ease-in-out) both slide-from-left;
+  }
+
+  /* Defensive fallback for explicit same-path transitions. Normal same-path
+     query/hash/state updates should be blocked before a page View Transition
+     starts by the app-level route transition policy. */
+  html[data-nav-direction="none"]::view-transition-old(page),
+  html[data-nav-direction="none"]::view-transition-new(page) {
+    animation: none;
+  }
+
+  /* Reduced motion: instant transitions */
+  @media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(page),
+    ::view-transition-new(page) {
+      animation: none;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .skeleton-shimmer {
+    position: relative;
+    overflow: hidden;
+    background-image: linear-gradient(
+      110deg,
+      color-mix(in oklch, var(--color-muted) 88%, transparent) 0%,
+      color-mix(in oklch, var(--color-muted-foreground) 18%, var(--color-muted)) 45%,
+      color-mix(in oklch, var(--color-muted) 88%, transparent) 100%
+    );
+    background-size: 200% 100%;
+    animation: skeleton-shimmer calc(var(--duration-slow) * 2) var(--ease-in-out) infinite;
+    will-change: background-position;
+  }
+}

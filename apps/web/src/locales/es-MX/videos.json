@@ -1,0 +1,52 @@
+{
+  "admin": {
+    "reprocess": "Volver a transcodificar",
+    "reprocessed": "Reencolado"
+  },
+  "detail": {
+    "audioTracksHeading": "Pistas de audio",
+    "subtitleTracksHeading": "Subtítulos",
+    "addAudioTrack": "Agregar doblaje",
+    "addSubtitleTrack": "Agregar subtítulos",
+    "renditionsHeading": "Resoluciones",
+    "deleteVideo": "Eliminar video",
+    "deleteVideoConfirm": "Escribe el título para confirmar",
+    "transcodingHint": "Estamos procesando tu video — normalmente toma unos minutos.",
+    "failedHint": "La transcodificación falló. {{reason}}",
+    "defaultTrack": "(predeterminada)",
+    "trackLabel": "Etiqueta",
+    "subtitleFormat": "Formato",
+    "subtitleContent": "Contenido",
+    "vttPlaceholder": "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nHola",
+    "srtPlaceholder": "1\n00:00:00,000 --> 00:00:03,000\nHola"
+  },
+  "list": {
+    "title": "Videos",
+    "empty": "Aún no has subido videos.",
+    "uploadCta": "Subir un video",
+    "statusPending": "Carga pendiente",
+    "statusTranscoding": "Transcodificando…",
+    "statusReady": "Listo",
+    "statusFailed": "Falló"
+  },
+  "uploader": {
+    "dropOrClick": "Suelta un video aquí o haz clic para elegir un archivo",
+    "acceptedFormats": "(MP4, MOV, MKV, WebM)",
+    "titleLabel": "Título",
+    "descriptionLabel": "Descripción (opcional)",
+    "sourceLocaleLabel": "Idioma del audio original",
+    "visibilityLabel": "Visibilidad",
+    "visibilityRestricted": "Restringido — solo tú y los administradores",
+    "visibilityPublic": "Público — cualquiera con el enlace",
+    "startUpload": "Iniciar carga",
+    "uploading": "Subiendo…",
+    "progress": "Cargado {{percent}}%",
+    "missingFile": "Elige un archivo de video para subir.",
+    "missingTitle": "Asigna un título al video.",
+    "missingAudioFile": "Elige un archivo de audio o video para subir.",
+    "missingLocale": "Elige un idioma."
+  },
+  "watch": {
+    "playerUnavailable": "Este video no está disponible."
+  }
+}

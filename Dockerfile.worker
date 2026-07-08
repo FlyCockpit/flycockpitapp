@@ -1,4 +1,4 @@
-FROM node:24-slim AS base
+FROM node:26-slim AS base
 
 # Runtime base:
 #   - openssl: required by Prisma query engine

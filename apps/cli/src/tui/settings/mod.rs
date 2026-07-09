@@ -67,7 +67,7 @@ use crate::daemon::proto::{LspControlAction, Request};
 use crate::providers::models_fetch::FetchOutcome;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use shell::{marker, muted_style, selected_or_field, window_lines};
+use shell::{SettingsScrollStates, marker, muted_style, selected_or_field};
 
 /// Height (in rows) the dialog wants when active.
 pub const DIALOG_HEIGHT: u16 = 20;
@@ -116,6 +116,7 @@ pub struct SettingsDialog {
     /// lazily when the UI / Tools pages open; saved on each edit there.
     pub(super) extended_path: PathBuf,
     pub(super) page: Page,
+    scroll_states: SettingsScrollStates,
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
@@ -737,6 +738,7 @@ impl SettingsDialog {
             config_path,
             extended_path,
             page: Page::Root { cursor: 0 },
+            scroll_states: SettingsScrollStates::default(),
             original_config: config.clone(),
             config,
             extended,
@@ -1413,8 +1415,8 @@ impl SettingsDialog {
 
     fn render_lsp_page(&self, frame: &mut Frame, area: Rect, p: &LspPage) {
         let (rows, selected_line) = lsp_rows(self, p);
-        let rows = window_lines(&rows, Some(selected_line), area.height);
-        frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), area);
+        self.scroll_states
+            .render_lines(frame, area, "lsp", rows, Some(selected_line));
     }
 
     // ── Rendering ────────────────────────────────────────────────────────
@@ -1430,7 +1432,7 @@ impl SettingsDialog {
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
 
         match &self.page {
-            Page::Root { cursor } => render_root(frame, layout[0], *cursor),
+            Page::Root { cursor } => render_root(frame, layout[0], *cursor, &self.scroll_states),
             Page::Agents(p) => self.render_agents_page(frame, layout[0], p),
             Page::Tools(p) => self.render_tools_page(frame, layout[0], p),
             Page::Harnesses(p) => self.render_harnesses_page(frame, layout[0], p),
@@ -1766,7 +1768,7 @@ pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
     Line::from(Span::styled(label.to_string(), style))
 }
 
-fn render_root(frame: &mut Frame, area: Rect, cursor: usize) {
+fn render_root(frame: &mut Frame, area: Rect, cursor: usize, scroll_states: &SettingsScrollStates) {
     let children = root_nodes();
     let cursor = cursor.min(children.len().saturating_sub(1));
     let rows = Layout::vertical([
@@ -1787,8 +1789,7 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize) {
             ])
         })
         .collect();
-    let list_lines = window_lines(&list_lines, Some(cursor), rows[0].height);
-    frame.render_widget(Paragraph::new(list_lines), rows[0]);
+    scroll_states.render_lines(frame, rows[0], "root", list_lines, Some(cursor));
 
     let desc = children[cursor].description;
     frame.render_widget(

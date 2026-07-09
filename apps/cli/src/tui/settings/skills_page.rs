@@ -19,13 +19,13 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
 use super::reset::{ResetButton, ResetOutcome};
+use super::shell::{push_wrapped_text, selected_line_from_marker};
 use super::{Nav, Page, SettingsDialog, save_status};
 
 /// Number of leading toggle rows before the scan-dir list: row 0 is the
@@ -237,17 +237,18 @@ impl SettingsDialog {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::default(),
-            Line::from(Span::styled(
-                "Scan dirs hold `<name>/SKILL.md` skills. Entries support \
-                 `~`, `$VAR`, and relative paths. The list ships pre-seeded \
-                 (~/.agents/skills + ./.agents/skills); an empty list scans \
-                 nothing. Ancestor walk extends relative entries to every \
-                 dir up to the git root."
-                    .to_string(),
-                muted,
-            )),
-            Line::default(),
         ];
+        push_wrapped_text(
+            &mut lines,
+            area.width,
+            "Scan dirs hold `<name>/SKILL.md` skills. Entries support \
+             `~`, `$VAR`, and relative paths. The list ships pre-seeded \
+             (~/.agents/skills + ./.agents/skills); an empty list scans \
+             nothing. Ancestor walk extends relative entries to every \
+             dir up to the git root.",
+            muted,
+        );
+        lines.push(Line::default());
 
         // Row 0: auto-`!` toggle.
         let toggle_on_cursor = p.cursor == 0;
@@ -356,7 +357,9 @@ impl SettingsDialog {
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "skills", lines, selected_line);
     }
 }
 

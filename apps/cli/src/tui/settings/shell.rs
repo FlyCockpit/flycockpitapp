@@ -1,8 +1,13 @@
 //! Shared rendering primitives for the `/settings` dialog shell.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{List, ListItem, ListState};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -93,6 +98,14 @@ pub(super) fn marker(selected: bool) -> &'static str {
     if selected { SELECTED_MARKER } else { "  " }
 }
 
+pub(super) fn selected_line_from_marker(lines: &[Line<'static>]) -> Option<usize> {
+    lines.iter().position(|line| {
+        line.spans
+            .first()
+            .is_some_and(|span| span.content.contains(SELECTED_MARKER))
+    })
+}
+
 pub(super) fn selected_or_normal(selected: bool) -> Style {
     if selected {
         selected_style()
@@ -113,61 +126,39 @@ pub(super) fn indicator_line(label: String) -> Line<'static> {
     Line::from(Span::styled(label, muted_style()))
 }
 
-pub(super) fn window_lines(
-    lines: &[Line<'static>],
-    selected_line: Option<usize>,
-    height: u16,
-) -> Vec<Line<'static>> {
-    let height = usize::from(height);
-    if height == 0 {
-        return Vec::new();
-    }
-    if lines.len() <= height {
-        return lines.to_vec();
+#[derive(Debug, Default)]
+pub(super) struct SettingsScrollStates {
+    states: RefCell<BTreeMap<String, ListState>>,
+}
+
+impl SettingsScrollStates {
+    pub(super) fn render_lines(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        key: impl Into<String>,
+        lines: Vec<Line<'static>>,
+        selected_line: Option<usize>,
+    ) {
+        let item_count = lines.len();
+        let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
+        let selected = selected_line
+            .filter(|_| item_count > 0)
+            .map(|line| line.min(item_count.saturating_sub(1)));
+        let mut states = self.states.borrow_mut();
+        let state = states.entry(key.into()).or_default();
+        state.select(selected);
+        frame.render_stateful_widget(List::new(items).scroll_padding(1), area, state);
     }
 
-    let selected = selected_line
-        .unwrap_or(0)
-        .min(lines.len().saturating_sub(1));
-    let mut body_cap = height;
-    let mut start = selected.saturating_sub(body_cap.saturating_sub(1));
-
-    for _ in 0..4 {
-        start = start.min(lines.len().saturating_sub(body_cap));
-        if selected < start {
-            start = selected;
-        } else if selected >= start + body_cap {
-            start = selected + 1 - body_cap;
-        }
-
-        let above = start;
-        let below = lines.len().saturating_sub(start + body_cap);
-        let chrome = usize::from(above > 0) + usize::from(below > 0);
-        let next_body_cap = height.saturating_sub(chrome).max(1);
-        if next_body_cap == body_cap {
-            break;
-        }
-        body_cap = next_body_cap;
+    #[cfg(test)]
+    pub(super) fn offset_for(&self, key: &str) -> usize {
+        self.states
+            .borrow()
+            .get(key)
+            .map(ListState::offset)
+            .unwrap_or(0)
     }
-
-    start = start.min(lines.len().saturating_sub(body_cap));
-    if selected < start {
-        start = selected;
-    } else if selected >= start + body_cap {
-        start = selected + 1 - body_cap;
-    }
-    start = start.min(lines.len().saturating_sub(body_cap));
-    let end = (start + body_cap).min(lines.len());
-
-    let mut out = Vec::with_capacity(height);
-    if start > 0 {
-        out.push(indicator_line(format!("↑ {start} more")));
-    }
-    out.extend(lines[start..end].iter().cloned());
-    if end < lines.len() && out.len() < height {
-        out.push(indicator_line(format!("↓ {} more", lines.len() - end)));
-    }
-    out
 }
 
 pub(super) struct WrappedValueLayout {
@@ -324,6 +315,17 @@ pub(super) fn push_text_field_at_cursor(
     );
 }
 
+pub(super) fn push_wrapped_text(
+    lines: &mut Vec<Line<'static>>,
+    width: u16,
+    text: &str,
+    style: Style,
+) {
+    for chunk in wrap_chunks(text, usize::from(width).max(1)) {
+        lines.push(Line::from(Span::styled(chunk, style)));
+    }
+}
+
 pub(super) fn clamp_to_char_boundary(value: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(value.len());
     while cursor > 0 && !value.is_char_boundary(cursor) {
@@ -374,6 +376,8 @@ pub(super) fn text_area_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn settings_text_columns_reserves_two_cell_gutter() {
@@ -401,6 +405,41 @@ mod tests {
         assert_eq!(top.width, area.width);
         assert_eq!(bottom.width, area.width);
         assert_eq!(bottom.y, top.y + top.height + TEXT_COLUMN_STACKED_GAP);
+    }
+
+    #[test]
+    fn list_state_keeps_offset_when_new_selection_remains_visible() {
+        let states = SettingsScrollStates::default();
+        let backend = TestBackend::new(24, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let lines = || {
+            (0..20)
+                .map(|i| Line::from(format!("row {i:02}")))
+                .collect::<Vec<_>>()
+        };
+
+        terminal
+            .draw(|frame| {
+                states.render_lines(frame, Rect::new(0, 0, 24, 5), "test", lines(), Some(8));
+            })
+            .expect("draw selected row");
+        let offset_after_down = states.offset_for("test");
+        assert!(
+            offset_after_down > 0,
+            "selection should move the list window"
+        );
+
+        terminal
+            .draw(|frame| {
+                states.render_lines(frame, Rect::new(0, 0, 24, 5), "test", lines(), Some(7));
+            })
+            .expect("draw adjacent selected row");
+
+        assert_eq!(
+            states.offset_for("test"),
+            offset_after_down,
+            "moving up within the visible padded window must not bottom-anchor"
+        );
     }
 }
 

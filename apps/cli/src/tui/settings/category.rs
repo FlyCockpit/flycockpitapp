@@ -48,7 +48,7 @@ use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
     TextColumnLayout, heading_style, muted_style, push_label_value_row, push_text_field_at_cursor,
-    selected_style, settings_text_columns, warning_style, window_lines,
+    push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
 use super::{Nav, Page, SettingsDialog, save_status};
@@ -2582,7 +2582,7 @@ impl SettingsDialog {
                         format!("-- {title} --"),
                         muted_style().add_modifier(Modifier::BOLD),
                     )));
-                    lines.push(Line::from(Span::styled(blurb.to_string(), muted_style())));
+                    push_wrapped_text(&mut lines, settings_area.width, blurb, muted_style());
                 }
                 Row::Setting(id) => {
                     let on_cursor = sel == p.cursor;
@@ -2616,6 +2616,7 @@ impl SettingsDialog {
 
         if let Some(id) = p.editing {
             lines.push(Line::default());
+            selected_line = lines.len();
             push_text_field_at_cursor(
                 &mut lines,
                 settings_area.width,
@@ -2678,10 +2679,12 @@ impl SettingsDialog {
             lines.push(Line::from(Span::styled(status.clone(), warning_style())));
         }
 
-        let visible = window_lines(&lines, Some(selected_line), settings_area.height);
-        frame.render_widget(
-            Paragraph::new(visible).wrap(Wrap { trim: false }),
+        self.scroll_states.render_lines(
+            frame,
             settings_area,
+            format!("category:{:?}", p.category),
+            lines,
+            Some(selected_line),
         );
 
         let mut help: Vec<Line<'static>> = Vec::new();

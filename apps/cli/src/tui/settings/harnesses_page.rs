@@ -19,7 +19,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::config::extended::{
     ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, PromptInputMode,
@@ -29,8 +28,8 @@ use crate::tui::textfield::TextField;
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    focused_field_style, marker, muted_style, push_text_field_at_cursor, selected_style,
-    warning_style, window_lines,
+    focused_field_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
+    selected_style, warning_style,
 };
 use super::{Nav, Page, SettingsDialog, save_status};
 
@@ -597,8 +596,9 @@ impl SettingsDialog {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
-        let lines = window_lines(&lines, Some(s.cursor + 4), area.height);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "harnesses:list", lines, selected_line);
     }
 
     fn render_harness_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
@@ -614,7 +614,8 @@ impl SettingsDialog {
         lines.push(Line::default());
 
         let Some(hc) = self.extended.harnesses.get(&s.name) else {
-            frame.render_widget(Paragraph::new(lines), area);
+            self.scroll_states
+                .render_lines(frame, area, "harnesses:edit", lines, None);
             return;
         };
 
@@ -656,8 +657,9 @@ impl SettingsDialog {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
-        let lines = window_lines(&lines, Some(s.cursor + 2), area.height);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "harnesses:edit", lines, selected_line);
     }
 }
 

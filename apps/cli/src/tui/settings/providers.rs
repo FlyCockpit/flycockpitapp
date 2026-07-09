@@ -44,7 +44,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
-use super::shell::clamp_to_char_boundary;
+use super::shell::{clamp_to_char_boundary, selected_line_from_marker};
 use super::{Nav, Page, RowDeleteConfirm, SettingsDialog, save_button_line};
 
 /// One selectable action on the Edit-provider menu. The menu is built
@@ -3219,7 +3219,9 @@ impl SettingsDialog {
                 Style::default().fg(Color::Yellow),
             )));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:list", lines, selected_line);
     }
 
     fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
@@ -3230,7 +3232,14 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
         render_copilot_setup_body(&mut lines, s);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_lines(
+            frame,
+            area,
+            "providers:copilot-setup",
+            lines,
+            selected_line,
+        );
     }
 
     fn render_add(&self, frame: &mut Frame, area: Rect, s: &AddState) {
@@ -3393,7 +3402,9 @@ impl SettingsDialog {
             };
             lines.push(Line::from(Span::styled(err.clone(), style)));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:add", lines, selected_line);
         if matches!(s.step, AddStep::EditHeaders) && s.headers.is_editing() {
             render_header_edit_popup(frame, area, &s.headers);
         }
@@ -3556,7 +3567,9 @@ impl SettingsDialog {
             muted,
         )));
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:edit", lines, selected_line);
     }
 
     /// Full-pane render for the Headers sub-page. The header rows are
@@ -3587,7 +3600,9 @@ impl SettingsDialog {
                 Style::default().fg(Color::Yellow),
             )));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:headers", lines, selected_line);
         if editor.is_editing() {
             render_header_edit_popup(frame, area, editor);
         }
@@ -3631,7 +3646,9 @@ impl SettingsDialog {
                 Style::default().fg(Color::Yellow),
             )));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:models", lines, selected_line);
         if editor.is_editing() {
             render_model_edit_popup(frame, area, editor);
         }
@@ -3794,7 +3811,9 @@ impl SettingsDialog {
                 muted,
             )));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:settings", lines, selected_line);
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {

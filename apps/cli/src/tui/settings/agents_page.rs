@@ -34,13 +34,13 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::agents::{AgentKind, AgentListing, is_builtin_agent, list_all};
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
+use super::shell::{push_wrapped_text, selected_line_from_marker};
 use super::{Nav, Page, SettingsDialog};
 
 /// `/settings → Agents` state.
@@ -465,16 +465,17 @@ impl SettingsDialog {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::default(),
-            Line::from(Span::styled(
-                "Edit opens the agent's .cockpit/agents/<name>.md ($EDITOR, else \
-                 in-TUI). Editing a built-in ejects its default first. The model is \
-                 the `model:` frontmatter field (provider/model). Delete removes a \
-                 custom agent; reset reverts an overridden built-in."
-                    .to_string(),
-                muted,
-            )),
-            Line::default(),
         ];
+        push_wrapped_text(
+            &mut lines,
+            area.width,
+            "Edit opens the agent's .cockpit/agents/<name>.md ($EDITOR, else \
+             in-TUI). Editing a built-in ejects its default first. The model is \
+             the `model:` frontmatter field (provider/model). Delete removes a \
+             custom agent; reset reverts an overridden built-in.",
+            muted,
+        );
+        lines.push(Line::default());
 
         for (i, row) in p.rows.iter().enumerate() {
             let on_cursor = i == p.cursor;
@@ -527,7 +528,9 @@ impl SettingsDialog {
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "agents", lines, selected_line);
     }
 }
 

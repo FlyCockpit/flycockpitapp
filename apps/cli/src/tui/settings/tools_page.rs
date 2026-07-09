@@ -7,7 +7,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use crate::config::extended::ToolCommandTemplate;
 use crate::tui::textfield::TextField;
@@ -15,7 +14,7 @@ use crate::tui::textfield::TextField;
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
     WrappedValueLayout, focused_field_style, muted_style, push_text_field_at_cursor,
-    push_wrapped_prefixed_value, selected_style, warning_style, window_lines,
+    push_wrapped_prefixed_value, selected_line_from_marker, selected_style, warning_style,
 };
 use super::{Nav, Page, SettingsDialog, save_status};
 
@@ -683,8 +682,9 @@ impl SettingsDialog {
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
         let lines = self.build_tools_page_lines(area.width, p);
-        let lines = window_lines(&lines, Some(p.cursor), area.height);
-        frame.render_widget(Paragraph::new(lines), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "tools", lines, selected_line);
     }
 }
 

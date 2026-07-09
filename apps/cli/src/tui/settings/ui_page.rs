@@ -25,6 +25,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::category::{Category, CategoryPage};
 use super::grab;
+use super::shell::{SettingsScrollStates, push_wrapped_text, selected_line_from_marker};
 use super::{Nav, Page, SettingsDialog, save_status};
 
 // ── Utility-model picker ─────────────────────────────────────────────────
@@ -386,6 +387,8 @@ impl SettingsDialog {
         p: &InstructionsPage,
     ) {
         render_grab_list(
+            &self.scroll_states,
+            "instructions",
             frame,
             area,
             "Instructions Files",
@@ -567,6 +570,8 @@ impl SettingsDialog {
         p: &RedactPatternsPage,
     ) {
         render_grab_list(
+            &self.scroll_states,
+            "redact-patterns",
             frame,
             area,
             "Environment File Patterns",
@@ -717,6 +722,8 @@ impl SettingsDialog {
 /// Shared full-pane renderer for the two grab/reorder list sub-pages.
 #[allow(clippy::too_many_arguments)]
 fn render_grab_list(
+    scroll_states: &SettingsScrollStates,
+    key: &'static str,
     frame: &mut Frame,
     area: Rect,
     title: &str,
@@ -736,9 +743,9 @@ fn render_grab_list(
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::default(),
-        Line::from(Span::styled(intro.to_string(), muted)),
-        Line::default(),
     ];
+    push_wrapped_text(&mut lines, area.width, intro, muted);
+    lines.push(Line::default());
 
     for (i, item) in items.iter().enumerate() {
         let is_grabbed = grabbed.is_some() && i == cursor;
@@ -797,5 +804,6 @@ fn render_grab_list(
         lines.push(Line::from(Span::styled(status.to_string(), yellow)));
     }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    let selected_line = selected_line_from_marker(&lines);
+    scroll_states.render_lines(frame, area, key, lines, selected_line);
 }

@@ -15,7 +15,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,7 +25,8 @@ use crate::tui::textfield::TextField;
 
 use super::secret_display;
 use super::shell::{
-    error_style, marker, muted_style, push_text_field, selected_style, warning_style, window_lines,
+    error_style, marker, muted_style, push_text_field, selected_line_from_marker, selected_style,
+    warning_style,
 };
 use super::{Nav, Page, SettingsDialog, save_button_line, save_status};
 
@@ -503,8 +503,9 @@ impl SettingsDialog {
                 Style::default().add_modifier(Modifier::ITALIC),
             )));
         }
-        let lines = window_lines(&lines, Some(s.cursor + 2), area.height);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "mcp:list", lines, selected_line);
     }
 
     fn render_mcp_add(&self, frame: &mut Frame, area: Rect, s: &AddState) {
@@ -703,8 +704,9 @@ impl SettingsDialog {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(status.clone(), error_style())));
         }
-        let lines = window_lines(&lines, Some(s.cursor + 2), area.height);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "mcp:add", lines, selected_line);
     }
 }
 

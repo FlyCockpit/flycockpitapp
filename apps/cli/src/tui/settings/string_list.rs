@@ -21,13 +21,13 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::category::{Category, CategoryPage};
 use super::grab;
 use super::secret_display;
+use super::shell::{push_wrapped_text, selected_line_from_marker};
 use super::ui_page::GrabState;
 use super::{Nav, Page, RowDeleteConfirm, SettingsDialog, save_status};
 
@@ -496,9 +496,9 @@ impl SettingsDialog {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::default(),
-            Line::from(Span::styled(p.kind.intro().to_string(), muted)),
-            Line::default(),
         ];
+        push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
+        lines.push(Line::default());
 
         let values = self.string_list_values(p.kind);
         for (i, val) in values.iter().enumerate() {
@@ -557,6 +557,13 @@ impl SettingsDialog {
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_lines(
+            frame,
+            area,
+            format!("string-list:{:?}", p.kind),
+            lines,
+            selected_line,
+        );
     }
 }

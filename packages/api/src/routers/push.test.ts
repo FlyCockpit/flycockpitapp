@@ -182,6 +182,21 @@ describe("push router — auth gates", () => {
       );
     });
 
+    it("rejects loose native push token prefixes", async () => {
+      const ctx = buildContext({ user: { role: "user" } });
+      const client = createRouterClient(pushRouter, { context: ctx });
+
+      await expect(
+        client.registerNative({ token: "ExpoPushToken-loose-prefix", platform: "ios" }),
+      ).rejects.toThrow();
+      await expect(
+        client.registerNative({ token: "ExpoPushToken[has space]", platform: "ios" }),
+      ).rejects.toThrow();
+
+      expect(db.nativePushToken.findUnique).not.toHaveBeenCalled();
+      expect(db.nativePushToken.create).not.toHaveBeenCalled();
+    });
+
     it("rejects native push tokens already registered to another user", async () => {
       db.nativePushToken.findUnique.mockResolvedValue({ userId: "other-user-id" });
       const ctx = buildContext({ user: { role: "user" } });

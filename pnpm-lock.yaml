@@ -978,6 +978,9 @@ importers:
 
   packages/cockpit-protocol:
     dependencies:
+      '@flycockpit/relay-protocol':
+        specifier: workspace:*
+        version: link:../relay-protocol
       zod:
         specifier: 'catalog:'
         version: 4.4.3

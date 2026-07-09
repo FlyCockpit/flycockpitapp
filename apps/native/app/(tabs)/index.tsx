@@ -2,7 +2,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { env } from "@flycockpit/env/native";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
-import { Button, Card, Chip, Spinner, Surface, useToast } from "heroui-native";
+import { Button, Card, Chip, Input, Spinner, Surface, TextField, useToast } from "heroui-native";
 import { useEffect, useState } from "react";
 import { Pressable, RefreshControl, Text, View } from "react-native";
 import { Container } from "@/components/container";
@@ -16,6 +16,7 @@ type InstanceCardProps = {
   shared?: boolean;
   onOpen: () => void;
   onRevoke?: () => void;
+  onRename?: (displayName: string) => void;
 };
 
 function presenceColor(presence: string) {
@@ -24,7 +25,12 @@ function presenceColor(presence: string) {
   return "default" as const;
 }
 
-function InstanceCard({ instance, shared, onOpen, onRevoke }: InstanceCardProps) {
+function InstanceCard({ instance, shared, onOpen, onRevoke, onRename }: InstanceCardProps) {
+  const [renameValue, setRenameValue] = useState(instance.displayName);
+  const canRename = Boolean(
+    onRename && renameValue.trim() && renameValue.trim() !== instance.displayName,
+  );
+
   return (
     <Card variant="secondary" className="p-4">
       <Pressable onPress={onOpen} className="gap-3">
@@ -42,6 +48,16 @@ function InstanceCard({ instance, shared, onOpen, onRevoke }: InstanceCardProps)
           <Ionicons name="chevron-forward" size={18} color="#8a8a8a" />
         </View>
       </Pressable>
+      {onRename ? (
+        <View className="mt-3 gap-2">
+          <TextField>
+            <Input value={renameValue} onChangeText={setRenameValue} placeholder="Instance name" />
+          </TextField>
+          <Button onPress={() => onRename(renameValue.trim())} isDisabled={!canRename}>
+            <Button.Label>Rename</Button.Label>
+          </Button>
+        </View>
+      ) : null}
       {onRevoke ? (
         <Button className="mt-3" onPress={onRevoke}>
           <Button.Label>Revoke</Button.Label>
@@ -112,6 +128,14 @@ export default function InstancesHome() {
       },
     }),
   );
+  const rename = useMutation(
+    orpc.instances.rename.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.instances.key() });
+        toast.show({ variant: "success", label: "Instance renamed" });
+      },
+    }),
+  );
 
   useEffect(() => {
     verifyServerEligibility(env.EXPO_PUBLIC_SERVER_URL).then(setEligibility);
@@ -157,8 +181,11 @@ export default function InstancesHome() {
     );
   }
 
+  const eligibilityBlocked = eligibility !== null && eligibility.status !== "eligible";
   const nativeBlocked =
-    profile.data?.nativeAppEligible === false || entitlements.data?.nativeAppAccess === false;
+    eligibilityBlocked ||
+    profile.data?.nativeAppEligible === false ||
+    entitlements.data?.nativeAppAccess === false;
 
   return (
     <Container
@@ -178,79 +205,98 @@ export default function InstancesHome() {
 
       {nativeBlocked ? (
         <Surface variant="secondary" className="p-4 rounded-lg mb-5">
-          <Text className="text-foreground font-semibold mb-1">Native access is not enabled</Text>
+          <Text className="text-foreground font-semibold mb-1">
+            {eligibilityBlocked
+              ? "Use the web app for this server"
+              : "Native access is not enabled"}
+          </Text>
           <Text className="text-muted text-sm">
-            Native remote control is available on hosted Pro plans and licensed enterprise servers.
+            {eligibilityBlocked
+              ? "This server is not available in the native app. Open the server in a browser and install it as a PWA for remote control."
+              : "Native remote control is available on hosted Pro plans and licensed enterprise servers."}
           </Text>
         </Surface>
       ) : null}
 
-      {pending.data?.invitations.length ? (
-        <View className="gap-3 mb-5">
-          <Text className="text-foreground text-xl font-semibold">Pending invitations</Text>
-          {pending.data.invitations.map((invite) => (
-            <Surface key={invite.id} variant="secondary" className="p-4 rounded-lg">
-              <Text className="text-foreground font-semibold">{invite.instance.displayName}</Text>
-              <Text className="text-muted text-sm mt-1">{invite.scope.replaceAll("_", " ")}</Text>
-              <View className="flex-row gap-3 mt-3">
-                <Button onPress={() => acceptInvite.mutate({ grantId: invite.id })}>
-                  <Button.Label>Accept</Button.Label>
-                </Button>
-                <Button onPress={() => declineInvite.mutate({ grantId: invite.id })}>
-                  <Button.Label>Decline</Button.Label>
-                </Button>
-              </View>
-            </Surface>
-          ))}
-        </View>
-      ) : null}
+      {nativeBlocked ? null : (
+        <>
+          {pending.data?.invitations.length ? (
+            <View className="gap-3 mb-5">
+              <Text className="text-foreground text-xl font-semibold">Pending invitations</Text>
+              {pending.data.invitations.map((invite) => (
+                <Surface key={invite.id} variant="secondary" className="p-4 rounded-lg">
+                  <Text className="text-foreground font-semibold">
+                    {invite.instance.displayName}
+                  </Text>
+                  <Text className="text-muted text-sm mt-1">
+                    {invite.scope.replaceAll("_", " ")}
+                  </Text>
+                  <View className="flex-row gap-3 mt-3">
+                    <Button onPress={() => acceptInvite.mutate({ grantId: invite.id })}>
+                      <Button.Label>Accept</Button.Label>
+                    </Button>
+                    <Button onPress={() => declineInvite.mutate({ grantId: invite.id })}>
+                      <Button.Label>Decline</Button.Label>
+                    </Button>
+                  </View>
+                </Surface>
+              ))}
+            </View>
+          ) : null}
 
-      <View className="gap-3 mb-5">
-        <Text className="text-foreground text-xl font-semibold">My instances</Text>
-        {mine.isPending ? <Spinner /> : null}
-        {mine.data?.instances.length ? (
-          mine.data.instances.map((instance) => (
-            <InstanceCard
-              key={instance.id}
-              instance={instance}
-              onOpen={() =>
-                router.push({
-                  pathname: "/instances/[instanceId]",
-                  params: { instanceId: instance.id },
-                })
-              }
-              onRevoke={() => revoke.mutate({ instanceId: instance.id })}
-            />
-          ))
-        ) : !mine.isPending ? (
-          <Surface variant="secondary" className="p-4 rounded-lg">
-            <Text className="text-muted text-sm">No cockpit-cli instances are connected yet.</Text>
-          </Surface>
-        ) : null}
-      </View>
+          <View className="gap-3 mb-5">
+            <Text className="text-foreground text-xl font-semibold">My instances</Text>
+            {mine.isPending ? <Spinner /> : null}
+            {mine.data?.instances.length ? (
+              mine.data.instances.map((instance) => (
+                <InstanceCard
+                  key={instance.id}
+                  instance={instance}
+                  onOpen={() =>
+                    router.push({
+                      pathname: "/instances/[instanceId]",
+                      params: { instanceId: instance.id },
+                    })
+                  }
+                  onRename={(displayName) =>
+                    rename.mutate({ instanceId: instance.id, displayName })
+                  }
+                  onRevoke={() => revoke.mutate({ instanceId: instance.id })}
+                />
+              ))
+            ) : !mine.isPending ? (
+              <Surface variant="secondary" className="p-4 rounded-lg">
+                <Text className="text-muted text-sm">
+                  No cockpit-cli instances are connected yet.
+                </Text>
+              </Surface>
+            ) : null}
+          </View>
 
-      <View className="gap-3">
-        <Text className="text-foreground text-xl font-semibold">Shared with me</Text>
-        {shared.data?.sharedInstances.length ? (
-          shared.data.sharedInstances.map((entry) => (
-            <InstanceCard
-              key={entry.instance.id}
-              instance={entry.instance}
-              shared
-              onOpen={() =>
-                router.push({
-                  pathname: "/instances/[instanceId]",
-                  params: { instanceId: entry.instance.id },
-                })
-              }
-            />
-          ))
-        ) : (
-          <Surface variant="secondary" className="p-4 rounded-lg">
-            <Text className="text-muted text-sm">No shared instances are available.</Text>
-          </Surface>
-        )}
-      </View>
+          <View className="gap-3">
+            <Text className="text-foreground text-xl font-semibold">Shared with me</Text>
+            {shared.data?.sharedInstances.length ? (
+              shared.data.sharedInstances.map((entry) => (
+                <InstanceCard
+                  key={entry.instance.id}
+                  instance={entry.instance}
+                  shared
+                  onOpen={() =>
+                    router.push({
+                      pathname: "/instances/[instanceId]",
+                      params: { instanceId: entry.instance.id },
+                    })
+                  }
+                />
+              ))
+            ) : (
+              <Surface variant="secondary" className="p-4 rounded-lg">
+                <Text className="text-muted text-sm">No shared instances are available.</Text>
+              </Surface>
+            )}
+          </View>
+        </>
+      )}
     </Container>
   );
 }

@@ -6,8 +6,8 @@ import type {
   ProjectSummary,
   SessionSummary,
 } from "@flycockpit/cockpit-protocol";
+import { RemoteSessionClient } from "@flycockpit/cockpit-protocol/client";
 import { create } from "zustand";
-import { RemoteSessionClient } from "@/lib/remote-sessions/client";
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
@@ -306,6 +306,8 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
       instanceId,
       relayUrl: tokenInfo.relayUrl,
       token: tokenInfo.token,
+      idPrefix: "web",
+      baseUrl: window.location.origin,
       onStatus: (status, statusDetail) => {
         set((state) => ({
           instances: setInstance(state.instances, instanceId, (current) => ({

@@ -1,6 +1,6 @@
 {
   "expo": {
-    "scheme": "flycockpit",
+    "scheme": ["flycockpit", "cockpit"],
     "orientation": "default",
     "icon": "./assets/images/icon.png",
     "splash": {

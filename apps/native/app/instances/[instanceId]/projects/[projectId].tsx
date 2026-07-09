@@ -1,15 +1,47 @@
-import type { HistoryEntry, SessionSummary } from "@flycockpit/cockpit-protocol";
+import {
+  type HistoryEntry,
+  type LiveEvent,
+  liveEventSchema,
+  type SessionSummary,
+} from "@flycockpit/cockpit-protocol";
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams } from "expo-router";
 import { Button, Card, Chip, Input, Spinner, Surface, TextField } from "heroui-native";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Text, View } from "react-native";
 import { Container } from "@/components/container";
 import { useNativeRemoteClient } from "@/hooks/use-native-remote-client";
 
 function formatSessionTitle(session: SessionSummary) {
   return session.title || session.shortId || session.sessionId;
+}
+
+function sortHistory(history: HistoryEntry[]) {
+  return [...history].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+}
+
+function upsertHistory(history: HistoryEntry[], entry: HistoryEntry) {
+  return sortHistory([entry, ...history.filter((item) => item.id !== entry.id)]);
+}
+
+function applySessionEvent(history: HistoryEntry[], event: LiveEvent) {
+  if (event.type === "history_entry") return upsertHistory(history, event.entry);
+  if (event.type === "assistant_delta") {
+    return history.map((entry) =>
+      entry.id === event.entryId && entry.kind === "assistant_text"
+        ? { ...entry, text: entry.text + event.delta }
+        : entry,
+    );
+  }
+  if (event.type === "interrupt_resolved") {
+    return history.map((entry) =>
+      entry.kind === "interrupt" && entry.interrupt.interruptId === event.interruptId
+        ? { ...entry, interrupt: { ...entry.interrupt, resolved: true } }
+        : entry,
+    );
+  }
+  return history;
 }
 
 function historyText(entry: HistoryEntry) {
@@ -42,7 +74,6 @@ export default function ProjectSessions() {
     : decodeURIComponent(String(params.projectId ?? ""));
   const initialSession = Array.isArray(params.session) ? params.session[0] : params.session;
   const projectName = Array.isArray(params.name) ? params.name[0] : params.name;
-  const { client, status, tokenQuery } = useNativeRemoteClient(instanceId);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialSession ?? null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -50,6 +81,31 @@ export default function ProjectSessions() {
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const selectedSessionRef = useRef<string | null>(initialSession ?? null);
+
+  const handleLiveEvent = useCallback((raw: unknown) => {
+    const parsed = liveEventSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const event = parsed.data;
+    if (event.type === "session_updated") {
+      setSessions((current) =>
+        [
+          event.summary,
+          ...current.filter((session) => session.sessionId !== event.summary.sessionId),
+        ].sort((a, b) => b.updatedAt - a.updatedAt),
+      );
+      return;
+    }
+    const sessionId = "sessionId" in event ? event.sessionId : null;
+    if (!sessionId || sessionId !== selectedSessionRef.current) return;
+    setHistory((current) => applySessionEvent(current, event));
+  }, []);
+
+  const { client, status, tokenQuery } = useNativeRemoteClient(instanceId, handleLiveEvent);
+
+  useEffect(() => {
+    selectedSessionRef.current = selectedSessionId;
+  }, [selectedSessionId]);
 
   const unresolvedInterrupts = useMemo(
     () => history.filter((entry) => entry.kind === "interrupt" && !entry.interrupt.resolved),
@@ -93,7 +149,6 @@ export default function ProjectSessions() {
     setMessage("");
     try {
       await client.sendUserMessage(selectedSessionId, text, "native-" + Date.now());
-      await attach(selectedSessionId);
     } catch (sendError) {
       setError(sendError instanceof Error ? sendError.message : "Could not send message.");
       setMessage(text);
@@ -106,8 +161,8 @@ export default function ProjectSessions() {
       quality: 0.85,
     });
     if (result.canceled || !result.assets[0]) return;
-    setMessage(
-      (current) => (current ? current + "\n" : "") + "Image attachment: " + result.assets[0].uri,
+    setError(
+      "Image upload is not available for remote sessions yet. The app will not send local file paths as message text.",
     );
   };
 
@@ -131,7 +186,6 @@ export default function ProjectSessions() {
         answer: resolution === "answer" ? answer : undefined,
       });
       setAnswer("");
-      await attach(selectedSessionId);
     } catch (resolveError) {
       setError(
         resolveError instanceof Error ? resolveError.message : "Could not resolve interrupt.",
@@ -244,7 +298,7 @@ export default function ProjectSessions() {
               <Input
                 value={message}
                 onChangeText={setMessage}
-                placeholder="Message Codex"
+                placeholder="Message Flycockpit"
                 multiline
               />
             </TextField>

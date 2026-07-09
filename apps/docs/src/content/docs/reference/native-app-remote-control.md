@@ -12,9 +12,9 @@ The Expo native app is a paid remote-control client for hosted Flycockpit and li
 2. Set `apps/native/.env` `EXPO_PUBLIC_SERVER_URL` to the hosted or enterprise server origin, without a path or query string.
 3. Run `pnpm doctor:native`, then `pnpm native:ios` or `pnpm native:android`.
 4. Sign in on the Account tab.
-5. Open the Instances tab and verify owned instances and accepted shared instances appear with presence.
+5. Open the Instances tab and verify owned instances and accepted shared instances appear with presence. Keep the app foregrounded and verify web/browser notifications for the same user are suppressed by native presence heartbeat.
 6. Open an instance, wait for the relay status to become `CONNECTED`, and open a project.
-7. Select a session, send a message, and verify it appears in the CLI session.
+7. Select a session, send a message, and verify it appears in the CLI session. Leave the session open and verify new assistant text streams in without pressing Refresh.
 8. Trigger an approval in the CLI, background the app, and verify an Expo push notification arrives.
 9. Tap the notification, open the project/session deep link, then approve or deny the interrupt and verify the CLI proceeds.
 
@@ -30,4 +30,4 @@ Native devices register Expo push tokens through `push.registerNative`. Token ro
 
 ## Current Cutline
 
-The v1 native app supports server eligibility checks, entitlement gating, instances, shared-with-me instances, project/session browsing, text messages, clipboard/image-assisted composer text, and approval/question interrupt cards. Terminal and file-browser surfaces remain separate follow-up work.
+The v1 native app supports server eligibility checks, entitlement gating, instances, shared-with-me instances, project/session browsing, live transcript streaming, text messages, clipboard-assisted composer text, and approval/question interrupt cards. Image attachment upload is intentionally disabled until the remote-session protocol exposes a real upload path; the app must not send local image URIs as message text. Terminal and file-browser surfaces remain separate follow-up work.

@@ -7,13 +7,9 @@ export const nativePushTokenSchema = z
   .trim()
   .min(16)
   .max(512)
-  .refine(
-    (token) =>
-      token.startsWith("ExponentPushToken[") ||
-      token.startsWith("ExpoPushToken[") ||
-      token.startsWith("ExpoPushToken"),
-    { message: "Native push token must be an Expo push token." },
-  );
+  .refine((token) => /^(ExponentPushToken|ExpoPushToken)\[[^\]\s]+\]$/.test(token), {
+    message: "Native push token must be an Expo push token.",
+  });
 
 export const nativePushPlatformSchema = z.enum(["ios", "android", "web"]);
 

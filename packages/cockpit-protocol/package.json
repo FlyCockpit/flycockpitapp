@@ -7,6 +7,9 @@
   "exports": {
     ".": {
       "default": "./src/index.ts"
+    },
+    "./client": {
+      "default": "./src/client.ts"
     }
   },
   "scripts": {
@@ -14,7 +17,8 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "zod": "catalog:"
+    "zod": "catalog:",
+    "@flycockpit/relay-protocol": "workspace:*"
   },
   "devDependencies": {
     "typescript": "catalog:",

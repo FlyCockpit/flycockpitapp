@@ -1,4 +1,8 @@
 import {
+  type DaemonClientRelayFrame,
+  daemonClientRelayFrameSchema,
+} from "@flycockpit/relay-protocol/envelopes";
+import {
   type AttachResult,
   type ClientRequest,
   createEnvelope,
@@ -12,19 +16,30 @@ import {
   parseListProjectsResult,
   parseListSessionsResult,
   serverMessageSchema,
-} from "@flycockpit/cockpit-protocol";
-import {
-  type DaemonClientRelayFrame,
-  daemonClientRelayFrameSchema,
-} from "@flycockpit/relay-protocol/envelopes";
+} from ".";
 
-type Status = "idle" | "connecting" | "connected" | "offline" | "error";
+export type RemoteSessionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
-type ClientOptions = {
+type Listener = { data?: unknown } | unknown;
+
+export type RemoteSessionWebSocket = {
+  readonly readyState: number;
+  send(data: string): void;
+  close(): void;
+  addEventListener(type: "open" | "close" | "error", listener: () => void): void;
+  addEventListener(type: "message", listener: (event: Listener) => void): void;
+};
+
+export type RemoteSessionWebSocketConstructor = new (url: string) => RemoteSessionWebSocket;
+
+export type RemoteSessionClientOptions = {
   instanceId: string;
   relayUrl: string;
   token: string;
-  onStatus?: (status: Status, detail?: string) => void;
+  idPrefix: string;
+  baseUrl?: string;
+  WebSocketImpl?: RemoteSessionWebSocketConstructor;
+  onStatus?: (status: RemoteSessionStatus, detail?: string) => void;
   onEvent?: (event: unknown) => void;
 };
 
@@ -33,8 +48,20 @@ type Pending = {
   reject: (error: Error) => void;
 };
 
-function clientRelayUrl(relayUrl: string, token: string) {
-  const url = new URL(relayUrl, window.location.origin);
+export class RemoteSessionError extends Error {
+  readonly code: string;
+  readonly data: unknown;
+
+  constructor(message: string, code: string, data: unknown) {
+    super(message);
+    this.name = "RemoteSessionError";
+    this.code = code;
+    this.data = data;
+  }
+}
+
+export function remoteSessionClientRelayUrl(relayUrl: string, token: string, baseUrl?: string) {
+  const url = baseUrl ? new URL(relayUrl, baseUrl) : new URL(relayUrl);
   if (!url.pathname.endsWith("/client")) {
     url.pathname = url.pathname.replace(/\/$/, "") + "/client";
   }
@@ -42,38 +69,50 @@ function clientRelayUrl(relayUrl: string, token: string) {
   return url.toString();
 }
 
+function defaultWebSocket() {
+  return (globalThis as { WebSocket?: RemoteSessionWebSocketConstructor }).WebSocket;
+}
+
+function messageData(event: Listener) {
+  if (event && typeof event === "object" && "data" in event) return event.data;
+  return event;
+}
+
 export class RemoteSessionClient {
-  private ws: WebSocket | null = null;
-  private pending = new Map<string, Pending>();
+  private ws: RemoteSessionWebSocket | null = null;
+  private readonly pending = new Map<string, Pending>();
   private requestSeq = 0;
   private readonly channelId: string;
 
-  constructor(private readonly options: ClientOptions) {
+  constructor(private readonly options: RemoteSessionClientOptions) {
     this.channelId = "sessions:" + options.instanceId;
   }
 
   connect() {
-    if (
-      this.ws &&
-      (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)
-    ) {
+    if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) return;
+    const WebSocketImpl = this.options.WebSocketImpl ?? defaultWebSocket();
+    if (!WebSocketImpl) {
+      this.options.onStatus?.("error", "WebSocket is not available.");
       return;
     }
     this.options.onStatus?.("connecting");
-    const ws = new WebSocket(clientRelayUrl(this.options.relayUrl, this.options.token));
+    const ws = new WebSocketImpl(
+      remoteSessionClientRelayUrl(this.options.relayUrl, this.options.token, this.options.baseUrl),
+    );
     this.ws = ws;
     ws.addEventListener("open", () => this.options.onStatus?.("connected"));
     ws.addEventListener("close", () => {
       if (this.ws === ws) this.ws = null;
       this.options.onStatus?.("offline");
-      for (const pending of this.pending.values())
+      for (const pending of this.pending.values()) {
         pending.reject(new Error("Instance connection closed."));
+      }
       this.pending.clear();
     });
     ws.addEventListener("error", () =>
       this.options.onStatus?.("error", "Relay connection failed."),
     );
-    ws.addEventListener("message", (event) => this.handleMessage(event.data));
+    ws.addEventListener("message", (event) => this.handleMessage(messageData(event)));
   }
 
   close() {
@@ -166,14 +205,14 @@ export class RemoteSessionClient {
   }
 
   private send(request: ClientRequest) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (this.ws?.readyState !== 1) {
       return Promise.reject(new Error("Instance connection is not open."));
     }
-    const id = "web-" + ++this.requestSeq;
+    const id = this.options.idPrefix + "-" + ++this.requestSeq;
     const envelope = createEnvelope(id, request);
     const promise = new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      window.setTimeout(() => {
+      globalThis.setTimeout(() => {
         if (!this.pending.delete(id)) return;
         reject(new Error("Request timed out."));
       }, 30_000);
@@ -198,7 +237,16 @@ export class RemoteSessionClient {
     const pending = this.pending.get(message.data.id);
     if (!pending) return;
     this.pending.delete(message.data.id);
-    if (message.data.ok) pending.resolve(message.data.result);
-    else pending.reject(new Error(message.data.error.message));
+    if (message.data.ok) {
+      pending.resolve(message.data.result);
+      return;
+    }
+    pending.reject(
+      new RemoteSessionError(
+        message.data.error.message,
+        message.data.error.code,
+        "data" in message.data.error ? message.data.error.data : undefined,
+      ),
+    );
   }
 }

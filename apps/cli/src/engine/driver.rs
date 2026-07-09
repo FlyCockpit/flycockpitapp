@@ -1174,23 +1174,38 @@ struct BatchNoninteractiveCompletion {
 }
 
 enum BackgroundNoninteractiveCompletion {
-    Single(Box<Result<SingleNoninteractiveCompletion>>),
-    Batch(Box<Result<BatchNoninteractiveCompletion>>),
+    Single {
+        task_call_id: String,
+        task_function_call_id: Option<String>,
+        result: Box<Result<SingleNoninteractiveCompletion>>,
+    },
+    Batch {
+        task_call_id: String,
+        task_function_call_id: Option<String>,
+        result: Box<Result<BatchNoninteractiveCompletion>>,
+    },
 }
 
 impl BackgroundNoninteractiveCompletion {
-    fn task_call_id(&self) -> Option<&str> {
+    fn task_call_id(&self) -> &str {
         match self {
-            Self::Single(result) => result
-                .as_ref()
-                .as_ref()
-                .ok()
-                .map(|c| c.task_call_id.as_str()),
-            Self::Batch(result) => result
-                .as_ref()
-                .as_ref()
-                .ok()
-                .map(|c| c.task_call_id.as_str()),
+            Self::Single { task_call_id, .. } | Self::Batch { task_call_id, .. } => task_call_id,
+        }
+    }
+}
+
+enum NoninteractiveCompletionDelivery {
+    None,
+    Inline(Message),
+    AsyncUser(String),
+}
+
+impl NoninteractiveCompletionDelivery {
+    fn into_inline_message(self) -> Message {
+        match self {
+            Self::Inline(message) => message,
+            Self::AsyncUser(text) => Message::user(text),
+            Self::None => Message::user(""),
         }
     }
 }
@@ -2637,7 +2652,9 @@ impl Driver {
             let active_target_id = self.active_queue_target_id();
             if !self.pending_noninteractive_completions.is_empty()
                 && !input_queue.has_pending_for(Some(&active_target_id)).await
-                && self.run_next_pending_noninteractive_completion(tx).await?
+                && self
+                    .run_next_pending_noninteractive_completion(&input_queue, tx)
+                    .await?
             {
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = false;
@@ -2698,14 +2715,15 @@ impl Driver {
                 }
                 completion = self.noninteractive_complete_rx.recv() => {
                     goal_watchdog = None;
-                    let result = self
-                        .finalize_background_noninteractive_completion(completion, tx)
+                    let delivered = self
+                        .deliver_background_noninteractive_completion(completion, &input_queue, tx)
                         .await?;
-                    self.goal_no_tool_idle_count = 0;
-                    self.goal_idle_intervention_pending = false;
-                    self.run_parent_tool_result(result, tx).await?;
-                    self.maybe_continue_active_goal(&input_queue, tx).await?;
-                    self.refresh_goal_watchdog(&mut goal_watchdog);
+                    if delivered {
+                        self.goal_no_tool_idle_count = 0;
+                        self.goal_idle_intervention_pending = false;
+                        self.maybe_continue_active_goal(&input_queue, tx).await?;
+                        self.refresh_goal_watchdog(&mut goal_watchdog);
+                    }
                 }
                 cmd = self.job_cmd_rx.recv() => {
                     goal_watchdog = None;
@@ -6627,12 +6645,18 @@ impl Driver {
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
+        let completion_task_call_id = task_call_id.clone();
+        let completion_task_function_call_id = task_function_call_id.clone();
         let handle = tokio::spawn(async move {
             let result = runner
                 .execute_single_noninteractive_task(task, &tx_for_task, cancel)
                 .await;
             let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Single(Box::new(result)))
+                .send(BackgroundNoninteractiveCompletion::Single {
+                    task_call_id: completion_task_call_id,
+                    task_function_call_id: completion_task_function_call_id,
+                    result: Box::new(result),
+                })
                 .await;
         });
         self.noninteractive_jobs.insert(
@@ -6679,7 +6703,10 @@ impl Driver {
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
-                self.finalize_background_noninteractive_completion(completion, tx).await
+                Ok(self
+                    .finalize_background_noninteractive_completion(completion, tx)
+                    .await?
+                    .into_inline_message())
             }
         }
     }
@@ -7243,7 +7270,7 @@ impl Driver {
         let pos = self
             .pending_noninteractive_completions
             .iter()
-            .position(|completion| completion.task_call_id() == Some(task_call_id))?;
+            .position(|completion| completion.task_call_id() == task_call_id)?;
         self.pending_noninteractive_completions.remove(pos)
     }
 
@@ -7257,7 +7284,7 @@ impl Driver {
         loop {
             let completion = self.noninteractive_complete_rx.recv().await?;
             match completion.task_call_id() {
-                Some(id) if id != task_call_id => {
+                id if id != task_call_id => {
                     self.pending_noninteractive_completions
                         .push_back(completion);
                 }
@@ -7268,36 +7295,63 @@ impl Driver {
 
     async fn run_next_pending_noninteractive_completion(
         &mut self,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<bool> {
         let Some(completion) = self.pending_noninteractive_completions.pop_front() else {
             return Ok(false);
         };
-        let result = self
-            .finalize_background_noninteractive_completion(Some(completion), tx)
-            .await?;
-        self.run_parent_tool_result(result, tx).await?;
-        Ok(true)
+        self.deliver_background_noninteractive_completion(Some(completion), input_rx, tx)
+            .await
+    }
+
+    async fn deliver_background_noninteractive_completion(
+        &mut self,
+        completion: Option<BackgroundNoninteractiveCompletion>,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<bool> {
+        match self
+            .finalize_background_noninteractive_completion(completion, tx)
+            .await?
+        {
+            NoninteractiveCompletionDelivery::None => Ok(false),
+            NoninteractiveCompletionDelivery::Inline(message) => {
+                self.run_parent_tool_result(message, tx).await?;
+                Ok(true)
+            }
+            NoninteractiveCompletionDelivery::AsyncUser(text) => {
+                if text.trim().is_empty() {
+                    return Ok(false);
+                }
+                self.run_user_input(UserSubmission::text(self.redact.scrub(&text)), input_rx, tx)
+                    .await?;
+                Ok(true)
+            }
+        }
     }
 
     async fn finalize_background_noninteractive_completion(
         &mut self,
         completion: Option<BackgroundNoninteractiveCompletion>,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> Result<Message> {
+    ) -> Result<NoninteractiveCompletionDelivery> {
         let Some(completion) = completion else {
-            return Ok(Message::user(""));
+            return Ok(NoninteractiveCompletionDelivery::None);
         };
         match completion {
-            BackgroundNoninteractiveCompletion::Single(result) => match *result {
+            BackgroundNoninteractiveCompletion::Single {
+                task_call_id,
+                task_function_call_id,
+                result,
+            } => match *result {
                 Ok(completion) => {
-                    let task_call_id = completion.task_call_id.clone();
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
                     if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
                         if job.delivered {
-                            return Ok(Message::user(""));
+                            return Ok(NoninteractiveCompletionDelivery::None);
                         }
                         job.delivered = true;
                     }
@@ -7306,8 +7360,9 @@ impl Driver {
                         .await;
                     if was_backgrounded {
                         Ok(self
-                            .async_delegation_result(&task_call_id, "completed")
-                            .unwrap_or_else(|| Message::user("")))
+                            .async_delegation_result(&task_call_id)
+                            .map(NoninteractiveCompletionDelivery::AsyncUser)
+                            .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
                         if let Err(e) = self
                             .session
@@ -7316,24 +7371,49 @@ impl Driver {
                         {
                             tracing::warn!(error = %e, task_call_id, "mark inline single delegation delivered failed");
                         }
-                        Ok(result)
+                        Ok(NoninteractiveCompletionDelivery::Inline(result))
                     }
                 }
-                Err(e) => Ok(Message::tool_result_with_call_id(
-                    "background-task-error".to_string(),
-                    None,
-                    format!("Error: {e:#}"),
-                )),
-            },
-            BackgroundNoninteractiveCompletion::Batch(result) => match *result {
-                Ok(completion) => {
-                    let task_call_id = completion.task_call_id.clone();
+                Err(e) => {
+                    let body = format!("Error: {e:#}");
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
                     if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
                         if job.delivered {
-                            return Ok(Message::user(""));
+                            return Ok(NoninteractiveCompletionDelivery::None);
+                        }
+                        job.delivered = true;
+                    }
+                    if was_backgrounded {
+                        self.record_background_noninteractive_error(&task_call_id, &body);
+                        Ok(self
+                            .async_delegation_result(&task_call_id)
+                            .map(NoninteractiveCompletionDelivery::AsyncUser)
+                            .unwrap_or(NoninteractiveCompletionDelivery::None))
+                    } else {
+                        Ok(NoninteractiveCompletionDelivery::Inline(
+                            Message::tool_result_with_call_id(
+                                task_call_id,
+                                task_function_call_id,
+                                body,
+                            ),
+                        ))
+                    }
+                }
+            },
+            BackgroundNoninteractiveCompletion::Batch {
+                task_call_id,
+                task_function_call_id,
+                result,
+            } => match *result {
+                Ok(completion) => {
+                    let was_backgrounded = self
+                        .noninteractive_delegations
+                        .is_backgrounded_job(&task_call_id);
+                    if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
+                        if job.delivered {
+                            return Ok(NoninteractiveCompletionDelivery::None);
                         }
                         job.delivered = true;
                     }
@@ -7342,8 +7422,9 @@ impl Driver {
                         .await;
                     if was_backgrounded {
                         Ok(self
-                            .async_delegation_result(&task_call_id, "completed")
-                            .unwrap_or_else(|| Message::user("")))
+                            .async_delegation_result(&task_call_id)
+                            .map(NoninteractiveCompletionDelivery::AsyncUser)
+                            .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
                         match self
                             .session
@@ -7366,15 +7447,72 @@ impl Driver {
                                 tracing::warn!(error = %e, task_call_id, "load inline batch delegation rows failed");
                             }
                         }
-                        Ok(result)
+                        Ok(NoninteractiveCompletionDelivery::Inline(result))
                     }
                 }
-                Err(e) => Ok(Message::tool_result_with_call_id(
-                    "background-task-error".to_string(),
-                    None,
-                    format!("Error: {e:#}"),
-                )),
+                Err(e) => {
+                    let body = format!("Error: {e:#}");
+                    let was_backgrounded = self
+                        .noninteractive_delegations
+                        .is_backgrounded_job(&task_call_id);
+                    if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
+                        if job.delivered {
+                            return Ok(NoninteractiveCompletionDelivery::None);
+                        }
+                        job.delivered = true;
+                    }
+                    if was_backgrounded {
+                        self.record_background_noninteractive_error(&task_call_id, &body);
+                        Ok(self
+                            .async_delegation_result(&task_call_id)
+                            .map(NoninteractiveCompletionDelivery::AsyncUser)
+                            .unwrap_or(NoninteractiveCompletionDelivery::None))
+                    } else {
+                        Ok(NoninteractiveCompletionDelivery::Inline(
+                            Message::tool_result_with_call_id(
+                                task_call_id,
+                                task_function_call_id,
+                                body,
+                            ),
+                        ))
+                    }
+                }
             },
+        }
+    }
+
+    fn record_background_noninteractive_error(&mut self, task_call_id: &str, body: &str) {
+        let rows = match self
+            .session
+            .db
+            .list_task_delegation_children(self.session.id)
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, task_call_id, "load task delegation rows for background error failed");
+                return;
+            }
+        };
+        for row in rows
+            .into_iter()
+            .filter(|row| row.task_call_id == task_call_id && delegation_status_live(row.status))
+        {
+            if let Err(e) = self.session.db.complete_task_delegation_child(
+                task_call_id,
+                &row.label,
+                body,
+                true,
+                None,
+            ) {
+                tracing::warn!(error = %e, task_call_id, label = %row.label, "complete errored background delegation child failed");
+            }
+            self.noninteractive_delegations.complete(
+                task_call_id,
+                &row.label,
+                body.to_string(),
+                true,
+                None,
+            );
         }
     }
 
@@ -7403,7 +7541,7 @@ impl Driver {
         Message::tool_result_with_call_id(task_call_id.to_string(), task_function_call_id, body)
     }
 
-    fn async_delegation_result(&mut self, task_call_id: &str, status: &str) -> Option<Message> {
+    fn async_delegation_result(&mut self, task_call_id: &str) -> Option<String> {
         let completed = match self
             .session
             .db
@@ -7411,36 +7549,47 @@ impl Driver {
         {
             Ok(rows) => rows
                 .into_iter()
-                .filter_map(|row| row.report.map(|report| (row.label, report)))
+                .map(|row| AsyncDelegationChildResult {
+                    label: row.label,
+                    status: row.status.as_str().to_string(),
+                    report: row.report,
+                })
                 .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "load undelivered delegation children failed");
                 self.noninteractive_delegations
                     .completed_undelivered(task_call_id)
+                    .into_iter()
+                    .map(|(label, report)| AsyncDelegationChildResult {
+                        label,
+                        status: "completed".to_string(),
+                        report: Some(report),
+                    })
+                    .collect::<Vec<_>>()
             }
         };
         if completed.is_empty() {
             return None;
         }
-        for (label, _) in &completed {
+        for child in &completed {
             let _ = self
                 .noninteractive_delegations
-                .mark_delivered(task_call_id, label);
+                .mark_delivered(task_call_id, &child.label);
             if let Err(e) = self
                 .session
                 .db
-                .mark_task_delegation_child_delivered(task_call_id, label)
+                .mark_task_delegation_child_delivered(task_call_id, &child.label)
             {
+                let label = child.label.as_str();
                 tracing::warn!(error = %e, task_call_id, label, "mark async delegation child delivered failed");
             }
         }
         let running = self.noninteractive_delegations.running_labels(task_call_id);
-        Some(Message::user(format_async_delegation_result(
+        Some(format_async_delegation_result(
             task_call_id,
-            status,
             &completed,
             &running,
-        )))
+        ))
     }
 
     fn dispatch_task_control(
@@ -7789,12 +7938,18 @@ impl Driver {
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
+        let completion_task_call_id = task_call_id.clone();
+        let completion_task_function_call_id = task_function_call_id.clone();
         let handle = tokio::spawn(async move {
             let result = runner
                 .execute_batch_noninteractive_task(task, &tx_for_task, cancel)
                 .await;
             let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Batch(Box::new(result)))
+                .send(BackgroundNoninteractiveCompletion::Batch {
+                    task_call_id: completion_task_call_id,
+                    task_function_call_id: completion_task_function_call_id,
+                    result: Box::new(result),
+                })
                 .await;
         });
         self.noninteractive_jobs.insert(
@@ -7850,7 +8005,10 @@ impl Driver {
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
-                self.finalize_background_noninteractive_completion(completion, tx).await
+                Ok(self
+                    .finalize_background_noninteractive_completion(completion, tx)
+                    .await?
+                    .into_inline_message())
             }
         }
     }
@@ -10073,26 +10231,54 @@ fn format_delegation_background_ack(
     body
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsyncDelegationChildResult {
+    label: String,
+    status: String,
+    report: Option<String>,
+}
+
+fn derive_async_delegation_status(children: &[AsyncDelegationChildResult]) -> &'static str {
+    if children.iter().any(|child| child.status == "failed") {
+        "failed"
+    } else if children.iter().any(|child| child.status == "lost") {
+        "lost"
+    } else if children.iter().any(|child| child.status == "cancelled") {
+        "cancelled"
+    } else {
+        "completed"
+    }
+}
+
 fn format_async_delegation_result(
     task_call_id: &str,
-    status: &str,
-    completed: &[(String, String)],
+    completed: &[AsyncDelegationChildResult],
     running: &[String],
 ) -> String {
     let completed_labels = completed
         .iter()
-        .map(|(label, _)| label.clone())
+        .map(|child| child.label.clone())
         .collect::<Vec<_>>();
+    let status = derive_async_delegation_status(completed);
     let mut body = format!(
         "[async delegation result · task_call_id={task_call_id} · status={status}]\ncompleted: {}\nrunning: {}",
         label_list(&completed_labels),
         label_list(running)
     );
-    for (label, report) in completed {
+    for child in completed {
         body.push_str("\n\n");
-        body.push_str(label);
-        body.push_str(":\n");
-        body.push_str(report);
+        body.push_str(&child.label);
+        body.push_str(" [status=");
+        body.push_str(&child.status);
+        body.push_str("]:\n");
+        if let Some(report) = &child.report {
+            if matches!(child.status.as_str(), "failed" | "cancelled" | "lost") {
+                body.push_str("error: ");
+            }
+            body.push_str(report);
+        } else {
+            body.push_str("(no report)");
+        }
     }
     body
 }
@@ -15471,6 +15657,17 @@ mod tests {
         }
     }
 
+    fn tool_result_provider_call_id(msg: &Message) -> Option<String> {
+        use rig::message::UserContent;
+        match msg {
+            Message::User { content } => content.iter().find_map(|part| match part {
+                UserContent::ToolResult(result) => result.call_id.clone(),
+                _ => None,
+            }),
+            _ => panic!("expected a tool_result user message"),
+        }
+    }
+
     fn pending_test_shrink() -> PendingDelegationShrink {
         PendingDelegationShrink {
             tracker: crate::engine::deleg_shrink::DelegationShrink::new(
@@ -15520,14 +15717,18 @@ mod tests {
     async fn pending_noninteractive_completion_routes_by_task_call_id() {
         let (mut driver, _tmp) = test_driver(8);
         let tx = driver.noninteractive_complete_tx.clone();
-        tx.send(BackgroundNoninteractiveCompletion::Single(Box::new(Ok(
-            single_noninteractive_completion("task-a", "a done"),
-        ))))
+        tx.send(BackgroundNoninteractiveCompletion::Single {
+            task_call_id: "task-a".to_string(),
+            task_function_call_id: Some("fn-task-a".to_string()),
+            result: Box::new(Ok(single_noninteractive_completion("task-a", "a done"))),
+        })
         .await
         .unwrap();
-        tx.send(BackgroundNoninteractiveCompletion::Single(Box::new(Ok(
-            single_noninteractive_completion("task-b", "b done"),
-        ))))
+        tx.send(BackgroundNoninteractiveCompletion::Single {
+            task_call_id: "task-b".to_string(),
+            task_function_call_id: Some("fn-task-b".to_string()),
+            result: Box::new(Ok(single_noninteractive_completion("task-b", "b done"))),
+        })
         .await
         .unwrap();
 
@@ -15535,19 +15736,186 @@ mod tests {
             .recv_noninteractive_completion_for("task-b")
             .await
             .expect("task-b completion");
-        assert_eq!(completion.task_call_id(), Some("task-b"));
+        assert_eq!(completion.task_call_id(), "task-b");
         assert_eq!(driver.pending_noninteractive_completions.len(), 1);
         assert_eq!(
             driver.pending_noninteractive_completions[0].task_call_id(),
-            Some("task-a")
+            "task-a"
         );
 
         let completion = driver
             .recv_noninteractive_completion_for("task-a")
             .await
             .expect("task-a completion");
-        assert_eq!(completion.task_call_id(), Some("task-a"));
+        assert_eq!(completion.task_call_id(), "task-a");
         assert!(driver.pending_noninteractive_completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inline_background_completion_error_keeps_original_task_pairing() {
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+        let delivery = driver
+            .finalize_background_noninteractive_completion(
+                Some(BackgroundNoninteractiveCompletion::Single {
+                    task_call_id: "task-inline".to_string(),
+                    task_function_call_id: Some("fn-inline".to_string()),
+                    result: Box::new(Err(anyhow::anyhow!("child crashed"))),
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        let NoninteractiveCompletionDelivery::Inline(message) = delivery else {
+            panic!("inline error should satisfy the open task tool call");
+        };
+        assert_eq!(tool_result_id(&message), "task-inline");
+        assert_eq!(
+            tool_result_provider_call_id(&message).as_deref(),
+            Some("fn-inline")
+        );
+        assert!(tool_result_text(&message).contains("child crashed"));
+    }
+
+    #[tokio::test]
+    async fn backgrounded_completion_error_becomes_async_failed_result_once() {
+        let (mut driver, _tmp) = test_driver(8);
+        seed_task_delegation(&driver, "task-bg-error", "default");
+        driver
+            .session
+            .db
+            .background_task_delegation_child("task-bg-error", "default")
+            .unwrap();
+        driver.noninteractive_delegations.register_running(
+            "task-bg-error",
+            "default",
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+        driver
+            .noninteractive_delegations
+            .background_on_user_input("task-bg-error", "default");
+        driver.noninteractive_jobs.insert(
+            "task-bg-error".to_string(),
+            BackgroundNoninteractiveJob {
+                delivered: false,
+                handle: tokio::spawn(async {}),
+            },
+        );
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+        let delivery = driver
+            .finalize_background_noninteractive_completion(
+                Some(BackgroundNoninteractiveCompletion::Single {
+                    task_call_id: "task-bg-error".to_string(),
+                    task_function_call_id: Some("fn-bg-error".to_string()),
+                    result: Box::new(Err(anyhow::anyhow!("late child crashed"))),
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        let NoninteractiveCompletionDelivery::AsyncUser(text) = delivery else {
+            panic!("backgrounded error should be delivered as async user input");
+        };
+        assert!(text.contains("task_call_id=task-bg-error"), "{text}");
+        assert!(text.contains("status=failed"), "{text}");
+        assert!(text.contains("default [status=failed]"), "{text}");
+        assert!(text.contains("error: Error: late child crashed"), "{text}");
+
+        let duplicate = driver
+            .finalize_background_noninteractive_completion(
+                Some(BackgroundNoninteractiveCompletion::Single {
+                    task_call_id: "task-bg-error".to_string(),
+                    task_function_call_id: Some("fn-bg-error".to_string()),
+                    result: Box::new(Err(anyhow::anyhow!("late child crashed again"))),
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(duplicate, NoninteractiveCompletionDelivery::None));
+    }
+
+    #[tokio::test]
+    async fn backgrounded_batch_completion_delivers_one_mixed_status_payload() {
+        let (mut driver, _tmp) = test_driver(8);
+        seed_batch_task_delegation(&driver, "task-mixed", &["first", "second", "third"]);
+        for label in ["first", "second", "third"] {
+            driver
+                .session
+                .db
+                .background_task_delegation_child("task-mixed", label)
+                .unwrap();
+            driver.noninteractive_delegations.register_running(
+                "task-mixed",
+                label,
+                "explore".to_string(),
+                NoninteractiveDelegationSnapshot::empty(),
+            );
+            driver
+                .noninteractive_delegations
+                .background_on_user_input("task-mixed", label);
+        }
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+        let delivery = driver
+            .finalize_background_noninteractive_completion(
+                Some(BackgroundNoninteractiveCompletion::Batch {
+                    task_call_id: "task-mixed".to_string(),
+                    task_function_call_id: Some("fn-mixed".to_string()),
+                    result: Box::new(Ok(BatchNoninteractiveCompletion {
+                        task_call_id: "task-mixed".to_string(),
+                        task_function_call_id: Some("fn-mixed".to_string()),
+                        children: vec![
+                            BatchChildCompletion {
+                                idx: 0,
+                                label: "first".to_string(),
+                                child_agent: "explore".to_string(),
+                                report: "first report".to_string(),
+                                failed: false,
+                                partial_progress: DelegationPartialProgress::default(),
+                                snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            },
+                            BatchChildCompletion {
+                                idx: 1,
+                                label: "second".to_string(),
+                                child_agent: "explore".to_string(),
+                                report: "second failed".to_string(),
+                                failed: true,
+                                partial_progress: DelegationPartialProgress::default(),
+                                snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            },
+                            BatchChildCompletion {
+                                idx: 2,
+                                label: "third".to_string(),
+                                child_agent: "explore".to_string(),
+                                report: "third report".to_string(),
+                                failed: false,
+                                partial_progress: DelegationPartialProgress::default(),
+                                snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            },
+                        ],
+                        repair_notes: Vec::new(),
+                    })),
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        let NoninteractiveCompletionDelivery::AsyncUser(text) = delivery else {
+            panic!("backgrounded batch should be delivered as one async user input");
+        };
+        assert!(text.contains("task_call_id=task-mixed"), "{text}");
+        assert!(text.contains("status=failed"), "{text}");
+        assert!(text.contains("first [status=completed]"), "{text}");
+        assert!(text.contains("second [status=failed]"), "{text}");
+        assert!(text.contains("error: second failed"), "{text}");
+        assert!(text.contains("third [status=completed]"), "{text}");
     }
 
     #[tokio::test]
@@ -16231,17 +16599,31 @@ mod tests {
     }
 
     #[test]
-    fn async_delegation_result_lists_only_new_children() {
-        let completed = vec![("second".to_string(), "second report".to_string())];
+    fn async_delegation_result_lists_only_new_children_with_status() {
+        let completed = vec![
+            AsyncDelegationChildResult {
+                label: "second".to_string(),
+                status: "completed".to_string(),
+                report: Some("second report".to_string()),
+            },
+            AsyncDelegationChildResult {
+                label: "third".to_string(),
+                status: "failed".to_string(),
+                report: Some("third failed".to_string()),
+            },
+        ];
         let running = Vec::new();
-        let body = format_async_delegation_result("task-batch", "completed", &completed, &running);
+        let body = format_async_delegation_result("task-batch", &completed, &running);
 
         assert!(body.contains("[async delegation result"));
         assert!(body.contains("task_call_id=task-batch"));
-        assert!(body.contains("status=completed"));
-        assert!(body.contains("completed: second"));
+        assert!(body.contains("status=failed"));
+        assert!(body.contains("completed: second, third"));
         assert!(body.contains("running: none"));
+        assert!(body.contains("second [status=completed]"));
         assert!(body.contains("second report"));
+        assert!(body.contains("third [status=failed]"));
+        assert!(body.contains("error: third failed"));
         assert!(!body.contains("first report"));
     }
 
@@ -16264,6 +16646,33 @@ mod tests {
                     resolved_cwd: None,
                     todo_ids_json: None,
                 }],
+            )
+            .unwrap();
+    }
+
+    fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels: &[&str]) {
+        let children = labels
+            .iter()
+            .map(|label| crate::db::task_delegations::DelegationChildInit {
+                label,
+                child_agent: "explore",
+                model: None,
+                output_dir: None,
+                requested_cwd: None,
+                resolved_cwd: None,
+                todo_ids_json: None,
+            })
+            .collect::<Vec<_>>();
+        driver
+            .session
+            .db
+            .upsert_task_delegation_job(
+                driver.session.id,
+                task_call_id,
+                Some("fc-test"),
+                "Build",
+                None,
+                &children,
             )
             .unwrap();
     }

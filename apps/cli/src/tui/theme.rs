@@ -43,6 +43,7 @@ pub const DIVIDER_FOCUSED: Color = METADATA_TEXT;
 pub const DIVIDER_DIM: Color = Color::Indexed(238);
 pub const TOOL_SIDEBAR: Color = Color::Indexed(244);
 pub const TOOL_OUTPUT: Color = Color::Indexed(245);
+pub const TRANSCRIPT_HOVER_BG: Color = Color::Indexed(236);
 pub const WARNING_TEXT: Color = Color::Yellow;
 pub const SUCCESS_TEXT: Color = Color::Green;
 pub const ERROR_TEXT: Color = Color::Red;
@@ -83,5 +84,6 @@ mod tests {
         assert_eq!(FAVORITE_MODEL, Color::Indexed(178));
         assert_eq!(SHELL_MODE_BORDER, Color::Indexed(70));
         assert_eq!(PLAN_YELLOW, Color::Rgb(0xf8, 0xd7, 0x49));
+        assert_eq!(TRANSCRIPT_HOVER_BG, Color::Indexed(236));
     }
 }

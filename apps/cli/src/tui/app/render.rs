@@ -26,13 +26,13 @@ use crate::tui::history::{
 use crate::tui::theme::{
     BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
     MUTED_COLOR_INDEX, MUTED_TEXT, SHELL_MODE_BADGE_BG, SHELL_MODE_BORDER, SUCCESS_TEXT,
-    WARNING_TEXT,
+    TRANSCRIPT_HOVER_BG, WARNING_TEXT,
 };
 
 use super::{
-    AUTOCOMPLETE_ROWS, App, HistoryRenderCacheEntry, INPUT_BORDER, MAX_INPUT_CONTENT,
-    MIN_INPUT_CONTENT, PaneSide, PendingRenderCacheEntry, Selection, Toast, ToastKind,
-    TranscriptFind, WORKING_MESSAGES,
+    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, INPUT_BORDER,
+    MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide, PendingRenderCacheEntry, Selection, Toast,
+    ToastKind, TranscriptFind, WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -47,6 +47,46 @@ const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
 type VisibleRows = (Vec<Line<'static>>, Vec<ChatRowMeta>);
 
 type ChatRows = (Vec<Line<'static>>, Vec<ChatRowMeta>, HashMap<usize, usize>);
+
+pub(super) fn affordance_target_for_row(meta: &ChatRowMeta) -> Option<AffordanceTarget> {
+    if let Some(history_index) = meta.chip_target {
+        return Some(AffordanceTarget::Chip { history_index });
+    }
+    if let Some((history_index, call_index)) = meta.tool_call_target {
+        return Some(AffordanceTarget::ToolCall {
+            history_index,
+            call_index,
+        });
+    }
+    if let Some(history_index) = meta.reasoning_window_target {
+        return Some(AffordanceTarget::ReasoningWindow { history_index });
+    }
+    meta.tool_box_target
+        .map(|history_index| AffordanceTarget::ToolBox { history_index })
+}
+
+fn hover_highlight_line(line: &mut Line<'static>) {
+    let hover = Style::default().bg(TRANSCRIPT_HOVER_BG);
+    line.style = line.style.patch(hover);
+    for span in &mut line.spans {
+        span.style = span.style.patch(hover);
+    }
+}
+
+fn apply_hover_highlight(
+    lines: &mut [Line<'static>],
+    meta: &[ChatRowMeta],
+    hovered: Option<AffordanceTarget>,
+) {
+    let Some(hovered) = hovered else {
+        return;
+    };
+    for (line, meta) in lines.iter_mut().zip(meta) {
+        if affordance_target_for_row(meta) == Some(hovered) {
+            hover_highlight_line(line);
+        }
+    }
+}
 
 fn hash_tool_call(hasher: &mut DefaultHasher, call: &ToolCall) {
     call.call_id.hash(hasher);
@@ -302,6 +342,8 @@ pub(crate) struct ChatRowMeta {
     pub copy_target: Option<ChatCopyTarget>,
     pub chip_target: Option<usize>,
     pub tool_box_target: Option<usize>,
+    pub tool_call_target: Option<(usize, usize)>,
+    pub reasoning_window_target: Option<usize>,
     pub diff_path: Option<String>,
     pub pin_hit: Option<PinHit>,
     pub continuation: bool,
@@ -316,6 +358,8 @@ impl ChatRowMeta {
             copy_target: None,
             chip_target: None,
             tool_box_target: None,
+            tool_call_target: None,
+            reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
             continuation: false,
@@ -1273,6 +1317,8 @@ impl App {
                     },
                     chip_target,
                     tool_box_target: is_box.then_some(idx),
+                    tool_call_target: None,
+                    reasoning_window_target: None,
                     diff_path: diff_path.clone(),
                     pin_hit,
                     continuation: false,
@@ -1458,7 +1504,10 @@ impl App {
             .collect();
         self.chat_cont_rows = self.chat_row_meta.iter().map(|m| m.continuation).collect();
         self.pin_control_rows = self.chat_row_meta.iter().map(|m| m.pin_hit).collect();
+        self.affordance_scroll_regions = self.build_affordance_scroll_regions();
 
+        let mut visible = visible;
+        apply_hover_highlight(&mut visible, &self.chat_row_meta, self.hovered_affordance);
         frame.render_widget(Paragraph::new(visible), area);
         if self.selection.is_some() || self.transcript_find.is_some() {
             // Snapshot the content layer before overlay chrome is rendered.
@@ -3407,10 +3456,12 @@ mod render_history_spacing_tests {
     };
     use crate::config::extended::{DiffStyle, ThinkingDisplay};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
+    use crate::tui::app::AffordanceTarget;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, ToolCall, ToolCallState, render_entry_call_count,
         render_pending_call_count, reset_render_entry_call_count, reset_render_pending_call_count,
     };
+    use crate::tui::theme::TRANSCRIPT_HOVER_BG;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -4104,6 +4155,33 @@ mod render_history_spacing_tests {
             app.chat_row_meta[diff_row].diff_path.as_deref(),
             Some("src/lib.rs")
         );
+    }
+
+    fn row_has_hover_bg(buffer: &ratatui::buffer::Buffer, row: usize, width: u16) -> bool {
+        (0..width).any(|col| buffer[(col, row as u16)].style().bg == Some(TRANSCRIPT_HOVER_BG))
+    }
+
+    #[test]
+    fn hovered_toolbox_rows_get_background_highlight_only_while_hovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![agent("assistant answer"), expanded_tool_box("tool output")];
+
+        render_history(&mut app, 80, 8);
+        let agent_row = find_row(&app, "assistant answer");
+        let tool_row = find_row(&app, "bash");
+        app.selection = None;
+        app.hovered_affordance = Some(AffordanceTarget::ToolBox { history_index: 1 });
+
+        let buffer = render_history_buffer(&mut app, 80, 8);
+        assert!(row_has_hover_bg(&buffer, tool_row, 80));
+        assert!(!row_has_hover_bg(&buffer, agent_row, 80));
+
+        app.hovered_affordance = None;
+        let cleared = render_history_buffer(&mut app, 80, 8);
+        assert!(!row_has_hover_bg(&cleared, tool_row, 80));
     }
 
     #[test]

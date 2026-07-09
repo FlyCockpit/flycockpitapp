@@ -793,6 +793,8 @@ mod tests {
             copy_target: None,
             chip_target: None,
             tool_box_target: None,
+            tool_call_target: None,
+            reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
             continuation: false,

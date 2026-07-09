@@ -237,6 +237,8 @@ mod selection_copy_state_tests {
             copy_target: None,
             chip_target: None,
             tool_box_target: None,
+            tool_call_target: None,
+            reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
             continuation: false,
@@ -302,6 +304,26 @@ pub(super) enum WorkingSpanState {
     Running { turn_id: Option<String> },
 }
 
+const ENABLE_ANY_MOUSE_MOTION: &str = "\x1b[?1003h";
+const DISABLE_ANY_MOUSE_MOTION: &str = "\x1b[?1003l";
+
+fn enable_mouse_capture_with_motion() -> std::io::Result<()> {
+    crossterm::execute!(stdout(), EnableMouseCapture)?;
+    if let Err(err) =
+        crossterm::execute!(stdout(), crossterm::style::Print(ENABLE_ANY_MOUSE_MOTION))
+    {
+        let _ = crossterm::execute!(stdout(), DisableMouseCapture);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn disable_mouse_capture_with_motion() -> std::io::Result<()> {
+    let motion = crossterm::execute!(stdout(), crossterm::style::Print(DISABLE_ANY_MOUSE_MOTION));
+    let capture = crossterm::execute!(stdout(), DisableMouseCapture);
+    motion.and(capture)
+}
+
 trait TerminalModeSink {
     fn apply(&mut self, command: TerminalCleanupCommand) -> Result<()>;
 }
@@ -312,7 +334,7 @@ impl TerminalModeSink for CrosstermTerminalModeSink {
     fn apply(&mut self, command: TerminalCleanupCommand) -> Result<()> {
         match command {
             TerminalCleanupCommand::DisableMouseCapture => {
-                crossterm::execute!(stdout(), DisableMouseCapture)?;
+                disable_mouse_capture_with_motion()?;
             }
             TerminalCleanupCommand::DisableBracketedPaste => {
                 crossterm::execute!(stdout(), crossterm::event::DisableBracketedPaste)?;
@@ -586,6 +608,48 @@ impl DisplayAttachBackoff {
     fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum AffordanceTarget {
+    Chip {
+        history_index: usize,
+    },
+    ToolBox {
+        history_index: usize,
+    },
+    ToolCall {
+        history_index: usize,
+        call_index: usize,
+    },
+    ReasoningWindow {
+        history_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AffordanceScrollRegion {
+    pub(super) target: AffordanceTarget,
+    pub(super) row_start: usize,
+    pub(super) row_end: usize,
+    pub(super) offset: usize,
+    pub(super) max_offset: usize,
+}
+
+fn resolve_inner_scroll_target(
+    regions: &[AffordanceScrollRegion],
+    row: usize,
+    up: bool,
+) -> Option<AffordanceTarget> {
+    let region = regions
+        .iter()
+        .find(|region| row >= region.row_start && row <= region.row_end)?;
+    let can_scroll = if up {
+        region.offset > 0
+    } else {
+        region.offset < region.max_offset
+    };
+    can_scroll.then_some(region.target)
 }
 
 #[derive(Clone, Copy)]
@@ -1630,6 +1694,8 @@ pub struct App {
     /// `None`. A wheel over a collapsed box scrolls the box; a click on
     /// any box row toggles its expansion. Refreshed every render.
     pub(super) box_rows: Vec<Option<usize>>,
+    pub(super) hovered_affordance: Option<AffordanceTarget>,
+    pub(super) affordance_scroll_regions: Vec<AffordanceScrollRegion>,
     /// Hit map for rendered diff rows. Header/body rows for a diff entry
     /// carry the edited path so right-click can offer editor actions only
     /// on real diff content.
@@ -2550,6 +2616,8 @@ impl App {
             chat_row_meta: Vec::new(),
             clickable_rows: Vec::new(),
             box_rows: Vec::new(),
+            hovered_affordance: None,
+            affordance_scroll_regions: Vec::new(),
             diff_rows: Vec::new(),
             last_cursor_shape: None,
             at_selected: 0,
@@ -2797,7 +2865,7 @@ impl App {
         // scroll-wheel via alternate-scroll translation. Native
         // selection still works under capture if the user holds the
         // terminal's bypass modifier (Shift / Option / Fn).
-        if self.mouse_capture && crossterm::execute!(stdout(), EnableMouseCapture).is_ok() {
+        if self.mouse_capture && enable_mouse_capture_with_motion().is_ok() {
             terminal_mode_guard.mark_mouse_capture_enabled();
         }
 
@@ -3121,12 +3189,15 @@ impl App {
     pub(super) fn toggle_mouse_capture_inline(&mut self) {
         let new_value = !self.mouse_capture;
         let exec_ok = if new_value {
-            crossterm::execute!(stdout(), EnableMouseCapture).is_ok()
+            enable_mouse_capture_with_motion().is_ok()
         } else {
-            crossterm::execute!(stdout(), DisableMouseCapture).is_ok()
+            disable_mouse_capture_with_motion().is_ok()
         };
         if exec_ok {
             self.mouse_capture = new_value;
+            if !new_value {
+                self.hovered_affordance = None;
+            }
             let state = if new_value { "on" } else { "off" };
             self.show_toast(
                 format!("/mouse: capture {state} (this session only)"),
@@ -3165,12 +3236,15 @@ impl App {
             return;
         }
         let res = if want {
-            crossterm::execute!(stdout(), EnableMouseCapture)
+            enable_mouse_capture_with_motion()
         } else {
-            crossterm::execute!(stdout(), DisableMouseCapture)
+            disable_mouse_capture_with_motion()
         };
         if res.is_ok() {
             self.mouse_capture = want;
+            if !want {
+                self.hovered_affordance = None;
+            }
         }
     }
 
@@ -3791,6 +3865,8 @@ impl App {
         self.reset_session_live_state();
         self.clickable_rows.clear();
         self.box_rows.clear();
+        self.hovered_affordance = None;
+        self.affordance_scroll_regions.clear();
         self.chat_row_meta.clear();
         self.chat_area = None;
         self.chat_text_grid.clear();
@@ -8538,6 +8614,10 @@ impl App {
         {
             self.toast = None;
         }
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            self.update_hovered_affordance(&mouse);
+            return;
+        }
         // Which-key overlay (`which-key-overlay.md`): rendered on top of every
         // pane, so it intercepts the wheel first. Wheel scrolls it; every other
         // mouse event is eaten so nothing reaches the pane/chat underneath.
@@ -8753,7 +8833,7 @@ impl App {
                     // wheel until it hits its top; then the transcript
                     // scrolls.
                     let rel = (mouse.row - area.y) as usize;
-                    if !self.scroll_box_at_row(rel, true) {
+                    if !self.scroll_inner_region_at_row(rel, true) {
                         self.scroll_chat_up(3);
                     }
                 }
@@ -8765,7 +8845,7 @@ impl App {
                 {
                     self.selection = None;
                     let rel = (mouse.row - area.y) as usize;
-                    if !self.scroll_box_at_row(rel, false) {
+                    if !self.scroll_inner_region_at_row(rel, false) {
                         self.scroll_chat_down(3);
                     }
                 }
@@ -8994,6 +9074,43 @@ impl App {
         (clamped_col, clamped_row)
     }
 
+    fn transcript_hover_suppressed(&self) -> bool {
+        self.dialog.is_active()
+            || self.question_dialog.is_some()
+            || self.daemon_prompt.is_some()
+            || self.context_menu.is_some()
+            || self.keys_overlay.is_some()
+            || self.model_picker.is_some()
+            || self.footer_agent_picker.is_some()
+            || self.footer_mode_picker.is_some()
+            || self.stats_pane.is_some()
+            || self.sessions_pane.is_some()
+            || self.skills_pane.is_some()
+            || self.permissions_pane.is_some()
+            || self.context_pane.is_some()
+            || self.notes_pane.is_some()
+            || self.diff_pane.is_some()
+            || self.pane.is_some()
+    }
+
+    fn affordance_target_at_mouse(&self, mouse: &MouseEvent) -> Option<AffordanceTarget> {
+        if !self.mouse_capture
+            || self.transcript_hover_suppressed()
+            || !self.mouse_in_chat_area(mouse)
+        {
+            return None;
+        }
+        let area = self.chat_area?;
+        let rel = (mouse.row - area.y) as usize;
+        self.chat_row_meta
+            .get(rel)
+            .and_then(crate::tui::app::render::affordance_target_for_row)
+    }
+
+    fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
+        self.hovered_affordance = self.affordance_target_at_mouse(mouse);
+    }
+
     /// True when the mouse position is inside the chat area's last-
     /// rendered rect. Returns false when the chat area hasn't been
     /// rendered yet (e.g. a dialog is open).
@@ -9031,20 +9148,64 @@ impl App {
         }
     }
 
-    /// If a *collapsed* `ToolBox` sits under chat-relative row `rel`,
-    /// advance its internal viewport by one call in `up`'s direction.
-    /// Returns `true` if it consumed the wheel (the box moved); `false`
-    /// to let the transcript scroll instead — so the box captures the
-    /// wheel only between its top and its newest call. Scrolling up
-    /// drops `follow`; scrolling back to the end restores it.
-    pub(super) fn scroll_box_at_row(&mut self, rel: usize, up: bool) -> bool {
-        let Some(idx) = self
-            .chat_row_meta
-            .get(rel)
-            .and_then(|meta| meta.tool_box_target)
+    pub(super) fn build_affordance_scroll_regions(&self) -> Vec<AffordanceScrollRegion> {
+        let mut regions = Vec::new();
+        let mut row = 0;
+        while row < self.chat_row_meta.len() {
+            let Some(idx) = self.chat_row_meta[row].tool_box_target else {
+                row += 1;
+                continue;
+            };
+            let start = row;
+            while row + 1 < self.chat_row_meta.len()
+                && self.chat_row_meta[row + 1].tool_box_target == Some(idx)
+            {
+                row += 1;
+            }
+            if let Some(HistoryEntry::ToolBox {
+                calls,
+                view_offset,
+                follow,
+                expanded,
+            }) = self.history.get(idx)
+                && !*expanded
+                && calls.len() > crate::tui::history::TOOLBOX_VISIBLE
+            {
+                let max_offset = calls.len() - crate::tui::history::TOOLBOX_VISIBLE;
+                let offset = if *follow {
+                    max_offset
+                } else {
+                    (*view_offset).min(max_offset)
+                };
+                regions.push(AffordanceScrollRegion {
+                    target: AffordanceTarget::ToolBox { history_index: idx },
+                    row_start: start,
+                    row_end: row,
+                    offset,
+                    max_offset,
+                });
+            }
+            row += 1;
+        }
+        regions
+    }
+
+    fn scroll_inner_region_at_row(&mut self, rel: usize, up: bool) -> bool {
+        let Some(target) = resolve_inner_scroll_target(&self.affordance_scroll_regions, rel, up)
         else {
             return false;
         };
+        match target {
+            AffordanceTarget::ToolBox { history_index } => {
+                self.scroll_box_target(history_index, up)
+            }
+            AffordanceTarget::Chip { .. }
+            | AffordanceTarget::ToolCall { .. }
+            | AffordanceTarget::ReasoningWindow { .. } => false,
+        }
+    }
+
+    fn scroll_box_target(&mut self, idx: usize, up: bool) -> bool {
         let Some(HistoryEntry::ToolBox {
             calls,
             view_offset,
@@ -11651,11 +11812,141 @@ fn spawn_git_refresh(
 }
 
 #[cfg(test)]
+mod affordance_hover_tests {
+    use super::{AffordanceScrollRegion, AffordanceTarget, App, resolve_inner_scroll_target};
+    use crate::tui::app::render::{ChatRowKind, ChatRowMeta};
+    use crate::tui::settings::Dialog;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    fn meta(
+        chip_target: Option<usize>,
+        tool_box_target: Option<usize>,
+        tool_call_target: Option<(usize, usize)>,
+        reasoning_window_target: Option<usize>,
+    ) -> ChatRowMeta {
+        ChatRowMeta {
+            history_index: None,
+            row_kind: ChatRowKind::Other,
+            copy_target: None,
+            chip_target,
+            tool_box_target,
+            tool_call_target,
+            reasoning_window_target,
+            diff_path: None,
+            pin_hit: None,
+            continuation: false,
+            selectable: false,
+        }
+    }
+
+    fn moved(row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn moved_mouse_resolves_chat_rows_to_affordance_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        app.chat_area = Some(Rect::new(5, 10, 20, 5));
+        app.chat_row_meta = vec![
+            meta(Some(1), None, None, None),
+            meta(None, Some(2), None, None),
+            meta(None, Some(3), Some((3, 4)), None),
+            meta(None, None, None, Some(5)),
+            meta(None, None, None, None),
+        ];
+
+        app.handle_mouse(moved(10));
+        assert_eq!(
+            app.hovered_affordance,
+            Some(AffordanceTarget::Chip { history_index: 1 })
+        );
+        app.handle_mouse(moved(11));
+        assert_eq!(
+            app.hovered_affordance,
+            Some(AffordanceTarget::ToolBox { history_index: 2 })
+        );
+        app.handle_mouse(moved(12));
+        assert_eq!(
+            app.hovered_affordance,
+            Some(AffordanceTarget::ToolCall {
+                history_index: 3,
+                call_index: 4,
+            })
+        );
+        app.handle_mouse(moved(13));
+        assert_eq!(
+            app.hovered_affordance,
+            Some(AffordanceTarget::ReasoningWindow { history_index: 5 })
+        );
+        app.handle_mouse(moved(14));
+        assert_eq!(app.hovered_affordance, None);
+    }
+
+    #[test]
+    fn moved_mouse_clears_hover_when_capture_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = false;
+        app.hovered_affordance = Some(AffordanceTarget::Chip { history_index: 1 });
+        app.chat_area = Some(Rect::new(5, 10, 20, 1));
+        app.chat_row_meta = vec![meta(Some(1), None, None, None)];
+
+        app.handle_mouse(moved(10));
+
+        assert_eq!(app.hovered_affordance, None);
+    }
+
+    #[test]
+    fn inner_scroll_resolver_falls_through_at_both_edges() {
+        let target = AffordanceTarget::ReasoningWindow { history_index: 7 };
+        let top = [AffordanceScrollRegion {
+            target,
+            row_start: 3,
+            row_end: 5,
+            offset: 0,
+            max_offset: 4,
+        }];
+        assert_eq!(resolve_inner_scroll_target(&top, 4, true), None);
+        assert_eq!(resolve_inner_scroll_target(&top, 4, false), Some(target));
+
+        let bottom = [AffordanceScrollRegion {
+            target,
+            row_start: 3,
+            row_end: 5,
+            offset: 4,
+            max_offset: 4,
+        }];
+        assert_eq!(resolve_inner_scroll_target(&bottom, 4, true), Some(target));
+        assert_eq!(resolve_inner_scroll_target(&bottom, 4, false), None);
+        assert_eq!(resolve_inner_scroll_target(&bottom, 8, true), None);
+    }
+}
+
+#[cfg(test)]
 mod terminal_mode_guard_tests {
-    use super::{TerminalCleanupCommand, TerminalModeGuard, TerminalModeSink};
+    use super::{
+        DISABLE_ANY_MOUSE_MOTION, ENABLE_ANY_MOUSE_MOTION, TerminalCleanupCommand,
+        TerminalModeGuard, TerminalModeSink,
+    };
     use anyhow::Result;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn any_motion_escape_sequences_are_paired() {
+        assert_eq!(ENABLE_ANY_MOUSE_MOTION, "\x1b[?1003h");
+        assert_eq!(DISABLE_ANY_MOUSE_MOTION, "\x1b[?1003l");
+    }
 
     #[derive(Clone, Default)]
     struct RecordingSink {

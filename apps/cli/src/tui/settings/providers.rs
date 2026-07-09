@@ -32,7 +32,7 @@ use crate::auth::{
 use crate::config::providers::{
     AuthKind, HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy,
     OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog, WireApi,
-    apply_known_frontier_model_defaults, format_model_fetch_age, merge_fetched_models_with_policy,
+    apply_template_model_defaults, format_model_fetch_age, merge_fetched_models_with_policy,
     provider_model_fetch_display_state, provider_model_fetch_reason_display,
     redact_model_fetch_reason,
 };
@@ -994,10 +994,9 @@ impl HeaderEditor {
 pub(super) struct ModelEditor {
     /// Effective template identity of the provider whose models are being
     /// edited ([`ProviderEntry::effective_template`]), resolved from the
-    /// loaded config at construction. Only scopes the known-frontier defaults
-    /// applied to newly added manual entries
-    /// ([`apply_known_frontier_model_defaults`]); `None` for providers with no
-    /// known template.
+    /// loaded config at construction. Only scopes template-specific defaults
+    /// applied to newly added manual entries ([`apply_template_model_defaults`]);
+    /// `None` for providers with no known template.
     pub(super) template: Option<String>,
     pub(super) rows: Vec<ModelEntry>,
     pub(super) cursor: usize,
@@ -1196,10 +1195,10 @@ impl ModelEditor {
                     capabilities: Default::default(),
                     provider_metadata: Default::default(),
                 };
-                // A hand-added known frontier id on a standard provider gets
-                // the same defaults a `/models` discovery would apply (z.ai
-                // has no `/models` endpoint, so manual add IS its discovery).
-                apply_known_frontier_model_defaults(self.template.as_deref(), &mut entry);
+                // A hand-added model gets the same template-scoped defaults
+                // a `/models` discovery would apply (z.ai has no `/models`
+                // endpoint, so manual add IS its discovery).
+                apply_template_model_defaults(self.template.as_deref(), &mut entry);
                 self.rows.push(entry);
                 self.cursor = self.rows.len() - 1;
             }

@@ -1255,14 +1255,49 @@ pub const KNOWN_FRONTIER_MODEL_IDS: &[&str] = &[
     "grok-4.5",
 ];
 
+pub const COPILOT_MODEL_MODE_DEFAULTS: &[(&str, LlmMode)] = &[
+    ("gpt-5.5", LlmMode::Frontier),
+    ("gpt-5.4", LlmMode::Frontier),
+    ("gpt-5.6-sol", LlmMode::Frontier),
+    ("claude-opus-4.6", LlmMode::Frontier),
+    ("claude-opus-4.7", LlmMode::Frontier),
+    ("claude-opus-4.8", LlmMode::Frontier),
+    ("claude-fable-5", LlmMode::Frontier),
+    ("claude-sonnet-4.6", LlmMode::Normal),
+    ("claude-sonnet-4.7", LlmMode::Normal),
+    ("claude-sonnet-4.8", LlmMode::Normal),
+    ("gpt-5.6-terra", LlmMode::Normal),
+    ("kimi-k2.7-code", LlmMode::Normal),
+    ("gpt-3.5-turbo", LlmMode::Defensive),
+    ("gpt-3.5-turbo-0613", LlmMode::Defensive),
+    ("gpt-4", LlmMode::Defensive),
+    ("gpt-4-0613", LlmMode::Defensive),
+    ("gpt-4.1", LlmMode::Defensive),
+    ("gpt-4.1-2025-04-14", LlmMode::Defensive),
+    ("gpt-4o", LlmMode::Defensive),
+    ("gpt-4-o-preview", LlmMode::Defensive),
+    ("gpt-4o-preview", LlmMode::Defensive),
+    ("gpt-4o-mini", LlmMode::Defensive),
+    ("gpt-4o-mini-2024-07-18", LlmMode::Defensive),
+    ("gpt-4o-2024-11-20", LlmMode::Defensive),
+    ("gpt-4o-2024-08-06", LlmMode::Defensive),
+    ("gpt-4o-2024-05-13", LlmMode::Defensive),
+    ("claude-haiku-4.5", LlmMode::Defensive),
+    ("gemini-2.5-pro", LlmMode::Defensive),
+    ("gemini-3.1-pro-preview", LlmMode::Defensive),
+    ("gemini-3.5-flash", LlmMode::Defensive),
+];
+
 /// The standard first-party provider **templates** whose models receive the
 /// known-frontier defaults ([`apply_known_frontier_model_defaults`]). These
 /// endpoints are known to serve the frontier ids verbatim and to prompt-cache,
 /// so the defaults are correct there; the same id served through an
-/// aggregator (OpenRouter/Copilot/…) is left alone. Matched against a
-/// provider's persisted [`ProviderEntry::template`] identity (with a map-key
-/// fallback via [`ProviderEntry::effective_template`]), **not** its config-map
-/// key — so a renamed connection like `anthropic-work` still gets the defaults.
+/// aggregator such as OpenRouter is left alone. GitHub Copilot has its own
+/// template-scoped mode table ([`COPILOT_MODEL_MODE_DEFAULTS`]). Matched
+/// against a provider's persisted [`ProviderEntry::template`] identity (with a
+/// map-key fallback via [`ProviderEntry::effective_template`]), **not** its
+/// config-map key — so a renamed connection like `anthropic-work` still gets
+/// the defaults.
 pub const FRONTIER_DEFAULT_PROVIDER_IDS: &[&str] =
     &["anthropic", "codex-oauth", "grok-oauth", "openai", "z-ai"];
 
@@ -1276,6 +1311,12 @@ pub fn is_known_frontier_model_id(model_id: &str) -> bool {
 /// key, so renaming e.g. `anthropic` to `anthropic-work` keeps the defaults.
 pub fn is_frontier_default_provider_template(template: &str) -> bool {
     FRONTIER_DEFAULT_PROVIDER_IDS.contains(&template)
+}
+
+pub fn copilot_default_mode_for_model_id(model_id: &str) -> Option<LlmMode> {
+    COPILOT_MODEL_MODE_DEFAULTS
+        .iter()
+        .find_map(|(id, mode)| (*id == model_id).then_some(*mode))
 }
 
 /// Merge a freshly-fetched `/models` list into an existing model list,
@@ -1294,18 +1335,17 @@ pub fn is_frontier_default_provider_template(template: &str) -> bool {
 /// cache/context/shrink/timeout, auto-prune, backup, mode, inline-think,
 /// repair/recovery settings, and thinking params — plus, for manual entries,
 /// the hand-set display `name` and `context_length`.
-/// The known-frontier defaults ([`apply_known_frontier_model_defaults`]:
-/// `mode: frontier`, `auto_prune: off`, `cache: ephemeral`) are applied only to
-/// ids that are **newly discovered** by this fetch — i.e. absent from
-/// `existing` — and only on the standard first-party providers
-/// ([`FRONTIER_DEFAULT_PROVIDER_IDS`]) for ids on the product-approved exact-id
-/// list ([`KNOWN_FRONTIER_MODEL_IDS`]). A previously-configured known id is
-/// never re-defaulted, so a user who clears e.g. `mode` back to inherit keeps
-/// that state across refreshes.
+/// Template-scoped model defaults ([`apply_template_model_defaults`]) are
+/// applied only to ids that are **newly discovered** by this fetch — i.e. absent
+/// from `existing`. Standard first-party providers get frontier defaults for
+/// ids on [`KNOWN_FRONTIER_MODEL_IDS`]; GitHub Copilot gets its own exact-id
+/// mode table ([`COPILOT_MODEL_MODE_DEFAULTS`]). A previously-configured known
+/// id is never re-defaulted, so a user who clears e.g. `mode` back to inherit
+/// keeps that state across refreshes.
 ///
 /// Policy-aware merge helper for CLI and TUI refreshes. `template` is the
 /// refreshed provider's effective template identity
-/// ([`ProviderEntry::effective_template`]) and only scopes the known-frontier
+/// ([`ProviderEntry::effective_template`]) and only scopes template-specific
 /// defaults; pass `None` for providers that map to no known template.
 pub fn merge_fetched_models_with_policy(
     template: Option<&str>,
@@ -1318,11 +1358,11 @@ pub fn merge_fetched_models_with_policy(
         if let Some(prev) = existing.iter().find(|e| e.id == m.id) {
             preserve_model_overrides(prev, &mut m);
         } else {
-            // Only genuinely newly-discovered ids receive the known-frontier
+            // Only genuinely newly-discovered ids receive template-scoped
             // defaults. A previously-configured id keeps whatever the user
             // left it as — including an intentionally-cleared `mode` back to
             // inherit — so a `/models` refresh never re-pins it.
-            apply_known_frontier_model_defaults(template, &mut m);
+            apply_template_model_defaults(template, &mut m);
         }
         merged.push(m);
     }
@@ -1339,12 +1379,22 @@ pub fn merge_fetched_models_with_policy(
     merged
 }
 
-/// Default a known frontier model on a standard first-party provider to the
-/// product-approved frontier settings: `mode: frontier` (top-tier steering),
-/// `auto_prune: off` and `cache: ephemeral` (these endpoints all prompt-cache,
-/// so automatic pruning would bust a real upstream cache). Each field is only
-/// filled in when still unset, so user-pinned values always win. Applied on
-/// `/models` merge and on manual model add (z.ai has no `/models` endpoint).
+/// Apply model defaults for a provider template. Known frontier models on a
+/// standard first-party provider receive product-approved frontier settings:
+/// `mode: frontier` (top-tier steering), `auto_prune: off` and `cache:
+/// ephemeral` (these endpoints all prompt-cache, so automatic pruning would
+/// bust a real upstream cache). Copilot models use
+/// [`COPILOT_MODEL_MODE_DEFAULTS`]: frontier-tier ids get the same full
+/// frontier field fills, while normal/defensive ids only get `mode`. Each field
+/// is only filled in when still unset, so user-pinned values always win.
+/// Applied on `/models` merge and on manual model add (z.ai has no `/models`
+/// endpoint).
+pub fn apply_template_model_defaults(template: Option<&str>, model: &mut ModelEntry) {
+    apply_known_frontier_model_defaults(template, model);
+    apply_copilot_model_mode_defaults(template, model);
+}
+
+/// Default a known frontier model on a standard first-party provider.
 pub fn apply_known_frontier_model_defaults(template: Option<&str>, model: &mut ModelEntry) {
     let Some(template) = template else {
         return;
@@ -1363,6 +1413,32 @@ pub fn apply_known_frontier_model_defaults(template: Option<&str>, model: &mut M
             mode: CacheMode::Ephemeral,
             ttl_secs: default_cache_ttl_secs(),
         });
+    }
+}
+
+/// Default known Copilot-served model ids on a provider created from the
+/// `copilot` template. Frontier-tier ids get the full frontier defaults because
+/// Copilot prompt-caches; normal and defensive tiers set mode only.
+pub fn apply_copilot_model_mode_defaults(template: Option<&str>, model: &mut ModelEntry) {
+    if template != Some("copilot") {
+        return;
+    }
+    let Some(mode) = copilot_default_mode_for_model_id(&model.id) else {
+        return;
+    };
+    if model.mode.is_none() {
+        model.mode = Some(mode);
+    }
+    if mode == LlmMode::Frontier {
+        if model.auto_prune.is_none() {
+            model.auto_prune = Some(false);
+        }
+        if model.cache.is_none() {
+            model.cache = Some(CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: default_cache_ttl_secs(),
+            });
+        }
     }
 }
 
@@ -4900,6 +4976,154 @@ mod tests {
         // the caller resolves the template identity before consulting the gate.
         assert!(!is_frontier_default_provider_template("anthropic-work"));
         assert!(!is_frontier_default_provider_template("openrouter"));
+    }
+
+    #[test]
+    fn copilot_model_mode_defaults_are_exact_matches_by_tier() {
+        assert_eq!(
+            COPILOT_MODEL_MODE_DEFAULTS.len(),
+            30,
+            "the product table should remain exact"
+        );
+        for (id, mode) in [
+            ("gpt-5.5", LlmMode::Frontier),
+            ("claude-opus-4.8", LlmMode::Frontier),
+            ("claude-sonnet-4.7", LlmMode::Normal),
+            ("kimi-k2.7-code", LlmMode::Normal),
+            ("gpt-4-o-preview", LlmMode::Defensive),
+            ("gpt-4o-preview", LlmMode::Defensive),
+            ("gemini-3.5-flash", LlmMode::Defensive),
+        ] {
+            assert_eq!(copilot_default_mode_for_model_id(id), Some(mode), "{id}");
+        }
+        assert_eq!(copilot_default_mode_for_model_id("gpt-5.5-mini"), None);
+        assert_eq!(copilot_default_mode_for_model_id("openai/gpt-5.5"), None);
+        assert_eq!(copilot_default_mode_for_model_id("claude-opus-4-8"), None);
+    }
+
+    #[test]
+    fn copilot_defaults_apply_only_to_newly_discovered_copilot_models() {
+        let mut pinned = model("claude-sonnet-4.7", false);
+        pinned.mode = Some(LlmMode::Defensive);
+        let cleared = model("gpt-4o", false);
+
+        let merged = merge_fetched_models_with_policy(
+            Some("copilot"),
+            &[pinned, cleared],
+            vec![
+                model("gpt-5.5", false),
+                model("claude-sonnet-4.7", false),
+                model("gpt-4o", false),
+                model("ordinary", false),
+            ],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
+
+        let frontier = by_id("gpt-5.5");
+        assert_eq!(frontier.mode, Some(LlmMode::Frontier));
+        assert_eq!(frontier.auto_prune, Some(false));
+        assert_eq!(
+            frontier.cache,
+            Some(CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: 300,
+            })
+        );
+
+        let preserved_pinned = by_id("claude-sonnet-4.7");
+        assert_eq!(preserved_pinned.mode, Some(LlmMode::Defensive));
+        assert_eq!(preserved_pinned.auto_prune, None);
+        assert_eq!(preserved_pinned.cache, None);
+
+        let preserved_cleared = by_id("gpt-4o");
+        assert_eq!(preserved_cleared.mode, None);
+        assert_eq!(preserved_cleared.auto_prune, None);
+        assert_eq!(preserved_cleared.cache, None);
+
+        let ordinary = by_id("ordinary");
+        assert_eq!(ordinary.mode, None);
+        assert_eq!(ordinary.auto_prune, None);
+        assert_eq!(ordinary.cache, None);
+    }
+
+    #[test]
+    fn copilot_normal_and_defensive_defaults_set_mode_only() {
+        let merged = merge_fetched_models_with_policy(
+            Some("copilot"),
+            &[],
+            vec![
+                model("claude-sonnet-4.6", false),
+                model("gpt-4o-mini", false),
+            ],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        let by_id = |id: &str| merged.iter().find(|m| m.id == id).unwrap();
+
+        let normal = by_id("claude-sonnet-4.6");
+        assert_eq!(normal.mode, Some(LlmMode::Normal));
+        assert_eq!(normal.auto_prune, None);
+        assert_eq!(normal.cache, None);
+
+        let defensive = by_id("gpt-4o-mini");
+        assert_eq!(defensive.mode, Some(LlmMode::Defensive));
+        assert_eq!(defensive.auto_prune, None);
+        assert_eq!(defensive.cache, None);
+    }
+
+    #[test]
+    fn copilot_defaults_do_not_apply_to_other_aggregators() {
+        let merged = merge_fetched_models_with_policy(
+            Some("openrouter"),
+            &[],
+            vec![
+                model("gpt-5.5", false),
+                model("claude-sonnet-4.6", false),
+                model("gpt-4o-mini", false),
+            ],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        for m in &merged {
+            assert_eq!(m.mode, None, "{}", m.id);
+            assert_eq!(m.auto_prune, None, "{}", m.id);
+            assert_eq!(m.cache, None, "{}", m.id);
+        }
+    }
+
+    #[test]
+    fn copilot_defaults_apply_on_manual_model_add_helper() {
+        let mut frontier = model("claude-fable-5", true);
+        apply_template_model_defaults(Some("copilot"), &mut frontier);
+        assert_eq!(frontier.mode, Some(LlmMode::Frontier));
+        assert_eq!(frontier.auto_prune, Some(false));
+        assert_eq!(
+            frontier.cache.as_ref().map(|c| c.mode),
+            Some(CacheMode::Ephemeral)
+        );
+
+        let mut normal = model("gpt-5.6-terra", true);
+        apply_template_model_defaults(Some("copilot"), &mut normal);
+        assert_eq!(normal.mode, Some(LlmMode::Normal));
+        assert_eq!(normal.auto_prune, None);
+        assert_eq!(normal.cache, None);
+    }
+
+    #[test]
+    fn renamed_copilot_template_connection_gets_copilot_defaults() {
+        let entry = ProviderEntry {
+            template: Some("copilot".into()),
+            ..ProviderEntry::default()
+        };
+        let merged = merge_fetched_models_with_policy(
+            entry.effective_template("copilot-work"),
+            &[],
+            vec![model("gpt-4o-mini", false)],
+            ModelMergePolicy::KeepUnlisted,
+        );
+        let m = merged.iter().find(|m| m.id == "gpt-4o-mini").unwrap();
+        assert_eq!(m.mode, Some(LlmMode::Defensive));
+        assert_eq!(m.auto_prune, None);
+        assert_eq!(m.cache, None);
     }
 
     /// Frontier defaults are applied only to ids this fetch newly discovers.

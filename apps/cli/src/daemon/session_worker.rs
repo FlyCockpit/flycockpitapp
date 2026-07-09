@@ -629,6 +629,13 @@ pub enum SessionWork {
         submission: Box<crate::engine::message::UserSubmission>,
         respond_to: oneshot::Sender<(proto::QueueItem, Vec<proto::QueueItem>)>,
     },
+    SteerDelegation {
+        task_call_id: String,
+        label: String,
+        message: String,
+        origin_principal: String,
+        respond_to: oneshot::Sender<proto::DelegationSteerResult>,
+    },
     RemoveQueuedUserMessage {
         queue_item_id: Uuid,
         respond_to: oneshot::Sender<proto::RemoveQueuedUserMessageResult>,
@@ -1456,6 +1463,23 @@ async fn run_worker(
                             target: proto::QueueTarget::default(),
                         });
                 let _ = respond_to.send((item, queue));
+            }
+            SessionWork::SteerDelegation {
+                task_call_id,
+                label,
+                message,
+                origin_principal,
+                respond_to,
+            } => {
+                let result = steer_delegation_side_channel(
+                    &session,
+                    &redact,
+                    task_call_id,
+                    label,
+                    message,
+                    origin_principal,
+                );
+                let _ = respond_to.send(result);
             }
             SessionWork::RemoveQueuedUserMessage {
                 queue_item_id,
@@ -2781,6 +2805,80 @@ pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig
     }
 }
 
+fn steer_delegation_side_channel(
+    session: &Session,
+    redact: &RedactionTable,
+    task_call_id: String,
+    label: String,
+    message: String,
+    origin_principal: String,
+) -> proto::DelegationSteerResult {
+    if message.trim().is_empty() {
+        return proto::DelegationSteerResult::not_steerable(
+            task_call_id,
+            Some(label),
+            "message is required for steer".to_string(),
+        );
+    }
+    let rows = match session.db.list_task_delegation_children(session.id) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return proto::DelegationSteerResult::internal(format!(
+                "could not load task delegations: {error:#}"
+            ));
+        }
+    };
+    let matches = rows
+        .iter()
+        .filter(|row| row.task_call_id == task_call_id && row.label == label)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        let reason = if matches.is_empty() {
+            "unknown delegation child"
+        } else {
+            "steer requires exactly one delegation child"
+        };
+        return proto::DelegationSteerResult::not_steerable(
+            task_call_id,
+            Some(label),
+            reason.to_string(),
+        );
+    }
+    let row = matches[0];
+    if row.status != crate::db::task_delegations::DelegationStatus::Running {
+        return proto::DelegationSteerResult::not_steerable(
+            row.task_call_id.clone(),
+            Some(row.label.clone()),
+            format!("child is {}", row.status.as_str()),
+        );
+    }
+    let scrubbed = redact.scrub(&message);
+    if scrubbed.trim().is_empty() {
+        return proto::DelegationSteerResult::not_steerable(
+            row.task_call_id.clone(),
+            Some(row.label.clone()),
+            "message is required for steer".to_string(),
+        );
+    }
+    match session.db.enqueue_task_delegation_steer(
+        &row.task_call_id,
+        &row.label,
+        &scrubbed,
+        &origin_principal,
+    ) {
+        Ok(()) => proto::DelegationSteerResult::queued(
+            row.task_call_id.clone(),
+            row.label.clone(),
+            row.pending_steers + 1,
+            origin_principal,
+            true,
+        ),
+        Err(error) => {
+            proto::DelegationSteerResult::internal(format!("could not persist steer: {error:#}"))
+        }
+    }
+}
+
 fn queue_item_to_proto(item: crate::engine::message::QueuedUserMessage) -> proto::QueueItem {
     proto::QueueItem {
         id: item.id,
@@ -3011,6 +3109,105 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, f);
         String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn steer_side_channel_scrubs_and_stamps_origin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        session
+            .db
+            .upsert_task_delegation_job(
+                session.id,
+                "task-live",
+                Some("fn-live"),
+                "Build",
+                None,
+                &[crate::db::task_delegations::DelegationChildInit {
+                    label: "alpha",
+                    child_agent: "explore",
+                    model: None,
+                    output_dir: None,
+                    requested_cwd: None,
+                    resolved_cwd: None,
+                    todo_ids_json: None,
+                }],
+            )
+            .unwrap();
+        let mut cfg = crate::config::extended::RedactConfig::default();
+        cfg.denylist = vec!["secret-user-steer-token".to_string()];
+        let table = RedactionTable::build(&cfg, tmp.path()).unwrap();
+
+        let result = steer_delegation_side_channel(
+            &session,
+            &table,
+            "task-live".to_string(),
+            "alpha".to_string(),
+            "please use secret-user-steer-token".to_string(),
+            "local:tester".to_string(),
+        );
+
+        assert_eq!(result.status, proto::DelegationSteerStatus::Queued);
+        assert_eq!(result.origin_principal.as_deref(), Some("local:tester"));
+        assert!(result.scrubbed);
+        let steers = session
+            .db
+            .drain_task_delegation_steers("task-live", "alpha")
+            .unwrap();
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].origin_principal, "local:tester");
+        assert!(!steers[0].body.contains("secret-user-steer-token"));
+        assert!(steers[0].body.contains("REDACTED"));
+    }
+
+    #[test]
+    fn steer_side_channel_rejects_non_running_child_without_enqueue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        session
+            .db
+            .upsert_task_delegation_job(
+                session.id,
+                "task-done",
+                Some("fn-done"),
+                "Build",
+                None,
+                &[crate::db::task_delegations::DelegationChildInit {
+                    label: "default",
+                    child_agent: "explore",
+                    model: None,
+                    output_dir: None,
+                    requested_cwd: None,
+                    resolved_cwd: None,
+                    todo_ids_json: None,
+                }],
+            )
+            .unwrap();
+        session
+            .db
+            .cancel_task_delegation_child("task-done", "default")
+            .unwrap();
+
+        let result = steer_delegation_side_channel(
+            &session,
+            &RedactionTable::empty(),
+            "task-done".to_string(),
+            "default".to_string(),
+            "continue".to_string(),
+            "local:tester".to_string(),
+        );
+
+        assert_eq!(result.status, proto::DelegationSteerStatus::NotSteerable);
+        assert!(result.message.contains("cancelled"), "{result:?}");
+        assert!(
+            session
+                .db
+                .drain_task_delegation_steers("task-done", "default")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

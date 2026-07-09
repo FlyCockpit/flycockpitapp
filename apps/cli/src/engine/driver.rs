@@ -7598,6 +7598,73 @@ impl Driver {
         ))
     }
 
+    fn enqueue_delegation_steer(
+        &mut self,
+        target_task_call_id: Option<String>,
+        label: Option<String>,
+        body: String,
+        origin_principal: String,
+        scrubbed: bool,
+    ) -> std::result::Result<crate::daemon::proto::DelegationSteerResult, String> {
+        let rows = self
+            .session
+            .db
+            .list_task_delegation_children(self.session.id)
+            .map_err(|e| format!("could not load task delegations: {e:#}"))?;
+        let orphaned = orphaned_task_control_keys(&rows, &self.noninteractive_delegations);
+        let selected =
+            match resolve_task_control_targets(&rows, target_task_call_id.clone(), label, false) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    return Ok(crate::daemon::proto::DelegationSteerResult::not_steerable(
+                        target_task_call_id.unwrap_or_default(),
+                        None,
+                        reason,
+                    ));
+                }
+            };
+        if selected.len() != 1 {
+            return Ok(crate::daemon::proto::DelegationSteerResult::not_steerable(
+                target_task_call_id.unwrap_or_default(),
+                None,
+                "steer requires exactly one delegation child".to_string(),
+            ));
+        }
+        let row = &selected[0];
+        if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
+            let reason = if orphaned.contains(&task_control_key(row)) {
+                "lost (daemon restarted; no live worker)".to_string()
+            } else {
+                delegation_status_name(row.status).to_string()
+            };
+            return Ok(crate::daemon::proto::DelegationSteerResult::not_steerable(
+                row.task_call_id.clone(),
+                Some(row.label.clone()),
+                reason,
+            ));
+        }
+        if body.trim().is_empty() {
+            return Ok(crate::daemon::proto::DelegationSteerResult::not_steerable(
+                row.task_call_id.clone(),
+                Some(row.label.clone()),
+                "message is required for steer".to_string(),
+            ));
+        }
+        self.session
+            .db
+            .enqueue_task_delegation_steer(&row.task_call_id, &row.label, &body, &origin_principal)
+            .map_err(|e| format!("could not persist steer: {e:#}"))?;
+        self.noninteractive_delegations
+            .push_steer(&row.task_call_id, &row.label, body);
+        Ok(crate::daemon::proto::DelegationSteerResult::queued(
+            row.task_call_id.clone(),
+            row.label.clone(),
+            row.pending_steers + 1,
+            origin_principal,
+            scrubbed,
+        ))
+    }
+
     fn dispatch_task_control(
         &mut self,
         action: TaskControlAction,
@@ -7884,30 +7951,16 @@ impl Driver {
                         "children": [task_child_detail_json(row, &orphaned)],
                     }));
                 };
-                if let Err(e) = self.session.db.enqueue_task_delegation_steer(
-                    &row.task_call_id,
-                    &row.label,
-                    &body,
+                match self.enqueue_delegation_steer(
+                    Some(row.task_call_id.clone()),
+                    Some(row.label.clone()),
+                    body,
+                    format!("agent:{}", row.task_call_id),
+                    false,
                 ) {
-                    return format!("Error: could not persist steer: {e:#}");
+                    Ok(result) => task_envelope(result.to_task_envelope_value()),
+                    Err(message) => format!("Error: {message}"),
                 }
-                self.noninteractive_delegations
-                    .push_steer(&row.task_call_id, &row.label, body);
-                let mut child = task_child_detail_json(row, &orphaned);
-                child["pending_steers"] = serde_json::json!(row.pending_steers + 1);
-                task_envelope(serde_json::json!({
-                    "state": "steer_queued",
-                    "task_call_id": row.task_call_id,
-                    "blocking": false,
-                    "tool_call_closed": row.status != crate::db::task_delegations::DelegationStatus::Running,
-                    "result_pending": false,
-                    "report_available": row.report.is_some(),
-                    "report_delivered": row.result_delivered,
-                    "actionable": true,
-                    "applies_at": "next_child_turn_boundary",
-                    "applies_if": "child_still_running_actionable",
-                    "children": [child],
-                }))
             }
         }
     }
@@ -10941,10 +10994,17 @@ impl NoninteractiveSteerTarget {
     }
 }
 
-fn render_noninteractive_steers(steers: &[String]) -> String {
+fn render_noninteractive_steers(
+    steers: &[crate::db::task_delegations::TaskDelegationSteerRow],
+) -> String {
     let mut out = String::from("[queued delegation steer]\n");
     for (idx, steer) in steers.iter().enumerate() {
-        out.push_str(&format!("{}. {}\n", idx + 1, steer.trim()));
+        out.push_str(&format!(
+            "{}. from {}: {}\n",
+            idx + 1,
+            steer.origin_principal,
+            steer.body.trim()
+        ));
     }
     out.push_str("\nContinue the delegated task, incorporating the queued steer above.");
     out

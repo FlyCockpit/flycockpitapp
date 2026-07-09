@@ -1072,12 +1072,36 @@ fn require_remote_session_writer(
     }
 }
 
+fn require_remote_target_session_writer(
+    principal: &ClientPrincipal,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Owner | SessionAccess::Writer => Ok(()),
+            SessionAccess::Readonly => Err(read_only_error(
+                "remote principal has read-only access to this session",
+            )),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
+        },
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        Err(e) => Err(internal(e)),
+    }
+}
+
 fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
     match request {
         Request::Attach { session_id, .. } => *session_id,
         Request::ResumePausedWork { session_id }
         | Request::CancelPausedWork { session_id }
         | Request::RepairResume { session_id }
+        | Request::SteerDelegation { session_id, .. }
         | Request::ArchiveSession { session_id, .. }
         | Request::UnarchiveSession { session_id }
         | Request::DiscardSession { session_id }
@@ -1308,6 +1332,10 @@ fn authorize_request(
                     "remote principal cannot paste into terminals",
                 ))
             }
+        }
+
+        Request::SteerDelegation { session_id, .. } => {
+            require_remote_target_session_writer(principal, ctx, *session_id)
         }
 
         Request::SendUserMessage { .. }
@@ -1772,6 +1800,36 @@ async fn handle_request(
                 .map_err(internal)?;
             let (item, queue) = response_rx.await.map_err(internal)?;
             Ok(Response::UserMessageQueued { item, queue })
+        }
+
+        Request::SteerDelegation {
+            session_id,
+            task_call_id,
+            label,
+            message,
+        } => {
+            let Some(handle) = ctx.registry.live_handle(session_id) else {
+                return Ok(Response::DelegationSteer {
+                    result: proto::DelegationSteerResult::not_steerable(
+                        task_call_id,
+                        Some(label),
+                        "session is not live".to_string(),
+                    ),
+                });
+            };
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::SteerDelegation {
+                    task_call_id,
+                    label,
+                    message,
+                    origin_principal: state.principal.steer_origin(),
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)?;
+            Ok(Response::DelegationSteer { result })
         }
 
         Request::BeginAttachmentUpload {

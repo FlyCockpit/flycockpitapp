@@ -124,6 +124,28 @@ impl DaemonClient {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn steer_delegation(
+        &self,
+        session_id: Uuid,
+        task_call_id: impl Into<String>,
+        label: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<proto::DelegationSteerResult> {
+        match self
+            .request_ok(Request::SteerDelegation {
+                session_id,
+                task_call_id: task_call_id.into(),
+                label: label.into(),
+                message: message.into(),
+            })
+            .await?
+        {
+            Response::DelegationSteer { result } => Ok(result),
+            other => Err(anyhow!("unexpected steer delegation response: {other:?}")),
+        }
+    }
+
     /// Pull the next server-pushed event. Returns `None` when the
     /// connection has closed. Multi-call from multiple cloned
     /// clients is fine; each event is delivered to exactly one

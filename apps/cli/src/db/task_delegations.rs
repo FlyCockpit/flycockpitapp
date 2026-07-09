@@ -70,6 +70,18 @@ pub struct DelegationChildRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct TaskDelegationSteerRow {
+    pub id: i64,
+    pub task_call_id: String,
+    pub label: String,
+    pub body: String,
+    pub origin_principal: String,
+    pub delivered: bool,
+    pub created_at: i64,
+    pub delivered_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DelegationChildDetail {
     pub task_call_id: String,
     pub label: String,
@@ -482,17 +494,22 @@ impl Db {
         task_call_id: &str,
         label: &str,
         body: &str,
+        origin_principal: &str,
     ) -> Result<()> {
         let body = body.trim();
+        let origin_principal = origin_principal.trim();
         if body.is_empty() {
             anyhow::bail!("steer body must not be empty");
+        }
+        if origin_principal.is_empty() {
+            anyhow::bail!("steer origin principal must not be empty");
         }
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO task_delegation_steers (task_call_id, label, body, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![task_call_id, label, body, now],
+                "INSERT INTO task_delegation_steers (task_call_id, label, body, origin_principal, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![task_call_id, label, body, origin_principal, now],
             )
             .context("enqueueing task delegation steer")?;
             Ok(())
@@ -503,13 +520,13 @@ impl Db {
         &self,
         task_call_id: &str,
         label: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<TaskDelegationSteerRow>> {
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
             let pending = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT id, body
+                        "SELECT id, task_call_id, label, body, origin_principal, delivered, created_at, delivered_at
                            FROM task_delegation_steers
                           WHERE task_call_id = ?1
                             AND label = ?2
@@ -518,23 +535,44 @@ impl Db {
                     )
                     .context("preparing pending delegation steer drain")?;
                 let rows = stmt
-                    .query_map(params![task_call_id, label], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })
+                    .query_map(params![task_call_id, label], decode_steer)
                     .context("querying pending delegation steers")?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
                     .context("decoding pending delegation steers")?
             };
-            for (id, _) in &pending {
+            for steer in &pending {
                 conn.execute(
                     "UPDATE task_delegation_steers
                         SET delivered = 1, delivered_at = ?2
                       WHERE id = ?1",
-                    params![id, now],
+                    params![steer.id, now],
                 )
                 .context("marking delegation steer delivered")?;
             }
-            Ok(pending.into_iter().map(|(_, body)| body).collect())
+            Ok(pending)
+        })
+    }
+
+    pub fn list_task_delegation_steers(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<TaskDelegationSteerRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.id, s.task_call_id, s.label, s.body, s.origin_principal,
+                            s.delivered, s.created_at, s.delivered_at
+                       FROM task_delegation_steers s
+                       JOIN task_delegation_jobs j ON j.task_call_id = s.task_call_id
+                      WHERE j.parent_session_id = ?1
+                      ORDER BY s.id ASC",
+                )
+                .context("preparing task delegation steers list")?;
+            let rows = stmt
+                .query_map(params![session_id.to_string()], decode_steer)
+                .context("querying task delegation steers")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("decoding task delegation steers")
         })
     }
 }
@@ -622,6 +660,19 @@ fn decode_child(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationChildRow>
         status: DelegationStatus::from_str(&status),
         report: row.get(4)?,
         result_delivered: delivered != 0,
+    })
+}
+
+fn decode_steer(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDelegationSteerRow> {
+    Ok(TaskDelegationSteerRow {
+        id: row.get(0)?,
+        task_call_id: row.get(1)?,
+        label: row.get(2)?,
+        body: row.get(3)?,
+        origin_principal: row.get(4)?,
+        delivered: row.get::<_, i64>(5)? != 0,
+        created_at: row.get(6)?,
+        delivered_at: row.get(7)?,
     })
 }
 
@@ -807,9 +858,9 @@ mod tests {
         )
         .unwrap();
 
-        db.enqueue_task_delegation_steer("task-1", "default", "first")
+        db.enqueue_task_delegation_steer("task-1", "default", "first", "agent:task-1")
             .unwrap();
-        db.enqueue_task_delegation_steer("task-1", "default", "second")
+        db.enqueue_task_delegation_steer("task-1", "default", "second", "local:test")
             .unwrap();
         assert!(
             db.cancel_task_delegation_child("task-1", "default")
@@ -830,11 +881,18 @@ mod tests {
         assert_eq!(rows[0].status, DelegationStatus::Cancelled);
         assert_eq!(rows[0].report.as_deref(), Some("cancelled"));
         assert_eq!(rows[0].pending_steers, 2);
+        let drained = db
+            .drain_task_delegation_steers("task-1", "default")
+            .unwrap();
         assert_eq!(
-            db.drain_task_delegation_steers("task-1", "default")
-                .unwrap(),
-            vec!["first".to_string(), "second".to_string()]
+            drained
+                .iter()
+                .map(|row| row.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
         );
+        assert_eq!(drained[0].origin_principal, "agent:task-1");
+        assert_eq!(drained[1].origin_principal, "local:test");
         let rows = db
             .list_task_delegation_children(session.session_id)
             .unwrap();

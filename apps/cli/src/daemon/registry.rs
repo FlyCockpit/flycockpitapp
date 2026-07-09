@@ -761,6 +761,16 @@ impl SessionRegistry {
             .map(|entry| entry.handle.live_status())
     }
 
+    /// Current live worker handle for an already-running session. Unlike
+    /// [`Self::attach`], this never starts or resumes a worker; side-channel
+    /// requests use it to avoid creating work for dead sessions.
+    pub fn live_handle(&self, session_id: Uuid) -> Option<SessionWorkerHandle> {
+        crate::sync::lock_or_recover(&self.inner.workers)
+            .live
+            .get(&session_id)
+            .map(|entry| entry.handle.clone())
+    }
+
     /// Stop a live session before archive/delete/discard. This is fail-closed:
     /// it cancels the in-flight turn, sends shutdown, then awaits the worker
     /// task with a bounded timeout. The caller must not mutate/delete DB rows

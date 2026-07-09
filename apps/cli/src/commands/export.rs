@@ -60,6 +60,7 @@ const REQ_DIR_TANDEM: &str = "inference_requests_tandem";
 const TOOL_OUTPUT_DIR: &str = "tool_outputs";
 const COMPRESSED_TOOL_RESULTS_DIR: &str = "compressed_tool_results";
 const DELEGATION_PAYLOADS_DIR: &str = "delegation_payloads";
+const DELEGATION_STEERS_DIR: &str = "delegation_steers";
 
 /// Sanitize a `provider`/`model` id for use in a tandem export filename:
 /// replace any character that isn't alphanumeric / `-` / `_` / `.` with `_`,
@@ -353,6 +354,7 @@ fn build_zip_with_options_and_env(
     let mut compressed_result_index: Vec<Value> = Vec::new();
     let mut delegation_payload_files: Vec<(String, String)> = Vec::new(); // (path, content)
     let mut delegation_payload_index: Vec<Value> = Vec::new();
+    let mut delegation_steer_index: Vec<Value> = Vec::new();
     let mut tool_identity_by_call: BTreeMap<(Uuid, String), Value> = BTreeMap::new();
     for s in bundle {
         for tool_call in db.list_tool_calls_for_session(s.session_id)? {
@@ -392,6 +394,22 @@ fn build_zip_with_options_and_env(
                 "file": path,
             }));
             compressed_result_files.push((path, entry.content));
+        }
+        for row in db.list_task_delegation_steers(s.session_id)? {
+            let body =
+                redact_string_for_export(row.body, &export_redactor, options.include_sensitive);
+            delegation_steer_index.push(json!({
+                "id": row.id,
+                "task_call_id": row.task_call_id,
+                "label": row.label,
+                "session_id": s.session_id.to_string(),
+                "short_id": short,
+                "origin_principal": row.origin_principal,
+                "body": body,
+                "delivered": row.delivered,
+                "created_at": row.created_at,
+                "delivered_at": row.delivered_at,
+            }));
         }
         for row in db.list_task_delegation_payloads(s.session_id)? {
             let file = format!(
@@ -697,6 +715,13 @@ fn build_zip_with_options_and_env(
                 .with_context(|| format!("zip: delegation payload index `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&delegation_payload_index)?.as_bytes())
                 .context("zip: writing delegation payload index")?;
+        }
+        if !delegation_steer_index.is_empty() {
+            let path = format!("{DELEGATION_STEERS_DIR}/index.json");
+            zw.start_file(&path, opts)
+                .with_context(|| format!("zip: delegation steer index `{path}`"))?;
+            zw.write_all(serde_json::to_string_pretty(&delegation_steer_index)?.as_bytes())
+                .context("zip: writing delegation steer index")?;
         }
         for (path, body) in &delegation_payload_files {
             zw.start_file(path, opts)
@@ -1702,8 +1727,17 @@ mod tests {
     /// file per call across main AND subagent.
     #[test]
     fn export_bundles_main_and_subagent_requests() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            r#"{"redact":{"scan_environment":false,"scan_dotenv":false,"denylist":["SECRET_STEER_TOKEN"]}}"#,
+        )
+        .unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/proj", "Build").unwrap();
+        let s = db
+            .create_session("p", tmp.path().to_string_lossy().as_ref(), "Build")
+            .unwrap();
         let sid = s.session_id;
 
         // Main agent inference call + captured request.
@@ -3102,6 +3136,62 @@ mod tests {
         assert_eq!(index[0]["excerpt"].as_str().unwrap().chars().count(), 512);
         let file = index[0]["file"].as_str().unwrap();
         assert_eq!(read_zip_entry(&zip, file).unwrap(), body);
+    }
+
+    #[test]
+    fn export_task_delegation_steers_includes_origin_and_redacted_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            r#"{"redact":{"scan_environment":false,"scan_dotenv":false,"denylist":["SECRET_STEER_TOKEN"]}}"#,
+        )
+        .unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let s = db
+            .create_session("p", tmp.path().to_string_lossy().as_ref(), "Build")
+            .unwrap();
+        let sid = s.session_id;
+        db.upsert_task_delegation_job(
+            sid,
+            "task-steer",
+            Some("fn-steer"),
+            "Build",
+            None,
+            &[crate::db::task_delegations::DelegationChildInit {
+                label: "alpha",
+                child_agent: "explore",
+                model: None,
+                output_dir: None,
+                requested_cwd: None,
+                resolved_cwd: None,
+                todo_ids_json: None,
+            }],
+        )
+        .unwrap();
+        db.enqueue_task_delegation_steer(
+            "task-steer",
+            "alpha",
+            "use SECRET_STEER_TOKEN",
+            "local:tester",
+        )
+        .unwrap();
+
+        let target = db.get_session(sid).unwrap().unwrap();
+        let bundle = collect_bundle(&db, sid).unwrap();
+        let zip = build_zip(&db, &target, &bundle).unwrap();
+        let names = entry_names(&zip);
+        assert!(names.iter().any(|n| n == "delegation_steers/index.json"));
+        let index: Vec<Value> =
+            serde_json::from_str(&read_zip_entry(&zip, "delegation_steers/index.json").unwrap())
+                .unwrap();
+        assert_eq!(index[0]["task_call_id"], "task-steer");
+        assert_eq!(index[0]["label"], "alpha");
+        assert_eq!(index[0]["origin_principal"], "local:tester");
+        assert_eq!(index[0]["delivered"], false);
+        let body = index[0]["body"].as_str().unwrap();
+        assert!(!body.contains("SECRET_STEER_TOKEN"));
+        assert!(body.contains("REDACTED"));
     }
 
     /// Additive backward compatibility: an OLDER export — events with none of

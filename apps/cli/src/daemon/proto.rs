@@ -244,6 +244,16 @@ pub enum Request {
         forced_skill: Option<String>,
     },
 
+    /// Side-channel steer for a running noninteractive child. This bypasses
+    /// the main user-message queue, so it does not background the child or
+    /// redirect the text to the parent.
+    SteerDelegation {
+        session_id: Uuid,
+        task_call_id: String,
+        label: String,
+        message: String,
+    },
+
     BeginAttachmentUpload {
         mime: String,
         byte_len: usize,
@@ -816,6 +826,114 @@ pub struct ImageAttachmentRef {
     pub id: Uuid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationSteerStatus {
+    Queued,
+    NotSteerable,
+    InternalError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationSteerResult {
+    pub status: DelegationSteerStatus,
+    pub task_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub pending_steers: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_principal: Option<String>,
+    #[serde(default)]
+    pub scrubbed: bool,
+}
+
+impl DelegationSteerResult {
+    pub fn queued(
+        task_call_id: String,
+        label: String,
+        pending_steers: i64,
+        origin_principal: String,
+        scrubbed: bool,
+    ) -> Self {
+        Self {
+            status: DelegationSteerStatus::Queued,
+            task_call_id,
+            label: Some(label),
+            message: "steer queued".to_string(),
+            pending_steers,
+            origin_principal: Some(origin_principal),
+            scrubbed,
+        }
+    }
+
+    pub fn not_steerable(task_call_id: String, label: Option<String>, reason: String) -> Self {
+        Self {
+            status: DelegationSteerStatus::NotSteerable,
+            task_call_id,
+            label,
+            message: reason,
+            pending_steers: 0,
+            origin_principal: None,
+            scrubbed: false,
+        }
+    }
+
+    pub fn internal(message: String) -> Self {
+        Self {
+            status: DelegationSteerStatus::InternalError,
+            task_call_id: String::new(),
+            label: None,
+            message,
+            pending_steers: 0,
+            origin_principal: None,
+            scrubbed: false,
+        }
+    }
+
+    pub fn to_task_envelope_value(&self) -> serde_json::Value {
+        match self.status {
+            DelegationSteerStatus::Queued => {
+                let label = self.label.clone().unwrap_or_default();
+                serde_json::json!({
+                    "state": "steer_queued",
+                    "task_call_id": self.task_call_id,
+                    "label": label,
+                    "blocking": false,
+                    "tool_call_closed": false,
+                    "result_pending": false,
+                    "report_available": false,
+                    "report_delivered": false,
+                    "actionable": true,
+                    "applies_at": "next_child_turn_boundary",
+                    "applies_if": "child_still_running_actionable",
+                    "origin_principal": self.origin_principal,
+                    "scrubbed": self.scrubbed,
+                    "children": [{
+                        "task_call_id": self.task_call_id,
+                        "label": label,
+                        "pending_steers": self.pending_steers,
+                        "actionable": true,
+                    }],
+                })
+            }
+            DelegationSteerStatus::NotSteerable => serde_json::json!({
+                "state": "refused",
+                "task_call_id": self.task_call_id,
+                "label": self.label,
+                "reason": self.message,
+                "actionable": false,
+            }),
+            DelegationSteerStatus::InternalError => serde_json::json!({
+                "state": "error",
+                "reason": self.message,
+                "actionable": false,
+            }),
+        }
+    }
+}
+
 // ---- Responses -------------------------------------------------------------
 
 /// Daemon → client RPC responses. Each variant is the typed answer to
@@ -835,6 +953,10 @@ pub enum Response {
     UserMessageQueued {
         item: QueueItem,
         queue: Vec<QueueItem>,
+    },
+
+    DelegationSteer {
+        result: DelegationSteerResult,
     },
 
     AttachmentUploadStarted {

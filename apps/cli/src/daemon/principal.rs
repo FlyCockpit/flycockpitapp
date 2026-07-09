@@ -67,6 +67,13 @@ impl ClientPrincipal {
         }
     }
 
+    pub fn steer_origin(&self) -> String {
+        match self {
+            Self::Owner => format!("local:{}", local_principal_name()),
+            Self::Remote(remote) => format!("flycockpit:{}", remote.user_id),
+        }
+    }
+
     pub fn can_agent_write_project(&self, project_root: &str) -> bool {
         self.is_owner() || self.has_project_scope(PrincipalScope::Agent, project_root)
     }
@@ -126,6 +133,28 @@ impl From<crate::daemon::relay_envelope::RelayGrant> for PrincipalGrant {
     }
 }
 
+fn local_principal_name() -> String {
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "owner".to_string());
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "owner".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn roots_equal(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -143,6 +172,7 @@ pub fn request_kind(request: &Request) -> &'static str {
     match request {
         Request::Attach { .. } => "attach",
         Request::SendUserMessage { .. } => "send_user_message",
+        Request::SteerDelegation { .. } => "steer_delegation",
         Request::BeginAttachmentUpload { .. } => "begin_attachment_upload",
         Request::UploadAttachmentChunk { .. } => "upload_attachment_chunk",
         Request::FinishAttachmentUpload { .. } => "finish_attachment_upload",

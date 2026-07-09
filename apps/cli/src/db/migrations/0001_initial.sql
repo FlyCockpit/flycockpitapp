@@ -977,6 +977,7 @@ CREATE TABLE task_delegation_steers (
     task_call_id TEXT NOT NULL,
     label TEXT NOT NULL,
     body TEXT NOT NULL,
+    origin_principal TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0 CHECK (delivered IN (0, 1)),
     created_at INTEGER NOT NULL,
     delivered_at INTEGER,

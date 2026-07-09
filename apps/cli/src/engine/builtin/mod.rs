@@ -1226,11 +1226,11 @@ pub fn build(args: &SpawnArgs) -> Agent {
         "task",
         crate::engine::tool::ToolDescOverride {
             normal: Some(
-                "Delegate substantive feature work to a subagent (builder writes, explore investigates); for unfamiliar or version-sensitive dependency APIs, use docs by default unless local code clearly establishes exact usage; write inline only for small single-scope edits, and keep your own context lean"
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
             frontier: Some(
-                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore, and use docs when dependency APIs are unfamiliar, version-specific, or not established by local code"
+                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
                     .to_string(),
             ),
             defensive: Some(
@@ -1244,8 +1244,13 @@ pub fn build(args: &SpawnArgs) -> Agent {
                  and the new request. For how to USE a third-party dependency's API, your first \
                  move is `docs` (JSON `{package, question}`), including dependency questions \
                  found while preparing a `builder` brief; skip it only when exact usage is \
-                 clearly established in already-read local code. Your own inline work is limited \
-                 to orchestration and short read-only lookups."
+                 clearly established in already-read local code. If a task returns a backgrounded \
+                 task_delegation JSON envelope, the tool call is closed but the child is detached \
+                 with result_pending=true; do not treat it as the report or redelegate solely \
+                 because it backgrounded. Continue the conversation and act on the async result, \
+                 or poll status/query/list by task_call_id. Read each child status/error; steer \
+                 only applies at the next child turn boundary if still running/actionable. Your \
+                 own inline work is limited to orchestration and short read-only lookups."
                     .to_string(),
             ),
         },
@@ -1311,11 +1316,11 @@ pub fn builder(args: &SpawnArgs) -> Agent {
         "task",
         crate::engine::tool::ToolDescOverride {
             normal: Some(
-                "Use `task` only for docs; for unfamiliar or version-sensitive dependency APIs, use docs by default unless local code clearly establishes exact usage, and do the assigned code work yourself"
+                "Use `task` only for docs by default for unfamiliar APIs; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
                     .to_string(),
             ),
             frontier: Some(
-                "Use `task` only for docs when a dependency API is unfamiliar, version-specific, or not established by local code; otherwise do the assigned code work yourself"
+                "Use `task` only for docs when APIs are unfamiliar; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
                     .to_string(),
             ),
             defensive: Some(
@@ -1327,7 +1332,10 @@ pub fn builder(args: &SpawnArgs) -> Agent {
                  one assigned implementation slice. Do not try to delegate the feature itself or \
                  accept new feature work outside the brief. If the request turns out to be out of \
                  your assigned scope, return the out-of-scope ask to your caller via the structured \
-                 `return` report rather than expanding it."
+                 `return` report rather than expanding it. If a docs task returns backgrounded \
+                 task_delegation JSON, the call is closed but detached/result-pending; wait for \
+                 the async result or query/list/status by task_call_id, and read child status/error \
+                 because docs can fail, be cancelled, or be lost."
                     .to_string(),
             ),
         },
@@ -2549,11 +2557,14 @@ mod tests {
         let task = task_definition(&agent, crate::config::extended::LlmMode::Defensive);
 
         for needle in [
-            "Substantive implementation goes to `{\"intent\":\"delegate\",\"delegate\":{\"agent\":\"builder\",\"prompt\":\"...\"}}`",
-            "FIRST move is `{\"intent\":\"delegate\",\"delegate\":{\"agent\":\"docs\"",
+            "Substantive implementation goes to `{\"intent\":\"delegate\",\"payload\":{\"agent\":\"builder\",\"prompt\":\"...\"}}`",
+            "FIRST move is `{\"intent\":\"delegate\",\"payload\":{\"agent\":\"docs\"",
             "dependency API questions discovered while preparing a `builder` brief",
             "one `builder` task is one implementation slice",
             "delegate again to a fresh `builder` brief seeded with the prior result summary",
+            "Task background contract:",
+            "Do not treat that as the report and do not redelegate the same work solely because it backgrounded",
+            "Read each child `status` (`completed`, `failed`, `cancelled`, `lost`) and optional `error`",
         ] {
             assert!(
                 agent.role_prompt.contains(needle),
@@ -2570,6 +2581,9 @@ mod tests {
             "your first move is `docs`",
             "preparing a `builder` brief",
             "inline work is limited to orchestration and short read-only lookups",
+            "backgrounded task_delegation JSON envelope",
+            "do not treat it as the report or redelegate solely because it backgrounded",
+            "Read each child status/error",
         ] {
             assert!(
                 task.description.contains(needle),
@@ -2592,6 +2606,8 @@ mod tests {
             "Do exactly one assigned implementation slice yourself",
             "return that out-of-scope ask to your caller through the structured `return` report",
             "FIRST move is to delegate to the `docs` subagent",
+            "If the `docs` task backgrounds",
+            "read per-child `status`/`error` because docs can fail",
             "exact usage pattern is clearly established in already-read local code",
             "Do not use `task` to delegate the feature itself",
         ] {
@@ -2609,6 +2625,8 @@ mod tests {
             "Do exactly one assigned implementation slice",
             "Do not try to delegate the feature itself",
             "return the out-of-scope ask to your caller via the structured `return` report",
+            "docs task returns backgrounded",
+            "read child status/error",
         ] {
             assert!(
                 task.description.contains(needle),
@@ -2695,6 +2713,8 @@ mod tests {
             task_definition(&builder(&args), crate::config::extended::LlmMode::Normal);
 
         assert!(build_task.description.contains("substantive feature work"));
+        assert!(build_task.description.contains("backgrounded JSON"));
+        assert!(build_task.description.contains("detached/result-pending"));
         assert!(build_task.description.contains("use docs by default"));
         assert!(
             build_task
@@ -2706,7 +2726,8 @@ mod tests {
                 .description
                 .contains("Use `task` only for docs")
         );
-        assert!(builder_task.description.contains("use docs by default"));
+        assert!(builder_task.description.contains("docs backgrounds"));
+        assert!(builder_task.description.contains("detached/result-pending"));
         assert!(
             !build_task
                 .description
@@ -2722,12 +2743,12 @@ mod tests {
             builder_task.description
         );
         assert!(
-            build_task.description.len() < 380,
+            build_task.description.len() < 520,
             "normal Build task description grew too verbose: {}",
             build_task.description
         );
         assert!(
-            builder_task.description.len() < 240,
+            builder_task.description.len() < 320,
             "normal builder task description grew too verbose: {}",
             builder_task.description
         );

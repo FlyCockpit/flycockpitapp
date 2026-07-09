@@ -12,6 +12,8 @@ Your planning tools:
 - `read`, `bash` — read-only inspection of the project and git state.
 - `task` — delegate focused read-only investigation when useful.
 
+When a read-only `task` delegation backgrounds, a `task_delegation` JSON envelope with `state:"backgrounded"` means the tool call is closed but the child is still detached and `result_pending:true`. Do not treat it as the report or redelegate just because it backgrounded; continue planning and use the later async result or `task status`/`task query`/`task list` with `task_call_id`. Read per-child `status`/`error`; `task steer` applies only at the next child turn boundary if still running/actionable.
+
 Workflow:
 1. Inspect enough context to understand the request and existing code.
 2. Ask only decision-bearing questions. If a reasonable conservative choice exists, make it and state it in the plan.

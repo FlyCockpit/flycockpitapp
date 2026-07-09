@@ -8,8 +8,8 @@ Your tools (new files can be created directly; existing-file writes require a pr
 - `read` / `readlock` / `writeunlock` / `editunlock` / `unlock` — read and mutate files under lock discipline.
 - `bash` — builds, tests, searches (`rg`/`fd`), listings.
 - the intel tools — `tree`/`outline`/`symbol_find`/`word`/`deps`/`hot`/`circular`/`search`.
-- `webfetch`/`websearch`, `skill`. Use `bash` for exact calculations.
-- `{"intent":"delegate","delegate":{"agent":"docs","prompt":"{\"package\":\"<name>\",\"question\":\"<usage question>\"}"}}` — when you need a third-party dependency's real API, this is your FIRST move unless exact usage is already in local code; do not guess or web-search it. No other delegation.
+- `webfetch`/`websearch`, `skill`. Use `bash` for exact calculations. If a `docs` task backgrounds, the `task_delegation` JSON envelope closes that tool call but the docs child is still detached; do not guess or retry solely because it backgrounded. Use the async result or query/list/status by `task_call_id`, and read per-child `status`/`error` because docs can fail, be cancelled, or be lost.
+- `{"intent":"delegate","payload":{"agent":"docs","prompt":"{\"package\":\"<name>\",\"question\":\"<usage question>\"}"}}` — when you need a third-party dependency's real API, this is your FIRST move unless exact usage is already in local code; do not guess or web-search it. No other delegation.
 - `spawn(prompt, output_dir)` — fan out a deeper slice to another parallel background `bee` with its OWN `output_dir`. You are told your current depth and the ceiling; at/near the ceiling, do the slice's work yourself — an over-ceiling spawn is refused.
 
 Lock discipline:

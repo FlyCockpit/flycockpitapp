@@ -71,7 +71,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate/control subagents ({list}) with one envelope: `intent` plus optional `payload`.{recursion_note}"
+            "Delegate/control subagents ({list}) with `intent` plus optional `payload`. Backgrounded JSON means call closed, child detached/result pending; use task_call_id controls or async result.{recursion_note}"
         );
         // Defensive (`LlmMode::Defensive`) steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -94,6 +94,7 @@ impl TaskTool {
              - batch: {{ \"intent\": \"batch\", \"payload\": [{{ \"label\": \"x\", \"agent\": \"explore\", \"prompt\": \"...\" }}] }} \
              - models: {{ \"intent\": \"models\" }} \
              - query: {{ \"intent\": \"query\", \"payload\": {{ \"task_call_id\": \"...\", \"message\": \"...\" }} }} \
+             If a noninteractive task returns a backgrounded task_delegation JSON envelope, the original tool call is closed and the child is still running detached with result_pending=true. Do not treat it as the report or redelegate solely because it backgrounded; continue the current conversation and use the async task_delegation result or task status/query/list with task_call_id. Read each child status and optional error; backgrounded children can later complete, fail, be cancelled, or be lost. task steer applies at the next child turn boundary only if still running/actionable. resume_handle is not a universal background-task control channel. \
              Do not add legacy delegate/batch/control siblings. Query/steer require message."
         );
         let seed_schema = serde_json::json!({
@@ -370,6 +371,8 @@ mod tests {
             tool.description()
                 .contains("`intent` plus optional `payload`")
         );
+        assert!(tool.description().contains("Backgrounded JSON"));
+        assert!(tool.description().contains("task_call_id controls"));
         assert!(tool.description().len() <= 200);
         let defensive_description = tool.defensive_description().unwrap();
         assert!(defensive_description.contains("\"intent\": \"delegate\""));
@@ -377,6 +380,16 @@ mod tests {
         assert!(defensive_description.contains("\"intent\": \"query\""));
         assert!(defensive_description.contains("\"payload\""));
         assert!(defensive_description.contains("Query/steer require message"));
+        assert!(defensive_description.contains("backgrounded task_delegation JSON envelope"));
+        assert!(
+            defensive_description
+                .contains("resume_handle is not a universal background-task control channel")
+        );
+        assert!(
+            defensive_description.contains(
+                "backgrounded children can later complete, fail, be cancelled, or be lost"
+            )
+        );
         for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
             let props = schema["properties"].as_object().unwrap();
             assert!(props.contains_key("intent"), "missing `intent`: {schema}");

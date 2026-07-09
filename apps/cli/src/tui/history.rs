@@ -2020,23 +2020,19 @@ fn append_subagent_routing_chips(
     model_trusted: bool,
     routing: &SubagentRoutingChips,
 ) {
-    if let Some(model) = routing.model.as_deref().filter(|value| !value.is_empty()) {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("[{model}]"),
-            Style::default()
-                .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                .add_modifier(Modifier::DIM),
-        ));
-    }
-    let trust = if model_trusted {
-        "trusted"
-    } else {
-        "untrusted"
+    let trust = if model_trusted { "t" } else { "u" };
+    let model = routing
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let trust_chip = match model {
+        Some(model) => format!("[{model} · {trust}]"),
+        None => format!("[{trust}]"),
     };
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
-        format!("[{trust}]"),
+        trust_chip,
         Style::default()
             .fg(Color::Indexed(MUTED_COLOR_INDEX))
             .add_modifier(Modifier::DIM),
@@ -4076,6 +4072,52 @@ mod tests {
         )
     }
 
+    #[test]
+    fn subagent_routing_chips_condense_model_and_trust() {
+        fn chip_text(
+            trusted_only: bool,
+            model_trusted: bool,
+            routing: SubagentRoutingChips,
+        ) -> String {
+            let mut spans = Vec::new();
+            append_subagent_routing_chips(&mut spans, trusted_only, model_trusted, &routing);
+            spans_text(&spans)
+        }
+
+        assert_eq!(
+            chip_text(
+                true,
+                true,
+                SubagentRoutingChips {
+                    model: Some("gpt-5".into()),
+                    location: Some("private_remote".into()),
+                    fallback: Some("backup".into()),
+                },
+            ),
+            " [gpt-5 · t] [private_remote] [fallback:backup] [trusted-only]"
+        );
+        assert_eq!(
+            chip_text(
+                false,
+                false,
+                SubagentRoutingChips {
+                    model: Some("gpt-5".into()),
+                    location: None,
+                    fallback: None,
+                },
+            ),
+            " [gpt-5 · u]"
+        );
+        assert_eq!(
+            chip_text(false, true, SubagentRoutingChips::default()),
+            " [t]"
+        );
+        assert_eq!(
+            chip_text(false, false, SubagentRoutingChips::default()),
+            " [u]"
+        );
+    }
+
     /// Running: one live line `{parent} delegated to {child}…
     /// (elapsed)`, child name orange, no expand chip.
     #[test]
@@ -4084,8 +4126,8 @@ mod tests {
         assert_eq!(r.lines.len(), 1);
         let text = line_text(&r.lines[0]);
         assert!(text.contains("Build delegated to explore"), "{text}");
-        assert!(text.contains("[claude-sonnet-4-6]"), "{text}");
-        assert!(text.contains("[trusted]"), "{text}");
+        assert!(text.contains("[claude-sonnet-4-6 · t]"), "{text}");
+        assert!(!text.contains("[trusted]"), "{text}");
         assert!(text.contains("[private_remote]"), "{text}");
         assert!(text.contains("[trusted-only]"), "{text}");
         // Verbatim casing: parent capitalized, child lowercase.
@@ -4120,8 +4162,8 @@ mod tests {
         );
         let header = line_text(&r.lines[0]);
         assert!(header.contains("explore worked for 2m 10s"), "{header}");
-        assert!(header.contains("[claude-sonnet-4-6]"), "{header}");
-        assert!(header.contains("[trusted]"), "{header}");
+        assert!(header.contains("[claude-sonnet-4-6 · t]"), "{header}");
+        assert!(!header.contains("[trusted]"), "{header}");
         assert!(header.contains("[private_remote]"), "{header}");
         assert!(header.contains("[trusted-only]"), "{header}");
         assert!(any_orange(&r.lines[0]));

@@ -14,6 +14,14 @@ export const actorSchema = z
   .passthrough();
 export type CockpitActor = z.infer<typeof actorSchema>;
 
+function actorFromPrincipal(principal: string | null | undefined): CockpitActor | null {
+  if (!principal) return null;
+  const [namespace, ...rest] = principal.split(":");
+  const userId = rest.join(":").trim();
+  if (namespace !== "flycockpit" || !userId) return null;
+  return { userId };
+}
+
 export const sessionStatusSchema = z.enum(["idle", "running", "needs_attention", "archived"]);
 export const attentionKindSchema = z.enum(["question", "approval", "error", "schedule"]);
 
@@ -36,10 +44,18 @@ export const sessionSummarySchema = z
     updatedAt: z.number().int().nonnegative(),
     createdAt: z.number().int().nonnegative().optional(),
     createdBy: actorSchema.nullable().optional(),
+    created_by_principal: z.string().nullable().optional(),
+    sharedWithCollaborators: z.boolean().optional(),
+    shared_with_collaborators: z.boolean().optional(),
     agent: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
   })
-  .passthrough();
+  .passthrough()
+  .transform(({ created_by_principal, shared_with_collaborators, ...summary }) => ({
+    ...summary,
+    createdBy: summary.createdBy ?? actorFromPrincipal(created_by_principal),
+    sharedWithCollaborators: summary.sharedWithCollaborators ?? shared_with_collaborators ?? false,
+  }));
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;
 
 export const projectSummarySchema = z
@@ -284,6 +300,9 @@ export const clientRequestSchema = z.discriminatedUnion("type", [
     })
     .strict(),
   z.object({ type: z.literal("fork_session"), sessionId: sessionIdSchema }).strict(),
+  z
+    .object({ type: z.literal("share_session"), sessionId: sessionIdSchema, shared: z.boolean() })
+    .strict(),
   z
     .object({
       type: z.literal("archive_session"),

@@ -54,6 +54,7 @@ type RemoteSessionState = {
   ) => Promise<void>;
   renameSession: (instanceId: string, sessionId: string, title: string) => Promise<void>;
   archiveSession: (instanceId: string, sessionId: string, archived: boolean) => Promise<void>;
+  shareSession: (instanceId: string, sessionId: string, shared: boolean) => Promise<void>;
   forkSession: (instanceId: string, sessionId: string) => Promise<void>;
   listFiles: (
     instanceId: string,
@@ -258,6 +259,32 @@ export function addOptimisticUserMessage(
   };
 }
 
+export function updateSessionSharedWithCollaborators(
+  existing: InstanceRemoteState,
+  sessionId: string,
+  sharedWithCollaborators: boolean,
+): InstanceRemoteState {
+  const updateSummary = (summary: SessionSummary): SessionSummary =>
+    summary.sessionId === sessionId ? { ...summary, sharedWithCollaborators } : summary;
+  const sessionsByProject = Object.fromEntries(
+    Object.entries(existing.sessionsByProject).map(([projectRoot, sessions]) => [
+      projectRoot,
+      sessions.map(updateSummary),
+    ]),
+  );
+  const detail = existing.detailsBySession[sessionId];
+  return {
+    ...existing,
+    sessionsByProject,
+    detailsBySession: detail
+      ? {
+          ...existing.detailsBySession,
+          [sessionId]: { ...detail, summary: updateSummary(detail.summary) },
+        }
+      : existing.detailsBySession,
+  };
+}
+
 function setInstance(
   instances: Record<string, InstanceRemoteState>,
   instanceId: string,
@@ -398,6 +425,29 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
         };
       }),
     }));
+  },
+  shareSession: async (instanceId, sessionId, shared) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    const current = get().instances[instanceId];
+    const previous = current?.detailsBySession[sessionId]?.summary.sharedWithCollaborators;
+    set((state) => ({
+      instances: setInstance(state.instances, instanceId, (current) =>
+        updateSessionSharedWithCollaborators(current, sessionId, shared),
+      ),
+    }));
+    try {
+      await client.shareSession(sessionId, shared);
+    } catch (error) {
+      if (previous !== undefined) {
+        set((state) => ({
+          instances: setInstance(state.instances, instanceId, (current) =>
+            updateSessionSharedWithCollaborators(current, sessionId, previous),
+          ),
+        }));
+      }
+      throw error;
+    }
   },
   forkSession: async (instanceId, sessionId) => {
     await get().clients[instanceId]?.forkSession(sessionId);

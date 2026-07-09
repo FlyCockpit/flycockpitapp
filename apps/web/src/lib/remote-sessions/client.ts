@@ -123,6 +123,10 @@ export class RemoteSessionClient {
     return this.send({ type: "archive_session", sessionId, archived });
   }
 
+  async shareSession(sessionId: string, shared: boolean) {
+    return parseAckResult(await this.send({ type: "share_session", sessionId, shared }));
+  }
+
   async listFiles(projectRoot: string, path: string, showHidden: boolean) {
     return parseFsListResult(await this.send({ type: "fs_list", projectRoot, path, showHidden }));
   }

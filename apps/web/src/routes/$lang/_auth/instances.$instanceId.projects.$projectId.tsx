@@ -13,6 +13,7 @@ import { Input } from "@flycockpit/ui/components/input";
 import { Label } from "@flycockpit/ui/components/label";
 import { toast } from "@flycockpit/ui/components/sileo";
 import { Skeleton } from "@flycockpit/ui/components/skeleton";
+import { Switch } from "@flycockpit/ui/components/switch";
 import { Textarea } from "@flycockpit/ui/components/textarea";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
@@ -33,6 +34,13 @@ import { useShallow } from "zustand/react/shallow";
 import { InlineRetry } from "@/components/inline-retry";
 import { useRemoteInstanceConnection } from "@/hooks/use-remote-instance-connection";
 import { useRemoteProjectSessions } from "@/hooks/use-remote-project-sessions";
+import {
+  canMutateSessions,
+  resolveSessionViewerMode,
+  type SessionViewerMode,
+  sessionAttributionName,
+  shouldShowSessionAttribution,
+} from "@/lib/session-visibility";
 import { useRemoteSessionsStore } from "@/stores/remote-sessions";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
@@ -47,6 +55,7 @@ export const Route = createFileRoute("/$lang/_auth/instances/$instanceId/project
 
 function ProjectSessionPage() {
   const { lang, instanceId, projectId } = Route.useParams();
+  const { session } = Route.useRouteContext();
   const search = Route.useSearch();
   const navigate = useNavigate({ from: Route.fullPath });
   const { t } = useTranslation(["instances", "common"]);
@@ -57,6 +66,8 @@ function ProjectSessionPage() {
     isPending: tokenIsPending,
     refetch: refetchToken,
   } = useQuery(orpc.instances.mintClientToken.queryOptions({ input: { instanceId } }));
+  const ownedInstances = useQuery(orpc.instances.listMine.queryOptions());
+  const sharedInstances = useQuery(orpc.instanceSharing.listSharedWithMe.queryOptions());
   useRemoteInstanceConnection(instanceId, tokenData);
   const { remote, sendMessage, resolveInterrupt, renameSession, archiveSession, forkSession } =
     useRemoteSessionsStore(
@@ -89,11 +100,20 @@ function ProjectSessionPage() {
 
   const activeSessions = sessions.filter((session) => !session.archived);
   const archivedSessions = sessions.filter((session) => session.archived);
+  const viewerMode = resolveSessionViewerMode({
+    instanceId,
+    projectRoot,
+    ownedInstanceIds: ownedInstances.data?.instances.map((item) => item.id) ?? [],
+    sharedInstances: sharedInstances.data?.sharedInstances ?? [],
+  });
+  const canWriteSessions = canMutateSessions(viewerMode);
+  const canShareSessions = viewerMode === "owner";
+  const readOnly = viewerMode === "agent_readonly";
   const offline = remote?.status !== "connected";
 
   async function submitMessage() {
     const text = message.trim();
-    if (!selectedSessionId || !text) return;
+    if (!selectedSessionId || !text || !canWriteSessions) return;
     setMessage("");
     try {
       await sendMessage(instanceId, selectedSessionId, text);
@@ -148,13 +168,15 @@ function ProjectSessionPage() {
               <FileCode className="size-4" />
               {t("instances:files.open")}
             </Link>
-            <NewSessionDialog
-              instanceId={instanceId}
-              projectRoot={projectRoot}
-              onCreated={(sessionId) => {
-                navigate({ search: { session: sessionId, interrupt: undefined } });
-              }}
-            />
+            {canWriteSessions ? (
+              <NewSessionDialog
+                instanceId={instanceId}
+                projectRoot={projectRoot}
+                onCreated={(sessionId) => {
+                  navigate({ search: { session: sessionId, interrupt: undefined } });
+                }}
+              />
+            ) : null}
           </div>
         </div>
       </div>
@@ -178,6 +200,8 @@ function ProjectSessionPage() {
               lang={lang}
               instanceId={instanceId}
               projectId={projectId}
+              viewerMode={viewerMode}
+              viewerUserId={session.user.id}
             />
             {archivedSessions.length ? (
               <SessionSection
@@ -187,6 +211,8 @@ function ProjectSessionPage() {
                 lang={lang}
                 instanceId={instanceId}
                 projectId={projectId}
+                viewerMode={viewerMode}
+                viewerUserId={session.user.id}
               />
             ) : null}
           </div>
@@ -206,79 +232,100 @@ function ProjectSessionPage() {
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <form
-                    className="flex gap-2"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      const title = renameTitle.trim();
-                      if (!title) return;
-                      setRenameTitle("");
-                      void renameSession(instanceId, detail.summary.sessionId, title);
-                    }}
-                  >
-                    <Input
-                      className="h-9 w-36 text-sm"
-                      value={renameTitle}
-                      onChange={(event) => setRenameTitle(event.target.value)}
-                      placeholder={t("instances:remote.renamePlaceholder")}
+                  {canShareSessions ? (
+                    <SessionVisibilityToggle
+                      instanceId={instanceId}
+                      session={detail.summary}
+                      disabled={offline || !canWriteSessions}
                     />
-                    <Button type="submit" variant="outline" size="sm">
-                      {t("instances:remote.rename")}
-                    </Button>
-                  </form>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void forkSession(instanceId, detail.summary.sessionId)}
-                  >
-                    <GitFork className="size-4" />
-                    {t("instances:remote.fork")}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      void archiveSession(
-                        instanceId,
-                        detail.summary.sessionId,
-                        !detail.summary.archived,
-                      )
-                    }
-                  >
-                    <Archive className="size-4" />
-                    {detail.summary.archived
-                      ? t("instances:remote.unarchive")
-                      : t("instances:remote.archive")}
-                  </Button>
+                  ) : null}
+                  {canWriteSessions ? (
+                    <>
+                      <form
+                        className="flex gap-2"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          const title = renameTitle.trim();
+                          if (!title) return;
+                          setRenameTitle("");
+                          void renameSession(instanceId, detail.summary.sessionId, title);
+                        }}
+                      >
+                        <Input
+                          className="h-9 w-36 text-sm"
+                          value={renameTitle}
+                          onChange={(event) => setRenameTitle(event.target.value)}
+                          placeholder={t("instances:remote.renamePlaceholder")}
+                        />
+                        <Button type="submit" variant="outline" size="sm">
+                          {t("instances:remote.rename")}
+                        </Button>
+                      </form>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void forkSession(instanceId, detail.summary.sessionId)}
+                      >
+                        <GitFork className="size-4" />
+                        {t("instances:remote.fork")}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          void archiveSession(
+                            instanceId,
+                            detail.summary.sessionId,
+                            !detail.summary.archived,
+                          )
+                        }
+                      >
+                        <Archive className="size-4" />
+                        {detail.summary.archived
+                          ? t("instances:remote.unarchive")
+                          : t("instances:remote.archive")}
+                      </Button>
+                    </>
+                  ) : null}
                 </div>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
                 <Transcript
                   history={detail.history}
                   interruptFocus={search.interrupt}
+                  readOnly={!canWriteSessions}
                   onResolve={(interruptId, resolution, answer) =>
-                    resolveInterrupt(instanceId, {
-                      sessionId: detail.summary.sessionId,
-                      interruptId,
-                      resolution,
-                      answer,
-                    })
+                    canWriteSessions
+                      ? resolveInterrupt(instanceId, {
+                          sessionId: detail.summary.sessionId,
+                          interruptId,
+                          resolution,
+                          answer,
+                        })
+                      : Promise.resolve()
                   }
                 />
               </div>
               <div className="border-t p-3 pb-[calc(0.75rem_+_var(--safe-area-bottom))]">
+                {readOnly ? (
+                  <p className="mb-2 rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+                    {t("instances:remote.readOnlyNotice")}
+                  </p>
+                ) : null}
                 <div className="flex gap-2">
                   <Textarea
                     className="min-h-[52px] flex-1 text-base"
                     value={message}
-                    disabled={offline}
+                    disabled={offline || !canWriteSessions}
                     onChange={(event) => setMessage(event.target.value)}
                     placeholder={
                       offline
                         ? t("instances:remote.composerOffline")
-                        : t("instances:remote.composerPlaceholder")
+                        : readOnly
+                          ? t("instances:remote.composerReadOnly")
+                          : t("instances:remote.composerPlaceholder")
                     }
                     onKeyDown={(event) => {
                       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -290,7 +337,7 @@ function ProjectSessionPage() {
                   <Button
                     type="button"
                     className="min-h-[52px]"
-                    disabled={offline || !message.trim()}
+                    disabled={offline || !canWriteSessions || !message.trim()}
                     onClick={() => void submitMessage()}
                   >
                     <Send className="size-4" />
@@ -319,6 +366,8 @@ function SessionSection({
   lang,
   instanceId,
   projectId,
+  viewerMode,
+  viewerUserId,
 }: {
   title: string;
   sessions: SessionSummary[];
@@ -326,7 +375,10 @@ function SessionSection({
   lang: string;
   instanceId: string;
   projectId: string;
+  viewerMode: SessionViewerMode;
+  viewerUserId?: string;
 }) {
+  const { t } = useTranslation("instances");
   if (!sessions.length) return null;
   return (
     <section className="min-w-60 space-y-2 md:min-w-0">
@@ -349,9 +401,16 @@ function SessionSection({
               <span className="truncate font-medium">{session.title}</span>
               {session.attention ? <ShieldAlert className="size-4 shrink-0 text-primary" /> : null}
             </div>
-            <div className="mt-1 flex gap-2 text-xs text-muted-foreground">
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span>{session.shortId ?? session.sessionId.slice(0, 8)}</span>
               <span>{session.status}</span>
+              {shouldShowSessionAttribution({ session, viewerMode, viewerUserId }) ? (
+                <span className="rounded border bg-muted px-1.5 py-0.5 text-[11px] text-foreground">
+                  {t("remote.createdBy", {
+                    name: sessionAttributionName(session, t("remote.collaborator")),
+                  })}
+                </span>
+              ) : null}
             </div>
           </Link>
         ))}
@@ -363,10 +422,12 @@ function SessionSection({
 function Transcript({
   history,
   interruptFocus,
+  readOnly,
   onResolve,
 }: {
   history: HistoryEntry[];
   interruptFocus?: string;
+  readOnly: boolean;
   onResolve: (
     interruptId: string,
     resolution: "approve" | "deny" | "answer",
@@ -380,6 +441,7 @@ function Transcript({
           key={entry.id}
           entry={entry}
           focused={entry.kind === "interrupt" && entry.interrupt.interruptId === interruptFocus}
+          readOnly={readOnly}
           onResolve={onResolve}
         />
       ))}
@@ -390,10 +452,12 @@ function Transcript({
 function TranscriptEntry({
   entry,
   focused,
+  readOnly,
   onResolve,
 }: {
   entry: HistoryEntry;
   focused: boolean;
+  readOnly: boolean;
   onResolve: (
     interruptId: string,
     resolution: "approve" | "deny" | "answer",
@@ -437,6 +501,8 @@ function TranscriptEntry({
           ) : null}
           {entry.interrupt.resolved ? (
             <p className="text-sm text-muted-foreground">{t("remote.interruptResolved")}</p>
+          ) : readOnly ? (
+            <p className="text-sm text-muted-foreground">{t("remote.readOnlyInterruptNotice")}</p>
           ) : (
             <div className="flex flex-wrap gap-2">
               <Button
@@ -487,6 +553,49 @@ function Bubble({
         <p className="whitespace-pre-wrap text-sm">{text}</p>
       )}
     </div>
+  );
+}
+
+function SessionVisibilityToggle({
+  instanceId,
+  session,
+  disabled,
+}: {
+  instanceId: string;
+  session: SessionSummary;
+  disabled: boolean;
+}) {
+  const { t } = useTranslation("instances");
+  const shareSession = useRemoteSessionsStore((state) => state.shareSession);
+  const [pending, setPending] = useState(false);
+
+  async function toggle(shared: boolean) {
+    setPending(true);
+    try {
+      await shareSession(instanceId, session.sessionId, shared);
+    } catch {
+      toast.error(t("remote.shareSessionFailed"));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <label className="flex min-h-9 items-center gap-2 rounded-md border px-2 py-1.5 text-sm">
+      <span className="leading-tight">
+        <span className="block font-medium">{t("remote.visibleToCollaborators")}</span>
+        <span className="block text-xs text-muted-foreground">
+          {t("remote.visibleToCollaboratorsDescription")}
+        </span>
+      </span>
+      <Switch
+        size="sm"
+        checked={session.sharedWithCollaborators}
+        disabled={disabled || pending}
+        onCheckedChange={(checked) => void toggle(checked === true)}
+        aria-label={t("remote.visibleToCollaborators")}
+      />
+    </label>
   );
 }
 

@@ -1,6 +1,11 @@
 import { attachResultSchema, type LiveEvent } from "@flycockpit/cockpit-protocol";
-import { describe, expect, it } from "vitest";
-import { addOptimisticUserMessage, applyLiveEvent, mergeAttach } from "./remote-sessions";
+import { describe, expect, it, vi } from "vitest";
+import {
+  addOptimisticUserMessage,
+  applyLiveEvent,
+  mergeAttach,
+  useRemoteSessionsStore,
+} from "./remote-sessions";
 
 const attachFixture = {
   session: {
@@ -113,6 +118,31 @@ describe("remote session reducers", () => {
     const entry = state.detailsBySession.s1.history.find((entry) => entry.id === "h5");
     expect(entry).toMatchObject({ kind: "assistant_text", text: "Hello world" });
     expect(state.detailsBySession.s1.nextSeq).toBe(7);
+  });
+
+  it("optimistically shares sessions and reverts when the daemon rejects the toggle", async () => {
+    const attach = attachResultSchema.parse({
+      ...attachFixture,
+      session: { ...attachFixture.session, sharedWithCollaborators: false },
+    });
+    const base = mergeAttach(
+      { ...empty, sessionsByProject: { [attach.session.projectRoot]: [attach.session] } },
+      attach,
+    );
+    const shareSession = vi.fn().mockRejectedValueOnce(new Error("denied"));
+    useRemoteSessionsStore.setState({
+      instances: { i1: base },
+      clients: { i1: { shareSession } as never },
+    });
+
+    await expect(useRemoteSessionsStore.getState().shareSession("i1", "s1", true)).rejects.toThrow(
+      "denied",
+    );
+
+    expect(shareSession).toHaveBeenCalledWith("s1", true);
+    const state = useRemoteSessionsStore.getState().instances.i1;
+    expect(state.detailsBySession.s1.summary.sharedWithCollaborators).toBe(false);
+    expect(state.sessionsByProject["/work/app"][0]?.sharedWithCollaborators).toBe(false);
   });
 
   it("marks interrupts resolved for all viewers", () => {

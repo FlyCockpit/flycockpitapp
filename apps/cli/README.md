@@ -134,6 +134,7 @@ cockpit packages prune --dry-run
 | `cockpit daemon start --detach` | Start the persistent background daemon. |
 | `cockpit daemon status` | Show daemon status. |
 | `cockpit daemon stop` | Stop the daemon. |
+| `cockpit sync status` | Show session-log sync and remote-audit upload state. |
 | `cockpit providers list` | List built-in provider templates. |
 | `cockpit fetch-models [provider]` | Refresh model catalogs from configured providers. |
 | `cockpit models [provider]` | List locally configured models. |

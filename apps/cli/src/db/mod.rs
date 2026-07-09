@@ -35,6 +35,7 @@ pub mod pins;
 pub mod principals;
 pub mod project_notes;
 pub mod prune_ledger;
+pub mod remote_audit_upload;
 pub mod retention;
 pub mod seed_tools;
 pub mod session_goals;

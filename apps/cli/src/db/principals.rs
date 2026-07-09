@@ -7,6 +7,7 @@ use crate::db::Db;
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAuditRow {
+    pub audit_id: i64,
     pub principal: String,
     pub request_kind: String,
     pub session_id: Option<Uuid>,
@@ -74,7 +75,7 @@ impl Db {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT principal, request_kind, session_id, verdict, path
+                    "SELECT audit_id, principal, request_kind, session_id, verdict, path
                        FROM remote_principal_audit
                       ORDER BY audit_id ASC",
                 )
@@ -94,6 +95,7 @@ impl Db {
                                 )
                             })?;
                     Ok(RemoteAuditRow {
+                        audit_id: row.get("audit_id")?,
                         principal: row.get("principal")?,
                         request_kind: row.get("request_kind")?,
                         session_id,
@@ -105,6 +107,54 @@ impl Db {
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding remote audit row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_remote_audit_after(
+        &self,
+        cursor_audit_id: i64,
+        limit: usize,
+    ) -> Result<Vec<RemoteAuditRow>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT audit_id, principal, request_kind, session_id, verdict, path
+                       FROM remote_principal_audit
+                      WHERE audit_id > ?1
+                      ORDER BY audit_id ASC
+                      LIMIT ?2",
+                )
+                .context("preparing remote audit cursor query")?;
+            let rows = stmt
+                .query_map(params![cursor_audit_id, limit], |row| {
+                    let sid: Option<String> = row.get("session_id")?;
+                    let session_id =
+                        sid.as_deref()
+                            .map(Uuid::parse_str)
+                            .transpose()
+                            .map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?;
+                    Ok(RemoteAuditRow {
+                        audit_id: row.get("audit_id")?,
+                        principal: row.get("principal")?,
+                        request_kind: row.get("request_kind")?,
+                        session_id,
+                        verdict: row.get("verdict")?,
+                        path: row.get("path")?,
+                    })
+                })
+                .context("querying remote audit cursor rows")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding remote audit cursor row")?);
             }
             Ok(out)
         })
@@ -157,6 +207,7 @@ mod tests {
         .unwrap();
         let rows = db.list_remote_audit().unwrap();
         assert_eq!(rows.len(), 1);
+        assert!(rows[0].audit_id > 0);
         assert_eq!(rows[0].principal, "flycockpit:user-1");
         assert_eq!(rows[0].request_kind, "send_user_message");
         assert_eq!(rows[0].session_id, Some(session.session_id));
@@ -172,6 +223,10 @@ mod tests {
         )
         .unwrap();
         let rows = db.list_remote_audit().unwrap();
+        assert!(rows[0].audit_id < rows[1].audit_id);
         assert_eq!(rows[1].path.as_deref(), Some("src/main.rs"));
+        let after_first = db.list_remote_audit_after(rows[0].audit_id, 10).unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].audit_id, rows[1].audit_id);
     }
 }

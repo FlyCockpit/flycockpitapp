@@ -1103,6 +1103,25 @@ CREATE TABLE connector_state (
 
 CREATE INDEX idx_connector_state_enabled ON connector_state (enabled, status);
 
+-- ---- remote_audit_upload_state -----------------------------------------------------------------------
+-- Cursor state for uploading remote-principal audit rows to the app-side
+-- instance audit endpoint. The cursor is the last remote_principal_audit.audit_id
+-- the daemon has fully considered for upload; poison rows that are skipped still
+-- advance it so one malformed row cannot wedge the pipeline.
+
+CREATE TABLE remote_audit_upload_state (
+    server_url          TEXT    NOT NULL,
+    instance_id         TEXT    NOT NULL,
+    cursor_audit_id     INTEGER NOT NULL DEFAULT 0,
+    last_uploaded_at_ms INTEGER,
+    last_error          TEXT,
+    updated_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (server_url, instance_id)
+);
+
+CREATE INDEX idx_remote_audit_upload_state_server
+    ON remote_audit_upload_state (server_url, instance_id);
+
 -- ---- remote_principal_audit -----------------------------------------------------------------------------
 -- Audit trail for remote-principal requests (attribution columns on
 -- sessions/session_events carry the per-row provenance).

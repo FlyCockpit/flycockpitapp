@@ -33,6 +33,7 @@ pub mod principal;
 pub mod proto;
 pub mod registry;
 pub mod relay_envelope;
+pub mod remote_audit_upload;
 pub mod server;
 pub mod session_worker;
 pub mod shutdown;
@@ -698,6 +699,7 @@ pub async fn run_foreground_inner(
     // can't block a waiting `readlock` forever.
     server::spawn_lock_sweeper(ctx.clone());
     let org_sync_task = org_sync::spawn_background(ctx.clone());
+    let remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
     let connector_task = connector::spawn_background(ctx.clone());
 
     timer.phase("signal_and_watchdog");
@@ -742,6 +744,7 @@ pub async fn run_foreground_inner(
         watchdog.abort();
     }
     org_sync_task.abort();
+    remote_audit_upload_task.abort();
     connector_task.abort();
     result
 }

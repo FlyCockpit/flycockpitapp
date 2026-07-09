@@ -23,7 +23,6 @@ use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
-use super::category::{Category, CategoryPage};
 use super::grab;
 use super::shell::{SettingsScrollStates, push_wrapped_text, selected_line_from_marker};
 use super::{Nav, Page, SettingsDialog, save_status};
@@ -238,17 +237,7 @@ impl SettingsDialog {
         } else {
             Nav::Stay
         };
-        match nav {
-            Nav::Stay => {
-                self.page = page;
-                false
-            }
-            Nav::Replace(new) => {
-                self.page = new;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     fn handle_instructions_page_key(&mut self, key: KeyEvent, p: &mut InstructionsPage) -> Nav {
@@ -282,9 +271,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                return Nav::Replace(Page::Category(Box::new(CategoryPage::new(
-                    Category::Behavior,
-                ))));
+                return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
@@ -413,17 +400,7 @@ impl SettingsDialog {
         } else {
             Nav::Stay
         };
-        match nav {
-            Nav::Stay => {
-                self.page = page;
-                false
-            }
-            Nav::Replace(new) => {
-                self.page = new;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     fn handle_redact_patterns_page_key(
@@ -463,9 +440,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                return Nav::Replace(Page::Category(Box::new(CategoryPage::new(
-                    Category::Privacy,
-                ))));
+                return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);

@@ -253,17 +253,7 @@ impl SettingsDialog {
             Page::Mcp(McpPage::Add(s)) => self.handle_mcp_add_key(key, s),
             _ => Nav::Close,
         };
-        match nav {
-            Nav::Stay => {
-                self.page = page;
-                false
-            }
-            Nav::Replace(p) => {
-                self.page = p;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
@@ -273,9 +263,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                return Nav::Replace(Page::Root {
-                    cursor: self.last_root_cursor,
-                });
+                return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 s.delete_pending = false;

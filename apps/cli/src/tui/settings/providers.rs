@@ -1852,15 +1852,7 @@ impl SettingsDialog {
         } else {
             Nav::Stay
         };
-        self.page = page;
-        match nav {
-            Nav::Stay => false,
-            Nav::Replace(new) => {
-                self.page = new;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     fn handle_providers_page_key(&mut self, key: KeyEvent, page: &mut ProvidersPage) -> Nav {
@@ -1879,9 +1871,7 @@ impl SettingsDialog {
                 let pressed_d = matches!(key.code, KeyCode::Char('d'));
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                        return Nav::Replace(Page::Root {
-                            cursor: self.last_root_cursor,
-                        });
+                        return Nav::Back;
                     }
                     KeyCode::Char('q') => return Nav::Close,
                     KeyCode::Up | KeyCode::Char('k') => {

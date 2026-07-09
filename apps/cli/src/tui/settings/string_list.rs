@@ -24,7 +24,6 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
-use super::category::{Category, CategoryPage};
 use super::grab;
 use super::secret_display;
 use super::shell::{push_wrapped_text, selected_line_from_marker};
@@ -95,17 +94,6 @@ impl StringListKind {
             StringListKind::RedactDenylist => "  (type replacement)",
             StringListKind::RedactAllowlist => "  (type variable name)",
             StringListKind::GitignoreAllow => "  (type glob, e.g. target/)",
-        }
-    }
-
-    /// The category page this editor returns to on back-nav.
-    fn back_category(self) -> Category {
-        match self {
-            StringListKind::AgentDirs => Category::Behavior,
-            StringListKind::ExtraDotenvPaths
-            | StringListKind::RedactDenylist
-            | StringListKind::RedactAllowlist
-            | StringListKind::GitignoreAllow => Category::Privacy,
         }
     }
 }
@@ -321,17 +309,7 @@ impl SettingsDialog {
         } else {
             Nav::Stay
         };
-        match nav {
-            Nav::Stay => {
-                self.page = page;
-                false
-            }
-            Nav::Replace(new) => {
-                self.page = new;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     fn handle_string_list_page_key(&mut self, key: KeyEvent, p: &mut StringListPage) -> Nav {
@@ -369,9 +347,7 @@ impl SettingsDialog {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 p.delete.disarm();
-                return Nav::Replace(Page::Category(Box::new(CategoryPage::new(
-                    kind.back_category(),
-                ))));
+                return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);

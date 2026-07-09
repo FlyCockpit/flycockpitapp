@@ -1686,17 +1686,7 @@ impl SettingsDialog {
         } else {
             Nav::Stay
         };
-        match nav {
-            Nav::Stay => {
-                self.page = page;
-                false
-            }
-            Nav::Replace(new) => {
-                self.page = new;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     fn handle_category_page_key(&mut self, key: KeyEvent, p: &mut CategoryPage) -> Nav {
@@ -1774,9 +1764,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                return Nav::Replace(Page::Root {
-                    cursor: self.last_root_cursor,
-                });
+                return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.reset.disarm();
@@ -2179,21 +2167,21 @@ impl SettingsDialog {
                 p.status = None;
                 Nav::Stay
             }
-            S::Instructions => Nav::Replace(Page::Instructions(InstructionsPage::new())),
-            S::RedactPatterns => Nav::Replace(Page::RedactPatterns(RedactPatternsPage::new())),
-            S::AgentDirs => Nav::Replace(Page::StringList(Box::new(
+            S::Instructions => Nav::Push(Page::Instructions(InstructionsPage::new())),
+            S::RedactPatterns => Nav::Push(Page::RedactPatterns(RedactPatternsPage::new())),
+            S::AgentDirs => Nav::Push(Page::StringList(Box::new(
                 super::string_list::StringListPage::agent_dirs(),
             ))),
-            S::RedactExtraDotenvPaths => Nav::Replace(Page::StringList(Box::new(
+            S::RedactExtraDotenvPaths => Nav::Push(Page::StringList(Box::new(
                 super::string_list::StringListPage::extra_dotenv_paths(),
             ))),
-            S::RedactDenylist => Nav::Replace(Page::StringList(Box::new(
+            S::RedactDenylist => Nav::Push(Page::StringList(Box::new(
                 super::string_list::StringListPage::redact_denylist(),
             ))),
-            S::RedactAllowlist => Nav::Replace(Page::StringList(Box::new(
+            S::RedactAllowlist => Nav::Push(Page::StringList(Box::new(
                 super::string_list::StringListPage::redact_allowlist(),
             ))),
-            S::GitignoreAllow => Nav::Replace(Page::StringList(Box::new(
+            S::GitignoreAllow => Nav::Push(Page::StringList(Box::new(
                 super::string_list::StringListPage::gitignore_allow(),
             ))),
             _ => Nav::Stay,

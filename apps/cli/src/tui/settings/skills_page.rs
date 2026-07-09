@@ -65,17 +65,7 @@ impl SettingsDialog {
         } else {
             Nav::Stay
         };
-        match nav {
-            Nav::Stay => {
-                self.page = page;
-                false
-            }
-            Nav::Replace(new) => {
-                self.page = new;
-                false
-            }
-            Nav::Close => true,
-        }
+        self.apply_nav(page, nav)
     }
 
     /// Toggles occupy cursors `0..TOGGLE_ROWS`; scan-dir rows occupy
@@ -106,9 +96,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                return Nav::Replace(Page::Root {
-                    cursor: self.last_root_cursor,
-                });
+                return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.reset.disarm();

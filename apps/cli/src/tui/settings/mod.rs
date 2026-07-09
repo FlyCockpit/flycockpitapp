@@ -130,9 +130,9 @@ pub struct SettingsDialog {
     /// recent load. Unknown raw keys are preserved separately by
     /// [`ExtendedConfigDoc`].
     pub(super) extended_warnings: Vec<String>,
-    /// Root-page cursor restored when navigating back. Updated every
-    /// time we leave Root for a subpage.
-    pub(super) last_root_cursor: usize,
+    /// Live parent pages for drill-down navigation. Popping restores the
+    /// exact page struct, including cursor and scroll state.
+    stack: Vec<Page>,
     /// The cwd this dialog was opened against. Held so Root's `h`/←
     /// can reopen the picker without losing context. `None` when the
     /// settings dialog was opened from a flow that has no picker to
@@ -301,8 +301,12 @@ pub(super) enum Nav {
     /// Stay on the current page; sub-state mutations have already been
     /// applied to the borrowed `&mut SubState`.
     Stay,
-    /// Navigate to `Page::...`.
+    /// Navigate to `Page::...` without preserving the current page.
     Replace(Page),
+    /// Push the current page and navigate to `Page::...`.
+    Push(Page),
+    /// Pop one page from the navigation stack.
+    Back,
     /// Close the whole dialog.
     Close,
 }
@@ -743,7 +747,7 @@ impl SettingsDialog {
             config,
             extended,
             extended_warnings,
-            last_root_cursor: 0,
+            stack: Vec::new(),
             picker_cwd: None,
             active_project_root: None,
             back_to_picker: false,
@@ -1081,6 +1085,34 @@ impl SettingsDialog {
         }
     }
 
+    fn apply_nav(&mut self, current: Page, nav: Nav) -> bool {
+        match nav {
+            Nav::Stay => {
+                self.page = current;
+                false
+            }
+            Nav::Replace(new) => {
+                self.page = new;
+                false
+            }
+            Nav::Push(new) => {
+                self.stack.push(current);
+                self.page = new;
+                false
+            }
+            Nav::Back => {
+                self.page = self.stack.pop().unwrap_or(Page::Root { cursor: 0 });
+                false
+            }
+            Nav::Close => true,
+        }
+    }
+
+    fn push_page(&mut self, current: Page, next: Page) {
+        self.stack.push(current);
+        self.page = next;
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         // Tab / Shift+Tab move between fields like ↓/↑ across settings
         // screens. The header editor owns Tab itself (the popup switches
@@ -1139,20 +1171,46 @@ impl SettingsDialog {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let chosen = children.get(cursor).map(|n| n.title).unwrap_or("");
-                self.last_root_cursor = cursor;
-                match chosen {
-                    PROVIDERS_TITLE => self.enter_providers(),
-                    "Agents" => {
-                        self.page = Page::Agents(AgentsPage::new(&self.agents_cwd()));
+                let next = match chosen {
+                    PROVIDERS_TITLE => Some(Page::Providers(ProvidersPage::List {
+                        cursor: providers::initial_list_cursor(&self.config),
+                        status: None,
+                        delete_pending: false,
+                    })),
+                    "Agents" => Some(Page::Agents(AgentsPage::new(&self.agents_cwd()))),
+                    "Interface" => {
+                        self.reload_extended();
+                        Some(Page::Category(Box::new(CategoryPage::new(
+                            Category::Interface,
+                        ))))
                     }
-                    "Interface" => self.enter_category(Category::Interface),
-                    "Behavior" => self.enter_category(Category::Behavior),
-                    "Privacy & Safety" => self.enter_category(Category::Privacy),
-                    "Translation" => self.enter_category(Category::Translation),
-                    "Profile" => self.enter_category(Category::Profile),
+                    "Behavior" => {
+                        self.reload_extended();
+                        Some(Page::Category(Box::new(CategoryPage::new(
+                            Category::Behavior,
+                        ))))
+                    }
+                    "Privacy & Safety" => {
+                        self.reload_extended();
+                        Some(Page::Category(Box::new(CategoryPage::new(
+                            Category::Privacy,
+                        ))))
+                    }
+                    "Translation" => {
+                        self.reload_extended();
+                        Some(Page::Category(Box::new(CategoryPage::new(
+                            Category::Translation,
+                        ))))
+                    }
+                    "Profile" => {
+                        self.reload_extended();
+                        Some(Page::Category(Box::new(CategoryPage::new(
+                            Category::Profile,
+                        ))))
+                    }
                     "Tools" => {
                         self.reload_extended();
-                        self.page = Page::Tools(ToolsPage {
+                        Some(Page::Tools(ToolsPage {
                             cursor: 0,
                             setup: None,
                             editing: None,
@@ -1160,12 +1218,12 @@ impl SettingsDialog {
                             edit_target: None,
                             status: None,
                             reset: ResetButton::default(),
-                        });
+                        }))
                     }
                     "Harnesses" => {
                         self.reload_extended();
                         let status = self.extended_warnings.first().cloned();
-                        self.page = Page::Harnesses(harnesses_page::HarnessesPage::List(
+                        Some(Page::Harnesses(harnesses_page::HarnessesPage::List(
                             harnesses_page::ListState {
                                 cursor: 0,
                                 status,
@@ -1173,31 +1231,36 @@ impl SettingsDialog {
                                 reset: ResetButton::default(),
                                 adding: None,
                             },
-                        ));
+                        )))
                     }
                     "Skills" => {
                         self.reload_extended();
-                        self.page = Page::Skills(skills_page::SkillsPage {
+                        Some(Page::Skills(skills_page::SkillsPage {
                             cursor: 0,
                             grabbed: None,
                             status: None,
                             reset: ResetButton::default(),
-                        });
+                        }))
                     }
-                    "MCP" => {
-                        self.enter_mcp();
-                    }
+                    "MCP" => Some(Page::Mcp(mcp_page::McpPage::List(mcp_page::ListState {
+                        cursor: 0,
+                        status: None,
+                        delete_pending: false,
+                    }))),
                     "LSP" => {
                         self.reload_extended();
-                        self.page = Page::Lsp(LspPage {
+                        Some(Page::Lsp(LspPage {
                             cursor: 0,
                             editing: None,
                             buf: TextField::default(),
                             status: None,
                             reset: ResetButton::default(),
-                        });
+                        }))
                     }
-                    _ => {}
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    self.push_page(Page::Root { cursor }, next);
                 }
                 return false;
             }
@@ -1262,14 +1325,16 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Esc => {
                 p.reset.disarm();
-                return true;
+                let nav = if self.stack.is_empty() {
+                    Nav::Close
+                } else {
+                    Nav::Back
+                };
+                return self.apply_nav(Page::Lsp(p), nav);
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 p.reset.disarm();
-                self.page = Page::Root {
-                    cursor: self.last_root_cursor,
-                };
-                return false;
+                return self.apply_nav(Page::Lsp(p), Nav::Back);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.reset.disarm();
@@ -4504,6 +4569,134 @@ mod tests {
             matches!(d.page, Page::Instructions(_)),
             "expected Instructions page after Enter on the instructions row, got {:?}",
             d.page
+        );
+    }
+
+    #[test]
+    fn nav_stack_restores_behavior_cursor_and_scroll_from_instructions() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_root_node(&mut d, "Behavior");
+        let before_cursor = match &mut d.page {
+            Page::Category(p) => {
+                p.cursor = p.cursor_of(SettingId::Instructions).unwrap();
+                p.cursor
+            }
+            other => panic!("expected Behavior category, got {other:?}"),
+        };
+
+        let _ = render_settings_rows(&d, 80, 10);
+        let before_offset = d.scroll_states.offset_for("category:Behavior");
+        assert!(before_offset > 0, "test setup should scroll Behavior");
+
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(d.page, Page::Instructions(_)));
+        d.handle_key(press(KeyCode::Esc));
+
+        match &d.page {
+            Page::Category(p) => {
+                assert_eq!(p.category, Category::Behavior);
+                assert_eq!(p.cursor, before_cursor);
+            }
+            other => panic!("expected restored Behavior category, got {other:?}"),
+        }
+        assert_eq!(
+            d.scroll_states.offset_for("category:Behavior"),
+            before_offset,
+            "category ListState offset should survive drill-in/back"
+        );
+    }
+
+    #[test]
+    fn nav_stack_restores_privacy_and_string_list_parents() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_root_node(&mut d, "Privacy & Safety");
+        let privacy_cursor = match &mut d.page {
+            Page::Category(p) => {
+                p.cursor = p.cursor_of(SettingId::RedactPatterns).unwrap();
+                p.cursor
+            }
+            other => panic!("expected Privacy category, got {other:?}"),
+        };
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(d.page, Page::RedactPatterns(_)));
+        d.handle_key(press(KeyCode::Esc));
+        match &d.page {
+            Page::Category(p) => {
+                assert_eq!(p.category, Category::Privacy);
+                assert_eq!(p.cursor, privacy_cursor);
+            }
+            other => panic!("expected restored Privacy category, got {other:?}"),
+        }
+
+        enter_root_node(&mut d, "Behavior");
+        let behavior_cursor = match &mut d.page {
+            Page::Category(p) => {
+                p.cursor = p.cursor_of(SettingId::AgentDirs).unwrap();
+                p.cursor
+            }
+            other => panic!("expected Behavior category, got {other:?}"),
+        };
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(d.page, Page::StringList(_)));
+        d.handle_key(press(KeyCode::Esc));
+        match &d.page {
+            Page::Category(p) => {
+                assert_eq!(p.category, Category::Behavior);
+                assert_eq!(p.cursor, behavior_cursor);
+            }
+            other => panic!("expected restored Behavior category, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_from_depth_two_pops_only_one_level() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_root_node(&mut d, "Behavior");
+        match &mut d.page {
+            Page::Category(p) => p.cursor = p.cursor_of(SettingId::Instructions).unwrap(),
+            other => panic!("expected Behavior category, got {other:?}"),
+        }
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(d.page, Page::Instructions(_)));
+
+        assert!(!d.handle_key(press(KeyCode::Esc)));
+        assert!(
+            matches!(&d.page, Page::Category(p) if p.category == Category::Behavior),
+            "Esc from sub-page should restore Behavior, got {:?}",
+            d.page
+        );
+    }
+
+    #[test]
+    fn popped_parent_renders_updated_subpage_values() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.extended.agent_guidance_files.clear();
+        enter_root_node(&mut d, "Behavior");
+        match &mut d.page {
+            Page::Category(p) => p.cursor = p.cursor_of(SettingId::Instructions).unwrap(),
+            other => panic!("expected Behavior category, got {other:?}"),
+        }
+        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(press(KeyCode::Char('a')));
+        type_chars(&mut d, "STACK.md");
+        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(press(KeyCode::Esc));
+
+        assert!(
+            d.extended
+                .agent_guidance_files
+                .iter()
+                .any(|path| path == "STACK.md"),
+            "restored category should see updated instructions config"
+        );
+        let rendered = render_settings_rows(&d, 100, 20).join("\n");
+        assert!(
+            rendered.contains("STACK") && rendered.contains(".md"),
+            "restored category should render updated instructions value; got:\n{rendered}"
         );
     }
 

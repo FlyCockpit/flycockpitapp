@@ -3,16 +3,17 @@
 //! See `the design notes` §1e for the spec. The composer collects `@partial`
 //! tokens; this module walks the cwd (gitignore-aware via the `ignore`
 //! crate), ranks candidates, and on submit rewrites every `@path[:range]`
-//! into a fenced `<file …>` / `<dir …>` block bounded by the read tool's
-//! byte cap.
+//! into a fenced `<file …>` / `<dir …>` block. File blocks use the same
+//! line-numbered format as the read tool, with mode-tiered tag caps.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use crate::config::extended::LlmMode;
 use crate::tools::common::{
-    OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice, truncation_marker,
+    OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice_with_byte_cap, truncation_marker,
 };
 
 /// Size of the visible suggestion window. Matches `AUTOCOMPLETE_ROWS` in
@@ -38,9 +39,38 @@ const MAX_WALK_ENTRIES: usize = 10_000;
 /// aren't possible; this guards against absurdly deep trees).
 const MAX_DEEPEN_DEPTH: usize = 32;
 
-/// Max directory entries shown for an `@dir/` inline expansion. Anything
-/// beyond this becomes a `... N more entries` footer.
+/// Normal-mode max directory entries shown for an `@dir/` inline expansion.
+/// Mode-specific caps live in [`TagInlineCaps`].
 const DIR_ENTRY_CAP: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagInlineCaps {
+    pub max_bytes: usize,
+    pub max_lines: usize,
+    pub max_dir_entries: usize,
+}
+
+impl TagInlineCaps {
+    pub fn for_mode(mode: LlmMode) -> Self {
+        match mode {
+            LlmMode::Defensive => Self {
+                max_bytes: OUTPUT_BYTE_CAP,
+                max_lines: 500,
+                max_dir_entries: 30,
+            },
+            LlmMode::Normal => Self {
+                max_bytes: 48 * 1024,
+                max_lines: READ_LINE_CAP,
+                max_dir_entries: DIR_ENTRY_CAP,
+            },
+            LlmMode::Frontier => Self {
+                max_bytes: 256 * 1024,
+                max_lines: 10_000,
+                max_dir_entries: 500,
+            },
+        }
+    }
+}
 
 /// One file/directory suggestion the popup renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,10 +345,16 @@ pub struct TagPolicy {
     cwd_resolved: PathBuf,
     allow_root: PathBuf,
     allow: Vec<String>,
+    caps: TagInlineCaps,
 }
 
 impl TagPolicy {
-    pub fn new(cwd: &Path, allow: Vec<String>) -> Self {
+    #[cfg(test)]
+    fn new(cwd: &Path, allow: Vec<String>) -> Self {
+        Self::new_for_mode(cwd, allow, LlmMode::Normal)
+    }
+
+    pub fn new_for_mode(cwd: &Path, allow: Vec<String>, mode: LlmMode) -> Self {
         let cwd_resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let allow_root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
         Self {
@@ -326,11 +362,16 @@ impl TagPolicy {
             cwd_resolved,
             allow_root,
             allow,
+            caps: TagInlineCaps::for_mode(mode),
         }
     }
 
     fn allow(&self) -> &[String] {
         &self.allow
+    }
+
+    fn caps(&self) -> TagInlineCaps {
+        self.caps
     }
 }
 
@@ -538,6 +579,9 @@ fn try_inline(
     {
         return blocked;
     }
+    let caps = policy
+        .map(TagPolicy::caps)
+        .unwrap_or_else(|| TagInlineCaps::for_mode(LlmMode::Normal));
     let meta = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(e) => {
@@ -561,7 +605,7 @@ fn try_inline(
                 "skipped",
             );
         }
-        let (block, count) = render_directory(&resolved, path_part, policy);
+        let (block, count) = render_directory(&resolved, path_part, policy, caps);
         return Expanded {
             wire_piece: block,
             expansion: TagExpansion {
@@ -602,7 +646,7 @@ fn try_inline(
     // with an explicit range is always inlined (the slice is bounded).
     if range.is_none() {
         let line_count = text.lines().count();
-        if line_count > READ_LINE_CAP || bytes.len() > OUTPUT_BYTE_CAP {
+        if line_count > caps.max_lines || bytes.len() > caps.max_bytes {
             let note = format!(
                 " [note: @{path_part} is {line_count} lines — not inlined; ask read with offset/limit]"
             );
@@ -618,7 +662,7 @@ fn try_inline(
         }
     }
 
-    let (block, lines_shown) = render_file(&text, path_part, range);
+    let (block, lines_shown) = render_file(&text, path_part, range, caps);
     Expanded {
         wire_piece: block,
         expansion: TagExpansion {
@@ -720,12 +764,17 @@ fn skip(tool: &'static str, path: &str, raw: &str, note_body: String, detail: &s
 
 /// Render a file as a line-numbered `<file>` block via the shared `read`
 /// formatter. Returns the block and the number of lines shown.
-fn render_file(text: &str, display_path: &str, range: Option<(usize, usize)>) -> (String, usize) {
+fn render_file(
+    text: &str,
+    display_path: &str,
+    range: Option<(usize, usize)>,
+    caps: TagInlineCaps,
+) -> (String, usize) {
     let (offset, limit) = match range {
         Some((start, end)) => (start, end - start + 1),
-        None => (1, READ_LINE_CAP),
+        None => (1, caps.max_lines),
     };
-    let slice = read_slice(text, offset, limit);
+    let slice = read_slice_with_byte_cap(text, offset, limit, caps.max_bytes);
     let lines_shown = slice.numbered.lines().count();
     let mut out = format!("\n<file path=\"{display_path}\">\n{}", slice.numbered);
     if !out.ends_with('\n') {
@@ -745,6 +794,7 @@ fn render_directory(
     path: &Path,
     display_path: &str,
     policy: Option<&TagPolicy>,
+    caps: TagInlineCaps,
 ) -> (String, usize) {
     let display = if display_path.ends_with('/') {
         display_path.to_string()
@@ -784,7 +834,7 @@ fn render_directory(
     });
     let total = entries.len();
     let mut body = String::new();
-    for (name, is_dir, size) in entries.iter().take(DIR_ENTRY_CAP) {
+    for (name, is_dir, size) in entries.iter().take(caps.max_dir_entries) {
         let kind = if *is_dir { "dir" } else { "file" };
         if *is_dir {
             body.push_str(&format!("{name}/ ({kind})\n"));
@@ -792,8 +842,8 @@ fn render_directory(
             body.push_str(&format!("{name} ({kind}) {size}\n"));
         }
     }
-    if total > DIR_ENTRY_CAP {
-        let remaining = total - DIR_ENTRY_CAP;
+    if total > caps.max_dir_entries {
+        let remaining = total - caps.max_dir_entries;
         body.push_str(&format!(
             "... {remaining} more entries; @-tag a subdirectory or ask explore for a search\n"
         ));
@@ -815,6 +865,190 @@ mod tests {
     /// the dirs-first/alpha ordering, not the count tie-breaker.
     fn sug(cwd: &Path, q: &str) -> Vec<Suggestion> {
         suggestions(cwd, q, &HashMap::new(), &[])
+    }
+
+    fn policy_for_mode(cwd: &Path, mode: LlmMode) -> TagPolicy {
+        TagPolicy::new_for_mode(cwd, Vec::new(), mode)
+    }
+
+    fn expand_with_mode(buffer: &str, cwd: &Path, mode: LlmMode) -> ExpandResult {
+        let policy = policy_for_mode(cwd, mode);
+        expand_tags_with_policy(buffer, &policy)
+    }
+
+    fn repeated_lines(line_count: usize, width: usize) -> String {
+        let body = "x".repeat(width);
+        let mut out = String::new();
+        for i in 1..=line_count {
+            out.push_str(&format!("line {i:04} {body}\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn tag_inline_caps_are_mode_tiered_and_policy_constructs_from_mode() {
+        let root = tmp_root();
+        for (mode, expected) in [
+            (
+                LlmMode::Defensive,
+                TagInlineCaps {
+                    max_bytes: 8 * 1024,
+                    max_lines: 500,
+                    max_dir_entries: 30,
+                },
+            ),
+            (
+                LlmMode::Normal,
+                TagInlineCaps {
+                    max_bytes: 48 * 1024,
+                    max_lines: 2_000,
+                    max_dir_entries: 100,
+                },
+            ),
+            (
+                LlmMode::Frontier,
+                TagInlineCaps {
+                    max_bytes: 256 * 1024,
+                    max_lines: 10_000,
+                    max_dir_entries: 500,
+                },
+            ),
+        ] {
+            assert_eq!(TagInlineCaps::for_mode(mode), expected);
+            assert_eq!(policy_for_mode(root.path(), mode).caps(), expected);
+        }
+    }
+
+    #[test]
+    fn mode_caps_gate_full_file_tags_by_lines_and_bytes() {
+        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+            let root = tmp_root();
+            let caps = TagInlineCaps::for_mode(mode);
+
+            fs::write(
+                root.path().join("within.txt"),
+                repeated_lines(caps.max_lines, 1),
+            )
+            .unwrap();
+            let within = expand_with_mode("@within.txt", root.path(), mode);
+            assert!(
+                within.wire.contains("<file path=\"within.txt\">"),
+                "{mode:?}: {}",
+                within.wire
+            );
+            assert!(within.expansions[0].ok, "{mode:?}");
+
+            fs::write(
+                root.path().join("too_many_lines.txt"),
+                repeated_lines(caps.max_lines + 1, 1),
+            )
+            .unwrap();
+            let too_many_lines = expand_with_mode("@too_many_lines.txt", root.path(), mode);
+            assert!(
+                !too_many_lines.wire.contains("<file"),
+                "{mode:?}: {}",
+                too_many_lines.wire
+            );
+            assert!(
+                too_many_lines.wire.contains("not inlined"),
+                "{mode:?}: {}",
+                too_many_lines.wire
+            );
+            assert!(!too_many_lines.expansions[0].ok, "{mode:?}");
+
+            fs::write(
+                root.path().join("too_many_bytes.txt"),
+                "x".repeat(caps.max_bytes + 1),
+            )
+            .unwrap();
+            let too_many_bytes = expand_with_mode("@too_many_bytes.txt", root.path(), mode);
+            assert!(
+                !too_many_bytes.wire.contains("<file"),
+                "{mode:?}: {}",
+                too_many_bytes.wire
+            );
+            assert!(
+                too_many_bytes.wire.contains("not inlined"),
+                "{mode:?}: {}",
+                too_many_bytes.wire
+            );
+            assert!(!too_many_bytes.expansions[0].ok, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn mode_caps_scale_range_tag_byte_ceiling() {
+        for (lower, higher, lines, width) in [
+            (LlmMode::Defensive, LlmMode::Normal, 80, 120),
+            (LlmMode::Normal, LlmMode::Frontier, 300, 200),
+        ] {
+            let root = tmp_root();
+            fs::write(root.path().join("range.txt"), repeated_lines(lines, width)).unwrap();
+
+            let lower_res = expand_with_mode(&format!("@range.txt:1-{lines}"), root.path(), lower);
+            assert!(
+                lower_res.wire.contains("[truncated"),
+                "{lower:?}: {}",
+                lower_res.wire
+            );
+            assert!(lower_res.expansions[0].ok, "{lower:?}");
+
+            let higher_res =
+                expand_with_mode(&format!("@range.txt:1-{lines}"), root.path(), higher);
+            assert!(
+                !higher_res.wire.contains("[truncated"),
+                "{higher:?}: {}",
+                higher_res.wire
+            );
+            assert_eq!(higher_res.expansions[0].detail, format!("{lines} lines"));
+        }
+
+        let root = tmp_root();
+        let lines = 1_500;
+        fs::write(
+            root.path().join("frontier-range.txt"),
+            repeated_lines(lines, 200),
+        )
+        .unwrap();
+        let frontier = expand_with_mode(
+            &format!("@frontier-range.txt:1-{lines}"),
+            root.path(),
+            LlmMode::Frontier,
+        );
+        assert!(
+            frontier.wire.contains("[truncated"),
+            "wire: {}",
+            frontier.wire
+        );
+    }
+
+    #[test]
+    fn mode_caps_scale_directory_listing_limit_and_remaining_count() {
+        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+            let root = tmp_root();
+            let caps = TagInlineCaps::for_mode(mode);
+            let dir_name = mode.as_str();
+            let dir = root.path().join(dir_name);
+            fs::create_dir(&dir).unwrap();
+            for i in 0..caps.max_dir_entries + 2 {
+                fs::write(dir.join(format!("file-{i:04}.txt")), "x").unwrap();
+            }
+
+            let res = expand_with_mode(&format!("@{dir_name}"), root.path(), mode);
+            assert_eq!(
+                res.wire.matches("(file)").count(),
+                caps.max_dir_entries,
+                "{mode:?}: {}",
+                res.wire
+            );
+            assert!(
+                res.wire.contains(
+                    "... 2 more entries; @-tag a subdirectory or ask explore for a search"
+                ),
+                "{mode:?}: {}",
+                res.wire
+            );
+        }
     }
 
     #[test]

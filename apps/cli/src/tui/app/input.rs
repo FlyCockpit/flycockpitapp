@@ -1951,7 +1951,8 @@ impl App {
         let quoted = crate::tui::file_tag::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = crate::config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
-        let tag_policy = crate::tui::file_tag::TagPolicy::new(&self.launch.cwd, allow);
+        let tag_policy =
+            crate::tui::file_tag::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
         let expanded = crate::tui::file_tag::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original

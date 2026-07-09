@@ -96,14 +96,24 @@ pub struct ReadSlice {
     pub offset_exceeded: bool,
 }
 
-/// Core of the `read` tool's output formatting (plan §13a), factored out
-/// so composer `@`-tag inlining produces byte-for-byte identical
-/// line-numbered, capped output. `offset` is 1-indexed, `limit` is in
-/// lines; applies the 2000-line / 8 KB caps. An `offset` past EOF yields
-/// an empty body (caller decides how to message it).
+/// Core of the `read` tool's output formatting (plan §13a). It returns
+/// line-numbered output in the shared format used by `read` and composer
+/// `@`-tag inlining. `offset` is 1-indexed, `limit` is in lines; the `read`
+/// tool uses the legacy 2000-line / 8 KB caps while tag inlining may pass a
+/// mode-specific byte ceiling via [`read_slice_with_byte_cap`]. An `offset`
+/// past EOF yields an empty body (caller decides how to message it).
 pub fn read_slice(text: &str, offset: usize, limit: usize) -> ReadSlice {
+    read_slice_with_byte_cap(text, offset, limit, OUTPUT_BYTE_CAP)
+}
+
+pub fn read_slice_with_byte_cap(
+    text: &str,
+    offset: usize,
+    limit: usize,
+    output_byte_cap: usize,
+) -> ReadSlice {
     let offset = offset.max(1);
-    let byte_cap = OUTPUT_BYTE_CAP.saturating_sub(80);
+    let byte_cap = output_byte_cap.saturating_sub(80);
     let mut numbered = String::new();
     let mut total_lines = 0;
     let mut emitted = 0;
@@ -398,6 +408,19 @@ mod tests {
         assert_eq!(slice.next_offset, 1);
         assert_eq!(slice.total_lines, 2);
         assert!(!slice.offset_exceeded);
+    }
+
+    #[test]
+    fn read_slice_with_byte_cap_uses_explicit_ceiling() {
+        let text = format!("{}\nsmall\n", "x".repeat(OUTPUT_BYTE_CAP + 200));
+        let legacy = read_slice(&text, 1, READ_LINE_CAP);
+        let larger = read_slice_with_byte_cap(&text, 1, READ_LINE_CAP, 48 * 1024);
+
+        assert!(legacy.truncated);
+        assert_eq!(legacy.numbered, "");
+        assert!(!larger.truncated);
+        assert!(larger.numbered.contains("1|"));
+        assert!(larger.numbered.contains("2|small"));
     }
 
     #[test]

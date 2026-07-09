@@ -96,6 +96,8 @@ impl DaemonContext {
             global_events.clone(),
             terminal_temp_root(&paths),
         ));
+        let container = Arc::new(crate::container::ContainerManager::detect());
+        let _ = crate::container::container_manager().set((*container).clone());
         spawn_terminal_reaper(terminal_host.clone(), shutdown.clone());
         registry.lsp_manager().set_notice_bus(global_events.clone());
         registry.set_global_bus(global_events.clone());
@@ -2193,14 +2195,25 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
-        Request::SetSandbox { enabled } => {
-            // Sandboxing part 2: flip the session's sandbox flag directly
-            // (it's a shared atomic) and reply with the resulting state.
-            // The handle also broadcasts a `SandboxState` event so every
-            // attached client stays in sync.
+        Request::SetSandbox {
+            mode,
+            container_network_enabled,
+        } => {
+            // Flip the session's sandbox mode directly (it's a shared
+            // atomic) and reply with the resulting state. The handle also
+            // broadcasts a `SandboxState` event so every attached client
+            // stays in sync.
             let att = require_attached(state)?;
-            let new = att.handle.set_sandbox(enabled);
-            Ok(Response::SandboxState { enabled: new })
+            let new = att
+                .handle
+                .set_sandbox(mode, container_network_enabled)
+                .map_err(bad_request)?;
+            Ok(Response::SandboxState {
+                mode: new,
+                enabled: new.enabled(),
+                container_network_enabled: att.handle.container_network_enabled(),
+                container_availability: crate::container::availability_snapshot(),
+            })
         }
 
         Request::SetPreflight { enabled } => {
@@ -2662,7 +2675,7 @@ async fn attach(
             .map_err(internal)?;
     }
     if remote_readonly_attach {
-        handle.set_sandbox(Some(true));
+        let _ = handle.set_sandbox(Some(crate::tools::sandbox_mode::SandboxMode::Sandbox), None);
         handle.set_approval_mode(crate::config::extended::ApprovalMode::Manual);
     }
 

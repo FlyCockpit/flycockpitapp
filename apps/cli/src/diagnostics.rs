@@ -23,6 +23,9 @@ pub struct DiagnosticsSnapshot {
     pub project_root: String,
     pub workspace_trust: String,
     pub sandbox: String,
+    pub container_runtime: String,
+    pub container_harness: String,
+    pub container_available: String,
     pub approval_mode: String,
     pub providers: Vec<String>,
     pub harnesses: Vec<String>,
@@ -69,6 +72,11 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
     let trust_mode = workspace_trust_mode(&input.cwd)?;
     let trust_resolved = trust_mode != "unresolved";
+    let container = crate::container::availability_snapshot();
+    let container_reason = container
+        .reason
+        .map(|reason| reason.as_str())
+        .unwrap_or("none");
 
     Ok(DiagnosticsSnapshot {
         session: session_label(input.session_id, input.session_short_id.as_deref()),
@@ -89,6 +97,16 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             .sandbox_enabled
             .map(|enabled| if enabled { "on" } else { "off" }.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        container_runtime: container
+            .runtime
+            .map(|runtime| runtime.as_str().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        container_harness: container.harness_in_container.to_string(),
+        container_available: if container.available {
+            "true".to_string()
+        } else {
+            format!("false ({container_reason})")
+        },
         approval_mode: extended.default_approval_mode.as_str().to_string(),
         providers: provider_lines(&providers, extended.trusted_only),
         harnesses: harness_lines(&harnesses, trust_resolved),

@@ -664,7 +664,9 @@ pub enum TurnEvent {
     /// Filesystem sandboxing was toggled for the session (`/sandbox`,
     /// sandboxing part 2). UI-only: the TUI surfaces the resulting state
     /// as a toast. Emitted by the daemon's `SetSandbox` handler.
-    SandboxState { enabled: bool },
+    SandboxState {
+        mode: crate::tools::sandbox_mode::SandboxMode,
+    },
 
     /// The shell sandbox cannot initialize (a confined `bash` hit the
     /// `SandboxGate::Refuse` path — Linux userns case; `implementation notes`

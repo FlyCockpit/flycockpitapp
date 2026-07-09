@@ -71,14 +71,13 @@ pub struct Session {
     /// [`Self::tmp_dir`] access; removed on [`Self::end`] and on drop.
     /// `Mutex<Option<…>>` so creation is one-shot and `end()` can take it.
     tmp_dir: Mutex<Option<PathBuf>>,
-    /// Whether filesystem sandboxing is active for this session
-    /// (sandboxing part 2). Resolved at spawn time by the precedence
-    /// daemon-`--no-sandbox` → client-`--no-sandbox` → ON
-    /// ([`Self::set_sandbox_enabled`]); flipped at runtime by the
-    /// `/sandbox` slash command. Read per tool call via
-    /// [`Self::sandbox_enabled`]; effective immediately. Default `true`
-    /// (sandboxing on) until the spawn path resolves the precedence.
-    sandbox_enabled: std::sync::atomic::AtomicBool,
+    /// Live sandbox mode for this session. Resolved at spawn time by the
+    /// daemon/client `--no-sandbox` precedence and flipped at runtime by
+    /// `/sandbox`. In-memory only; resumed sessions re-resolve defaults.
+    sandbox_mode: AtomicU8,
+    /// Per-session container-network toggle. Only honored by container modes;
+    /// default off so container sandboxes start with `--network none`.
+    container_network_enabled: AtomicBool,
     /// Command-approval mode for this session right now
     /// (implementation note), encoded by
     /// [`approval_mode_to_u8`] / [`approval_mode_from_u8`]. Resolved at
@@ -381,7 +380,10 @@ impl Session {
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
-            sandbox_enabled: AtomicBool::new(true),
+            sandbox_mode: AtomicU8::new(sandbox_mode_to_u8(
+                crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            )),
+            container_network_enabled: AtomicBool::new(false),
             // Default `manual` until the spawn path applies the config default.
             approval_mode: AtomicU8::new(approval_mode_to_u8(
                 crate::config::extended::ApprovalMode::Manual,
@@ -476,25 +478,53 @@ impl Session {
         tip.suppressed_by().iter().any(|name| set.contains(*name))
     }
 
-    /// Whether filesystem sandboxing is active for this session right now
-    /// (sandboxing part 2). Read per tool call.
+    /// Whether any sandboxing mode is active for this session right now.
+    /// Kept as a derived helper so native file-tool checks can remain boolean.
     pub fn sandbox_enabled(&self) -> bool {
-        self.sandbox_enabled.load(Ordering::Relaxed)
+        self.sandbox_mode().enabled()
     }
 
-    /// Set the session's sandbox-enabled flag. Used by the spawn path to
-    /// apply the daemon → client → ON precedence, and by the `/sandbox`
-    /// slash command to flip it at runtime. Returns the new state.
+    pub fn sandbox_mode(&self) -> crate::tools::sandbox_mode::SandboxMode {
+        sandbox_mode_from_u8(self.sandbox_mode.load(Ordering::Relaxed))
+    }
+
+    pub fn set_sandbox_mode(
+        &self,
+        mode: crate::tools::sandbox_mode::SandboxMode,
+    ) -> crate::tools::sandbox_mode::SandboxMode {
+        self.sandbox_mode
+            .store(sandbox_mode_to_u8(mode), Ordering::Relaxed);
+        mode
+    }
+
+    /// Legacy on/off setter used by existing callers until the UX prompt grows
+    /// mode selection. `true` maps to the zerobox sandbox, `false` to off.
     pub fn set_sandbox_enabled(&self, enabled: bool) -> bool {
-        self.sandbox_enabled.store(enabled, Ordering::Relaxed);
+        self.set_sandbox_mode(crate::tools::sandbox_mode::SandboxMode::from_enabled(
+            enabled,
+        ));
         enabled
     }
 
-    /// Toggle the sandbox-enabled flag (`/sandbox` with no argument).
-    /// Returns the new state.
+    #[cfg(test)]
+    pub fn toggle_sandbox_mode(&self) -> crate::tools::sandbox_mode::SandboxMode {
+        let new = self.sandbox_mode().toggled_legacy();
+        self.set_sandbox_mode(new)
+    }
+
+    #[cfg(test)]
     pub fn toggle_sandbox_enabled(&self) -> bool {
-        let new = !self.sandbox_enabled();
-        self.set_sandbox_enabled(new)
+        self.toggle_sandbox_mode().enabled()
+    }
+
+    pub fn container_network_enabled(&self) -> bool {
+        self.container_network_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_container_network_enabled(&self, enabled: bool) -> bool {
+        self.container_network_enabled
+            .store(enabled, Ordering::Relaxed);
+        enabled
     }
 
     /// The session's current command-approval mode
@@ -1567,6 +1597,24 @@ fn provider_family_for_id(provider: &str) -> &'static str {
 
 /// Encode an [`crate::config::extended::ApprovalMode`] as the `u8` the
 /// session's atomic stores. Inverse of [`approval_mode_from_u8`].
+fn sandbox_mode_to_u8(mode: crate::tools::sandbox_mode::SandboxMode) -> u8 {
+    match mode {
+        crate::tools::sandbox_mode::SandboxMode::Off => 0,
+        crate::tools::sandbox_mode::SandboxMode::Sandbox => 1,
+        crate::tools::sandbox_mode::SandboxMode::Container => 2,
+        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => 3,
+    }
+}
+
+fn sandbox_mode_from_u8(value: u8) -> crate::tools::sandbox_mode::SandboxMode {
+    match value {
+        0 => crate::tools::sandbox_mode::SandboxMode::Off,
+        2 => crate::tools::sandbox_mode::SandboxMode::Container,
+        3 => crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+        _ => crate::tools::sandbox_mode::SandboxMode::Sandbox,
+    }
+}
+
 fn approval_mode_to_u8(mode: crate::config::extended::ApprovalMode) -> u8 {
     use crate::config::extended::ApprovalMode;
     match mode {

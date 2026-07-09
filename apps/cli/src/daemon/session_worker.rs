@@ -426,25 +426,39 @@ impl SessionWorkerHandle {
         self.env_overlay.clone()
     }
 
-    /// Set or toggle the session's filesystem-sandbox flag (sandboxing
-    /// part 2). `None` toggles; `Some(b)` sets explicitly. Returns the
-    /// resulting state. Effective immediately for the next tool call (the
-    /// driver reads the same atomic). Broadcasts a `SandboxState` event
-    /// so every attached client stays in sync.
-    pub fn set_sandbox(&self, enabled: Option<bool>) -> bool {
-        let new = match enabled {
-            Some(b) => self.session.set_sandbox_enabled(b),
-            None => self.session.toggle_sandbox_enabled(),
-        };
-        // Re-arm the sandbox-unavailable indicator (§6.5): toggling clears the
-        // TUI notice (the client clears on this `SandboxState`), so a renewed
-        // unavailable condition after re-enabling can surface a fresh notice.
+    /// Set or toggle the session's sandbox mode. `None` toggles the legacy
+    /// off/sandbox state; explicit container modes are validated before storing.
+    pub fn set_sandbox(
+        &self,
+        mode: Option<crate::tools::sandbox_mode::SandboxMode>,
+        container_network_enabled: Option<bool>,
+    ) -> Result<crate::tools::sandbox_mode::SandboxMode, String> {
+        if let Some(enabled) = container_network_enabled {
+            self.session.set_container_network_enabled(enabled);
+        }
+        let requested = mode.unwrap_or_else(|| self.session.sandbox_mode().toggled_legacy());
+        if requested.is_container() {
+            let availability = crate::container::availability_snapshot();
+            if !availability.available {
+                return Err(availability
+                    .unavailable_reason_text()
+                    .unwrap_or_else(|| "container sandbox is unavailable".to_string()));
+            }
+        }
+        let new = self.session.set_sandbox_mode(requested);
         self.sandbox_notice_armed.store(false, Ordering::SeqCst);
         let _ = self.event_tx.send(proto::Event::SandboxState {
             session_id: self.session_id,
-            enabled: new,
+            mode: new,
+            enabled: new.enabled(),
+            container_network_enabled: self.session.container_network_enabled(),
+            container_availability: crate::container::availability_snapshot(),
         });
-        new
+        Ok(new)
+    }
+
+    pub fn container_network_enabled(&self) -> bool {
+        self.session.container_network_enabled()
     }
 
     /// Set the session's command-approval mode and broadcast the resulting
@@ -518,6 +532,12 @@ impl Drop for InteractiveClientGuard {
         if detach_should_release(prev, self.live.processing()) {
             schedule_session_locks_unattended(
                 self.locks.clone(),
+                self.counter.clone(),
+                self.live.clone(),
+                self.session_id,
+                "last detach while idle",
+            );
+            schedule_session_container_release(
                 self.counter.clone(),
                 self.live.clone(),
                 self.session_id,
@@ -738,7 +758,7 @@ pub fn spawn(
     //       sessions it creates.
     //   (c) else ON.
     // A later `/sandbox` flip overrides this for the session.
-    session.set_sandbox_enabled(resolve_sandbox_default(client_no_sandbox));
+    session.set_sandbox_mode(resolve_sandbox_default(client_no_sandbox));
     // Command-approval mode (implementation note): new
     // sessions start in the configured default (`manual` unless overridden).
     // A later `/settings` change re-resolves on the next session.
@@ -981,6 +1001,12 @@ async fn run_worker(
                         if interactive_clients_for_forward.load(Ordering::SeqCst) == 0 {
                             schedule_session_locks_unattended(
                                 locks_for_forward.clone(),
+                                interactive_clients_for_forward.clone(),
+                                live_for_forward.clone(),
+                                session_id,
+                                "idle with no attached clients",
+                            );
+                            schedule_session_container_release(
                                 interactive_clients_for_forward.clone(),
                                 live_for_forward.clone(),
                                 session_id,
@@ -2034,6 +2060,39 @@ fn schedule_session_locks_unattended(
     }
 }
 
+fn schedule_session_container_release(
+    counter: Arc<AtomicUsize>,
+    live: Arc<LiveState>,
+    session_id: Uuid,
+    reason: &'static str,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(release_session_container_unattended(
+            counter, live, session_id, reason,
+        ));
+    }
+}
+
+async fn release_session_container_unattended(
+    counter: Arc<AtomicUsize>,
+    live: Arc<LiveState>,
+    session_id: Uuid,
+    reason: &'static str,
+) {
+    if counter.load(Ordering::SeqCst) != 0 || live.processing() || live.has_active_schedules() {
+        return;
+    }
+    let Some(manager) = crate::container::container_manager().get() else {
+        return;
+    };
+    if counter.load(Ordering::SeqCst) != 0 || live.processing() || live.has_active_schedules() {
+        return;
+    }
+    if let Err(e) = manager.remove_container(session_id).await {
+        tracing::warn!(error = %e, %session_id, reason, "removing idle session container failed");
+    }
+}
+
 async fn release_session_locks_unattended(
     locks: Arc<LockManager>,
     counter: Arc<AtomicUsize>,
@@ -2593,10 +2652,13 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         // The engine never emits `SandboxState` — the daemon's
         // `SetSandbox` handler broadcasts the wire event directly (it
         // carries `session_id`). This arm exists only for exhaustiveness.
-        TurnEvent::SandboxState { enabled } => {
+        TurnEvent::SandboxState { mode } => {
             vec![proto::Event::SandboxState {
                 session_id,
-                enabled,
+                mode,
+                enabled: mode.enabled(),
+                container_network_enabled: false,
+                container_availability: crate::container::availability_snapshot(),
             }]
         }
         // Emitted by `engine::agent::turn` on the sandbox-unavailable refuse
@@ -2852,19 +2914,22 @@ fn daemon_no_sandbox() -> bool {
 }
 
 /// Resolve the new-session sandbox default from the live daemon flag.
-fn resolve_sandbox_default(client_no_sandbox: bool) -> bool {
+fn resolve_sandbox_default(client_no_sandbox: bool) -> crate::tools::sandbox_mode::SandboxMode {
     resolve_sandbox_default_with(daemon_no_sandbox(), client_no_sandbox)
 }
 
-/// Pure precedence resolver (highest wins): daemon `--no-sandbox` →
-/// client `--no-sandbox` → ON. Returns `true` when sandboxing should
-/// start enabled. Factored out from [`resolve_sandbox_default`] so the
-/// precedence can be unit-tested without touching process env.
-fn resolve_sandbox_default_with(daemon_no_sandbox: bool, client_no_sandbox: bool) -> bool {
-    if daemon_no_sandbox {
-        false
+/// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->
+/// client `--no-sandbox` -> sandbox mode. Factored out from
+/// [`resolve_sandbox_default`] so the precedence can be unit-tested without
+/// touching process env.
+fn resolve_sandbox_default_with(
+    daemon_no_sandbox: bool,
+    client_no_sandbox: bool,
+) -> crate::tools::sandbox_mode::SandboxMode {
+    if daemon_no_sandbox || client_no_sandbox {
+        crate::tools::sandbox_mode::SandboxMode::Off
     } else {
-        !client_no_sandbox
+        crate::tools::sandbox_mode::SandboxMode::Sandbox
     }
 }
 
@@ -3076,17 +3141,24 @@ mod tests {
 
     #[test]
     fn sandbox_default_precedence_daemon_wins() {
-        // (a) daemon `--no-sandbox` → OFF regardless of the client flag.
-        assert!(!resolve_sandbox_default_with(true, false));
-        assert!(!resolve_sandbox_default_with(true, true));
+        use crate::tools::sandbox_mode::SandboxMode;
+
+        // (a) daemon `--no-sandbox` -> OFF regardless of the client flag.
+        assert_eq!(resolve_sandbox_default_with(true, false), SandboxMode::Off);
+        assert_eq!(resolve_sandbox_default_with(true, true), SandboxMode::Off);
     }
 
     #[test]
     fn sandbox_default_precedence_client_then_on() {
-        // (b) no daemon flag, client `--no-sandbox` → OFF.
-        assert!(!resolve_sandbox_default_with(false, true));
-        // (c) neither flag → ON.
-        assert!(resolve_sandbox_default_with(false, false));
+        use crate::tools::sandbox_mode::SandboxMode;
+
+        // (b) no daemon flag, client `--no-sandbox` -> OFF.
+        assert_eq!(resolve_sandbox_default_with(false, true), SandboxMode::Off);
+        // (c) neither flag -> ON.
+        assert_eq!(
+            resolve_sandbox_default_with(false, false),
+            SandboxMode::Sandbox
+        );
     }
 
     /// The concurrent-write-during-plan warning fires once per plan episode per

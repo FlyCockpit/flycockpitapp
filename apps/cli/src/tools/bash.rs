@@ -261,6 +261,29 @@ impl Tool for BashTool {
             &extended_config.command_resource_profiles,
             &profile_introspector,
         );
+        let resource_plan = build_resource_plan(
+            declared_resources,
+            &extended_config.resource_scheduler,
+            command,
+            &command_classification,
+            queue_timeout_ms,
+        );
+
+        if ctx.session.sandbox_mode().is_container() {
+            return run_container_bash(
+                command,
+                &prefixed,
+                &cwd,
+                timeout_ms,
+                &session_env,
+                &scrub,
+                &extended_config,
+                &command_resource_plan,
+                &resource_plan,
+                ctx,
+            )
+            .await;
+        }
 
         // Resolve the gating decision. When confinement is actually on the
         // table (sandbox on, not already broad-granted) we consult the
@@ -344,13 +367,6 @@ impl Tool for BashTool {
             .with_sandbox(meta));
         }
 
-        let resource_plan = build_resource_plan(
-            declared_resources,
-            &extended_config.resource_scheduler,
-            command,
-            &command_classification,
-            queue_timeout_ms,
-        );
         let (resource_meta, _resource_lease) =
             match acquire_resource_lease(ctx, &resource_plan, &meta).await {
                 Ok(acquired) => acquired,
@@ -1579,6 +1595,214 @@ fn looks_like_build_test_check(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_container_bash(
+    display_command: &str,
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_ms: u64,
+    session_env: &std::collections::HashMap<String, String>,
+    scrub: &[(String, String)],
+    extended_config: &crate::config::extended::ExtendedConfig,
+    command_resource_plan: &crate::tools::command_resource_profiles::CommandResourcePlan,
+    resource_plan: &ResourcePlan,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    let mode = ctx.session.sandbox_mode();
+    let mut meta = crate::engine::tool::SandboxMeta {
+        enabled: true,
+        confined: true,
+        escalated: false,
+        broad_grant_simple_commands: false,
+        approval_scope_recorded: None,
+        unavailable_reason: None,
+        resource_profiles: command_resource_plan.metas.clone(),
+    };
+    let (resource_meta, _resource_lease) =
+        match acquire_resource_lease(ctx, resource_plan, &meta).await {
+            Ok(acquired) => acquired,
+            Err(output) => return Ok(output),
+        };
+    let attempt = run_container_shell(
+        command,
+        cwd,
+        mode,
+        session_env,
+        scrub,
+        extended_config,
+        command_resource_plan,
+        ctx,
+        timeout_ms,
+    )
+    .await;
+    let final_outcome = match attempt {
+        RunOutcome::Cancelled => {
+            return Ok(ToolOutput::truncated_text(
+                "Error: command cancelled by user (ctrl+c)".to_string(),
+            )
+            .with_bash_meta(meta, &resource_meta));
+        }
+        RunOutcome::TimedOut => {
+            return Ok(ToolOutput::truncated_text(format!(
+                "Error: timeout after {timeout_ms} ms{}",
+                crate::tools::command_resource_profiles::resource_profile_context(
+                    command_resource_plan
+                )
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
+        RunOutcome::SpawnError(e) => {
+            meta.unavailable_reason = Some(e.to_string());
+            let mut message = format!(
+                "Error: container sandbox command refused ({e}); fix the container runtime/Dockerfile or switch sandbox modes with `/sandbox off` or `/sandbox on`."
+            );
+            message.push_str(
+                &crate::tools::command_resource_profiles::resource_profile_context(
+                    command_resource_plan,
+                ),
+            );
+            return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
+        }
+        RunOutcome::WaitError(e) => {
+            return Ok(ToolOutput::text(format!(
+                "Error: the container command failed to run ({e}); fix the runtime or switch sandbox modes"
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
+        RunOutcome::Done(o) => o,
+    };
+    Ok(render_bash_outcome(
+        display_command,
+        cwd,
+        final_outcome,
+        None,
+        ctx,
+        meta,
+        &resource_meta,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_container_shell(
+    command: &str,
+    cwd: &std::path::Path,
+    mode: crate::tools::sandbox_mode::SandboxMode,
+    session_env: &std::collections::HashMap<String, String>,
+    scrub: &[(String, String)],
+    extended_config: &crate::config::extended::ExtendedConfig,
+    command_resource_plan: &crate::tools::command_resource_profiles::CommandResourcePlan,
+    ctx: &ToolCtx,
+    timeout_ms: u64,
+) -> RunOutcome {
+    let manager = crate::container::container_manager()
+        .get_or_init(|| async { crate::container::ContainerManager::detect() })
+        .await;
+    if let Err(reason) = manager.ensure_available() {
+        return RunOutcome::SpawnError(std::io::Error::other(reason));
+    }
+    let map = crate::container::MountMap::for_current_platform(ctx.cwd.clone());
+    let Some(container_cwd) = map.to_container(cwd) else {
+        return RunOutcome::SpawnError(std::io::Error::other(format!(
+            "working directory {} is outside the container project mount {}",
+            cwd.display(),
+            ctx.cwd.display()
+        )));
+    };
+    let resolved = match crate::container::resolve_dockerfile_for_session(
+        &ctx.cwd,
+        &extended_config.sandbox,
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
+    };
+    let dockerfile_bytes = match std::fs::read(&resolved.path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return RunOutcome::SpawnError(std::io::Error::other(format!(
+                "reading sandbox Dockerfile {} failed: {e}",
+                resolved.path.display()
+            )));
+        }
+    };
+    let image = match manager
+        .ensure_image(&resolved.path, &dockerfile_bytes)
+        .await
+    {
+        Ok(image) => image,
+        Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
+    };
+    let profile_mounts =
+        crate::container::resource_profile_mounts(command_resource_plan, &map, cfg!(windows));
+    let name = match manager
+        .ensure_container(
+            ctx.session.id,
+            &image,
+            mode,
+            &map,
+            &profile_mounts,
+            ctx.session.container_network_enabled(),
+        )
+        .await
+    {
+        Ok(name) => name,
+        Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
+    };
+    let env = crate::container::container_env(session_env, scrub);
+    let cmd = match manager.exec_command(&name, &container_cwd, &env, command) {
+        Ok(cmd) => cmd,
+        Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
+    };
+    run_prepared_command(cmd, ctx, timeout_ms).await
+}
+
+fn render_bash_outcome(
+    command: &str,
+    cwd: &std::path::Path,
+    final_outcome: ShellOutcome,
+    windows_notice: Option<&'static str>,
+    ctx: &ToolCtx,
+    meta: crate::engine::tool::SandboxMeta,
+    resource_meta: &Option<ResourceMeta>,
+) -> ToolOutput {
+    let compress = ctx.session.shell_compression_enabled();
+    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+        crate::tools::shell_compress::classify_tip(command)
+            .filter(|t| !ctx.session.tip_suppressed(*t))
+    } else {
+        None
+    };
+    let native_write_hint = durable_shell_write_hint(command);
+    let body = render_output(
+        &final_outcome,
+        windows_notice,
+        compress,
+        command,
+        cwd,
+        tip,
+        native_write_hint,
+    );
+    let exit_field = if final_outcome.signaled {
+        None
+    } else {
+        Some(final_outcome.exit)
+    };
+    let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
+    let sidecar = bash_output_sidecar(command, cwd, &final_outcome, &body, truncated_for_display);
+    let mut out = if truncated_for_display {
+        ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
+            .with_bash_meta(meta, resource_meta)
+    } else {
+        ToolOutput::text(body).with_bash_meta(meta, resource_meta)
+    };
+    if let Some(sidecar) = sidecar {
+        out = out.with_output_sidecar(sidecar);
+    }
+    match exit_field {
+        Some(code) => out.with_exit_code(code),
+        None => out,
+    }
+}
+
 /// Spawn `sh -c <command>` — confined via zerobox when `confine`, else
 /// plain — apply the process-group + kill-on-drop + cancel/timeout/
 /// pgid-kill logic (identical for both paths), and return the outcome.
@@ -1653,6 +1877,21 @@ async fn run_shell(
     #[cfg(unix)]
     cmd.process_group(0);
 
+    run_prepared_command(cmd, ctx, timeout_ms).await
+}
+
+async fn run_prepared_command(
+    mut cmd: tokio::process::Command,
+    ctx: &ToolCtx,
+    timeout_ms: u64,
+) -> RunOutcome {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return RunOutcome::SpawnError(e),
@@ -1660,10 +1899,6 @@ async fn run_shell(
     #[cfg(unix)]
     let child_pid = child.id();
 
-    // Drain stdout/stderr on background tasks so `wait()` can't deadlock
-    // on a full pipe buffer, while keeping `child` borrowable (rather
-    // than consumed by `wait_with_output`) so the cancel branch can kill
-    // it. The reader tasks end naturally when the pipes close.
     use tokio::io::AsyncReadExt;
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
@@ -1683,9 +1918,6 @@ async fn run_shell(
     });
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    // Race the command against (a) its timeout and (b) a turn-cancel
-    // (user ctrl+c). On cancel we terminate the process group promptly
-    // so a long-running test run dies instead of holding the turn open.
     let status = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => {
@@ -1698,8 +1930,6 @@ async fn run_shell(
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return RunOutcome::WaitError(e),
             Err(_) => {
-                // Timed out: kill the group so a hung command can't
-                // linger past its deadline, then report.
                 kill_child(&mut child, #[cfg(unix)] child_pid).await;
                 stdout_task.abort();
                 stderr_task.abort();

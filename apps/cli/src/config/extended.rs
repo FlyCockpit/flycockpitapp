@@ -160,6 +160,11 @@ pub struct ExtendedConfig {
     #[serde(rename = "resourceScheduler", default)]
     pub resource_scheduler: ResourceSchedulerConfig,
 
+    /// Shell sandbox substrate configuration. The UI for choosing defaults is
+    /// added separately; this engine consumes the Dockerfile path.
+    #[serde(default, skip_serializing_if = "SandboxConfig::is_default")]
+    pub sandbox: SandboxConfig,
+
     /// Daemon resource lifecycle limits. These protect daemon-global state
     /// that is shared by every connected client.
     #[serde(default)]
@@ -491,6 +496,29 @@ impl CommandResourceProfilesConfig {
 
     pub fn profile_enabled(&self, id: &str) -> bool {
         self.enabled.get(id).copied().unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxConfig {
+    #[serde(rename = "defaultMode", default)]
+    pub default_mode: crate::tools::sandbox_mode::SandboxMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<PathBuf>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            dockerfile: None,
+        }
+    }
+}
+
+impl SandboxConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -2787,6 +2815,7 @@ impl Default for ExtendedConfig {
             system_prompt: SystemPromptConfig::default(),
             schedule: ScheduleConfig::default(),
             resource_scheduler: ResourceSchedulerConfig::default(),
+            sandbox: SandboxConfig::default(),
             daemon: DaemonConfig::default(),
             retention: RetentionConfig::default(),
             delegation: DelegationConfig::default(),
@@ -3005,6 +3034,7 @@ impl ExtendedConfigDoc {
         parse_field!("system_prompt", system_prompt);
         parse_field!("schedule", schedule);
         parse_field!("resourceScheduler", resource_scheduler);
+        parse_field!("sandbox", sandbox);
         parse_field!("delegation", delegation);
         parse_field!("deepthink", deepthink);
         parse_field!("swarm", swarm);

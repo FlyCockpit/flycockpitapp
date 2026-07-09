@@ -579,14 +579,15 @@ pub enum Request {
         default_depth: u32,
     },
 
-    /// Set (or toggle) filesystem sandboxing for the attached session at
-    /// runtime (`/sandbox`, sandboxing part 2). `enabled = None` toggles
-    /// the current state; `Some(true)`/`Some(false)` set it explicitly.
-    /// Effective immediately for subsequent tool calls. Acked with the
-    /// resulting state via [`Response::SandboxState`].
+    /// Set (or toggle) sandbox mode for the attached session at runtime.
+    /// `mode = None` toggles the legacy off/sandbox state; container-mode
+    /// selection is explicit. `container_network_enabled` updates the live
+    /// per-session container network flag when present.
     SetSandbox {
-        #[serde(default)]
-        enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::tools::sandbox_mode::SandboxMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        container_network_enabled: Option<bool>,
     },
 
     /// Set (or toggle) request preflight for the attached session at runtime
@@ -1034,10 +1035,13 @@ pub enum Response {
         system_tokens: u64,
     },
 
-    /// The resulting sandbox-enabled state after a [`Request::SetSandbox`]
-    /// (sandboxing part 2). The TUI surfaces it via a toast.
+    /// The resulting sandbox mode after a [`Request::SetSandbox`].
     SandboxState {
+        mode: crate::tools::sandbox_mode::SandboxMode,
         enabled: bool,
+        #[serde(default)]
+        container_network_enabled: bool,
+        container_availability: crate::container::ContainerAvailability,
     },
 
     /// The resulting redaction-source state after a
@@ -1622,12 +1626,15 @@ pub enum Event {
         seed_tool_tokens: u64,
     },
 
-    /// Filesystem sandboxing was set/toggled for the session (`/sandbox`,
-    /// sandboxing part 2). Broadcast to every attached client so they
-    /// surface the resulting state (TUI: a toast).
+    /// Sandboxing mode was set/toggled for the session (`/sandbox`). Broadcast
+    /// to every attached client so they surface the resulting state.
     SandboxState {
         session_id: Uuid,
+        mode: crate::tools::sandbox_mode::SandboxMode,
         enabled: bool,
+        #[serde(default)]
+        container_network_enabled: bool,
+        container_availability: crate::container::ContainerAvailability,
     },
 
     /// The shell sandbox cannot initialize for this session (`bash` hit the

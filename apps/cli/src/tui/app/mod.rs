@@ -5194,7 +5194,10 @@ impl App {
         }
         if let Some(enabled) = commit.sandbox_enabled
             && !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox {
-                enabled: Some(enabled),
+                mode: Some(crate::tools::sandbox_mode::SandboxMode::from_enabled(
+                    enabled,
+                )),
+                container_network_enabled: None,
             })
         {
             any_failed = true;
@@ -6063,7 +6066,10 @@ impl App {
                 return;
             }
         };
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox { enabled }) {
+        if !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox {
+            mode: enabled.map(crate::tools::sandbox_mode::SandboxMode::from_enabled),
+            container_network_enabled: None,
+        }) {
             self.history.push(HistoryEntry::Plain {
                 line: "/sandbox: no daemon connection".to_string(),
             });
@@ -7694,18 +7700,14 @@ impl App {
                     ),
                 });
             }
-            TurnEvent::SandboxState { enabled } => {
-                // `/sandbox` result (sandboxing part 2): surface the
-                // resulting on/off state as a toast.
+            TurnEvent::SandboxState { mode } => {
+                let enabled = mode.enabled();
                 self.no_sandbox = !enabled;
-                self.show_toast(
-                    if enabled { "sandbox on" } else { "sandbox off" },
-                    ToastKind::Info,
-                );
-                // Turning the sandbox off resolves the unavailable condition —
-                // clear the persistent down-notice (§6.5). Turning it back on
-                // re-arms the daemon's de-dupe, so a still-broken sandbox
-                // re-surfaces a fresh notice on the next refused `bash`.
+                let toast = match mode {
+                    crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox on".to_string(),
+                    other => format!("sandbox {}", other.as_str()),
+                };
+                self.show_toast(&toast, ToastKind::Info);
                 if !enabled {
                     self.sandbox_down_notice = None;
                 }
@@ -14004,13 +14006,17 @@ mod sandbox_notice_tests {
         assert_eq!(app.sandbox_down_notice.as_deref(), Some(REMEDY));
         assert_eq!(app.history.len(), history_len_before);
 
-        // `/sandbox off` → `SandboxState { enabled: false }` clears it.
-        app.apply_event(TurnEvent::SandboxState { enabled: false });
+        // `/sandbox off` -> `SandboxState { mode: Off }` clears it.
+        app.apply_event(TurnEvent::SandboxState {
+            mode: crate::tools::sandbox_mode::SandboxMode::Off,
+        });
         assert!(app.sandbox_down_notice.is_none());
         assert_eq!(app.sandbox_notice_lines(), 0);
 
         // Re-enabling does not resurrect a stale notice on its own.
-        app.apply_event(TurnEvent::SandboxState { enabled: true });
+        app.apply_event(TurnEvent::SandboxState {
+            mode: crate::tools::sandbox_mode::SandboxMode::Sandbox,
+        });
         assert!(app.sandbox_down_notice.is_none());
     }
 

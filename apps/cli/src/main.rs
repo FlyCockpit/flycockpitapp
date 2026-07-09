@@ -15,6 +15,7 @@ mod cli;
 mod clipboard;
 mod commands;
 mod config;
+mod container;
 mod credentials;
 mod daemon;
 mod db;

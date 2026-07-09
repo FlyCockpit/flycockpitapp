@@ -896,9 +896,15 @@ impl NoninteractiveDelegationRegistry {
 
     fn snapshot_report(&self, task_call_id: &str, label: &str) -> Option<String> {
         let key = NoninteractiveDelegationKey::new(task_call_id, label);
-        self.entries
-            .get(&key)
-            .and_then(|entry| entry.completion.as_ref().map(|c| c.report.clone()))
+        let entry = self.entries.get(&key)?;
+        if let Some(completion) = &entry.completion {
+            return Some(completion.report.clone());
+        }
+        if entry.snapshot.history.is_empty() {
+            return None;
+        }
+        let start = entry.snapshot.history.len().saturating_sub(6);
+        serde_json::to_string(&entry.snapshot.history[start..]).ok()
     }
 
     fn drain_steer_queue(
@@ -7621,11 +7627,15 @@ impl Driver {
             TaskControlAction::Models => unreachable!("handled before task delegation DB lookup"),
             TaskControlAction::List => format_task_control_list(&rows, &orphaned),
             TaskControlAction::Status => {
-                let selected =
-                    match resolve_task_control_targets(&rows, target_task_call_id, label, false) {
-                        Ok(selected) => selected,
-                        Err(e) => return e,
-                    };
+                let selected = match resolve_task_control_targets(
+                    &rows,
+                    target_task_call_id.clone(),
+                    label,
+                    false,
+                ) {
+                    Ok(selected) => selected,
+                    Err(e) => return e,
+                };
                 format_task_control_status(&selected, &orphaned)
             }
             TaskControlAction::Cancel => {
@@ -7715,93 +7725,164 @@ impl Driver {
                         ));
                     }
                 }
-                if changed.is_empty() && orphaned_lost.is_empty() {
-                    format!(
-                        "cancel: no live delegation changed; already terminal or unknown ({})",
-                        unchanged.join(", ")
-                    )
+                let state = if changed.is_empty() && orphaned_lost.is_empty() {
+                    "no_change"
+                } else if !orphaned_lost.is_empty() && changed.is_empty() {
+                    "lost"
                 } else {
-                    let mut parts = Vec::new();
-                    if !changed.is_empty() {
-                        parts.push(format!("cancelled {}", changed.join(", ")));
-                    }
-                    if !orphaned_lost.is_empty() {
-                        parts.push(format!("orphaned (lost) {}", orphaned_lost.join(", ")));
-                    }
-                    if !unchanged.is_empty() {
-                        parts.push(format!("unchanged {}", unchanged.join(", ")));
-                    }
-                    parts.join("; ")
-                }
+                    "cancelled"
+                };
+                task_envelope(serde_json::json!({
+                    "state": state,
+                    "task_call_id": target_task_call_id,
+                    "blocking": false,
+                    "tool_call_closed": true,
+                    "result_pending": false,
+                    "report_available": false,
+                    "report_delivered": false,
+                    "cancelled": changed,
+                    "orphaned_lost": orphaned_lost,
+                    "unchanged": unchanged,
+                    "children": [],
+                }))
             }
             TaskControlAction::Query => {
-                let selected =
-                    match resolve_task_control_targets(&rows, target_task_call_id, label, false) {
-                        Ok(selected) => selected,
-                        Err(e) => return e,
-                    };
+                let selected = match resolve_task_control_targets(
+                    &rows,
+                    target_task_call_id.clone(),
+                    label,
+                    false,
+                ) {
+                    Ok(selected) => selected,
+                    Err(e) => return e,
+                };
                 if selected.len() != 1 {
-                    return "Error: query requires exactly one delegation child".to_string();
+                    return task_envelope(serde_json::json!({
+                        "state": "refused",
+                        "task_call_id": target_task_call_id,
+                        "blocking": false,
+                        "tool_call_closed": true,
+                        "result_pending": false,
+                        "report_available": false,
+                        "report_delivered": false,
+                        "actionable": false,
+                        "reason": "query requires exactly one delegation child",
+                        "children": [],
+                    }));
                 }
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
-                    if orphaned.contains(&task_control_key(row)) {
-                        return format!(
-                            "Error: cannot query {}:{} because it is lost (daemon restarted; no live worker)",
-                            row.task_call_id, row.label
-                        );
-                    }
-                    return format!(
-                        "Error: cannot query {}:{} because it is {}",
-                        row.task_call_id,
-                        row.label,
-                        delegation_status_name(row.status)
-                    );
-                }
-                let report = row
-                    .report
-                    .clone()
-                    .or_else(|| {
-                        self.noninteractive_delegations
-                            .snapshot_report(&row.task_call_id, &row.label)
-                    })
-                    .unwrap_or_else(|| {
-                        "No report yet; child is still running/backgrounded.".to_string()
+                    let reason = if orphaned.contains(&task_control_key(row)) {
+                        "lost (daemon restarted; no live worker)".to_string()
+                    } else {
+                        delegation_status_name(row.status).to_string()
+                    };
+                    let report_source = if row.report.is_some() { "db" } else { "none" };
+                    let mut value = serde_json::json!({
+                        "state": "refused",
+                        "task_call_id": row.task_call_id,
+                        "blocking": false,
+                        "tool_call_closed": true,
+                        "result_pending": false,
+                        "report_available": row.report.is_some(),
+                        "report_delivered": row.result_delivered,
+                        "actionable": false,
+                        "reason": reason,
+                        "report_source": report_source,
+                        "children": [task_child_detail_json(row, &orphaned)],
                     });
-                format!(
-                    "query snapshot for {}:{} ({}; read-only, child state unchanged)\n{}",
-                    row.task_call_id,
-                    row.label,
-                    delegation_status_name(row.status),
-                    cap_text(&report, 1200)
-                )
+                    if let Some(report) = &row.report {
+                        value["report"] = serde_json::json!(cap_text(report, 1200));
+                    }
+                    return task_envelope(value);
+                }
+                let db_report = row.report.clone();
+                let live_report = self
+                    .noninteractive_delegations
+                    .snapshot_report(&row.task_call_id, &row.label);
+                let (report_source, report) = if let Some(report) = db_report {
+                    ("db", report)
+                } else if let Some(report) = live_report {
+                    ("live_snapshot", report)
+                } else {
+                    (
+                        "none",
+                        "No report yet; child is still running/backgrounded.".to_string(),
+                    )
+                };
+                task_envelope(serde_json::json!({
+                    "state": "query",
+                    "task_call_id": row.task_call_id,
+                    "blocking": false,
+                    "tool_call_closed": row.status != crate::db::task_delegations::DelegationStatus::Running,
+                    "result_pending": false,
+                    "report_available": report_source != "none",
+                    "report_delivered": row.result_delivered,
+                    "actionable": true,
+                    "read_only": true,
+                    "child_state_unchanged": true,
+                    "report_source": report_source,
+                    "children": [task_child_detail_json(row, &orphaned)],
+                    "report": cap_text(&report, 1200),
+                }))
             }
             TaskControlAction::Steer => {
-                let selected =
-                    match resolve_task_control_targets(&rows, target_task_call_id, label, false) {
-                        Ok(selected) => selected,
-                        Err(e) => return e,
-                    };
+                let selected = match resolve_task_control_targets(
+                    &rows,
+                    target_task_call_id.clone(),
+                    label,
+                    false,
+                ) {
+                    Ok(selected) => selected,
+                    Err(e) => return e,
+                };
                 if selected.len() != 1 {
-                    return "Error: steer requires exactly one delegation child".to_string();
+                    return task_envelope(serde_json::json!({
+                        "state": "refused",
+                        "task_call_id": target_task_call_id,
+                        "blocking": false,
+                        "tool_call_closed": true,
+                        "result_pending": false,
+                        "report_available": false,
+                        "report_delivered": false,
+                        "actionable": false,
+                        "reason": "steer requires exactly one delegation child",
+                        "children": [],
+                    }));
                 }
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
-                    if orphaned.contains(&task_control_key(row)) {
-                        return format!(
-                            "Error: cannot steer {}:{} because it is lost (daemon restarted; no live worker)",
-                            row.task_call_id, row.label
-                        );
-                    }
-                    return format!(
-                        "Error: cannot steer {}:{} because it is {}",
-                        row.task_call_id,
-                        row.label,
-                        delegation_status_name(row.status)
-                    );
+                    let reason = if orphaned.contains(&task_control_key(row)) {
+                        "lost (daemon restarted; no live worker)".to_string()
+                    } else {
+                        delegation_status_name(row.status).to_string()
+                    };
+                    return task_envelope(serde_json::json!({
+                        "state": "refused",
+                        "task_call_id": row.task_call_id,
+                        "blocking": false,
+                        "tool_call_closed": true,
+                        "result_pending": false,
+                        "report_available": row.report.is_some(),
+                        "report_delivered": row.result_delivered,
+                        "actionable": false,
+                        "reason": reason,
+                        "children": [task_child_detail_json(row, &orphaned)],
+                    }));
                 }
                 let Some(body) = message else {
-                    return "Error: `message` is required for steer".to_string();
+                    return task_envelope(serde_json::json!({
+                        "state": "refused",
+                        "task_call_id": row.task_call_id,
+                        "blocking": false,
+                        "tool_call_closed": true,
+                        "result_pending": false,
+                        "report_available": row.report.is_some(),
+                        "report_delivered": row.result_delivered,
+                        "actionable": false,
+                        "reason": "message is required for steer",
+                        "children": [task_child_detail_json(row, &orphaned)],
+                    }));
                 };
                 if let Err(e) = self.session.db.enqueue_task_delegation_steer(
                     &row.task_call_id,
@@ -7812,10 +7893,21 @@ impl Driver {
                 }
                 self.noninteractive_delegations
                     .push_steer(&row.task_call_id, &row.label, body);
-                format!(
-                    "steer queued for {}:{}; it will be injected at the child's next turn boundary",
-                    row.task_call_id, row.label
-                )
+                let mut child = task_child_detail_json(row, &orphaned);
+                child["pending_steers"] = serde_json::json!(row.pending_steers + 1);
+                task_envelope(serde_json::json!({
+                    "state": "steer_queued",
+                    "task_call_id": row.task_call_id,
+                    "blocking": false,
+                    "tool_call_closed": row.status != crate::db::task_delegations::DelegationStatus::Running,
+                    "result_pending": false,
+                    "report_available": row.report.is_some(),
+                    "report_delivered": row.result_delivered,
+                    "actionable": true,
+                    "applies_at": "next_child_turn_boundary",
+                    "applies_if": "child_still_running_actionable",
+                    "children": [child],
+                }))
             }
         }
     }
@@ -9971,12 +10063,6 @@ async fn discard_pending_input(rx: &crate::engine::message::UserSubmissionQueue)
     dropped
 }
 
-/// Fold multiple user submissions into one inference payload per GOALS
-/// §1c: blank-line text separator, no special framing or numbering, and
-/// all image parts concatenated in order. The user composed them as
-/// separate thoughts; the model sees one coherent message. The folded
-/// `text` preserves each submission's `IMAGE_PART_SENTINEL` markers in
-/// place, so the marker order still lines up with `images`.
 /// Header line for a late-arriving async-result delivery
 /// (implementation note). Names both the job `kind`
 /// (`loop`/`timer`/`background`/`swarm`) and the originating `job_id` (the
@@ -10014,14 +10100,6 @@ fn user_message_event_data(
             .unwrap_or(serde_json::Value::Null);
     }
     data
-}
-
-fn label_list(labels: &[String]) -> String {
-    if labels.is_empty() {
-        "none".to_string()
-    } else {
-        labels.join(", ")
-    }
 }
 
 fn delegation_status_name(status: crate::db::task_delegations::DelegationStatus) -> &'static str {
@@ -10144,68 +10222,96 @@ fn resolve_task_control_targets(
     }
 }
 
+fn task_envelope(mut value: serde_json::Value) -> String {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("type".to_string(), serde_json::json!("task_delegation"));
+        obj.insert("version".to_string(), serde_json::json!(1));
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| {
+        "{\"type\":\"task_delegation\",\"version\":1,\"state\":\"serialization_error\"}".to_string()
+    })
+}
+
+fn task_child_detail_json(
+    row: &crate::db::task_delegations::DelegationChildDetail,
+    orphaned: &HashSet<(String, String)>,
+) -> serde_json::Value {
+    let is_orphaned = orphaned.contains(&task_control_key(row));
+    let status = if is_orphaned {
+        "lost"
+    } else {
+        delegation_status_name(row.status)
+    };
+    let report_available = row.report.is_some();
+    let result_pending =
+        !row.result_delivered && (!delegation_status_live(row.status) || is_orphaned);
+    let actionable = delegation_status_live(row.status) && !is_orphaned;
+    let mut child = serde_json::json!({
+        "task_call_id": row.task_call_id,
+        "label": row.label,
+        "agent": row.child_agent,
+        "model": row.model.as_deref().unwrap_or("default"),
+        "status": status,
+        "blocking": row.status == crate::db::task_delegations::DelegationStatus::Running && !is_orphaned,
+        "tool_call_closed": row.status != crate::db::task_delegations::DelegationStatus::Running,
+        "result_pending": result_pending,
+        "report_available": report_available,
+        "report_delivered": row.result_delivered,
+        "pending_steers": row.pending_steers,
+        "orphaned": is_orphaned,
+        "actionable": actionable,
+        "started_at": row.started_at,
+        "finished_at": row.finished_at,
+        "updated_at": row.updated_at,
+    });
+    if let Some(report) = &row.report {
+        child["report"] = serde_json::json!(cap_text(report, 500));
+    }
+    child
+}
+
 fn format_task_control_list(
     rows: &[crate::db::task_delegations::DelegationChildDetail],
     orphaned: &HashSet<(String, String)>,
 ) -> String {
-    let mut lines = vec!["task delegations:".to_string()];
-    for row in rows.iter().take(12) {
-        let is_orphaned = orphaned.contains(&task_control_key(row));
-        let unread =
-            if !row.result_delivered && (!delegation_status_live(row.status) || is_orphaned) {
-                " unread_result"
-            } else {
-                ""
-            };
-        lines.push(format!(
-            "- {}:{} agent={} status={} pending_steers={}{}",
-            row.task_call_id,
-            row.label,
-            row.child_agent,
-            task_control_row_status_name(row, orphaned),
-            row.pending_steers,
-            unread
-        ));
-    }
-    if rows.len() > 12 {
-        lines.push(format!("[{} more omitted]", rows.len() - 12));
-    }
-    if rows.is_empty() {
-        lines.push("- none".to_string());
-    }
-    lines.join("\n")
+    let children = rows
+        .iter()
+        .take(12)
+        .map(|row| task_child_detail_json(row, orphaned))
+        .collect::<Vec<_>>();
+    task_envelope(serde_json::json!({
+        "state": "list",
+        "task_call_id": serde_json::Value::Null,
+        "blocking": children.iter().any(|child| child["blocking"].as_bool().unwrap_or(false)),
+        "tool_call_closed": true,
+        "result_pending": children.iter().any(|child| child["result_pending"].as_bool().unwrap_or(false)),
+        "report_available": children.iter().any(|child| child["report_available"].as_bool().unwrap_or(false)),
+        "report_delivered": children.iter().all(|child| child["report_delivered"].as_bool().unwrap_or(false)),
+        "children": children,
+        "omitted_children": rows.len().saturating_sub(12),
+    }))
 }
 
 fn format_task_control_status(
     rows: &[crate::db::task_delegations::DelegationChildDetail],
     orphaned: &HashSet<(String, String)>,
 ) -> String {
-    let mut lines = Vec::new();
-    for row in rows.iter().take(8) {
-        lines.push(format!(
-            "{}:{} agent={} model={} status={} started={} finished={} updated={} delivered={} pending_steers={}",
-            row.task_call_id,
-            row.label,
-            row.child_agent,
-            row.model.as_deref().unwrap_or("default"),
-            task_control_row_status_name(row, orphaned),
-            row.started_at.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()),
-            row.finished_at.map(|v| v.to_string()).unwrap_or_else(|| "not_finished".to_string()),
-            row.updated_at,
-            row.result_delivered,
-            row.pending_steers,
-        ));
-        if let Some(report) = &row.report {
-            lines.push(format!(
-                "last_report: {}",
-                cap_text(report, 500).replace('\n', " ")
-            ));
-        }
-    }
-    if rows.len() > 8 {
-        lines.push(format!("[{} more children omitted]", rows.len() - 8));
-    }
-    lines.join("\n")
+    let children = rows
+        .iter()
+        .take(8)
+        .map(|row| task_child_detail_json(row, orphaned))
+        .collect::<Vec<_>>();
+    task_envelope(serde_json::json!({
+        "state": "status",
+        "task_call_id": rows.first().map(|row| row.task_call_id.as_str()),
+        "blocking": children.iter().any(|child| child["blocking"].as_bool().unwrap_or(false)),
+        "tool_call_closed": children.iter().all(|child| child["tool_call_closed"].as_bool().unwrap_or(false)),
+        "result_pending": children.iter().any(|child| child["result_pending"].as_bool().unwrap_or(false)),
+        "report_available": children.iter().any(|child| child["report_available"].as_bool().unwrap_or(false)),
+        "report_delivered": children.iter().all(|child| child["report_delivered"].as_bool().unwrap_or(false)),
+        "children": children,
+        "omitted_children": rows.len().saturating_sub(8),
+    }))
 }
 
 fn format_delegation_background_ack(
@@ -10213,22 +10319,53 @@ fn format_delegation_background_ack(
     completed: &[(String, String)],
     running: &[String],
 ) -> String {
-    let completed_labels = completed
-        .iter()
-        .map(|(label, _)| label.clone())
-        .collect::<Vec<_>>();
-    let mut body = format!(
-        "[delegation backgrounded · task_call_id={task_call_id}]\ncompleted: {}\nrunning: {}",
-        label_list(&completed_labels),
-        label_list(running)
-    );
+    let mut children = Vec::new();
     for (label, report) in completed {
-        body.push_str("\n\n");
-        body.push_str(label);
-        body.push_str(":\n");
-        body.push_str(report);
+        children.push(serde_json::json!({
+            "task_call_id": task_call_id,
+            "label": label,
+            "agent": serde_json::Value::Null,
+            "model": serde_json::Value::Null,
+            "status": "completed",
+            "blocking": false,
+            "tool_call_closed": true,
+            "result_pending": false,
+            "report_available": true,
+            "report_delivered": true,
+            "pending_steers": 0,
+            "orphaned": false,
+            "actionable": false,
+            "newly_delivered": true,
+            "report": report,
+        }));
     }
-    body
+    for label in running {
+        children.push(serde_json::json!({
+            "task_call_id": task_call_id,
+            "label": label,
+            "agent": serde_json::Value::Null,
+            "model": serde_json::Value::Null,
+            "status": "backgrounded",
+            "blocking": false,
+            "tool_call_closed": true,
+            "result_pending": true,
+            "report_available": false,
+            "report_delivered": false,
+            "pending_steers": 0,
+            "orphaned": false,
+            "actionable": true,
+        }));
+    }
+    task_envelope(serde_json::json!({
+        "state": "backgrounded",
+        "task_call_id": task_call_id,
+        "blocking": false,
+        "tool_call_closed": true,
+        "result_pending": !running.is_empty(),
+        "report_available": !completed.is_empty(),
+        "report_delivered": completed.iter().all(|_| true) && running.is_empty(),
+        "children": children,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10255,32 +10392,63 @@ fn format_async_delegation_result(
     completed: &[AsyncDelegationChildResult],
     running: &[String],
 ) -> String {
-    let completed_labels = completed
-        .iter()
-        .map(|child| child.label.clone())
-        .collect::<Vec<_>>();
     let status = derive_async_delegation_status(completed);
-    let mut body = format!(
-        "[async delegation result · task_call_id={task_call_id} · status={status}]\ncompleted: {}\nrunning: {}",
-        label_list(&completed_labels),
-        label_list(running)
-    );
-    for child in completed {
-        body.push_str("\n\n");
-        body.push_str(&child.label);
-        body.push_str(" [status=");
-        body.push_str(&child.status);
-        body.push_str("]:\n");
-        if let Some(report) = &child.report {
-            if matches!(child.status.as_str(), "failed" | "cancelled" | "lost") {
-                body.push_str("error: ");
+    let mut children = completed
+        .iter()
+        .map(|child| {
+            let mut value = serde_json::json!({
+                "task_call_id": task_call_id,
+                "label": child.label,
+                "agent": serde_json::Value::Null,
+                "model": serde_json::Value::Null,
+                "status": child.status,
+                "blocking": false,
+                "tool_call_closed": true,
+                "result_pending": false,
+                "report_available": child.report.is_some(),
+                "report_delivered": true,
+                "pending_steers": 0,
+                "orphaned": child.status == "lost",
+                "actionable": false,
+                "newly_delivered": true,
+            });
+            if let Some(report) = &child.report {
+                if matches!(child.status.as_str(), "failed" | "cancelled" | "lost") {
+                    value["error"] = serde_json::json!(report);
+                } else {
+                    value["report"] = serde_json::json!(report);
+                }
             }
-            body.push_str(report);
-        } else {
-            body.push_str("(no report)");
-        }
+            value
+        })
+        .collect::<Vec<_>>();
+    for label in running {
+        children.push(serde_json::json!({
+            "task_call_id": task_call_id,
+            "label": label,
+            "agent": serde_json::Value::Null,
+            "model": serde_json::Value::Null,
+            "status": "backgrounded",
+            "blocking": false,
+            "tool_call_closed": true,
+            "result_pending": true,
+            "report_available": false,
+            "report_delivered": false,
+            "pending_steers": 0,
+            "orphaned": false,
+            "actionable": true,
+        }));
     }
-    body
+    task_envelope(serde_json::json!({
+        "state": status,
+        "task_call_id": task_call_id,
+        "blocking": false,
+        "tool_call_closed": true,
+        "result_pending": false,
+        "report_available": !completed.is_empty(),
+        "report_delivered": true,
+        "children": children,
+    }))
 }
 
 enum FoldedSubmission {
@@ -15821,10 +15989,14 @@ mod tests {
         let NoninteractiveCompletionDelivery::AsyncUser(text) = delivery else {
             panic!("backgrounded error should be delivered as async user input");
         };
-        assert!(text.contains("task_call_id=task-bg-error"), "{text}");
-        assert!(text.contains("status=failed"), "{text}");
-        assert!(text.contains("default [status=failed]"), "{text}");
-        assert!(text.contains("error: Error: late child crashed"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["type"], "task_delegation");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["task_call_id"], "task-bg-error");
+        assert_eq!(json["children"][0]["label"], "default");
+        assert_eq!(json["children"][0]["status"], "failed");
+        assert_eq!(json["children"][0]["error"], "Error: late child crashed");
 
         let duplicate = driver
             .finalize_background_noninteractive_completion(
@@ -15910,12 +16082,22 @@ mod tests {
         let NoninteractiveCompletionDelivery::AsyncUser(text) = delivery else {
             panic!("backgrounded batch should be delivered as one async user input");
         };
-        assert!(text.contains("task_call_id=task-mixed"), "{text}");
-        assert!(text.contains("status=failed"), "{text}");
-        assert!(text.contains("first [status=completed]"), "{text}");
-        assert!(text.contains("second [status=failed]"), "{text}");
-        assert!(text.contains("error: second failed"), "{text}");
-        assert!(text.contains("third [status=completed]"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["type"], "task_delegation");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["task_call_id"], "task-mixed");
+        let children = json["children"].as_array().unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0]["label"], "first");
+        assert_eq!(children[0]["status"], "completed");
+        assert_eq!(children[0]["report"], "first report");
+        assert_eq!(children[1]["label"], "second");
+        assert_eq!(children[1]["status"], "failed");
+        assert_eq!(children[1]["error"], "second failed");
+        assert_eq!(children[2]["label"], "third");
+        assert_eq!(children[2]["status"], "completed");
+        assert_eq!(children[2]["report"], "third report");
     }
 
     #[tokio::test]
@@ -16428,8 +16610,19 @@ mod tests {
         seed_task_delegation(&driver, "task-orphan", "default");
 
         let list = driver.dispatch_task_control(TaskControlAction::List, None, None, None);
-        assert!(list.contains("status=lost (orphaned)"), "{list}");
-        assert!(!list.contains("status=running"), "{list}");
+        let list_json: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(list_json["type"], "task_delegation");
+        assert_eq!(list_json["version"], 1);
+        assert_eq!(list_json["state"], "list");
+        assert_eq!(list_json["children"][0]["status"], "lost");
+        assert_eq!(list_json["children"][0]["blocking"], false);
+        assert_eq!(list_json["children"][0]["tool_call_closed"], false);
+        assert_eq!(list_json["children"][0]["result_pending"], true);
+        assert_eq!(list_json["children"][0]["report_available"], false);
+        assert_eq!(list_json["children"][0]["report_delivered"], false);
+        assert_eq!(list_json["children"][0]["pending_steers"], 0);
+        assert_eq!(list_json["children"][0]["orphaned"], true);
+        assert_eq!(list_json["children"][0]["actionable"], false);
 
         let status = driver.dispatch_task_control(
             TaskControlAction::Status,
@@ -16437,7 +16630,10 @@ mod tests {
             Some("default".to_string()),
             None,
         );
-        assert!(status.contains("status=lost (orphaned)"), "{status}");
+        let status_json: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status_json["state"], "status");
+        assert_eq!(status_json["children"][0]["status"], "lost");
+        assert_eq!(status_json["children"][0]["orphaned"], true);
 
         let query = driver.dispatch_task_control(
             TaskControlAction::Query,
@@ -16445,12 +16641,15 @@ mod tests {
             Some("default".to_string()),
             None,
         );
-        assert!(
-            query.contains(
-                "Error: cannot query task-orphan:default because it is lost (daemon restarted; no live worker)"
-            ),
-            "{query}"
+        let query_json: serde_json::Value = serde_json::from_str(&query).unwrap();
+        assert_eq!(query_json["state"], "refused");
+        assert_eq!(query_json["actionable"], false);
+        assert_eq!(
+            query_json["reason"],
+            "lost (daemon restarted; no live worker)"
         );
+        assert_eq!(query_json["report_source"], "none");
+        assert_eq!(query_json["children"][0]["status"], "lost");
 
         let steer = driver.dispatch_task_control(
             TaskControlAction::Steer,
@@ -16458,12 +16657,14 @@ mod tests {
             Some("default".to_string()),
             Some("please continue".to_string()),
         );
-        assert!(
-            steer.contains(
-                "Error: cannot steer task-orphan:default because it is lost (daemon restarted; no live worker)"
-            ),
-            "{steer}"
+        let steer_json: serde_json::Value = serde_json::from_str(&steer).unwrap();
+        assert_eq!(steer_json["state"], "refused");
+        assert_eq!(steer_json["actionable"], false);
+        assert_eq!(
+            steer_json["reason"],
+            "lost (daemon restarted; no live worker)"
         );
+        assert_eq!(steer_json["children"][0]["status"], "lost");
 
         let cancel = driver.dispatch_task_control(
             TaskControlAction::Cancel,
@@ -16471,14 +16672,10 @@ mod tests {
             Some("default".to_string()),
             None,
         );
-        assert!(
-            cancel.contains("orphaned (lost) task-orphan:default"),
-            "{cancel}"
-        );
-        assert!(
-            !cancel.contains("cancelled task-orphan:default"),
-            "{cancel}"
-        );
+        let cancel_json: serde_json::Value = serde_json::from_str(&cancel).unwrap();
+        assert_eq!(cancel_json["state"], "lost");
+        assert_eq!(cancel_json["cancelled"].as_array().unwrap().len(), 0);
+        assert_eq!(cancel_json["orphaned_lost"][0], "task-orphan:default");
         let rows = driver
             .session
             .db
@@ -16498,12 +16695,21 @@ mod tests {
             "task-live",
             "default",
             "explore".to_string(),
-            NoninteractiveDelegationSnapshot::empty(),
+            NoninteractiveDelegationSnapshot::from_history(vec![Message::user("live context")]),
         );
 
         let list = driver.dispatch_task_control(TaskControlAction::List, None, None, None);
-        assert!(list.contains("status=running"), "{list}");
-        assert!(!list.contains("(orphaned)"), "{list}");
+        let list_json: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(list_json["state"], "list");
+        assert_eq!(list_json["children"][0]["status"], "running");
+        assert_eq!(list_json["children"][0]["blocking"], true);
+        assert_eq!(list_json["children"][0]["tool_call_closed"], false);
+        assert_eq!(list_json["children"][0]["result_pending"], false);
+        assert_eq!(list_json["children"][0]["report_available"], false);
+        assert_eq!(list_json["children"][0]["report_delivered"], false);
+        assert_eq!(list_json["children"][0]["pending_steers"], 0);
+        assert_eq!(list_json["children"][0]["orphaned"], false);
+        assert_eq!(list_json["children"][0]["actionable"], true);
 
         let query = driver.dispatch_task_control(
             TaskControlAction::Query,
@@ -16511,10 +16717,20 @@ mod tests {
             Some("default".to_string()),
             None,
         );
+        let query_json: serde_json::Value = serde_json::from_str(&query).unwrap();
+        assert_eq!(query_json["state"], "query");
+        assert_eq!(query_json["task_call_id"], "task-live");
+        assert_eq!(query_json["read_only"], true);
+        assert_eq!(query_json["child_state_unchanged"], true);
+        assert_eq!(query_json["report_source"], "live_snapshot");
         assert!(
-            query.contains("query snapshot for task-live:default (running"),
-            "{query}"
+            query_json["report"]
+                .as_str()
+                .unwrap()
+                .contains("live context"),
+            "{query_json}"
         );
+        assert_eq!(query_json["children"][0]["status"], "running");
 
         let steer = driver.dispatch_task_control(
             TaskControlAction::Steer,
@@ -16522,10 +16738,11 @@ mod tests {
             Some("default".to_string()),
             Some("keep going".to_string()),
         );
-        assert!(
-            steer.contains("steer queued for task-live:default"),
-            "{steer}"
-        );
+        let steer_json: serde_json::Value = serde_json::from_str(&steer).unwrap();
+        assert_eq!(steer_json["state"], "steer_queued");
+        assert_eq!(steer_json["applies_at"], "next_child_turn_boundary");
+        assert_eq!(steer_json["applies_if"], "child_still_running_actionable");
+        assert_eq!(steer_json["children"][0]["pending_steers"], 1);
 
         let cancel = driver.dispatch_task_control(
             TaskControlAction::Cancel,
@@ -16533,7 +16750,9 @@ mod tests {
             Some("default".to_string()),
             None,
         );
-        assert!(cancel.contains("cancelled task-live:default"), "{cancel}");
+        let cancel_json: serde_json::Value = serde_json::from_str(&cancel).unwrap();
+        assert_eq!(cancel_json["state"], "cancelled");
+        assert_eq!(cancel_json["cancelled"][0], "task-live:default");
         let rows = driver
             .session
             .db
@@ -16542,6 +16761,65 @@ mod tests {
         assert_eq!(
             rows[0].status,
             crate::db::task_delegations::DelegationStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn task_query_reports_db_and_none_sources() {
+        let (mut driver, _tmp) = test_driver(8);
+        seed_task_delegation(&driver, "task-db", "default");
+        driver
+            .session
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE task_delegation_children SET report = 'db report' WHERE task_call_id = 'task-db' AND label = 'default'",
+                    [],
+                )?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap();
+        driver.noninteractive_delegations.register_running(
+            "task-db",
+            "default",
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::from_history(vec![Message::user("live fallback")]),
+        );
+
+        let db_query = driver.dispatch_task_control(
+            TaskControlAction::Query,
+            Some("task-db".to_string()),
+            Some("default".to_string()),
+            None,
+        );
+        let db_json: serde_json::Value = serde_json::from_str(&db_query).unwrap();
+        assert_eq!(db_json["state"], "query");
+        assert_eq!(db_json["report_source"], "db");
+        assert_eq!(db_json["report"], "db report");
+        assert_eq!(db_json["report_available"], true);
+
+        seed_task_delegation(&driver, "task-none", "default");
+        driver.noninteractive_delegations.register_running(
+            "task-none",
+            "default",
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+        let none_query = driver.dispatch_task_control(
+            TaskControlAction::Query,
+            Some("task-none".to_string()),
+            Some("default".to_string()),
+            None,
+        );
+        let none_json: serde_json::Value = serde_json::from_str(&none_query).unwrap();
+        assert_eq!(none_json["state"], "query");
+        assert_eq!(none_json["report_source"], "none");
+        assert_eq!(none_json["report_available"], false);
+        assert!(
+            none_json["report"]
+                .as_str()
+                .unwrap()
+                .contains("No report yet")
         );
     }
 
@@ -16589,12 +16867,26 @@ mod tests {
         let completed = vec![("first".to_string(), "first report".to_string())];
         let running = vec!["second".to_string()];
         let body = format_delegation_background_ack("task-batch", &completed, &running);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        assert!(body.contains("[delegation backgrounded"));
-        assert!(body.contains("task_call_id=task-batch"));
-        assert!(body.contains("completed: first"));
-        assert!(body.contains("running: second"));
-        assert!(body.contains("first report"));
+        assert_eq!(json["type"], "task_delegation");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["state"], "backgrounded");
+        assert_eq!(json["task_call_id"], "task-batch");
+        assert_eq!(json["blocking"], false);
+        assert_eq!(json["tool_call_closed"], true);
+        assert_eq!(json["result_pending"], true);
+        let children = json["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["task_call_id"], "task-batch");
+        assert_eq!(children[0]["label"], "first");
+        assert_eq!(children[0]["status"], "completed");
+        assert_eq!(children[0]["newly_delivered"], true);
+        assert_eq!(children[0]["report"], "first report");
+        assert_eq!(children[1]["task_call_id"], "task-batch");
+        assert_eq!(children[1]["label"], "second");
+        assert_eq!(children[1]["status"], "backgrounded");
+        assert_eq!(children[1]["result_pending"], true);
         assert!(!body.contains("original child prompt"));
     }
 
@@ -16614,16 +16906,24 @@ mod tests {
         ];
         let running = Vec::new();
         let body = format_async_delegation_result("task-batch", &completed, &running);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        assert!(body.contains("[async delegation result"));
-        assert!(body.contains("task_call_id=task-batch"));
-        assert!(body.contains("status=failed"));
-        assert!(body.contains("completed: second, third"));
-        assert!(body.contains("running: none"));
-        assert!(body.contains("second [status=completed]"));
-        assert!(body.contains("second report"));
-        assert!(body.contains("third [status=failed]"));
-        assert!(body.contains("error: third failed"));
+        assert_eq!(json["type"], "task_delegation");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["task_call_id"], "task-batch");
+        assert_eq!(json["result_pending"], false);
+        let children = json["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["task_call_id"], "task-batch");
+        assert_eq!(children[0]["label"], "second");
+        assert_eq!(children[0]["status"], "completed");
+        assert_eq!(children[0]["newly_delivered"], true);
+        assert_eq!(children[0]["report"], "second report");
+        assert_eq!(children[1]["task_call_id"], "task-batch");
+        assert_eq!(children[1]["label"], "third");
+        assert_eq!(children[1]["status"], "failed");
+        assert_eq!(children[1]["error"], "third failed");
         assert!(!body.contains("first report"));
     }
 

@@ -171,6 +171,7 @@ fn canonical_if_exists(path: &str) -> PathBuf {
 pub fn request_kind(request: &Request) -> &'static str {
     match request {
         Request::Attach { .. } => "attach",
+        Request::SubagentTranscript { .. } => "subagent_transcript",
         Request::SendUserMessage { .. } => "send_user_message",
         Request::SteerDelegation { .. } => "steer_delegation",
         Request::BeginAttachmentUpload { .. } => "begin_attachment_upload",

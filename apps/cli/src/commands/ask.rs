@@ -93,6 +93,8 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         tokio_util::sync::CancellationToken::new(),
         None,
+        None,
+        None,
     )
     .await
 }

@@ -18,6 +18,7 @@
 //! is shared across agents in the same conversation; agent
 //! transcripts are private.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -32,6 +33,30 @@ use crate::db::Db;
 use crate::db::sessions::SessionRow;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::engine::repair::Recovery;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEventLineage {
+    pub task_call_id: String,
+    pub label: String,
+}
+
+tokio::task_local! {
+    static SESSION_EVENT_LINEAGE: Option<SessionEventLineage>;
+}
+
+pub async fn with_session_event_lineage<F>(
+    lineage: Option<SessionEventLineage>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    SESSION_EVENT_LINEAGE.scope(lineage, future).await
+}
+
+fn current_session_event_lineage() -> Option<SessionEventLineage> {
+    SESSION_EVENT_LINEAGE.try_with(Clone::clone).ok().flatten()
+}
 
 /// What the auto-title hook should do after a user message. Returned by
 /// [`Session::note_user_content`]; the driver spawns the matching detached
@@ -1160,8 +1185,20 @@ impl Session {
         origin_principal: Option<&str>,
         data: &Value,
     ) -> Result<i64> {
+        let lineage = current_session_event_lineage();
         self.db
-            .insert_session_event_with_origin(self.id, kind, agent, call_id, origin_principal, data)
+            .insert_session_event_with_context(
+                self.id,
+                kind,
+                agent,
+                call_id,
+                crate::db::session_log::SessionEventContext {
+                    origin_principal,
+                    task_call_id: lineage.as_ref().map(|l| l.task_call_id.as_str()),
+                    label: lineage.as_ref().map(|l| l.label.as_str()),
+                },
+                data,
+            )
             .context("inserting session_event")
     }
 

@@ -522,6 +522,14 @@ pub enum TurnEvent {
         model_trusted: bool,
         routing: serde_json::Value,
     },
+    /// A noninteractive child turn event forwarded through its parent
+    /// session stream with delegation lineage.
+    NestedTurn {
+        task_call_id: String,
+        label: String,
+        parent_task_call_id: Option<String>,
+        inner: Box<TurnEvent>,
+    },
     /// Provider-reported token usage for the round-trip that just
     /// completed. Absent when the provider didn't include a usage
     /// chunk in the response stream.

@@ -479,6 +479,8 @@ CREATE TABLE session_events (
     type        TEXT    NOT NULL,                  -- TurnEvent-aligned discriminant
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable
+    task_call_id TEXT,                             -- owning delegation run, when inside a child
+    label       TEXT,                              -- delegation label paired with task_call_id
     data_json   TEXT    NOT NULL DEFAULT '{}',     -- per-type payload
     -- assistant-turn reasoning projected out of `data_json` so queries and
     -- exports can read it column-wise without parsing JSON (the same idiom
@@ -491,6 +493,8 @@ CREATE TABLE session_events (
 
 CREATE INDEX idx_sevents_session_seq ON session_events (session_id, seq);
 CREATE INDEX idx_sevents_call        ON session_events (call_id);
+CREATE INDEX idx_sevents_task_child  ON session_events (session_id, task_call_id, label, seq)
+  WHERE task_call_id IS NOT NULL;
 CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
   WHERE origin_principal IS NOT NULL;
 

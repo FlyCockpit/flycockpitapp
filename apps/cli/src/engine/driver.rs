@@ -639,7 +639,7 @@ struct NoninteractiveDelegationKey {
 }
 
 impl NoninteractiveDelegationKey {
-    fn new(task_call_id: impl Into<String>, label: impl Into<String>) -> Self {
+    pub(crate) fn new(task_call_id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             task_call_id: task_call_id.into(),
             label: label.into(),
@@ -6947,6 +6947,11 @@ impl Driver {
                     self.interrupts.clone(),
                     cancel.clone(),
                     Some(self.tandem_set.clone()),
+                    Some(tx.clone()),
+                    Some(NoninteractiveSteerTarget::new(
+                        task_call_id.clone(),
+                        "default",
+                    )),
                 )
                 .await
                 {
@@ -7061,6 +7066,7 @@ impl Driver {
                         self.loop_guard_threshold,
                         EXPLORE_MAX_TURNS,
                         Some(self.tandem_set.clone()),
+                        Some(tx.clone()),
                         Some(NoninteractiveSteerTarget::new(
                             task_call_id.clone(),
                             "default",
@@ -8463,6 +8469,11 @@ impl Driver {
                                 driver.interrupts.clone(),
                                 child_cancel.clone(),
                                 Some(driver.tandem_set.clone()),
+                                Some(tx.clone()),
+                                Some(NoninteractiveSteerTarget::new(
+                                    entry_task_call_id.clone(),
+                                    entry.label.clone(),
+                                )),
                             )
                             .await
                             {
@@ -8540,6 +8551,7 @@ impl Driver {
                             driver.loop_guard_threshold,
                             EXPLORE_MAX_TURNS,
                             Some(driver.tandem_set.clone()),
+                            Some(tx.clone()),
                             Some(NoninteractiveSteerTarget::new(
                                 entry_task_call_id.clone(),
                                 entry.label.clone(),
@@ -11049,6 +11061,8 @@ pub(crate) async fn run_noninteractive(
     // Model-comparison tandem (shadow) set, forwarded so the `docs` pipeline's
     // resolver/answerer turns are shadowed when the feature is on.
     tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    steer_target: Option<NoninteractiveSteerTarget>,
 ) -> Result<String> {
     // The docs pipeline (the only other caller) neither rehydrates nor
     // seeds: a fresh transcript, no prior history, and a throwaway seed
@@ -11069,7 +11083,8 @@ pub(crate) async fn run_noninteractive(
         loop_guard_threshold,
         max_turns,
         tandem,
-        None,
+        event_tx,
+        steer_target,
     )
     .await?;
     Ok(out.report)
@@ -11082,12 +11097,150 @@ pub(crate) struct NoninteractiveSteerTarget {
 }
 
 impl NoninteractiveSteerTarget {
-    fn new(task_call_id: impl Into<String>, label: impl Into<String>) -> Self {
+    pub(crate) fn new(task_call_id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             task_call_id: task_call_id.into(),
             label: label.into(),
         }
     }
+}
+
+impl NoninteractiveSteerTarget {
+    fn lineage(&self) -> crate::session::SessionEventLineage {
+        crate::session::SessionEventLineage {
+            task_call_id: self.task_call_id.clone(),
+            label: self.label.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingNestedDeltas {
+    assistant: Option<(String, String)>,
+    reasoning: Option<(String, String)>,
+}
+
+impl PendingNestedDeltas {
+    fn push_assistant(&mut self, agent: String, delta: String) {
+        match self.assistant.as_mut() {
+            Some((current_agent, current_delta)) if current_agent == &agent => {
+                current_delta.push_str(&delta);
+            }
+            _ => {
+                self.assistant = Some((agent, delta));
+            }
+        }
+    }
+
+    fn push_reasoning(&mut self, agent: String, delta: String) {
+        match self.reasoning.as_mut() {
+            Some((current_agent, current_delta)) if current_agent == &agent => {
+                current_delta.push_str(&delta);
+            }
+            _ => {
+                self.reasoning = Some((agent, delta));
+            }
+        }
+    }
+
+    fn drain(&mut self) -> Vec<TurnEvent> {
+        let mut out = Vec::new();
+        if let Some((agent, delta)) = self.reasoning.take()
+            && !delta.is_empty()
+        {
+            out.push(TurnEvent::ReasoningDelta { agent, delta });
+        }
+        if let Some((agent, delta)) = self.assistant.take()
+            && !delta.is_empty()
+        {
+            out.push(TurnEvent::AssistantTextDelta { agent, delta });
+        }
+        out
+    }
+}
+
+fn wrap_noninteractive_child_event(
+    target: &NoninteractiveSteerTarget,
+    inner: TurnEvent,
+) -> TurnEvent {
+    TurnEvent::NestedTurn {
+        task_call_id: target.task_call_id.clone(),
+        label: target.label.clone(),
+        parent_task_call_id: None,
+        inner: Box::new(inner),
+    }
+}
+
+async fn send_wrapped_noninteractive_event(
+    tx: &mpsc::Sender<TurnEvent>,
+    target: &NoninteractiveSteerTarget,
+    event: TurnEvent,
+) -> bool {
+    tx.send(wrap_noninteractive_child_event(target, event))
+        .await
+        .is_ok()
+}
+
+async fn flush_nested_deltas(
+    tx: &mpsc::Sender<TurnEvent>,
+    target: &NoninteractiveSteerTarget,
+    pending: &mut PendingNestedDeltas,
+) -> bool {
+    for event in pending.drain() {
+        if !send_wrapped_noninteractive_event(tx, target, event).await {
+            return false;
+        }
+    }
+    true
+}
+
+fn spawn_noninteractive_event_forwarder(
+    mut rx: mpsc::Receiver<TurnEvent>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    target: Option<NoninteractiveSteerTarget>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (Some(event_tx), Some(target)) = (event_tx, target) else {
+            while rx.recv().await.is_some() {}
+            return;
+        };
+
+        let mut pending = PendingNestedDeltas::default();
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                maybe_event = rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        let _ = flush_nested_deltas(&event_tx, &target, &mut pending).await;
+                        break;
+                    };
+                    match event {
+                        TurnEvent::AssistantTextDelta { agent, delta } => {
+                            pending.push_assistant(agent, delta);
+                        }
+                        TurnEvent::ReasoningDelta { agent, delta } => {
+                            pending.push_reasoning(agent, delta);
+                        }
+                        other => {
+                            if !flush_nested_deltas(&event_tx, &target, &mut pending).await {
+                                break;
+                            }
+                            if !send_wrapped_noninteractive_event(&event_tx, &target, other).await {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    if !flush_nested_deltas(&event_tx, &target, &mut pending).await {
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn render_noninteractive_steers(
@@ -11166,13 +11319,13 @@ pub(crate) async fn run_noninteractive_resumable(
     // this leaf subagent's (`builder`/`explore`/`docs`) substantive turns are
     // shadowed too; `None`/empty disables it. Cheap clone per call.
     tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
     steer_target: Option<NoninteractiveSteerTarget>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
     use crate::engine::agent::turn_with_backup;
 
-    // The child needs an event channel; we drain and discard.
-    let (sink_tx, mut sink_rx) = mpsc::channel::<TurnEvent>(64);
-    let drain = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+    let (child_tx, child_rx) = mpsc::channel::<TurnEvent>(64);
+    let forwarder = spawn_noninteractive_event_forwarder(child_rx, event_tx, steer_target.clone());
 
     let agent = Arc::new(child);
     // Per-turn backup-model fallback for the subagent (`per-model-
@@ -11220,7 +11373,7 @@ pub(crate) async fn run_noninteractive_resumable(
         // inference.md`). Passed into `turn`, which dispatches the shadows from
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
-        let outcome = match turn_with_backup(
+        let turn_future = turn_with_backup(
             &agent,
             backup_model.as_ref(),
             &mut history,
@@ -11244,14 +11397,21 @@ pub(crate) async fn run_noninteractive_resumable(
             call_id,
             tandem.as_ref(),
             None,
-            &sink_tx,
-        )
-        .await
-        {
+            &child_tx,
+        );
+        let outcome_future = async {
+            if let Some(target) = &steer_target {
+                crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
+                    .await
+            } else {
+                turn_future.await
+            }
+        };
+        let outcome = match outcome_future.await {
             Ok(outcome) => outcome,
             Err(error) => {
-                drop(sink_tx);
-                let _ = drain.await;
+                drop(child_tx);
+                let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(error, history));
             }
         };
@@ -11262,8 +11422,8 @@ pub(crate) async fn run_noninteractive_resumable(
                     .expect("Continue with empty history is unreachable");
             }
             TurnOutcome::Done => {
-                drop(sink_tx);
-                let _ = drain.await;
+                drop(child_tx);
+                let _ = forwarder.await;
                 // No `return` tool call: fall back to wrapping the final text
                 // (envelope-holding agents only — the `docs` pipeline keeps its
                 // plain answer). `None` selects the fallback path.
@@ -11271,8 +11431,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 return Ok(NoninteractiveOutcome { report, history });
             }
             TurnOutcome::Return { fields } => {
-                drop(sink_tx);
-                let _ = drain.await;
+                drop(child_tx);
+                let _ = forwarder.await;
                 let report =
                     assemble_subagent_report(&agent, &history, &deferred_log, Some(&fields));
                 return Ok(NoninteractiveOutcome { report, history });
@@ -11289,8 +11449,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 // shouldn't happen, but if it does we bail rather than spin
                 // (the single async-job + primary-swap authority is the main
                 // driver, never a noninteractive subagent — §22 anti-runaway).
-                drop(sink_tx);
-                let _ = drain.await;
+                drop(child_tx);
+                let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
                     anyhow::anyhow!(
                         "noninteractive agent `{}` attempted to delegate or schedule a job",
@@ -11301,8 +11461,8 @@ pub(crate) async fn run_noninteractive_resumable(
             }
         }
     }
-    drop(sink_tx);
-    let _ = drain.await;
+    drop(child_tx);
+    let _ = forwarder.await;
     Err(NoninteractiveRunError::new(
         anyhow::anyhow!(
             "noninteractive agent `{}` exceeded {max_turns} turns",
@@ -11750,6 +11910,69 @@ fn collect_final_text(history: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn noninteractive_event_forwarder_wraps_child_events() {
+        let (child_tx, child_rx) = mpsc::channel(8);
+        let (parent_tx, mut parent_rx) = mpsc::channel(8);
+        let target = NoninteractiveSteerTarget::new("task-1", "default");
+        let forwarder =
+            spawn_noninteractive_event_forwarder(child_rx, Some(parent_tx), Some(target));
+
+        child_tx
+            .send(TurnEvent::AssistantTextDelta {
+                agent: "Explore".into(),
+                delta: "hel".into(),
+            })
+            .await
+            .unwrap();
+        child_tx
+            .send(TurnEvent::AssistantTextDelta {
+                agent: "Explore".into(),
+                delta: "lo".into(),
+            })
+            .await
+            .unwrap();
+        child_tx
+            .send(TurnEvent::ToolStart {
+                agent: "Explore".into(),
+                call_id: "call-1".into(),
+                tool: "read".into(),
+                args: serde_json::json!({"path":"README.md"}),
+            })
+            .await
+            .unwrap();
+        drop(child_tx);
+        forwarder.await.unwrap();
+
+        match parent_rx.recv().await.unwrap() {
+            TurnEvent::NestedTurn {
+                task_call_id,
+                label,
+                parent_task_call_id,
+                inner,
+            } => {
+                assert_eq!(task_call_id, "task-1");
+                assert_eq!(label, "default");
+                assert_eq!(parent_task_call_id, None);
+                assert!(matches!(
+                    inner.as_ref(),
+                    TurnEvent::AssistantTextDelta { agent, delta }
+                        if agent == "Explore" && delta == "hello"
+                ));
+            }
+            other => panic!("expected nested assistant delta, got {other:?}"),
+        }
+        match parent_rx.recv().await.unwrap() {
+            TurnEvent::NestedTurn { inner, .. } => assert!(matches!(
+                inner.as_ref(),
+                TurnEvent::ToolStart { agent, call_id, tool, .. }
+                    if agent == "Explore" && call_id == "call-1" && tool == "read"
+            )),
+            other => panic!("expected nested tool start, got {other:?}"),
+        }
+        assert!(parent_rx.recv().await.is_none());
+    }
 
     /// Build a driver rooted on a keyless localhost agent (the model is
     /// never called by the action-dispatch paths under test).

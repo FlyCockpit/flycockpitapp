@@ -7488,6 +7488,10 @@ impl App {
                     },
                 );
             }
+            TurnEvent::NestedTurn { .. } => {
+                // Transport foundation only: a later subagent view consumes
+                // nested events. The main transcript remains unchanged.
+            }
             TurnEvent::Usage { usage, .. } => {
                 self.last_usage = Some(usage);
                 // Re-anchor the live counter: the provider's fresh total

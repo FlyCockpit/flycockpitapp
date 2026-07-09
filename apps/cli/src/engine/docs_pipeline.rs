@@ -25,11 +25,14 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::engine::agent::TurnEvent;
 use crate::engine::builtin::{SpawnArgs, docs_answerer, docs_resolver};
-use crate::engine::driver::run_noninteractive;
+use crate::engine::driver::{NoninteractiveSteerTarget, run_noninteractive};
 use crate::redact::RedactionTable;
 use crate::session::Session;
 use crate::tools::docs::DocsResolution;
@@ -80,6 +83,8 @@ pub async fn run(
     // answerer turns are shadowed when the feature is on
     // (implementation note).
     tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    steer_target: Option<NoninteractiveSteerTarget>,
 ) -> Result<String> {
     let input = parse_input(brief);
 
@@ -123,6 +128,8 @@ pub async fn run(
         crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
         DOCS_RESOLVER_MAX_TURNS,
         tandem.clone(),
+        event_tx.clone(),
+        steer_target.clone(),
     )
     .await?;
 
@@ -166,6 +173,8 @@ pub async fn run(
         crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
         DOCS_ANSWERER_MAX_TURNS,
         tandem,
+        event_tx,
+        steer_target,
     )
     .await?;
     Ok(answer)

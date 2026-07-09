@@ -224,6 +224,14 @@ pub enum Request {
         env_policy: crate::env_snapshot::EnvDriftPolicy,
     },
 
+    /// Fetch one noninteractive child run's persisted transcript. This is
+    /// read-only and independent of attach/resume history projection.
+    SubagentTranscript {
+        session_id: Uuid,
+        task_call_id: String,
+        label: String,
+    },
+
     /// Send a user message into the currently attached session. The
     /// daemon enqueues it on the driver and acks immediately —
     /// per-turn progress flows over the event stream. `image_refs` carries
@@ -1030,6 +1038,13 @@ pub enum Response {
         env_policy_applied: crate::env_snapshot::EnvDriftPolicy,
     },
 
+    SubagentTranscript {
+        session_id: Uuid,
+        task_call_id: String,
+        label: String,
+        history: Vec<HistoryEntry>,
+    },
+
     Sessions {
         sessions: Vec<SessionSummary>,
     },
@@ -1585,6 +1600,17 @@ pub enum Event {
         model_trusted: bool,
         #[serde(default)]
         routing: serde_json::Value,
+    },
+
+    /// A noninteractive child event forwarded through the parent session
+    /// stream with enough lineage for clients to build a delegation tree.
+    NestedTurn {
+        session_id: Uuid,
+        task_call_id: String,
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_task_call_id: Option<String>,
+        inner: Box<Event>,
     },
 
     /// Provider-reported token usage for the round-trip that just

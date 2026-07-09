@@ -303,11 +303,18 @@ pub fn history_snapshot_with_active_subagent_conn(
     let visible_agent = |agent: Option<&str>| {
         agent == Some(root_agent) || active_child.is_some_and(|child| agent == Some(child))
     };
+    let visible_lineage = |ev: &SessionEventRow| match ev.task_call_id.as_deref() {
+        None => true,
+        Some(task_call_id) => active_subagent.is_some_and(|active| {
+            task_call_id == active.task_call_id
+                && ev.label.as_deref() == Some(active.label.as_str())
+        }),
+    };
 
     let mut snapshot: Vec<proto::HistoryEntry> = Vec::new();
     for ev in &events {
         match ev.kind.as_str() {
-            "user_message" => {
+            "user_message" if visible_lineage(ev) => {
                 let text = ev
                     .data
                     .get("text")
@@ -321,7 +328,7 @@ pub fn history_snapshot_with_active_subagent_conn(
                     origin_principal: ev.origin_principal.clone(),
                 });
             }
-            "assistant_message" if visible_agent(ev.agent.as_deref()) => {
+            "assistant_message" if visible_agent(ev.agent.as_deref()) && visible_lineage(ev) => {
                 let agent = ev.agent.as_deref().unwrap_or(root_agent).to_string();
                 let text = ev
                     .data
@@ -343,7 +350,7 @@ pub fn history_snapshot_with_active_subagent_conn(
                     seq: ev.seq,
                 });
             }
-            "tool_call" if visible_agent(ev.agent.as_deref()) => {
+            "tool_call" if visible_agent(ev.agent.as_deref()) && visible_lineage(ev) => {
                 let Some(call_id) = ev.call_id.as_deref() else {
                     // A corrupt tool_call row with no call_id can't be paired
                     // or rendered meaningfully — skip it (the model-history
@@ -416,7 +423,7 @@ pub fn history_snapshot_with_active_subagent_conn(
                 };
                 snapshot.push(entry);
             }
-            "inference_failure" if visible_agent(ev.agent.as_deref()) => {
+            "inference_failure" if visible_agent(ev.agent.as_deref()) && visible_lineage(ev) => {
                 let summary = inference_failure_summary(&ev.data);
                 if summary.trim().is_empty() {
                     continue;
@@ -485,6 +492,174 @@ pub fn history_snapshot_with_active_subagent_conn(
             }
             // Everything else (subagent frames, notes, prune markers, other
             // agents' turns) is not part of the resumed root transcript.
+            _ => {}
+        }
+    }
+
+    Ok(snapshot)
+}
+
+pub fn subagent_history_snapshot_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    task_call_id: &str,
+    label: &str,
+) -> Result<Vec<proto::HistoryEntry>> {
+    let events = Db::list_session_events_conn(conn, session_id)
+        .map_err(|e| anyhow!("loading session events for subagent history snapshot: {e}"))?;
+    let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
+        .map_err(|e| anyhow!("loading tool calls for subagent history snapshot: {e}"))?;
+
+    let mut tc_by_id: std::collections::HashMap<&str, &ToolCallEvent> =
+        std::collections::HashMap::new();
+    for tc in &tool_calls {
+        tc_by_id.insert(tc.call_id.as_str(), tc);
+    }
+
+    let owns_row = |ev: &SessionEventRow| {
+        ev.task_call_id.as_deref() == Some(task_call_id) && ev.label.as_deref() == Some(label)
+    };
+
+    let mut snapshot: Vec<proto::HistoryEntry> = Vec::new();
+    for ev in events.iter().filter(|ev| owns_row(ev)) {
+        match ev.kind.as_str() {
+            "user_message" => {
+                let text = ev
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                snapshot.push(proto::HistoryEntry::User {
+                    text,
+                    ts_ms: ev.ts_ms,
+                    seq: ev.seq,
+                    origin_principal: ev.origin_principal.clone(),
+                });
+            }
+            "assistant_message" => {
+                let agent = ev.agent.clone().unwrap_or_default();
+                let text = ev
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reasoning = ev
+                    .data
+                    .get("reasoning")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                snapshot.push(proto::HistoryEntry::Assistant {
+                    agent,
+                    text,
+                    reasoning,
+                    ts_ms: ev.ts_ms,
+                    seq: ev.seq,
+                });
+            }
+            "tool_call" => {
+                let Some(call_id) = ev.call_id.as_deref() else {
+                    continue;
+                };
+                let entry = match tc_by_id.get(call_id) {
+                    Some(tc) => {
+                        let (recovery_kind, recovery_stage) = tc.recovery.raw_db_fields();
+                        proto::HistoryEntry::ToolCall {
+                            agent: tc.agent.clone(),
+                            call_id: call_id.to_string(),
+                            tool: tc.tool.clone(),
+                            original_input: tc.original_input_json.clone(),
+                            wire_input: tc.wire_input_json.clone(),
+                            recovery_kind: recovery_kind.map(|s| s.into_owned()),
+                            recovery_stage: recovery_stage.map(|s| s.into_owned()),
+                            output: tc.output.clone(),
+                            hard_fail: tc.hard_fail,
+                            truncated: tc.truncated,
+                            hint: hint_text(tc.hint.as_ref()),
+                        }
+                    }
+                    None => {
+                        let tool = ev
+                            .data
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let original_input = ev
+                            .data
+                            .get("original_input")
+                            .or_else(|| ev.data.get("wire_input"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let wire_input = ev
+                            .data
+                            .get("wire_input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let output = ev
+                            .data
+                            .get("output")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        proto::HistoryEntry::ToolCall {
+                            agent: ev.agent.clone().unwrap_or_default(),
+                            call_id: call_id.to_string(),
+                            tool,
+                            original_input,
+                            wire_input,
+                            recovery_kind: None,
+                            recovery_stage: None,
+                            output,
+                            hard_fail: false,
+                            truncated: false,
+                            hint: hint_text(ev.data.get("hint")),
+                        }
+                    }
+                };
+                snapshot.push(entry);
+            }
+            "inference_failure" => {
+                let summary = inference_failure_summary(&ev.data);
+                if summary.trim().is_empty() {
+                    continue;
+                }
+                let detail = ev
+                    .data
+                    .get("detail")
+                    .or_else(|| ev.data.get("full_detail"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                snapshot.push(proto::HistoryEntry::InferenceError { summary, detail });
+            }
+            "subagent_spawned" => {
+                let parent = ev.data.get("parent").and_then(|v| v.as_str()).unwrap_or("");
+                let child = ev
+                    .data
+                    .get("child")
+                    .or_else(|| ev.data.get("child_agent"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let child_label = ev
+                    .data
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
+                let child_task_call_id = ev
+                    .call_id
+                    .as_deref()
+                    .or_else(|| ev.data.get("task_call_id").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                snapshot.push(proto::HistoryEntry::Subagent {
+                    parent: parent.to_string(),
+                    child: child.to_string(),
+                    task_call_id: child_task_call_id.to_string(),
+                    label: child_label.to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -3750,5 +3925,130 @@ mod tests {
             | proto::HistoryEntry::Subagent { .. }
             | proto::HistoryEntry::InferenceError { .. } => panic!("not a message entry"),
         }
+    }
+}
+
+#[cfg(test)]
+mod subagent_observe_tests {
+    use super::*;
+    use crate::db::session_log::SessionEventKind;
+    use serde_json::json;
+
+    #[test]
+    fn subagent_snapshot_isolates_interleaved_runs_with_same_agent() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .unwrap();
+        let sid = session.session_id;
+
+        db.insert_session_event_with_context(
+            sid,
+            SessionEventKind::UserMessage,
+            Some("Explore"),
+            None,
+            crate::db::session_log::SessionEventContext {
+                origin_principal: None,
+                task_call_id: Some("task-a"),
+                label: Some("default"),
+            },
+            &json!({ "text": "brief a" }),
+        )
+        .unwrap();
+        db.insert_session_event_with_context(
+            sid,
+            SessionEventKind::UserMessage,
+            Some("Explore"),
+            None,
+            crate::db::session_log::SessionEventContext {
+                origin_principal: None,
+                task_call_id: Some("task-b"),
+                label: Some("default"),
+            },
+            &json!({ "text": "brief b" }),
+        )
+        .unwrap();
+        db.insert_session_event_with_context(
+            sid,
+            SessionEventKind::AssistantMessage,
+            Some("Explore"),
+            Some("call-a"),
+            crate::db::session_log::SessionEventContext {
+                origin_principal: None,
+                task_call_id: Some("task-a"),
+                label: Some("default"),
+            },
+            &json!({ "text": "answer a", "reasoning": "ra" }),
+        )
+        .unwrap();
+        db.insert_session_event_with_context(
+            sid,
+            SessionEventKind::AssistantMessage,
+            Some("Explore"),
+            Some("call-b"),
+            crate::db::session_log::SessionEventContext {
+                origin_principal: None,
+                task_call_id: Some("task-b"),
+                label: Some("default"),
+            },
+            &json!({ "text": "answer b", "reasoning": "rb" }),
+        )
+        .unwrap();
+
+        let child_a = db
+            .with_conn(|conn| subagent_history_snapshot_conn(conn, sid, "task-a", "default"))
+            .unwrap();
+        assert_eq!(child_a.len(), 2);
+        assert!(matches!(&child_a[0], proto::HistoryEntry::User { text, .. } if text == "brief a"));
+        assert!(
+            matches!(&child_a[1], proto::HistoryEntry::Assistant { text, reasoning, .. } if text == "answer a" && reasoning == "ra")
+        );
+
+        let child_b = db
+            .with_conn(|conn| subagent_history_snapshot_conn(conn, sid, "task-b", "default"))
+            .unwrap();
+        assert_eq!(child_b.len(), 2);
+        assert!(matches!(&child_b[0], proto::HistoryEntry::User { text, .. } if text == "brief b"));
+        assert!(
+            matches!(&child_b[1], proto::HistoryEntry::Assistant { text, reasoning, .. } if text == "answer b" && reasoning == "rb")
+        );
+    }
+
+    #[test]
+    fn root_snapshot_hides_finished_child_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .unwrap();
+        let sid = session.session_id;
+        db.insert_session_event(
+            sid,
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &json!({ "text": "root prompt" }),
+        )
+        .unwrap();
+        db.insert_session_event_with_context(
+            sid,
+            SessionEventKind::AssistantMessage,
+            Some("Explore"),
+            Some("call-child"),
+            crate::db::session_log::SessionEventContext {
+                origin_principal: None,
+                task_call_id: Some("task-child"),
+                label: Some("default"),
+            },
+            &json!({ "text": "hidden child", "reasoning": "" }),
+        )
+        .unwrap();
+
+        let root = db
+            .with_conn(|conn| history_snapshot_with_active_subagent_conn(conn, sid, "Build", None))
+            .unwrap();
+        assert_eq!(root.len(), 1);
+        assert!(
+            matches!(&root[0], proto::HistoryEntry::User { text, .. } if text == "root prompt")
+        );
     }
 }

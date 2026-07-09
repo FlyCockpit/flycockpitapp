@@ -172,6 +172,14 @@ impl InferenceRequestStatus {
     }
 }
 
+/// Optional context stamped onto a `session_events` row.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionEventContext<'a> {
+    pub origin_principal: Option<&'a str>,
+    pub task_call_id: Option<&'a str>,
+    pub label: Option<&'a str>,
+}
+
 /// A row read back from `session_events`.
 #[derive(Debug, Clone)]
 pub struct SessionEventRow {
@@ -181,6 +189,8 @@ pub struct SessionEventRow {
     pub kind: String,
     pub agent: Option<String>,
     pub call_id: Option<String>,
+    pub task_call_id: Option<String>,
+    pub label: Option<String>,
     pub origin_principal: Option<String>,
     pub data: Value,
 }
@@ -254,20 +264,45 @@ impl Db {
         origin_principal: Option<&str>,
         data: &Value,
     ) -> Result<i64> {
+        self.insert_session_event_with_context(
+            session_id,
+            kind,
+            agent,
+            call_id,
+            SessionEventContext {
+                origin_principal,
+                task_call_id: None,
+                label: None,
+            },
+            data,
+        )
+    }
+
+    pub fn insert_session_event_with_context(
+        &self,
+        session_id: Uuid,
+        kind: SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        context: SessionEventContext<'_>,
+        data: &Value,
+    ) -> Result<i64> {
         let data_json = serde_json::to_string(data).context("serializing event data")?;
         let ts_ms = now_ms();
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO session_events
-                 (session_id, ts_ms, type, agent, call_id, origin_principal, data_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session_id.to_string(),
                     ts_ms,
                     kind.as_str(),
                     agent,
                     call_id,
-                    origin_principal,
+                    context.task_call_id,
+                    context.label,
+                    context.origin_principal,
                     data_json,
                 ],
             )
@@ -288,7 +323,7 @@ impl Db {
     ) -> Result<Vec<SessionEventRow>> {
         let mut stmt = conn
             .prepare(
-                "SELECT seq, session_id, ts_ms, type, agent, call_id, origin_principal, data_json
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json
                    FROM session_events
                   WHERE session_id = ?1
                   ORDER BY seq ASC",
@@ -344,6 +379,8 @@ fn decode_event_row(row: &rusqlite::Row<'_>) -> DecodeResult<SessionEventRow> {
             kind: row.get("type").map_err(anyhow::Error::from)?,
             agent: row.get("agent").map_err(anyhow::Error::from)?,
             call_id: row.get("call_id").map_err(anyhow::Error::from)?,
+            task_call_id: row.get("task_call_id").map_err(anyhow::Error::from)?,
+            label: row.get("label").map_err(anyhow::Error::from)?,
             origin_principal: row.get("origin_principal").map_err(anyhow::Error::from)?,
             data,
         })

@@ -2573,6 +2573,21 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
                 routing,
             }]
         }
+        TurnEvent::NestedTurn {
+            task_call_id,
+            label,
+            parent_task_call_id,
+            inner,
+        } => turn_event_to_proto(*inner, session_id)
+            .into_iter()
+            .map(|inner| proto::Event::NestedTurn {
+                session_id,
+                task_call_id: task_call_id.clone(),
+                label: label.clone(),
+                parent_task_call_id: parent_task_call_id.clone(),
+                inner: Box::new(inner),
+            })
+            .collect(),
         TurnEvent::Usage { agent, usage } => {
             vec![proto::Event::Usage {
                 session_id,
@@ -3426,6 +3441,52 @@ mod tests {
                 assert_eq!(turn_id.as_deref(), Some("turn-1"));
             }
             other => panic!("expected one AgentIdle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_turn_event_maps_to_wrapped_proto_event() {
+        let sid = Uuid::new_v4();
+        let out = turn_event_to_proto(
+            TurnEvent::NestedTurn {
+                task_call_id: "task-1".into(),
+                label: "default".into(),
+                parent_task_call_id: Some("parent-task".into()),
+                inner: Box::new(TurnEvent::AssistantTextDelta {
+                    agent: "Explore".into(),
+                    delta: "hello".into(),
+                }),
+            },
+            sid,
+        );
+        match out.as_slice() {
+            [
+                proto::Event::NestedTurn {
+                    session_id,
+                    task_call_id,
+                    label,
+                    parent_task_call_id,
+                    inner,
+                },
+            ] => {
+                assert_eq!(*session_id, sid);
+                assert_eq!(task_call_id, "task-1");
+                assert_eq!(label, "default");
+                assert_eq!(parent_task_call_id.as_deref(), Some("parent-task"));
+                match inner.as_ref() {
+                    proto::Event::AssistantTextDelta {
+                        session_id,
+                        agent,
+                        delta,
+                    } => {
+                        assert_eq!(*session_id, sid);
+                        assert_eq!(agent, "Explore");
+                        assert_eq!(delta, "hello");
+                    }
+                    other => panic!("expected wrapped AssistantTextDelta, got {other:?}"),
+                }
+            }
+            other => panic!("expected one NestedTurn, got {other:?}"),
         }
     }
 

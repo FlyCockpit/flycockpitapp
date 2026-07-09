@@ -801,6 +801,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | BackupUsed { session_id, .. }
         | SubagentSpawned { session_id, .. }
         | SubagentReport { session_id, .. }
+        | NestedTurn { session_id, .. }
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
@@ -1076,6 +1077,21 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             model_trusted,
             routing,
         },
+        NestedTurn {
+            task_call_id,
+            label,
+            parent_task_call_id,
+            inner,
+            ..
+        } => {
+            let inner = proto_event_to_turn_event(*inner)?;
+            TurnEvent::NestedTurn {
+                task_call_id,
+                label,
+                parent_task_call_id,
+                inner: Box::new(inner),
+            }
+        }
         Usage {
             agent,
             input_tokens,
@@ -1633,6 +1649,41 @@ mod tests {
                 turn_id: Some(turn_id),
             } if turn_id == "turn-1"
         ));
+    }
+
+    #[test]
+    fn nested_turn_event_routes_and_decodes() {
+        let sid = uuid::Uuid::new_v4();
+        let event = proto::Event::NestedTurn {
+            session_id: sid,
+            task_call_id: "task-1".into(),
+            label: "default".into(),
+            parent_task_call_id: Some("parent-task".into()),
+            inner: Box::new(proto::Event::ReasoningDelta {
+                session_id: sid,
+                agent: "Explore".into(),
+                delta: "thinking".into(),
+            }),
+        };
+        assert_eq!(event_session(&event), Some(sid));
+        match proto_event_to_turn_event(event) {
+            Some(TurnEvent::NestedTurn {
+                task_call_id,
+                label,
+                parent_task_call_id,
+                inner,
+            }) => {
+                assert_eq!(task_call_id, "task-1");
+                assert_eq!(label, "default");
+                assert_eq!(parent_task_call_id.as_deref(), Some("parent-task"));
+                assert!(matches!(
+                    inner.as_ref(),
+                    TurnEvent::ReasoningDelta { agent, delta }
+                        if agent == "Explore" && delta == "thinking"
+                ));
+            }
+            other => panic!("expected nested turn event, got {other:?}"),
+        }
     }
 
     #[test]

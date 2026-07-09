@@ -1102,6 +1102,7 @@ fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
         | Request::CancelPausedWork { session_id }
         | Request::RepairResume { session_id }
         | Request::SteerDelegation { session_id, .. }
+        | Request::SubagentTranscript { session_id, .. }
         | Request::ArchiveSession { session_id, .. }
         | Request::UnarchiveSession { session_id }
         | Request::DiscardSession { session_id }
@@ -1246,6 +1247,19 @@ fn authorize_request(
             project_root: None,
             ..
         } => Ok(()),
+        Request::SubagentTranscript { session_id, .. } => match ctx.db.get_session(*session_id) {
+            Ok(Some(row)) => match session_access_for_row(principal, &row) {
+                SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
+                SessionAccess::None => Err(authorization_error(
+                    "remote principal cannot access this session",
+                )),
+            },
+            Ok(None) => Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            }),
+            Err(e) => Err(internal(e)),
+        },
 
         Request::ListSessions { .. }
         | Request::SessionLiveStatus { .. }
@@ -1760,6 +1774,33 @@ async fn handle_request(
                 &principal,
             )
             .await
+        }
+
+        Request::SubagentTranscript {
+            session_id,
+            task_call_id,
+            label,
+        } => {
+            let db = ctx.db.clone();
+            let task_call_id_for_read = task_call_id.clone();
+            let label_for_read = label.clone();
+            let history = db
+                .run_blocking(move |conn| {
+                    crate::engine::rehydrate::subagent_history_snapshot_conn(
+                        conn,
+                        session_id,
+                        &task_call_id_for_read,
+                        &label_for_read,
+                    )
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::SubagentTranscript {
+                session_id,
+                task_call_id,
+                label,
+                history,
+            })
         }
 
         Request::SendUserMessage {

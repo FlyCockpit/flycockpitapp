@@ -191,7 +191,7 @@ impl Db {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT seq, session_id, ts_ms, type, agent, call_id, data_json
+                    "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, data_json
                        FROM session_events
                       WHERE seq > ?1
                       ORDER BY seq ASC
@@ -214,6 +214,8 @@ impl Db {
                             kind: row.get("type").map_err(anyhow::Error::from)?,
                             agent: row.get("agent").map_err(anyhow::Error::from)?,
                             call_id: row.get("call_id").map_err(anyhow::Error::from)?,
+                            task_call_id: row.get("task_call_id").map_err(anyhow::Error::from)?,
+                            label: row.get("label").map_err(anyhow::Error::from)?,
                             origin_principal: None,
                             data,
                         })

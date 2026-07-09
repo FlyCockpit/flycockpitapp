@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -200,7 +201,22 @@ pub fn parse_framed_nul_env(output: &[u8]) -> Result<HashMap<String, String>, St
     Ok(vars)
 }
 
-pub fn capture_tui_shell_env() -> (EnvSnapshot, Option<String>) {
+type CaptureResult = (EnvSnapshot, Option<String>);
+
+static TUI_SHELL_ENV_CACHE: OnceLock<CaptureResult> = OnceLock::new();
+
+pub fn capture_tui_shell_env() -> CaptureResult {
+    capture_tui_shell_env_cached(&TUI_SHELL_ENV_CACHE, capture_tui_shell_env_uncached)
+}
+
+fn capture_tui_shell_env_cached(
+    cache: &OnceLock<CaptureResult>,
+    capture: impl FnOnce() -> CaptureResult,
+) -> CaptureResult {
+    cache.get_or_init(capture).clone()
+}
+
+fn capture_tui_shell_env_uncached() -> CaptureResult {
     #[cfg(windows)]
     {
         return (
@@ -242,6 +258,7 @@ fn capture_shell_env_unix() -> Result<HashMap<String, String>, String> {
     } else {
         command.arg("-lic").arg(&script);
     }
+    detach_command_from_terminal(&mut command);
     let output = command
         .output()
         .map_err(|e| format!("failed to run {}: {e}", shell_path.display()))?;
@@ -253,6 +270,21 @@ fn capture_shell_env_unix() -> Result<HashMap<String, String>, String> {
         ));
     }
     parse_framed_nul_env(&output.stdout)
+}
+
+#[cfg(not(windows))]
+fn detach_command_from_terminal(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the child runs only `setsid` before exec, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 pub fn user_runtime_read_paths_from_path(path_value: Option<&str>) -> Vec<PathBuf> {
@@ -334,6 +366,7 @@ fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn digest_is_stable_regardless_of_map_order() {
@@ -363,6 +396,92 @@ mod tests {
     fn parser_rejects_shell_noise_outside_frame() {
         let raw = format!("hello\n{SHELL_ENV_BEGIN}\nA=1\0\n{SHELL_ENV_END}\n");
         assert!(parse_framed_nul_env(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn capture_cache_reuses_successful_snapshot() {
+        let cache = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            let (snapshot, diagnostic) = capture_tui_shell_env_cached(&cache, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    EnvSnapshot::new(
+                        EnvSnapshotSource::TuiShell,
+                        HashMap::from([("PATH".to_string(), "/bin".to_string())]),
+                    ),
+                    None,
+                )
+            });
+            assert_eq!(snapshot.meta().source, EnvSnapshotSource::TuiShell);
+            assert!(diagnostic.is_none());
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn capture_cache_reuses_fallback_snapshot() {
+        let cache = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            let (snapshot, diagnostic) = capture_tui_shell_env_cached(&cache, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    EnvSnapshot::new(
+                        EnvSnapshotSource::TuiProcessFallback,
+                        HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+                    ),
+                    Some("could not capture login shell environment".to_string()),
+                )
+            });
+            assert_eq!(
+                snapshot.meta().source,
+                EnvSnapshotSource::TuiProcessFallback
+            );
+            assert!(diagnostic.is_some());
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_shell_env_command_runs_in_new_session() {
+        let parent_sid = proc_stat_session_id(std::process::id()).unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("cat /proc/self/stat");
+        detach_command_from_terminal(&mut command);
+
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let stat = String::from_utf8(output.stdout).unwrap();
+        let child_sid = parse_proc_stat_session_id(&stat).unwrap();
+
+        assert_ne!(child_sid, parent_sid);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_stat_session_id(pid: u32) -> Result<i32, String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|e| format!("failed to read proc stat: {e}"))?;
+        parse_proc_stat_session_id(&stat)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_proc_stat_session_id(stat: &str) -> Result<i32, String> {
+        let after_comm = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| "missing proc stat comm terminator".to_string())?
+            .1;
+        let fields: Vec<_> = after_comm.split_whitespace().collect();
+        fields
+            .get(3)
+            .ok_or_else(|| "missing session field".to_string())?
+            .parse()
+            .map_err(|e| format!("invalid session field: {e}"))
     }
 
     #[test]

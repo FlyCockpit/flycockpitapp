@@ -554,6 +554,40 @@ fn attach_to_session_retry_once<T, E>(mut attach: impl FnMut() -> Result<T, E>) 
     }
 }
 
+const DISPLAY_ATTACH_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const DISPLAY_ATTACH_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct DisplayAttachBackoff {
+    next_attempt_at: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for DisplayAttachBackoff {
+    fn default() -> Self {
+        Self {
+            next_attempt_at: None,
+            delay: DISPLAY_ATTACH_INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl DisplayAttachBackoff {
+    fn can_attempt(&self, now: Instant) -> bool {
+        self.next_attempt_at.is_none_or(|next| now >= next)
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        let delay = self.delay.min(DISPLAY_ATTACH_MAX_BACKOFF);
+        self.next_attempt_at = Some(now + delay);
+        self.delay = delay.saturating_mul(2).min(DISPLAY_ATTACH_MAX_BACKOFF);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct SlashCommand {
     name: &'static str,
@@ -1520,6 +1554,7 @@ pub struct App {
     /// `Result<AgentRunner, String>` so a failed init keeps the error
     /// around for next-time visibility.
     pub(super) agent_runner: Option<Result<AgentRunner, String>>,
+    display_attach_backoff: DisplayAttachBackoff,
     /// Shared client-side runner for TUI background actions. Daemon RPCs and
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
@@ -2496,6 +2531,7 @@ impl App {
             daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
+            display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
             completed_async_actions: Vec::new(),
             chat_area: None,
@@ -3770,6 +3806,7 @@ impl App {
         // Drop the runner so the next submit re-attaches the daemon
         // with `session_id: None`, opening a fresh session.
         self.agent_runner = None;
+        self.reset_display_attach_backoff();
         // The fresh session is deferred-persistence until its first message
         // (session-id-display-and-lazy-persist).
         self.current_session_persisted = false;
@@ -6529,7 +6566,7 @@ impl App {
             self.daemon_connected,
             || true,
         );
-        if should_probe {
+        if should_probe && self.display_attach_backoff.can_attempt(Instant::now()) {
             self.start_display_daemon_probe_action(|| crate::daemon::discover_blocking().status);
         }
     }
@@ -6569,7 +6606,7 @@ impl App {
             self.daemon_connected,
             || true,
         );
-        if attach {
+        if attach && self.display_attach_backoff.can_attempt(Instant::now()) {
             self.try_attach_for_display();
         }
     }
@@ -6630,6 +6667,7 @@ impl App {
     /// first-message path and the eager display attach.
     fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         if let Ok(r) = &runner {
+            self.reset_display_attach_backoff();
             // In daemonless mode this runner spawned our own ephemeral
             // daemon; arm the ownership guard so it's reaped on exit.
             self.arm_daemon_guard(r);
@@ -6694,9 +6732,15 @@ impl App {
             agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
         if runner.is_ok() {
             self.adopt_runner(runner);
+        } else {
+            self.display_attach_backoff.record_failure(Instant::now());
         }
         // On `Err`, drop it silently: leave `agent_runner` as `None` so a
         // later tick can retry once the daemon is actually reachable.
+    }
+
+    pub(super) fn reset_display_attach_backoff(&mut self) {
+        self.display_attach_backoff.reset();
     }
 
     /// Re-fetch the fresh-chat guidance estimate from the daemon at `socket`
@@ -11810,6 +11854,52 @@ mod fork_attach_retry_tests {
 
         assert_eq!(result, Ok("attached"));
         assert_eq!(attempts.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod display_attach_backoff_tests {
+    use super::{DISPLAY_ATTACH_INITIAL_BACKOFF, DISPLAY_ATTACH_MAX_BACKOFF, DisplayAttachBackoff};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn suppresses_repeated_attach_ticks_until_backoff_expires() {
+        let mut backoff = DisplayAttachBackoff::default();
+        let t0 = Instant::now();
+
+        assert!(backoff.can_attempt(t0));
+        backoff.record_failure(t0);
+        assert!(!backoff.can_attempt(t0 + Duration::from_millis(249)));
+        assert!(backoff.can_attempt(t0 + DISPLAY_ATTACH_INITIAL_BACKOFF));
+    }
+
+    #[test]
+    fn exponential_delay_is_capped() {
+        let mut backoff = DisplayAttachBackoff::default();
+        let t0 = Instant::now();
+
+        for _ in 0..8 {
+            backoff.record_failure(t0);
+        }
+
+        assert_eq!(
+            backoff.next_attempt_at,
+            Some(t0 + DISPLAY_ATTACH_MAX_BACKOFF)
+        );
+        assert_eq!(backoff.delay, DISPLAY_ATTACH_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn reset_allows_immediate_attach_after_explicit_action_or_success() {
+        let mut backoff = DisplayAttachBackoff::default();
+        let t0 = Instant::now();
+
+        backoff.record_failure(t0);
+        assert!(!backoff.can_attempt(t0));
+
+        backoff.reset();
+        assert!(backoff.can_attempt(t0));
+        assert_eq!(backoff.delay, DISPLAY_ATTACH_INITIAL_BACKOFF);
     }
 }
 

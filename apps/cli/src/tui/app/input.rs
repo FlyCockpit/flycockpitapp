@@ -277,6 +277,7 @@ impl App {
                             });
                             self.daemon_connected = true;
                             self.daemon_prompt = None;
+                            self.reset_display_attach_backoff();
                             self.maybe_open_add_provider_wizard();
                         }
                         Err(e) => {

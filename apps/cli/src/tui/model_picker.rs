@@ -513,13 +513,12 @@ impl ModelPickerDialog {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Indexed(178));
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let (filter_before, filter_after) = self.filter.split_at_cursor();
         lines.push(Line::from(vec![
             Span::styled("filter: ".to_string(), muted),
-            Span::styled(
-                self.filter.text().to_string(),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(filter_before.to_string(), Style::default().fg(Color::White)),
+            Span::styled("▎".to_string(), yellow),
+            Span::styled(filter_after.to_string(), Style::default().fg(Color::White)),
         ]));
         lines.push(Line::default());
 
@@ -1085,6 +1084,31 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    #[test]
+    fn pick_filter_caret_follows_textfield_cursor_after_mid_insert() {
+        let mut d = dialog_with(vec![entry("alpha")]);
+        d.handle_key(press(KeyCode::Char('a')));
+        d.handle_key(press(KeyCode::Char('b')));
+        d.handle_key(press(KeyCode::Left));
+        d.handle_key(press(KeyCode::Char('X')));
+
+        let rendered = rendered_text(&mut d, 60, 12);
+
+        assert!(rendered.contains("filter: aX▎b"), "{rendered}");
+    }
+
+    #[test]
+    fn pick_filter_caret_handles_wide_unicode_cursor() {
+        let mut d = dialog_with(vec![entry("alpha")]);
+        d.filter.set("中a");
+        d.filter.handle_key(press(KeyCode::Home));
+        d.filter.handle_key(press(KeyCode::Right));
+
+        let rendered = rendered_text(&mut d, 60, 12);
+
+        assert!(rendered.contains("filter: 中 ▎a"), "{rendered}");
     }
 
     #[test]

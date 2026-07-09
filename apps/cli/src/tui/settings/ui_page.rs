@@ -606,10 +606,12 @@ impl SettingsDialog {
                     "custom provider:model-id".to_string(),
                     muted,
                 )));
+                let (before, after) = buf.split_at_cursor();
                 lines.push(Line::from(vec![
                     Span::styled("› ".to_string(), muted),
-                    Span::styled(buf.text().to_string(), Style::default().fg(Color::White)),
-                    Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+                    Span::styled(before.to_string(), Style::default().fg(Color::White)),
+                    Span::styled("▎".to_string(), yellow),
+                    Span::styled(after.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
                 if picker.entries.is_empty() {

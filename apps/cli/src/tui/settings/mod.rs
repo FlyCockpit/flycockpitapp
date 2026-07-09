@@ -2615,6 +2615,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_settings_numeric_edit_render_places_caret_at_textfield_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        let entry = entry(&[]);
+        let mut editor = settings_editor::SettingsEditor::for_provider("p", &entry);
+        let field = settings_editor::SettingsField::AutoCompactPct;
+        editor.cursor = editor
+            .fields()
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("auto compact field");
+        editor.editing = Some(field);
+        editor.buf = TextField::new("1234");
+        editor.buf.handle_key(press(KeyCode::Home));
+        editor.buf.handle_key(press(KeyCode::Right));
+        editor.buf.handle_key(press(KeyCode::Right));
+        d.page = Page::Providers(ProvidersPage::ProviderSettings {
+            editor,
+            parent: Box::new(providers::EditState::new("p".to_string(), entry)),
+        });
+
+        let rows = render_settings_rows(&d, 100, 30).join("\n");
+
+        assert!(rows.contains("12▎34"), "{rows}");
+    }
+
+    #[test]
     fn category_short_viewport_keeps_bottom_reset_row_visible() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
@@ -4088,6 +4115,19 @@ mod tests {
     /// With no configured models, opening the field drops straight into
     /// the free-text fallback (Custom mode), and a typed `provider:model-id`
     /// is accepted + persisted.
+    #[test]
+    fn utility_picker_custom_render_places_caret_at_textfield_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        open_utility_picker(&mut d);
+        type_chars(&mut d, "ab");
+        d.handle_key(press(KeyCode::Left));
+
+        let rows = render_settings_rows(&d, 80, 20).join("\n");
+
+        assert!(rows.contains("› a▎b"), "{rows}");
+    }
+
     #[test]
     fn utility_picker_no_models_falls_back_to_free_text() {
         let tmp = TempDir::new().unwrap();

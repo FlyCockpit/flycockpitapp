@@ -45,6 +45,14 @@ impl TextField {
         self.cursor
     }
 
+    pub fn split_at_cursor(&self) -> (&str, &str) {
+        let mut cursor = self.cursor.min(self.buffer.len());
+        while cursor > 0 && !self.buffer.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        self.buffer.split_at(cursor)
+    }
+
     pub fn set(&mut self, value: impl Into<String>) {
         self.buffer = value.into();
         self.cursor = self.buffer.len();
@@ -174,6 +182,16 @@ mod tests {
         tf.handle_key(key(KeyCode::Right));
         tf.handle_key(key(KeyCode::Right));
         assert_eq!(tf.cursor_col(), 2);
+    }
+
+    #[test]
+    fn split_at_cursor_respects_utf8_boundaries() {
+        let mut tf = TextField::new("hé中");
+        tf.handle_key(key(KeyCode::Home));
+        tf.handle_key(key(KeyCode::Right));
+        tf.handle_key(key(KeyCode::Right));
+
+        assert_eq!(tf.split_at_cursor(), ("hé", "中"));
     }
 
     #[test]

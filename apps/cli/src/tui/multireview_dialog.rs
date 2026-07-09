@@ -113,6 +113,24 @@ mod tests {
     }
 
     #[test]
+    fn prompt_lines_render_caret_at_textfield_cursor() {
+        let mut d = dialog();
+        d.prompt.set("alpha".to_string());
+        d.prompt.handle_key(key(KeyCode::Home));
+        d.prompt.handle_key(key(KeyCode::Right));
+        d.prompt.handle_key(key(KeyCode::Right));
+
+        let rendered = d
+            .prompt_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("focus: al▎pha"), "{rendered}");
+    }
+
+    #[test]
     fn paste_on_non_text_multireview_controls_is_ignored() {
         let mut d = dialog();
         d.paste("does not toggle");
@@ -523,6 +541,7 @@ impl MultireviewDialog {
     }
 
     fn prompt_lines(&self) -> Vec<Line<'_>> {
+        let (before, after) = self.prompt.split_at_cursor();
         vec![
             Line::from("Guiding prompt"),
             Line::from(vec![
@@ -530,7 +549,12 @@ impl MultireviewDialog {
                     "focus: ",
                     Style::default().fg(ratatui::style::Color::Indexed(MUTED_COLOR_INDEX)),
                 ),
-                Span::raw(self.prompt.text()),
+                Span::raw(before.to_string()),
+                Span::styled(
+                    "▎".to_string(),
+                    Style::default().fg(ratatui::style::Color::Yellow),
+                ),
+                Span::raw(after.to_string()),
             ]),
         ]
     }

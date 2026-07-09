@@ -3682,13 +3682,6 @@ impl SettingsDialog {
                 Style::default().fg(Color::White)
             };
             let overridden = editor.is_overridden(*field);
-            // While editing a numeric field, show the live buffer with a
-            // caret; otherwise the formatted working value.
-            let value = if editor.editing == Some(*field) {
-                format!("{}▎", editor.buf.text())
-            } else {
-                editor.value_str(*field)
-            };
             let value_style = if !overridden {
                 muted
             } else if selected {
@@ -3703,8 +3696,20 @@ impl SettingsDialog {
                     label_style,
                 ),
                 Span::raw("  "),
-                Span::styled(value, value_style),
             ];
+            // While editing a numeric field, show the live buffer with a
+            // caret at the text-field cursor; otherwise the formatted value.
+            if editor.editing == Some(*field) {
+                let (before, after) = editor.buf.split_at_cursor();
+                spans.push(Span::styled(before.to_string(), value_style));
+                spans.push(Span::styled(
+                    "▎".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::styled(after.to_string(), value_style));
+            } else {
+                spans.push(Span::styled(editor.value_str(*field), value_style));
+            }
             if !overridden {
                 spans.push(Span::styled("  (inherited)".to_string(), muted));
             }

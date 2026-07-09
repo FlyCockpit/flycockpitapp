@@ -71,6 +71,11 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolCommandTemplate>,
 
+    /// Provider used by the built-in web tools. The shell-template entries in
+    /// `tools.webfetch` / `tools.websearch` are consulted only for `custom`.
+    #[serde(default, skip_serializing_if = "WebConfig::is_default")]
+    pub web: WebConfig,
+
     /// Require every inference request to use a provider/model marked
     /// `trust: "trusted"`. Off by default.
     #[serde(default, rename = "trustedOnly", alias = "trusted_only")]
@@ -2674,6 +2679,29 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebProvider {
+    #[default]
+    Firecrawl,
+    Tinyfish,
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WebConfig {
+    #[serde(default)]
+    pub provider: WebProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecrawl_base_url: Option<String>,
+}
+
+impl WebConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// Tri-state vim mode: `hint` (default; vim enabled, hint shown on
 /// entry to Normal), `enabled` (vim on, no hint), `disabled` (vim off).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2796,6 +2824,7 @@ impl Default for ExtendedConfig {
             name: None,
             packages_directory: None,
             tools: HashMap::new(),
+            web: WebConfig::default(),
             trusted_only: false,
             allow_remote_config: false,
             utility_model: None,
@@ -3014,6 +3043,7 @@ impl ExtendedConfigDoc {
         parse_field!("name", name);
         parse_field!("packages_directory", packages_directory);
         parse_field!("tools", tools);
+        parse_field!("web", web);
         parse_field!("trustedOnly", trusted_only);
         parse_field!("trusted_only", trusted_only);
         parse_field!("allow_remote_config", allow_remote_config);

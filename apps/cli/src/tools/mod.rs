@@ -53,6 +53,7 @@ pub mod todo;
 pub mod todo_read;
 pub mod tool_result_retrieve;
 pub mod unlock;
+pub mod web;
 pub mod writeunlock;
 
 pub mod common;

@@ -3946,17 +3946,15 @@ async fn translate_final_response(
     crate::engine::translate::outbound(&stripped, &extended, &providers, redact, trusted_only).await
 }
 
-/// The tools the command-safety gate (`auto` approval mode) covers: `bash`
-/// plus the network tools (`webfetch` and `mcp` — which runs model-authored
-/// Python that drives network/subprocess MCP calls).
-/// Anything else is out of scope and runs ungated. Matched by name in the
-/// dispatch loop.
-fn is_gated_tool(name: &str) -> bool {
-    matches!(name, "bash" | "webfetch" | "mcp")
+/// The tools the command-safety gate (`auto` approval mode) covers. Native
+/// websearch runs ungated; custom websearch is gated because it executes an
+/// arbitrary shell template.
+fn is_gated_tool(name: &str, cwd: &std::path::Path) -> bool {
+    matches!(name, "bash" | "mcp") || crate::tools::web::web_tool_requires_gate(name, cwd)
 }
 
 pub(crate) fn result_scan_tool_candidate(name: &str) -> bool {
-    is_gated_tool(name) || name == "task"
+    matches!(name, "bash" | "webfetch" | "websearch" | "mcp") || name == "task"
 }
 
 pub(crate) fn should_scan_tool_result(
@@ -4016,7 +4014,7 @@ async fn safety_gate_decision_with_configs(
     use crate::config::extended::ApprovalMode;
     use crate::engine::safety_gate::{SafetyOutcome, evaluate};
 
-    if !is_gated_tool(tool) {
+    if !is_gated_tool(tool, &ctx.cwd) {
         return GateOutcome::Run { recheck: false };
     }
     match ctx.session.approval_mode() {
@@ -5469,16 +5467,25 @@ mod safety_gate_tests {
     }
 
     #[test]
-    fn gate_scope_covers_only_bash_and_network_tools() {
-        // bash + the two network tools are gated; everything else is out of
-        // scope (read/edit/intel/etc. never reach the utility-model gate).
-        assert!(is_gated_tool("bash"));
-        assert!(is_gated_tool("webfetch"));
-        assert!(is_gated_tool("mcp"));
-        assert!(!is_gated_tool("read"));
-        assert!(!is_gated_tool("editunlock"));
-        assert!(!is_gated_tool("search"));
-        assert!(!is_gated_tool("task"));
+    fn gate_scope_covers_shell_mcp_fetch_and_custom_websearch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        assert!(is_gated_tool("bash", cwd));
+        assert!(is_gated_tool("webfetch", cwd));
+        assert!(is_gated_tool("mcp", cwd));
+        assert!(!is_gated_tool("websearch", cwd));
+        assert!(!is_gated_tool("read", cwd));
+        assert!(!is_gated_tool("editunlock", cwd));
+        assert!(!is_gated_tool("search", cwd));
+        assert!(!is_gated_tool("task", cwd));
+
+        std::fs::create_dir_all(cwd.join(".cockpit")).unwrap();
+        std::fs::write(
+            cwd.join(".cockpit/config.json"),
+            r#"{"web":{"provider":"custom"}}"#,
+        )
+        .unwrap();
+        assert!(is_gated_tool("websearch", cwd));
     }
 
     #[tokio::test]

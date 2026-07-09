@@ -234,6 +234,7 @@ tree-sitter-go = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 rayon = "1"
+firecrawl = "2"
 
 # Linux-only: logind `handle-lid-switch` inhibitor lock for
 # `/caffeinate` lid-close survival (the high-level inhibitor logind

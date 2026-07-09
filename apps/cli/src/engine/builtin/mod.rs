@@ -321,6 +321,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "spawn",
         "handoff",
         "mcp",
+        "webfetch",
+        "websearch",
         "lsp",
         "plan_read",
         "plan_write",
@@ -363,6 +365,9 @@ fn is_reserved_custom_tool_name(name: &str) -> bool {
 fn validate_configured_custom_tools(cwd: &Path) -> Result<()> {
     let cfg = crate::config::extended::load_for_cwd(cwd);
     for name in cfg.tools.keys() {
+        if crate::tools::custom::is_builtin_web_tool(name) {
+            continue;
+        }
         if is_reserved_custom_tool_name(name) {
             bail!(
                 "custom tool `{name}` collides with a reserved cockpit tool name; choose a different custom tool name"
@@ -400,6 +405,7 @@ fn materialize_tool_by_name(
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
         "schedule" => tb.with(Arc::new(tools::schedule::ScheduleTool)),
         "mcp" => tb.with(Arc::new(tools::mcp_tool::McpTool)),
+        "webfetch" | "websearch" => tb.with(tools::web::materialize_web_tool(name, &args.cwd)?),
         "lsp" => tb.with(Arc::new(tools::lsp::LspTool)),
         "handoff" => tb.with(Arc::new(tools::handoff::HandoffTool)),
         "return" => tb.with(Arc::new(tools::return_tool::ReturnTool)),
@@ -628,9 +634,18 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
 /// Disabled rows and empty commands are skipped.
 fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
     let cfg = crate::config::extended::load_for_cwd(cwd);
+    let custom_web = cfg.web.provider == crate::config::extended::WebProvider::Custom;
+
+    if !custom_web {
+        tb = tb.with(Arc::new(crate::tools::web::WebFetchTool));
+        tb = tb.with(Arc::new(crate::tools::web::WebSearchTool));
+    }
 
     for (name, tpl) in cfg.tools.iter() {
         if !tpl.enabled || tpl.command.trim().is_empty() {
+            continue;
+        }
+        if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
             continue;
         }
         tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
@@ -642,6 +657,9 @@ fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
         )));
     }
     for name in crate::tui::settings::builtin_tool_names() {
+        if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
+            continue;
+        }
         if cfg.tools.contains_key(*name) {
             continue;
         }

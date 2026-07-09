@@ -24,8 +24,8 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 const SHELL_TIMEOUT_SECS: u64 = 30;
-const WEBFETCH: &str = "webfetch";
-const WEBSEARCH: &str = "websearch";
+pub(crate) const WEBFETCH: &str = "webfetch";
+pub(crate) const WEBSEARCH: &str = "websearch";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolTemplateProvenance {
@@ -269,7 +269,7 @@ fn render_failure_diagnostic(
     )
 }
 
-fn is_builtin_web_tool(name: &str) -> bool {
+pub(crate) fn is_builtin_web_tool(name: &str) -> bool {
     matches!(name, WEBFETCH | WEBSEARCH)
 }
 

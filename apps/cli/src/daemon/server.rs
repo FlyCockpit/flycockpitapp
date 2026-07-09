@@ -515,6 +515,8 @@ impl Drop for ClientState {
     }
 }
 
+const MIN_ATTACHMENT_UPLOAD_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 struct AttachmentUploadLimits {
     per_client_uploads: usize,
@@ -529,14 +531,68 @@ impl Default for AttachmentUploadLimits {
     }
 }
 
+impl AttachmentUploadLimits {
+    fn from_config(config: DaemonUploadLimitsConfig) -> Self {
+        let (limits, warning) = Self::from_config_with_warning(config);
+        if let Some(warning) = warning {
+            tracing::warn!(%warning, "daemon upload limit adjusted");
+        }
+        limits
+    }
+
+    fn from_config_with_warning(config: DaemonUploadLimitsConfig) -> (Self, Option<String>) {
+        let (per_upload_bytes, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
+        (
+            Self {
+                per_client_uploads: config.per_client_uploads,
+                global_uploads: config.global_uploads,
+                per_upload_bytes,
+                global_bytes: config.global_bytes,
+            },
+            warning,
+        )
+    }
+}
+
 impl From<DaemonUploadLimitsConfig> for AttachmentUploadLimits {
     fn from(config: DaemonUploadLimitsConfig) -> Self {
-        Self {
-            per_client_uploads: config.per_client_uploads,
-            global_uploads: config.global_uploads,
-            per_upload_bytes: config.per_upload_bytes,
-            global_bytes: config.global_bytes,
-        }
+        Self::from_config(config)
+    }
+}
+
+fn normalize_per_upload_bytes(configured: usize) -> (usize, Option<String>) {
+    if configured > proto::MAX_SINGLE_IMAGE_BYTES {
+        return (
+            proto::MAX_SINGLE_IMAGE_BYTES,
+            Some(format!(
+                "per_upload_bytes {} exceeds protocol cap {}; clamping",
+                format_upload_bytes(configured),
+                format_upload_bytes(proto::MAX_SINGLE_IMAGE_BYTES)
+            )),
+        );
+    }
+    if configured < MIN_ATTACHMENT_UPLOAD_BYTES {
+        return (
+            MIN_ATTACHMENT_UPLOAD_BYTES,
+            Some(format!(
+                "per_upload_bytes {} is below minimum {}; clamping",
+                format_upload_bytes(configured),
+                format_upload_bytes(MIN_ATTACHMENT_UPLOAD_BYTES)
+            )),
+        );
+    }
+    (configured, None)
+}
+
+fn format_upload_bytes(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -3855,7 +3911,7 @@ mod tests {
         let limits = AttachmentUploadLimits::default();
         assert_eq!(limits.per_client_uploads, 4);
         assert_eq!(limits.global_uploads, 32);
-        assert_eq!(limits.per_upload_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
         assert_eq!(limits.global_bytes, 256 * 1024 * 1024);
 
         let cfg_limits: AttachmentUploadLimits = ExtendedConfig::default().daemon.uploads.into();
@@ -3863,6 +3919,85 @@ mod tests {
         assert_eq!(cfg_limits.global_uploads, limits.global_uploads);
         assert_eq!(cfg_limits.per_upload_bytes, limits.per_upload_bytes);
         assert_eq!(cfg_limits.global_bytes, limits.global_bytes);
+    }
+
+    #[test]
+    fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
+        let (limits, warning) =
+            AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
+                per_upload_bytes: 64 * 1024 * 1024,
+                ..DaemonUploadLimitsConfig::default()
+            });
+        assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
+        assert_eq!(
+            warning.as_deref(),
+            Some("per_upload_bytes 64 MiB exceeds protocol cap 4 MiB; clamping")
+        );
+
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+        let byte_len = proto::MAX_SINGLE_IMAGE_BYTES + 1;
+        let err = begin_attachment_upload_with_limits(
+            &mut state,
+            proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
+            byte_len,
+            "0".repeat(64),
+            proto::AttachmentPurpose::UserMessageImage,
+            limits,
+        )
+        .expect_err("upload above protocol cap is rejected by clamped per-upload limit");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("pending-upload limit"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn attachment_upload_config_below_protocol_cap_binds() {
+        let configured = MIN_ATTACHMENT_UPLOAD_BYTES + 1;
+        let (limits, warning) =
+            AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
+                per_upload_bytes: configured,
+                ..DaemonUploadLimitsConfig::default()
+            });
+        assert_eq!(limits.per_upload_bytes, configured);
+        assert!(warning.is_none());
+
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+        let err = begin_attachment_upload_with_limits(
+            &mut state,
+            proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
+            configured + 1,
+            "0".repeat(64),
+            proto::AttachmentPurpose::UserMessageImage,
+            limits,
+        )
+        .expect_err("upload above configured cap is rejected even below protocol cap");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("pending-upload limit"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() {
+        let (limits, warning) =
+            AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
+                per_upload_bytes: 0,
+                ..DaemonUploadLimitsConfig::default()
+            });
+        assert_eq!(limits.per_upload_bytes, MIN_ATTACHMENT_UPLOAD_BYTES);
+        assert_eq!(
+            warning.as_deref(),
+            Some("per_upload_bytes 0 bytes is below minimum 64 KiB; clamping")
+        );
     }
 
     #[test]

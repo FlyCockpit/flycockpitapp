@@ -985,12 +985,17 @@ pub struct DaemonConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonUploadLimitsConfig {
+    /// Maximum pending uploads per connected client.
     #[serde(default = "default_daemon_uploads_per_client")]
     pub per_client_uploads: usize,
+    /// Maximum pending uploads across the daemon.
     #[serde(default = "default_daemon_uploads_global")]
     pub global_uploads: usize,
+    /// Maximum bytes per individual attachment upload. The daemon clamps this
+    /// to the image-upload protocol ceiling (`MAX_SINGLE_IMAGE_BYTES`).
     #[serde(default = "default_daemon_uploads_per_upload_bytes")]
     pub per_upload_bytes: usize,
+    /// Maximum pending attachment bytes across the daemon.
     #[serde(default = "default_daemon_uploads_global_bytes")]
     pub global_bytes: usize,
 }
@@ -1015,7 +1020,7 @@ fn default_daemon_uploads_global() -> usize {
 }
 
 fn default_daemon_uploads_per_upload_bytes() -> usize {
-    64 * 1024 * 1024
+    crate::daemon::proto::MAX_SINGLE_IMAGE_BYTES
 }
 
 fn default_daemon_uploads_global_bytes() -> usize {

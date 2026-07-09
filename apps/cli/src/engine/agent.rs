@@ -117,6 +117,15 @@ fn guidance_scan_skipped_for_trust(path: &std::path::Path) -> bool {
     !found.starts_with(root)
 }
 
+async fn guidance_scan_skipped_for_trust_blocking(path: std::path::PathBuf) -> bool {
+    tokio::task::spawn_blocking(move || guidance_scan_skipped_for_trust(&path))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "guidance trust scan task join failed");
+            false
+        })
+}
+
 async fn inject_initial_project_guidance(
     agent_name: &str,
     history: &mut Vec<Message>,
@@ -134,7 +143,7 @@ async fn inject_initial_project_guidance(
         return;
     }
 
-    if !guidance_scan_skipped_for_trust(&path) {
+    if !guidance_scan_skipped_for_trust_blocking(path.clone()).await {
         let (extended, providers) = crate::auto_title::load_configs_for(cwd);
         let guard = crate::config::extended::resolve_injection_guard(cwd);
         let outcome = crate::engine::injection_check::check(
@@ -183,9 +192,10 @@ async fn inject_live_project_guidance_change(
     message: &str,
 ) {
     let guidance_path = crate::engine::builtin::load_agent_guidance(cwd).map(|(path, _)| path);
-    let skip_scan = guidance_path
-        .as_deref()
-        .is_some_and(guidance_scan_skipped_for_trust);
+    let skip_scan = match guidance_path.clone() {
+        Some(path) => guidance_scan_skipped_for_trust_blocking(path).await,
+        None => false,
+    };
     if !skip_scan {
         let (extended, providers) = crate::auto_title::load_configs_for(cwd);
         let guard = crate::config::extended::resolve_injection_guard(cwd);
@@ -1149,6 +1159,26 @@ fn scrub_sidecar_value(value: Value, redact: &crate::redact::RedactionTable) -> 
         other => other,
     }
 }
+async fn record_inference_request_blocking(
+    session: Arc<Session>,
+    call_id: Uuid,
+    payload: Value,
+    status: crate::db::session_log::InferenceRequestStatus,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || session.record_inference_request(call_id, &payload, status))
+        .await
+        .map_err(|e| anyhow::anyhow!("record_inference_request task join failed: {e}"))?
+}
+
+async fn record_usage_blocking(
+    session: Arc<Session>,
+    call_id: Uuid,
+    usage: crate::tokens::TokenUsage,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || session.record_usage(call_id, usage))
+        .await
+        .map_err(|e| anyhow::anyhow!("record_usage task join failed: {e}"))?
+}
 
 /// Drive one round-trip with the model + dispatch any tool calls. The
 /// `history` buffer is mutated in place: the user message (if any) was
@@ -1280,11 +1310,14 @@ pub async fn turn(
         model.assemble_dispatch_request(&agent.system, history, &prompt, &tools, &agent.params);
     let dispatch_payload =
         with_phases(dispatch_payload, &serde_json::json!({ "dispatched_ms": 0 }));
-    if let Err(e) = session.record_inference_request(
+    if let Err(e) = record_inference_request_blocking(
+        session.clone(),
         call_id,
-        &dispatch_payload,
+        dispatch_payload.clone(),
         crate::db::session_log::InferenceRequestStatus::Pending,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(error = %e, "record_inference_request (dispatch) failed");
     }
 
@@ -1405,7 +1438,7 @@ pub async fn turn(
             // sentinels and are handled by the driver without a red error).
             record_inference_outcome(
                 InferenceOutcomeRecord {
-                    session: &session,
+                    session: session.clone(),
                     call_id,
                     dispatch_payload: &dispatch_payload,
                     agent_name: &agent.name,
@@ -1432,11 +1465,14 @@ pub async fn turn(
             "completed_ms": timing.completed_ms,
         }),
     );
-    if let Err(e) = session.record_inference_request(
+    if let Err(e) = record_inference_request_blocking(
+        session.clone(),
         call_id,
-        &completed_payload,
+        completed_payload.clone(),
         crate::db::session_log::InferenceRequestStatus::Completed,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(error = %e, "record_inference_request (completed) failed");
     }
     // Record the single `inference_request` timeline event for this call, now
@@ -1529,26 +1565,25 @@ pub async fn turn(
     let reasoning = redact.scrub(&reasoning);
 
     if let Some(u) = usage {
-        if let Err(e) = session.record_usage(call_id, u) {
+        if let Err(e) = record_usage_blocking(session.clone(), call_id, u).await {
             tracing::warn!(error = %e, "session.record_usage failed");
         }
-        // Feed the round into tokenizer calibration. The basis is a
-        // consistent text proxy for what was sent + produced (the
-        // messages already in history + this prompt + the assistant
-        // output); the scale factor absorbs system/tool/serialization
-        // overhead, so we deliberately don't reconstruct rig's exact
-        // request wire format.
-        let mut basis = String::new();
-        for m in history.iter() {
-            if let Ok(s) = serde_json::to_string(m) {
+        // Feed the round into tokenizer calibration only after the cheap
+        // discard guards pass. Building the basis serializes the whole turn
+        // history and is intentionally skipped when the sample cannot be used.
+        if session.should_note_calibration_sample(u) {
+            let mut basis = String::new();
+            for m in history.iter() {
+                if let Ok(s) = serde_json::to_string(m) {
+                    basis.push_str(&s);
+                }
+            }
+            if let Ok(s) = serde_json::to_string(&prompt) {
                 basis.push_str(&s);
             }
+            basis.push_str(&text);
+            session.note_calibration_sample(&basis, u);
         }
-        if let Ok(s) = serde_json::to_string(&prompt) {
-            basis.push_str(&s);
-        }
-        basis.push_str(&text);
-        session.note_calibration_sample(&basis, u);
 
         let _ = tx
             .send(TurnEvent::Usage {
@@ -3452,7 +3487,7 @@ fn with_phases(mut payload: Value, phases: &Value) -> Value {
 /// terminal status only (`cancelled`) — no red error, no failure event (the
 /// driver unwinds those silently). All writes are best-effort.
 struct InferenceOutcomeRecord<'a> {
-    session: &'a Session,
+    session: Arc<Session>,
     call_id: Uuid,
     dispatch_payload: &'a Value,
     agent_name: &'a str,
@@ -3486,8 +3521,13 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
             dispatch_payload.clone(),
             &serde_json::json!({ "dispatched_ms": 0 }),
         );
-        if let Err(e) =
-            session.record_inference_request(call_id, &cancelled, InferenceRequestStatus::Cancelled)
+        if let Err(e) = record_inference_request_blocking(
+            session.clone(),
+            call_id,
+            cancelled,
+            InferenceRequestStatus::Cancelled,
+        )
+        .await
         {
             tracing::warn!(error = %e, "record_inference_request (cancelled) failed");
         }
@@ -3501,8 +3541,13 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
             dispatch_payload.clone(),
             &serde_json::json!({ "dispatched_ms": 0 }),
         );
-        if let Err(e) =
-            session.record_inference_request(call_id, &errored, InferenceRequestStatus::Errored)
+        if let Err(e) = record_inference_request_blocking(
+            session.clone(),
+            call_id,
+            errored,
+            InferenceRequestStatus::Errored,
+        )
+        .await
         {
             tracing::warn!(error = %e, "record_inference_request (errored) failed");
         }
@@ -3522,7 +3567,9 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
             "failed_ms": failure.elapsed_ms,
         }),
     );
-    if let Err(e) = session.record_inference_request(call_id, &terminal, status) {
+    if let Err(e) =
+        record_inference_request_blocking(session.clone(), call_id, terminal, status).await
+    {
         tracing::warn!(error = %e, "record_inference_request (terminal failure) failed");
     }
 
@@ -6196,7 +6243,7 @@ mod inference_outcome_tests {
         let redact = RedactionTable::empty();
         record_inference_outcome(
             InferenceOutcomeRecord {
-                session: &session,
+                session: session.clone(),
                 call_id,
                 dispatch_payload: &payload,
                 agent_name: "builder",
@@ -6267,7 +6314,7 @@ mod inference_outcome_tests {
         // A cancel emits no UI regardless of the flag; pass `true` to prove it.
         record_inference_outcome(
             InferenceOutcomeRecord {
-                session: &session,
+                session: session.clone(),
                 call_id,
                 dispatch_payload: &payload,
                 agent_name: "builder",

@@ -1990,7 +1990,10 @@ impl Model {
         );
         if !identity_records.is_empty() {
             captured["responses_tool_identity"] = serde_json::to_value(&identity_records)
-                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "serialize responses tool identity records failed");
+                    serde_json::Value::Array(Vec::new())
+                });
         }
 
         if let Some(path) = debug_last_message_path() {
@@ -2615,7 +2618,12 @@ impl Model {
         let attempt = self.tandem_send(system, &stripped, prompt, tools, params);
         match tokio::time::timeout(limit, attempt).await {
             Ok(Ok((choice, usage))) => {
-                let response = serde_json::to_value(&choice).ok();
+                let response = serde_json::to_value(&choice)
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "serialize tandem response choice failed");
+                        e
+                    })
+                    .ok();
                 let usage = usage.map(|u| {
                     serde_json::json!({
                         "input_tokens": u.input_tokens,

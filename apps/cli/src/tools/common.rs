@@ -108,6 +108,7 @@ pub fn read_slice(text: &str, offset: usize, limit: usize) -> ReadSlice {
     let mut total_lines = 0;
     let mut emitted = 0;
     let mut truncated = false;
+    let mut stopped_for_byte_cap = false;
 
     for (i, line) in text.lines().enumerate() {
         let line_no = i + 1;
@@ -115,16 +116,19 @@ pub fn read_slice(text: &str, offset: usize, limit: usize) -> ReadSlice {
         if line_no < offset {
             continue;
         }
-        if emitted >= limit {
+        if emitted >= limit || stopped_for_byte_cap {
+            truncated = true;
+            continue;
+        }
+        let before_len = numbered.len();
+        push_numbered_line(&mut numbered, line_no, line);
+        if numbered.len() > byte_cap {
+            numbered.truncate(before_len);
+            stopped_for_byte_cap = true;
             truncated = true;
             continue;
         }
         emitted += 1;
-        if numbered.len() <= byte_cap {
-            push_numbered_line(&mut numbered, line_no, line);
-        } else {
-            truncated = true;
-        }
     }
 
     if numbered.len() > byte_cap {
@@ -381,6 +385,18 @@ mod tests {
         assert!(slice.truncated);
         assert_eq!(slice.next_offset, 3);
         assert_eq!(slice.total_lines, 3);
+        assert!(!slice.offset_exceeded);
+    }
+
+    #[test]
+    fn read_slice_byte_cap_does_not_skip_unshown_lines() {
+        let huge = "x".repeat(OUTPUT_BYTE_CAP + 200);
+        let slice = read_slice(&format!("{huge}\nsmall\n"), 1, READ_LINE_CAP);
+
+        assert_eq!(slice.numbered, "");
+        assert!(slice.truncated);
+        assert_eq!(slice.next_offset, 1);
+        assert_eq!(slice.total_lines, 2);
         assert!(!slice.offset_exceeded);
     }
 

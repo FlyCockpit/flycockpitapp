@@ -179,6 +179,34 @@ impl UserSubmissionQueue {
         (id, snapshot)
     }
 
+    pub async fn requeue_front(
+        &self,
+        mut submission: UserSubmission,
+        fallback_target: QueueTarget,
+    ) -> Vec<QueuedUserMessage> {
+        let id = submission
+            .queue_item_ids
+            .first()
+            .copied()
+            .unwrap_or_else(Uuid::new_v4);
+        let target = submission.queue_target.take().unwrap_or(fallback_target);
+        submission.queue_item_ids.clear();
+        let snapshot = {
+            let mut state = self.inner.lock().await;
+            state.started.remove(&id);
+            state.started_targets.remove(&id);
+            state.pending.push_front(QueuedSubmission {
+                id,
+                submission,
+                target,
+            });
+            snapshot_pending(&state)
+        };
+        self.publish(snapshot.clone());
+        self.notify.notify_one();
+        snapshot
+    }
+
     pub async fn remove(&self, id: Uuid) -> (RemoveQueuedMessageResult, Vec<QueuedUserMessage>) {
         let (result, snapshot) = {
             let mut state = self.inner.lock().await;
@@ -914,6 +942,31 @@ mod tests {
             vec!["msg 0", "msg 1"]
         );
         assert_eq!(queue.recv().await.expect("remaining").text, "msg 2");
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_requeue_front_restores_started_item() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let (id, _) = queue
+            .push(UserSubmission::text("first"), target.clone())
+            .await;
+        queue
+            .push(UserSubmission::text("second"), target.clone())
+            .await;
+
+        let first = queue.recv_for(Some(&target.id)).await.expect("first");
+        assert_eq!(first.queue_item_ids, vec![id]);
+        queue.requeue_front(first, target.clone()).await;
+
+        let first_again = queue.recv_for(Some(&target.id)).await.expect("first again");
+        assert_eq!(first_again.text, "first");
+        assert_eq!(first_again.queue_item_ids, vec![id]);
+        assert_eq!(
+            queue.recv_for(Some(&target.id)).await.expect("second").text,
+            "second"
+        );
     }
 
     #[tokio::test]

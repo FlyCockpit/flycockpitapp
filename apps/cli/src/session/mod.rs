@@ -1441,6 +1441,18 @@ impl Session {
         self.pinned_messages.lock().unwrap().clone()
     }
 
+    pub fn should_note_calibration_sample(&self, usage: crate::tokens::TokenUsage) -> bool {
+        if usage.is_empty() || usage.cached_input_tokens != 0 {
+            return false;
+        }
+        let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
+            return false;
+        };
+        !self
+            .db
+            .tokenizer_calibration_fresh(&provider, &model, Utc::now().timestamp())
+    }
+
     /// Feed one inference round into the tokenizer-calibration window.
     /// `basis` is a consistent text proxy for the round-trip (the
     /// messages sent + the assistant output); `usage` is the provider's

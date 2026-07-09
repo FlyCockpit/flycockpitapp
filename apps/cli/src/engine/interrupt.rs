@@ -38,6 +38,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::sync::lock_or_recover;
+
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
@@ -107,7 +109,7 @@ impl InterruptHub {
     /// leaves a dangling sender.
     pub fn register(&self, interrupt_id: Uuid) -> PendingInterrupt<'_> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().unwrap().insert(interrupt_id, tx);
+        lock_or_recover(&self.waiters).insert(interrupt_id, tx);
         PendingInterrupt {
             hub: self,
             interrupt_id,
@@ -163,7 +165,7 @@ impl InterruptHub {
     /// `schedule` needs-attention nudge that nobody awaits. The DB row has
     /// already been updated by the caller regardless.
     pub fn resolve(&self, interrupt_id: Uuid, response: ResolveResponse) -> bool {
-        let Some(tx) = self.waiters.lock().unwrap().remove(&interrupt_id) else {
+        let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) else {
             return false;
         };
         tx.send(response).is_ok()
@@ -200,7 +202,7 @@ impl PendingInterrupt<'_> {
 impl Drop for PendingInterrupt<'_> {
     fn drop(&mut self) {
         // Idempotent: `resolve` already removed it on the happy path.
-        self.hub.waiters.lock().unwrap().remove(&self.interrupt_id);
+        lock_or_recover(&self.hub.waiters).remove(&self.interrupt_id);
     }
 }
 
@@ -292,13 +294,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poisoned_waiter_mutex_recovers_without_panicking() {
+        let hub = InterruptHub::detached();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hub.waiters.lock().unwrap();
+            panic!("poison waiter mutex");
+        }));
+
+        let id = Uuid::new_v4();
+        let pending = hub.register(id);
+        assert!(hub.resolve(id, ResolveResponse::Cancel));
+        assert!(matches!(pending.wait().await, ResolveResponse::Cancel));
+    }
+
+    #[tokio::test]
     async fn dropped_sender_resolves_to_cancel() {
         // Worker teardown: the registry is cleared (sender dropped)
         // while a tool is still awaiting. `wait` must yield `Cancel`.
         let hub = InterruptHub::detached();
         let id = Uuid::new_v4();
         let pending = hub.register(id);
-        hub.waiters.lock().unwrap().clear();
+        lock_or_recover(&hub.waiters).clear();
         assert!(matches!(pending.wait().await, ResolveResponse::Cancel));
     }
 }

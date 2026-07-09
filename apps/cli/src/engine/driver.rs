@@ -272,9 +272,7 @@ impl CancelHandle {
     /// when already cancelling (cancelling a cancelled token is a no-op),
     /// and concurrently from multiple callers.
     pub fn cancel(&self) {
-        if let Ok(slot) = self.current.lock()
-            && let Some(token) = slot.as_ref()
-        {
+        if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             token.cancel();
         }
     }
@@ -290,9 +288,7 @@ struct CancelSlotGuard {
 
 impl Drop for CancelSlotGuard {
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.slot.lock() {
-            *slot = None;
-        }
+        *crate::sync::lock_or_recover(&self.slot) = None;
     }
 }
 
@@ -1745,25 +1741,45 @@ impl Driver {
         self.schedule.set_redaction_table(table);
     }
 
+    async fn load_max_primary_rounds_for_turn(&self) -> u32 {
+        let cwd = self.cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::config::extended::load_for_cwd(&cwd).max_primary_rounds
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "loading max_primary_rounds task join failed");
+            crate::config::extended::ExtendedConfig::default().max_primary_rounds
+        })
+    }
+
     async fn refresh_redaction_table_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
-        let mut cfg = crate::config::extended::load_for_cwd(&self.cwd).redact;
-        if let Some(v) = self.redaction_scan_environment_override {
-            cfg.scan_environment = v;
-        }
-        if let Some(v) = self.redaction_scan_dotenv_override {
-            cfg.scan_dotenv = v;
-        }
-        if let Some(v) = self.redaction_scan_ssh_keys_override {
-            cfg.scan_ssh_keys = v;
-        }
+        let cwd = self.cwd.clone();
+        let scan_environment_override = self.redaction_scan_environment_override;
+        let scan_dotenv_override = self.redaction_scan_dotenv_override;
+        let scan_ssh_keys_override = self.redaction_scan_ssh_keys_override;
         let session_env = self.stack[0]
             .agent
             .env_overlay
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        match RedactionTable::build_with_env(&cfg, &self.cwd, &session_env) {
-            Ok(table) => {
+        match tokio::task::spawn_blocking(move || {
+            let mut cfg = crate::config::extended::load_for_cwd(&cwd).redact;
+            if let Some(v) = scan_environment_override {
+                cfg.scan_environment = v;
+            }
+            if let Some(v) = scan_dotenv_override {
+                cfg.scan_dotenv = v;
+            }
+            if let Some(v) = scan_ssh_keys_override {
+                cfg.scan_ssh_keys = v;
+            }
+            RedactionTable::build_with_env(&cfg, &cwd, &session_env)
+        })
+        .await
+        {
+            Ok(Ok(table)) => {
                 let table = Arc::new(table);
                 for path in table.unsupported_files() {
                     if self.redaction_unsupported_notified.insert(path.clone()) {
@@ -1779,8 +1795,11 @@ impl Driver {
                 }
                 self.set_redaction_table(table);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "refreshing redaction table failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "refreshing redaction table task join failed");
             }
         }
     }
@@ -3317,6 +3336,20 @@ impl Driver {
         })
     }
 
+    async fn requeue_command_submission_for_boundary(
+        &self,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        submission: UserSubmission,
+    ) -> bool {
+        if !matches!(submission.kind, UserSubmissionKind::Compact) {
+            return false;
+        }
+        input_rx
+            .requeue_front(submission, self.active_queue_target())
+            .await;
+        true
+    }
+
     async fn run_prepared_queued_user_batch(
         &mut self,
         submissions: Vec<UserSubmission>,
@@ -3631,16 +3664,16 @@ impl Driver {
         name: &str,
         swap_ctx: PrimarySwapContext<'_>,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> bool {
         if self.stack.len() != 1 {
             tracing::warn!(
                 requested = %name,
                 "primary swap ignored: an interactive subagent holds the foreground"
             );
-            return;
+            return false;
         }
         if self.stack[0].agent.name == name {
-            return;
+            return true;
         }
         match crate::engine::builtin::load(name, &self.spawn_args(true)) {
             Ok(agent) => {
@@ -3681,7 +3714,7 @@ impl Driver {
                             to = %agent.name,
                             "primary swap failed during lock ownership update"
                         );
-                        return;
+                        return false;
                     }
                 }
                 // Deferred agent-swap identity marker (`agent-swap-
@@ -3729,9 +3762,11 @@ impl Driver {
                     })
                     .await;
                 self.emit_context_projection(tx).await;
+                true
             }
             Err(e) => {
                 tracing::warn!(error = %e, requested = %name, "primary swap failed to load agent");
+                false
             }
         }
     }
@@ -4132,9 +4167,6 @@ impl Driver {
                 hint: None,
             })
             .await;
-        if let Err(e) = self.session.set_active_agent(target) {
-            tracing::warn!(error = %e, "set_active_agent on handoff failed");
-        }
         // Build the kickoff from the user's originating request BEFORE the swap
         // strips any abandoned skill pair — `turns_from_messages` reads the
         // last plain user turn (the skill body is a tool-result round it skips),
@@ -4144,8 +4176,12 @@ impl Driver {
             Message::tool_result_with_call_id(task_call_id, task_function_call_id, kickoff.clone());
         // The `primary_swap` event records BOTH the user-facing `display` and
         // the model-facing wire `kickoff` (GOALS §14) with trigger `handoff`.
-        self.swap_primary_with_context(target, PrimarySwapContext::handoff(&display, &kickoff), tx)
+        let swapped = self
+            .swap_primary_with_context(target, PrimarySwapContext::handoff(&display, &kickoff), tx)
             .await;
+        if swapped && let Err(e) = self.session.set_active_agent(target) {
+            tracing::warn!(error = %e, "set_active_agent on handoff failed");
+        }
         next_prompt
     }
 
@@ -6678,6 +6714,17 @@ impl Driver {
                 let Some(first) = user else {
                     return Ok(Message::user(""));
                 };
+                if self
+                    .requeue_command_submission_for_boundary(input_rx, first.clone())
+                    .await
+                {
+                    let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
+                    let delivery = self
+                        .finalize_background_noninteractive_completion(completion, tx)
+                        .await?;
+                    self.reap_finished_noninteractive_jobs();
+                    return Ok(delivery.into_inline_message());
+                }
                 self.noninteractive_delegations
                     .background_on_user_input(&task_call_id, "default");
                 if let Err(e) = self
@@ -6709,10 +6756,11 @@ impl Driver {
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
-                Ok(self
+                let delivery = self
                     .finalize_background_noninteractive_completion(completion, tx)
-                    .await?
-                    .into_inline_message())
+                    .await?;
+                self.reap_finished_noninteractive_jobs();
+                Ok(delivery.into_inline_message())
             }
         }
     }
@@ -7317,10 +7365,11 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<bool> {
-        match self
+        let delivery = self
             .finalize_background_noninteractive_completion(completion, tx)
-            .await?
-        {
+            .await?;
+        self.reap_finished_noninteractive_jobs();
+        match delivery {
             NoninteractiveCompletionDelivery::None => Ok(false),
             NoninteractiveCompletionDelivery::Inline(message) => {
                 self.run_parent_tool_result(message, tx).await?;
@@ -7484,6 +7533,36 @@ impl Driver {
                     }
                 }
             },
+        }
+    }
+
+    fn reap_finished_noninteractive_jobs(&mut self) {
+        self.noninteractive_jobs.retain(|task_call_id, job| {
+            let reap = job.delivered && job.handle.is_finished();
+            if reap {
+                tracing::debug!(task_call_id, "reaped delivered noninteractive job handle");
+            }
+            !reap
+        });
+    }
+
+    fn release_noninteractive_child_locks(
+        &self,
+        rows: &[crate::db::task_delegations::DelegationChildDetail],
+    ) {
+        let mut released = std::collections::HashSet::new();
+        for row in rows {
+            if !released.insert(row.child_agent.as_str()) {
+                continue;
+            }
+            if let Err(e) = self.locks.suspend_agent(&row.child_agent, self.session.id) {
+                tracing::warn!(
+                    error = ?e,
+                    agent = %row.child_agent,
+                    task_call_id = %row.task_call_id,
+                    "release noninteractive child locks after abort failed"
+                );
+            }
         }
     }
 
@@ -7721,6 +7800,7 @@ impl Driver {
                     && let Some(job) = self.noninteractive_jobs.remove(&task_call_id)
                 {
                     job.handle.abort();
+                    self.release_noninteractive_child_locks(&selected);
                 }
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
@@ -8110,6 +8190,17 @@ impl Driver {
                 let Some(first) = user else {
                     return Ok(Message::user(""));
                 };
+                if self
+                    .requeue_command_submission_for_boundary(input_rx, first.clone())
+                    .await
+                {
+                    let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
+                    let delivery = self
+                        .finalize_background_noninteractive_completion(completion, tx)
+                        .await?;
+                    self.reap_finished_noninteractive_jobs();
+                    return Ok(delivery.into_inline_message());
+                }
                 let labels = self
                     .noninteractive_delegations
                     .entries
@@ -8150,10 +8241,11 @@ impl Driver {
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
-                Ok(self
+                let delivery = self
                     .finalize_background_noninteractive_completion(completion, tx)
-                    .await?
-                    .into_inline_message())
+                    .await?;
+                self.reap_finished_noninteractive_jobs();
+                Ok(delivery.into_inline_message())
             }
         }
     }
@@ -8669,8 +8761,7 @@ impl Driver {
     ) -> Result<()> {
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
-        self.max_primary_rounds =
-            crate::config::extended::load_for_cwd(&self.cwd).max_primary_rounds;
+        self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.refresh_redaction_table_for_turn(tx).await;
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,
@@ -8705,7 +8796,7 @@ impl Driver {
         // so a stale token can never affect a later run.
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
-            *self.cancel_current.lock().unwrap() = Some(cancel.clone());
+            *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
             }
@@ -9103,11 +9194,16 @@ impl Driver {
                             .last_mut()
                             .expect("stack never empty")
                             .history
-                            .push(last_tool_result);
+                            .push(last_tool_result.clone());
                         match queued.kind {
                             UserSubmissionKind::Compact => {
-                                self.do_compact(tx).await;
-                                return Ok(());
+                                input_rx
+                                    .requeue_front(queued, self.active_queue_target())
+                                    .await;
+                                if let Some(frame) = self.stack.last_mut() {
+                                    let _ = frame.history.pop();
+                                }
+                                next_prompt = last_tool_result;
                             }
                             UserSubmissionKind::User => {
                                 let Some(prepared) =
@@ -12608,6 +12704,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_handoff_does_not_persist_target_agent() {
+        let (mut driver, _t) = auto_rooted_driver();
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+
+        driver
+            .apply_handoff(
+                "DefinitelyNotAnAgent",
+                "call-1".to_string(),
+                Some("fc-1".to_string()),
+                &tx,
+            )
+            .await;
+
+        assert_eq!(driver.active_agent(), "Auto");
+        assert_eq!(persisted_active_agent(&driver), "Auto");
+    }
+
     /// Part 1 (implementation note): the swapped-in
     /// primary's first turn is driven by an IMPERATIVE kickoff — the user's
     /// originating request restated verbatim + a begin-now instruction — NOT
@@ -15977,6 +16091,61 @@ mod tests {
             .expect("task-a completion");
         assert_eq!(completion.task_call_id(), "task-a");
         assert!(driver.pending_noninteractive_completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivered_finished_noninteractive_job_is_reaped() {
+        let (mut driver, _tmp) = test_driver(8);
+        driver.noninteractive_jobs.insert(
+            "task-reap".to_string(),
+            BackgroundNoninteractiveJob {
+                delivered: true,
+                handle: tokio::spawn(async {}),
+            },
+        );
+        tokio::task::yield_now().await;
+
+        driver.reap_finished_noninteractive_jobs();
+
+        assert!(!driver.noninteractive_jobs.contains_key("task-reap"));
+    }
+
+    #[tokio::test]
+    async fn whole_job_cancel_releases_aborted_child_locks() {
+        let (mut driver, tmp) = test_driver(8);
+        let path = tmp.path().join("held.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        seed_task_delegation(&driver, "task-lock", "default");
+        driver.noninteractive_delegations.register_running(
+            "task-lock",
+            "default",
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+        driver
+            .locks
+            .acquire(&path, "explore", driver.session.id)
+            .unwrap();
+        driver.noninteractive_jobs.insert(
+            "task-lock".to_string(),
+            BackgroundNoninteractiveJob {
+                delivered: false,
+                handle: tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+            },
+        );
+
+        let body = driver.dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-lock".to_string()),
+            None,
+            None,
+        );
+
+        assert!(body.contains("cancelled"), "{body}");
+        assert!(driver.locks.holder(&path).is_none());
+        assert!(!driver.noninteractive_jobs.contains_key("task-lock"));
     }
 
     #[tokio::test]

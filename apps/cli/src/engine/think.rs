@@ -273,8 +273,9 @@ fn trailing_partial_match(s: &str, tag: &str) -> Option<usize> {
     // (s == "<", n == 1) is buffered, not emitted as literal text.
     let max = s.len().min(tag.len() - 1);
     for n in (1..=max).rev() {
-        if s.is_char_boundary(n) && tag.is_char_boundary(n) && s.ends_with(&tag[..n]) {
-            return Some(s.len() - n);
+        let suffix_start = s.len() - n;
+        if s.is_char_boundary(suffix_start) && tag.is_char_boundary(n) && s.ends_with(&tag[..n]) {
+            return Some(suffix_start);
         }
     }
     None
@@ -323,6 +324,12 @@ mod tests {
                 "stream split at {i} ({a:?}|{b:?}) != one-shot"
             );
         }
+    }
+
+    #[test]
+    fn partial_think_tag_after_multibyte_char_stays_buffered() {
+        assert_stream_matches_oneshot("日<think>reason</think>answer");
+        assert_eq!(trailing_partial_match("日<", OPEN), Some("日".len()));
     }
 
     #[test]

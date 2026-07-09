@@ -299,7 +299,25 @@ pub fn preserves_control_tokens(original: &str, cleaned: &str) -> bool {
     }
     counts
         .into_iter()
-        .all(|(tok, want)| cleaned.matches(tok).count() >= want)
+        .all(|(tok, want)| bounded_token_matches(cleaned, tok) >= want)
+}
+
+fn bounded_token_matches(haystack: &str, token: &str) -> usize {
+    haystack
+        .match_indices(token)
+        .filter(|(idx, _)| token_has_boundaries(haystack, *idx, token.len()))
+        .count()
+}
+
+fn token_has_boundaries(haystack: &str, start: usize, len: usize) -> bool {
+    let before = haystack[..start].chars().next_back();
+    let after = haystack[start + len..].chars().next();
+    !before.is_some_and(is_control_token_continuation)
+        && !after.is_some_and(is_control_token_continuation)
+}
+
+fn is_control_token_continuation(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\')
 }
 
 /// Assemble the preflight [`PreflightContext`] from a session's `history` and
@@ -702,6 +720,17 @@ mod tests {
         let original = "run /build and tag @src/main.rs for the change";
         let cleaned = "Run /build and tag @src/main.rs for this change.";
         assert!(preserves_control_tokens(original, cleaned));
+    }
+
+    #[test]
+    fn guard_rejects_appended_control_token_mutation() {
+        let original = "check @config.json before continuing";
+        let cleaned = "Check @config.json.bak before continuing.";
+        assert!(!preserves_control_tokens(original, cleaned));
+
+        let original = "run /build now";
+        let cleaned = "Run /builder now.";
+        assert!(!preserves_control_tokens(original, cleaned));
     }
 
     #[test]

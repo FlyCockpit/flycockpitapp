@@ -241,6 +241,25 @@ impl SettingsDialog {
                         }
                     }
                 }
+                EditorOutcome::ExternalEdit => {
+                    if std::env::var_os("EDITOR").is_none() {
+                        p.status = Some("No $EDITOR environment variable".into());
+                    } else {
+                        let path = editor.path.clone();
+                        let text = editor.text().to_string();
+                        let text = format!("{}\n", text.trim_end_matches('\n'));
+                        match std::fs::write(&path, &text) {
+                            Ok(()) => {
+                                p.editing = None;
+                                p.pending_external_edit = Some(path);
+                                p.status = Some("opening $EDITOR…".into());
+                            }
+                            Err(e) => {
+                                p.status = Some(format!("write failed: {e}"));
+                            }
+                        }
+                    }
+                }
                 EditorOutcome::Cancel => {
                     p.editing = None;
                     p.status = Some("edit cancelled".into());

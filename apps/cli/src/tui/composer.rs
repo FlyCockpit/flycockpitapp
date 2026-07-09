@@ -898,6 +898,7 @@ impl Composer {
     }
 
     /// Delete from cursor to the position vim-`w`/`W` would land at.
+    #[cfg(test)]
     pub fn delete_word_forward(&mut self, big_word: bool) {
         let start = self.cursor;
         self.move_word_forward(big_word);
@@ -909,6 +910,7 @@ impl Composer {
     }
 
     /// Delete from cursor back to the position vim-`b`/`B` would land at.
+    #[cfg(test)]
     pub fn delete_word_backward(&mut self, big_word: bool) {
         let end = self.cursor;
         self.move_word_backward(big_word);
@@ -930,6 +932,7 @@ impl Composer {
     }
 
     /// `d0` — delete from cursor back to start of current line.
+    #[cfg(test)]
     pub fn delete_to_line_start(&mut self) {
         let end = self.cursor;
         self.move_line_start();
@@ -971,17 +974,6 @@ impl Composer {
             .map(|i| i + 1)
             .unwrap_or(0);
         self.cursor = line_start;
-    }
-
-    /// `dG` — delete from cursor to end of buffer.
-    pub fn delete_to_buffer_end(&mut self) {
-        self.buffer.truncate(self.cursor);
-    }
-
-    /// `dgg` — delete from start of buffer to cursor.
-    pub fn delete_to_buffer_start(&mut self) {
-        self.buffer.drain(0..self.cursor);
-        self.cursor = 0;
     }
 
     /// `o` — open a new empty line below the current one and land at

@@ -3790,6 +3790,30 @@ impl App {
         Ok(())
     }
 
+    fn run_external_editor_command(
+        terminal: &mut DefaultTerminal,
+        editor: &std::ffi::OsStr,
+        path: &std::path::Path,
+    ) -> Result<std::io::Result<std::process::ExitStatus>> {
+        // Suspend ratatui's input handling for the editor invocation.
+        // We disable the keyboard-enhancement flags / cursor styles
+        // crossterm pushed for us, leave raw mode, and let the editor
+        // own the TTY. Re-enable everything after it exits.
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+
+        let status = std::process::Command::new(editor).arg(path).status();
+
+        let _ = enable_raw_mode();
+        let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
+        terminal.clear()?;
+
+        Ok(status)
+    }
+
     /// Ctrl+G was pressed: pop the composer text out into `$EDITOR`,
     /// then reload whatever the user wrote back into the buffer. Quits
     /// raw mode for the duration so the editor owns the terminal.
@@ -3834,21 +3858,7 @@ impl App {
         }
         let path = temp.path().to_path_buf();
 
-        // Suspend ratatui's input handling for the editor invocation.
-        // We disable the keyboard-enhancement flags / cursor styles
-        // crossterm pushed for us, leave raw mode, and let the editor
-        // own the TTY. Re-enable everything after it exits.
-        use crossterm::terminal::{
-            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        };
-        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-
-        let status = std::process::Command::new(&editor).arg(&path).status();
-
-        let _ = enable_raw_mode();
-        let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
-        terminal.clear()?;
+        let status = Self::run_external_editor_command(terminal, &editor, &path)?;
 
         match status {
             Ok(s) if s.success() => match std::fs::read_to_string(&path) {
@@ -3907,17 +3917,7 @@ impl App {
             return Ok(());
         };
 
-        use crossterm::terminal::{
-            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        };
-        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-
-        let status = std::process::Command::new(&editor).arg(&path).status();
-
-        let _ = enable_raw_mode();
-        let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
-        terminal.clear()?;
+        let status = Self::run_external_editor_command(terminal, &editor, &path)?;
 
         let editor_error = match status {
             Ok(s) if s.success() => None,

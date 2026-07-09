@@ -52,3 +52,4 @@ pub mod stats_pane;
 pub mod textfield;
 pub mod theme;
 pub mod usage_pane;
+pub mod vim_editor;

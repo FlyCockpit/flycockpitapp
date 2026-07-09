@@ -4941,6 +4941,94 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_preserves_consecutive_user_turns_and_scrubs_each() {
+        let (_tmp, redact) = secret_table();
+        let model = model_at("http://127.0.0.1:1/v1", redact);
+        let history = vec![
+            Message::user("first queued"),
+            Message::user(format!("second queued {SECRET}")),
+        ];
+
+        let captured = model.assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("final queued"),
+            &[],
+            &ModelParams::default(),
+        );
+
+        let wire_history = captured["history"].as_array().expect("history array");
+        assert_eq!(
+            wire_history.len(),
+            2,
+            "consecutive user turns stay separate"
+        );
+        assert!(
+            serde_json::to_string(&wire_history[0])
+                .unwrap()
+                .contains("first queued")
+        );
+        let second = serde_json::to_string(&wire_history[1]).unwrap();
+        assert!(
+            second.contains("second queued"),
+            "second turn missing: {second}"
+        );
+        assert!(
+            second.contains(PLACEHOLDER),
+            "second turn was not scrubbed: {second}"
+        );
+        assert!(
+            !second.contains(SECRET),
+            "second turn leaked secret: {second}"
+        );
+    }
+
+    #[test]
+    fn dispatch_hoists_queued_time_prelude_out_of_user_turns() {
+        let model = model_at(
+            "http://127.0.0.1:1/v1",
+            TestArc::new(RedactionTable::empty()),
+        );
+        let time_prelude = "[time: 2026-07-09T00:00:00Z]";
+        let history = vec![
+            Message::System {
+                content: time_prelude.to_string(),
+            },
+            Message::user("first queued"),
+            Message::user("second queued"),
+        ];
+
+        let captured = model.assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("third queued"),
+            &[],
+            &ModelParams::default(),
+        );
+
+        let wire_history = captured["history"].as_array().expect("history array");
+        assert_eq!(wire_history.len(), 3);
+        assert_eq!(wire_history[0]["role"], json!("system"));
+        assert!(
+            serde_json::to_string(&wire_history[0])
+                .unwrap()
+                .contains(time_prelude)
+        );
+        for (entry, expected) in wire_history[1..]
+            .iter()
+            .zip(["first queued", "second queued"])
+        {
+            assert_eq!(entry["role"], json!("user"));
+            let rendered = serde_json::to_string(entry).unwrap();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains(time_prelude), "{rendered}");
+        }
+        let prompt = serde_json::to_string(&captured["prompt"]).unwrap();
+        assert!(prompt.contains("third queued"), "{prompt}");
+        assert!(!prompt.contains(time_prelude), "{prompt}");
+    }
+
+    #[test]
     fn openai_compatible_dispatch_still_strips_reasoning() {
         let model = model_at(
             "http://127.0.0.1:1/v1",

@@ -2589,11 +2589,10 @@ impl Driver {
     }
 
     /// Long-running main loop: pulls user input from `input_rx` and
-    /// drives it through the agent stack, **folding queued user
-    /// messages** (GOALS §1c) at every inference boundary. The fold
-    /// runs `try_recv` until the channel is empty, joins the
-    /// collected texts with a blank line, and uses that as the next
-    /// inference's user content.
+    /// drives it through the agent stack, draining queued user messages
+    /// (GOALS §1c) at inference boundaries. A drained batch preserves one
+    /// user turn per queued submission in FIFO order; compact markers split
+    /// batches instead of synthesizing dummy user turns.
     ///
     /// Per GOALS §1c, the queue is delivered at the *next inference
     /// call* — not the next user turn. Mid-tool-loop: the next
@@ -2661,56 +2660,13 @@ impl Driver {
                     // first message (rare but harmless).
                     let mut batch = vec![first];
                     drain_queue(&input_queue, &mut batch, &active_target_id).await;
-                    for item in fold_submission_commands(batch) {
-                        match item {
-                            FoldedSubmission::Compact => self.do_compact(tx).await,
-                            FoldedSubmission::User(folded) => {
-                                let folded = *folded;
-                                if self.preflight_will_run(&folded.text) {
-                                    let _ = tx.send(TurnEvent::PreflightStarted).await;
-                                }
-                                let (injection, preflight) = tokio::join!(
-                                    self.injection_check_only(&folded.text),
-                                    self.run_preflight(&folded.text),
-                                );
-                                if let Some((threshold, outcome)) = injection
-                                    && !self.apply_injection_outcome(threshold, outcome, tx).await
-                                {
-                                    let _ = tx.send(TurnEvent::UserMessageRetracted).await;
-                                    self.emit_context_projection(tx).await;
-                                    let turn_id = self.current_lifecycle_turn_id.take();
-                                    let _ = tx.send(TurnEvent::AgentIdle { turn_id }).await;
-                                    continue;
-                                }
-                                let (raw_text, cleaned_for_display, forced_skill) = self
-                                    .resolve_preflight_outcome(
-                                        preflight,
-                                        &folded.text,
-                                        folded.forced_skill,
-                                        tx,
-                                    )
-                                    .await;
-                                let inbound_text = self.translate_inbound(&raw_text).await;
-                                let submission = UserSubmission {
-                                    kind: UserSubmissionKind::User,
-                                    text: self.redact.scrub(&inbound_text),
-                                    images: folded.images,
-                                    forced_skill,
-                                    origin_principal: folded.origin_principal,
-                                    job_id: folded.job_id,
-                                    preflight_cleaned: cleaned_for_display,
-                                    queue_item_ids: folded.queue_item_ids,
-                                    queue_target: folded.queue_target,
-                                };
-                                self.goal_no_tool_idle_count = 0;
-                                if !self.is_goal_intervention_continue(&submission.text) {
-                                    self.goal_idle_intervention_pending = false;
-                                }
-                                self.run_user_input(submission, &input_queue, tx).await?;
-                                self.maybe_continue_active_goal(&input_queue, tx).await?;
-                            }
-                        }
+                    let items = fold_submission_commands(batch);
+                    if items.iter().any(|item| matches!(item, FoldedSubmission::User(_))) {
+                        self.goal_no_tool_idle_count = 0;
+                        self.goal_idle_intervention_pending = false;
                     }
+                    self.run_folded_submission_commands(items, &input_queue, tx).await?;
+                    self.maybe_continue_active_goal(&input_queue, tx).await?;
                     self.refresh_goal_watchdog(&mut goal_watchdog);
                 }
                 ctl = control_rx.recv() => {
@@ -3297,6 +3253,128 @@ impl Driver {
             })
             .await;
         seq
+    }
+
+    async fn prepare_queued_user_submission(
+        &mut self,
+        submission: UserSubmission,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Option<UserSubmission> {
+        if self.preflight_will_run(&submission.text) {
+            let _ = tx.send(TurnEvent::PreflightStarted).await;
+        }
+        let (injection, preflight) = tokio::join!(
+            self.injection_check_only(&submission.text),
+            self.run_preflight(&submission.text),
+        );
+        if let Some((threshold, outcome)) = injection
+            && !self.apply_injection_outcome(threshold, outcome, tx).await
+        {
+            let _ = tx.send(TurnEvent::UserMessageRetracted).await;
+            self.emit_context_projection(tx).await;
+            let turn_id = self.current_lifecycle_turn_id.take();
+            let _ = tx.send(TurnEvent::AgentIdle { turn_id }).await;
+            return None;
+        }
+        let (raw_text, cleaned_for_display, forced_skill) = self
+            .resolve_preflight_outcome(preflight, &submission.text, submission.forced_skill, tx)
+            .await;
+        let inbound_text = self.translate_inbound(&raw_text).await;
+        Some(UserSubmission {
+            kind: UserSubmissionKind::User,
+            text: self.redact.scrub(&inbound_text),
+            images: submission.images,
+            forced_skill,
+            origin_principal: submission.origin_principal,
+            job_id: submission.job_id,
+            preflight_cleaned: cleaned_for_display,
+            queue_item_ids: submission.queue_item_ids,
+            queue_target: submission.queue_target,
+        })
+    }
+
+    async fn run_prepared_queued_user_batch(
+        &mut self,
+        submissions: Vec<UserSubmission>,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        if submissions.is_empty() {
+            return Ok(());
+        }
+        if submissions.len() == 1
+            || submissions
+                .iter()
+                .take(submissions.len().saturating_sub(1))
+                .any(|submission| submission.forced_skill.is_some())
+        {
+            for submission in submissions {
+                self.run_user_input(submission, input_rx, tx).await?;
+            }
+            return Ok(());
+        }
+
+        let last_index = submissions.len() - 1;
+        let mut leading_history = Vec::with_capacity(last_index);
+        let mut last = None;
+        for (idx, submission) in submissions.into_iter().enumerate() {
+            if idx == last_index {
+                last = Some(submission);
+                break;
+            }
+            self.record_queued_user_fold(&submission, tx).await;
+            leading_history.push(crate::engine::message::build_user_message(UserSubmission {
+                kind: UserSubmissionKind::User,
+                text: submission.text,
+                images: submission.images,
+                forced_skill: None,
+                origin_principal: None,
+                job_id: None,
+                preflight_cleaned: None,
+                queue_item_ids: Vec::new(),
+                queue_target: None,
+            }));
+        }
+        let last = last.expect("non-empty queued batch has a final user turn");
+        self.run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
+            .await
+    }
+
+    async fn run_folded_submission_commands(
+        &mut self,
+        items: Vec<FoldedSubmission>,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        let mut pending_users = Vec::new();
+        for item in items {
+            match item {
+                FoldedSubmission::Compact => {
+                    self.run_prepared_queued_user_batch(
+                        std::mem::take(&mut pending_users),
+                        input_rx,
+                        tx,
+                    )
+                    .await?;
+                    self.do_compact(tx).await;
+                }
+                FoldedSubmission::User(submission) => {
+                    let Some(prepared) = self.prepare_queued_user_submission(*submission, tx).await
+                    else {
+                        self.run_prepared_queued_user_batch(
+                            std::mem::take(&mut pending_users),
+                            input_rx,
+                            tx,
+                        )
+                        .await?;
+                        return Ok(());
+                    };
+                    pending_users.push(prepared);
+                }
+            }
+        }
+        self.run_prepared_queued_user_batch(pending_users, input_rx, tx)
+            .await
     }
 
     fn refresh_goal_watchdog(&self, watchdog: &mut Option<Pin<Box<Sleep>>>) {
@@ -6584,15 +6662,14 @@ impl Driver {
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
-                let mut batch = vec![first];
-                let target_id = self.active_queue_target_id();
-                drain_queue(input_rx, &mut batch, &target_id).await;
-                let folded = fold_submissions(batch);
-                self.record_queued_user_fold(&folded, tx).await;
+                let Some(prepared) = self.prepare_queued_user_submission(first, tx).await else {
+                    return Ok(Message::user(""));
+                };
+                self.record_queued_user_fold(&prepared, tx).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     kind: UserSubmissionKind::User,
-                    text: self.with_time_prelude(self.redact.scrub(&folded.text)),
-                    images: folded.images,
+                    text: self.with_time_prelude(prepared.text),
+                    images: prepared.images,
                     forced_skill: None,
                     origin_principal: None,
                     job_id: None,
@@ -7756,15 +7833,14 @@ impl Driver {
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
-                let mut batch = vec![first];
-                let target_id = self.active_queue_target_id();
-                drain_queue(input_rx, &mut batch, &target_id).await;
-                let folded = fold_submissions(batch);
-                self.record_queued_user_fold(&folded, tx).await;
+                let Some(prepared) = self.prepare_queued_user_submission(first, tx).await else {
+                    return Ok(Message::user(""));
+                };
+                self.record_queued_user_fold(&prepared, tx).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     kind: UserSubmissionKind::User,
-                    text: self.with_time_prelude(self.redact.scrub(&folded.text)),
-                    images: folded.images,
+                    text: self.with_time_prelude(prepared.text),
+                    images: prepared.images,
                     forced_skill: None,
                     origin_principal: None,
                     job_id: None,
@@ -8276,6 +8352,18 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        self.run_user_input_with_leading_history(submission, Vec::new(), false, input_rx, tx)
+            .await
+    }
+
+    async fn run_user_input_with_leading_history(
+        &mut self,
+        submission: UserSubmission,
+        leading_history: Vec<Message>,
+        time_prelude_as_system: bool,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds =
@@ -8451,6 +8539,22 @@ impl Driver {
         // re-issue a tool it lacks (priority #1). Annotates once; idempotent.
         self.annotate_absent_tool_calls();
 
+        if !leading_history.is_empty() || time_prelude_as_system {
+            let time_prelude = time_prelude_as_system
+                .then(|| {
+                    self.session
+                        .take_time_prelude(self.time_injection_interval_minutes)
+                        .map(|content| Message::System { content })
+                })
+                .flatten();
+            if let Some(top) = self.stack.last_mut() {
+                if let Some(prelude) = time_prelude {
+                    top.history.push(prelude);
+                }
+                top.history.extend(leading_history);
+            }
+        }
+
         let retry_recovery = self.failed_turn_retry_prompt_for(&raw_user_text);
         let mut next_prompt = if let Some((recovery_id, recovered_text)) = &retry_recovery {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
@@ -8468,7 +8572,11 @@ impl Driver {
         } else {
             crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
-                text: self.with_time_prelude(user_text),
+                text: if time_prelude_as_system {
+                    user_text
+                } else {
+                    self.with_time_prelude(user_text)
+                },
                 images,
                 forced_skill: None,
                 origin_principal: None,
@@ -8533,7 +8641,7 @@ impl Driver {
                     &agent,
                     backup_model.as_ref(),
                     &mut top.history,
-                    next_prompt,
+                    next_prompt.clone(),
                     self.session.clone(),
                     self.locks.clone(),
                     self.redact.clone(),
@@ -8675,35 +8783,52 @@ impl Driver {
                     }
 
                     let target_id = self.active_queue_target_id();
-                    let top = self.stack.last_mut().expect("stack never empty");
-                    let last_tool_result = top
-                        .history
-                        .pop()
-                        .expect("Continue with empty history is unreachable");
+                    let last_tool_result = {
+                        let top = self.stack.last_mut().expect("stack never empty");
+                        top.history
+                            .pop()
+                            .expect("Continue with empty history is unreachable")
+                    };
 
-                    // Fold any queued user messages onto the upcoming
-                    // inference. The tool result still has to be
-                    // delivered, so push it back onto history and use
-                    // the queued user content as the next prompt.
+                    // Carry at most one queued user message onto this upcoming
+                    // inference. Later queued messages remain pending so their
+                    // original turn boundaries and metadata are preserved.
                     let mut queued: Vec<UserSubmission> = Vec::new();
-                    drain_queue(input_rx, &mut queued, &target_id).await;
-                    if queued.is_empty() {
-                        next_prompt = last_tool_result;
+                    drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
+                    if let Some(queued) = queued.into_iter().next() {
+                        self.stack
+                            .last_mut()
+                            .expect("stack never empty")
+                            .history
+                            .push(last_tool_result);
+                        match queued.kind {
+                            UserSubmissionKind::Compact => {
+                                self.do_compact(tx).await;
+                                return Ok(());
+                            }
+                            UserSubmissionKind::User => {
+                                let Some(prepared) =
+                                    self.prepare_queued_user_submission(queued, tx).await
+                                else {
+                                    return Ok(());
+                                };
+                                self.record_queued_user_fold(&prepared, tx).await;
+                                next_prompt =
+                                    crate::engine::message::build_user_message(UserSubmission {
+                                        kind: UserSubmissionKind::User,
+                                        text: self.with_time_prelude(prepared.text),
+                                        images: prepared.images,
+                                        forced_skill: None,
+                                        origin_principal: None,
+                                        job_id: None,
+                                        preflight_cleaned: None,
+                                        queue_item_ids: Vec::new(),
+                                        queue_target: None,
+                                    });
+                            }
+                        }
                     } else {
-                        top.history.push(last_tool_result);
-                        let folded = fold_submissions(queued);
-                        self.record_queued_user_fold(&folded, tx).await;
-                        next_prompt = crate::engine::message::build_user_message(UserSubmission {
-                            kind: UserSubmissionKind::User,
-                            text: self.with_time_prelude(self.redact.scrub(&folded.text)),
-                            images: folded.images,
-                            forced_skill: None,
-                            origin_principal: None,
-                            job_id: None,
-                            preflight_cleaned: None,
-                            queue_item_ids: Vec::new(),
-                            queue_target: None,
-                        });
+                        next_prompt = last_tool_result;
                     }
                     continue;
                 }
@@ -8735,22 +8860,35 @@ impl Driver {
                     // them and start a new run with the combined text.
                     let mut queued: Vec<UserSubmission> = Vec::new();
                     let target_id = self.active_queue_target_id();
-                    drain_queue(input_rx, &mut queued, &target_id).await;
-                    if !queued.is_empty() {
-                        let folded = fold_submissions(queued);
-                        self.record_queued_user_fold(&folded, tx).await;
-                        next_prompt = crate::engine::message::build_user_message(UserSubmission {
-                            kind: UserSubmissionKind::User,
-                            text: self.redact.scrub(&folded.text),
-                            images: folded.images,
-                            forced_skill: None,
-                            origin_principal: None,
-                            job_id: None,
-                            preflight_cleaned: None,
-                            queue_item_ids: Vec::new(),
-                            queue_target: None,
-                        });
-                        continue;
+                    drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
+                    if let Some(queued) = queued.into_iter().next() {
+                        match queued.kind {
+                            UserSubmissionKind::Compact => {
+                                self.do_compact(tx).await;
+                                continue;
+                            }
+                            UserSubmissionKind::User => {
+                                let Some(prepared) =
+                                    self.prepare_queued_user_submission(queued, tx).await
+                                else {
+                                    continue;
+                                };
+                                self.record_queued_user_fold(&prepared, tx).await;
+                                next_prompt =
+                                    crate::engine::message::build_user_message(UserSubmission {
+                                        kind: UserSubmissionKind::User,
+                                        text: prepared.text,
+                                        images: prepared.images,
+                                        forced_skill: None,
+                                        origin_principal: None,
+                                        job_id: None,
+                                        preflight_cleaned: None,
+                                        queue_item_ids: Vec::new(),
+                                        queue_target: None,
+                                    });
+                                continue;
+                            }
+                        }
                     }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
                         if self.goal_continue_progress_since(anchor_seq) {
@@ -9643,13 +9781,22 @@ impl Driver {
 }
 
 /// Drain queued user submissions from the channel without blocking.
-/// Stops at the [`MAX_FOLD`] cap; anything beyond stays for a later fold.
+/// Stops at the [`MAX_FOLD`] batch cap; anything beyond stays queued.
 async fn drain_queue(
     rx: &crate::engine::message::UserSubmissionQueue,
     into: &mut Vec<UserSubmission>,
     target_id: &str,
 ) {
-    rx.drain_into_for(into, MAX_FOLD, Some(target_id)).await;
+    drain_queue_limit(rx, into, target_id, MAX_FOLD).await;
+}
+
+async fn drain_queue_limit(
+    rx: &crate::engine::message::UserSubmissionQueue,
+    into: &mut Vec<UserSubmission>,
+    target_id: &str,
+    max: usize,
+) {
+    rx.drain_into_for(into, max, Some(target_id)).await;
 }
 
 /// Discard *all* currently-queued user submissions from the channel
@@ -9956,71 +10103,13 @@ enum FoldedSubmission {
 }
 
 fn fold_submission_commands(submissions: Vec<UserSubmission>) -> Vec<FoldedSubmission> {
-    let mut out = Vec::new();
-    let mut pending = Vec::new();
-    for submission in submissions {
-        match submission.kind {
-            UserSubmissionKind::User => pending.push(submission),
-            UserSubmissionKind::Compact => {
-                if !pending.is_empty() {
-                    out.push(FoldedSubmission::User(Box::new(fold_submissions(
-                        std::mem::take(&mut pending),
-                    ))));
-                }
-                out.push(FoldedSubmission::Compact);
-            }
-        }
-    }
-    if !pending.is_empty() {
-        out.push(FoldedSubmission::User(Box::new(fold_submissions(pending))));
-    }
-    out
-}
-
-fn fold_submissions(submissions: Vec<UserSubmission>) -> UserSubmission {
-    let mut texts = Vec::with_capacity(submissions.len());
-    let mut images = Vec::new();
-    // A user-issued skill slash command (`forced_skill`) is a deterministic
-    // single-skill invocation; if several fold together the first one wins
-    // (the others' text still rides along as accompanying task input).
-    let mut forced_skill = None;
-    // An async-result delivery (implementation note) is injected
-    // standalone via `run_user_input`, never folded with user input; the
-    // first-wins carry mirrors `forced_skill` purely for completeness.
-    let mut job_id = None;
-    let mut origin_principal = None;
-    let mut queue_item_ids = Vec::new();
-    let mut queue_target = None;
-    for s in submissions {
-        texts.push(s.text);
-        images.extend(s.images);
-        queue_item_ids.extend(s.queue_item_ids);
-        if queue_target.is_none() {
-            queue_target = s.queue_target;
-        }
-        if forced_skill.is_none() {
-            forced_skill = s.forced_skill;
-        }
-        if origin_principal.is_none() {
-            origin_principal = s.origin_principal;
-        }
-        if job_id.is_none() {
-            job_id = s.job_id;
-        }
-    }
-    UserSubmission {
-        kind: UserSubmissionKind::User,
-        text: texts.join("\n\n"),
-        images,
-        forced_skill,
-        origin_principal,
-        job_id,
-        // Preflight runs on the folded text *after* this point, so a folded
-        // submission never carries a cleaned form yet.
-        preflight_cleaned: None,
-        queue_item_ids,
-        queue_target,
-    }
+    submissions
+        .into_iter()
+        .map(|submission| match submission.kind {
+            UserSubmissionKind::User => FoldedSubmission::User(Box::new(submission)),
+            UserSubmissionKind::Compact => FoldedSubmission::Compact,
+        })
+        .collect()
 }
 
 /// Estimate the wire-side token total of a message history via the
@@ -13696,28 +13785,37 @@ mod tests {
         queue
             .drain_into_for(&mut drained, MAX_FOLD, Some(&target.id))
             .await;
-        let folded = fold_submissions(drained);
-        let seq = driver
-            .record_queued_user_fold(&folded, &tx)
+        assert_eq!(drained.len(), 2);
+        let first_seq = driver
+            .record_queued_user_fold(&drained[0], &tx)
             .await
-            .expect("queued fold should persist");
+            .expect("first queued message should persist");
+        let second_seq = driver
+            .record_queued_user_fold(&drained[1], &tx)
+            .await
+            .expect("second queued message should persist");
 
-        let event = rx.try_recv().expect("queued fold turn event");
-        match event {
-            TurnEvent::QueuedUserMessagesFolded {
-                text,
-                queue_item_ids,
-                target: event_target,
-                seq: event_seq,
-                preflight_cleaned,
-            } => {
-                assert_eq!(text, "first queued\n\nsecond queued");
-                assert_eq!(queue_item_ids, vec![first_id, second_id]);
-                assert_eq!(event_target.id, target.id);
-                assert_eq!(event_seq, Some(seq));
-                assert!(preflight_cleaned.is_none());
+        for (expected_text, expected_id, expected_seq) in [
+            ("first queued", first_id, first_seq),
+            ("second queued", second_id, second_seq),
+        ] {
+            let event = rx.try_recv().expect("queued turn event");
+            match event {
+                TurnEvent::QueuedUserMessagesFolded {
+                    text,
+                    queue_item_ids,
+                    target: event_target,
+                    seq: event_seq,
+                    preflight_cleaned,
+                } => {
+                    assert_eq!(text, expected_text);
+                    assert_eq!(queue_item_ids, vec![expected_id]);
+                    assert_eq!(event_target.id, target.id);
+                    assert_eq!(event_seq, Some(expected_seq));
+                    assert!(preflight_cleaned.is_none());
+                }
+                other => panic!("expected queued turn event, got {other:?}"),
             }
-            other => panic!("expected queued fold event, got {other:?}"),
         }
 
         let events = driver
@@ -13725,16 +13823,20 @@ mod tests {
             .db
             .list_session_events(driver.session.id)
             .unwrap();
-        let recorded = events
-            .iter()
-            .find(|event| event.seq == seq)
-            .expect("queued fold user_message event");
-        assert_eq!(recorded.kind, "user_message");
-        assert_eq!(recorded.data["text"], "first queued\n\nsecond queued");
-        assert_eq!(recorded.data["queued"], true);
-        assert_eq!(recorded.data["queue_item_ids"][0], first_id.to_string());
-        assert_eq!(recorded.data["queue_item_ids"][1], second_id.to_string());
-        assert_eq!(recorded.data["queue_target"]["id"], target.id);
+        for (expected_text, expected_id, expected_seq) in [
+            ("first queued", first_id, first_seq),
+            ("second queued", second_id, second_seq),
+        ] {
+            let recorded = events
+                .iter()
+                .find(|event| event.seq == expected_seq)
+                .expect("queued user_message event");
+            assert_eq!(recorded.kind, "user_message");
+            assert_eq!(recorded.data["text"], expected_text);
+            assert_eq!(recorded.data["queued"], true);
+            assert_eq!(recorded.data["queue_item_ids"][0], expected_id.to_string());
+            assert_eq!(recorded.data["queue_target"]["id"], target.id);
+        }
     }
 
     /// `/prune` (and auto-prune) target the **foreground** agent only —
@@ -17341,17 +17443,19 @@ mod tests {
             UserSubmission::text("after one"),
             UserSubmission::text("after two"),
         ]);
-        assert_eq!(folded.len(), 3);
+        assert_eq!(folded.len(), 4);
         match &folded[0] {
             FoldedSubmission::User(submission) => assert_eq!(submission.text, "before"),
-            FoldedSubmission::Compact => panic!("expected leading user fold"),
+            FoldedSubmission::Compact => panic!("expected leading user turn"),
         }
         assert!(matches!(folded[1], FoldedSubmission::Compact));
         match &folded[2] {
-            FoldedSubmission::User(submission) => {
-                assert_eq!(submission.text, "after one\n\nafter two");
-            }
-            FoldedSubmission::Compact => panic!("expected trailing user fold"),
+            FoldedSubmission::User(submission) => assert_eq!(submission.text, "after one"),
+            FoldedSubmission::Compact => panic!("expected first trailing user turn"),
+        }
+        match &folded[3] {
+            FoldedSubmission::User(submission) => assert_eq!(submission.text, "after two"),
+            FoldedSubmission::Compact => panic!("expected second trailing user turn"),
         }
     }
 

@@ -2803,6 +2803,65 @@ mod tests {
     }
 
     #[test]
+    fn behavior_command_resource_profile_rows_edit_and_persist() {
+        use crate::config::extended::ExtendedConfigDoc;
+
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+
+        open_category_on(&mut d, Category::Behavior, SettingId::CommandProfileRust);
+        d.handle_key(press(KeyCode::Enter));
+        assert!(
+            !d.extended
+                .command_resource_profiles
+                .profile_enabled("rust_toolchain")
+        );
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(
+            reloaded.command_resource_profiles.enabled["rust_toolchain"],
+            false
+        );
+
+        open_category_on(
+            &mut d,
+            Category::Behavior,
+            SettingId::CommandProfileWrappers,
+        );
+        d.handle_key(press(KeyCode::Enter));
+        if let Page::Category(p) = &mut d.page {
+            p.buf
+                .set(r#"{"just ci":["rust_toolchain","node_package_manager"]}"#.to_string());
+        }
+        d.handle_key(press(KeyCode::Enter));
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(
+            reloaded.command_resource_profiles.wrappers["just ci"],
+            vec![
+                "rust_toolchain".to_string(),
+                "node_package_manager".to_string()
+            ]
+        );
+
+        open_category_on(
+            &mut d,
+            Category::Behavior,
+            SettingId::CommandProfileCustomProfiles,
+        );
+        d.handle_key(press(KeyCode::Enter));
+        if let Page::Category(p) = &mut d.page {
+            p.buf.set(
+                r#"{"terraform_toolchain":{"commands":["terraform"],"roots":[{"kind":"terraform_plugin_cache","path":".terraform","withinCwd":true}]}}"#.to_string(),
+            );
+        }
+        d.handle_key(press(KeyCode::Enter));
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        let profile = &reloaded.command_resource_profiles.profiles["terraform_toolchain"];
+        assert_eq!(profile.commands, vec!["terraform".to_string()]);
+        assert_eq!(profile.roots[0].kind, "terraform_plugin_cache");
+        assert!(profile.roots[0].within_cwd);
+    }
+
+    #[test]
     fn behavior_llm_mode_row_toggles_and_persists() {
         use crate::config::extended::{ExtendedConfigDoc, LlmMode};
         let tmp = TempDir::new().unwrap();

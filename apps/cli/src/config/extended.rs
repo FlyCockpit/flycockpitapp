@@ -7,7 +7,7 @@
 //! `the design notes` §4. All fields are optional; a missing file is fine
 //! (defaults apply).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -430,18 +430,107 @@ pub enum ApprovalPolicyScope {
     Global,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct CommandResourceProfilesConfig {
-    /// Approval-key strings for wrapper commands that should use the Rust
-    /// toolchain profile, e.g. `"just test"` or `"make check"`.
-    #[serde(rename = "rustToolchain", default)]
-    pub rust_toolchain: Vec<String>,
+    /// User-defined declarative command resource profiles. Built-ins are not
+    /// represented here; they are supplied by the registry and may be toggled
+    /// through `enabled`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, CommandResourceProfileDefinition>,
+    /// Approval-key strings for wrapper commands mapped to one or more profile
+    /// ids, e.g. `"just ci": ["rust_toolchain", "node_package_manager"]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wrappers: BTreeMap<String, Vec<String>>,
+    /// Explicit enable/disable bits. Built-in and custom profiles default to
+    /// enabled when omitted; unknown future ids are preserved here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub enabled: BTreeMap<String, bool>,
+    /// Forward-compatible fields under `commandResourceProfiles`.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for CommandResourceProfilesConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        struct Raw {
+            #[serde(default)]
+            profiles: BTreeMap<String, CommandResourceProfileDefinition>,
+            #[serde(default)]
+            wrappers: BTreeMap<String, Vec<String>>,
+            #[serde(default)]
+            enabled: BTreeMap<String, bool>,
+            #[serde(flatten, default)]
+            extra: Map<String, Value>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.extra.contains_key("rustToolchain") {
+            return Err(serde::de::Error::custom(
+                "commandResourceProfiles.rustToolchain is no longer supported; use commandResourceProfiles.wrappers",
+            ));
+        }
+        Ok(Self {
+            profiles: raw.profiles,
+            wrappers: raw.wrappers,
+            enabled: raw.enabled,
+            extra: raw.extra,
+        })
+    }
 }
 
 impl CommandResourceProfilesConfig {
     pub fn is_empty(&self) -> bool {
-        self.rust_toolchain.is_empty()
+        self.profiles.is_empty()
+            && self.wrappers.is_empty()
+            && self.enabled.is_empty()
+            && self.extra.is_empty()
     }
+
+    pub fn profile_enabled(&self, id: &str) -> bool {
+        self.enabled.get(id).copied().unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CommandResourceProfileDefinition {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<CommandResourceProfileRoot>,
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandResourceProfileRoot {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub access: CommandResourceProfileRootAccess,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
+    #[serde(rename = "withinCwd", default, skip_serializing_if = "is_false")]
+    pub within_cwd: bool,
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandResourceProfileRootAccess {
+    Read,
+    #[default]
+    ReadWrite,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ShellCompression {
@@ -3127,14 +3216,31 @@ mod tests {
     }
 
     #[test]
-    fn command_resource_profiles_round_trip_rust_toolchain_wrappers() {
+    fn command_resource_profiles_round_trip_generic_shape_and_unknowns() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.json");
         std::fs::write(
             &path,
             r#"{
                 "commandResourceProfiles": {
-                    "rustToolchain": ["just test", "make check"]
+                    "profiles": {
+                        "terraform_toolchain": {
+                            "commands": ["terraform", "tofu"],
+                            "roots": [
+                                { "kind": "terraform_plugin_cache", "env": "TF_PLUGIN_CACHE_DIR", "access": "read_write", "futureRoot": true }
+                            ],
+                            "futureProfile": { "preserve": true }
+                        }
+                    },
+                    "wrappers": {
+                        "just ci": ["rust_toolchain", "node_package_manager"],
+                        "just infra-plan": ["terraform_toolchain"]
+                    },
+                    "enabled": {
+                        "rust_toolchain": false,
+                        "future_profile": true
+                    },
+                    "futureTop": { "keep": true }
                 },
                 "future_key": true
             }"#,
@@ -3144,27 +3250,75 @@ mod tests {
         let mut doc = ExtendedConfigDoc::load(&path).unwrap();
         let mut cfg = doc.config();
         assert_eq!(
-            cfg.command_resource_profiles.rust_toolchain,
-            vec!["just test".to_string(), "make check".to_string()]
+            cfg.command_resource_profiles.wrappers["just ci"],
+            vec![
+                "rust_toolchain".to_string(),
+                "node_package_manager".to_string()
+            ]
+        );
+        assert_eq!(
+            cfg.command_resource_profiles.profiles["terraform_toolchain"].commands,
+            vec!["terraform".to_string(), "tofu".to_string()]
+        );
+        assert!(
+            !cfg.command_resource_profiles
+                .profile_enabled("rust_toolchain")
+        );
+        assert!(
+            cfg.command_resource_profiles
+                .profile_enabled("node_package_manager")
         );
 
         cfg.command_resource_profiles
-            .rust_toolchain
-            .push("./scripts/ci".to_string());
+            .wrappers
+            .insert("make check".to_string(), vec!["go_toolchain".to_string()]);
         doc.write(&cfg).unwrap();
 
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["future_key"], true);
+        assert_eq!(raw["commandResourceProfiles"]["futureTop"]["keep"], true);
         assert_eq!(
-            raw["commandResourceProfiles"]["rustToolchain"][2],
-            "./scripts/ci"
+            raw["commandResourceProfiles"]["profiles"]["terraform_toolchain"]["futureProfile"]["preserve"],
+            true
+        );
+        assert_eq!(
+            raw["commandResourceProfiles"]["profiles"]["terraform_toolchain"]["roots"][0]["futureRoot"],
+            true
+        );
+        assert_eq!(
+            raw["commandResourceProfiles"]["wrappers"]["make check"][0],
+            "go_toolchain"
         );
         let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+        assert_eq!(
+            reloaded.command_resource_profiles.wrappers["just infra-plan"],
+            vec!["terraform_toolchain".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_resource_profiles_reject_legacy_rust_toolchain_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "commandResourceProfiles": {
+                    "rustToolchain": ["just test"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (_cfg, warnings) = ExtendedConfigDoc::load(&path)
+            .unwrap()
+            .config_with_warnings();
+
         assert!(
-            reloaded
-                .command_resource_profiles
-                .rust_toolchain
-                .contains(&"./scripts/ci".to_string())
+            warnings
+                .iter()
+                .any(|warning| warning.contains("commandResourceProfiles")),
+            "{warnings:?}"
         );
     }
 

@@ -249,15 +249,17 @@ impl Tool for BashTool {
         let scrub = scrub_overrides(&session_env);
         let command_classification = crate::approval::classify::classify(command);
         let extended_config = crate::config::extended::load_for_cwd(&cwd);
-        let rust_profile_config = extended_config
-            .command_resource_profiles
-            .rust_toolchain
-            .clone();
-        let rust_toolchain_plan = crate::tools::rust_toolchain::plan_for_command(
+        let profile_introspector =
+            crate::tools::command_resource_profiles::ProductionProfileIntrospector::new(
+                true,
+                tmp_dir.clone(),
+            );
+        let command_resource_plan = crate::tools::command_resource_profiles::plan_for_command(
             command_classification.simple_commands(),
             &cwd,
             &session_env,
-            &rust_profile_config,
+            &extended_config.command_resource_profiles,
+            &profile_introspector,
         );
 
         // Resolve the gating decision. When confinement is actually on the
@@ -301,7 +303,7 @@ impl Tool for BashTool {
                 // band so the engine raises the deterministic user-facing
                 // indicator (§6.5). Never enters the model-facing body above.
                 unavailable_reason: Some(reason.clone()),
-                resource_profiles: rust_toolchain_plan.meta.clone().into_iter().collect(),
+                resource_profiles: command_resource_plan.metas.clone(),
             };
             return Ok(ToolOutput::text(format!(
                 "Error: the shell sandbox cannot start here ({reason}); `bash` will fail for the rest of the session until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
@@ -326,18 +328,18 @@ impl Tool for BashTool {
             // Not the refuse path — the sandbox initialized (or was off /
             // broad-granted), so there's no unavailable remedy to surface.
             unavailable_reason: None,
-            resource_profiles: rust_toolchain_plan.meta.clone().into_iter().collect(),
+            resource_profiles: command_resource_plan.metas.clone(),
         };
 
-        if confine && !rust_toolchain_plan.invalid_roots.is_empty() {
-            let issues = rust_toolchain_plan
+        if confine && !command_resource_plan.invalid_roots.is_empty() {
+            let issues = command_resource_plan
                 .invalid_roots
                 .iter()
                 .map(|issue| issue.render())
                 .collect::<Vec<_>>()
                 .join("; ");
             return Ok(ToolOutput::text(format!(
-                "Error: rust_toolchain sandbox profile cannot expose configured toolchain roots ({issues}). Fix the root environment variables or use a broad command approval so the command runs without shell confinement."
+                "Error: command resource profiles cannot expose configured toolchain roots ({issues}). Fix the root environment variables/profile config or use a broad command approval so the command runs without shell confinement."
             ))
             .with_sandbox(meta));
         }
@@ -363,7 +365,7 @@ impl Tool for BashTool {
             tmp_dir.as_deref(),
             &scrub,
             &session_env,
-            &rust_toolchain_plan.allow_paths,
+            &command_resource_plan.allow_paths,
             ctx,
             timeout_ms,
         )
@@ -378,13 +380,19 @@ impl Tool for BashTool {
             RunOutcome::TimedOut => {
                 return Ok(ToolOutput::truncated_text(format!(
                     "Error: timeout after {timeout_ms} ms{}",
-                    resource_profile_context(&rust_toolchain_plan)
+                    crate::tools::command_resource_profiles::resource_profile_context(
+                        &command_resource_plan
+                    )
                 ))
                 .with_bash_meta(meta, &resource_meta));
             }
             RunOutcome::SpawnError(e) => {
                 let mut message = render_spawn_error(&prefixed, &cwd, &e);
-                message.push_str(&resource_profile_context(&rust_toolchain_plan));
+                message.push_str(
+                    &crate::tools::command_resource_profiles::resource_profile_context(
+                        &command_resource_plan,
+                    ),
+                );
                 return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
             }
             RunOutcome::WaitError(e) => {
@@ -425,7 +433,7 @@ impl Tool for BashTool {
                     tmp_dir.as_deref(),
                     &scrub,
                     &session_env,
-                    &rust_toolchain_plan.allow_paths,
+                    &command_resource_plan.allow_paths,
                     ctx,
                     timeout_ms,
                 )
@@ -439,13 +447,21 @@ impl Tool for BashTool {
                     }
                     RunOutcome::TimedOut => {
                         return Ok(ToolOutput::truncated_text(format!(
-                            "Error: timeout after {timeout_ms} ms"
+                            "Error: timeout after {timeout_ms} ms{}",
+                            crate::tools::command_resource_profiles::resource_profile_context(
+                                &command_resource_plan
+                            )
                         ))
                         .with_bash_meta(meta, &resource_meta));
                     }
                     RunOutcome::SpawnError(e) => {
-                        return Ok(ToolOutput::text(render_spawn_error(&prefixed, &cwd, &e))
-                            .with_bash_meta(meta, &resource_meta));
+                        let mut message = render_spawn_error(&prefixed, &cwd, &e);
+                        message.push_str(
+                            &crate::tools::command_resource_profiles::resource_profile_context(
+                                &command_resource_plan,
+                            ),
+                        );
+                        return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
                     }
                     RunOutcome::WaitError(e) => {
                         return Ok(ToolOutput::text(format!(
@@ -456,6 +472,14 @@ impl Tool for BashTool {
                     RunOutcome::Done(o) => final_outcome = o,
                 }
             }
+        }
+
+        if confine
+            && !final_outcome.success
+            && let Some(hint) = command_resource_plan.unsupported_hint()
+        {
+            final_outcome.stderr.extend_from_slice(hint.as_bytes());
+            final_outcome.stderr.push(b'\n');
         }
 
         // Native shell-output compression (implementation note):
@@ -1130,42 +1154,6 @@ fn render_spawn_error(command: &str, cwd: &Path, error: &std::io::Error) -> Stri
         Some(&error.to_string()),
         missing,
     ));
-    out
-}
-
-fn resource_profile_context(plan: &crate::tools::rust_toolchain::RustToolchainPlan) -> String {
-    if !plan.detected {
-        return String::new();
-    }
-    let roots = plan
-        .allow_paths
-        .iter()
-        .map(|path| {
-            format!(
-                "{}:{}:{}",
-                path.kind,
-                path.access.as_str(),
-                path.path.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let denied = plan
-        .invalid_roots
-        .iter()
-        .map(|issue| issue.render())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let mut out = format!(
-        "\nrust_toolchain profile: matched [{}]",
-        plan.matched_commands.join(", ")
-    );
-    if !roots.is_empty() {
-        out.push_str(&format!("; roots [{roots}]"));
-    }
-    if !denied.is_empty() {
-        out.push_str(&format!("; denied [{denied}]"));
-    }
     out
 }
 

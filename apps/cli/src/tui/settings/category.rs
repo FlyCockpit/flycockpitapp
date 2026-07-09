@@ -24,6 +24,8 @@
 //! hardcoded list, so a grown cast (e.g. a `Swarm` primary) is reflected
 //! automatically.
 
+use std::collections::BTreeMap;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -35,6 +37,9 @@ use crate::config::extended::{
     ApprovalMode, Concurrency, DefaultPrimaryAgent, DiffStyle, InjectionResultAction,
     InjectionThreshold, LlmMode, PredictNextMessage, ShellCompression, TextEmbeddedRecovery,
     ThinkingDisplay, TuiConfig, VimModeSetting,
+};
+use crate::tools::command_resource_profiles::{
+    GO_TOOLCHAIN, JAVA_TOOLCHAIN, NODE_PACKAGE_MANAGER, PYTHON_TOOLCHAIN, RUST_TOOLCHAIN,
 };
 use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, suggest_dirs};
 use crate::tui::textfield::TextField;
@@ -319,6 +324,13 @@ pub(super) enum SettingId {
     ApprovalMode,
     PredictNextMessage,
     ShellCompression,
+    CommandProfileRust,
+    CommandProfileNode,
+    CommandProfilePython,
+    CommandProfileGo,
+    CommandProfileJava,
+    CommandProfileWrappers,
+    CommandProfileCustomProfiles,
     InlineThink,
     HintToolCallCorrections,
     TextEmbeddedRecovery,
@@ -418,6 +430,13 @@ impl SettingId {
             SettingId::ApprovalMode => "approval mode",
             SettingId::PredictNextMessage => "predict next message",
             SettingId::ShellCompression => "shell compression",
+            SettingId::CommandProfileRust => "Rust resource profile",
+            SettingId::CommandProfileNode => "Node resource profile",
+            SettingId::CommandProfilePython => "Python resource profile",
+            SettingId::CommandProfileGo => "Go resource profile",
+            SettingId::CommandProfileJava => "Java resource profile",
+            SettingId::CommandProfileWrappers => "resource profile wrappers",
+            SettingId::CommandProfileCustomProfiles => "custom resource profiles",
             SettingId::InlineThink => "extract inline <think>",
             SettingId::HintToolCallCorrections => "hint tool-call corrections",
             SettingId::TextEmbeddedRecovery => "text-embedded recovery",
@@ -614,6 +633,38 @@ impl SettingId {
                  context to save tokens. `enabled` (default) strips noise with a \
                  per-command strategy — errors, warnings, failures and diagnostics \
                  are always kept; `disabled` returns bash output verbatim."
+            }
+            SettingId::CommandProfileRust => {
+                "Allow sandboxed Rust commands to reach Cargo/Rustup homes, binary \
+                 directories, and Cargo config files without a broad approval. On by \
+                 default; wrappers can also opt commands into this profile."
+            }
+            SettingId::CommandProfileNode => {
+                "Allow sandboxed Node package-manager commands to reach package-manager \
+                 caches such as npm, pnpm, yarn, bun, and corepack. On by default."
+            }
+            SettingId::CommandProfilePython => {
+                "Allow sandboxed Python tooling to reach pip/uv/poetry/mypy caches and \
+                 an external active virtualenv when present. On by default."
+            }
+            SettingId::CommandProfileGo => {
+                "Allow sandboxed Go tooling to reach GOPATH, module cache, and build \
+                 cache roots. On by default; Go cache discovery may run a trusted \
+                 `go env` introspection."
+            }
+            SettingId::CommandProfileJava => {
+                "Allow sandboxed Java tooling to reach Maven and Gradle user caches. \
+                 On by default."
+            }
+            SettingId::CommandProfileWrappers => {
+                "JSON object mapping wrapper approval keys to profile ids. For example, \
+                 `just ci` can map to `rust_toolchain` and `node_package_manager` so a \
+                 wrapper command gets the same scoped cache access as the tools it runs."
+            }
+            SettingId::CommandProfileCustomProfiles => {
+                "JSON object defining additional command resource profiles. Each key is \
+                 a profile id; each value declares `commands` and `roots` so sandboxed \
+                 commands can expose only the required external caches or tool state."
             }
             SettingId::InlineThink => {
                 "Classify a leading inline `<think>…</think>` block. On (default) \
@@ -918,6 +969,8 @@ impl SettingId {
             | SettingId::GitignoreAllow => ActionKind::Drill,
             // Inline text/number edits.
             SettingId::ExitTailLines
+            | SettingId::CommandProfileWrappers
+            | SettingId::CommandProfileCustomProfiles
             | SettingId::LoopGuardThreshold
             | SettingId::MaxPrimaryRounds
             | SettingId::ScheduleMaxConcurrent
@@ -1102,6 +1155,17 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ApprovalMode),
             Setting(S::PredictNextMessage),
             Setting(S::ShellCompression),
+            Heading {
+                title: "Command resource profiles",
+                blurb: "Scoped cache/toolchain access for sandboxed developer commands.",
+            },
+            Setting(S::CommandProfileRust),
+            Setting(S::CommandProfileNode),
+            Setting(S::CommandProfilePython),
+            Setting(S::CommandProfileGo),
+            Setting(S::CommandProfileJava),
+            Setting(S::CommandProfileWrappers),
+            Setting(S::CommandProfileCustomProfiles),
             Setting(S::InlineThink),
             Setting(S::HintToolCallCorrections),
             Setting(S::TextEmbeddedRecovery),
@@ -1269,6 +1333,30 @@ impl SettingsDialog {
             S::ApprovalMode => approval_mode_label(e.default_approval_mode).to_string(),
             S::PredictNextMessage => predict_next_message_label(e.predict_next_message).to_string(),
             S::ShellCompression => shell_compression_label(e.shell_compression).to_string(),
+            S::CommandProfileRust => command_profile_enabled_value(
+                e.command_resource_profiles.profile_enabled(RUST_TOOLCHAIN),
+            ),
+            S::CommandProfileNode => command_profile_enabled_value(
+                e.command_resource_profiles
+                    .profile_enabled(NODE_PACKAGE_MANAGER),
+            ),
+            S::CommandProfilePython => command_profile_enabled_value(
+                e.command_resource_profiles
+                    .profile_enabled(PYTHON_TOOLCHAIN),
+            ),
+            S::CommandProfileGo => command_profile_enabled_value(
+                e.command_resource_profiles.profile_enabled(GO_TOOLCHAIN),
+            ),
+            S::CommandProfileJava => command_profile_enabled_value(
+                e.command_resource_profiles.profile_enabled(JAVA_TOOLCHAIN),
+            ),
+            S::CommandProfileWrappers => map_summary(
+                e.command_resource_profiles.wrappers.len(),
+                "wrapper mapping",
+            ),
+            S::CommandProfileCustomProfiles => {
+                map_summary(e.command_resource_profiles.profiles.len(), "custom profile")
+            }
             S::InlineThink => on_off(
                 e.inline_think,
                 "on (default — <think> is thinking: chip, dropped later)",
@@ -1493,6 +1581,39 @@ fn lang_value(s: &str) -> String {
     }
 }
 
+fn command_profile_enabled_value(enabled: bool) -> String {
+    on_off(enabled, "on (default — scoped cache access)", "off")
+}
+
+fn map_summary(len: usize, singular: &str) -> String {
+    match len {
+        0 => "(none)".to_string(),
+        1 => format!("1 {singular}"),
+        n => format!("{n} {singular}s"),
+    }
+}
+
+fn pretty_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn parse_json_map<T>(raw: &str, label: &str) -> Result<BTreeMap<String, T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(raw).map_err(|e| format!("invalid JSON for {label}: {e}"))
+}
+
+fn toggle_command_profile(e: &mut crate::config::extended::ExtendedConfig, id: &str) {
+    let next = !e.command_resource_profiles.profile_enabled(id);
+    e.command_resource_profiles
+        .enabled
+        .insert(id.to_string(), next);
+}
+
 // ── Key handling ─────────────────────────────────────────────────────────
 
 impl SettingsDialog {
@@ -1706,6 +1827,11 @@ impl SettingsDialog {
             S::ApprovalMode => e.default_approval_mode = e.default_approval_mode.cycled(),
             S::PredictNextMessage => e.predict_next_message = e.predict_next_message.cycled(),
             S::ShellCompression => e.shell_compression = e.shell_compression.toggled(),
+            S::CommandProfileRust => toggle_command_profile(e, RUST_TOOLCHAIN),
+            S::CommandProfileNode => toggle_command_profile(e, NODE_PACKAGE_MANAGER),
+            S::CommandProfilePython => toggle_command_profile(e, PYTHON_TOOLCHAIN),
+            S::CommandProfileGo => toggle_command_profile(e, GO_TOOLCHAIN),
+            S::CommandProfileJava => toggle_command_profile(e, JAVA_TOOLCHAIN),
             S::InlineThink => e.inline_think = !e.inline_think,
             S::HintToolCallCorrections => {
                 e.hint_tool_call_corrections = !e.hint_tool_call_corrections
@@ -1751,6 +1877,8 @@ impl SettingsDialog {
             S::SwarmMaxConcurrency => e.swarm.max_concurrency.to_string(),
             S::DialogLockoutMs => e.dialog.lockout_ms.to_string(),
             S::TimeInjectionInterval => e.system_prompt.time_injection_interval_minutes.to_string(),
+            S::CommandProfileWrappers => pretty_json(&e.command_resource_profiles.wrappers),
+            S::CommandProfileCustomProfiles => pretty_json(&e.command_resource_profiles.profiles),
             S::PackagesDir => e
                 .packages_directory
                 .as_ref()
@@ -1826,6 +1954,14 @@ impl SettingsDialog {
             S::TimeInjectionInterval => {
                 let v = parse_min_u32(trimmed, 0)?;
                 self.extended.system_prompt.time_injection_interval_minutes = v;
+            }
+            S::CommandProfileWrappers => {
+                self.extended.command_resource_profiles.wrappers =
+                    parse_json_map(trimmed, "wrappers")?;
+            }
+            S::CommandProfileCustomProfiles => {
+                self.extended.command_resource_profiles.profiles =
+                    parse_json_map(trimmed, "profiles")?;
             }
             S::PackagesDir => {
                 self.extended.packages_directory = if trimmed.is_empty() {
@@ -2052,6 +2188,7 @@ impl SettingsDialog {
                 e.inline_think = d.inline_think;
                 e.hint_tool_call_corrections = d.hint_tool_call_corrections;
                 e.text_embedded_recovery = d.text_embedded_recovery;
+                e.command_resource_profiles = d.command_resource_profiles;
                 e.deepthink = d.deepthink;
                 e.loop_guard = d.loop_guard;
                 e.max_primary_rounds = d.max_primary_rounds;
@@ -2272,6 +2409,13 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::DefaultPrimaryAgent => &["defaultPrimaryAgent"],
         S::PredictNextMessage => &["predictNextMessage"],
         S::ShellCompression => &["shellCompression"],
+        S::CommandProfileRust => &["commandResourceProfiles", "enabled", "rust_toolchain"],
+        S::CommandProfileNode => &["commandResourceProfiles", "enabled", "node_package_manager"],
+        S::CommandProfilePython => &["commandResourceProfiles", "enabled", "python_toolchain"],
+        S::CommandProfileGo => &["commandResourceProfiles", "enabled", "go_toolchain"],
+        S::CommandProfileJava => &["commandResourceProfiles", "enabled", "java_toolchain"],
+        S::CommandProfileWrappers => &["commandResourceProfiles", "wrappers"],
+        S::CommandProfileCustomProfiles => &["commandResourceProfiles", "profiles"],
         S::InlineThink => &["inlineThink"],
         S::HintToolCallCorrections => &["hintToolCallCorrections"],
         S::TextEmbeddedRecovery => &["textEmbeddedRecovery"],

@@ -223,8 +223,14 @@ pub struct SandboxMeta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxResourceProfileMeta {
     pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_wrappers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub introspection: Vec<SandboxResourceIntrospectionMeta>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<SandboxResourceRootMeta>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -236,6 +242,21 @@ pub struct SandboxResourceRootMeta {
     pub kind: String,
     pub path: String,
     pub access: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributing_profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxResourceIntrospectionMeta {
+    pub tool: String,
+    pub command: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,11 +747,22 @@ mod sandbox_meta_tests {
             unavailable_reason: None,
             resource_profiles: vec![SandboxResourceProfileMeta {
                 profile: "rust_toolchain".to_string(),
+                definition_source: Some("builtin".to_string()),
                 matched_commands: vec!["cargo test".to_string()],
+                configured_wrappers: vec!["just test".to_string()],
+                introspection: vec![SandboxResourceIntrospectionMeta {
+                    tool: "go".to_string(),
+                    command: "go env GOMODCACHE GOCACHE".to_string(),
+                    status: "used".to_string(),
+                    detail: None,
+                }],
                 roots: vec![SandboxResourceRootMeta {
                     kind: "cargo_home".to_string(),
                     path: "/home/me/.cargo".to_string(),
                     access: "read_write".to_string(),
+                    source: Some("session_env".to_string()),
+                    reason: None,
+                    contributing_profiles: vec!["rust_toolchain".to_string()],
                 }],
                 denied_roots: Vec::new(),
             }],
@@ -743,6 +775,23 @@ mod sandbox_meta_tests {
             "cargo test"
         );
         assert_eq!(v["resource_profiles"][0]["roots"][0]["kind"], "cargo_home");
+        assert_eq!(v["resource_profiles"][0]["definition_source"], "builtin");
+        assert_eq!(
+            v["resource_profiles"][0]["configured_wrappers"][0],
+            "just test"
+        );
+        assert_eq!(
+            v["resource_profiles"][0]["roots"][0]["source"],
+            "session_env"
+        );
+        assert_eq!(
+            v["resource_profiles"][0]["roots"][0]["contributing_profiles"][0],
+            "rust_toolchain"
+        );
+        assert_eq!(
+            v["resource_profiles"][0]["introspection"][0]["status"],
+            "used"
+        );
     }
 }
 

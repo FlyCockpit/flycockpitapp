@@ -18,6 +18,7 @@
 //! - [`todo`] / [`todo_read`] — durable task-backed todo state.
 
 pub mod bash;
+pub mod command_resource_profiles;
 pub mod custom;
 pub mod defer;
 pub mod delegation_payload_retrieve;
@@ -36,7 +37,6 @@ pub mod question;
 pub mod read;
 pub mod readlock;
 pub mod return_tool;
-pub mod rust_toolchain;
 pub mod sandbox;
 pub mod schedule;
 pub mod seed;

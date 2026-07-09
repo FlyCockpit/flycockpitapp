@@ -1626,11 +1626,12 @@ impl SettingsDialog {
                     message = "provider has no /models endpoint (skipped)".to_string();
                 }
                 Err(e) => {
+                    let reason = redact_model_fetch_reason(e.as_str());
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
-                        entry.mark_model_fetch_failed_kept_existing(e.to_string());
+                        entry.mark_model_fetch_failed_kept_existing(reason.clone());
                     }
                     let _ = self.save_config();
-                    message = format!("fetch failed: {e}");
+                    message = format!("fetch failed: {reason}");
                 }
                 Ok(FetchOutcome::Models { .. }) | Ok(FetchOutcome::FallbackAvailable { .. }) => {
                     unreachable!()
@@ -2468,7 +2469,8 @@ impl SettingsDialog {
                         // Hand off to the provider-settings sub-page, moving
                         // the EditState out so it returns intact on back
                         // (mirrors the Headers/Models rows).
-                        let settings = SettingsEditor::for_provider(&s.provider_id, &s.entry);
+                        let settings = SettingsEditor::for_provider(&s.provider_id, &s.entry)
+                            .with_trust_confirm_lockout_ms(self.extended.dialog.lockout_ms);
                         let owned = std::mem::replace(
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
@@ -2637,7 +2639,8 @@ impl SettingsDialog {
                 let mut seed_entry = parent.entry.clone();
                 seed_entry.models = editor.rows.clone();
                 let settings =
-                    SettingsEditor::for_model(&parent.provider_id, &seed_entry, &model_id);
+                    SettingsEditor::for_model(&parent.provider_id, &seed_entry, &model_id)
+                        .with_trust_confirm_lockout_ms(self.extended.dialog.lockout_ms);
                 let models = Box::new(std::mem::replace(
                     editor,
                     ModelEditor::new(None, Vec::new()),
@@ -5158,6 +5161,39 @@ mod tests {
 
     fn option_row_count(rendered: &str) -> usize {
         rendered.lines().filter(|line| line.contains('[')).count()
+    }
+
+    #[test]
+    fn single_fetch_error_is_redacted_in_status_and_saved_state() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "p".into(),
+            provider_with_models(vec![model("existing", true)]),
+        );
+        let (_tmp, mut dialog) = dialog_with_config(cfg);
+        let entry = dialog.config.providers["p"].clone();
+        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        dialog.apply_fetch_result(
+            "p",
+            Err(format!("fetch failed with Authorization: Bearer {secret}")),
+        );
+
+        let status = match &dialog.page {
+            Page::Providers(ProvidersPage::Edit(s)) => s.status.as_deref().unwrap_or(""),
+            other => panic!("expected Edit page, got {other:?}"),
+        };
+        assert!(!status.contains(secret), "status leaked secret: {status}");
+        let reason = dialog.config.providers["p"]
+            .last_model_fetch
+            .as_ref()
+            .and_then(|status| status.reason.as_deref())
+            .unwrap_or("");
+        assert!(
+            !reason.contains(secret),
+            "saved reason leaked secret: {reason}"
+        );
     }
 
     #[test]

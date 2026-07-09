@@ -70,7 +70,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
     let extended = crate::config::extended::load_for_cwd(&input.cwd);
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
-    let trust_mode = workspace_trust_mode(&input.cwd)?;
+    let trust_mode = workspace_trust_mode(&input.cwd);
     let trust_resolved = trust_mode != "unresolved";
     let container = crate::container::availability_snapshot();
     let container_reason = container
@@ -142,13 +142,15 @@ fn session_label(id: Option<uuid::Uuid>, short_id: Option<&str>) -> String {
     }
 }
 
-fn workspace_trust_mode(cwd: &Path) -> Result<String> {
-    let db = crate::db::Db::open_default()?;
-    let mode = db
-        .workspace_trust_for_path(cwd)?
+fn workspace_trust_mode(cwd: &Path) -> String {
+    let Ok(db) = crate::db::Db::open_default() else {
+        return "unresolved".to_string();
+    };
+    db.workspace_trust_for_path(cwd)
+        .ok()
+        .flatten()
         .map(|decision| decision.mode.as_str().to_string())
-        .unwrap_or_else(|| "unresolved".to_string());
-    Ok(mode)
+        .unwrap_or_else(|| "unresolved".to_string())
 }
 
 fn provider_lines(

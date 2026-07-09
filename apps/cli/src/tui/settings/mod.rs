@@ -58,11 +58,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::config::dirs::{
-    ConfigDir, ConfigDirKind, creatable_config_dirs, cwd_scoped_creatable_dirs,
+    CONFIG_FILE, ConfigDir, ConfigDirKind, creatable_config_dirs, cwd_scoped_creatable_dirs,
     discover_config_dirs, scaffold_config_dir,
 };
 use crate::config::extended::{ExtendedConfig, ExtendedConfigDoc};
-use crate::config::providers::{ConfigDoc, OnUnlistedModelsFetch, ProvidersConfig};
+use crate::config::providers::{ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
 use crate::daemon::proto::{LspControlAction, Request};
 use crate::providers::models_fetch::FetchOutcome;
 use crate::tui::textfield::TextField;
@@ -119,6 +119,9 @@ pub struct SettingsDialog {
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
+    /// Snapshot loaded when the dialog opened or last saved. Used to merge only
+    /// keys this dialog changed over a fresh disk read.
+    original_config: ProvidersConfig,
     /// Cached cockpit-only `config.json` state. Read by the UI page and the
     /// Tools page; written back on each edit.
     pub(super) extended: ExtendedConfig,
@@ -343,7 +346,7 @@ impl Dialog {
         if let Dialog::PickConfig { dirs, .. } = &d
             && let Some(dir) = dirs.first()
         {
-            let path = dir.path.join("config.json");
+            let path = dir.path.join(CONFIG_FILE);
             d = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
                 path,
                 cwd.to_path_buf(),
@@ -365,7 +368,7 @@ impl Dialog {
         if let Dialog::PickConfig { dirs, .. } = &d
             && let Some(dir) = dirs.first()
         {
-            let path = dir.path.join("config.json");
+            let path = dir.path.join(CONFIG_FILE);
             let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
             s.enter_model_settings();
             d = Dialog::Settings(Box::new(s));
@@ -414,7 +417,7 @@ impl Dialog {
         if let Dialog::PickConfig { dirs, .. } = &d
             && let Some(dir) = dirs.first()
         {
-            let path = dir.path.join("config.json");
+            let path = dir.path.join(CONFIG_FILE);
             let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
             s.page = Page::Providers(ProvidersPage::Add(AddState::new()));
             d = Dialog::Settings(Box::new(s));
@@ -522,7 +525,7 @@ impl Dialog {
                     ListAction::Stay => false,
                     ListAction::Close => true,
                     ListAction::Select(idx) => {
-                        let chosen = dirs[idx].path.join("config.json");
+                        let chosen = dirs[idx].path.join(CONFIG_FILE);
                         let cwd = cwd.clone();
                         *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
                             chosen, cwd,
@@ -734,6 +737,7 @@ impl SettingsDialog {
             config_path,
             extended_path,
             page: Page::Root { cursor: 0 },
+            original_config: config.clone(),
             config,
             extended,
             extended_warnings,
@@ -796,15 +800,13 @@ impl SettingsDialog {
         self.page = Page::Providers(providers::active_model_settings_page(&self.config));
     }
 
-    fn reload_config(&mut self) {
-        if let Ok(doc) = ConfigDoc::load(&self.config_path) {
-            self.config = doc.providers();
-        }
-    }
-
     fn save_config(&mut self) -> Result<(), String> {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
-        doc.write(&self.config).map_err(|e| e.to_string())?;
+        let mut merged = doc.providers();
+        merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        doc.write(&merged).map_err(|e| e.to_string())?;
+        self.config = merged.clone();
+        self.original_config = merged;
         Ok(())
     }
 
@@ -2020,6 +2022,41 @@ fn project_root_for_project_config(config_path: &Path) -> Option<PathBuf> {
     config_dir.parent().map(PathBuf::from)
 }
 
+fn merge_dialog_provider_config(
+    disk: &mut ProvidersConfig,
+    original: &ProvidersConfig,
+    current: &ProvidersConfig,
+) {
+    if current.active_model != original.active_model {
+        disk.active_model = current.active_model.clone();
+    }
+    if current.category_defaults != original.category_defaults {
+        disk.category_defaults = current.category_defaults.clone();
+    }
+    if current.on_unlisted_models_fetch != original.on_unlisted_models_fetch {
+        disk.on_unlisted_models_fetch = current.on_unlisted_models_fetch;
+    }
+
+    for provider_id in original.providers.keys() {
+        if !current.providers.contains_key(provider_id) {
+            disk.providers.remove(provider_id);
+        }
+    }
+    for (provider_id, entry) in &current.providers {
+        let original_entry = original.providers.get(provider_id);
+        if original_entry.is_none_or(|old| !provider_entries_equal(old, entry)) {
+            disk.providers.insert(provider_id.clone(), entry.clone());
+        }
+    }
+}
+
+fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 enum ListAction {
     Stay,
     Close,
@@ -3147,6 +3184,37 @@ mod tests {
         let mut d = SettingsDialog::open(path);
         d.enter_providers();
         d
+    }
+
+    #[test]
+    fn save_config_preserves_untouched_provider_file_disk_edits() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        write_provider_file(
+            &d.config_path,
+            "vendor",
+            r#"{"url":"https://out-of-band","headers":[]}"#,
+        );
+
+        d.config.active_model = Some(crate::config::providers::ActiveModelRef {
+            provider: "vendor".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        });
+        d.save_config().unwrap();
+
+        let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+            .unwrap()
+            .providers();
+        assert_eq!(reloaded.providers["vendor"].url, "https://out-of-band");
+        assert_eq!(
+            reloaded
+                .active_model
+                .as_ref()
+                .map(|active| active.model.as_str()),
+            Some("m1")
+        );
     }
 
     #[test]
@@ -5221,6 +5289,24 @@ mod tests {
             Page::Tools(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
             other => panic!("expected Tools, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tools_page_documents_cleared_builtin_description_inherits_default() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_tools_from_root(&mut d);
+        let p = match &d.page {
+            Page::Tools(p) => p,
+            other => panic!("expected Tools, got {other:?}"),
+        };
+        let rendered = d
+            .build_tools_page_lines(80, p)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Clearing a built-in tool description inherits the default."));
     }
 
     #[test]

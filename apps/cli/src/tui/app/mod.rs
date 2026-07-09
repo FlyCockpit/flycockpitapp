@@ -7271,12 +7271,19 @@ impl App {
                     });
                     return;
                 }
-                self.update_tool_state(
+                if !self.update_tool_state(
                     &call_id,
                     ToolCallState::Success,
-                    Some((output, truncated)),
+                    Some((output.clone(), truncated)),
                     hint,
-                );
+                ) {
+                    self.history.push(HistoryEntry::ToolLine {
+                        call_id,
+                        tool,
+                        summary: agent_runner::first_line(&output, 200),
+                        state: ToolCallState::Success,
+                    });
+                }
             }
             TurnEvent::ResourceWait {
                 display_id,
@@ -9122,11 +9129,11 @@ impl App {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             return;
         };
-        let name = runner.active_agent.lock().unwrap().clone();
+        let name = crate::sync::lock_or_recover(&runner.active_agent).clone();
         if name != self.launch.agent_name {
             self.launch.agent_name = name;
         }
-        let path = runner.active_agent_path.lock().unwrap().clone();
+        let path = crate::sync::lock_or_recover(&runner.active_agent_path).clone();
         if !path.is_empty() && path != self.agent_path {
             self.agent_path = path;
         }
@@ -15419,6 +15426,28 @@ mod keys_overlay_tests {
             app.composer.text().is_empty(),
             "no key leaked into the composer"
         );
+    }
+
+    #[test]
+    fn orphan_tool_end_renders_standalone_success_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.apply_event(crate::engine::agent::TurnEvent::ToolEnd {
+            agent: "Build".into(),
+            call_id: "orphan-call".into(),
+            tool: "read".into(),
+            output: "orphan result\nsecond line".into(),
+            truncated: false,
+            hint: None,
+        });
+
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::ToolLine { call_id, summary, state, .. })
+                if call_id == "orphan-call"
+                    && summary == "orphan result"
+                    && *state == crate::tui::history::ToolCallState::Success
+        ));
     }
 
     /// Esc and `q` close the overlay while it is open.

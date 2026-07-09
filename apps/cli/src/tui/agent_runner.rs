@@ -353,9 +353,7 @@ fn try_spawn_inner(
                 let refs = match upload_submission_images(&client, &sub.images).await {
                     Ok(refs) => refs,
                     Err(error) => {
-                        events
-                            .lock()
-                            .unwrap()
+                        crate::sync::lock_or_recover(&events)
                             .push(TurnEvent::UserMessageDispatchFailed { error });
                         continue;
                     }
@@ -378,19 +376,16 @@ fn try_spawn_inner(
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        events
-                            .lock()
-                            .unwrap()
+                        crate::sync::lock_or_recover(&events)
                             .push(TurnEvent::UserMessageDispatchFailed { error: e.message });
                     }
                     Err(e) => {
                         tracing::warn!(error = ?e, "send_user_message transport failed");
-                        events
-                            .lock()
-                            .unwrap()
-                            .push(TurnEvent::UserMessageDispatchFailed {
+                        crate::sync::lock_or_recover(&events).push(
+                            TurnEvent::UserMessageDispatchFailed {
                                 error: e.to_string(),
-                            });
+                            },
+                        );
                         break;
                     }
                 }

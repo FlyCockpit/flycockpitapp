@@ -651,6 +651,11 @@ impl SettingsDialog {
             p.reset
                 .render_line(p.cursor == reset_row, "reset to defaults"),
         );
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Clearing a built-in tool description inherits the default.".to_string(),
+            muted,
+        )));
 
         if let Some(field) = p.editing {
             let label = match field {

@@ -50,7 +50,9 @@
 //! disk and stays; Back (`Esc`/`h`/`←`) writes the working state into the parent
 //! [`EditState`]'s entry and auto-commits it (no edit is ever dropped).
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::config::extended::LlmMode;
 use crate::config::providers::{
@@ -320,6 +322,8 @@ pub(super) struct SettingsEditor {
     cost_rank: Option<i64>,
     subagent_invokable: Option<bool>,
     provider_trust_confirm_pending: bool,
+    provider_trust_confirm_ready_at: Option<Instant>,
+    provider_trust_confirm_lockout: Duration,
     /// Per-group "is this overridden on the model" flags. Always true for
     /// provider scope (the values are concrete). `mode` tracks override via
     /// `mode.is_some()` directly, so it has no flag here.
@@ -377,6 +381,8 @@ impl SettingsEditor {
             cost_rank: entry.cost_rank,
             subagent_invokable: entry.subagent_invokable,
             provider_trust_confirm_pending: false,
+            provider_trust_confirm_ready_at: None,
+            provider_trust_confirm_lockout: Duration::ZERO,
             context_present: true,
             cache_present: true,
             shrink_present: true,
@@ -388,6 +394,11 @@ impl SettingsEditor {
             buf: TextField::default(),
             status: None,
         }
+    }
+
+    pub(super) fn with_trust_confirm_lockout_ms(mut self, lockout_ms: u64) -> Self {
+        self.provider_trust_confirm_lockout = Duration::from_millis(lockout_ms);
+        self
     }
 
     /// Build the editor for a single model's overrides. Working values are
@@ -453,6 +464,8 @@ impl SettingsEditor {
             cost_rank: model.and_then(|m| m.cost_rank),
             subagent_invokable: model.and_then(|m| m.subagent_invokable),
             provider_trust_confirm_pending: false,
+            provider_trust_confirm_ready_at: None,
+            provider_trust_confirm_lockout: Duration::ZERO,
             context_present: model.is_some_and(|m| m.context.is_some()),
             cache_present: model.is_some_and(|m| m.cache.is_some()),
             shrink_present: model.is_some_and(|m| m.shrink.is_some()),
@@ -782,11 +795,23 @@ impl SettingsEditor {
                     Some(ModelTrust::Trusted) => {
                         self.trust = None;
                         self.provider_trust_confirm_pending = false;
+                        self.provider_trust_confirm_ready_at = None;
                         self.status = None;
                     }
                     _ if self.provider_trust_confirm_pending => {
+                        if self
+                            .provider_trust_confirm_ready_at
+                            .is_some_and(|ready_at| Instant::now() < ready_at)
+                        {
+                            self.status = Some(
+                                "wait before confirming provider trust; future fetched models inherit unredacted access"
+                                    .to_string(),
+                            );
+                            return;
+                        }
                         self.trust = Some(ModelTrust::Trusted);
                         self.provider_trust_confirm_pending = false;
+                        self.provider_trust_confirm_ready_at = None;
                         self.status = Some(
                             "provider trusted: future fetched models inherit unredacted access"
                                 .to_string(),
@@ -794,6 +819,8 @@ impl SettingsEditor {
                     }
                     _ => {
                         self.provider_trust_confirm_pending = true;
+                        self.provider_trust_confirm_ready_at =
+                            Some(Instant::now() + self.provider_trust_confirm_lockout);
                         self.status = Some(
                             "press Enter again to mark the provider trusted; future fetched models inherit unredacted access"
                                 .to_string(),
@@ -1111,6 +1138,12 @@ impl SettingsEditor {
                     return SettingsResult::Save;
                 }
                 let field = self.field_at(self.cursor);
+                if field == SettingsField::TrustPolicy
+                    && matches!(self.scope, SettingsScope::Provider)
+                    && matches!(key.kind, KeyEventKind::Repeat)
+                {
+                    return SettingsResult::Stay;
+                }
                 if field.is_numeric() {
                     self.begin_numeric_edit(field);
                 } else if field.is_text() {
@@ -1307,6 +1340,16 @@ mod tests {
             code,
             modifiers: KeyModifiers::empty(),
             kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn repeat(code: KeyCode) -> KeyEvent {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Repeat,
             state: KeyEventState::empty(),
         }
     }
@@ -1603,6 +1646,26 @@ mod tests {
         assert!(help.contains("stores them as reasoning"));
         assert!(help.contains("Interface -> Thinking display"));
         assert!(help.contains("does not request more reasoning"));
+    }
+
+    #[test]
+    fn provider_trust_confirm_ignores_repeat_and_honors_lockout() {
+        let entry = provider_with_model();
+        let mut provider =
+            SettingsEditor::for_provider("p", &entry).with_trust_confirm_lockout_ms(60_000);
+        provider.cursor = provider
+            .fields()
+            .iter()
+            .position(|f| *f == SettingsField::TrustPolicy)
+            .unwrap();
+
+        provider.handle_key(press(KeyCode::Enter));
+        provider.handle_key(repeat(KeyCode::Enter));
+        assert_ne!(provider.value_str(SettingsField::TrustPolicy), "trusted");
+
+        provider.handle_key(press(KeyCode::Enter));
+        assert_ne!(provider.value_str(SettingsField::TrustPolicy), "trusted");
+        assert!(provider.status.as_deref().unwrap_or("").contains("wait"));
     }
 
     #[test]

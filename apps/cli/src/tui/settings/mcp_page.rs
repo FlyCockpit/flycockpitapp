@@ -582,7 +582,7 @@ impl SettingsDialog {
             "base env",
             s.base_env.text(),
             s.cursor == FIELD_BASE_ENV,
-            Some("stdio KEY=VALUE, comma separated"),
+            Some("stdio env, one KEY=VALUE per row"),
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Auth", muted_style())));
@@ -619,7 +619,7 @@ impl SettingsDialog {
             "auth env",
             s.auth_env.text(),
             s.cursor == FIELD_AUTH_ENV,
-            Some("stdio env auth KEY=VALUE"),
+            Some("stdio env auth, one KEY=VALUE per row"),
         );
         push_text_field(
             &mut lines,
@@ -980,7 +980,7 @@ fn split_words(raw: &str) -> Vec<String> {
 
 fn parse_pairs(raw: &str) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
-    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for item in raw.lines().map(str::trim).filter(|s| !s.is_empty()) {
         let Some((key, value)) = item.split_once('=') else {
             return Err(format!("env mapping `{item}` must be KEY=VALUE"));
         };
@@ -1087,7 +1087,7 @@ fn format_pairs_for_edit(
     for k in credential_refs.keys() {
         parts.push(format!("{k}={}", secret_display::mask_value()));
     }
-    parts.join(", ")
+    parts.join("\n")
 }
 
 #[cfg(test)]
@@ -1198,6 +1198,17 @@ mod tests {
         stdio.endpoint = None;
         stdio.command = Some("node".into());
         assert!(matches!(lifecycle("bad", &stdio), ServerLifecycle::Error));
+    }
+
+    #[test]
+    fn env_pairs_allow_commas_in_values_per_row() {
+        let pairs = parse_pairs("A=one,two\nB=three").unwrap();
+        assert_eq!(pairs.get("A").map(String::as_str), Some("one,two"));
+        assert_eq!(pairs.get("B").map(String::as_str), Some("three"));
+
+        let mut vars = BTreeMap::new();
+        vars.insert("A".to_string(), "one,two".to_string());
+        assert_eq!(format_pairs_for_edit(&vars, &BTreeMap::new()), "A=one,two");
     }
 
     #[test]

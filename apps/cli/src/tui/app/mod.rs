@@ -9837,7 +9837,7 @@ impl App {
                     id,
                     &entry,
                     &resolved,
-                    Some(Duration::from_secs(15)),
+                    Duration::from_secs(15),
                 )
                 .await
                 {

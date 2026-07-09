@@ -639,23 +639,74 @@ fn agents_subdir(config_dir: &Path) -> PathBuf {
 /// Every directory to search for on-disk agent files, in left-to-right
 /// override precedence: the layered config dirs (home/global, machine-
 /// local, then project ancestors — see [`crate::config::dirs`]) each
-/// contribute their `agents/` subdir, followed by any configured
-/// `extended.agent_dirs` (tilde-expanded). Reuses the existing config
-/// discovery; no parallel scheme.
+/// contribute their `agents/` subdir, followed by configured
+/// `extended.agent_dirs`. Unlike skills scan dirs, these entries are
+/// resolved relative to the config file that defined them, not the process
+/// cwd and not through ancestor-walk. This makes a checked-in project config
+/// mean the same thing from every launch directory.
 pub fn agent_search_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = crate::config::dirs::discover_config_dirs(cwd)
         .into_iter()
         .map(|d| agents_subdir(&d.path))
         .collect();
-    let cfg = crate::config::extended::load_for_cwd(cwd);
-    for d in &cfg.agent_dirs {
-        let expanded = shellexpand::tilde(&d.to_string_lossy()).into_owned();
-        let dir = PathBuf::from(expanded);
-        if !crate::config::trust::path_blocked_by_workspace_trust(&dir) {
-            dirs.push(dir);
+    dirs.extend(configured_agent_dirs_for_paths(
+        &crate::config::dirs::config_file_paths_for_load(cwd),
+    ));
+    dirs
+}
+
+fn configured_agent_dirs_for_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
         }
+        let Ok(doc) = crate::config::extended::ExtendedConfigDoc::load(path) else {
+            continue;
+        };
+        let Some(value) = doc.raw_field("agent_dirs") else {
+            continue;
+        };
+        let parsed = match serde_json::from_value::<Vec<PathBuf>>(value.clone()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    key = "agent_dirs",
+                    %error,
+                    "skipping malformed extended config field"
+                );
+                continue;
+            }
+        };
+        dirs = parsed
+            .into_iter()
+            .filter_map(|dir| resolve_agent_dir_entry(path, &dir))
+            .filter(|dir| !crate::config::trust::path_blocked_by_workspace_trust(dir))
+            .collect();
     }
     dirs
+}
+
+fn resolve_agent_dir_entry(config_path: &Path, dir: &Path) -> Option<PathBuf> {
+    let rendered = dir.to_string_lossy();
+    let resolved = crate::envref::resolve(&rendered);
+    if resolved.has_missing() || resolved.has_errors() {
+        tracing::warn!(
+            path = %config_path.display(),
+            key = "agent_dirs",
+            missing = ?resolved.missing,
+            errors = ?resolved.errors,
+            "skipping unresolved agent_dirs entry"
+        );
+        return None;
+    }
+    let path = PathBuf::from(resolved.value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        config_path.parent().map(|parent| parent.join(path))
+    }
 }
 
 /// Resolve the on-disk path an agent named `name` would resolve to in

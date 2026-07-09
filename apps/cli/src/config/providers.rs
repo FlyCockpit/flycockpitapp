@@ -50,6 +50,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -2533,6 +2534,7 @@ impl ConfigDoc {
                 Ok(doc) => {
                     let mut layer = doc.raw.clone();
                     warn_inline_providers_ignored(path, &layer);
+                    warn_malformed_provider_layer_metadata(path, &layer);
                     if let Some(obj) = layer.as_object_mut() {
                         obj.remove("providers");
                     }
@@ -2579,23 +2581,27 @@ impl ConfigDoc {
     pub fn providers(&self) -> ProvidersConfig {
         let mut cfg = ProvidersConfig::default();
         warn_inline_providers_ignored(&self.path, &self.raw);
-        if let Some(s) = self
-            .raw
-            .get("on_unlisted_models_fetch")
-            .and_then(Value::as_str)
-            && let Ok(parsed) =
-                serde_json::from_value::<OnUnlistedModelsFetch>(Value::String(s.to_string()))
+        if let Some(v) = self.raw.get("on_unlisted_models_fetch")
+            && let Some(parsed) = parse_provider_metadata_field::<OnUnlistedModelsFetch>(
+                &self.path,
+                "on_unlisted_models_fetch",
+                v,
+            )
         {
             cfg.on_unlisted_models_fetch = Some(parsed);
         }
         if let Some(v) = self.raw.get("active_model")
-            && let Ok(parsed) = serde_json::from_value::<ActiveModelRef>(v.clone())
+            && let Some(parsed) =
+                parse_provider_metadata_field::<ActiveModelRef>(&self.path, "active_model", v)
         {
             cfg.active_model = Some(parsed);
         }
         if let Some(v) = self.raw.get("category_defaults")
-            && let Ok(parsed) =
-                serde_json::from_value::<BTreeMap<String, ProviderModelRef>>(v.clone())
+            && let Some(parsed) = parse_provider_metadata_field::<BTreeMap<String, ProviderModelRef>>(
+                &self.path,
+                "category_defaults",
+                v,
+            )
         {
             cfg.category_defaults = parsed;
         }
@@ -2609,8 +2615,18 @@ impl ConfigDoc {
                     tracing::warn!(provider = %id, error = %e, "skipping malformed provider entry");
                     continue;
                 }
-                if let Ok(entry) = serde_json::from_value::<ProviderEntry>(v.clone()) {
-                    cfg.providers.insert(id.clone(), entry);
+                match serde_json::from_value::<ProviderEntry>(v.clone()) {
+                    Ok(entry) => {
+                        cfg.providers.insert(id.clone(), entry);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            provider = %id,
+                            %error,
+                            "skipping malformed inline provider entry"
+                        );
+                    }
                 }
             }
         }
@@ -2887,6 +2903,44 @@ fn value_mentions_xai_grok(value: &Value) -> bool {
     }
 }
 
+fn parse_provider_metadata_field<T>(path: &Path, key: &'static str, value: &Value) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value::<T>(value.clone()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                key,
+                %error,
+                "skipping malformed provider config field"
+            );
+            None
+        }
+    }
+}
+
+fn warn_malformed_provider_layer_metadata(path: &Path, layer: &Value) {
+    if let Some(value) = layer.get("on_unlisted_models_fetch") {
+        let _ = parse_provider_metadata_field::<OnUnlistedModelsFetch>(
+            path,
+            "on_unlisted_models_fetch",
+            value,
+        );
+    }
+    if let Some(value) = layer.get("active_model") {
+        let _ = parse_provider_metadata_field::<ActiveModelRef>(path, "active_model", value);
+    }
+    if let Some(value) = layer.get("category_defaults") {
+        let _ = parse_provider_metadata_field::<BTreeMap<String, ProviderModelRef>>(
+            path,
+            "category_defaults",
+            value,
+        );
+    }
+}
+
 fn warn_inline_providers_ignored(path: &Path, raw: &Value) {
     if path.as_os_str().is_empty() || raw.get("providers").is_none() {
         return;
@@ -3025,6 +3079,42 @@ mod tests {
     fn read_provider_file(config_path: &Path, provider_id: &str) -> Value {
         let path = provider_file_path_for_config(config_path, provider_id).unwrap();
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(std::sync::Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_warn_logs(f: impl FnOnce()) -> String {
+        let sink = SharedLog(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
     }
 
     #[test]
@@ -3232,6 +3322,39 @@ mod tests {
     }
 
     #[test]
+    fn malformed_provider_metadata_and_inline_provider_entries_warn_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        let top_level_doc = ConfigDoc {
+            path: path.clone(),
+            raw: serde_json::json!({
+                "on_unlisted_models_fetch": "explode",
+                "active_model": { "model": "missing-provider" },
+                "category_defaults": { "cheap_code": { "provider": "p" } }
+            }),
+        };
+        let inline_doc = ConfigDoc {
+            path: PathBuf::new(),
+            raw: serde_json::json!({ "providers": { "bad": 42 } }),
+        };
+
+        let logs = capture_warn_logs(|| {
+            let _ = top_level_doc.providers();
+            let _ = inline_doc.providers();
+        });
+
+        assert!(logs.contains(path.to_string_lossy().as_ref()), "{logs}");
+        assert!(logs.contains("on_unlisted_models_fetch"), "{logs}");
+        assert!(logs.contains("active_model"), "{logs}");
+        assert!(logs.contains("category_defaults"), "{logs}");
+        assert!(logs.contains("bad"), "{logs}");
+        assert!(
+            logs.contains("skipping malformed inline provider entry"),
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn label_falls_back_to_id() {
         let entry = ProviderEntry::default();
         assert_eq!(entry.label("my-id"), "my-id");
@@ -3416,6 +3539,33 @@ mod tests {
         assert_eq!(cfg.resolve_timeout("nope", "x"), TimeoutConfig::default());
         assert_eq!(TimeoutConfig::default().ttft_secs, 120);
         assert_eq!(TimeoutConfig::default().idle_secs, 90);
+    }
+
+    #[test]
+    fn providers_from_paths_replaces_active_model_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home").join("config.json");
+        let project = tmp.path().join("project").join("config.json");
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &home,
+            r#"{"active_model":{"provider":"home","model":"old","reasoning_effort":{"value":"high"},"thinking_mode":"high"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"active_model":{"provider":"project","model":"new"}}"#,
+        )
+        .unwrap();
+
+        let cfg = ConfigDoc::providers_from_paths(&[home, project]);
+        let active = cfg.active_model.expect("project active model survives");
+
+        assert_eq!(active.provider, "project");
+        assert_eq!(active.model, "new");
+        assert_eq!(active.reasoning_effort, None);
+        assert_eq!(active.thinking_mode, None);
     }
 
     #[test]

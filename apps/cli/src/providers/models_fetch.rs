@@ -15,6 +15,7 @@
 //! `mixer-rs/src/providers/common/models_list.rs`).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -32,6 +33,7 @@ const COPILOT_TOKEN_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "
 const COPILOT_DIRECT_API_TOKEN_ENV: &str = "GITHUB_COPILOT_API_TOKEN";
 const COPILOT_API_URL_ENV: &str = "COPILOT_API_URL";
 const ERROR_BODY_SNIPPET_CHARS: usize = 256;
+const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_MODEL_LIST_CLIENT_VERSION: &str = "0.0.0";
 
 fn codex_model_list_client_version() -> &'static str {
@@ -41,19 +43,37 @@ fn codex_model_list_client_version() -> &'static str {
     CODEX_MODEL_LIST_CLIENT_VERSION
 }
 
-/// Resolved view of a `HeaderSpec` after `$VAR` expansion.
-#[derive(Debug, Clone)]
+/// Resolved view of a `HeaderSpec` after envref expansion.
+#[derive(Clone)]
 pub struct ResolvedHeader {
     pub name: String,
     pub value: String,
 }
 
-/// Fully resolved provider request inputs after applying `$VAR`
+impl fmt::Debug for ResolvedHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedHeader")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Fully resolved provider request inputs after applying envref
 /// expansion plus GitHub Copilot's documented token fallbacks.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedRequest {
     pub base_url: String,
     pub headers: Vec<ResolvedHeader>,
+}
+
+impl fmt::Debug for ResolvedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedRequest")
+            .field("base_url", &self.base_url)
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 /// Apply `$VAR` resolution to every header, collecting any missing-env
@@ -74,6 +94,7 @@ where
     for h in headers {
         let r = envref::resolve_with(&h.value, &lookup);
         push_missing(&mut missing, &r.missing);
+        push_missing(&mut missing, &r.errors);
         out.push(ResolvedHeader {
             name: h.name.clone(),
             value: r.value,
@@ -209,13 +230,17 @@ fn resolve_provider_request_inner(
     let is_copilot = is_github_copilot_provider(provider_id, entry);
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(entry.headers.len() + 1);
     let mut missing_other: Vec<String> = Vec::new();
+    let mut errors_other: Vec<String> = Vec::new();
     let mut auth_header: Option<ResolvedHeader> = None;
     let mut auth_missing: Vec<String> = Vec::new();
+    let mut auth_errors: Vec<String> = Vec::new();
 
     for h in &entry.headers {
         let resolved = envref::resolve_with(&h.value, &lookup);
         if h.name.eq_ignore_ascii_case("authorization") {
-            if resolved.has_missing() {
+            if resolved.has_errors() {
+                push_missing(&mut auth_errors, &resolved.errors);
+            } else if resolved.has_missing() {
                 push_missing(&mut auth_missing, &resolved.missing);
             } else {
                 auth_header = Some(ResolvedHeader {
@@ -227,6 +252,10 @@ fn resolve_provider_request_inner(
         }
 
         push_missing(&mut missing_other, &resolved.missing);
+        if resolved.has_errors() {
+            push_missing(&mut errors_other, &resolved.errors);
+            continue;
+        }
         headers.push(ResolvedHeader {
             name: h.name.clone(),
             value: resolved.value,
@@ -237,6 +266,18 @@ fn resolve_provider_request_inner(
         anyhow::bail!(
             "provider `{provider_id}` references unset env var(s): {}",
             missing_other.join(", ")
+        );
+    }
+    if !errors_other.is_empty() {
+        anyhow::bail!(
+            "provider `{provider_id}` has invalid env reference(s): {}",
+            errors_other.join(", ")
+        );
+    }
+    if !auth_errors.is_empty() {
+        anyhow::bail!(
+            "Authorization for provider `{provider_id}` has invalid env reference(s): {}",
+            auth_errors.join(", ")
         );
     }
 
@@ -375,7 +416,7 @@ pub enum FetchOutcome {
 pub async fn fetch_models(
     base_url: &str,
     headers: &[ResolvedHeader],
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<FetchOutcome> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     fetch_models_at(&url, headers, timeout).await
@@ -407,7 +448,7 @@ fn codex_oauth_fallback_models() -> Vec<ModelEntry> {
 async fn fetch_models_at(
     url: &str,
     headers: &[ResolvedHeader],
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<FetchOutcome> {
     fetch_models_at_detailed(url, headers, timeout)
         .await
@@ -423,13 +464,12 @@ struct FetchModelsAtResult {
 async fn fetch_models_at_detailed(
     url: &str,
     headers: &[ResolvedHeader],
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<FetchModelsAtResult> {
-    let mut builder = reqwest::Client::builder();
-    if let Some(t) = timeout {
-        builder = builder.timeout(t);
-    }
-    let client = builder.build().context("building reqwest client")?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("building reqwest client")?;
 
     let resp = send_models_request_with_retries(&client, url, headers).await?;
     let status = resp.status();
@@ -450,7 +490,7 @@ async fn fetch_models_at_detailed(
         anyhow::bail!("{url} returned {status}: {}", response_body_snippet(&body));
     }
 
-    let body = resp.text().await.context("reading /models response body")?;
+    let body = read_success_body_limited(resp).await?;
     let body_nonempty = !body.trim().is_empty();
     let models = parse_models_body(&body)?;
     Ok(FetchModelsAtResult {
@@ -505,7 +545,7 @@ pub async fn fetch_models_for_provider(
     provider_id: &str,
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<FetchOutcome> {
     let request = resolve_model_list_request_async(provider_id, entry, resolved).await?;
     let url = models_url_for_provider(provider_id, entry, &request.base_url);
@@ -560,6 +600,24 @@ pub async fn fetch_models_for_provider(
         }
         Ok(result) => Ok(result.outcome),
     }
+}
+
+async fn read_success_body_limited(mut resp: reqwest::Response) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("reading /models response body")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+            anyhow::bail!(
+                "/models response body exceeded {} byte limit",
+                MAX_MODELS_RESPONSE_BYTES
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("/models response body was not valid UTF-8")
 }
 
 pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
@@ -1229,6 +1287,23 @@ mod tests {
     }
 
     #[test]
+    fn resolved_request_debug_redacts_header_values() {
+        let resolved = ResolvedRequest {
+            base_url: "https://api.example.com/v1".into(),
+            headers: vec![ResolvedHeader {
+                name: "Authorization".into(),
+                value: "Bearer fixture-secret-token".into(),
+            }],
+        };
+
+        let rendered = format!("{resolved:?}");
+
+        assert!(rendered.contains("Authorization"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("fixture-secret-token"), "{rendered}");
+    }
+
+    #[test]
     fn copilot_falls_back_to_gh_token_when_default_header_var_is_missing() {
         let _g = env_lock();
         clear_copilot_env();
@@ -1758,14 +1833,10 @@ mod tests {
                 headers: Vec::new(),
             };
 
-            let outcome = fetch_models_for_provider(
-                "codex-oauth",
-                &entry,
-                &resolved,
-                Some(Duration::from_secs(5)),
-            )
-            .await
-            .unwrap();
+            let outcome =
+                fetch_models_for_provider("codex-oauth", &entry, &resolved, Duration::from_secs(5))
+                    .await
+                    .unwrap();
 
             let request = request_handle.await.unwrap();
             assert!(request.starts_with("GET /v1/models?client_version=0.0.0 "));
@@ -1820,10 +1891,9 @@ mod tests {
             headers: Vec::new(),
         };
 
-        let outcome =
-            fetch_models_for_provider("local", &entry, &resolved, Some(Duration::from_secs(5)))
-                .await
-                .unwrap();
+        let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
+            .await
+            .unwrap();
         let _ = request_handle.await.unwrap();
 
         match outcome {
@@ -1848,14 +1918,10 @@ mod tests {
             headers: Vec::new(),
         };
 
-        let outcome = fetch_models_for_provider(
-            "codex-oauth",
-            &entry,
-            &resolved,
-            Some(Duration::from_secs(5)),
-        )
-        .await
-        .unwrap();
+        let outcome =
+            fetch_models_for_provider("codex-oauth", &entry, &resolved, Duration::from_secs(5))
+                .await
+                .unwrap();
         let _ = request_handle.await.unwrap();
 
         match outcome {
@@ -1892,14 +1958,10 @@ mod tests {
                 headers: Vec::new(),
             };
 
-            let err = fetch_models_for_provider(
-                "codex-oauth",
-                &entry,
-                &resolved,
-                Some(Duration::from_secs(5)),
-            )
-            .await
-            .unwrap_err();
+            let err =
+                fetch_models_for_provider("codex-oauth", &entry, &resolved, Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
             assert!(err.to_string().contains(&format!("returned {status}")));
             assert_eq!(request_handle.await.unwrap().len(), 1);
         }
@@ -1907,6 +1969,38 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_success_response_body_errors_before_parse() {
+        let mut body = String::from(r#"{"data":[]}"#);
+        body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
+        let body: &'static str = Box::leak(body.into_boxed_str());
+        let (base_url, request_handle) = serve_models_once(body).await;
+        let entry = ProviderEntry {
+            url: base_url.clone(),
+            allow_insecure_http: true,
+            ..ProviderEntry::default()
+        };
+        let resolved = ResolvedRequest {
+            base_url,
+            headers: Vec::new(),
+        };
+
+        let err = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        let _ = request_handle.await.unwrap();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("/models response body exceeded"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&MAX_MODELS_RESPONSE_BYTES.to_string()),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -1926,10 +2020,9 @@ mod tests {
             headers: Vec::new(),
         };
 
-        let outcome =
-            fetch_models_for_provider("local", &entry, &resolved, Some(Duration::from_secs(5)))
-                .await
-                .unwrap();
+        let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
+            .await
+            .unwrap();
         let requests = request_handle.await.unwrap();
         assert_eq!(requests.len(), 2);
         match outcome {

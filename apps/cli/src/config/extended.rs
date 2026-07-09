@@ -1507,7 +1507,14 @@ fn resolve_injection_guard_from_paths(paths: &[PathBuf]) -> ResolvedInjectionGua
         if guard.get("threshold").is_some() {
             threshold = doc.config().prompt_injection_guard.threshold;
         }
-        if guard.get("resultAction").is_some() || guard.get("result_action").is_some() {
+        if guard.get("result_action").is_some() {
+            tracing::warn!(
+                path = %path.display(),
+                key = "prompt_injection_guard.result_action",
+                "unsupported prompt injection guard field spelling; use `resultAction`"
+            );
+            result_action = InjectionResultAction::Block;
+        } else if guard.get("resultAction").is_some() {
             result_action = doc.config().prompt_injection_guard.result_action;
         }
         if guard.get("check_prompt").and_then(Value::as_str).is_some()
@@ -1810,7 +1817,13 @@ pub(crate) fn deep_merge_value(base: &mut Value, overlay: &Value) {
     deep_merge_value_at(base, overlay, &mut Vec::new());
 }
 
+const ATOMIC_CONFIG_VALUE_PATHS: &[&[&str]] = &[&["active_model"]];
+
 fn deep_merge_value_at(base: &mut Value, overlay: &Value, path: &mut Vec<String>) {
+    if is_atomic_config_value_path(path) {
+        *base = overlay.clone();
+        return;
+    }
     match (base, overlay) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
             for (k, v) in overlay_map {
@@ -1833,6 +1846,16 @@ fn deep_merge_value_at(base: &mut Value, overlay: &Value, path: &mut Vec<String>
         }
         (base_slot, _) => *base_slot = overlay.clone(),
     }
+}
+
+fn is_atomic_config_value_path(path: &[String]) -> bool {
+    ATOMIC_CONFIG_VALUE_PATHS.iter().any(|candidate| {
+        candidate.len() == path.len()
+            && candidate
+                .iter()
+                .zip(path.iter())
+                .all(|(expected, actual)| *expected == actual)
+    })
 }
 
 fn is_providers_models_path(path: &[String]) -> bool {
@@ -2829,6 +2852,10 @@ impl ExtendedConfigDoc {
     /// field cannot zero the entire settings view.
     pub fn config(&self) -> ExtendedConfig {
         self.config_with_warnings().0
+    }
+
+    pub(crate) fn raw_field(&self, key: &str) -> Option<&Value> {
+        self.raw.get(key)
     }
 
     /// Parse the raw object and return human-readable warnings for known
@@ -4477,6 +4504,42 @@ mod tests {
         let resolved = resolve_injection_guard_from_paths(&[global]);
         assert_eq!(resolved.threshold, InjectionThreshold::Medium);
         assert_eq!(resolved.check_prompt, "G");
+    }
+
+    #[test]
+    fn resolve_injection_guard_result_action_uses_camel_case_only() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("global.json");
+        std::fs::write(
+            &global,
+            r#"{"prompt_injection_guard":{"resultAction":"ask"}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_injection_guard_from_paths(&[global]);
+
+        assert_eq!(resolved.result_action, InjectionResultAction::Ask);
+    }
+
+    #[test]
+    fn resolve_injection_guard_snake_result_action_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("global.json");
+        let project = tmp.path().join("project.json");
+        std::fs::write(
+            &global,
+            r#"{"prompt_injection_guard":{"resultAction":"ask"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"prompt_injection_guard":{"result_action":"ask"}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_injection_guard_from_paths(&[global, project]);
+
+        assert_eq!(resolved.result_action, InjectionResultAction::Block);
     }
 
     #[test]

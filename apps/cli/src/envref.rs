@@ -1,13 +1,15 @@
 //! Environment-variable references inside config strings.
 //!
-//! The reference syntax is `$NAME`, matching at:
+//! The reference syntax is `$NAME` or `${NAME}`, matching at:
 //!   - the very start of the string, or
 //!   - immediately after an ASCII whitespace byte.
 //!
 //! `NAME` is `[A-Za-z_][A-Za-z0-9_]*`. Anything else (`$$`, `Bearer$X`) is
 //! left verbatim. The conservative rule lets users write `Bearer $TOKEN`
 //! and `$TOKEN` but not surprise themselves with a `$` that appears in
-//! the middle of a literal.
+//! the middle of a literal. A leading `~` also expands to the user's home
+//! directory so every envref-powered config surface shares the same basic
+//! path conveniences.
 //!
 //! [`resolve`] returns the expanded string plus the names of any
 //! references whose env var is unset; the TUI uses that list to render a
@@ -22,20 +24,31 @@ pub struct Resolved {
     /// order they appear. Each name is reported once even if referenced
     /// multiple times.
     pub missing: Vec<String>,
-    /// All `$NAME` references that the resolver recognized, regardless
-    /// of whether they were present. Useful for "this string is dynamic".
+    /// All env references that the resolver recognized, regardless of
+    /// whether they were present. Useful for "this string is dynamic".
     pub referenced: Vec<String>,
+    /// Syntax errors in env references. Callers that send requests with
+    /// resolved values should fail rather than forwarding literals.
+    pub errors: Vec<String>,
 }
 
 impl Resolved {
     pub fn has_missing(&self) -> bool {
         !self.missing.is_empty()
     }
+
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
 }
 
-/// Expand `$VAR` references using `std::env::var`.
+/// Expand `$VAR` and `${VAR}` references using `std::env::var`.
 pub fn resolve(input: &str) -> Resolved {
-    resolve_with(input, |k| env::var(k).ok())
+    resolve_with_home(
+        input,
+        |k| env::var(k).ok(),
+        env::var("HOME").ok().as_deref(),
+    )
 }
 
 /// Same as [`resolve`] but lets the caller supply the lookup function.
@@ -44,36 +57,58 @@ pub fn resolve_with<F>(input: &str, lookup: F) -> Resolved
 where
     F: Fn(&str) -> Option<String>,
 {
+    resolve_with_home(input, lookup, env::var("HOME").ok().as_deref())
+}
+
+fn resolve_with_home<F>(input: &str, lookup: F, home: Option<&str>) -> Resolved
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let expanded_input = expand_leading_tilde(input, home);
+    let input = expanded_input.as_str();
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut missing: Vec<String> = Vec::new();
     let mut referenced: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let at_dollar = bytes[i] == b'$';
         let prev_ok = i == 0 || is_ascii_whitespace(bytes[i - 1]);
-        if at_dollar
-            && prev_ok
-            && let Some((name, rest)) = take_var_name(&bytes[i + 1..])
-        {
-            if !referenced.iter().any(|n| n.as_str() == name) {
-                referenced.push(name.to_string());
-            }
-            match lookup(name) {
-                Some(val) => out.push_str(&val),
-                None => {
-                    // Missing: keep the literal `$NAME` so a later
-                    // re-resolve (after the user exports the var)
-                    // works without re-typing.
-                    out.push('$');
-                    out.push_str(name);
-                    if !missing.iter().any(|n| n.as_str() == name) {
-                        missing.push(name.to_string());
+        if at_dollar && prev_ok {
+            if bytes.get(i + 1) == Some(&b'{') {
+                match take_braced_var_name(&bytes[i + 2..], i) {
+                    Ok(Some((name, consumed))) => {
+                        push_ref(&mut referenced, name);
+                        match lookup(name) {
+                            Some(val) => out.push_str(&val),
+                            None => {
+                                out.push_str(&input[i..i + consumed]);
+                                push_ref(&mut missing, name);
+                            }
+                        }
+                        i += consumed;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => errors.push(error),
+                }
+            } else if let Some((name, rest)) = take_var_name(&bytes[i + 1..]) {
+                push_ref(&mut referenced, name);
+                match lookup(name) {
+                    Some(val) => out.push_str(&val),
+                    None => {
+                        // Missing: keep the literal `$NAME` so a later
+                        // re-resolve (after the user exports the var)
+                        // works without re-typing.
+                        out.push('$');
+                        out.push_str(name);
+                        push_ref(&mut missing, name);
                     }
                 }
+                i = bytes.len() - rest.len();
+                continue;
             }
-            i = bytes.len() - rest.len();
-            continue;
         }
         // Default path: copy one UTF-8 char.
         let ch_len = utf8_char_len(bytes[i]);
@@ -84,7 +119,47 @@ where
         value: out,
         missing,
         referenced,
+        errors,
     }
+}
+
+fn expand_leading_tilde(input: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return input.to_string();
+    };
+    if input == "~" {
+        return home.to_string();
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        return format!("{home}/{rest}");
+    }
+    input.to_string()
+}
+
+fn push_ref(items: &mut Vec<String>, name: &str) {
+    if !items.iter().any(|n| n.as_str() == name) {
+        items.push(name.to_string());
+    }
+}
+
+fn take_braced_var_name(rest: &[u8], offset: usize) -> Result<Option<(&str, usize)>, String> {
+    let Some(end) = rest.iter().position(|b| *b == b'}') else {
+        return Err(format!(
+            "unterminated braced env reference at byte {offset}"
+        ));
+    };
+    let name_bytes = &rest[..end];
+    if name_bytes.is_empty() {
+        return Err(format!("empty braced env reference at byte {offset}"));
+    }
+    let name = std::str::from_utf8(name_bytes)
+        .map_err(|_| format!("invalid braced env reference at byte {offset}"))?;
+    if !valid_var_name(name.as_bytes()) {
+        return Err(format!(
+            "invalid braced env variable name `{name}` at byte {offset}"
+        ));
+    }
+    Ok(Some((name, end + 3)))
 }
 
 fn take_var_name(rest: &[u8]) -> Option<(&str, &[u8])> {
@@ -101,6 +176,14 @@ fn take_var_name(rest: &[u8]) -> Option<(&str, &[u8])> {
         .unwrap_or(rest.len());
     let name = std::str::from_utf8(&rest[..end]).ok()?;
     Some((name, &rest[end..]))
+}
+
+fn valid_var_name(name: &[u8]) -> bool {
+    let Some((&first, rest)) = name.split_first() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && rest.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
 fn is_ascii_whitespace(b: u8) -> bool {
@@ -147,6 +230,28 @@ mod tests {
     fn expands_after_whitespace() {
         let r = resolve_with("Bearer $TOKEN", fake(&[("TOKEN", "xyz")]));
         assert_eq!(r.value, "Bearer xyz");
+    }
+
+    #[test]
+    fn expands_braced_var() {
+        let r = resolve_with("Bearer ${TOKEN}", fake(&[("TOKEN", "xyz")]));
+        assert_eq!(r.value, "Bearer xyz");
+        assert_eq!(r.referenced, vec!["TOKEN".to_string()]);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn expands_leading_tilde_with_test_home() {
+        let r = resolve_with_home("~/agents", fake(&[]), Some("/home/tester"));
+        assert_eq!(r.value, "/home/tester/agents");
+    }
+
+    #[test]
+    fn unmatched_braced_var_reports_byte_offset() {
+        let r = resolve_with("${TOKEN", fake(&[("TOKEN", "xyz")]));
+        assert_eq!(r.value, "${TOKEN");
+        assert!(r.errors[0].contains("byte 0"), "{:?}", r.errors);
+        assert!(r.errors[0].contains("unterminated"), "{:?}", r.errors);
     }
 
     #[test]

@@ -40,7 +40,7 @@ impl FetchHandle {
                     &pid,
                     &entry,
                     &r,
-                    Some(Duration::from_secs(15)),
+                    Duration::from_secs(15),
                 )
                 .await
                 .map_err(|e| e.to_string()),

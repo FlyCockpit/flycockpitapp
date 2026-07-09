@@ -71,13 +71,9 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
             }
         };
 
-        let outcome = models_fetch::fetch_models_for_provider(
-            id,
-            &entry,
-            &resolved,
-            Some(Duration::from_secs(15)),
-        )
-        .await;
+        let outcome =
+            models_fetch::fetch_models_for_provider(id, &entry, &resolved, Duration::from_secs(15))
+                .await;
 
         print_fetch_outcome(&outcome, args.allow_fallback);
         summaries.push((id.clone(), outcome));
@@ -316,7 +312,7 @@ async fn resolve_interactive_fallbacks(
                                     &provider_id,
                                     &entry,
                                     &resolved,
-                                    Some(Duration::from_secs(15)),
+                                    Duration::from_secs(15),
                                 )
                                 .await
                             }

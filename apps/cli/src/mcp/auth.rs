@@ -68,9 +68,11 @@ impl StoredTokens {
 pub struct ResolvedAuth {
     pub headers: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
-    /// `$VAR` references that were referenced but not present in the env,
-    /// for surfacing a warning. Never fatal.
+    /// Env references that were referenced but not present in non-header env
+    /// config, for surfacing a warning. Header-auth misses are fatal for
+    /// remote transports and are reported through `header_errors`.
     pub missing_env: Vec<String>,
+    pub header_errors: Vec<String>,
 }
 
 /// Resolve the non-OAuth parts of a server's auth into headers + env.
@@ -105,6 +107,7 @@ fn resolve_static_inner(
         let r = crate::envref::resolve(v);
         out.env.insert(k.clone(), r.value);
         out.missing_env.extend(r.missing);
+        out.missing_env.extend(r.errors);
     }
     match &cfg.auth {
         Auth::Header(h) => {
@@ -118,8 +121,23 @@ fn resolve_static_inner(
                 }
             } else {
                 let r = crate::envref::resolve(&h.value);
-                out.headers.insert(h.header.clone(), r.value);
-                out.missing_env.extend(r.missing);
+                if r.has_missing() || r.has_errors() {
+                    out.missing_env.extend(r.missing.iter().cloned());
+                    for missing in &r.missing {
+                        out.header_errors.push(format!(
+                            "MCP auth header `{}` references unset environment variable `{missing}`",
+                            h.header
+                        ));
+                    }
+                    for error in &r.errors {
+                        out.header_errors.push(format!(
+                            "MCP auth header `{}` has invalid environment reference: {error}",
+                            h.header
+                        ));
+                    }
+                } else {
+                    out.headers.insert(h.header.clone(), r.value);
+                }
             }
         }
         Auth::Env(e) => {
@@ -136,6 +154,7 @@ fn resolve_static_inner(
                 let r = crate::envref::resolve(v);
                 out.env.insert(k.clone(), r.value);
                 out.missing_env.extend(r.missing);
+                out.missing_env.extend(r.errors);
             }
         }
         // OAuth bearer is attached by the caller via `oauth_bearer`; None

@@ -25,6 +25,19 @@ fn write_large_agent(path: &Path, size: u64) {
         .unwrap();
 }
 
+#[test]
+fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("project").join(".cockpit");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.json");
+    fs::write(&config, r#"{"agent_dirs":["relative-agents"]}"#).unwrap();
+
+    let dirs = configured_agent_dirs_for_paths(&[config.clone()]);
+
+    assert_eq!(dirs, vec![config_dir.join("relative-agents")]);
+}
+
 // ── Parsing ──────────────────────────────────────────────────────────────
 
 #[test]

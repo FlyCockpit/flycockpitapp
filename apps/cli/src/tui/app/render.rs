@@ -1523,6 +1523,17 @@ impl App {
         }
     }
 
+    fn history_position_label(&self) -> Option<String> {
+        if self.prompt_history_cursor == 0 || self.prompt_history.is_empty() {
+            return None;
+        }
+        let total = self.prompt_history.len();
+        let current = total
+            .saturating_sub(self.prompt_history_cursor)
+            .saturating_add(1);
+        Some(format!("History: {current}/{total}"))
+    }
+
     pub(super) fn render_input(
         &mut self,
         frame: &mut ratatui::Frame,
@@ -1556,14 +1567,23 @@ impl App {
             .borders(borders)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
-        if shell_mode && !queue_above {
-            input_block = input_block.title(Line::from(Span::styled(
-                " shell mode ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(SHELL_MODE_BADGE_BG)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        if !queue_above {
+            if let Some(label) = self.history_position_label() {
+                input_block = input_block.title(Line::from(Span::styled(
+                    format!(" {label} "),
+                    Style::default()
+                        .fg(Color::Indexed(255))
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else if shell_mode {
+                input_block = input_block.title(Line::from(Span::styled(
+                    " shell mode ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(SHELL_MODE_BADGE_BG)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
         }
         let input_inner = input_block.inner(area);
 
@@ -4529,6 +4549,18 @@ mod prediction_ghost_context_indicator_tests {
         (0..width).map(|x| buf[(x, 1)].symbol()).collect::<String>()
     }
 
+    fn render_input_top_row(app: &mut App, width: u16) -> String {
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                app.render_input(f, Rect::new(0, 0, width, 3), false);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..width).map(|x| buf[(x, 0)].symbol()).collect::<String>()
+    }
+
     fn render_input_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4580,6 +4612,42 @@ mod prediction_ghost_context_indicator_tests {
                 .contains(Modifier::REVERSED),
             "following ASCII cell is outside the visual selection"
         );
+    }
+
+    #[test]
+    fn history_label_renders_oldest_to_newest_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prompt_history = vec![
+            "oldest".to_string(),
+            "middle".to_string(),
+            "newest".to_string(),
+        ];
+
+        app.prompt_history_cursor = 1;
+        let newest_row = render_input_top_row(&mut app, 50);
+        assert!(newest_row.contains("History: 3/3"), "{newest_row}");
+
+        app.prompt_history_cursor = 3;
+        let oldest_row = render_input_top_row(&mut app, 50);
+        assert!(oldest_row.contains("History: 1/3"), "{oldest_row}");
+    }
+
+    #[test]
+    fn history_label_is_hidden_when_not_recalling_and_overrides_shell_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.insert_str("!echo hi");
+
+        let shell_row = render_input_top_row(&mut app, 50);
+        assert!(shell_row.contains("shell mode"), "{shell_row}");
+        assert!(!shell_row.contains("History:"), "{shell_row}");
+
+        app.prompt_history = vec!["!previous".to_string()];
+        app.prompt_history_cursor = 1;
+        let history_row = render_input_top_row(&mut app, 50);
+        assert!(history_row.contains("History: 1/1"), "{history_row}");
+        assert!(!history_row.contains("shell mode"), "{history_row}");
     }
 
     #[test]

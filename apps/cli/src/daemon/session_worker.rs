@@ -617,6 +617,10 @@ pub enum SessionWork {
         target_id: Option<String>,
         respond_to: oneshot::Sender<proto::RemoveQueuedUserMessageResult>,
     },
+    RemoveEditableQueuedUserMessages {
+        target_id: Option<String>,
+        respond_to: oneshot::Sender<proto::RemoveQueuedUserMessagesResult>,
+    },
     Cancel,
     ResolveInterrupt {
         interrupt_id: Uuid,
@@ -1455,6 +1459,27 @@ async fn run_worker(
                     applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
                     reason,
                     removed_item: removed_item.map(queue_item_to_proto),
+                    queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                });
+            }
+            SessionWork::RemoveEditableQueuedUserMessages {
+                target_id,
+                respond_to,
+            } => {
+                let target_id = target_id.unwrap_or_else(|| {
+                    foreground_input_target
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .id
+                        .clone()
+                });
+                let (result, removed_items, snapshot) =
+                    driver_input_queue.remove_editable_for(&target_id).await;
+                let reason = remove_reason_to_proto(result);
+                let _ = respond_to.send(proto::RemoveQueuedUserMessagesResult {
+                    applied: !removed_items.is_empty(),
+                    reason,
+                    removed_items: removed_items.into_iter().map(queue_item_to_proto).collect(),
                     queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                 });
             }

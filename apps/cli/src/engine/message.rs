@@ -249,6 +249,49 @@ impl UserSubmissionQueue {
         (result, removed, snapshot)
     }
 
+    pub async fn remove_editable_for(
+        &self,
+        target_id: &str,
+    ) -> (
+        RemoveQueuedMessageResult,
+        Vec<QueuedUserMessage>,
+        Vec<QueuedUserMessage>,
+    ) {
+        let (result, removed, snapshot) = {
+            let mut state = self.inner.lock().await;
+            let mut removed = Vec::new();
+            let mut kept = VecDeque::with_capacity(state.pending.len());
+            while let Some(item) = state.pending.pop_front() {
+                if item.target.id == target_id {
+                    removed.push(queued_message_from_submission(&item));
+                } else {
+                    kept.push_back(item);
+                }
+            }
+            state.pending = kept;
+            let has_started_target = state
+                .started_targets
+                .values()
+                .any(|target| target.id == target_id);
+            let result = if !removed.is_empty() {
+                if has_started_target {
+                    RemoveQueuedMessageResult::AlreadyStarted
+                } else {
+                    RemoveQueuedMessageResult::Removed
+                }
+            } else if has_started_target {
+                RemoveQueuedMessageResult::AlreadyStarted
+            } else {
+                RemoveQueuedMessageResult::NotFound
+            };
+            (result, removed, snapshot_pending(&state))
+        };
+        if !removed.is_empty() {
+            self.publish(snapshot.clone());
+        }
+        (result, removed, snapshot)
+    }
+
     pub async fn recv(&self) -> Option<UserSubmission> {
         self.recv_for(None).await
     }
@@ -903,6 +946,73 @@ mod tests {
             queue.recv_for(Some(&child.id)).await.map(|s| s.text),
             Some("child only".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_bulk_removes_matching_target_fifo() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+
+        queue
+            .push(UserSubmission::text("root first"), root.clone())
+            .await;
+        queue
+            .push(UserSubmission::text("child only"), child.clone())
+            .await;
+        queue
+            .push(UserSubmission::text("root second"), root.clone())
+            .await;
+
+        let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        assert_eq!(
+            removed
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root first", "root second"]
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child only"]
+        );
+        assert_eq!(
+            queue.recv_for(Some(&child.id)).await.map(|s| s.text),
+            Some("child only".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_bulk_reports_started_after_partial_removal() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+
+        queue
+            .push(UserSubmission::text("root folding"), root.clone())
+            .await;
+        let mut drained = Vec::new();
+        queue.drain_into_for(&mut drained, 1, Some(&root.id)).await;
+        assert_eq!(drained[0].text, "root folding");
+        queue
+            .push(UserSubmission::text("root editable"), root.clone())
+            .await;
+
+        let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::AlreadyStarted);
+        assert_eq!(
+            removed
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root editable"]
+        );
+        assert!(snapshot.is_empty());
     }
 
     #[tokio::test]

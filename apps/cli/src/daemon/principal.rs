@@ -149,6 +149,7 @@ pub fn request_kind(request: &Request) -> &'static str {
         Request::CancelAttachmentUpload { .. } => "cancel_attachment_upload",
         Request::RemoveQueuedUserMessage { .. } => "remove_queued_user_message",
         Request::RemoveNewestQueuedUserMessage { .. } => "remove_newest_queued_user_message",
+        Request::RemoveEditableQueuedUserMessages { .. } => "remove_editable_queued_user_messages",
         Request::ResumePausedWork { .. } => "resume_paused_work",
         Request::CancelPausedWork { .. } => "cancel_paused_work",
         Request::RepairResume { .. } => "repair_resume",

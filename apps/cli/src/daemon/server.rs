@@ -1078,6 +1078,7 @@ fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
         | Request::CancelAttachmentUpload { .. }
         | Request::RemoveQueuedUserMessage { .. }
         | Request::RemoveNewestQueuedUserMessage { .. }
+        | Request::RemoveEditableQueuedUserMessages { .. }
         | Request::CancelTurn
         | Request::LspControl { .. }
         | Request::ResolveInterrupt { .. }
@@ -1298,6 +1299,7 @@ fn authorize_request(
         | Request::CancelAttachmentUpload { .. }
         | Request::RemoveQueuedUserMessage { .. }
         | Request::RemoveNewestQueuedUserMessage { .. }
+        | Request::RemoveEditableQueuedUserMessages { .. }
         | Request::ResumePausedWork { .. }
         | Request::CancelPausedWork { .. }
         | Request::RepairResume { .. }
@@ -1785,6 +1787,24 @@ async fn handle_request(
                 applied: result.applied,
                 reason: result.reason,
                 removed_item: result.removed_item,
+                queue: result.queue,
+            })
+        }
+        Request::RemoveEditableQueuedUserMessages { target_id } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::RemoveEditableQueuedUserMessages {
+                    target_id,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)?;
+            Ok(Response::RemoveQueuedUserMessagesResult {
+                applied: result.applied,
+                reason: result.reason,
+                removed_items: result.removed_items,
                 queue: result.queue,
             })
         }

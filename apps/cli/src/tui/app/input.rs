@@ -1129,10 +1129,10 @@ impl App {
     /// live buffer into `staged_draft` so a later Down can restore
     /// it.
     pub(super) fn history_up(&mut self) {
-        // Buffer empty + queue non-empty → ask the daemon to unqueue a
-        // removable item before making it editable.
+        // Buffer empty + queue non-empty -> ask the daemon to unqueue every
+        // editable foreground item before making the group editable.
         if self.prompt_history_cursor == 0 && self.composer.is_empty() && !self.queue.is_empty() {
-            self.edit_newest_queued_message();
+            self.edit_queued_messages();
             return;
         }
         if !cursor_on_first_line(self.composer.text(), self.composer.cursor()) {
@@ -2275,23 +2275,26 @@ impl App {
 }
 
 enum QueueEditOutcome {
-    Edited(String),
+    Edited { text: String, partial: bool },
     AlreadyStarted,
     Unavailable,
 }
 
 impl App {
-    fn edit_newest_queued_message(&mut self) {
-        match self.remove_newest_queued_message() {
-            QueueEditOutcome::Edited(text) => {
+    fn edit_queued_messages(&mut self) {
+        match self.remove_editable_queued_messages() {
+            QueueEditOutcome::Edited { text, partial } => {
                 self.composer.set(text);
                 self.paste_registry.clear();
+                if partial {
+                    self.push_queue_edit_notice("some queued messages already started");
+                }
             }
             QueueEditOutcome::AlreadyStarted => {
                 self.push_queue_edit_notice("queued message already started");
             }
             QueueEditOutcome::Unavailable => {
-                self.push_queue_edit_notice("queued message could not be edited");
+                self.push_queue_edit_notice("queued messages could not be edited");
             }
         }
     }
@@ -2300,43 +2303,42 @@ impl App {
         self.show_toast(text, super::ToastKind::Info);
     }
 
-    fn remove_newest_queued_message(&mut self) -> QueueEditOutcome {
+    fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
         let socket = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => runner.socket.clone(),
             _ => return QueueEditOutcome::Unavailable,
         };
-        self.remove_newest_queued_message_with(|| {
+        self.remove_editable_queued_messages_with(|| {
             crate::tui::agent_runner::daemon_request_at_blocking(
                 &socket,
-                Request::RemoveNewestQueuedUserMessage { target_id: None },
+                Request::RemoveEditableQueuedUserMessages { target_id: None },
             )
         })
     }
 
-    fn remove_newest_queued_message_with<F>(&mut self, remove: F) -> QueueEditOutcome
+    fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
     where
         F: FnOnce() -> Result<Response, String>,
     {
         match remove() {
-            Ok(Response::RemoveQueuedUserMessageResult {
+            Ok(Response::RemoveQueuedUserMessagesResult {
                 applied: true,
-                removed_item: Some(removed_item),
+                reason,
+                removed_items,
                 queue,
-                ..
-            }) => {
-                let removed_text = removed_item.text.clone();
+            }) if !removed_items.is_empty() => {
+                let removed_text = removed_items
+                    .into_iter()
+                    .map(|item| item.text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 self.replace_queue_from_proto(queue);
-                QueueEditOutcome::Edited(removed_text)
+                QueueEditOutcome::Edited {
+                    text: removed_text,
+                    partial: matches!(reason, proto::RemoveQueuedUserMessageReason::AlreadyStarted),
+                }
             }
-            Ok(Response::RemoveQueuedUserMessageResult {
-                applied: true,
-                queue,
-                ..
-            }) => {
-                self.replace_queue_from_proto(queue);
-                QueueEditOutcome::Unavailable
-            }
-            Ok(Response::RemoveQueuedUserMessageResult { reason, queue, .. }) => {
+            Ok(Response::RemoveQueuedUserMessagesResult { reason, queue, .. }) => {
                 self.replace_queue_from_proto(queue);
                 match reason {
                     proto::RemoveQueuedUserMessageReason::AlreadyStarted => {
@@ -2370,17 +2372,20 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(super) fn edit_newest_queued_message_for_test(&mut self, response: Response) {
-        match self.remove_newest_queued_message_with(|| Ok(response)) {
-            QueueEditOutcome::Edited(text) => {
+    pub(super) fn edit_queued_messages_for_test(&mut self, response: Response) {
+        match self.remove_editable_queued_messages_with(|| Ok(response)) {
+            QueueEditOutcome::Edited { text, partial } => {
                 self.composer.set(text);
                 self.paste_registry.clear();
+                if partial {
+                    self.push_queue_edit_notice("some queued messages already started");
+                }
             }
             QueueEditOutcome::AlreadyStarted => {
                 self.push_queue_edit_notice("queued message already started");
             }
             QueueEditOutcome::Unavailable => {
-                self.push_queue_edit_notice("queued message could not be edited");
+                self.push_queue_edit_notice("queued messages could not be edited");
             }
         }
     }
@@ -3575,12 +3580,13 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn up_edit_success_removes_daemon_item_and_fills_composer() {
+    fn up_edit_success_removes_daemon_items_fifo_and_fills_composer() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.queue.push(optimistic_queue_item("older".to_string()));
         app.queue.push(optimistic_queue_item("edit me".to_string()));
-        let removed = app.queue[1].clone();
+        let older = app.queue[0].clone();
+        let newer = app.queue[1].clone();
         app.queued_tag_batches.push(Vec::new());
         app.queued_tag_batches
             .push(vec![crate::tui::file_tag::TagExpansion {
@@ -3590,31 +3596,33 @@ mod queued_message_edit_tests {
                 detail: "1 line".to_string(),
             }]);
 
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
-            removed_item: Some(QueueItem {
-                id: removed.id,
-                status: QueueItemStatus::Queued,
-                text: removed.text,
-                target: crate::daemon::proto::QueueTarget::default(),
-            }),
-            queue: vec![proto_item("older", QueueItemStatus::Queued)],
+            removed_items: vec![
+                QueueItem {
+                    id: older.id,
+                    status: QueueItemStatus::Queued,
+                    text: older.text,
+                    target: crate::daemon::proto::QueueTarget::default(),
+                },
+                QueueItem {
+                    id: newer.id,
+                    status: QueueItemStatus::Queued,
+                    text: newer.text,
+                    target: crate::daemon::proto::QueueTarget::default(),
+                },
+            ],
+            queue: Vec::new(),
         });
 
-        assert_eq!(app.composer.text(), "edit me");
-        assert_eq!(
-            app.queue
-                .iter()
-                .map(|item| item.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["older"]
+        assert_eq!(app.composer.text(), "older\n\nedit me");
+        assert!(app.queue.is_empty());
+        assert!(
+            app.queued_tag_batches.is_empty(),
+            "tag metadata for removed queued messages is dropped"
         );
-        assert_eq!(
-            app.queued_tag_batches.len(),
-            1,
-            "tag metadata for the removed queued message is dropped"
-        );
+        assert_eq!(app.prompt_history_cursor, 0);
     }
 
     #[test]
@@ -3623,10 +3631,10 @@ mod queued_message_edit_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.queue.push(optimistic_queue_item("started".to_string()));
 
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: false,
             reason: RemoveQueuedUserMessageReason::AlreadyStarted,
-            removed_item: None,
+            removed_items: Vec::new(),
             queue: vec![proto_item("started", QueueItemStatus::Folding)],
         });
 
@@ -3652,10 +3660,10 @@ mod queued_message_edit_tests {
                 detail: "1 line".to_string(),
             }]);
 
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
-            removed_item: Some(proto_item("daemon authoritative", QueueItemStatus::Queued)),
+            removed_items: vec![proto_item("daemon authoritative", QueueItemStatus::Queued)],
             queue: Vec::new(),
         });
 
@@ -3668,48 +3676,31 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn repeated_up_edit_removes_daemon_newest_each_time() {
+    fn up_edit_partial_started_keeps_removed_draft_and_shows_notice() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.queue.push(optimistic_queue_item("older".to_string()));
-        app.queue.push(optimistic_queue_item("newer".to_string()));
-        let older = app.queue[0].clone();
-        let newer = app.queue[1].clone();
+        app.queue
+            .push(optimistic_queue_item("editable".to_string()));
+        let editable = app.queue[0].clone();
 
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
-            reason: RemoveQueuedUserMessageReason::Removed,
-            removed_item: Some(QueueItem {
-                id: newer.id,
+            reason: RemoveQueuedUserMessageReason::AlreadyStarted,
+            removed_items: vec![QueueItem {
+                id: editable.id,
                 status: QueueItemStatus::Queued,
-                text: newer.text,
-                target: crate::daemon::proto::QueueTarget::default(),
-            }),
-            queue: vec![QueueItem {
-                id: older.id,
-                status: QueueItemStatus::Queued,
-                text: older.text.clone(),
+                text: editable.text,
                 target: crate::daemon::proto::QueueTarget::default(),
             }],
-        });
-
-        assert_eq!(app.composer.text(), "newer");
-        app.composer.clear();
-
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
-            applied: true,
-            reason: RemoveQueuedUserMessageReason::Removed,
-            removed_item: Some(QueueItem {
-                id: older.id,
-                status: QueueItemStatus::Queued,
-                text: older.text,
-                target: crate::daemon::proto::QueueTarget::default(),
-            }),
             queue: Vec::new(),
         });
 
-        assert_eq!(app.composer.text(), "older");
+        assert_eq!(app.composer.text(), "editable");
         assert!(app.queue.is_empty());
+        assert!(
+            matches!(&app.toast, Some(toast) if toast.text == "some queued messages already started"),
+            "partial edit outcome is visible"
+        );
     }
 
     #[test]
@@ -3723,17 +3714,17 @@ mod queued_message_edit_tests {
         );
         app.queue.push(queue_item_from_proto(other.clone()));
 
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: false,
             reason: RemoveQueuedUserMessageReason::NotFound,
-            removed_item: None,
+            removed_items: Vec::new(),
             queue: vec![other],
         });
 
         assert!(app.composer.is_empty());
         assert_eq!(app.queue[0].text, "other target");
         assert!(
-            matches!(&app.toast, Some(toast) if toast.text == "queued message could not be edited"),
+            matches!(&app.toast, Some(toast) if toast.text == "queued messages could not be edited"),
             "target-miss removal failure is visible"
         );
         assert!(
@@ -3753,10 +3744,10 @@ mod queued_message_edit_tests {
             QueueItemStatus::Folding,
         )));
 
-        app.edit_newest_queued_message_for_test(Response::RemoveQueuedUserMessageResult {
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: false,
             reason: RemoveQueuedUserMessageReason::AlreadyStarted,
-            removed_item: None,
+            removed_items: Vec::new(),
             queue: vec![proto_item("started", QueueItemStatus::Folding)],
         });
 
@@ -3786,6 +3777,25 @@ mod queued_message_edit_tests {
                 .collect::<Vec<_>>(),
             vec!["daemon item"]
         );
+    }
+
+    #[test]
+    fn history_up_after_queue_edit_saves_and_restores_folded_draft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("first\n\nsecond".to_string());
+        app.composer.set_cursor(0);
+        app.prompt_history.push("previous prompt".to_string());
+
+        app.history_up();
+
+        assert_eq!(app.composer.text(), "previous prompt");
+        assert_eq!(app.prompt_history_cursor, 1);
+
+        app.history_down();
+
+        assert_eq!(app.composer.text(), "first\n\nsecond");
+        assert_eq!(app.prompt_history_cursor, 0);
     }
 
     #[test]

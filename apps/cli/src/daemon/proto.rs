@@ -280,6 +280,14 @@ pub enum Request {
         target_id: Option<String>,
     },
 
+    /// Atomically remove every editable queued user message for a foreground
+    /// target. When `target_id` is absent, the worker uses its current
+    /// foreground input target.
+    RemoveEditableQueuedUserMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+
     /// Explicitly resume durable work that was paused during daemon shutdown.
     /// Safe work continues through the normal driver/tool approval path; work
     /// that needs an interactive approval remains parked until a client can
@@ -841,6 +849,14 @@ pub enum Response {
         reason: RemoveQueuedUserMessageReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removed_item: Option<QueueItem>,
+        queue: Vec<QueueItem>,
+    },
+
+    /// Result of [`Request::RemoveEditableQueuedUserMessages`].
+    RemoveQueuedUserMessagesResult {
+        applied: bool,
+        reason: RemoveQueuedUserMessageReason,
+        removed_items: Vec<QueueItem>,
         queue: Vec<QueueItem>,
     },
 
@@ -1992,6 +2008,14 @@ pub struct RemoveQueuedUserMessageResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveQueuedUserMessagesResult {
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    pub removed_items: Vec<QueueItem>,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: Uuid,
     /// 6-char display id (GOALS §17b). Optional for backwards-compat
@@ -2874,7 +2898,7 @@ mod tests {
 
         let event = Envelope::event(Event::QueueUpdated {
             session_id,
-            queue: vec![item],
+            queue: vec![item.clone()],
         });
         let back: Envelope = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
         match back.body {
@@ -2922,6 +2946,51 @@ mod tests {
                 ..
             } => assert_eq!(target_id.as_deref(), Some("root")),
             other => panic!("unexpected request: {other:?}"),
+        }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::RemoveEditableQueuedUserMessages {
+                target_id: Some("root".to_string()),
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request: Request::RemoveEditableQueuedUserMessages { target_id },
+                ..
+            } => assert_eq!(target_id.as_deref(), Some("root")),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let response = Envelope::response(
+            Uuid::new_v4(),
+            Response::RemoveQueuedUserMessagesResult {
+                applied: true,
+                reason: RemoveQueuedUserMessageReason::Removed,
+                removed_items: vec![item.clone()],
+                queue: Vec::new(),
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        match back.body {
+            Body::Response { response, .. } => match *response {
+                Response::RemoveQueuedUserMessagesResult {
+                    applied,
+                    reason,
+                    removed_items,
+                    queue,
+                } => {
+                    assert!(applied);
+                    assert_eq!(reason, RemoveQueuedUserMessageReason::Removed);
+                    assert_eq!(removed_items[0].id, item_id);
+                    assert!(queue.is_empty());
+                }
+                other => panic!("unexpected response: {other:?}"),
+            },
+            other => panic!("unexpected frame: {other:?}"),
         }
     }
 

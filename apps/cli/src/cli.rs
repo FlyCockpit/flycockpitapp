@@ -136,7 +136,7 @@ pub enum Command {
     #[command(subcommand)]
     Sync(SyncCommand),
 
-    /// Open a remote control session over WebSocket (paid feature; planned).
+    /// Toggle outbound relay access for remote control on this instance; requires `cockpit login`.
     Connect(ConnectArgs),
 
     /// Fetch and check out a GitHub PR, then launch cockpit in the worktree.

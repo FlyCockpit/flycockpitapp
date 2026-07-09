@@ -28,7 +28,7 @@
 //!     └── {seq:05}_{short_id}_{call_id}__{provider}_{model}.json
 //! ```
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
@@ -265,8 +265,19 @@ struct ExportBundleOptions {
 }
 
 #[cfg(test)]
+fn test_export_env() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[cfg(test)]
 fn build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) -> Result<Vec<u8>> {
-    build_zip_with_options(db, target, bundle, ExportBundleOptions::default())
+    build_zip_with_options_and_env(
+        db,
+        target,
+        bundle,
+        ExportBundleOptions::default(),
+        &test_export_env(),
+    )
 }
 
 fn build_zip_with_options(
@@ -274,6 +285,17 @@ fn build_zip_with_options(
     target: &SessionRow,
     bundle: &[SessionRow],
     options: ExportBundleOptions,
+) -> Result<Vec<u8>> {
+    let env = process_env_map();
+    build_zip_with_options_and_env(db, target, bundle, options, &env)
+}
+
+fn build_zip_with_options_and_env(
+    db: &Db,
+    target: &SessionRow,
+    bundle: &[SessionRow],
+    options: ExportBundleOptions,
+    env: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
     // session_id → short_id lookup for tagging events.
     let short_ids: BTreeMap<Uuid, String> = bundle
@@ -305,7 +327,7 @@ fn build_zip_with_options(
         .filter_map(|e| e.call_id.clone())
         .collect();
     let utility_call_ids = db.utility_call_ids(&candidate_call_ids)?;
-    let export_redactor = export_redaction_table(target);
+    let export_redactor = export_redaction_table_with_env(target, env);
 
     // Call ids that have a successful `inference_request` event: those own the
     // captured-body file. A failed/hung turn records an `inference_failure`
@@ -586,7 +608,8 @@ fn build_zip_with_options(
     });
 
     let manifest = build_manifest(db, target, bundle, options);
-    let config_entries = collect_config_entries(target, options.include_generated_artifacts);
+    let config_entries =
+        collect_config_entries_with_env(target, options.include_generated_artifacts, env);
     let approval_entries = collect_approval_entries(db, bundle)?;
 
     // Write the archive.
@@ -815,10 +838,24 @@ fn export_resume_repair_state(db: &Db, target: &SessionRow) -> Option<Value> {
     }))
 }
 
-fn export_redaction_table(target: &SessionRow) -> RedactionTable {
+fn process_env_map() -> HashMap<String, String> {
+    std::env::vars_os()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+}
+
+fn export_redaction_table_with_env(
+    target: &SessionRow,
+    env: &HashMap<String, String>,
+) -> RedactionTable {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    RedactionTable::build(&extended.redact, &cwd).unwrap_or_else(|e| {
+    RedactionTable::build_with_env(&extended.redact, &cwd, env).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "export: redaction table build failed; payload scrub is a no-op");
         RedactionTable::empty()
     })
@@ -886,9 +923,10 @@ fn layer_label(kind: &ConfigDirKind, project_index: usize) -> String {
 /// scrubbed through the redaction table. Returns `(zip_path, contents)`
 /// pairs. Always returns at least one entry (a marker when no config exists)
 /// so `config/` is present and the export never fails on missing config.
-fn collect_config_entries(
+fn collect_config_entries_with_env(
     target: &SessionRow,
     include_generated_artifacts: bool,
+    env: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let cwd = PathBuf::from(&target.project_root);
     let layers = discover_config_dirs(&cwd);
@@ -898,7 +936,7 @@ fn collect_config_entries(
     // redaction) must not block the export — fall back to a no-op table that
     // returns input unchanged, which a disabled config would do anyway.
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    let redactor = RedactionTable::build(&extended.redact, &cwd).unwrap_or_else(|e| {
+    let redactor = RedactionTable::build_with_env(&extended.redact, &cwd, env).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "export: redaction table build failed; config scrub is a no-op");
         RedactionTable::empty()
     });
@@ -1824,8 +1862,14 @@ mod tests {
 
         let target = db.get_session(s.session_id).unwrap().unwrap();
         let bundle = collect_bundle(&db, s.session_id).unwrap();
-        let safe =
-            build_zip_with_options(&db, &target, &bundle, ExportBundleOptions::default()).unwrap();
+        let safe = build_zip_with_options_and_env(
+            &db,
+            &target,
+            &bundle,
+            ExportBundleOptions::default(),
+            &test_export_env(),
+        )
+        .unwrap();
         let safe_body = entry_names(&safe)
             .into_iter()
             .find(|name| name.starts_with("inference_requests/"))
@@ -1838,7 +1882,7 @@ mod tests {
                 .contains("trusted-secret-value")
         );
 
-        let sensitive = build_zip_with_options(
+        let sensitive = build_zip_with_options_and_env(
             &db,
             &target,
             &bundle,
@@ -1846,6 +1890,7 @@ mod tests {
                 include_sensitive: true,
                 ..ExportBundleOptions::default()
             },
+            &test_export_env(),
         )
         .unwrap();
         let sensitive_body = entry_names(&sensitive)
@@ -3748,7 +3793,7 @@ mod tests {
             .to_rfc3339();
         assert_eq!(iso, expected);
 
-        let zip = build_zip_with_options(
+        let zip = build_zip_with_options_and_env(
             &db,
             &target,
             &bundle,
@@ -3756,6 +3801,7 @@ mod tests {
                 include_generated_artifacts: true,
                 include_sensitive: false,
             },
+            &test_export_env(),
         )
         .unwrap();
         let manifest: Value =
@@ -3814,7 +3860,8 @@ mod tests {
             scan_ssh_keys: false,
             ..crate::config::extended::RedactConfig::default()
         };
-        let redactor = RedactionTable::build(&cfg, tmp.path()).unwrap();
+        let redactor =
+            RedactionTable::build_with_env(&cfg, tmp.path(), &test_export_env()).unwrap();
 
         let entries = config_entries_from_layers(&layers, &redactor, false);
         let map: BTreeMap<String, String> = entries.into_iter().collect();
@@ -3878,7 +3925,8 @@ mod tests {
             scan_ssh_keys: false,
             ..crate::config::extended::RedactConfig::default()
         };
-        let redactor = RedactionTable::build(&cfg, tmp.path()).unwrap();
+        let redactor =
+            RedactionTable::build_with_env(&cfg, tmp.path(), &test_export_env()).unwrap();
         let entries = config_entries_from_layers(&layers, &redactor, false);
         let map: BTreeMap<String, String> = entries.into_iter().collect();
 

@@ -12,19 +12,19 @@
 
 `cockpit` is a Rust-native AI coding harness. It combines an interactive terminal UI, a persistent session daemon, OpenAI-compatible provider configuration, file-locking write tools, MCP integration, and built-in agent roles for planning, coding, review, package research, and background execution.
 
-The project is early (`0.1.0`), but the codebase already has a broad surface: durable SQLite-backed sessions, prompt/context pruning, provider model catalogs, workspace trust controls, multi-agent delegation, plan execution in git worktrees, session export/import, and diagnostics.
+The project is early (`0.1.0`), but the codebase already has a broad surface: durable SQLite-backed sessions, prompt/context pruning, provider model catalogs, workspace trust controls, multi-agent delegation, session export/import, and diagnostics.
 
 ## Highlights
 
 - Codex-style TUI: run `cockpit` to open an interactive project session.
 - Headless automation: `cockpit run` streams assistant output or NDJSON events for scripts and CI.
 - Persistent daemon: sessions survive client exits and can be listed, resumed, forked, exported, and imported.
-- Multi-agent workflow: bundled `Auto`, `Build`, `builder`, `Plan`, `planner`, `Swarm`, `bee`, `Multireview`, `PlanBuild`, `explore`, and `scout` agents.
+- Multi-agent workflow: bundled `Auto`, `Build`, `builder`, `Plan`, `Swarm`, `bee`, `Multireview`, `explore`, and `scout` agents.
 - File safety: write-capable agents use daemon-arbitrated file locks plus sandbox-aware shell execution.
 - Provider flexibility: OpenAI-compatible endpoints plus templates for OpenAI, Codex OAuth, xAI/Grok, z.ai, MiniMax, OpenCode Zen, GitHub Copilot, OpenRouter, DeepSeek, Anthropic, and Xiaomi MiMo.
 - MCP support: configure streamable HTTP, stdio, or SSE MCP servers reached through the sandboxed `mcp` tool.
 - Project intelligence: tree-sitter indexes, symbol lookup, dependency/callgraph tools, package snapshots, and a docs-answering pipeline.
-- Usage insight: token/cost accounting, per-model stats, plan metrics, and debug exports.
+- Usage insight: token/cost accounting, per-model stats, and debug exports.
 
 ## Install
 
@@ -150,7 +150,6 @@ cockpit packages prune --dry-run
 | `cockpit trust set [path] --mode trust` | Store a workspace trust decision. |
 | `cockpit mcp add ...` | Add an MCP server to layered `.cockpit/mcp.json`. |
 | `cockpit mcp list` | List configured MCP servers. |
-| `cockpit plan run <slug>` | Execute a planned workflow. |
 | `cockpit completion <shell>` | Generate shell completions. |
 
 ## Configuration

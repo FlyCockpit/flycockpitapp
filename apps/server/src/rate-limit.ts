@@ -85,6 +85,111 @@ export const rpcLimiter = new RateLimiterRedis({
   }),
 });
 
+/**
+ * Instance invite limiters — stricter than the generic RPC limiter and keyed
+ * by both owner and target email to limit account-level and recipient spam.
+ */
+export const instanceInviteOwnerLimiter = new RateLimiterRedis({
+  storeClient: redisConnection,
+  keyPrefix: "rl:instance-invite:owner",
+  points: env.RATE_LIMIT_INSTANCE_INVITE_POINTS,
+  duration: env.RATE_LIMIT_INSTANCE_INVITE_DURATION,
+  blockDuration: env.RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION,
+  inMemoryBlockOnConsumed: env.RATE_LIMIT_INSTANCE_INVITE_POINTS + 1,
+  inMemoryBlockDuration: env.RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION,
+  insuranceLimiter: new RateLimiterMemory({
+    keyPrefix: "rl:instance-invite:owner:ins",
+    points: Math.ceil(env.RATE_LIMIT_INSTANCE_INVITE_POINTS * 1.5),
+    duration: env.RATE_LIMIT_INSTANCE_INVITE_DURATION,
+    blockDuration: env.RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION,
+  }),
+});
+
+export const instanceInviteTargetLimiter = new RateLimiterRedis({
+  storeClient: redisConnection,
+  keyPrefix: "rl:instance-invite:target",
+  points: env.RATE_LIMIT_INSTANCE_INVITE_POINTS,
+  duration: env.RATE_LIMIT_INSTANCE_INVITE_DURATION,
+  blockDuration: env.RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION,
+  inMemoryBlockOnConsumed: env.RATE_LIMIT_INSTANCE_INVITE_POINTS + 1,
+  inMemoryBlockDuration: env.RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION,
+  insuranceLimiter: new RateLimiterMemory({
+    keyPrefix: "rl:instance-invite:target:ins",
+    points: Math.ceil(env.RATE_LIMIT_INSTANCE_INVITE_POINTS * 1.5),
+    duration: env.RATE_LIMIT_INSTANCE_INVITE_DURATION,
+    blockDuration: env.RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION,
+  }),
+});
+
+function isInstanceInviteRpcPath(pathname: string) {
+  return (
+    pathname === "/rpc/instanceSharing/invite" ||
+    pathname === "/rpc/instanceSharing.invite" ||
+    pathname.endsWith("/instanceSharing/invite") ||
+    pathname.endsWith("/instanceSharing.invite")
+  );
+}
+
+function rpcInputFromBody(body: unknown): Record<string, unknown> | null {
+  if (!body || typeof body !== "object") return null;
+  const record = body as Record<string, unknown>;
+  if (record.input && typeof record.input === "object")
+    return record.input as Record<string, unknown>;
+  if (record.json && typeof record.json === "object") return record.json as Record<string, unknown>;
+  return record;
+}
+
+async function readInviteTargetEmail(c: Context) {
+  try {
+    const body = await c.req.raw.clone().json();
+    const input = rpcInputFromBody(body);
+    const email = input?.email;
+    return typeof email === "string" ? email.trim().toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createInstanceInviteRateLimiterMiddleware(
+  input: { ownerLimiter?: RateLimiter; targetLimiter?: RateLimiter } = {},
+) {
+  const ownerLimiter = input.ownerLimiter ?? instanceInviteOwnerLimiter;
+  const targetLimiter = input.targetLimiter ?? instanceInviteTargetLimiter;
+
+  return async (c: Context, next: Next) => {
+    if (!isInstanceInviteRpcPath(new URL(c.req.url).pathname)) {
+      await next();
+      return;
+    }
+
+    const ownerKey = "owner:" + resolveKey(c);
+    const targetEmail = await readInviteTargetEmail(c);
+    const targetKey = targetEmail ? "email:" + targetEmail : null;
+
+    try {
+      const ownerResult = await ownerLimiter.consume(ownerKey);
+      setRateLimitHeaders(c, ownerLimiter, ownerResult);
+      if (targetKey) {
+        const targetResult = await targetLimiter.consume(targetKey);
+        setRateLimitHeaders(c, targetLimiter, targetResult);
+      }
+      await next();
+    } catch (rlResult: unknown) {
+      if (rlResult instanceof RateLimiterRes) {
+        const limiter =
+          rlResult.consumedPoints > ownerLimiter.points ? ownerLimiter : targetLimiter;
+        setRateLimitHeaders(c, limiter, rlResult);
+        const retryAfter = Math.ceil(rlResult.msBeforeNext / 1000);
+        c.header("Retry-After", String(retryAfter));
+        return c.json({ error: "Too many invite attempts. Please wait and try again." }, 429);
+      }
+
+      console.error("[instance-invite-rate-limit] Redis error, failing open:", rlResult);
+      await next();
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Middleware factory
 // ---------------------------------------------------------------------------

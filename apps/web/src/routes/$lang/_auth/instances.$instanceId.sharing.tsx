@@ -23,7 +23,7 @@ import { Skeleton } from "@flycockpit/ui/components/skeleton";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { ArrowLeft, Clock, RefreshCw, Trash2, UserPlus } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
@@ -54,6 +54,7 @@ function InstanceSharingPage() {
   const { t } = useTranslation("instances");
   const queryClient = useQueryClient();
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteTwoFactorRequired, setInviteTwoFactorRequired] = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<Grant | null>(null);
   const instances = useQuery(orpc.instances.listMine.queryOptions());
   const sharing = useQuery(
@@ -65,9 +66,16 @@ function InstanceSharingPage() {
       onSuccess: async (result) => {
         await queryClient.invalidateQueries({ queryKey: orpc.instanceSharing.key() });
         toast.success(result.emailSent ? t("sharing.inviteSent") : t("sharing.inviteSaved"));
+        setInviteTwoFactorRequired(false);
         setInviteOpen(false);
       },
-      onError: (err) => toast.error(friendly(err, t("sharing.inviteError"))),
+      onError: (err) => {
+        if (isTwoFactorInviteError(err)) {
+          setInviteTwoFactorRequired(true);
+          return;
+        }
+        toast.error(friendly(err, t("sharing.inviteError")));
+      },
     }),
   );
   const revoke = useMutation(
@@ -135,9 +143,17 @@ function InstanceSharingPage() {
         </div>
         <InviteGrantDialog
           open={inviteOpen}
-          onOpenChange={setInviteOpen}
+          onOpenChange={(open) => {
+            setInviteOpen(open);
+            if (!open) setInviteTwoFactorRequired(false);
+          }}
+          lang={lang}
           isPending={invite.isPending}
-          onInvite={(value) => invite.mutate({ instanceId, ...value })}
+          showTwoFactorRequired={inviteTwoFactorRequired}
+          onInvite={(value) => {
+            setInviteTwoFactorRequired(false);
+            invite.mutate({ instanceId, ...value });
+          }}
         />
       </div>
 
@@ -208,15 +224,24 @@ function InstanceSharingPage() {
   );
 }
 
+function isTwoFactorInviteError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /two-factor|two factor/i.test(message);
+}
+
 function InviteGrantDialog({
   open,
   onOpenChange,
+  lang,
   isPending,
+  showTwoFactorRequired,
   onInvite,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  lang: string;
   isPending: boolean;
+  showTwoFactorRequired: boolean;
   onInvite: (value: {
     email: string;
     scopes: SharingScope[];
@@ -229,8 +254,17 @@ function InviteGrantDialog({
   const [projectRoot, setProjectRoot] = useState("");
   const [selectedScopes, setSelectedScopes] = useState<SharingScope[]>(["agent"]);
   const [expiresIn, setExpiresIn] = useState<ExpiryPreset>("never");
+  const [terminalConfirmEmail, setTerminalConfirmEmail] = useState("");
   const terminalSelected = selectedScopes.includes("terminal");
-  const canSubmit = email.trim().length > 0 && selectedScopes.length > 0 && !isPending;
+  const normalizedEmail = email.trim().toLowerCase();
+  const terminalConfirmed =
+    !terminalSelected || terminalConfirmEmail.trim().toLowerCase() === normalizedEmail;
+  const canSubmit =
+    normalizedEmail.length > 0 && selectedScopes.length > 0 && terminalConfirmed && !isPending;
+
+  useEffect(() => {
+    if (!terminalSelected) setTerminalConfirmEmail("");
+  }, [terminalSelected]);
 
   function toggleScope(scope: SharingScope, checked: boolean) {
     setSelectedScopes((current) => {
@@ -277,7 +311,10 @@ function InviteGrantDialog({
               inputMode="email"
               autoComplete="email"
               value={email}
-              onChange={(event) => setEmail(event.target.value)}
+              onChange={(event) => {
+                setEmail(event.target.value);
+                setTerminalConfirmEmail("");
+              }}
             />
           </div>
           <div className="space-y-2">
@@ -311,8 +348,34 @@ function InviteGrantDialog({
             </div>
           </fieldset>
           {terminalSelected ? (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive text-sm">
-              {t("sharing.terminalWarning")}
+            <div className="space-y-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
+              <p className="text-destructive">{t("sharing.terminalWarning")}</p>
+              <div className="space-y-2">
+                <Label htmlFor="share-terminal-confirm">{t("sharing.terminalConfirmLabel")}</Label>
+                <Input
+                  id="share-terminal-confirm"
+                  type="email"
+                  inputMode="email"
+                  autoComplete="off"
+                  value={terminalConfirmEmail}
+                  onChange={(event) => setTerminalConfirmEmail(event.target.value)}
+                />
+                <p className="text-muted-foreground text-xs">
+                  {t("sharing.terminalConfirmHint", { email: normalizedEmail || "-" })}
+                </p>
+              </div>
+            </div>
+          ) : null}
+          {showTwoFactorRequired ? (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
+              <p className="text-destructive">{t("sharing.twoFactorRequired")}</p>
+              <Link
+                to="/$lang/settings/security"
+                params={{ lang }}
+                className="mt-2 inline-flex text-primary underline-offset-4 hover:underline"
+              >
+                {t("sharing.enableTwoFactorLink")}
+              </Link>
             </div>
           ) : null}
           <div className="space-y-2">

@@ -3,6 +3,8 @@ import { createRouterClient, ORPCError } from "@orpc/server";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
+import { createInstanceCredential } from "../lib/instance-credentials";
+import { ingestRemoteInstanceAuditEvents } from "../lib/instance-sharing";
 import { instanceSharingRouter } from "./instance-sharing";
 
 vi.mock("@flycockpit/db", async () => {
@@ -36,6 +38,7 @@ const db = prisma as unknown as {
   appSetting: { findMany: MockInstance };
   cockpitInstance: { findUnique: MockInstance };
   user: { findUnique: MockInstance };
+  notification: { create: MockInstance };
   instanceAccessGrant: {
     findMany: MockInstance;
     findFirst: MockInstance;
@@ -44,7 +47,7 @@ const db = prisma as unknown as {
     update: MockInstance;
     updateMany: MockInstance;
   };
-  instanceAuditEvent: { create: MockInstance; findMany: MockInstance };
+  instanceAuditEvent: { create: MockInstance; createMany: MockInstance; findMany: MockInstance };
 };
 const sendEmailMock = sendEmail as unknown as MockInstance;
 const renderShareInviteMock = renderShareInvite as unknown as MockInstance;
@@ -136,7 +139,9 @@ describe("instanceSharingRouter", () => {
     db.instanceAccessGrant.updateMany.mockResolvedValue({ count: 0 });
     db.instanceAccessGrant.create.mockImplementation(async ({ data }) => grant(data));
     db.instanceAccessGrant.update.mockImplementation(async ({ data }) => grant(data));
+    db.notification.create.mockResolvedValue({ id: "notification-1" });
     db.instanceAuditEvent.create.mockResolvedValue({ id: "audit-1" });
+    db.instanceAuditEvent.createMany.mockResolvedValue({ count: 1 });
     db.instanceAuditEvent.findMany.mockResolvedValue([]);
     sendEmailMock.mockResolvedValue(undefined);
   });
@@ -192,6 +197,14 @@ describe("instanceSharingRouter", () => {
     expect(renderShareInviteMock).toHaveBeenCalledWith(
       expect.objectContaining({ existingUser: true, locale: "es-MX" }),
     );
+    expect(db.notification.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "grantee-1",
+        instanceId: "instance-1",
+        type: "INSTANCE_SHARE_INVITE",
+        deepLinkUrl: "/es-MX/instances",
+      }),
+    });
   });
 
   it("rejects non-owners before creating grants", async () => {
@@ -250,6 +263,24 @@ describe("instanceSharingRouter", () => {
     });
   });
 
+  it("rejects invite acceptance until the matching email is verified", async () => {
+    const client = createRouterClient(instanceSharingRouter, {
+      context: buildContext({
+        id: "grantee-1",
+        email: "grantee@example.test",
+        emailVerified: false,
+      }),
+    });
+
+    await expect(client.accept({ grantId: "grant-1" })).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.message).toMatch(/verify/i);
+      return true;
+    });
+    expect(db.instanceAccessGrant.findFirst).not.toHaveBeenCalled();
+    expect(db.instanceAccessGrant.update).not.toHaveBeenCalled();
+  });
+
   it("declines pending grants", async () => {
     db.instanceAccessGrant.findFirst.mockResolvedValue(grant());
     db.instanceAccessGrant.update.mockResolvedValue(grant({ status: "DECLINED" }));
@@ -280,6 +311,79 @@ describe("instanceSharingRouter", () => {
         body: expect.stringContaining('"disconnect_user"'),
       }),
     );
+  });
+
+  it("renews only expired grants and uses the stored scope for default expiry", async () => {
+    db.instanceAccessGrant.findUnique.mockResolvedValue(
+      grant({ status: "EXPIRED", scope: "PROJECT_FILES", granteeUserId: "grantee-1" }),
+    );
+    db.instanceAccessGrant.update.mockImplementation(async ({ data }) =>
+      grant({ status: data.status, expiresAt: data.expiresAt, granteeUserId: "grantee-1" }),
+    );
+    const client = createRouterClient(instanceSharingRouter, { context: buildContext() });
+
+    const result = await client.renew({ grantId: "grant-1", expiresIn: "never" });
+
+    expect(result).toMatchObject({ status: "active", expiresAt: null });
+    expect(db.instanceAccessGrant.update).toHaveBeenCalledWith({
+      where: { id: "grant-1" },
+      data: expect.objectContaining({ status: "ACTIVE", expiresAt: null, revokedAt: null }),
+    });
+  });
+
+  it.each(["REVOKED", "DECLINED"])("rejects renewing %s grants", async (status) => {
+    db.instanceAccessGrant.findUnique.mockResolvedValue(grant({ status }));
+    const client = createRouterClient(instanceSharingRouter, { context: buildContext() });
+
+    await expect(client.renew({ grantId: "grant-1", expiresIn: "7d" })).rejects.toSatisfy(
+      (error: ORPCError) => {
+        expect(error.code).toBe("BAD_REQUEST");
+        return true;
+      },
+    );
+    expect(db.instanceAccessGrant.update).not.toHaveBeenCalled();
+  });
+
+  it("ingests remote audit events idempotently with an instance token", async () => {
+    const credential = createInstanceCredential();
+    db.cockpitInstance.findUnique.mockResolvedValue(
+      instance({ secretPrefix: credential.prefix, secretHash: credential.hash }),
+    );
+    db.instanceAuditEvent.createMany.mockResolvedValue({ count: 1 });
+
+    const result = await ingestRemoteInstanceAuditEvents({
+      instanceId: "instance-1",
+      instanceToken: credential.token,
+      events: [{ clientEventId: "client-event-1", kind: "remote_command", metadata: { ok: true } }],
+    });
+
+    expect(result).toEqual({ received: 1, ingested: 1 });
+    expect(db.instanceAuditEvent.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          instanceId: "instance-1",
+          clientEventId: "client-event-1",
+          kind: "remote_command",
+        }),
+      ],
+      skipDuplicates: true,
+    });
+  });
+
+  it("rejects remote audit ingest with a bad instance token", async () => {
+    db.cockpitInstance.findUnique.mockResolvedValue(instance());
+
+    await expect(
+      ingestRemoteInstanceAuditEvents({
+        instanceId: "instance-1",
+        instanceToken: "bad-token",
+        events: [{ clientEventId: "client-event-1", kind: "remote_command" }],
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("UNAUTHORIZED");
+      return true;
+    });
+    expect(db.instanceAuditEvent.createMany).not.toHaveBeenCalled();
   });
 
   it("surfaces pending grants for a newly signed-in matching email", async () => {

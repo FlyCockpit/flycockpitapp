@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createContext } from "@flycockpit/api/context";
 import { getPublicDeploymentProfile } from "@flycockpit/api/lib/deployment-profile";
+import { ingestRemoteInstanceAuditEvents } from "@flycockpit/api/lib/instance-sharing";
 import {
   ingestAttentionNotification,
   parseRelayAttentionIngest,
@@ -36,6 +37,7 @@ import { deviceAdminGate } from "./device-admin-gate.js";
 import { mcpApp } from "./mcp/index.js";
 import {
   authLimiter,
+  createInstanceInviteRateLimiterMiddleware,
   createRateLimiterMiddleware,
   rpcLimiter,
   signupLimiter,
@@ -202,6 +204,26 @@ app.post("/api/relay/control-ingest", async (c) => {
   }
 });
 
+app.post("/api/relay/audit-ingest", async (c) => {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "bad_json" }, 400);
+  }
+
+  try {
+    const result = await ingestRemoteInstanceAuditEvents(body);
+    return c.json({ ok: true, result });
+  } catch (err) {
+    if (err instanceof ORPCError) {
+      const status = err.status >= 400 && err.status <= 599 ? err.status : 400;
+      return c.json({ error: err.code, message: err.message }, status as 400);
+    }
+    return c.json({ error: "bad_request" }, 400);
+  }
+});
+
 // Liveness probe — answers whether this Node process can serve HTTP. Keep this
 // independent of external services so orchestrators do not restart healthy app
 // containers during a transient Postgres/Redis failover.
@@ -332,6 +354,10 @@ app.use("/sw/*", sessionMiddleware);
 // the endpoint cannot be used to detect whether the user holds an admin role.
 app.use("/mcp", createRateLimiterMiddleware(rpcLimiter));
 app.route("/mcp", mcpApp);
+
+// Rate limit instance sharing invites before the general RPC limiter so owner
+// and target-email spam budgets cannot hide inside normal API traffic.
+app.use("/rpc/*", createInstanceInviteRateLimiterMiddleware());
 
 // Rate limit RPC endpoint — general API traffic.
 // Uses Redis-backed limiter with in-memory insurance fallback (fail-open).

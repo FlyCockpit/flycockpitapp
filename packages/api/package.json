@@ -65,6 +65,9 @@
     },
     "./lib/notifications": {
       "default": "./src/lib/notifications.ts"
+    },
+    "./lib/instance-sharing": {
+      "default": "./src/lib/instance-sharing.ts"
     }
   },
   "scripts": {

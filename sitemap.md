@@ -22,6 +22,12 @@ All app routes are prefixed with a locale segment: `/{lang}/...`. Supported loca
 | Route | Purpose |
 | --- | --- |
 | `/{lang}/dashboard` | Signed-in user dashboard. |
+| `/{lang}/instances` | Registered and shared cockpit instances. |
+| `/{lang}/instances/$instanceId` | Instance overview and remote workspace entrypoint. |
+| `/{lang}/instances/$instanceId/terminal` | Browser terminal for an authorized instance. |
+| `/{lang}/instances/$instanceId/projects/$projectId` | Remote project session workspace. |
+| `/{lang}/instances/$instanceId/projects/$projectId/files` | Remote project file browser. |
+| `/{lang}/instances/$instanceId/sharing` | Instance sharing grants, invitations, and audit log. |
 | `/{lang}/settings` | Account settings. |
 | `/{lang}/settings/profile` | Profile settings. |
 | `/{lang}/settings/security` | Password, sessions, two-factor auth, and passkeys. |

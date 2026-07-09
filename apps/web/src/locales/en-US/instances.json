@@ -196,7 +196,8 @@
       "grant_accepted": "Grant accepted",
       "grant_declined": "Grant declined",
       "grant_revoked": "Grant revoked",
-      "grant_renewed": "Grant renewed"
+      "grant_renewed": "Grant renewed",
+      "grant_revoked_account_deleted": "Grant revoked after account deletion"
     },
     "loadFailed": "Could not load sharing settings.",
     "pendingTitle": "Invitations",
@@ -209,7 +210,11 @@
     "acceptError": "Could not accept that invitation.",
     "declineError": "Could not decline that invitation.",
     "sharedWithMeTitle": "Shared with me",
-    "sharedWithMeDescription": "Instances other users have explicitly shared with this account."
+    "sharedWithMeDescription": "Instances other users have explicitly shared with this account.",
+    "terminalConfirmLabel": "Confirm terminal recipient email",
+    "terminalConfirmHint": "Type {{email}} to enable terminal access for this invite.",
+    "twoFactorRequired": "Enable two-factor authentication before granting terminal access.",
+    "enableTwoFactorLink": "Open security settings"
   },
   "files": {
     "title": "Files",

@@ -196,7 +196,8 @@
       "grant_accepted": "Permiso aceptado",
       "grant_declined": "Permiso rechazado",
       "grant_revoked": "Permiso revocado",
-      "grant_renewed": "Permiso renovado"
+      "grant_renewed": "Permiso renovado",
+      "grant_revoked_account_deleted": "Permiso revocado tras eliminar la cuenta"
     },
     "loadFailed": "No se pudo cargar la configuración de uso compartido.",
     "pendingTitle": "Invitaciones",
@@ -209,7 +210,11 @@
     "acceptError": "No se pudo aceptar esa invitación.",
     "declineError": "No se pudo rechazar esa invitación.",
     "sharedWithMeTitle": "Compartidas conmigo",
-    "sharedWithMeDescription": "Instancias que otros usuarios compartieron explícitamente con esta cuenta."
+    "sharedWithMeDescription": "Instancias que otros usuarios compartieron explícitamente con esta cuenta.",
+    "terminalConfirmLabel": "Confirmar correo para terminal",
+    "terminalConfirmHint": "Escribe {{email}} para habilitar acceso de terminal en esta invitación.",
+    "twoFactorRequired": "Activa la autenticación de dos factores antes de conceder acceso de terminal.",
+    "enableTwoFactorLink": "Abrir configuración de seguridad"
   },
   "files": {
     "title": "Archivos",

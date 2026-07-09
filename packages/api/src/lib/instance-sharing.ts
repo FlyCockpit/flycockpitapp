@@ -1,6 +1,8 @@
 import prisma from "@flycockpit/db";
 import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
+import { z } from "zod";
+import { parseInstanceToken, verifyInstanceSecret } from "./instance-credentials";
 import type { RelayGrant, RelayGrantScope } from "./relay-tokens";
 
 export const sharingScopes = ["terminal", "agent", "agent_readonly", "project_files"] as const;
@@ -105,6 +107,7 @@ export async function publishGrantRevocation(input: { userId: string; instanceId
 export async function recordInstanceAuditEvent(input: {
   instanceId: string;
   actorUserId?: string | null;
+  clientEventId?: string | null;
   kind: string;
   metadata: unknown;
 }) {
@@ -112,6 +115,7 @@ export async function recordInstanceAuditEvent(input: {
     data: {
       instanceId: input.instanceId,
       actorUserId: input.actorUserId ?? null,
+      clientEventId: input.clientEventId ?? null,
       kind: input.kind,
       metadataJson: JSON.stringify(input.metadata),
     },
@@ -185,4 +189,124 @@ export async function requireActiveInstanceForAccess(instanceId: string) {
     throw new ORPCError("FORBIDDEN", { message: "This instance has been revoked." });
   }
   return instance;
+}
+
+const remoteAuditEventSchema = z
+  .object({
+    id: z.string().trim().min(1).max(160).optional(),
+    eventId: z.string().trim().min(1).max(160).optional(),
+    clientEventId: z.string().trim().min(1).max(160).optional(),
+    kind: z.string().trim().min(1).max(120),
+    occurredAt: z.string().datetime().optional(),
+    actorUserId: z.string().trim().min(1).max(128).optional(),
+    principalTag: z.string().trim().min(1).max(256).optional(),
+    sessionId: z.string().trim().min(1).max(256).optional(),
+    projectRoot: z.string().trim().min(1).max(4096).optional(),
+    metadata: z.unknown().optional(),
+  })
+  .strict()
+  .refine((event) => event.clientEventId || event.eventId || event.id, {
+    message: "Remote audit events require a client event id.",
+  });
+
+export const remoteAuditIngestSchema = z
+  .object({
+    instanceId: z.string().trim().min(1).max(128),
+    instanceToken: z.string().trim().min(1),
+    events: z.array(remoteAuditEventSchema).min(1).max(100),
+  })
+  .strict();
+
+function clientEventIdFor(event: z.infer<typeof remoteAuditEventSchema>) {
+  return event.clientEventId ?? event.eventId ?? event.id ?? "";
+}
+
+async function requireActiveInstanceForToken(instanceId: string, instanceToken: string) {
+  const parsed = parseInstanceToken(instanceToken);
+  if (!parsed) throw new ORPCError("UNAUTHORIZED", { message: "Invalid instance token." });
+
+  const instance = await prisma.cockpitInstance.findUnique({ where: { id: instanceId } });
+  if (!instance || instance.secretPrefix !== parsed.prefix) {
+    throw new ORPCError("UNAUTHORIZED", { message: "Invalid instance token." });
+  }
+  if (String(instance.status) !== "ACTIVE" || instance.revokedAt) {
+    throw new ORPCError("FORBIDDEN", { message: "This instance has been revoked." });
+  }
+  if (!verifyInstanceSecret(parsed.secret, instance.secretHash)) {
+    throw new ORPCError("UNAUTHORIZED", { message: "Invalid instance token." });
+  }
+  return instance;
+}
+
+export async function ingestRemoteInstanceAuditEvents(body: unknown) {
+  const parsed = remoteAuditIngestSchema.parse(body);
+  const instance = await requireActiveInstanceForToken(parsed.instanceId, parsed.instanceToken);
+  const data = parsed.events.map((event) => ({
+    instanceId: instance.id,
+    actorUserId: null,
+    clientEventId: clientEventIdFor(event),
+    kind: event.kind,
+    metadataJson: JSON.stringify({
+      occurredAt: event.occurredAt ?? null,
+      actorUserId: event.actorUserId ?? null,
+      principalTag: event.principalTag ?? null,
+      sessionId: event.sessionId ?? null,
+      projectRoot: event.projectRoot ?? null,
+      metadata: event.metadata ?? null,
+    }),
+  }));
+
+  const result = await prisma.instanceAuditEvent.createMany({
+    data,
+    skipDuplicates: true,
+  });
+  return { received: data.length, ingested: result.count };
+}
+
+export async function revokeInstanceAccessGrantsForDeletedUser(input: {
+  userId: string;
+  actorUserId?: string | null;
+}) {
+  const grants = await prisma.instanceAccessGrant.findMany({
+    where: {
+      granteeUserId: input.userId,
+      status: { in: ["PENDING", "ACTIVE", "EXPIRED"] },
+    },
+    select: { id: true, instanceId: true, status: true, scope: true, projectRoot: true },
+  });
+  if (grants.length === 0) return { revokedCount: 0, disconnectsSent: 0 };
+
+  const revokedAt = new Date();
+  await prisma.instanceAccessGrant.updateMany({
+    where: { id: { in: grants.map((grant) => grant.id) } },
+    data: { status: "REVOKED", revokedAt },
+  });
+
+  let disconnectsSent = 0;
+  const disconnectSentByInstance = new Map<string, boolean>();
+  for (const instanceId of new Set(grants.map((grant) => grant.instanceId))) {
+    const sent = await publishGrantRevocation({ userId: input.userId, instanceId });
+    disconnectSentByInstance.set(instanceId, sent);
+    if (sent) disconnectsSent += 1;
+  }
+
+  await Promise.all(
+    grants.map((grant) =>
+      recordInstanceAuditEvent({
+        instanceId: grant.instanceId,
+        actorUserId: input.actorUserId ?? null,
+        kind: "grant_revoked_account_deleted",
+        metadata: {
+          grantId: grant.id,
+          granteeUserId: input.userId,
+          previousStatus: String(grant.status).toLowerCase(),
+          scope: fromDbScope(grant.scope),
+          projectRoot: grant.projectRoot,
+          disconnectSent: disconnectSentByInstance.get(grant.instanceId) ?? false,
+        },
+      }),
+    ),
+  );
+
+  return { revokedCount: grants.length, disconnectsSent };
 }

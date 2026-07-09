@@ -16,7 +16,12 @@ vi.mock("@flycockpit/db", async () => {
 });
 
 vi.mock("@flycockpit/env/server", () => ({
-  env: { BETTER_AUTH_URL: "http://localhost:3000" },
+  env: {
+    BETTER_AUTH_SECRET: "1234567890abcdef1234567890abcdef",
+    BETTER_AUTH_URL: "http://localhost:3000",
+    COCKPIT_RELAY_URL: "wss://relay.example.test/ws",
+    RELAY_CONTROL_SECRET: "1234567890abcdef1234567890abcdef",
+  },
   ADMIN_EMAILS: new Set<string>(),
 }));
 
@@ -55,6 +60,8 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   session: { deleteMany: MockInstance };
+  instanceAccessGrant: { findMany: MockInstance; updateMany: MockInstance };
+  instanceAuditEvent: { create: MockInstance };
   $transaction: MockInstance;
 };
 
@@ -105,6 +112,10 @@ function buildContext(
 describe("usersRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    global.fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    db.instanceAccessGrant.findMany.mockResolvedValue([]);
+    db.instanceAccessGrant.updateMany.mockResolvedValue({ count: 0 });
+    db.instanceAuditEvent.create.mockResolvedValue({ id: "audit-1" });
   });
 
   describe("auth gates", () => {
@@ -380,14 +391,41 @@ describe("usersRouter", () => {
   });
 
   describe("remove", () => {
-    it("hard-deletes when no FK constraint blocks it", async () => {
+    it("revokes grantee grants and hard-deletes when no FK constraint blocks it", async () => {
       db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      db.instanceAccessGrant.findMany.mockResolvedValue([
+        {
+          id: "grant-1",
+          instanceId: "instance-1",
+          status: "ACTIVE",
+          scope: "AGENT",
+          projectRoot: "/repo",
+        },
+      ]);
       db.user.delete.mockResolvedValue({});
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
       const res = await client.remove({ userId: "other-user-id" });
 
       expect(res).toEqual({ success: true });
+      expect(db.instanceAccessGrant.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ["grant-1"] } },
+        data: expect.objectContaining({ status: "REVOKED", revokedAt: expect.any(Date) }),
+      });
+      expect(db.instanceAuditEvent.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          instanceId: "instance-1",
+          actorUserId: "admin-user-id",
+          kind: "grant_revoked_account_deleted",
+        }),
+      });
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://relay.example.test/control",
+        expect.objectContaining({
+          method: "POST",
+          body: expect.stringContaining('"disconnect_user"'),
+        }),
+      );
       expect(db.user.delete).toHaveBeenCalledWith({ where: { id: "other-user-id" } });
     });
 

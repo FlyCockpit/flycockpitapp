@@ -53,6 +53,9 @@ export const env = createEnv({
     RATE_LIMIT_SIGNUP_POINTS: z.coerce.number().int().positive().default(3),
     RATE_LIMIT_SIGNUP_DURATION: z.coerce.number().int().positive().default(3600),
     RATE_LIMIT_SIGNUP_BLOCK_DURATION: z.coerce.number().int().positive().default(3600),
+    RATE_LIMIT_INSTANCE_INVITE_POINTS: z.coerce.number().int().positive().default(10),
+    RATE_LIMIT_INSTANCE_INVITE_DURATION: z.coerce.number().int().positive().default(3600),
+    RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION: z.coerce.number().int().positive().default(3600),
     // Number of reverse-proxy hops in front of the app, for deriving the real
     // client IP used as the anonymous rate-limit key.
     //

@@ -4,6 +4,7 @@ enum NotificationType {
   TURN_DONE
   TURN_ERROR
   SCHEDULE_DONE
+  INSTANCE_SHARE_INVITE
 }
 
 enum NotificationDeliveryVia {

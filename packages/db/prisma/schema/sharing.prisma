@@ -45,16 +45,18 @@ model InstanceAccessGrant {
 }
 
 model InstanceAuditEvent {
-  id           String          @id @default(cuid(2))
-  createdAt    DateTime        @default(now())
-  updatedAt    DateTime        @default(now()) @updatedAt
-  instanceId   String
-  actorUserId  String?
-  kind         String
-  metadataJson String
-  Instance     CockpitInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Actor        User?           @relation("InstanceAuditEventActor", fields: [actorUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  id            String          @id @default(cuid(2))
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @default(now()) @updatedAt
+  instanceId    String
+  actorUserId   String?
+  clientEventId String?
+  kind          String
+  metadataJson  String
+  Instance      CockpitInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Actor         User?           @relation("InstanceAuditEventActor", fields: [actorUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
+  @@unique([instanceId, clientEventId])
   @@index([instanceId, createdAt])
   @@index([actorUserId, createdAt])
   @@map("instance_audit_event")

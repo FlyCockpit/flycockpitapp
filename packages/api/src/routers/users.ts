@@ -8,6 +8,7 @@ import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 
 import { adminOr404Procedure } from "../index";
+import { revokeInstanceAccessGrantsForDeletedUser } from "../lib/instance-sharing";
 
 // Roles surfaced in the admin UI. Better-auth itself stores `role` as a free-
 // form string (and supports comma-separated lists), but the admin dashboard
@@ -282,6 +283,10 @@ export const usersRouter = {
     // cascade. Any remaining restricted relation produces a Prisma constraint
     // error, which we surface as archive guidance instead.
     try {
+      await revokeInstanceAccessGrantsForDeletedUser({
+        userId: input.userId,
+        actorUserId: context.session.user.id,
+      });
       await prisma.user.delete({ where: { id: input.userId } });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to delete user";

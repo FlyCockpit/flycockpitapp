@@ -135,6 +135,33 @@ function deepLink(locale: string, instanceId: string, event: AttentionNotificati
   return `/${locale}/instances/${encodeURIComponent(instanceId)}/projects/${projectId}?${params.toString()}`;
 }
 
+export async function createInstanceShareInviteNotification(input: {
+  userId: string;
+  instanceId: string;
+  instanceName: string;
+  ownerName: string;
+  grantIds: string[];
+  locale?: string | null;
+}) {
+  const eventId =
+    "instance-share-invite:" + input.instanceId + ":" + input.grantIds.sort().join(",");
+  const locale = userLocale(input.locale);
+  return prisma.notification.create({
+    data: {
+      eventId,
+      userId: input.userId,
+      instanceId: input.instanceId,
+      sessionRef: null,
+      projectRoot: null,
+      type: "INSTANCE_SHARE_INVITE",
+      title: input.ownerName + " shared " + input.instanceName + " with you",
+      body: "Open your instances to review the invitation.",
+      deepLinkUrl: `/${locale}/instances`,
+      deliveredVia: "TOAST",
+    },
+  });
+}
+
 async function sendWebPushToUser(
   userId: string,
   payload: { title: string; body: string; url: string },

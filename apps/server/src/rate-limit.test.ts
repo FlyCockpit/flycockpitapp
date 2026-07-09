@@ -24,6 +24,9 @@ vi.mock("@flycockpit/env/server", () => ({
     RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
     RATE_LIMIT_RPC_POINTS: 5,
     RATE_LIMIT_RPC_DURATION: 60,
+    RATE_LIMIT_INSTANCE_INVITE_POINTS: 2,
+    RATE_LIMIT_INSTANCE_INVITE_DURATION: 3600,
+    RATE_LIMIT_INSTANCE_INVITE_BLOCK_DURATION: 3600,
     TRUST_PROXY_HOPS: undefined,
   },
 }));
@@ -51,7 +54,9 @@ vi.mock("rate-limiter-flexible", async (importOriginal) => {
   };
 });
 
-const { createRateLimiterMiddleware } = await import("./rate-limit.js");
+const { createInstanceInviteRateLimiterMiddleware, createRateLimiterMiddleware } = await import(
+  "./rate-limit.js"
+);
 
 // ---------------------------------------------------------------------------
 // Test: rate limiter middleware returns 429 with correct headers
@@ -179,5 +184,48 @@ describe("createRateLimiterMiddleware", () => {
       headers: { "x-forwarded-for": "203.0.113.99" },
     });
     expect(rejected.status).toBe(429);
+  });
+});
+
+describe("createInstanceInviteRateLimiterMiddleware", () => {
+  it("limits instance invites by owner and target email", async () => {
+    const ownerLimiter = new RateLimiterMemory({
+      keyPrefix: "invite-owner",
+      points: 1,
+      duration: 60,
+    });
+    const targetLimiter = new RateLimiterMemory({
+      keyPrefix: "invite-target",
+      points: 1,
+      duration: 60,
+    });
+    const app = new Hono<{ Variables: { session: { user: { id: string } } } }>();
+    app.use("/*", async (c, next) => {
+      c.set("session", { user: { id: c.req.header("x-user") ?? "owner-1" } });
+      await next();
+    });
+    app.use("/rpc/*", createInstanceInviteRateLimiterMiddleware({ ownerLimiter, targetLimiter }));
+    app.post("/rpc/instanceSharing/invite", (c) => c.text("ok"));
+
+    const first = await app.request("/rpc/instanceSharing/invite", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-user": "owner-1" },
+      body: JSON.stringify({ email: "Target@Example.Test" }),
+    });
+    expect(first.status).toBe(200);
+
+    const sameOwner = await app.request("/rpc/instanceSharing/invite", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-user": "owner-1" },
+      body: JSON.stringify({ email: "other@example.test" }),
+    });
+    expect(sameOwner.status).toBe(429);
+
+    const sameTarget = await app.request("/rpc/instanceSharing/invite", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-user": "owner-2" },
+      body: JSON.stringify({ email: "target@example.test" }),
+    });
+    expect(sameTarget.status).toBe(429);
   });
 });

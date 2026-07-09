@@ -7,6 +7,7 @@ import { protectedProcedure } from "../index";
 import {
   activeSharedRelayGrantsForUser,
   expireStaleInstanceAccessGrants,
+  fromDbScope,
   normalizeEmail,
   projectRootForGrant,
   projectRootKey,
@@ -18,6 +19,7 @@ import {
   sharingScopes,
   toDbScope,
 } from "../lib/instance-sharing";
+import { createInstanceShareInviteNotification } from "../lib/notifications";
 
 const scopeSchema = z.enum(sharingScopes);
 const expirySchema = z.enum(["24h", "7d", "30d", "never"]);
@@ -229,8 +231,24 @@ export const instanceSharingRouter = {
       });
     }
 
+    const grants = [...created, ...reused];
+    if (grantee && grants.length > 0) {
+      try {
+        await createInstanceShareInviteNotification({
+          userId: grantee.id,
+          instanceId: input.instanceId,
+          instanceName: instance.displayName,
+          ownerName: context.session.user.name || context.session.user.email,
+          grantIds: grants.map((grant) => grant.id),
+          locale: grantee.locale,
+        });
+      } catch (err) {
+        console.error("[instance-sharing.invite] failed to create invite notification", err);
+      }
+    }
+
     let emailSent = false;
-    if (created.length > 0 || reused.length > 0) {
+    if (grants.length > 0) {
       try {
         const locale = grantee?.locale ?? context.session.user.locale ?? "en-US";
         const { subject, html } = renderShareInvite({
@@ -249,11 +267,16 @@ export const instanceSharingRouter = {
       }
     }
 
-    return { grants: [...created, ...reused].map(serializeGrant), emailSent };
+    return { grants: grants.map(serializeGrant), emailSent };
   }),
 
   accept: protectedProcedure.input(grantIdInput).handler(async ({ input, context }) => {
     await expireStaleInstanceAccessGrants();
+    if (context.session.user.emailVerified !== true) {
+      throw new ORPCError("FORBIDDEN", {
+        message: "Verify your email address before accepting this invite.",
+      });
+    }
     const email = normalizeEmail(context.session.user.email);
     const grant = await prisma.instanceAccessGrant.findFirst({
       where: { id: input.grantId, granteeEmail: email, status: "PENDING" },
@@ -319,7 +342,10 @@ export const instanceSharingRouter = {
     const grant = await prisma.instanceAccessGrant.findUnique({ where: { id: input.grantId } });
     if (!grant) throw new ORPCError("NOT_FOUND", { message: "Grant not found." });
     await requireOwnedInstance(grant.instanceId, context.session.user.id);
-    const scope = String(grant.scope) === "TERMINAL" ? "terminal" : "agent";
+    if (String(grant.status) !== "EXPIRED") {
+      throw new ORPCError("BAD_REQUEST", { message: "Only expired grants can be renewed." });
+    }
+    const scope = fromDbScope(grant.scope);
     const expiresAt = expiryDate([scope], input.expiresIn);
     const updated = await prisma.instanceAccessGrant.update({
       where: { id: grant.id },

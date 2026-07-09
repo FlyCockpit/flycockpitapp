@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::config::extended::{ApprovalMode, LlmMode};
 use crate::config::providers::ModelTrust;
+use crate::tools::sandbox_mode::SandboxMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickModelChoice {
@@ -37,7 +38,9 @@ pub struct QuickCurrent {
     pub recursion_enabled: bool,
     pub recursion_depth: u32,
     pub trusted_only: bool,
-    pub sandbox_enabled: bool,
+    pub sandbox_mode: SandboxMode,
+    pub container_network_enabled: bool,
+    pub container_availability: crate::container::ContainerAvailability,
     pub approval_mode: ApprovalMode,
     pub active_model: Option<(String, String)>,
 }
@@ -47,7 +50,8 @@ pub struct QuickCommit {
     pub llm_mode: Option<LlmMode>,
     pub recursion: Option<(bool, u32)>,
     pub trusted_only: Option<bool>,
-    pub sandbox_enabled: Option<bool>,
+    pub sandbox_mode: Option<SandboxMode>,
+    pub container_network_enabled: Option<bool>,
     pub approval_mode: Option<ApprovalMode>,
     pub active_model: Option<(String, String)>,
 }
@@ -91,7 +95,8 @@ pub struct QuickDialog {
     staged_llm_mode: Option<LlmMode>,
     staged_recursion: Option<RecursionChoice>,
     staged_trusted_only: Option<bool>,
-    staged_sandbox_enabled: Option<bool>,
+    staged_sandbox_mode: Option<SandboxMode>,
+    staged_container_network_enabled: Option<bool>,
     staged_approval_mode: Option<ApprovalMode>,
     staged_model: Option<usize>,
 }
@@ -145,7 +150,8 @@ impl QuickDialog {
             staged_llm_mode: None,
             staged_recursion: None,
             staged_trusted_only: None,
-            staged_sandbox_enabled: None,
+            staged_sandbox_mode: None,
+            staged_container_network_enabled: None,
             staged_approval_mode: None,
             staged_model: None,
         };
@@ -254,7 +260,10 @@ impl QuickDialog {
             .position(|choice| *choice == self.current_recursion())
             .unwrap_or(0);
         self.cursors[2] = usize::from(self.current.trusted_only);
-        self.cursors[3] = if self.current.sandbox_enabled { 0 } else { 1 };
+        self.cursors[3] = sandbox_mode_options()
+            .iter()
+            .position(|mode| *mode == self.current.sandbox_mode)
+            .unwrap_or(1);
         self.cursors[4] = approval_options()
             .iter()
             .position(|mode| *mode == self.current.approval_mode)
@@ -288,7 +297,8 @@ impl QuickDialog {
         match tab {
             Tab::Mode => mode_options().len(),
             Tab::Recursion => recursion_options().len(),
-            Tab::Trust | Tab::Sandbox => 2,
+            Tab::Trust => 2,
+            Tab::Sandbox => sandbox_mode_options().len() + 1,
             Tab::Permissions => approval_options().len(),
             Tab::Model => self.models.len().max(1),
         }
@@ -306,7 +316,22 @@ impl QuickDialog {
                 self.staged_trusted_only = Some(self.cursors[self.tab] == 1);
             }
             Tab::Sandbox => {
-                self.staged_sandbox_enabled = Some(self.cursors[self.tab] == 0);
+                let cursor = self.cursors[self.tab];
+                let modes = sandbox_mode_options();
+                if let Some(mode) = modes.get(cursor).copied() {
+                    if mode.is_container() && !self.current.container_availability.available {
+                        return;
+                    }
+                    self.staged_sandbox_mode = Some(mode);
+                } else {
+                    let active_mode = self
+                        .staged_sandbox_mode
+                        .unwrap_or(self.current.sandbox_mode);
+                    if active_mode.is_container() {
+                        self.staged_container_network_enabled =
+                            Some(!self.active_container_network_enabled());
+                    }
+                }
             }
             Tab::Permissions => {
                 self.staged_approval_mode = Some(approval_options()[self.cursors[self.tab]]);
@@ -317,6 +342,11 @@ impl QuickDialog {
                 }
             }
         }
+    }
+
+    fn active_container_network_enabled(&self) -> bool {
+        self.staged_container_network_enabled
+            .unwrap_or(self.current.container_network_enabled)
     }
 
     fn commit(&self) -> QuickCommit {
@@ -339,10 +369,15 @@ impl QuickDialog {
         {
             commit.trusted_only = Some(enabled);
         }
-        if let Some(enabled) = self.staged_sandbox_enabled
-            && enabled != self.current.sandbox_enabled
+        if let Some(mode) = self.staged_sandbox_mode
+            && mode != self.current.sandbox_mode
         {
-            commit.sandbox_enabled = Some(enabled);
+            commit.sandbox_mode = Some(mode);
+        }
+        if let Some(enabled) = self.staged_container_network_enabled
+            && enabled != self.current.container_network_enabled
+        {
+            commit.container_network_enabled = Some(enabled);
         }
         if let Some(mode) = self.staged_approval_mode
             && mode != self.current.approval_mode
@@ -431,24 +466,40 @@ impl QuickDialog {
                     )
                 })
                 .collect(),
-            Tab::Sandbox => [true, false]
-                .iter()
-                .enumerate()
-                .map(|(i, enabled)| {
-                    self.option_line(
-                        i,
-                        if *enabled { "on" } else { "off" },
-                        if *enabled {
-                            "shell filesystem sandboxing enabled"
-                        } else {
-                            "shell filesystem sandboxing disabled for this session"
-                        },
-                        self.current.sandbox_enabled == *enabled,
-                        self.staged_sandbox_enabled == Some(*enabled),
-                        false,
-                    )
-                })
-                .collect(),
+            Tab::Sandbox => {
+                let mut lines: Vec<Line<'static>> = sandbox_mode_options()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mode)| {
+                        let disabled =
+                            mode.is_container() && !self.current.container_availability.available;
+                        self.option_line(
+                            i,
+                            sandbox_mode_label(*mode),
+                            &sandbox_mode_description(*mode, &self.current.container_availability),
+                            self.current.sandbox_mode == *mode,
+                            self.staged_sandbox_mode == Some(*mode),
+                            disabled,
+                        )
+                    })
+                    .collect();
+                let active_mode = self
+                    .staged_sandbox_mode
+                    .unwrap_or(self.current.sandbox_mode);
+                lines.push(self.option_line(
+                    sandbox_mode_options().len(),
+                    if self.active_container_network_enabled() {
+                        "network on"
+                    } else {
+                        "network off"
+                    },
+                    "outbound network for container sandboxes",
+                    self.current.container_network_enabled,
+                    self.staged_container_network_enabled.is_some(),
+                    !active_mode.is_container(),
+                ));
+                lines
+            }
             Tab::Permissions => approval_options()
                 .iter()
                 .enumerate()
@@ -582,6 +633,50 @@ fn approval_options() -> &'static [ApprovalMode] {
     &[ApprovalMode::Manual, ApprovalMode::Auto, ApprovalMode::Yolo]
 }
 
+fn sandbox_mode_options() -> &'static [SandboxMode] {
+    &[
+        SandboxMode::Off,
+        SandboxMode::Sandbox,
+        SandboxMode::Container,
+        SandboxMode::ContainerReadonly,
+    ]
+}
+
+fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Off => "off",
+        SandboxMode::Sandbox => "on",
+        SandboxMode::Container => "container",
+        SandboxMode::ContainerReadonly => "container readonly",
+    }
+}
+
+fn sandbox_mode_description(
+    mode: SandboxMode,
+    availability: &crate::container::ContainerAvailability,
+) -> String {
+    match mode {
+        SandboxMode::Off => "shell sandboxing disabled for this session".to_string(),
+        SandboxMode::Sandbox => "filesystem sandboxing on host".to_string(),
+        SandboxMode::Container | SandboxMode::ContainerReadonly if !availability.available => {
+            format!("unavailable: {}", container_unavailable_label(availability))
+        }
+        SandboxMode::Container => "run bash in a writable project container".to_string(),
+        SandboxMode::ContainerReadonly => "run bash in a read-only project container".to_string(),
+    }
+}
+
+fn container_unavailable_label(
+    availability: &crate::container::ContainerAvailability,
+) -> &'static str {
+    match availability.reason {
+        Some(crate::container::ContainerUnavailableReason::HarnessInContainer) => {
+            "Cockpit is running inside a container"
+        }
+        _ => "No docker/podman runtime found",
+    }
+}
+
 fn recursion_options() -> &'static [RecursionChoice] {
     &[
         RecursionChoice::Off,
@@ -640,7 +735,14 @@ mod tests {
             recursion_enabled: true,
             recursion_depth: 2,
             trusted_only: false,
-            sandbox_enabled: true,
+            sandbox_mode: SandboxMode::Sandbox,
+            container_network_enabled: false,
+            container_availability: crate::container::ContainerAvailability {
+                runtime: Some(crate::container::ContainerRuntimeKind::Docker),
+                harness_in_container: false,
+                available: true,
+                reason: None,
+            },
             approval_mode: ApprovalMode::Manual,
             active_model: Some(("p".to_string(), "a".to_string())),
         }
@@ -735,6 +837,81 @@ mod tests {
             assert!(snapshot.contains(&depth.to_string()));
         }
         assert!(!snapshot.contains("> 0"));
+    }
+
+    #[test]
+    fn sandbox_tab_stages_container_mode() {
+        let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
+        for _ in 0..3 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(dialog.active_tab(), Tab::Sandbox);
+        assert_eq!(dialog.active_cursor(), 1);
+
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            dialog.commit(),
+            QuickCommit {
+                sandbox_mode: Some(SandboxMode::Container),
+                ..QuickCommit::default()
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_tab_network_toggle_requires_staged_container_mode() {
+        let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
+        for _ in 0..3 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+
+        for _ in 0..3 {
+            dialog.handle_key(key(KeyCode::Down));
+        }
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(dialog.commit(), QuickCommit::default());
+
+        dialog.handle_key(key(KeyCode::Up));
+        dialog.handle_key(key(KeyCode::Up));
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(
+            dialog.commit(),
+            QuickCommit {
+                sandbox_mode: Some(SandboxMode::Container),
+                container_network_enabled: Some(true),
+                ..QuickCommit::default()
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_tab_does_not_stage_unavailable_container_mode() {
+        let mut current = current();
+        current.container_availability = crate::container::ContainerAvailability {
+            runtime: None,
+            harness_in_container: false,
+            available: false,
+            reason: Some(crate::container::ContainerUnavailableReason::NoRuntime),
+        };
+        let mut dialog = QuickDialog::open(current, vec![model("p/a")]);
+        for _ in 0..3 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(dialog.commit(), QuickCommit::default());
+        assert!(
+            dialog
+                .snapshot()
+                .contains("unavailable: No docker/podman runtime found")
+        );
     }
 
     #[test]

@@ -2988,6 +2988,37 @@ mod tests {
     }
 
     #[test]
+    fn privacy_sandbox_rows_cycle_edit_and_persist() {
+        use crate::config::extended::ExtendedConfigDoc;
+        use crate::tools::sandbox_mode::SandboxMode;
+
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.extended.sandbox.default_mode = SandboxMode::Off;
+        d.save_extended().unwrap();
+
+        open_category_on(&mut d, Category::Privacy, SettingId::SandboxDefaultMode);
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Sandbox);
+
+        open_category_on(&mut d, Category::Privacy, SettingId::SandboxDockerfile);
+        d.handle_key(press(KeyCode::Enter));
+        type_chars(&mut d, "/tmp/cockpit.Dockerfile");
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            d.extended.sandbox.dockerfile.as_deref(),
+            Some(std::path::Path::new("/tmp/cockpit.Dockerfile"))
+        );
+
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Sandbox);
+        assert_eq!(
+            reloaded.sandbox.dockerfile,
+            Some(std::path::PathBuf::from("/tmp/cockpit.Dockerfile"))
+        );
+    }
+
+    #[test]
     fn privacy_redaction_rows_toggle_and_persist() {
         use crate::config::extended::ExtendedConfigDoc;
         let tmp = TempDir::new().unwrap();
@@ -4800,7 +4831,7 @@ mod tests {
         d.save_extended().unwrap();
 
         open_category_on(&mut d, Category::Privacy, SettingId::RedactDenylist);
-        let rendered = render_settings_rows(&d, 100, 45).join("\n");
+        let rendered = render_settings_rows(&d, 100, 55).join("\n");
         assert!(rendered.contains("2 value(s) masked"), "{rendered}");
         assert!(!rendered.contains("secret-value"), "{rendered}");
         assert!(!rendered.contains("other-value"), "{rendered}");

@@ -1069,7 +1069,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "sandbox",
-        description: "Toggle filesystem sandboxing (arg: on/off)",
+        description: "Set sandbox mode (arg: off/on/container/container-readonly; bare cycles)",
     },
     SlashCommand {
         name: "sessions",
@@ -1190,10 +1190,20 @@ impl SlashCommand {
                 "{} Keep the machine awake so agents survive a closed lid (arg: on/off/until-idle)",
                 on_off(app.caffeinate_active)
             ),
-            "sandbox" => format!(
-                "{} Toggle filesystem sandboxing (arg: on/off)",
-                on_off(!app.no_sandbox)
-            ),
+            "sandbox" => {
+                let mut desc = format!(
+                    "Sandbox mode is `{}` (arg: off/on/container/container-readonly; bare cycles)",
+                    sandbox_mode_label(app.sandbox_mode)
+                );
+                if app.sandbox_mode.is_container() {
+                    desc.push_str(if app.container_network_enabled {
+                        "; network on"
+                    } else {
+                        "; network off"
+                    });
+                }
+                desc
+            }
             "llm-mode" => format!(
                 "LLM steering mode is `{}` (arg: toggle/defend/normal; bare = toggle)",
                 app.llm_mode.as_str()
@@ -1856,6 +1866,9 @@ pub struct App {
     /// filesystem sandboxing OFF (unless the daemon itself was launched
     /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
     pub(super) no_sandbox: bool,
+    pub(super) sandbox_mode: crate::tools::sandbox_mode::SandboxMode,
+    pub(super) container_network_enabled: bool,
+    pub(super) container_availability: crate::container::ContainerAvailability,
     /// Daemon-broadcast caffeination state (`/caffeinate`). Drives the `☕`
     /// chrome glyph; set/cleared from the daemon-global `CaffeinateState`
     /// event so it stays in sync across all clients (incl. until-idle
@@ -2562,6 +2575,9 @@ impl App {
             active_schedules: std::collections::BTreeMap::new(),
             ctrl_c_armed_at: None,
             no_sandbox,
+            sandbox_mode: crate::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
+            container_network_enabled: false,
+            container_availability: crate::container::availability_snapshot(),
             caffeinate_active: false,
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),
@@ -5156,7 +5172,9 @@ impl App {
             recursion_enabled: self.delegation_recursion_enabled,
             recursion_depth: self.delegation_recursion_depth,
             trusted_only: self.trusted_only_enabled,
-            sandbox_enabled: !self.no_sandbox,
+            sandbox_mode: self.sandbox_mode,
+            container_network_enabled: self.container_network_enabled,
+            container_availability: self.container_availability.clone(),
             approval_mode: self.approval_mode,
             active_model: self.launch.active_model.clone(),
         };
@@ -5192,12 +5210,10 @@ impl App {
         {
             any_failed = true;
         }
-        if let Some(enabled) = commit.sandbox_enabled
+        if (commit.sandbox_mode.is_some() || commit.container_network_enabled.is_some())
             && !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox {
-                mode: Some(crate::tools::sandbox_mode::SandboxMode::from_enabled(
-                    enabled,
-                )),
-                container_network_enabled: None,
+                mode: commit.sandbox_mode,
+                container_network_enabled: commit.container_network_enabled,
             })
         {
             any_failed = true;
@@ -6057,18 +6073,50 @@ impl App {
     /// session; the resulting state is surfaced via the `SandboxState`
     /// event → toast. Effective immediately for subsequent tool calls.
     pub(super) fn handle_sandbox_command(&mut self, args: &str) {
-        let enabled = match parse_sandbox_arg(args) {
-            Ok(e) => e,
+        let command = match parse_sandbox_arg(args) {
+            Ok(command) => command,
             Err(other) => {
                 self.history.push(HistoryEntry::Plain {
-                    line: format!("/sandbox: unknown arg `{other}` — use `on` or `off`"),
+                    line: format!(
+                        "/sandbox: unknown arg `{other}` - use off, on, container, container-readonly, or network on/off"
+                    ),
                 });
                 return;
             }
         };
+        let (mode, network) = match command {
+            SandboxCommand::Cycle => (
+                Some(next_sandbox_mode(
+                    self.sandbox_mode,
+                    &self.container_availability,
+                )),
+                None,
+            ),
+            SandboxCommand::Set(mode) => {
+                if mode.is_container() && !self.container_availability.available {
+                    self.history.push(HistoryEntry::Plain {
+                        line: format!(
+                            "/sandbox: container modes unavailable: {}",
+                            container_unavailable_label(&self.container_availability)
+                        ),
+                    });
+                    return;
+                }
+                (Some(mode), None)
+            }
+            SandboxCommand::Network(enabled) => {
+                if !self.sandbox_mode.is_container() {
+                    self.history.push(HistoryEntry::Plain {
+                        line: "/sandbox: network only applies to container sandboxes".to_string(),
+                    });
+                    return;
+                }
+                (None, Some(enabled))
+            }
+        };
         if !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox {
-            mode: enabled.map(crate::tools::sandbox_mode::SandboxMode::from_enabled),
-            container_network_enabled: None,
+            mode,
+            container_network_enabled: network,
         }) {
             self.history.push(HistoryEntry::Plain {
                 line: "/sandbox: no daemon connection".to_string(),
@@ -7700,12 +7748,19 @@ impl App {
                     ),
                 });
             }
-            TurnEvent::SandboxState { mode } => {
+            TurnEvent::SandboxState {
+                mode,
+                container_network_enabled,
+                container_availability,
+            } => {
                 let enabled = mode.enabled();
                 self.no_sandbox = !enabled;
+                self.sandbox_mode = mode;
+                self.container_network_enabled = container_network_enabled;
+                self.container_availability = container_availability;
                 let toast = match mode {
                     crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox on".to_string(),
-                    other => format!("sandbox {}", other.as_str()),
+                    other => format!("sandbox {}", sandbox_mode_label(other)),
                 };
                 self.show_toast(&toast, ToastKind::Info);
                 if !enabled {
@@ -10372,15 +10427,74 @@ pub(super) fn parse_pane_side(arg: &str) -> PaneSide {
     }
 }
 
-/// Parse a `/sandbox` argument (sandboxing part 2) into the
-/// `SetSandbox.enabled` value: `""` (no arg) toggles (`None`), `on` /
-/// `off` set explicitly. `Err(arg)` for anything else.
-fn parse_sandbox_arg(args: &str) -> Result<Option<bool>, String> {
-    match args.trim().to_ascii_lowercase().as_str() {
-        "" => Ok(None),
-        "on" => Ok(Some(true)),
-        "off" => Ok(Some(false)),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxCommand {
+    Cycle,
+    Set(crate::tools::sandbox_mode::SandboxMode),
+    Network(bool),
+}
+
+fn parse_sandbox_arg(args: &str) -> Result<SandboxCommand, String> {
+    let normalized = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized.to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => Ok(SandboxCommand::Cycle),
+        "on" => Ok(SandboxCommand::Set(
+            crate::tools::sandbox_mode::SandboxMode::Sandbox,
+        )),
+        "off" => Ok(SandboxCommand::Set(
+            crate::tools::sandbox_mode::SandboxMode::Off,
+        )),
+        "container" => Ok(SandboxCommand::Set(
+            crate::tools::sandbox_mode::SandboxMode::Container,
+        )),
+        "container-readonly" | "container-ro" | "readonly" => Ok(SandboxCommand::Set(
+            crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+        )),
+        "network on" => Ok(SandboxCommand::Network(true)),
+        "network off" => Ok(SandboxCommand::Network(false)),
         other => Err(other.to_string()),
+    }
+}
+
+fn sandbox_mode_label(mode: crate::tools::sandbox_mode::SandboxMode) -> &'static str {
+    match mode {
+        crate::tools::sandbox_mode::SandboxMode::Off => "off",
+        crate::tools::sandbox_mode::SandboxMode::Sandbox => "on",
+        crate::tools::sandbox_mode::SandboxMode::Container => "container",
+        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+    }
+}
+
+fn next_sandbox_mode(
+    current: crate::tools::sandbox_mode::SandboxMode,
+    availability: &crate::container::ContainerAvailability,
+) -> crate::tools::sandbox_mode::SandboxMode {
+    let modes: &[crate::tools::sandbox_mode::SandboxMode] = if availability.available {
+        &[
+            crate::tools::sandbox_mode::SandboxMode::Off,
+            crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            crate::tools::sandbox_mode::SandboxMode::Container,
+            crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+        ]
+    } else {
+        &[
+            crate::tools::sandbox_mode::SandboxMode::Off,
+            crate::tools::sandbox_mode::SandboxMode::Sandbox,
+        ]
+    };
+    let idx = modes.iter().position(|mode| *mode == current).unwrap_or(0);
+    modes[(idx + 1) % modes.len()]
+}
+
+fn container_unavailable_label(
+    availability: &crate::container::ContainerAvailability,
+) -> &'static str {
+    match availability.reason {
+        Some(crate::container::ContainerUnavailableReason::HarnessInContainer) => {
+            "Cockpit is running inside a container"
+        }
+        _ => "No docker/podman runtime found",
     }
 }
 
@@ -12606,10 +12720,10 @@ mod working_msg_tests {
 #[cfg(test)]
 mod local_cmd_tests {
     use super::{
-        App, GIT_AGENT_TOKEN_CAP, McpAction, PaneSide, cache_config_caches, cap_tokens,
-        editor_argv_for_cwd, new_external_editor_tempfile, parse_llm_mode_arg, parse_mcp_action,
-        parse_pane_side, parse_sandbox_arg, sanitize_for_raw_stdout, slash_args, strip_ansi,
-        tool_invocation, xml_escape,
+        App, GIT_AGENT_TOKEN_CAP, McpAction, PaneSide, SandboxCommand, cache_config_caches,
+        cap_tokens, editor_argv_for_cwd, new_external_editor_tempfile, parse_llm_mode_arg,
+        parse_mcp_action, parse_pane_side, parse_sandbox_arg, sanitize_for_raw_stdout, slash_args,
+        strip_ansi, tool_invocation, xml_escape,
     };
     use crate::tui::history::HistoryEntry;
     use serde_json::json;
@@ -12797,16 +12911,77 @@ mod local_cmd_tests {
     }
 
     #[test]
-    fn parse_sandbox_arg_maps_to_enabled() {
-        // `/sandbox` (no arg) toggles; `on`/`off` set explicitly
-        // (sandboxing part 2). Case- and whitespace-insensitive.
-        assert_eq!(parse_sandbox_arg(""), Ok(None));
-        assert_eq!(parse_sandbox_arg("  "), Ok(None));
-        assert_eq!(parse_sandbox_arg("on"), Ok(Some(true)));
-        assert_eq!(parse_sandbox_arg(" ON "), Ok(Some(true)));
-        assert_eq!(parse_sandbox_arg("off"), Ok(Some(false)));
-        assert_eq!(parse_sandbox_arg("Off"), Ok(Some(false)));
+    fn parse_sandbox_arg_maps_to_modes_and_network() {
+        use crate::tools::sandbox_mode::SandboxMode;
+
+        assert_eq!(parse_sandbox_arg(""), Ok(SandboxCommand::Cycle));
+        assert_eq!(parse_sandbox_arg("  "), Ok(SandboxCommand::Cycle));
+        assert_eq!(
+            parse_sandbox_arg("on"),
+            Ok(SandboxCommand::Set(SandboxMode::Sandbox))
+        );
+        assert_eq!(
+            parse_sandbox_arg("off"),
+            Ok(SandboxCommand::Set(SandboxMode::Off))
+        );
+        assert_eq!(
+            parse_sandbox_arg("container"),
+            Ok(SandboxCommand::Set(SandboxMode::Container))
+        );
+        assert_eq!(
+            parse_sandbox_arg("container-ro"),
+            Ok(SandboxCommand::Set(SandboxMode::ContainerReadonly))
+        );
+        assert_eq!(
+            parse_sandbox_arg("readonly"),
+            Ok(SandboxCommand::Set(SandboxMode::ContainerReadonly))
+        );
+        assert_eq!(
+            parse_sandbox_arg("network   ON"),
+            Ok(SandboxCommand::Network(true))
+        );
+        assert_eq!(
+            parse_sandbox_arg("network off"),
+            Ok(SandboxCommand::Network(false))
+        );
         assert_eq!(parse_sandbox_arg("maybe"), Err("maybe".to_string()));
+    }
+
+    #[test]
+    fn next_sandbox_mode_skips_unavailable_container_modes() {
+        use super::next_sandbox_mode;
+        use crate::container::{ContainerAvailability, ContainerUnavailableReason};
+        use crate::tools::sandbox_mode::SandboxMode;
+
+        let unavailable = ContainerAvailability {
+            runtime: None,
+            harness_in_container: false,
+            available: false,
+            reason: Some(ContainerUnavailableReason::NoRuntime),
+        };
+        assert_eq!(
+            next_sandbox_mode(SandboxMode::Off, &unavailable),
+            SandboxMode::Sandbox
+        );
+        assert_eq!(
+            next_sandbox_mode(SandboxMode::Sandbox, &unavailable),
+            SandboxMode::Off
+        );
+
+        let available = ContainerAvailability {
+            runtime: Some(crate::container::ContainerRuntimeKind::Docker),
+            harness_in_container: false,
+            available: true,
+            reason: None,
+        };
+        assert_eq!(
+            next_sandbox_mode(SandboxMode::Sandbox, &available),
+            SandboxMode::Container
+        );
+        assert_eq!(
+            next_sandbox_mode(SandboxMode::Container, &available),
+            SandboxMode::ContainerReadonly
+        );
     }
 
     #[test]
@@ -14009,6 +14184,8 @@ mod sandbox_notice_tests {
         // `/sandbox off` -> `SandboxState { mode: Off }` clears it.
         app.apply_event(TurnEvent::SandboxState {
             mode: crate::tools::sandbox_mode::SandboxMode::Off,
+            container_network_enabled: false,
+            container_availability: crate::container::availability_snapshot(),
         });
         assert!(app.sandbox_down_notice.is_none());
         assert_eq!(app.sandbox_notice_lines(), 0);
@@ -14016,6 +14193,8 @@ mod sandbox_notice_tests {
         // Re-enabling does not resurrect a stale notice on its own.
         app.apply_event(TurnEvent::SandboxState {
             mode: crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            container_network_enabled: false,
+            container_availability: crate::container::availability_snapshot(),
         });
         assert!(app.sandbox_down_notice.is_none());
     }

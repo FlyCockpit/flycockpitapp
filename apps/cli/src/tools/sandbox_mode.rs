@@ -34,13 +34,4 @@ impl SandboxMode {
             Self::Sandbox
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Sandbox => "sandbox",
-            Self::Container => "container",
-            Self::ContainerReadonly => "container_readonly",
-        }
-    }
 }

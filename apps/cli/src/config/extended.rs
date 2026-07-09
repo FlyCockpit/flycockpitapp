@@ -3090,6 +3090,7 @@ impl ExtendedConfigDoc {
         remove_malformed!("prompt_injection_guard", PromptInjectionGuardConfig);
         remove_malformed!("llm_mode", LlmMode);
         remove_malformed!("approvalPolicy", ApprovalPolicyConfig);
+        remove_malformed!("sandbox", SandboxConfig);
         remove_malformed!("review", ReviewConfig);
         raw
     }
@@ -3170,6 +3171,7 @@ impl ExtendedConfigDoc {
             "harness_report_summarization",
             "compact_model",
             "commandResourceProfiles",
+            "sandbox",
         ] {
             if serialized.get(key).is_none() {
                 obj.remove(key);

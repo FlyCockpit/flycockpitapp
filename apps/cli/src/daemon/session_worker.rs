@@ -758,7 +758,10 @@ pub fn spawn(
     //       sessions it creates.
     //   (c) else ON.
     // A later `/sandbox` flip overrides this for the session.
-    session.set_sandbox_mode(resolve_sandbox_default(client_no_sandbox));
+    session.set_sandbox_mode(resolve_sandbox_default(
+        client_no_sandbox,
+        extended_cfg.sandbox.default_mode,
+    ));
     // Command-approval mode (implementation note): new
     // sessions start in the configured default (`manual` unless overridden).
     // A later `/settings` change re-resolves on the next session.
@@ -2652,13 +2655,17 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         // The engine never emits `SandboxState` — the daemon's
         // `SetSandbox` handler broadcasts the wire event directly (it
         // carries `session_id`). This arm exists only for exhaustiveness.
-        TurnEvent::SandboxState { mode } => {
+        TurnEvent::SandboxState {
+            mode,
+            container_network_enabled,
+            container_availability,
+        } => {
             vec![proto::Event::SandboxState {
                 session_id,
                 mode,
                 enabled: mode.enabled(),
-                container_network_enabled: false,
-                container_availability: crate::container::availability_snapshot(),
+                container_network_enabled,
+                container_availability,
             }]
         }
         // Emitted by `engine::agent::turn` on the sandbox-unavailable refuse
@@ -2914,8 +2921,11 @@ fn daemon_no_sandbox() -> bool {
 }
 
 /// Resolve the new-session sandbox default from the live daemon flag.
-fn resolve_sandbox_default(client_no_sandbox: bool) -> crate::tools::sandbox_mode::SandboxMode {
-    resolve_sandbox_default_with(daemon_no_sandbox(), client_no_sandbox)
+fn resolve_sandbox_default(
+    client_no_sandbox: bool,
+    configured_default: crate::tools::sandbox_mode::SandboxMode,
+) -> crate::tools::sandbox_mode::SandboxMode {
+    resolve_sandbox_default_with(daemon_no_sandbox(), client_no_sandbox, configured_default)
 }
 
 /// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->
@@ -2925,11 +2935,15 @@ fn resolve_sandbox_default(client_no_sandbox: bool) -> crate::tools::sandbox_mod
 fn resolve_sandbox_default_with(
     daemon_no_sandbox: bool,
     client_no_sandbox: bool,
+    configured_default: crate::tools::sandbox_mode::SandboxMode,
 ) -> crate::tools::sandbox_mode::SandboxMode {
     if daemon_no_sandbox || client_no_sandbox {
-        crate::tools::sandbox_mode::SandboxMode::Off
-    } else {
+        return crate::tools::sandbox_mode::SandboxMode::Off;
+    }
+    if configured_default.is_container() && !crate::container::availability_snapshot().available {
         crate::tools::sandbox_mode::SandboxMode::Sandbox
+    } else {
+        configured_default
     }
 }
 
@@ -3144,8 +3158,14 @@ mod tests {
         use crate::tools::sandbox_mode::SandboxMode;
 
         // (a) daemon `--no-sandbox` -> OFF regardless of the client flag.
-        assert_eq!(resolve_sandbox_default_with(true, false), SandboxMode::Off);
-        assert_eq!(resolve_sandbox_default_with(true, true), SandboxMode::Off);
+        assert_eq!(
+            resolve_sandbox_default_with(true, false, SandboxMode::Sandbox),
+            SandboxMode::Off
+        );
+        assert_eq!(
+            resolve_sandbox_default_with(true, true, SandboxMode::Container),
+            SandboxMode::Off
+        );
     }
 
     #[test]
@@ -3153,10 +3173,13 @@ mod tests {
         use crate::tools::sandbox_mode::SandboxMode;
 
         // (b) no daemon flag, client `--no-sandbox` -> OFF.
-        assert_eq!(resolve_sandbox_default_with(false, true), SandboxMode::Off);
+        assert_eq!(
+            resolve_sandbox_default_with(false, true, SandboxMode::Container),
+            SandboxMode::Off
+        );
         // (c) neither flag -> ON.
         assert_eq!(
-            resolve_sandbox_default_with(false, false),
+            resolve_sandbox_default_with(false, false, SandboxMode::Sandbox),
             SandboxMode::Sandbox
         );
     }

@@ -666,6 +666,8 @@ pub enum TurnEvent {
     /// as a toast. Emitted by the daemon's `SetSandbox` handler.
     SandboxState {
         mode: crate::tools::sandbox_mode::SandboxMode,
+        container_network_enabled: bool,
+        container_availability: crate::container::ContainerAvailability,
     },
 
     /// The shell sandbox cannot initialize (a confined `bash` hit the

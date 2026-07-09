@@ -160,6 +160,41 @@ fn approval_mode_label(m: ApprovalMode) -> &'static str {
     }
 }
 
+fn sandbox_mode_setting_value(mode: crate::tools::sandbox_mode::SandboxMode) -> String {
+    let label = match mode {
+        crate::tools::sandbox_mode::SandboxMode::Off => "off",
+        crate::tools::sandbox_mode::SandboxMode::Sandbox => "on (default host filesystem sandbox)",
+        crate::tools::sandbox_mode::SandboxMode::Container => "container",
+        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+    };
+    if mode.is_container() && !crate::container::availability_snapshot().available {
+        format!("{label} (unavailable here)")
+    } else {
+        label.to_string()
+    }
+}
+
+fn cycle_sandbox_mode(
+    mode: crate::tools::sandbox_mode::SandboxMode,
+) -> crate::tools::sandbox_mode::SandboxMode {
+    use crate::tools::sandbox_mode::SandboxMode;
+    let modes: &[SandboxMode] = if crate::container::availability_snapshot().available {
+        &[
+            SandboxMode::Off,
+            SandboxMode::Sandbox,
+            SandboxMode::Container,
+            SandboxMode::ContainerReadonly,
+        ]
+    } else {
+        &[SandboxMode::Off, SandboxMode::Sandbox]
+    };
+    let idx = modes
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(0);
+    modes[(idx + 1) % modes.len()]
+}
+
 fn predict_next_message_label(m: PredictNextMessage) -> &'static str {
     match m {
         PredictNextMessage::Off => "off (no next-message prediction; no utility call)",
@@ -363,6 +398,8 @@ pub(super) enum SettingId {
     AgentDirs,
 
     // ── Privacy & Safety ─────────────────────────────────────────────
+    SandboxDefaultMode,
+    SandboxDockerfile,
     RedactEnabled,
     RedactScanEnvironment,
     RedactScanDotenv,
@@ -466,6 +503,8 @@ impl SettingId {
             SettingId::TimeInjectionInterval => "time-injection interval (min)",
             SettingId::PackagesDir => "packages dir",
             SettingId::AgentDirs => "agent dirs",
+            SettingId::SandboxDefaultMode => "default sandbox mode",
+            SettingId::SandboxDockerfile => "sandbox Dockerfile",
             SettingId::RedactEnabled => "redaction",
             SettingId::RedactScanEnvironment => "environment variable redaction",
             SettingId::RedactScanDotenv => "environment file redaction",
@@ -817,6 +856,12 @@ impl SettingId {
                  the built-in locations. Paths are tilde-expanded. Drill in to add, \
                  edit, reorder, or remove entries."
             }
+            SettingId::SandboxDefaultMode => {
+                "Which sandbox mode new sessions start in. `on` is the default host filesystem sandbox; `off` disables sandboxing; container modes run bash inside docker/podman when available. The --no-sandbox flag still forces off."
+            }
+            SettingId::SandboxDockerfile => {
+                "Optional Dockerfile path for container sandboxes. Blank uses the global default at ~/.config/cockpit/sandbox/Dockerfile. Project values only take effect for trusted workspaces."
+            }
             SettingId::RedactEnabled => {
                 "The master redaction switch. On (default) routes every outbound \
                  prompt through the scrubber so secrets are replaced with the \
@@ -981,6 +1026,7 @@ impl SettingId {
             | SettingId::TimeInjectionInterval
             | SettingId::CompactPrompt
             | SettingId::PackagesDir
+            | SettingId::SandboxDockerfile
             | SettingId::InjectionCheckPrompt
             | SettingId::InjectionModel
             | SettingId::PreflightModel
@@ -1212,6 +1258,8 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::AgentDirs),
         ],
         Category::Privacy => vec![
+            Setting(S::SandboxDefaultMode),
+            Setting(S::SandboxDockerfile),
             Setting(S::RedactEnabled),
             Setting(S::RedactScanEnvironment),
             Setting(S::RedactScanDotenv),
@@ -1459,6 +1507,13 @@ impl SettingsDialog {
                         .join(", ")
                 }
             }
+            S::SandboxDefaultMode => sandbox_mode_setting_value(e.sandbox.default_mode),
+            S::SandboxDockerfile => e
+                .sandbox
+                .dockerfile
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unset - global default Dockerfile)".to_string()),
             S::RedactEnabled => on_off(
                 e.redact.enabled,
                 "on (default — scrub every outbound prompt)",
@@ -1845,6 +1900,9 @@ impl SettingsDialog {
             S::ScheduleAllowUnboundedLoops => {
                 e.schedule.allow_unbounded_loops = !e.schedule.allow_unbounded_loops
             }
+            S::SandboxDefaultMode => {
+                e.sandbox.default_mode = cycle_sandbox_mode(e.sandbox.default_mode)
+            }
             S::RedactEnabled => e.redact.enabled = !e.redact.enabled,
             S::RedactScanEnvironment => e.redact.scan_environment = !e.redact.scan_environment,
             S::RedactScanDotenv => e.redact.scan_dotenv = !e.redact.scan_dotenv,
@@ -1881,6 +1939,12 @@ impl SettingsDialog {
             S::CommandProfileCustomProfiles => pretty_json(&e.command_resource_profiles.profiles),
             S::PackagesDir => e
                 .packages_directory
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            S::SandboxDockerfile => e
+                .sandbox
+                .dockerfile
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
@@ -1965,6 +2029,13 @@ impl SettingsDialog {
             }
             S::PackagesDir => {
                 self.extended.packages_directory = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(trimmed))
+                };
+            }
+            S::SandboxDockerfile => {
+                self.extended.sandbox.dockerfile = if trimmed.is_empty() {
                     None
                 } else {
                     Some(std::path::PathBuf::from(trimmed))
@@ -2405,6 +2476,8 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::AttentionDesktop => &["tui", "attention", "desktop"],
         S::LlmMode => &["llm_mode"],
         S::ApprovalMode => &["defaultApprovalMode"],
+        S::SandboxDefaultMode => &["sandbox", "defaultMode"],
+        S::SandboxDockerfile => &["sandbox", "dockerfile"],
         S::ExperimentalMode => &["experimentalMode"],
         S::DefaultPrimaryAgent => &["defaultPrimaryAgent"],
         S::PredictNextMessage => &["predictNextMessage"],

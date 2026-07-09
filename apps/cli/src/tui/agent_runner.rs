@@ -1177,7 +1177,16 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             description,
             questions,
         },
-        SandboxState { mode, .. } => TurnEvent::SandboxState { mode },
+        SandboxState {
+            mode,
+            container_network_enabled,
+            container_availability,
+            ..
+        } => TurnEvent::SandboxState {
+            mode,
+            container_network_enabled,
+            container_availability,
+        },
         SandboxUnavailable { remedy, .. } => TurnEvent::SandboxUnavailable { remedy },
         RedactionState {
             scan_environment,

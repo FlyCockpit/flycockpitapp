@@ -41,6 +41,7 @@ const EVENT_QUEUE: usize = 1024;
 /// generous ceiling so a hung daemon causes a loud error rather than
 /// a stalled TUI.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
 /// Public handle. Cheap to clone: every clone shares the same
 /// background reader/writer task; only the event-stream subscription
@@ -142,13 +143,29 @@ async fn run_io(
 ) {
     let mut pending: HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>> =
         HashMap::new();
+    let mut inbound_burst = InboundBurst::default();
 
     loop {
+        if inbound_burst.should_probe_outbound() {
+            match request_rx.try_recv() {
+                Ok(cmd) => {
+                    inbound_burst.reset();
+                    if !handle_io_command(cmd, &mut proto, &mut pending).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => inbound_burst.reset(),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
         tokio::select! {
             biased;
 
             // Inbound envelope from the daemon.
             recv = proto.recv() => {
+                inbound_burst.record_inbound();
                 match recv {
                     Ok(None) => {
                         tracing::debug!("daemon closed the connection");
@@ -212,31 +229,12 @@ async fn run_io(
 
             // Outbound request from the user.
             cmd = request_rx.recv() => {
-                match cmd {
-                    None => {
-                        // All DaemonClient handles dropped; exit cleanly.
-                        break;
-                    }
-                    Some(IoCommand::Cancel { id }) => {
-                        if remove_pending_request(&mut pending, id).is_some() {
-                            tracing::debug!(id = %id, "daemon request timed out; removed pending entry");
-                        }
-                    }
-                    Some(IoCommand::Request(p)) => {
-                        let id = p.id;
-                        pending.insert(id, p.reply);
-                        let envelope = Envelope::request(id, p.request);
-                        if let Err(e) = proto.send(&envelope).await {
-                            tracing::warn!(error = ?e, "daemon write failed");
-                            if let Some(tx) = pending.remove(&id) {
-                                let _ = tx.send(Err(ErrorPayload {
-                                    code: proto::ErrorCode::Internal,
-                                    message: format!("write to daemon failed: {e}"),
-                                }));
-                            }
-                            break;
-                        }
-                    }
+                inbound_burst.reset();
+                let Some(cmd) = cmd else {
+                    break;
+                };
+                if !handle_io_command(cmd, &mut proto, &mut pending).await {
+                    break;
                 }
             }
         }
@@ -248,6 +246,57 @@ async fn run_io(
             code: proto::ErrorCode::Internal,
             message: "daemon connection closed".into(),
         }));
+    }
+}
+
+#[derive(Default)]
+struct InboundBurst {
+    frames: usize,
+}
+
+impl InboundBurst {
+    fn record_inbound(&mut self) {
+        self.frames = self.frames.saturating_add(1);
+    }
+
+    fn reset(&mut self) {
+        self.frames = 0;
+    }
+
+    fn should_probe_outbound(&self) -> bool {
+        self.frames >= MAX_BIASED_INBOUND_FRAMES
+    }
+}
+
+async fn handle_io_command(
+    cmd: IoCommand,
+    proto: &mut ProtoStream<UnixStream>,
+    pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
+) -> bool {
+    match cmd {
+        IoCommand::Cancel { id } => {
+            if remove_pending_request(pending, id).is_some() {
+                tracing::debug!(id = %id, "daemon request timed out; removed pending entry");
+            }
+            true
+        }
+        IoCommand::Request(p) => {
+            let id = p.id;
+            pending.insert(id, p.reply);
+            let envelope = Envelope::request(id, p.request);
+            if let Err(e) = proto.send(&envelope).await {
+                tracing::warn!(error = ?e, "daemon write failed");
+                if let Some(tx) = pending.remove(&id) {
+                    let _ = tx.send(Err(ErrorPayload {
+                        code: proto::ErrorCode::Internal,
+                        message: format!("write to daemon failed: {e}"),
+                    }));
+                }
+                false
+            } else {
+                true
+            }
+        }
     }
 }
 
@@ -501,6 +550,19 @@ mod tests {
             },
         ));
         assert!(!is_nil_daemon_status_hello(Uuid::nil(), &Response::Ack));
+    }
+
+    #[test]
+    fn inbound_burst_probes_outbound_after_thirty_two_frames() {
+        let mut burst = InboundBurst::default();
+        for _ in 0..(MAX_BIASED_INBOUND_FRAMES - 1) {
+            burst.record_inbound();
+            assert!(!burst.should_probe_outbound());
+        }
+        burst.record_inbound();
+        assert!(burst.should_probe_outbound());
+        burst.reset();
+        assert!(!burst.should_probe_outbound());
     }
 
     #[test]

@@ -158,27 +158,34 @@ impl Db {
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE task_delegation_children
-                        SET status = 'backgrounded', updated_at = ?3
-                      WHERE task_call_id = ?1
-                        AND label = ?2
-                        AND status = 'running'",
-                    params![task_call_id, label, now],
-                )
-                .context("marking task delegation child backgrounded")?;
-            if changed > 0 {
-                conn.execute(
-                    "UPDATE task_delegation_jobs
-                        SET status = 'backgrounded', ack_delivered = 1, updated_at = ?2
-                      WHERE task_call_id = ?1
-                        AND status IN ('running', 'backgrounded')",
-                    params![task_call_id, now],
-                )
-                .context("marking task delegation job backgrounded")?;
-            }
-            Ok(changed > 0)
+            immediate_transaction(
+                conn,
+                "beginning background delegation transaction",
+                "committing background delegation transaction",
+                || {
+                    let changed = conn
+                        .execute(
+                            "UPDATE task_delegation_children
+                                SET status = 'backgrounded', updated_at = ?3
+                              WHERE task_call_id = ?1
+                                AND label = ?2
+                                AND status = 'running'",
+                            params![task_call_id, label, now],
+                        )
+                        .context("marking task delegation child backgrounded")?;
+                    if changed > 0 {
+                        conn.execute(
+                            "UPDATE task_delegation_jobs
+                                SET status = 'backgrounded', ack_delivered = 1, updated_at = ?2
+                              WHERE task_call_id = ?1
+                                AND status IN ('running', 'backgrounded')",
+                            params![task_call_id, now],
+                        )
+                        .context("marking task delegation job backgrounded")?;
+                    }
+                    Ok(changed > 0)
+                },
+            )
         })
     }
 
@@ -197,53 +204,60 @@ impl Db {
             DelegationStatus::Completed
         };
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE task_delegation_children
-                    SET status = ?3,
-                        report = ?4,
-                        snapshot_json = COALESCE(?5, snapshot_json),
-                        finished_at = COALESCE(finished_at, ?6),
-                        updated_at = ?6
-                  WHERE task_call_id = ?1
-                    AND label = ?2
-                    AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
-                params![
-                    task_call_id,
-                    label,
-                    status.as_str(),
-                    report,
-                    snapshot_json,
-                    now
-                ],
-            )
-            .context("completing task delegation child")?;
+            immediate_transaction(
+                conn,
+                "beginning complete delegation transaction",
+                "committing complete delegation transaction",
+                || {
+                    conn.execute(
+                        "UPDATE task_delegation_children
+                            SET status = ?3,
+                                report = ?4,
+                                snapshot_json = COALESCE(?5, snapshot_json),
+                                finished_at = COALESCE(finished_at, ?6),
+                                updated_at = ?6
+                          WHERE task_call_id = ?1
+                            AND label = ?2
+                            AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                        params![
+                            task_call_id,
+                            label,
+                            status.as_str(),
+                            report,
+                            snapshot_json,
+                            now
+                        ],
+                    )
+                    .context("completing task delegation child")?;
 
-            let (remaining, failed): (i64, i64) = conn
-                .query_row(
-                    "SELECT
-                        COALESCE(SUM(status IN ('running', 'backgrounded', 'paused_pending_tool')), 0),
-                        COALESCE(SUM(status IN ('failed', 'lost')), 0)
-                       FROM task_delegation_children
-                      WHERE task_call_id = ?1",
-                    params![task_call_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .context("summarizing task delegation children")?;
-            if remaining == 0 {
-                let job_status = if failed > 0 {
-                    DelegationStatus::Failed
-                } else {
-                    DelegationStatus::Completed
-                };
-                conn.execute(
-                    "UPDATE task_delegation_jobs
-                        SET status = ?2, updated_at = ?3
-                      WHERE task_call_id = ?1",
-                    params![task_call_id, job_status.as_str(), now],
-                )
-                .context("completing task delegation job")?;
-            }
-            Ok(())
+                    let (remaining, failed): (i64, i64) = conn
+                        .query_row(
+                            "SELECT
+                                COALESCE(SUM(status IN ('running', 'backgrounded', 'paused_pending_tool')), 0),
+                                COALESCE(SUM(status IN ('failed', 'lost')), 0)
+                               FROM task_delegation_children
+                              WHERE task_call_id = ?1",
+                            params![task_call_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .context("summarizing task delegation children")?;
+                    if remaining == 0 {
+                        let job_status = if failed > 0 {
+                            DelegationStatus::Failed
+                        } else {
+                            DelegationStatus::Completed
+                        };
+                        conn.execute(
+                            "UPDATE task_delegation_jobs
+                                SET status = ?2, updated_at = ?3
+                              WHERE task_call_id = ?1",
+                            params![task_call_id, job_status.as_str(), now],
+                        )
+                        .context("completing task delegation job")?;
+                    }
+                    Ok(())
+                },
+            )
         })
     }
 
@@ -277,35 +291,42 @@ impl Db {
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE task_delegation_children
-                        SET result_delivered = 1, updated_at = ?3
-                      WHERE task_call_id = ?1
-                        AND label = ?2
-                        AND result_delivered = 0",
-                    params![task_call_id, label, now],
-                )
-                .context("marking task delegation child delivered")?;
-            let remaining: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*)
-                       FROM task_delegation_children
-                      WHERE task_call_id = ?1 AND result_delivered = 0",
-                    params![task_call_id],
-                    |row| row.get(0),
-                )
-                .context("counting undelivered task delegation children")?;
-            if remaining == 0 {
-                conn.execute(
-                    "UPDATE task_delegation_jobs
-                        SET final_delivered = 1, updated_at = ?2
-                      WHERE task_call_id = ?1",
-                    params![task_call_id, now],
-                )
-                .context("marking task delegation final delivered")?;
-            }
-            Ok(changed > 0)
+            immediate_transaction(
+                conn,
+                "beginning delivered delegation transaction",
+                "committing delivered delegation transaction",
+                || {
+                    let changed = conn
+                        .execute(
+                            "UPDATE task_delegation_children
+                                SET result_delivered = 1, updated_at = ?3
+                              WHERE task_call_id = ?1
+                                AND label = ?2
+                                AND result_delivered = 0",
+                            params![task_call_id, label, now],
+                        )
+                        .context("marking task delegation child delivered")?;
+                    let remaining: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*)
+                               FROM task_delegation_children
+                              WHERE task_call_id = ?1 AND result_delivered = 0",
+                            params![task_call_id],
+                            |row| row.get(0),
+                        )
+                        .context("counting undelivered task delegation children")?;
+                    if remaining == 0 {
+                        conn.execute(
+                            "UPDATE task_delegation_jobs
+                                SET final_delivered = 1, updated_at = ?2
+                              WHERE task_call_id = ?1",
+                            params![task_call_id, now],
+                        )
+                        .context("marking task delegation final delivered")?;
+                    }
+                    Ok(changed > 0)
+                },
+            )
         })
     }
 
@@ -340,128 +361,119 @@ impl Db {
     pub fn cancel_task_delegation_child(&self, task_call_id: &str, label: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE task_delegation_children
-                        SET status = 'cancelled',
-                            report = COALESCE(report, 'cancelled'),
-                            finished_at = COALESCE(finished_at, ?3),
-                            updated_at = ?3
-                      WHERE task_call_id = ?1
-                        AND label = ?2
-                        AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
-                    params![task_call_id, label, now],
-                )
-                .context("cancelling task delegation child")?;
-            let (remaining, failed): (i64, i64) = conn
-                .query_row(
-                    "SELECT
-                        COALESCE(SUM(status IN ('running', 'backgrounded', 'paused_pending_tool')), 0),
-                        COALESCE(SUM(status IN ('failed', 'lost')), 0)
-                       FROM task_delegation_children
-                      WHERE task_call_id = ?1",
-                    params![task_call_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .context("summarizing delegation after cancel")?;
-            if remaining == 0 {
-                let status = if failed > 0 { "failed" } else { "cancelled" };
-                conn.execute(
-                    "UPDATE task_delegation_jobs
-                        SET status = ?2, updated_at = ?3
-                      WHERE task_call_id = ?1",
-                    params![task_call_id, status, now],
-                )
-                .context("marking delegation job cancelled")?;
-            }
-            Ok(changed > 0)
+            immediate_transaction(
+                conn,
+                "beginning cancel delegation transaction",
+                "committing cancel delegation transaction",
+                || {
+                    let changed = conn
+                        .execute(
+                            "UPDATE task_delegation_children
+                                SET status = 'cancelled',
+                                    report = COALESCE(report, 'cancelled'),
+                                    finished_at = COALESCE(finished_at, ?3),
+                                    updated_at = ?3
+                              WHERE task_call_id = ?1
+                                AND label = ?2
+                                AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                            params![task_call_id, label, now],
+                        )
+                        .context("cancelling task delegation child")?;
+                    let (remaining, failed): (i64, i64) = conn
+                        .query_row(
+                            "SELECT
+                                COALESCE(SUM(status IN ('running', 'backgrounded', 'paused_pending_tool')), 0),
+                                COALESCE(SUM(status IN ('failed', 'lost')), 0)
+                               FROM task_delegation_children
+                              WHERE task_call_id = ?1",
+                            params![task_call_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .context("summarizing delegation after cancel")?;
+                    if remaining == 0 {
+                        let status = if failed > 0 { "failed" } else { "cancelled" };
+                        conn.execute(
+                            "UPDATE task_delegation_jobs
+                                SET status = ?2, updated_at = ?3
+                              WHERE task_call_id = ?1",
+                            params![task_call_id, status, now],
+                        )
+                        .context("marking delegation job cancelled")?;
+                    }
+                    Ok(changed > 0)
+                },
+            )
         })
     }
 
     pub fn mark_task_delegation_child_lost(&self, task_call_id: &str, label: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")
-                .context("beginning lost delegation transaction")?;
-            let result = (|| {
-                let changed = mark_child_lost(conn, task_call_id, label, now)?;
-                if changed {
-                    reconcile_job_after_lost(conn, task_call_id, now)?;
-                }
-                Ok(changed)
-            })();
-            match result {
-                Ok(changed) => {
-                    conn.execute_batch("COMMIT")
-                        .context("committing lost delegation transaction")?;
+            immediate_transaction(
+                conn,
+                "beginning lost delegation transaction",
+                "committing lost delegation transaction",
+                || {
+                    let changed = mark_child_lost(conn, task_call_id, label, now)?;
+                    if changed {
+                        reconcile_job_after_lost(conn, task_call_id, now)?;
+                    }
                     Ok(changed)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(e)
-                }
-            }
+                },
+            )
         })
     }
 
     pub fn reconcile_orphaned_task_delegations(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")
-                .context("beginning orphaned delegation reconcile")?;
-            let result = (|| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT task_call_id, label
+            immediate_transaction(
+                conn,
+                "beginning orphaned delegation reconcile",
+                "committing orphaned delegation reconcile",
+                || {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT task_call_id, label
                            FROM task_delegation_children
                           WHERE status IN ('running', 'backgrounded', 'paused_pending_tool')
                           ORDER BY task_call_id ASC, label ASC",
-                    )
-                    .context("preparing orphaned delegation child scan")?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .context("querying orphaned delegation children")?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .context("decoding orphaned delegation children")?;
-                drop(stmt);
+                        )
+                        .context("preparing orphaned delegation child scan")?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .context("querying orphaned delegation children")?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .context("decoding orphaned delegation children")?;
+                    drop(stmt);
 
-                for (task_call_id, label) in &rows {
-                    mark_child_lost(conn, task_call_id, label, now)?;
-                }
+                    for (task_call_id, label) in &rows {
+                        mark_child_lost(conn, task_call_id, label, now)?;
+                    }
 
-                let mut job_stmt = conn
-                    .prepare(
-                        "SELECT DISTINCT task_call_id
+                    let mut job_stmt = conn
+                        .prepare(
+                            "SELECT DISTINCT task_call_id
                            FROM task_delegation_jobs
                           WHERE status IN ('running', 'backgrounded')",
-                    )
-                    .context("preparing orphaned delegation job scan")?;
-                let jobs = job_stmt
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .context("querying orphaned delegation jobs")?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .context("decoding orphaned delegation jobs")?;
-                drop(job_stmt);
+                        )
+                        .context("preparing orphaned delegation job scan")?;
+                    let jobs = job_stmt
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .context("querying orphaned delegation jobs")?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .context("decoding orphaned delegation jobs")?;
+                    drop(job_stmt);
 
-                for task_call_id in &jobs {
-                    reconcile_job_after_lost(conn, task_call_id, now)?;
-                }
+                    for task_call_id in &jobs {
+                        reconcile_job_after_lost(conn, task_call_id, now)?;
+                    }
 
-                Ok(rows.len())
-            })();
-            match result {
-                Ok(changed) => {
-                    conn.execute_batch("COMMIT")
-                        .context("committing orphaned delegation reconcile")?;
-                    Ok(changed)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(e)
-                }
-            }
+                    Ok(rows.len())
+                },
+            )
         })
     }
 
@@ -524,6 +536,28 @@ impl Db {
             }
             Ok(pending.into_iter().map(|(_, body)| body).collect())
         })
+    }
+}
+
+fn immediate_transaction<T>(
+    conn: &rusqlite::Connection,
+    begin_context: &str,
+    commit_context: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .with_context(|| begin_context.to_string())?;
+    let result = f();
+    match result {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")
+                .with_context(|| commit_context.to_string())?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
     }
 }
 
@@ -933,6 +967,36 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn complete_child_rolls_back_when_job_update_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = seed_job(&db, "task-rollback", &["default"]);
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_task_job_update
+                 BEFORE UPDATE ON task_delegation_jobs
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected job update failure');
+                 END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = db
+            .complete_task_delegation_child("task-rollback", "default", "report", false, None)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("injected job update failure"),
+            "unexpected error: {err:#}"
+        );
+
+        let rows = db.list_task_delegation_children(session_id).unwrap();
+        assert_eq!(rows[0].status, DelegationStatus::Running);
+        assert_eq!(rows[0].report, None);
+        assert_eq!(job_status(&db, "task-rollback"), DelegationStatus::Running);
     }
 
     fn job_status(db: &Db, task_call_id: &str) -> DelegationStatus {

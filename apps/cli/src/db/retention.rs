@@ -1,7 +1,7 @@
 //! Retention pass for payload-heavy session tables.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{config::extended::RetentionConfig, db::Db};
@@ -80,17 +80,36 @@ impl Db {
         }
 
         let deleted = outcome.sessions_expired + outcome.payload_rows_deleted;
-        if self.path.is_some() && self.should_vacuum(deleted, now_secs, cfg) {
-            self.with_conn(|conn| {
-                conn.execute_batch("VACUUM")
-                    .context("vacuuming after retention pass")?;
-                Ok(())
-            })?;
+        if self.path.is_some()
+            && self.should_vacuum(deleted, now_secs, cfg)
+            && self.vacuum_retention_database()?
+        {
             self.record_vacuum(now_secs)?;
             outcome.vacuumed = true;
         }
 
         Ok(outcome)
+    }
+
+    fn vacuum_retention_database(&self) -> Result<bool> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(false);
+        };
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening sqlite vacuum connection at {}", path.display()))?;
+        crate::db::apply_connection_pragmas(&conn, true)
+            .with_context(|| format!("setting vacuum connection pragmas on {}", path.display()))?;
+        // VACUUM under WAL still needs exclusive access to rewrite the DB. Run it on a
+        // short-lived connection with the standard busy timeout so the daemon-wide shared
+        // connection mutex stays available while SQLite waits or declines the vacuum.
+        match conn.execute_batch("VACUUM") {
+            Ok(()) => Ok(true),
+            Err(err) if sqlite_busy(&err) => {
+                tracing::debug!(error = %err, "retention vacuum skipped because sqlite is busy");
+                Ok(false)
+            }
+            Err(err) => Err(err).context("vacuuming after retention pass"),
+        }
     }
 
     fn last_vacuum_secs(&self) -> Result<Option<i64>> {
@@ -104,6 +123,14 @@ impl Db {
             .context("querying retention vacuum timestamp")
         })
     }
+}
+
+fn sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 fn prune_session_payloads_conn(conn: &Connection, cutoff_secs: i64) -> Result<u64> {
@@ -393,6 +420,26 @@ mod tests {
         let cfg = RetentionConfig::default();
         db.record_vacuum(100).unwrap();
         assert!(!db.should_vacuum(0, 100, &cfg));
+    }
+
+    #[test]
+    fn vacuum_uses_dedicated_connection_without_shared_mutex() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("retention.db")).unwrap();
+        let db_for_vacuum = db.clone();
+        db.with_conn(|_conn| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(db_for_vacuum.vacuum_retention_database()).unwrap();
+            });
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("vacuum should not wait for the shared connection mutex")
+                .unwrap();
+            assert!(result);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

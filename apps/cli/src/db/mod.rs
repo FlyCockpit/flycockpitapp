@@ -262,11 +262,10 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// Apply pending migrations under one `BEGIN IMMEDIATE` writer lock.
 ///
 /// Pending migration work runs with SQLite foreign-key enforcement
-/// disabled and is re-verified after commit with `PRAGMA
-/// foreign_key_check`. This is the runner-owned seam for SQLite
-/// table-rebuild migrations; migration SQL must not emit
-/// `PRAGMA foreign_keys` itself because that pragma is a no-op inside
-/// a transaction.
+/// disabled, then validates with `PRAGMA foreign_key_check` before
+/// commit. This is the runner-owned seam for SQLite table-rebuild
+/// migrations; migration SQL must not emit `PRAGMA foreign_keys` itself
+/// because that pragma is a no-op inside a transaction.
 fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
     let current_before_lock = current_schema_version(conn)?;
     if current_before_lock >= migrations.len() as i64 {
@@ -301,6 +300,10 @@ fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
             .with_context(|| format!("recording migration {version}"))?;
         }
 
+        if fk_was_on {
+            foreign_key_check(conn).context("validating migration foreign keys")?;
+        }
+
         conn.execute_batch("COMMIT;")
             .context("committing migrations")?;
         Ok(())
@@ -311,10 +314,6 @@ fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
         return Err(e);
     }
 
-    if fk_was_on && let Err(e) = foreign_key_check(conn) {
-        let _ = set_foreign_keys(conn, true);
-        return Err(e);
-    }
     set_foreign_keys(conn, fk_was_on).context("restoring foreign_keys after migrations")?;
 
     Ok(())
@@ -725,6 +724,46 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(message.contains("rowid=10"), "unexpected error: {message}");
+        assert!(foreign_keys_enabled(&conn).unwrap());
+    }
+
+    #[test]
+    fn migration_fk_violation_rolls_back_to_prior_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_connection_pragmas(&conn, false).unwrap();
+        let first = r#"
+            CREATE TABLE parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE
+            );
+            INSERT INTO parent (id) VALUES (1);
+            INSERT INTO child (id, parent_id) VALUES (10, 1);
+        "#;
+        let violating_second = r#"
+            CREATE TABLE parent_new (id INTEGER PRIMARY KEY);
+            DROP TABLE parent;
+            ALTER TABLE parent_new RENAME TO parent;
+        "#;
+
+        migrate_with(&conn, &[first]).unwrap();
+        let err = migrate_with(&conn, &[first, violating_second]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("migration left dangling foreign keys"),
+            "unexpected error: {err:#}"
+        );
+
+        let version = current_schema_version(&conn).unwrap();
+        assert_eq!(version, 1);
+        let child_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM child WHERE id = 10 AND parent_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count, 1);
+        foreign_key_check(&conn).unwrap();
         assert!(foreign_keys_enabled(&conn).unwrap());
     }
 

@@ -478,6 +478,9 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
+        if self.inner.shutdown.is_draining() {
+            bail!("daemon is shutting down; not starting session workers");
+        }
         let session_id = session.id;
         let project_root = session.project_root.clone();
 
@@ -1156,6 +1159,44 @@ mod tests {
         assert_eq!(reg.live_generation(id), Some(new_generation));
         assert!(reg.lookup(id).is_some());
         assert!(crate::sync::lock_or_recover(&reg.inner.worker_joins).contains_key(&id));
+    }
+
+    #[test]
+    fn start_worker_refuses_after_drain_begins() {
+        let reg = test_registry();
+        reg.inner.shutdown.begin_drain();
+        let session = test_session(&reg);
+        let providers = ProvidersConfig::default();
+        let extended = ExtendedConfig::default();
+        let env = EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        );
+        let policy = WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                root: session.project_root.clone(),
+                opened_path: session.project_root.clone(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let err = match reg.start_worker(
+            Arc::try_unwrap(session)
+                .ok()
+                .expect("fresh test session has one owner"),
+            &providers,
+            &extended,
+            false,
+            None,
+            policy,
+            env,
+            1,
+        ) {
+            Ok(_) => panic!("start_worker should refuse after drain begins"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("shutting down"));
+        assert!(reg.active_session_ids().is_empty());
     }
 
     #[tokio::test]

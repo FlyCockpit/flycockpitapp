@@ -1426,20 +1426,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
     crate::intel::hex_lower(&digest)
 }
 
-fn validate_png_attachment(bytes: &[u8]) -> std::result::Result<(), ErrorPayload> {
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-        .map_err(|_| bad_request("attachment is not a valid PNG"))?;
-    if image.width() > proto::MAX_IMAGE_DIMENSION_PIXELS
-        || image.height() > proto::MAX_IMAGE_DIMENSION_PIXELS
-    {
-        return Err(bad_request(format!(
-            "attachment dimensions {}x{} exceed the {} pixel limit",
-            image.width(),
-            image.height(),
-            proto::MAX_IMAGE_DIMENSION_PIXELS
-        )));
-    }
-    Ok(())
+async fn validate_png_attachment(bytes: Vec<u8>) -> std::result::Result<Vec<u8>, ErrorPayload> {
+    tokio::task::spawn_blocking(move || validate_png_attachment_blocking(bytes))
+        .await
+        .map_err(internal)?
+}
+
+fn validate_png_attachment_blocking(bytes: Vec<u8>) -> std::result::Result<Vec<u8>, ErrorPayload> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
+    limits.max_image_height = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
+    limits.max_alloc = Some(proto::MAX_SINGLE_IMAGE_BYTES as u64);
+    let mut reader = image::ImageReader::with_format(
+        std::io::Cursor::new(bytes.as_slice()),
+        image::ImageFormat::Png,
+    );
+    reader.limits(limits);
+    reader.decode().map_err(|err| match err {
+        image::ImageError::Limits(_) => bad_request(format!(
+            "attachment PNG exceeds the {} pixel or {} byte decode limit",
+            proto::MAX_IMAGE_DIMENSION_PIXELS,
+            proto::MAX_SINGLE_IMAGE_BYTES
+        )),
+        _ => bad_request("attachment is not a valid PNG"),
+    })?;
+    Ok(bytes)
 }
 
 fn begin_attachment_upload(
@@ -1560,7 +1571,7 @@ fn upload_attachment_chunk(
     })
 }
 
-fn finish_attachment_upload(
+async fn finish_attachment_upload(
     state: &mut ClientState,
     upload_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -1579,7 +1590,7 @@ fn finish_attachment_upload(
     if actual != upload.sha256 {
         return Err(bad_request("attachment SHA-256 mismatch"));
     }
-    validate_png_attachment(&upload.bytes)?;
+    let bytes = validate_png_attachment(upload.bytes).await?;
     match upload.purpose {
         proto::AttachmentPurpose::UserMessageImage => {
             let Some(session_id) = upload.session_id else {
@@ -1593,7 +1604,7 @@ fn finish_attachment_upload(
                 ReadyAttachment {
                     session_id,
                     mime: upload.mime,
-                    bytes: upload.bytes,
+                    bytes,
                     purpose: upload.purpose,
                     created_at: Instant::now(),
                 },
@@ -1601,7 +1612,7 @@ fn finish_attachment_upload(
             Ok(Response::AttachmentUploaded { image_ref })
         }
         proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            state.terminal_host.paste_image(terminal_id, &upload.bytes)
+            state.terminal_host.paste_image(terminal_id, &bytes)
         }
     }
 }
@@ -1617,6 +1628,12 @@ fn consume_image_refs(
             refs.len(),
             proto::MAX_IMAGES_PER_USER_MESSAGE
         )));
+    }
+    let mut seen = HashSet::new();
+    for image_ref in refs {
+        if !seen.insert(image_ref.id) {
+            return Err(bad_request("duplicate image ref in user message"));
+        }
     }
     let mut total = 0usize;
     for image_ref in refs {
@@ -1645,8 +1662,13 @@ fn consume_image_refs(
     }
     let images = refs
         .iter()
-        .filter_map(|image_ref| state.ready_attachments.remove(&image_ref.id))
-        .map(|attachment| attachment.bytes)
+        .map(|image_ref| {
+            state
+                .ready_attachments
+                .remove(&image_ref.id)
+                .expect("image ref was validated before removal")
+                .bytes
+        })
         .collect();
     Ok(images)
 }
@@ -1765,7 +1787,9 @@ async fn handle_request(
             data_base64,
         } => upload_attachment_chunk(state, upload_id, offset, data_base64),
 
-        Request::FinishAttachmentUpload { upload_id } => finish_attachment_upload(state, upload_id),
+        Request::FinishAttachmentUpload { upload_id } => {
+            finish_attachment_upload(state, upload_id).await
+        }
 
         Request::CancelAttachmentUpload { upload_id } => {
             if state.pending_uploads.remove(&upload_id).is_some() {
@@ -4014,11 +4038,22 @@ mod tests {
         }
     }
 
+    fn finish_attachment_upload_for_test(
+        state: &mut ClientState,
+        upload_id: Uuid,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(finish_attachment_upload(state, upload_id))
+    }
+
     fn finish_upload_for(state: &mut ClientState, png: &[u8]) -> proto::ImageAttachmentRef {
         let upload_id = begin_upload_for(state, png);
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(png);
         upload_attachment_chunk(state, upload_id, 0, data_base64).unwrap();
-        match finish_attachment_upload(state, upload_id).unwrap() {
+        match finish_attachment_upload_for_test(state, upload_id).unwrap() {
             Response::AttachmentUploaded { image_ref } => image_ref,
             other => panic!("unexpected response: {other:?}"),
         }
@@ -4040,6 +4075,27 @@ mod tests {
             .expect_err("second consume must fail");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("already consumed"));
+    }
+
+    #[test]
+    fn duplicate_image_refs_are_rejected_without_consuming() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, session_id) = attached_state(&ctx, tmp.path());
+        let png = sample_png();
+        let image_ref = finish_upload_for(&mut state, &png);
+
+        let err = consume_image_refs(
+            &mut state,
+            session_id,
+            &[image_ref.clone(), image_ref.clone()],
+        )
+        .expect_err("duplicate refs must fail");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("duplicate image ref"));
+
+        let images = consume_image_refs(&mut state, session_id, &[image_ref]).unwrap();
+        assert_eq!(images, vec![png]);
     }
 
     #[test]
@@ -4106,7 +4162,8 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(&png),
         )
         .unwrap();
-        let err = finish_attachment_upload(&mut state, upload_id).expect_err("hash mismatch");
+        let err =
+            finish_attachment_upload_for_test(&mut state, upload_id).expect_err("hash mismatch");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("SHA-256 mismatch"));
 
@@ -4119,9 +4176,27 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(&bad_png),
         )
         .unwrap();
-        let err = finish_attachment_upload(&mut state, upload_id).expect_err("invalid png");
+        let err =
+            finish_attachment_upload_for_test(&mut state, upload_id).expect_err("invalid png");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("valid PNG"));
+    }
+
+    #[test]
+    fn png_validation_uses_strict_limits() {
+        let large = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            proto::MAX_IMAGE_DIMENSION_PIXELS + 1,
+            1,
+            image::Rgba([1, 2, 3, 255]),
+        ));
+        let mut png = Vec::new();
+        large
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let err = validate_png_attachment_blocking(png).expect_err("dimension limit");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("decode limit"));
     }
 
     #[test]
@@ -5017,6 +5092,17 @@ mod tests {
             .db
             .create_session("p", tmp.path().to_str().unwrap(), "Build")
             .unwrap();
+        let live_session = Arc::new(
+            Session::resume(ctx.db.clone(), session.session_id)
+                .unwrap()
+                .expect("session row"),
+        );
+        let (handle, _work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        ctx.registry.insert_test_worker(handle, join);
         assert!(ctx.shutdown.begin_drain());
 
         let (left, right) = UnixStream::pair().expect("socket pair");

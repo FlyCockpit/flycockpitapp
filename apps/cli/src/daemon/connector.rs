@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -52,29 +52,41 @@ struct ChannelHandle {
 
 pub fn spawn_background(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut wake_rx = ctx.connector_wake_rx();
         loop {
             if ctx.shutdown_signal().is_draining() {
                 break;
             }
-            match sync_once(ctx.clone()).await {
+            match sync_once(ctx.clone(), &mut wake_rx).await {
                 Ok(ConnectorRunOutcome::Revoked) => break,
                 Ok(ConnectorRunOutcome::Disabled) => {
-                    tokio::time::sleep(Duration::from_secs(CONNECTOR_POLL_SECS)).await;
+                    sleep_or_connector_wake(&mut wake_rx, Duration::from_secs(CONNECTOR_POLL_SECS))
+                        .await;
                 }
                 Ok(ConnectorRunOutcome::Disconnected) => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    sleep_or_connector_wake(&mut wake_rx, Duration::from_secs(1)).await;
                 }
                 Ok(ConnectorRunOutcome::Refresh) => {}
                 Err(error) => {
                     tracing::warn!(error = %error, "relay connector loop failed");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    sleep_or_connector_wake(&mut wake_rx, Duration::from_secs(5)).await;
                 }
             }
         }
     })
 }
 
-async fn sync_once(ctx: Arc<DaemonContext>) -> Result<ConnectorRunOutcome> {
+async fn sleep_or_connector_wake(wake_rx: &mut watch::Receiver<u64>, duration: Duration) {
+    tokio::select! {
+        _ = wake_rx.changed() => {}
+        _ = tokio::time::sleep(duration) => {}
+    }
+}
+
+async fn sync_once(
+    ctx: Arc<DaemonContext>,
+    wake_rx: &mut watch::Receiver<u64>,
+) -> Result<ConnectorRunOutcome> {
     let Some(credential) = maybe_load_credential() else {
         return Ok(ConnectorRunOutcome::Disabled);
     };
@@ -96,12 +108,13 @@ async fn sync_once(ctx: Arc<DaemonContext>) -> Result<ConnectorRunOutcome> {
         return Ok(ConnectorRunOutcome::Disabled);
     }
 
-    run_enabled_connector(ctx, credential).await
+    run_enabled_connector(ctx, credential, wake_rx).await
 }
 
 async fn run_enabled_connector(
     ctx: Arc<DaemonContext>,
     credential: StoredFlycockpitCredential,
+    wake_rx: &mut watch::Receiver<u64>,
 ) -> Result<ConnectorRunOutcome> {
     let mut backoff = Backoff::default();
     loop {
@@ -160,7 +173,7 @@ async fn run_enabled_connector(
                     publish_status(&ctx, &credential, false, "off", None, Some(&message));
                     return Ok(ConnectorRunOutcome::Revoked);
                 }
-                tokio::time::sleep(backoff.next()).await;
+                sleep_or_connector_wake(wake_rx, backoff.next()).await;
                 continue;
             }
         };
@@ -171,14 +184,17 @@ async fn run_enabled_connector(
                 backoff.reset();
                 publish_status(&ctx, &credential, true, "connected", Some(&relay_url), None);
                 let refresh_after = token_refresh_delay(token.expires_at.as_deref());
-                let outcome = run_socket(
-                    ctx.clone(),
-                    credential.clone(),
-                    relay_url.clone(),
-                    ws,
-                    refresh_after,
-                )
-                .await;
+                let mut socket_wake_rx = wake_rx.clone();
+                let outcome = tokio::select! {
+                    outcome = run_socket(
+                        ctx.clone(),
+                        credential.clone(),
+                        relay_url.clone(),
+                        ws,
+                        refresh_after,
+                    ) => outcome,
+                    _ = socket_wake_rx.changed() => Ok(ConnectorRunOutcome::Refresh),
+                };
                 match outcome {
                     Ok(ConnectorRunOutcome::Revoked) => return Ok(ConnectorRunOutcome::Revoked),
                     Ok(ConnectorRunOutcome::Refresh) => {
@@ -227,7 +243,7 @@ async fn run_enabled_connector(
                 );
             }
         }
-        tokio::time::sleep(backoff.next()).await;
+        sleep_or_connector_wake(wake_rx, backoff.next()).await;
     }
 }
 

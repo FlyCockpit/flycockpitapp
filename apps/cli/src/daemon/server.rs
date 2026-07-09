@@ -17,7 +17,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
@@ -71,6 +71,7 @@ pub struct DaemonContext {
     shutdown: crate::daemon::shutdown::ShutdownSignal,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
+    connector_wake: watch::Sender<u64>,
 }
 
 impl DaemonContext {
@@ -89,6 +90,7 @@ impl DaemonContext {
         let registry =
             SessionRegistry::new(db.clone(), locks, shutdown.clone(), resource_scheduler);
         let (client_count, _) = tokio::sync::watch::channel(0usize);
+        let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
         let terminal_host = Arc::new(crate::daemon::terminal_host::TerminalHost::new(
             global_events.clone(),
@@ -111,6 +113,7 @@ impl DaemonContext {
                 EnvSnapshotSource::DaemonStart,
             ))),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
+            connector_wake,
         }
     }
 
@@ -173,6 +176,19 @@ impl DaemonContext {
         self.resync_drain_state(proto).await?;
         let _ = attached;
         Ok(())
+    }
+
+    /// Subscribe to connector wakeups. Credential store/clear requests use
+    /// this to interrupt the connector's fallback polling sleep and any active
+    /// relay socket so credential changes take effect immediately.
+    pub fn connector_wake_rx(&self) -> watch::Receiver<u64> {
+        self.connector_wake.subscribe()
+    }
+
+    pub fn wake_connector(&self) {
+        self.connector_wake.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
     }
 
     /// Subscribe to the live connected-client count. Used by the
@@ -1369,6 +1385,8 @@ fn authorize_request(
         | Request::ListAgents
         | Request::ListModels { .. }
         | Request::SetCaffeinate { .. }
+        | Request::StoreFlycockpitCredential { .. }
+        | Request::ClearFlycockpitCredential
         | Request::RecordUsage { .. }
         | Request::GetUsageCounts { .. }
         | Request::StopDaemon => Err(authorization_error("request requires the local owner")),
@@ -2267,6 +2285,28 @@ async fn handle_request(
                 .send_work(SessionWork::Pin { text })
                 .await
                 .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::StoreFlycockpitCredential { credential } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept Flycockpit credential writes",
+                ));
+            }
+            crate::auth::flycockpit::store_credential(&credential).map_err(internal)?;
+            ctx.wake_connector();
+            Ok(Response::Ack)
+        }
+
+        Request::ClearFlycockpitCredential => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept Flycockpit credential writes",
+                ));
+            }
+            crate::auth::flycockpit::clear_credential().map_err(internal)?;
+            ctx.wake_connector();
             Ok(Response::Ack)
         }
 
@@ -3394,6 +3434,151 @@ mod tests {
             scope: crate::daemon::principal::PrincipalScope::Terminal,
             project_root: None,
         }
+    }
+
+    fn owner_state() -> ClientState {
+        ClientState {
+            principal: ClientPrincipal::owner(),
+            attached: None,
+            pending_uploads: HashMap::new(),
+            ready_attachments: HashMap::new(),
+            upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
+            upload_limits: AttachmentUploadLimits::default(),
+            terminal_views: HashSet::new(),
+            terminal_host: test_terminal_host(),
+        }
+    }
+
+    fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredential {
+        crate::auth::flycockpit::StoredFlycockpitCredential {
+            server_url: "https://app.example.test".to_string(),
+            instance_id: "inst-1".to_string(),
+            instance_token: "fci_instance_secret_rpc".to_string(),
+            account: crate::auth::flycockpit::AccountInfo {
+                user_id: "user-1".to_string(),
+                email: "user@example.test".to_string(),
+            },
+            display_name: Some("Devbox".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_home = tmp.path().join("state");
+        let runtime_dir = tmp.path().join("runtime");
+        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
+            ("XDG_STATE_HOME", state_home.as_path()),
+            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
+        ]);
+        let ctx = persistent_test_ctx();
+        let credential = flycockpit_credential();
+        let mut state = owner_state();
+        let mut wake_rx = ctx.connector_wake_rx();
+
+        let debug = format!(
+            "{:?}",
+            Request::StoreFlycockpitCredential {
+                credential: credential.clone(),
+            }
+        );
+        assert!(!debug.contains(&credential.instance_token));
+        assert!(debug.contains("<redacted>"));
+
+        let response = handle_request(
+            Request::StoreFlycockpitCredential {
+                credential: credential.clone(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("credential store succeeds");
+        assert!(matches!(response, Response::Ack));
+        tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
+            .await
+            .expect("connector wake delivered")
+            .expect("wake sender alive");
+
+        let stored = crate::auth::flycockpit::load_credential().unwrap();
+        assert_eq!(stored, credential);
+
+        #[cfg(unix)]
+        {
+            let store = crate::credentials::CredentialStore::open_default().unwrap();
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+        let scrubbed = table.scrub("token=fci_instance_secret_rpc");
+        assert!(!scrubbed.contains("fci_instance_secret_rpc"));
+    }
+
+    #[tokio::test]
+    async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_home = tmp.path().join("state");
+        let runtime_dir = tmp.path().join("runtime");
+        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
+            ("XDG_STATE_HOME", state_home.as_path()),
+            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
+        ]);
+        let ctx = persistent_test_ctx();
+        crate::auth::flycockpit::store_credential(&flycockpit_credential()).unwrap();
+        let mut state = owner_state();
+        let mut wake_rx = ctx.connector_wake_rx();
+
+        let response = handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx)
+            .await
+            .expect("credential clear succeeds");
+        assert!(matches!(response, Response::Ack));
+        tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
+            .await
+            .expect("connector wake delivered")
+            .expect("wake sender alive");
+        assert!(crate::auth::flycockpit::load_credential().is_err());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_home = tmp.path().join("state");
+        let runtime_dir = tmp.path().join("runtime");
+        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
+            ("XDG_STATE_HOME", state_home.as_path()),
+            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
+        ]);
+        let ctx = test_ctx();
+        let mut state = owner_state();
+        let err = handle_request(
+            Request::StoreFlycockpitCredential {
+                credential: flycockpit_credential(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("ephemeral daemon must reject credential writes");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("ephemeral daemons"));
+
+        let err = handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx)
+            .await
+            .expect_err("ephemeral daemon must reject credential clears");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(crate::auth::flycockpit::load_credential().is_err());
     }
 
     #[tokio::test]

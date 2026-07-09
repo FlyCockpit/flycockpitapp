@@ -5,8 +5,12 @@ use anyhow::{Context, Result};
 use crate::auth::flycockpit::{
     ConnectionStatus, DEFAULT_SERVER_URL, FlycockpitClient, StoredFlycockpitCredential,
     clear_credential, default_display_name, load_credential, maybe_load_credential,
+    store_credential,
 };
 use crate::cli::LoginArgs;
+use crate::daemon::DaemonStatus;
+use crate::daemon::client::DaemonClient;
+use crate::daemon::proto::{Request, Response};
 use crate::db::connector::ConnectorDisclosure;
 use crate::db::org_sync::OrgSyncDisclosure;
 
@@ -47,7 +51,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     }
 
     let credential = client
-        .complete_device_code_login(login, Some(display_name), existing_instance_id)
+        .complete_device_code_login_without_store(login, Some(display_name), existing_instance_id)
         .await?;
     println!(
         "Logged in to Flycockpit as {} on {}",
@@ -55,7 +59,8 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     );
     println!("Instance: {}", credential.instance_id);
     let enable_remote_access = prompt_remote_access_default_yes()?;
-    if let Ok(db) = crate::db::Db::open_default() {
+    let db = crate::db::Db::open_default().ok();
+    if let Some(db) = db.as_ref() {
         if let Err(error) = db.set_connector_enabled(
             &credential.server_url,
             &credential.instance_id,
@@ -67,9 +72,12 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         } else {
             println!("Remote access: disabled (use `cockpit connect on` to enable)");
         }
-        if let Err(error) = crate::daemon::org_sync::sync_current_credential_once(&db).await {
-            tracing::warn!(error = %error, "Flycockpit login: best-effort org sync policy check failed");
-        }
+    }
+    store_credential_via_daemon_or_direct(&credential).await?;
+    if let Some(db) = db.as_ref()
+        && let Err(error) = crate::daemon::org_sync::sync_current_credential_once(db).await
+    {
+        tracing::warn!(error = %error, "Flycockpit login: best-effort org sync policy check failed");
     }
     Ok(())
 }
@@ -87,7 +95,7 @@ pub async fn logout() -> Result<()> {
     {
         tracing::warn!(error = %error, "Flycockpit logout: best-effort instance revoke failed");
     }
-    clear_credential().context("clearing Flycockpit credentials")?;
+    clear_credential_via_daemon_or_direct().await?;
     if let Ok(db) = crate::db::Db::open_default()
         && let Err(error) = db.mark_org_sync_disabled(&credential.server_url)
     {
@@ -95,6 +103,68 @@ pub async fn logout() -> Result<()> {
     }
     println!("Logged out of Flycockpit.");
     Ok(())
+}
+
+async fn running_persistent_daemon_client() -> Result<Option<DaemonClient>> {
+    let discovered = crate::daemon::discover().await;
+    if !matches!(discovered.status, DaemonStatus::Running) {
+        return Ok(None);
+    }
+    match DaemonClient::connect(&discovered.paths.socket).await {
+        Ok(client) => Ok(Some(client)),
+        Err(error) => {
+            tracing::warn!(error = %error, "Flycockpit credential RPC: running daemon disappeared; falling back to direct credential file write");
+            eprintln!(
+                "Flycockpit credential RPC failed because the daemon disappeared; writing credentials directly."
+            );
+            Ok(None)
+        }
+    }
+}
+
+async fn store_credential_via_daemon_or_direct(
+    credential: &StoredFlycockpitCredential,
+) -> Result<()> {
+    if let Some(client) = running_persistent_daemon_client().await? {
+        match client
+            .request(Request::StoreFlycockpitCredential {
+                credential: credential.clone(),
+            })
+            .await
+        {
+            Ok(Ok(Response::Ack)) => return Ok(()),
+            Ok(Ok(other)) => anyhow::bail!(
+                "daemon returned unexpected response to Flycockpit credential store: {other:?}"
+            ),
+            Ok(Err(error)) => {
+                anyhow::bail!("daemon rejected Flycockpit credential store: {error}")
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Flycockpit credential RPC failed; falling back to direct credential file write");
+                eprintln!("Flycockpit credential RPC failed; writing credentials directly.");
+            }
+        }
+    }
+    store_credential(credential).context("storing Flycockpit credentials")
+}
+
+async fn clear_credential_via_daemon_or_direct() -> Result<()> {
+    if let Some(client) = running_persistent_daemon_client().await? {
+        match client.request(Request::ClearFlycockpitCredential).await {
+            Ok(Ok(Response::Ack)) => return Ok(()),
+            Ok(Ok(other)) => anyhow::bail!(
+                "daemon returned unexpected response to Flycockpit credential clear: {other:?}"
+            ),
+            Ok(Err(error)) => {
+                anyhow::bail!("daemon rejected Flycockpit credential clear: {error}")
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Flycockpit credential clear RPC failed; falling back to direct credential file write");
+                eprintln!("Flycockpit credential clear RPC failed; clearing credentials directly.");
+            }
+        }
+    }
+    clear_credential().context("clearing Flycockpit credentials")
 }
 
 pub async fn whoami() -> Result<()> {
@@ -237,6 +307,26 @@ mod tests {
             },
             display_name: Some("Workstation".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn store_and_clear_credential_fall_back_to_direct_write_without_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_home = tmp.path().join("state");
+        let runtime_dir = tmp.path().join("runtime");
+        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
+            ("XDG_STATE_HOME", state_home.as_path()),
+            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
+        ]);
+        let credential = credential();
+
+        store_credential_via_daemon_or_direct(&credential)
+            .await
+            .unwrap();
+        assert_eq!(load_credential().unwrap(), credential);
+
+        clear_credential_via_daemon_or_direct().await.unwrap();
+        assert!(load_credential().is_err());
     }
 
     #[test]

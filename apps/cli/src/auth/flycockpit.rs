@@ -1,5 +1,6 @@
 //! Flycockpit account device authorization and instance credentials.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -25,7 +26,7 @@ pub struct AccountInfo {
     pub email: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredFlycockpitCredential {
     pub server_url: String,
     pub instance_id: String,
@@ -33,6 +34,18 @@ pub struct StoredFlycockpitCredential {
     pub account: AccountInfo,
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+impl fmt::Debug for StoredFlycockpitCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredFlycockpitCredential")
+            .field("server_url", &self.server_url)
+            .field("instance_id", &self.instance_id)
+            .field("instance_token", &"<redacted>")
+            .field("account", &self.account)
+            .field("display_name", &self.display_name)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +213,21 @@ impl FlycockpitClient {
         })
     }
 
+    #[cfg(test)]
     pub async fn complete_device_code_login(
+        &self,
+        login: DeviceLogin,
+        display_name: Option<String>,
+        existing_instance_id: Option<String>,
+    ) -> Result<StoredFlycockpitCredential> {
+        let stored = self
+            .complete_device_code_login_without_store(login, display_name, existing_instance_id)
+            .await?;
+        store_credential(&stored)?;
+        Ok(stored)
+    }
+
+    pub async fn complete_device_code_login_without_store(
         &self,
         login: DeviceLogin,
         display_name: Option<String>,
@@ -210,7 +237,7 @@ impl FlycockpitClient {
         let registered = self
             .register_instance(&access_token, display_name.clone(), existing_instance_id)
             .await?;
-        let stored = StoredFlycockpitCredential {
+        Ok(StoredFlycockpitCredential {
             server_url: self.server_url.clone(),
             instance_id: registered.instance_id,
             instance_token: registered.instance_token,
@@ -219,9 +246,7 @@ impl FlycockpitClient {
                 email: registered.account.email,
             },
             display_name: display_name.or_else(|| Some(default_display_name())),
-        };
-        store_credential(&stored)?;
-        Ok(stored)
+        })
     }
 
     async fn poll_device_token(&self, login: DeviceLogin) -> Result<String> {
@@ -430,13 +455,40 @@ pub fn maybe_load_credential() -> Option<StoredFlycockpitCredential> {
 pub fn store_credential(credential: &StoredFlycockpitCredential) -> Result<()> {
     let mut store = CredentialStore::open_default()?;
     store.set(CREDENTIAL_KEY, serde_json::to_value(credential)?);
-    store.save()
+    store.save()?;
+    register_credential_for_redaction(credential);
+    Ok(())
 }
 
 pub fn clear_credential() -> Result<()> {
     let mut store = CredentialStore::open_default()?;
     store.remove(CREDENTIAL_KEY);
-    store.save()
+    store.save()?;
+    clear_credential_redaction_registration();
+    Ok(())
+}
+
+pub fn register_credential_for_redaction(credential: &StoredFlycockpitCredential) {
+    #[cfg(test)]
+    {
+        TEST_REDACTION_TOKEN.with(|token| {
+            *token.borrow_mut() = Some(credential.instance_token.clone());
+        });
+    }
+
+    #[cfg(not(test))]
+    {
+        let _ = credential;
+    }
+}
+
+fn clear_credential_redaction_registration() {
+    #[cfg(test)]
+    {
+        TEST_REDACTION_TOKEN.with(|token| {
+            *token.borrow_mut() = None;
+        });
+    }
 }
 
 pub fn stored_instance_token_for_redaction() -> Option<String> {

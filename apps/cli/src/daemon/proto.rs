@@ -674,6 +674,18 @@ pub enum Request {
         text: String,
     },
 
+    /// Store Flycockpit instance credentials in the daemon-owned credential file
+    /// and wake the relay connector immediately. Owner-only; ephemeral daemons
+    /// reject it because they must not own persistent credentials.
+    StoreFlycockpitCredential {
+        credential: crate::auth::flycockpit::StoredFlycockpitCredential,
+    },
+
+    /// Clear Flycockpit instance credentials from the daemon-owned credential
+    /// file and wake the relay connector so active sockets stop promptly.
+    /// Owner-only; ephemeral daemons reject it.
+    ClearFlycockpitCredential,
+
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
 

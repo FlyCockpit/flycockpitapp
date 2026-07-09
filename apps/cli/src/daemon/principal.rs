@@ -200,6 +200,8 @@ pub fn request_kind(request: &Request) -> &'static str {
         Request::Prune => "prune",
         Request::Compact => "compact",
         Request::Pin { .. } => "pin",
+        Request::StoreFlycockpitCredential { .. } => "store_flycockpit_credential",
+        Request::ClearFlycockpitCredential => "clear_flycockpit_credential",
         Request::DaemonStatus => "daemon_status",
         Request::RefreshEnv { .. } => "refresh_env",
         Request::RecordUsage { .. } => "record_usage",

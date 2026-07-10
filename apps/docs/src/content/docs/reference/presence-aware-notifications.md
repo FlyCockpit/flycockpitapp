@@ -7,7 +7,7 @@ Use this script to verify daemon attention events through the relay, control pla
 1. Start the web, server, relay, and a cockpit-cli daemon connected to the same account.
 2. Configure VAPID keys and enable web push in **Settings -> Cockpit notifications**.
 3. Set the relay ingest URL to the server endpoint, for example `RELAY_CONTROL_INGEST_URL=https://api.example.test/api/relay/control-ingest`.
-4. If the relay runs as a separate process, set the same `RELAY_CONTROL_SECRET` on the server and relay so the server can publish toast frames back to `/ws/user`.
+4. Set the same `RELAY_CONTROL_SECRET` on the server and relay. The relay uses it when posting presence and attention events; the server uses it when publishing toast and disconnect frames back to `/ws/user`.
 
 ## Manual E2E
 

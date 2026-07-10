@@ -189,6 +189,7 @@ services:
     # used by the server; RELAY_JWKS_URL can stay unset unless the relay must
     # reach the server through a private/internal URL.
     envVars:
+      - fromGroup: app-secrets
       - key: NODE_ENV
         value: production
       - key: BETTER_AUTH_URL
@@ -196,6 +197,8 @@ services:
       - key: RELAY_TOKEN_ISSUER
         sync: false
       - key: RELAY_JWKS_URL
+        sync: false
+      - key: RELAY_CONTROL_INGEST_URL
         sync: false
       - key: RELAY_PORT
         value: "3010"
@@ -264,6 +267,9 @@ envVarGroups:
     envVars:
       # Auth (default). Render generates this once and persists it across syncs.
       - key: BETTER_AUTH_SECRET
+        generateValue: true
+      # Shared bearer secret for relay <-> server control traffic.
+      - key: RELAY_CONTROL_SECRET
         generateValue: true
       # Email / SMTP (default feature). Required in production if signup is
       # enabled. Remove these if you rip out email — see removable/email.md.

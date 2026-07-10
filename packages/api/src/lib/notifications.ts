@@ -1,6 +1,5 @@
 import { DEFAULT_LOCALE, isSupportedLocale } from "@flycockpit/config/locales";
 import prisma from "@flycockpit/db";
-import { env } from "@flycockpit/env/server";
 import {
   type AttentionEventType,
   type AttentionNotificationPayload,
@@ -11,6 +10,11 @@ import {
 import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 import { sendNativePushToUser } from "./native-push";
+import {
+  getMissingRelayControlConfigKeys,
+  getRelayControlConfig,
+  relayControlUrl,
+} from "./relay-config";
 import { sendPushNotification } from "./web-push";
 
 export { type AttentionEventType, attentionEventTypeSchema };
@@ -194,35 +198,44 @@ async function sendWebPushToUser(
   };
 }
 
-function relayControlUrl() {
-  if (!env.COCKPIT_RELAY_URL || !env.RELAY_CONTROL_SECRET) return null;
-  const url = new URL(env.COCKPIT_RELAY_URL);
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  url.pathname = "/control";
-  url.search = "";
-  url.hash = "";
-  return url.toString();
-}
-
-async function publishToast(message: RelayControlMessage) {
-  const url = relayControlUrl();
-  if (!url || !env.RELAY_CONTROL_SECRET) return false;
+export async function publishToast(message: RelayControlMessage) {
+  const config = getRelayControlConfigForPublish();
+  if (!config) return false;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2000);
-    const response = await fetch(url, {
+    const response = await fetch(config.url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${env.RELAY_CONTROL_SECRET}`,
+        authorization: `Bearer ${config.controlSecret}`,
       },
       body: JSON.stringify(message),
       signal: controller.signal,
     }).finally(() => clearTimeout(timer));
+    if (!response.ok) {
+      console.warn(`[relay-control] publishToast failed status=${response.status}`);
+    }
     return response.ok;
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[relay-control] publishToast failed: ${err instanceof Error ? err.message : "unknown"}`,
+    );
     return false;
   }
+}
+
+function getRelayControlConfigForPublish() {
+  const url = relayControlUrl();
+  if (!url) {
+    const missing = getMissingRelayControlConfigKeys();
+    console.warn(
+      `[relay-control] publishToast skipped; missing ${missing.join(", ") || "relay control config"}.`,
+    );
+    return null;
+  }
+  const config = getRelayControlConfig();
+  return config ? { url, controlSecret: config.controlSecret } : null;
 }
 
 async function resolveRecipients(
@@ -378,10 +391,16 @@ export function parseRelayAttentionIngest(body: unknown) {
     if (!parsed.userId) throw new ORPCError("BAD_REQUEST", { message: "Missing user id." });
     return {
       kind: "presence" as const,
+      relayId: parsed.relayId ?? null,
       userId: parsed.userId,
       payload: userPresencePayloadSchema.parse(parsed.payload),
     };
   }
   if (!parsed.instanceId) throw new ORPCError("BAD_REQUEST", { message: "Missing instance id." });
-  return { kind: "attention" as const, instanceId: parsed.instanceId, payload: parsed.payload };
+  return {
+    kind: "attention" as const,
+    relayId: parsed.relayId ?? null,
+    instanceId: parsed.instanceId,
+    payload: parsed.payload,
+  };
 }

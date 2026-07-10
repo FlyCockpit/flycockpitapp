@@ -1,5 +1,4 @@
 import prisma from "@flycockpit/db";
-import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -8,17 +7,8 @@ import {
   NOTIFICATION_TYPES,
   recordUserPresenceHeartbeat,
 } from "../lib/notifications";
+import { relayWebSocketUrl } from "../lib/relay-config";
 import { createRelayToken } from "../lib/relay-tokens";
-
-function defaultRelayUrl() {
-  if (env.COCKPIT_RELAY_URL) return env.COCKPIT_RELAY_URL;
-  const base = new URL(env.BETTER_AUTH_URL);
-  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
-  base.pathname = "/ws";
-  base.search = "";
-  base.hash = "";
-  return base.toString();
-}
 
 function serializeNotification(notification: {
   id: string;
@@ -124,7 +114,7 @@ export const notificationsRouter = {
       userId: context.session.user.id,
       grants: [],
     });
-    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: defaultRelayUrl() };
+    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayWebSocketUrl() };
   }),
 
   myPreferences: protectedProcedure.handler(async ({ context }) => {

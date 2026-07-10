@@ -55,6 +55,7 @@ services:
       APPLY_SCHEMA: ${APPLY_SCHEMA:-safe}
       COCKPIT_INSTANCE_LIMIT: ${COCKPIT_INSTANCE_LIMIT:-10}
       COCKPIT_RELAY_URL: ${COCKPIT_RELAY_URL:-ws://localhost:3010/ws}
+      RELAY_CONTROL_SECRET: ${RELAY_CONTROL_SECRET:?set RELAY_CONTROL_SECRET}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-}
       SMTP_USER: ${SMTP_USER:-}
@@ -103,6 +104,8 @@ services:
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:?set BETTER_AUTH_URL}
       RELAY_TOKEN_ISSUER: ${BETTER_AUTH_URL:?set BETTER_AUTH_URL}
       RELAY_JWKS_URL: http://server:3000/api/relay/jwks.json
+      RELAY_CONTROL_INGEST_URL: http://server:3000/api/relay/control-ingest
+      RELAY_CONTROL_SECRET: ${RELAY_CONTROL_SECRET:?set RELAY_CONTROL_SECRET}
       RELAY_PORT: 3010
       REDIS_URL: redis://redis:6379
     ports:

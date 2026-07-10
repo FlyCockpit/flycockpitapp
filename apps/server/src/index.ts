@@ -1,12 +1,6 @@
 import { createHash } from "node:crypto";
 import { createContext } from "@flycockpit/api/context";
 import { getPublicDeploymentProfile } from "@flycockpit/api/lib/deployment-profile";
-import { ingestRemoteInstanceAuditEvents } from "@flycockpit/api/lib/instance-sharing";
-import {
-  ingestAttentionNotification,
-  parseRelayAttentionIngest,
-  recordUserPresenceHeartbeat,
-} from "@flycockpit/api/lib/notifications";
 import {
   pushSubscriptionInputSchema,
   upsertPushSubscription,
@@ -42,6 +36,7 @@ import {
   rpcLimiter,
   signupLimiter,
 } from "./rate-limit.js";
+import { mountRelayRoutes } from "./relay-routes.js";
 import { validateSameSiteJsonRequest } from "./request-origin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
@@ -169,60 +164,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 app.get("/api/meta/profile", (c) => c.json(getPublicDeploymentProfile()));
+mountRelayRoutes(app, { rateLimiter: createRateLimiterMiddleware(rpcLimiter) });
 app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
-
-app.post("/api/relay/control-ingest", async (c) => {
-  let body: unknown;
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: "bad_json" }, 400);
-  }
-
-  try {
-    const parsed = parseRelayAttentionIngest(body);
-    if (parsed.kind === "presence") {
-      await recordUserPresenceHeartbeat({
-        userId: parsed.userId,
-        clientId: parsed.payload.clientId,
-        visible: parsed.payload.visible,
-      });
-      return c.json({ ok: true });
-    }
-
-    const result = await ingestAttentionNotification({
-      instanceId: parsed.instanceId,
-      payload: parsed.payload,
-    });
-    return c.json({ ok: true, result });
-  } catch (err) {
-    if (err instanceof ORPCError) {
-      const status = err.status >= 400 && err.status <= 599 ? err.status : 400;
-      return c.json({ error: err.code, message: err.message }, status as 400);
-    }
-    return c.json({ error: "bad_request" }, 400);
-  }
-});
-
-app.post("/api/relay/audit-ingest", async (c) => {
-  let body: unknown;
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: "bad_json" }, 400);
-  }
-
-  try {
-    const result = await ingestRemoteInstanceAuditEvents(body);
-    return c.json({ ok: true, result });
-  } catch (err) {
-    if (err instanceof ORPCError) {
-      const status = err.status >= 400 && err.status <= 599 ? err.status : 400;
-      return c.json({ error: err.code, message: err.message }, status as 400);
-    }
-    return c.json({ error: "bad_request" }, 400);
-  }
-});
 
 // Liveness probe — answers whether this Node process can serve HTTP. Keep this
 // independent of external services so orchestrators do not restart healthy app

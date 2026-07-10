@@ -68,6 +68,12 @@
     },
     "./lib/instance-sharing": {
       "default": "./src/lib/instance-sharing.ts"
+    },
+    "./lib/relay-config": {
+      "default": "./src/lib/relay-config.ts"
+    },
+    "./lib/relay-credentials": {
+      "default": "./src/lib/relay-credentials.ts"
     }
   },
   "scripts": {

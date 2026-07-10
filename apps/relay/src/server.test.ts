@@ -1,9 +1,9 @@
 import type { AddressInfo } from "node:net";
 import { signRelayToken, verifyRelayTokenWithSecret } from "@flycockpit/relay-protocol/tokens";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { MemoryPresenceStore } from "./presence";
-import { createRelayServer, type RelayServerHandle } from "./server";
+import { createRelayServer, type RelayServerConfig, type RelayServerHandle } from "./server";
 
 const secret = "1234567890abcdef1234567890abcdef";
 const issuer = "https://app.example.test";
@@ -19,7 +19,7 @@ async function token(input: Parameters<typeof signRelayToken>[0]) {
   return (await signRelayToken(input, { secret, issuer })).token;
 }
 
-async function startRelay(logs: string[] = []) {
+async function startRelay(logs: string[] = [], overrides: Partial<RelayServerConfig> = {}) {
   const presenceStore = new MemoryPresenceStore();
   const handle = createRelayServer({
     relayId: "relay-test",
@@ -38,6 +38,7 @@ async function startRelay(logs: string[] = []) {
       warn: (...args) => logs.push(args.join(" ")),
       error: (...args) => logs.push(args.join(" ")),
     },
+    ...overrides,
   });
   await new Promise<void>((resolve) => handle.server.listen(0, resolve));
   handles.push(handle);
@@ -177,6 +178,55 @@ describe("relay server", () => {
     });
     await expect(clientClose).resolves.toMatchObject({ code: 4410 });
     await expect(daemonClose).resolves.toMatchObject({ code: 4410 });
+  });
+
+  it("sends the relay control secret on user-presence and daemon control ingest", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const { url } = await startRelay([], {
+      controlIngestUrl: "https://api.example.test/api/relay/control-ingest",
+      controlSecret: "control-secret-control-secret-1234",
+    });
+
+    const user = connect(url, "/ws/user", await token({ tokenType: "user", userId: "user-1" }));
+    await opened(user);
+    user.send(
+      JSON.stringify({
+        v: 1,
+        type: "presence",
+        clientId: "client-1",
+        visible: true,
+        ts: "2026-07-10T00:00:00.000Z",
+      }),
+    );
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const daemon = connect(
+      url,
+      "/ws/daemon",
+      await token({ tokenType: "connector", instanceId: "instance-1", userId: "owner-1" }),
+    );
+    await opened(daemon);
+    daemon.send(
+      JSON.stringify({
+        v: 1,
+        to: "control",
+        event: "APPROVAL_NEEDED",
+        payload: { eventId: "evt-1" },
+      }),
+    );
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    for (const call of fetchMock.mock.calls) {
+      expect(call[1]).toMatchObject({
+        headers: expect.objectContaining({
+          authorization: "Bearer control-secret-control-secret-1234",
+        }),
+      });
+    }
+    fetchMock.mockRestore();
   });
 
   it("does not write frame bodies to logs", async () => {

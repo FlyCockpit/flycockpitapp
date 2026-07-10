@@ -320,11 +320,14 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
       connection.ws.close(CLOSE_BAD_FRAME);
       return;
     }
-    if (!config.controlIngestUrl) return;
+    if (!controlIngestConfigured || !config.controlIngestUrl || !config.controlSecret) return;
     try {
       await fetch(config.controlIngestUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${config.controlSecret}`,
+        },
         body: JSON.stringify({
           relayId: config.relayId,
           event: "user_presence",
@@ -406,11 +409,14 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
       return;
     }
     if (!("channelId" in frame)) {
-      if (config.controlIngestUrl) {
+      if (controlIngestConfigured && config.controlIngestUrl && config.controlSecret) {
         try {
           await fetch(config.controlIngestUrl, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${config.controlSecret}`,
+            },
             body: JSON.stringify({
               instanceId: connection.instanceId,
               relayId: config.relayId,
@@ -492,6 +498,13 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     }
   }, config.heartbeatMs);
   heartbeat.unref();
+
+  const controlIngestConfigured = Boolean(config.controlIngestUrl && config.controlSecret);
+  if (config.controlIngestUrl && !config.controlSecret) {
+    logger.error(
+      "[relay] RELAY_CONTROL_INGEST_URL is set but RELAY_CONTROL_SECRET is missing; control ingest is disabled",
+    );
+  }
 
   let unsubscribeControl: (() => Promise<void>) | undefined;
   void presenceStore

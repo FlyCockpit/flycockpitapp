@@ -1,5 +1,4 @@
 import prisma from "@flycockpit/db";
-import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 import { authenticatedProcedure, protectedProcedure, publicProcedure } from "../index";
@@ -15,6 +14,7 @@ import {
   ownerTerminalGrant,
   requireActiveInstanceForAccess,
 } from "../lib/instance-sharing";
+import { relayWebSocketUrl } from "../lib/relay-config";
 import { createRelayToken } from "../lib/relay-tokens";
 
 const TERMINAL_STEP_UP_GRACE_MS = 5 * 60 * 1000;
@@ -41,17 +41,6 @@ const instanceTokenInput = z.object({
 const userCodeInput = z.object({
   userCode: z.string().trim().min(1).max(64),
 });
-
-function defaultRelayUrl() {
-  if (env.COCKPIT_RELAY_URL) return env.COCKPIT_RELAY_URL;
-  const base = new URL(env.BETTER_AUTH_URL);
-  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
-  base.pathname = "/ws";
-  base.search = "";
-  base.hash = "";
-  return base.toString();
-}
-
 function serializeInstance(instance: {
   id: string;
   displayName: string;
@@ -251,7 +240,7 @@ export const instancesRouter = {
       userId: instance.userId,
       grants: [],
     });
-    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: defaultRelayUrl() };
+    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayWebSocketUrl() };
   }),
 
   mintClientToken: protectedProcedure
@@ -275,7 +264,7 @@ export const instancesRouter = {
         userId: context.session.user.id,
         grants,
       });
-      return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: defaultRelayUrl() };
+      return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayWebSocketUrl() };
     }),
 
   mintTerminalClientToken: protectedProcedure
@@ -319,7 +308,7 @@ export const instancesRouter = {
       return {
         token: relay.token,
         expiresAt: relay.expiresAt,
-        relayUrl: defaultRelayUrl(),
+        relayUrl: relayWebSocketUrl(),
         stepUpExpiresAt,
       };
     }),

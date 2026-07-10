@@ -26,8 +26,14 @@ vi.mock("./web-push", () => ({
 
 const { default: prisma } = await import("@flycockpit/db");
 const { sendPushNotification } = await import("./web-push");
-const { decideNotificationDelivery, ingestAttentionNotification, normalizeAttentionPayload } =
-  await import("./notifications");
+const {
+  decideNotificationDelivery,
+  ingestAttentionNotification,
+  normalizeAttentionPayload,
+  parseRelayAttentionIngest,
+  publishToast,
+} = await import("./notifications");
+const { resetRelayControlConfig, setRelayControlConfig } = await import("./relay-config");
 
 const db = prisma as unknown as {
   cockpitInstance: { findUnique: ReturnType<typeof vi.fn> };
@@ -148,9 +154,93 @@ describe("notification delivery decision", () => {
   });
 });
 
+describe("relay attention ingest parsing", () => {
+  it("threads relayId through presence and attention payloads", () => {
+    expect(
+      parseRelayAttentionIngest({
+        relayId: "relay-1",
+        event: "user_presence",
+        userId: "user-1",
+        payload: { clientId: "client-1", visible: true },
+      }),
+    ).toMatchObject({ kind: "presence", relayId: "relay-1" });
+
+    expect(
+      parseRelayAttentionIngest({
+        relayId: "relay-1",
+        instanceId: "instance-1",
+        event: "APPROVAL_NEEDED",
+        payload: basePayload,
+      }),
+    ).toMatchObject({ kind: "attention", relayId: "relay-1" });
+  });
+});
+
+describe("publishToast", () => {
+  beforeEach(() => {
+    resetRelayControlConfig();
+  });
+
+  it("logs and returns false when relay control config is missing", async () => {
+    setRelayControlConfig(null);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await expect(
+      publishToast({
+        type: "notify_user",
+        userId: "user-1",
+        notification: {
+          id: "notification-1",
+          type: "APPROVAL_NEEDED",
+          title: "Approval needed",
+          body: "Open the session to review the request.",
+          url: "/en-US/instances",
+          instanceId: "instance-1",
+          sessionRef: "session-1",
+          createdAt: "2026-07-06T00:00:01.000Z",
+        },
+      }),
+    ).resolves.toBe(false);
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("RELAY_CONTROL_SECRET"));
+    warn.mockRestore();
+  });
+
+  it("logs the response status when relay control returns non-2xx", async () => {
+    setRelayControlConfig({
+      relayId: "relay-1",
+      controlSecret: "x".repeat(32),
+      controlUrl: "https://relay.example.test/control",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ error: "nope" }), { status: 503 }));
+
+    await expect(
+      publishToast({
+        type: "disconnect_user",
+        userId: "user-1",
+        reason: "test",
+      }),
+    ).resolves.toBe(false);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://relay.example.test/control",
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: `Bearer ${"x".repeat(32)}` }),
+      }),
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("status=503"));
+    fetchMock.mockRestore();
+    warn.mockRestore();
+  });
+});
+
 describe("attention notification ingestion", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRelayControlConfig();
     seedBaseDb();
   });
 

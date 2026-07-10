@@ -1,8 +1,12 @@
 import prisma from "@flycockpit/db";
-import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 import { parseInstanceToken, verifyInstanceSecret } from "./instance-credentials";
+import {
+  getMissingRelayControlConfigKeys,
+  getRelayControlConfig,
+  relayControlUrl,
+} from "./relay-config";
 import type { RelayGrant, RelayGrantScope } from "./relay-tokens";
 
 export const sharingScopes = ["terminal", "agent", "agent_readonly", "project_files"] as const;
@@ -68,19 +72,18 @@ export function projectRootForGrant(scope: SharingScope, projectRoot: string | n
   return key === "*" ? null : key;
 }
 
-function relayControlUrl() {
-  if (!env.COCKPIT_RELAY_URL || !env.RELAY_CONTROL_SECRET) return null;
-  const url = new URL(env.COCKPIT_RELAY_URL);
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  url.pathname = "/control";
-  url.search = "";
-  url.hash = "";
-  return url.toString();
-}
-
 export async function publishGrantRevocation(input: { userId: string; instanceId: string }) {
   const url = relayControlUrl();
-  if (!url || !env.RELAY_CONTROL_SECRET) return false;
+  const config = getRelayControlConfig();
+  if (!url || !config) {
+    const missing = getMissingRelayControlConfigKeys();
+    console.warn(
+      `[relay-control] publishGrantRevocation skipped; missing ${
+        missing.join(", ") || "relay control config"
+      }.`,
+    );
+    return false;
+  }
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2000);
@@ -88,7 +91,7 @@ export async function publishGrantRevocation(input: { userId: string; instanceId
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: "Bearer " + env.RELAY_CONTROL_SECRET,
+        authorization: "Bearer " + config.controlSecret,
       },
       body: JSON.stringify({
         type: "disconnect_user",
@@ -98,8 +101,16 @@ export async function publishGrantRevocation(input: { userId: string; instanceId
       }),
       signal: controller.signal,
     }).finally(() => clearTimeout(timer));
+    if (!response.ok) {
+      console.warn(`[relay-control] publishGrantRevocation failed status=${response.status}`);
+    }
     return response.ok;
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[relay-control] publishGrantRevocation failed: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    );
     return false;
   }
 }

@@ -93,6 +93,7 @@ export const env = createEnv({
       .default(10 * 1024 * 1024),
     COCKPIT_INSTANCE_LIMIT: z.coerce.number().int().positive().default(10),
     COCKPIT_INSTANCE_GRANTEE_LIMIT: z.coerce.number().int().positive().default(10),
+    COCKPIT_RELAY_ID: z.string().trim().min(1).max(120).optional(),
     COCKPIT_RELAY_URL: z.string().url().optional(),
     RELAY_CONTROL_SECRET: z.string().min(32).optional(),
   },

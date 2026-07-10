@@ -7,10 +7,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[cfg(test)]
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::daemon::proto::{self, ErrorCode, ErrorPayload, Response};
+use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
+#[cfg(test)]
+use crate::redact::RedactionTable;
 
 const REPLAY_BUFFER_BYTES: usize = 256 * 1024;
 const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
@@ -23,7 +27,8 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 #[derive(Debug, Clone)]
 pub struct TerminalHost {
     inner: Arc<Mutex<TerminalHostInner>>,
-    event_tx: broadcast::Sender<proto::Event>,
+    event_tx: EventSender,
+    redaction: SharedRedactionTable,
     temp_root: PathBuf,
     idle_ttl: Duration,
 }
@@ -194,19 +199,21 @@ fn find_decrqm_response_end(input: &[u8], start: usize) -> Option<usize> {
 }
 
 impl TerminalHost {
-    pub fn new(event_tx: broadcast::Sender<proto::Event>, temp_root: PathBuf) -> Self {
+    pub fn new(event_tx: EventSender, redaction: SharedRedactionTable, temp_root: PathBuf) -> Self {
         prepare_temp_root(&temp_root);
         Self {
             inner: Arc::new(Mutex::new(TerminalHostInner::default())),
             event_tx,
+            redaction,
             temp_root,
             idle_ttl: TERMINAL_IDLE_TTL,
         }
     }
 
     #[cfg(test)]
-    pub fn new_for_test(event_tx: broadcast::Sender<proto::Event>, temp_root: PathBuf) -> Self {
-        Self::new(event_tx, temp_root)
+    pub fn new_for_test(event_tx: EventSender, temp_root: PathBuf) -> Self {
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        Self::new(event_tx, redaction, temp_root)
     }
 
     pub fn open(
@@ -225,8 +232,16 @@ impl TerminalHost {
             }
         }
         let id = Uuid::new_v4();
-        let terminal = spawn_terminal(id, &cwd, cols, rows, &self.temp_root, self.event_tx.clone())
-            .map_err(internal)?;
+        let terminal = spawn_terminal(
+            id,
+            &cwd,
+            cols,
+            rows,
+            &self.temp_root,
+            self.event_tx.clone(),
+            self.redaction.clone(),
+        )
+        .map_err(internal)?;
         crate::sync::lock_or_recover(&self.inner)
             .terminals
             .insert(id, terminal);
@@ -405,7 +420,7 @@ impl TerminalHost {
     }
 
     fn emit(&self, event: proto::Event) {
-        let _ = self.event_tx.send(event);
+        send_current_event(&self.event_tx, &self.redaction, event);
     }
 
     fn emit_output_chunks(&self, terminal_id: Uuid, bytes: Vec<u8>) {
@@ -424,7 +439,8 @@ fn spawn_terminal(
     cols: u16,
     rows: u16,
     temp_root: &Path,
-    event_tx: broadcast::Sender<proto::Event>,
+    event_tx: EventSender,
+    redaction: SharedRedactionTable,
 ) -> Result<Arc<Mutex<TerminalState>>> {
     let rows = rows.max(1);
     let cols = cols.max(1);
@@ -469,6 +485,7 @@ fn spawn_terminal(
     }));
 
     let reader_state = Arc::clone(&state);
+    let reader_redaction = redaction.clone();
     std::thread::Builder::new()
         .name(format!("cockpit-remote-terminal-{id}"))
         .spawn(move || {
@@ -486,16 +503,24 @@ fn spawn_terminal(
                             filtered
                         };
                         for chunk in filtered.passthrough.chunks(OUTPUT_CHUNK_BYTES) {
-                            let _ = event_tx.send(proto::Event::TerminalOutput {
-                                terminal_id: id,
-                                bytes: chunk.to_vec(),
-                            });
+                            send_current_event(
+                                &event_tx,
+                                &reader_redaction,
+                                proto::Event::TerminalOutput {
+                                    terminal_id: id,
+                                    bytes: chunk.to_vec(),
+                                },
+                            );
                         }
                         for text in filtered.clipboards {
-                            let _ = event_tx.send(proto::Event::TerminalClipboard {
-                                terminal_id: id,
-                                text,
-                            });
+                            send_current_event(
+                                &event_tx,
+                                &reader_redaction,
+                                proto::Event::TerminalClipboard {
+                                    terminal_id: id,
+                                    text,
+                                },
+                            );
                         }
                     }
                     Err(_) => break,
@@ -504,11 +529,15 @@ fn spawn_terminal(
             let mut state = crate::sync::lock_or_recover(&reader_state);
             if !state.closed {
                 state.closed = true;
-                let _ = event_tx.send(proto::Event::TerminalClosed {
-                    terminal_id: id,
-                    reason: "exited".to_string(),
-                    exit_code: None,
-                });
+                send_current_event(
+                    &event_tx,
+                    &reader_redaction,
+                    proto::Event::TerminalClosed {
+                        terminal_id: id,
+                        reason: "exited".to_string(),
+                        exit_code: None,
+                    },
+                );
             }
         })
         .context("spawn terminal pty reader thread")?;
@@ -723,10 +752,12 @@ mod tests {
         let mut seen = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(proto::Event::TerminalOutput {
-                terminal_id: id,
-                bytes,
-            })) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            if let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+                && let proto::Event::TerminalOutput {
+                    terminal_id: id,
+                    bytes,
+                } = envelope.event
                 && id == terminal_id
             {
                 seen.extend(bytes);

@@ -31,12 +31,17 @@ use crate::daemon::proto::{
 use crate::daemon::registry::SessionRegistry;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
+use crate::daemon::{
+    EventEnvelope, EventReceiver, EventSender, SharedRedactionTable, current_redaction, send_event,
+    set_current_redaction,
+};
 use crate::db::Db;
 use crate::env_snapshot::{
     EnvDiffSummary, EnvDriftPolicy, EnvSnapshot, EnvSnapshotMeta, EnvSnapshotSource,
     EnvSnapshotWire, diff_summary,
 };
 use crate::locks::LockManager;
+use crate::redact::RedactionTable;
 
 /// Daemon-wide broadcast capacity for global (non-session) events such as
 /// [`proto::Event::CaffeinateState`]. Generous — these are rare.
@@ -46,6 +51,110 @@ const IN_PROCESS_EVENT_QUEUE: usize = 1024;
 
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
     OnceLock::new();
+
+fn build_daemon_redaction_table() -> Arc<RedactionTable> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let cfg = crate::config::extended::load_for_cwd(&cwd).redact;
+    Arc::new(RedactionTable::build(&cfg, &cwd).unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "building daemon redaction table failed");
+        RedactionTable::empty()
+    }))
+}
+
+fn refresh_global_redaction_table(shared: &SharedRedactionTable) -> Arc<RedactionTable> {
+    let fresh = build_daemon_redaction_table();
+    let table = match current_redaction(shared).union(&fresh) {
+        Ok(table) => Arc::new(table),
+        Err(error) => {
+            tracing::warn!(error = %error, "unioning daemon redaction table failed");
+            fresh
+        }
+    };
+    set_current_redaction(shared, table.clone());
+    table
+}
+
+fn scrub_json_strings(value: &mut serde_json::Value, redact: &RedactionTable) {
+    match value {
+        serde_json::Value::String(s) => {
+            *s = redact.scrub(s);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_json_strings(item, redact);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                scrub_json_strings(value, redact);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scrub_event_for_principal(
+    principal: &ClientPrincipal,
+    envelope: EventEnvelope,
+) -> Option<proto::Event> {
+    if principal.is_owner() {
+        return Some(envelope.event);
+    }
+    scrub_proto_event(envelope.event, &envelope.redact)
+}
+
+fn scrub_proto_event(event: proto::Event, redact: &RedactionTable) -> Option<proto::Event> {
+    let mut value = match serde_json::to_value(&event) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "serializing event for redaction failed; dropping event");
+            return None;
+        }
+    };
+    scrub_json_strings(&mut value, redact);
+    match serde_json::from_value(value) {
+        Ok(event) => Some(event),
+        Err(error) => {
+            tracing::warn!(error = %error, "deserializing redacted event failed; dropping event");
+            None
+        }
+    }
+}
+
+fn scrub_history_for_principal(
+    principal: &ClientPrincipal,
+    history: Vec<proto::HistoryEntry>,
+    redact: &RedactionTable,
+) -> Vec<proto::HistoryEntry> {
+    if principal.is_owner() {
+        return history;
+    }
+    history
+        .into_iter()
+        .filter_map(|entry| scrub_history_entry(entry, redact))
+        .collect()
+}
+
+fn scrub_history_entry(
+    entry: proto::HistoryEntry,
+    redact: &RedactionTable,
+) -> Option<proto::HistoryEntry> {
+    let mut value = match serde_json::to_value(&entry) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "serializing history entry for redaction failed; dropping entry");
+            return None;
+        }
+    };
+    scrub_json_strings(&mut value, redact);
+    match serde_json::from_value(value) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            tracing::warn!(error = %error, "deserializing redacted history entry failed; dropping entry");
+            None
+        }
+    }
+}
 
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
@@ -62,7 +171,8 @@ pub struct DaemonContext {
     /// worker, every client task subscribes to this regardless of which
     /// (if any) session it's attached to — so a daemon-global event like
     /// [`proto::Event::CaffeinateState`] reaches *all* connected clients.
-    global_events: broadcast::Sender<proto::Event>,
+    global_events: EventSender,
+    global_redaction: SharedRedactionTable,
     pub terminal_host: Arc<crate::daemon::terminal_host::TerminalHost>,
     /// Live count of connected clients. Each [`handle_client`] task
     /// increments on accept and decrements on exit. The ephemeral
@@ -115,14 +225,18 @@ impl DaemonContext {
         let (client_count, _) = tokio::sync::watch::channel(0usize);
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
+        let global_redaction = Arc::new(std::sync::RwLock::new(build_daemon_redaction_table()));
         let terminal_host = Arc::new(crate::daemon::terminal_host::TerminalHost::new(
             global_events.clone(),
+            global_redaction.clone(),
             terminal_temp_root(&paths),
         ));
         let container = Arc::new(crate::container::ContainerManager::detect());
         let _ = crate::container::container_manager().set((*container).clone());
         spawn_terminal_reaper(terminal_host.clone(), shutdown.clone());
-        registry.lsp_manager().set_notice_bus(global_events.clone());
+        registry
+            .lsp_manager()
+            .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
         Self {
             db,
@@ -131,6 +245,7 @@ impl DaemonContext {
             started_at: Instant::now(),
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
+            global_redaction,
             terminal_host,
             client_count,
             shutdown,
@@ -150,13 +265,14 @@ impl DaemonContext {
 
     /// Subscribe to the daemon-global event bus. Every client task holds
     /// one of these for its lifetime.
-    pub fn subscribe_global(&self) -> broadcast::Receiver<proto::Event> {
+    pub fn subscribe_global(&self) -> EventReceiver {
         self.global_events.subscribe()
     }
 
     /// Broadcast a daemon-global event to all connected clients.
     pub fn broadcast_global(&self, event: proto::Event) {
-        let _ = self.global_events.send(event);
+        let table = refresh_global_redaction_table(&self.global_redaction);
+        send_event(&self.global_events, &table, event);
     }
 
     async fn resync_caffeinate_state<S>(&self, proto: &mut ProtoStream<S>) -> Result<()>
@@ -719,7 +835,7 @@ struct ReadyAttachment {
 
 struct AttachedSession {
     handle: SessionWorkerHandle,
-    event_rx: broadcast::Receiver<proto::Event>,
+    event_rx: EventReceiver,
     /// Held for the lifetime of the attachment when this client is
     /// interactive (can answer interrupts). Dropping it on detach /
     /// re-attach / disconnect decrements the worker's interactive-client
@@ -771,8 +887,8 @@ async fn run_in_process_client(
             biased;
             global = global_rx.recv() => {
                 match global {
-                    Ok(ev) => {
-                        if event_tx.send(ev).await.is_err() {
+                    Ok(envelope) => {
+                        if event_tx.send(envelope.event).await.is_err() {
                             return;
                         }
                     }
@@ -792,8 +908,8 @@ async fn run_in_process_client(
             }
             event = event_branch => {
                 match event {
-                    Some(Ok(ev)) => {
-                        if event_tx.send(ev).await.is_err() {
+                    Some(Ok(envelope)) => {
+                        if event_tx.send(envelope.event).await.is_err() {
                             return;
                         }
                     }
@@ -935,7 +1051,10 @@ where
             biased;
             global = global_rx.recv() => {
                 match global {
-                    Ok(ev) => {
+                    Ok(envelope) => {
+                        let Some(ev) = scrub_event_for_principal(&state.principal, envelope) else {
+                            continue;
+                        };
                         if let Err(e) = proto.send(&Envelope::event(ev)).await {
                             tracing::debug!(error = ?e, "client disconnected during global event send");
                             return Ok(());
@@ -962,7 +1081,10 @@ where
             }
             event = event_branch => {
                 match event {
-                    Some(Ok(ev)) => {
+                    Some(Ok(envelope)) => {
+                        let Some(ev) = scrub_event_for_principal(&state.principal, envelope) else {
+                            continue;
+                        };
                         // A raised/resolved interrupt moves the project's
                         // interruptions count. The worker's single forwarder
                         // recomputes and broadcasts the global plan-status
@@ -3031,6 +3153,13 @@ async fn attach(
         );
     }
 
+    let history = if let Some(att) = state.attached.as_ref() {
+        let redact = att.handle.redaction_table();
+        scrub_history_for_principal(&state.principal, history, &redact)
+    } else {
+        history
+    };
+
     Ok(Response::Attached {
         session_id,
         short_id,
@@ -3649,6 +3778,197 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, f);
         String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+
+    fn remote_principal() -> ClientPrincipal {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "remote-user".to_string(),
+            grants: vec![principal::PrincipalGrant {
+                scope: principal::PrincipalScope::AgentReadonly,
+                project_root: None,
+            }],
+        })
+    }
+
+    fn table_for(secret: &str) -> Arc<RedactionTable> {
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: false,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            denylist: vec![secret.to_string()],
+            placeholder: "[redacted]".to_string(),
+            ..crate::config::extended::RedactConfig::default()
+        };
+        Arc::new(RedactionTable::build(&cfg, Path::new(".")).unwrap())
+    }
+
+    #[test]
+    fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
+        let table = table_for("client-boundary-secret");
+        let event = proto::Event::AssistantText {
+            session_id: Uuid::new_v4(),
+            agent: "Build".to_string(),
+            text: "visible client-boundary-secret".to_string(),
+            reasoning: String::new(),
+            seq: None,
+        };
+        let envelope = EventEnvelope {
+            event: event.clone(),
+            redact: table,
+        };
+
+        let owner = scrub_event_for_principal(&ClientPrincipal::owner(), envelope.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&owner).unwrap(),
+            serde_json::to_string(&event).unwrap()
+        );
+        let scrubbed = scrub_event_for_principal(&remote_principal(), envelope).unwrap();
+        let proto::Event::AssistantText { text, .. } = scrubbed else {
+            panic!("expected AssistantText")
+        };
+        assert_eq!(text, "visible [redacted]");
+    }
+
+    #[test]
+    fn boundary_scrubs_streaming_deltas_for_non_owner() {
+        let table = table_for("stream-secret");
+        for event in [
+            proto::Event::AssistantTextDelta {
+                session_id: Uuid::new_v4(),
+                agent: "Build".to_string(),
+                delta: "token stream-secret".to_string(),
+            },
+            proto::Event::ReasoningDelta {
+                session_id: Uuid::new_v4(),
+                agent: "Build".to_string(),
+                delta: "thought stream-secret".to_string(),
+            },
+        ] {
+            let scrubbed = scrub_event_for_principal(
+                &remote_principal(),
+                EventEnvelope {
+                    event,
+                    redact: table.clone(),
+                },
+            )
+            .unwrap();
+            let rendered = serde_json::to_string(&scrubbed).unwrap();
+            assert!(!rendered.contains("stream-secret"), "{rendered}");
+            assert!(rendered.contains("[redacted]"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn boundary_scrubs_nested_json_text_for_non_owner() {
+        let table = table_for("nested-secret");
+        let event = proto::Event::ToolStart {
+            session_id: Uuid::new_v4(),
+            agent: "Build".to_string(),
+            call_id: "call-1".to_string(),
+            tool: "bash".to_string(),
+            args: serde_json::json!({ "sidecar": { "text": "nested-secret" } }),
+        };
+        let scrubbed = scrub_event_for_principal(
+            &remote_principal(),
+            EventEnvelope {
+                event,
+                redact: table,
+            },
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&scrubbed).unwrap();
+        assert!(!rendered.contains("nested-secret"), "{rendered}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+    }
+
+    #[test]
+    fn boundary_uses_emit_time_table_not_later_table() {
+        let emit_table = table_for("emit-secret");
+        let _later_table = table_for("later-secret");
+        let event = proto::Event::AssistantTextDelta {
+            session_id: Uuid::new_v4(),
+            agent: "Build".to_string(),
+            delta: "emit-secret later-secret".to_string(),
+        };
+        let scrubbed = scrub_event_for_principal(
+            &remote_principal(),
+            EventEnvelope {
+                event,
+                redact: emit_table,
+            },
+        )
+        .unwrap();
+        let proto::Event::AssistantTextDelta { delta, .. } = scrubbed else {
+            panic!("expected AssistantTextDelta")
+        };
+        assert_eq!(delta, "[redacted] later-secret");
+    }
+
+    #[test]
+    fn session_and_global_events_use_their_own_tables() {
+        let session_id = Uuid::new_v4();
+        let session_event = proto::Event::Notice {
+            session_id,
+            text: "session-secret global-secret".to_string(),
+        };
+        let global_event = proto::Event::LspNotice {
+            text: "session-secret global-secret".to_string(),
+        };
+
+        let scrubbed_session = scrub_event_for_principal(
+            &remote_principal(),
+            EventEnvelope {
+                event: session_event,
+                redact: table_for("session-secret"),
+            },
+        )
+        .unwrap();
+        let scrubbed_global = scrub_event_for_principal(
+            &remote_principal(),
+            EventEnvelope {
+                event: global_event,
+                redact: table_for("global-secret"),
+            },
+        )
+        .unwrap();
+
+        let proto::Event::Notice { text, .. } = scrubbed_session else {
+            panic!("expected Notice")
+        };
+        assert_eq!(text, "[redacted] global-secret");
+        let proto::Event::LspNotice { text } = scrubbed_global else {
+            panic!("expected LspNotice")
+        };
+        assert_eq!(text, "session-secret [redacted]");
+    }
+
+    #[test]
+    fn attach_history_is_scrubbed_only_for_non_owner() {
+        let table = table_for("history-secret");
+        let history = vec![proto::HistoryEntry::ToolCall {
+            agent: "Build".to_string(),
+            call_id: "call-1".to_string(),
+            tool: "bash".to_string(),
+            original_input: serde_json::json!({ "cmd": "echo history-secret" }),
+            wire_input: serde_json::json!({ "cmd": "echo history-secret" }),
+            recovery_kind: None,
+            recovery_stage: None,
+            output: "history-secret".to_string(),
+            hard_fail: false,
+            truncated: false,
+            hint: Some("history-secret".to_string()),
+        }];
+
+        let owner = scrub_history_for_principal(&ClientPrincipal::owner(), history.clone(), &table);
+        assert_eq!(
+            serde_json::to_string(&owner).unwrap(),
+            serde_json::to_string(&history).unwrap()
+        );
+        let remote = scrub_history_for_principal(&remote_principal(), history, &table);
+        let rendered = serde_json::to_string(&remote).unwrap();
+        assert!(!rendered.contains("history-secret"), "{rendered}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
     }
 
     fn test_ctx() -> Arc<DaemonContext> {
@@ -4969,7 +5289,12 @@ mod tests {
         }
 
         let attached = state.attached.as_mut().expect("attached session");
-        match attached.event_rx.try_recv().expect("approval broadcast") {
+        match attached
+            .event_rx
+            .try_recv()
+            .expect("approval broadcast")
+            .event
+        {
             proto::Event::ApprovalModeState { mode, .. } => {
                 assert_eq!(mode, crate::config::extended::ApprovalMode::Yolo);
             }
@@ -5164,7 +5489,7 @@ mod tests {
         // First request: begin drain + non-forced notice.
         request_shutdown(&ctx);
         assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
-        match events.recv().await.expect("drain notice") {
+        match events.recv().await.expect("drain notice").event {
             proto::Event::DaemonDraining { forced } => assert!(!forced),
             other => panic!("expected DaemonDraining, got {other:?}"),
         }
@@ -5172,7 +5497,7 @@ mod tests {
         // Second request mid-drain: shorten to force + forced notice.
         request_shutdown(&ctx);
         assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
-        match events.recv().await.expect("forced notice") {
+        match events.recv().await.expect("forced notice").event {
             proto::Event::DaemonDraining { forced } => assert!(forced),
             other => panic!("expected forced DaemonDraining, got {other:?}"),
         }

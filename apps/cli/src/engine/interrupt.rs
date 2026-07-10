@@ -40,10 +40,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::sync::lock_or_recover;
 
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::daemon::proto::{self, InterruptQuestionSet, ResolveResponse};
+use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
 
 /// Shared interrupt rendezvous. Cheap to clone via `Arc`.
 pub struct InterruptHub {
@@ -55,7 +56,8 @@ pub struct InterruptHub {
     /// non-daemon paths (tool unit tests, the standalone run shim) where
     /// no client is listening — raising still works; the event is just
     /// not broadcast. Cloned from the session worker's fan-out sender.
-    events: Option<broadcast::Sender<proto::Event>>,
+    events: Option<EventSender>,
+    redaction: Option<SharedRedactionTable>,
     /// Count of attached *interactive* clients — ones that can answer an
     /// interrupt (the TUI; later the remote dashboard). A `cockpit run`
     /// event pump attaches but cannot answer, so it does not count. The
@@ -74,12 +76,14 @@ impl InterruptHub {
     /// interactive clients attach/detach; the loop guard reads it via
     /// [`Self::is_interactive_attached`].
     pub fn new(
-        events: broadcast::Sender<proto::Event>,
+        events: EventSender,
+        redaction: SharedRedactionTable,
         interactive_clients: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
             events: Some(events),
+            redaction: Some(redaction),
             interactive_clients,
         }
     }
@@ -91,6 +95,7 @@ impl InterruptHub {
         Self {
             waiters: Mutex::new(HashMap::new()),
             events: None,
+            redaction: None,
             interactive_clients: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -129,17 +134,21 @@ impl InterruptHub {
         description: &str,
         questions: InterruptQuestionSet,
     ) {
-        if let Some(events) = &self.events {
+        if let (Some(events), Some(redaction)) = (&self.events, &self.redaction) {
             // `send` errors only when there are no subscribers — fine,
             // the interrupt still parks in the DB for the next client.
-            let _ = events.send(proto::Event::InterruptRaised {
-                session_id,
-                interrupt_id,
-                agent: agent.to_string(),
-                description: description.to_string(),
-                question: None,
-                questions: Some(questions),
-            });
+            send_current_event(
+                events,
+                redaction,
+                proto::Event::InterruptRaised {
+                    session_id,
+                    interrupt_id,
+                    agent: agent.to_string(),
+                    description: description.to_string(),
+                    question: None,
+                    questions: Some(questions),
+                },
+            );
         }
     }
 
@@ -151,10 +160,14 @@ impl InterruptHub {
     /// (replace, not delta); only the allow-set is ever sent. Reuses the same
     /// per-session event fan-out the worker uses for `RedactionState`.
     pub fn emit_gitignore_allow(&self, session_id: Uuid, allow: Vec<String>) {
-        if let Some(events) = &self.events {
+        if let (Some(events), Some(redaction)) = (&self.events, &self.redaction) {
             // `send` errors only when there are no subscribers — fine; an
             // attaching client re-hydrates the set via the attach broadcast.
-            let _ = events.send(proto::Event::GitignoreAllow { session_id, allow });
+            send_current_event(
+                events,
+                redaction,
+                proto::Event::GitignoreAllow { session_id, allow },
+            );
         }
     }
 

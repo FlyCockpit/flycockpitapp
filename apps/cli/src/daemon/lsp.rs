@@ -25,12 +25,16 @@ use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+#[cfg(test)]
 use tokio::sync::broadcast;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::config::extended::{ExtendedConfig, LspAutoInstall};
+use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
+#[cfg(test)]
+use crate::redact::RedactionTable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LspServerStatus {
@@ -90,7 +94,7 @@ struct LspInner {
     statuses: RwLock<HashMap<String, LspServerStatus>>,
     prompted: Mutex<HashSet<String>>,
     installed: RwLock<HashMap<String, InstalledRecord>>,
-    notices: StdMutex<Option<broadcast::Sender<crate::daemon::proto::Event>>>,
+    notices: StdMutex<Option<(EventSender, SharedRedactionTable)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,8 +124,8 @@ impl LspManager {
         }
     }
 
-    pub fn set_notice_bus(&self, tx: broadcast::Sender<crate::daemon::proto::Event>) {
-        *crate::sync::lock_or_recover(&self.inner.notices) = Some(tx);
+    pub fn set_notice_bus(&self, tx: EventSender, redaction: SharedRedactionTable) {
+        *crate::sync::lock_or_recover(&self.inner.notices) = Some((tx, redaction));
     }
 
     #[allow(dead_code)]
@@ -382,8 +386,12 @@ impl LspManager {
     }
 
     async fn notice(&self, text: String) {
-        if let Some(tx) = crate::sync::lock_or_recover(&self.inner.notices).as_ref() {
-            let _ = tx.send(crate::daemon::proto::Event::LspNotice { text });
+        if let Some((tx, redaction)) = crate::sync::lock_or_recover(&self.inner.notices).as_ref() {
+            send_current_event(
+                tx,
+                redaction,
+                crate::daemon::proto::Event::LspNotice { text },
+            );
         }
     }
 
@@ -1569,11 +1577,20 @@ mod tests {
         }));
 
         let (tx, mut rx) = broadcast::channel(4);
-        manager.set_notice_bus(tx);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        manager.set_notice_bus(tx, redaction);
         manager.notice("poison recovered".to_string()).await;
 
         match rx.recv().await.unwrap() {
-            crate::daemon::proto::Event::LspNotice { text } => {
+            envelope
+                if matches!(
+                    envelope.event,
+                    crate::daemon::proto::Event::LspNotice { .. }
+                ) =>
+            {
+                let crate::daemon::proto::Event::LspNotice { text } = envelope.event else {
+                    unreachable!()
+                };
                 assert_eq!(text, "poison recovered");
             }
             other => panic!("unexpected event: {other:?}"),

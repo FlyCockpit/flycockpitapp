@@ -17,14 +17,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
 use crate::config::trust::WorkspaceTrustPolicy;
-use crate::daemon::proto;
+use crate::daemon::EventSender;
 use crate::daemon::session_worker::{self, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownSignal;
 use crate::db::Db;
@@ -72,7 +72,7 @@ struct Inner {
     shutdown: ShutdownSignal,
     /// Daemon-global event bus, installed once by [`DaemonContext`]. Workers
     /// use it for singular global recomputes derived from per-session events.
-    global_bus: Mutex<Option<broadcast::Sender<proto::Event>>>,
+    global_bus: Mutex<Option<EventSender>>,
 }
 
 struct WorkerState {
@@ -247,7 +247,7 @@ impl SessionRegistry {
         self.inner.resource_scheduler.clone()
     }
 
-    pub fn set_global_bus(&self, tx: broadcast::Sender<proto::Event>) {
+    pub fn set_global_bus(&self, tx: EventSender) {
         *crate::sync::lock_or_recover(&self.inner.global_bus) = Some(tx);
     }
 

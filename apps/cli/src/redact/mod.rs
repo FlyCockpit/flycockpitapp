@@ -292,6 +292,9 @@ pub struct RedactionTable {
     /// scrub or redaction is disabled. Keeping it `Option` lets
     /// [`scrub`] short-circuit without allocating.
     matcher: Option<AhoCorasick>,
+    /// Canonical `(value, origin)` entries used to build `matcher`. Stored so
+    /// monotonic egress tables can union candidates and compile one matcher.
+    entries: Vec<(String, String)>,
     /// Parallel to `matcher`'s pattern list. Used by
     /// `cockpit debug redact` to render `value (from $VAR)` rows.
     origins: Vec<String>,
@@ -347,6 +350,7 @@ impl RedactionTable {
         if !cfg.enabled {
             return Ok(Self {
                 matcher: None,
+                entries: Vec::new(),
                 origins: Vec::new(),
                 placeholder: cfg.placeholder.clone(),
                 disabled: true,
@@ -444,30 +448,27 @@ impl RedactionTable {
             entries.push((candidate.value, candidate.origin));
         }
 
-        // Sort longest-first so that overlapping patterns prefer the
-        // longer match (`aho-corasick` with LeftmostLongest does this
-        // implicitly, but sorting also gives the debug-dump a stable
-        // canonical order).
+        Self::from_entries(entries, cfg.placeholder.clone(), false, unsupported_files)
+    }
+
+    fn from_entries(
+        mut entries: Vec<(String, String)>,
+        placeholder: String,
+        disabled: bool,
+        unsupported_files: Vec<PathBuf>,
+    ) -> Result<Self> {
         entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-
-        // De-duplicate identical values; we don't want to redact a
-        // single value twice (the placeholder would still be right but
-        // the origins list would carry stale entries). Sorting by value
-        // after length makes duplicates adjacent even when they were
-        // collected from non-adjacent sources.
         entries.dedup_by(|a, b| a.0 == b.0);
-
         if entries.is_empty() {
             return Ok(Self {
                 matcher: None,
+                entries,
                 origins: Vec::new(),
-                placeholder: cfg.placeholder.clone(),
-                disabled: false,
+                placeholder,
+                disabled,
                 unsupported_files,
             });
         }
-
-        // (4) Build the table from the pruned list.
         let patterns: Vec<&str> = entries.iter().map(|(v, _)| v.as_str()).collect();
         let matcher = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
@@ -475,14 +476,29 @@ impl RedactionTable {
             .build(&patterns)
             .map_err(|e| anyhow::anyhow!("building aho-corasick: {e}"))?;
         let origins = entries.iter().map(|(_, o)| o.clone()).collect();
-
         Ok(Self {
             matcher: Some(matcher),
+            entries,
             origins,
-            placeholder: cfg.placeholder.clone(),
-            disabled: false,
+            placeholder,
+            disabled,
             unsupported_files,
         })
+    }
+
+    pub fn union(&self, other: &Self) -> Result<Self> {
+        let mut entries = self.entries.clone();
+        entries.extend(other.entries.iter().cloned());
+        let mut unsupported_files = self.unsupported_files.clone();
+        unsupported_files.extend(other.unsupported_files.iter().cloned());
+        unsupported_files.sort();
+        unsupported_files.dedup();
+        Self::from_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled && other.disabled,
+            unsupported_files,
+        )
     }
 
     /// Scrub every secret in `body`. Returns the cleaned string. The
@@ -520,6 +536,7 @@ impl RedactionTable {
     pub fn empty() -> Self {
         Self {
             matcher: None,
+            entries: Vec::new(),
             origins: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
             disabled: true,
@@ -1119,6 +1136,66 @@ mod scrub_fast_path_tests {
             Cow::Borrowed(got) => assert_eq!(got.as_ptr(), input.as_ptr()),
             Cow::Owned(_) => panic!("empty redaction table should not allocate"),
         }
+    }
+
+    fn table_from_env_value(name: &str, value: &str) -> RedactionTable {
+        let cfg = RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: "[redacted]".to_string(),
+            ..RedactConfig::default()
+        };
+        let env = HashMap::from([(name.to_string(), value.to_string())]);
+        RedactionTable::build_with_env(&cfg, Path::new("."), &env).unwrap()
+    }
+
+    #[test]
+    fn unioned_tables_scrub_values_from_both_inputs() {
+        let first = table_from_env_value("FIRST_SECRET", "first-secret-value");
+        let second = table_from_env_value("SECOND_SECRET", "second-secret-value");
+        let unioned = first.union(&second).unwrap();
+
+        let scrubbed = unioned.scrub("first-secret-value and second-secret-value");
+        assert!(!scrubbed.contains("first-secret-value"), "{scrubbed}");
+        assert!(!scrubbed.contains("second-secret-value"), "{scrubbed}");
+        assert_eq!(scrubbed.matches("[redacted]").count(), 2);
+    }
+
+    #[test]
+    fn unioned_table_is_deterministic_for_unchanged_input() {
+        let first = table_from_env_value("FIRST_SECRET", "first-secret-value");
+        let second = table_from_env_value("SECOND_SECRET", "second-secret-value");
+        let once = first.union(&second).unwrap();
+        let twice = once.union(&second).unwrap();
+        let input = "first-secret-value / second-secret-value";
+        assert_eq!(once.scrub(input), twice.scrub(input));
+    }
+
+    #[test]
+    fn union_with_scanning_disabled_keeps_old_values_and_adds_no_new_env_values() {
+        let first = table_from_env_value("FIRST_SECRET", "first-secret-value");
+        let cfg = RedactConfig {
+            enabled: true,
+            scan_environment: false,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: "[redacted]".to_string(),
+            ..RedactConfig::default()
+        };
+        let env = HashMap::from([(
+            "SECOND_SECRET".to_string(),
+            "second-secret-value".to_string(),
+        )]);
+        let disabled_source = RedactionTable::build_with_env(&cfg, Path::new("."), &env).unwrap();
+        let unioned = first.union(&disabled_source).unwrap();
+
+        let scrubbed = unioned.scrub("first-secret-value and second-secret-value");
+        assert!(!scrubbed.contains("first-secret-value"), "{scrubbed}");
+        assert!(scrubbed.contains("second-secret-value"), "{scrubbed}");
     }
 
     #[test]

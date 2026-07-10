@@ -43,6 +43,7 @@ pub(crate) mod test_harness;
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::private_fs::ensure_private_dir;
@@ -52,6 +53,46 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
+
+use crate::redact::RedactionTable;
+
+/// In-daemon event broadcast item. The wire schema remains proto::Event;
+/// the envelope pins the accumulated redaction table that was live when the
+/// event was emitted so each client can scrub with the correct snapshot.
+#[derive(Debug, Clone)]
+pub struct EventEnvelope {
+    pub event: proto::Event,
+    pub redact: Arc<RedactionTable>,
+}
+
+pub type EventSender = broadcast::Sender<EventEnvelope>;
+pub type EventReceiver = broadcast::Receiver<EventEnvelope>;
+pub type SharedRedactionTable = Arc<std::sync::RwLock<Arc<RedactionTable>>>;
+
+pub fn current_redaction(table: &SharedRedactionTable) -> Arc<RedactionTable> {
+    table
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+pub fn set_current_redaction(table: &SharedRedactionTable, redact: Arc<RedactionTable>) {
+    *table
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = redact;
+}
+
+pub fn send_current_event(tx: &EventSender, redact: &SharedRedactionTable, event: proto::Event) {
+    send_event(tx, &current_redaction(redact), event);
+}
+
+pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::Event) {
+    let _ = tx.send(EventEnvelope {
+        event,
+        redact: redact.clone(),
+    });
+}
 
 /// Env var carrying the ephemeral daemon's socket path from the parent
 /// `run` process to the daemon child it spawns. Internal wiring only —

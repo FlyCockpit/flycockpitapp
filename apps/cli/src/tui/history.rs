@@ -2158,8 +2158,14 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             ));
         }
         spans.extend([
-            Span::styled(format!("{parent} delegated to "), Style::default()),
-            Span::styled(child.to_string(), name_style),
+            Span::styled(
+                format!("{parent} delegated to "),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled(
+                child.to_string(),
+                name_style.add_modifier(Modifier::UNDERLINED),
+            ),
             Span::styled(
                 format!("{dots} {}", format_status_elapsed(elapsed)),
                 Style::default().add_modifier(Modifier::ITALIC),

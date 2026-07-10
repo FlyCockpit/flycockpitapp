@@ -241,6 +241,7 @@ mod selection_copy_state_tests {
             row_kind: ChatRowKind::Message,
             copy_target: None,
             chip_target: None,
+            subagent_target: None,
             tool_box_target: None,
             tool_call_target: None,
             tool_result_scroll: None,
@@ -620,6 +621,9 @@ impl DisplayAttachBackoff {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AffordanceTarget {
     Chip {
+        history_index: usize,
+    },
+    Subagent {
         history_index: usize,
     },
     ToolBox {
@@ -1488,6 +1492,11 @@ pub struct App {
     /// renderer appends a live entry to the bottom of the history
     /// pane.
     pub(super) pending: Option<PendingMsg>,
+    /// Currently rendered transcript view. `Main` is the normal session transcript;
+    /// `Subagent` means `history`/`pending` have been swapped to the selected child.
+    pub(super) transcript_view: TranscriptViewMeta,
+    /// Parent transcript views captured while drilling into subagents.
+    pub(super) transcript_view_stack: Vec<StoredTranscriptView>,
     /// Reference point for the animated `Thinking…` dots. Set once at
     /// `App::new` time; the renderer derives the dot count from the
     /// elapsed time so the animation advances each tick.
@@ -2473,6 +2482,313 @@ pub(super) struct PendingRenderCacheEntry {
     pub(super) state: crate::tui::history::PendingRenderState,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(super) enum TranscriptViewMeta {
+    #[default]
+    Main,
+    Subagent(SubagentViewMeta),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SubagentViewMeta {
+    pub(super) parent: String,
+    pub(super) child: String,
+    pub(super) task_call_id: String,
+    pub(super) label: String,
+    pub(super) read_only: bool,
+    pub(super) finished: bool,
+    pub(super) countdown_started: Option<Instant>,
+    pub(super) countdown_cancelled: bool,
+    pub(super) notice: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct StoredTranscriptView {
+    pub(super) meta: TranscriptViewMeta,
+    pub(super) history: Vec<HistoryEntry>,
+    pub(super) pending: Option<PendingMsg>,
+    pub(super) history_render_versions: Vec<u64>,
+    pub(super) history_render_fingerprints: Vec<u64>,
+    pub(super) history_render_cache: HashMap<usize, HistoryRenderCacheEntry>,
+    pub(super) pending_render_cache: Option<PendingRenderCacheEntry>,
+    pub(super) chat_scroll_offset: usize,
+    pub(super) chat_fresh_anchor_top: Option<usize>,
+    pub(super) chat_fresh_tail_padding: usize,
+    pub(super) pending_fresh_turn_history_idx: Option<usize>,
+}
+
+impl App {
+    fn capture_transcript_view(&mut self) -> StoredTranscriptView {
+        StoredTranscriptView {
+            meta: std::mem::take(&mut self.transcript_view),
+            history: std::mem::take(&mut self.history),
+            pending: self.pending.take(),
+            history_render_versions: std::mem::take(&mut self.history_render_versions),
+            history_render_fingerprints: std::mem::take(&mut self.history_render_fingerprints),
+            history_render_cache: std::mem::take(&mut self.history_render_cache),
+            pending_render_cache: self.pending_render_cache.take(),
+            chat_scroll_offset: self.chat_scroll_offset,
+            chat_fresh_anchor_top: self.chat_fresh_anchor_top.take(),
+            chat_fresh_tail_padding: self.chat_fresh_tail_padding,
+            pending_fresh_turn_history_idx: self.pending_fresh_turn_history_idx.take(),
+        }
+    }
+
+    fn restore_transcript_view(&mut self, mut view: StoredTranscriptView) {
+        self.transcript_view = std::mem::take(&mut view.meta);
+        self.history = std::mem::take(&mut view.history);
+        self.pending = view.pending.take();
+        self.history_render_versions = std::mem::take(&mut view.history_render_versions);
+        self.history_render_fingerprints = std::mem::take(&mut view.history_render_fingerprints);
+        self.history_render_cache = std::mem::take(&mut view.history_render_cache);
+        self.pending_render_cache = view.pending_render_cache.take();
+        self.chat_scroll_offset = view.chat_scroll_offset;
+        self.chat_fresh_anchor_top = view.chat_fresh_anchor_top;
+        self.chat_fresh_tail_padding = view.chat_fresh_tail_padding;
+        self.pending_fresh_turn_history_idx = view.pending_fresh_turn_history_idx;
+        self.chat_row_meta.clear();
+        self.clickable_rows.clear();
+        self.box_rows.clear();
+        self.diff_rows.clear();
+        self.hovered_affordance = None;
+    }
+
+    pub(super) fn active_subagent_view(&self) -> Option<&SubagentViewMeta> {
+        match &self.transcript_view {
+            TranscriptViewMeta::Subagent(view) => Some(view),
+            TranscriptViewMeta::Main => None,
+        }
+    }
+
+    pub(super) fn active_subagent_view_mut(&mut self) -> Option<&mut SubagentViewMeta> {
+        match &mut self.transcript_view {
+            TranscriptViewMeta::Subagent(view) => Some(view),
+            TranscriptViewMeta::Main => None,
+        }
+    }
+
+    pub(super) fn open_subagent_view_for_history_index(&mut self, idx: usize) -> bool {
+        let Some(HistoryEntry::Subagent {
+            parent,
+            child,
+            task_call_id,
+            label,
+            outcome,
+            ..
+        }) = self.history.get(idx).cloned()
+        else {
+            return false;
+        };
+
+        let history = self.backfill_subagent_history(&task_call_id, &label);
+        let read_only = outcome.is_some() || child == "docs";
+        let finished = outcome.is_some();
+        let meta = SubagentViewMeta {
+            parent,
+            child,
+            task_call_id,
+            label,
+            read_only,
+            finished,
+            countdown_started: None,
+            countdown_cancelled: true,
+            notice: if read_only && outcome.is_none() {
+                Some("This subagent is read-only.".to_string())
+            } else {
+                None
+            },
+        };
+
+        let previous = self.capture_transcript_view();
+        self.transcript_view_stack.push(previous);
+        self.transcript_view = TranscriptViewMeta::Subagent(meta);
+        self.history = history;
+        self.pending = None;
+        self.history_render_versions = vec![0; self.history.len()];
+        self.history_render_fingerprints = vec![0; self.history.len()];
+        self.history_render_cache.clear();
+        self.pending_render_cache = None;
+        self.chat_scroll_offset = 0;
+        self.chat_fresh_anchor_top = None;
+        self.chat_fresh_tail_padding = 0;
+        self.pending_fresh_turn_history_idx = None;
+        self.hovered_affordance = None;
+        true
+    }
+
+    fn backfill_subagent_history(&self, task_call_id: &str, label: &str) -> Vec<HistoryEntry> {
+        let Some(session_id) = self.current_session_id() else {
+            return Vec::new();
+        };
+        let snapshot = crate::db::Db::open_default()
+            .and_then(|db| {
+                db.read_blocking(|conn| {
+                    crate::engine::rehydrate::subagent_history_snapshot_conn(
+                        conn,
+                        session_id,
+                        task_call_id,
+                        label,
+                    )
+                })
+            })
+            .unwrap_or_default();
+        wire_history_to_entries(snapshot)
+    }
+
+    pub(super) fn return_from_subagent_view(&mut self) -> bool {
+        let Some(previous) = self.transcript_view_stack.pop() else {
+            return false;
+        };
+        self.restore_transcript_view(previous);
+        self.chat_scroll_offset = 0;
+        true
+    }
+
+    pub(super) fn cancel_subagent_countdown_or_return(&mut self) -> bool {
+        if let Some(view) = self.active_subagent_view_mut()
+            && view.countdown_started.is_some()
+            && !view.countdown_cancelled
+        {
+            view.countdown_cancelled = true;
+            view.notice = Some("Stayed in finished subagent view.".to_string());
+            return true;
+        }
+        self.return_from_subagent_view()
+    }
+
+    pub(super) fn refresh_subagent_countdown(&mut self) {
+        let should_return = self
+            .active_subagent_view()
+            .and_then(|view| {
+                view.countdown_started
+                    .map(|started| (started, view.countdown_cancelled))
+            })
+            .is_some_and(|(started, cancelled)| {
+                !cancelled && started.elapsed() >= Duration::from_secs(5)
+            });
+        if should_return {
+            let _ = self.return_from_subagent_view();
+        }
+    }
+
+    pub(super) fn active_subagent_countdown_line(&self) -> Option<String> {
+        let view = self.active_subagent_view()?;
+        let started = view.countdown_started?;
+        if view.countdown_cancelled {
+            return None;
+        }
+        let elapsed = started.elapsed().as_secs();
+        let remaining = 5_u64.saturating_sub(elapsed).max(1);
+        Some(format!(
+            "Returning to {} from {} in {remaining}s - press esc to stay here",
+            view.parent, view.child
+        ))
+    }
+
+    pub(super) fn submit_subagent_steer(&mut self) -> bool {
+        let Some(view) = self.active_subagent_view().cloned() else {
+            return false;
+        };
+        let message = self.composer.text().trim().to_string();
+        if message.is_empty() {
+            return true;
+        }
+        if view.read_only || view.finished {
+            if let Some(active) = self.active_subagent_view_mut() {
+                active.notice =
+                    Some("This subagent is read-only; steering is disabled.".to_string());
+            }
+            return true;
+        }
+        let Some(session_id) = self.current_session_id() else {
+            if let Some(active) = self.active_subagent_view_mut() {
+                active.notice = Some("No active session; steer was not sent.".to_string());
+            }
+            return true;
+        };
+        self.composer.clear();
+        self.history.push(HistoryEntry::User {
+            text: message.clone(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        self.history.push(HistoryEntry::Plain {
+            line: "steer queued for next turn boundary".to_string(),
+        });
+        self.history_render_versions.resize(self.history.len(), 0);
+        self.history_render_fingerprints
+            .resize(self.history.len(), 0);
+        let req = crate::daemon::proto::Request::SteerDelegation {
+            session_id,
+            task_call_id: view.task_call_id,
+            label: view.label,
+            message,
+        };
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("subagent.steer"),
+            AsyncActionPolicy::AllowConcurrent,
+            move || match agent_runner::daemon_request_blocking(req)? {
+                crate::daemon::proto::Response::DelegationSteer { result } => {
+                    Ok(AsyncActionPayload::DelegationSteer(result))
+                }
+                other => Err(format!("unexpected steer response: {other:?}")),
+            },
+        );
+        true
+    }
+
+    fn apply_subagent_steer_result(&mut self, result: crate::daemon::proto::DelegationSteerResult) {
+        let line = match result.status {
+            crate::daemon::proto::DelegationSteerStatus::Queued => {
+                let label = result.label.clone().unwrap_or_default();
+                format!(
+                    "steer queued for {}/{} at next turn boundary",
+                    result.task_call_id, label
+                )
+            }
+            crate::daemon::proto::DelegationSteerStatus::NotSteerable => {
+                format!("steer not queued: {}", result.message)
+            }
+            crate::daemon::proto::DelegationSteerStatus::InternalError => {
+                format!("steer failed: {}", result.message)
+            }
+        };
+        match result.status {
+            crate::daemon::proto::DelegationSteerStatus::Queued => {
+                if let Some(view) = self.active_subagent_view_mut() {
+                    view.notice = Some(line);
+                } else {
+                    self.show_toast(line, ToastKind::Success);
+                }
+            }
+            crate::daemon::proto::DelegationSteerStatus::NotSteerable => {
+                if let Some(view) = self.active_subagent_view_mut() {
+                    view.read_only = true;
+                    view.finished = true;
+                    view.notice = Some(line);
+                    if view.countdown_started.is_none() {
+                        view.countdown_started = Some(Instant::now());
+                        view.countdown_cancelled = false;
+                    }
+                } else {
+                    self.show_toast(line, ToastKind::Warning);
+                }
+            }
+            crate::daemon::proto::DelegationSteerStatus::InternalError => {
+                if let Some(view) = self.active_subagent_view_mut() {
+                    view.notice = Some(line);
+                } else {
+                    self.show_toast(line, ToastKind::Error);
+                }
+            }
+        }
+    }
+}
+
 async fn wait_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
     match notify {
         Some(notify) => notify.notified().await,
@@ -2614,6 +2930,8 @@ impl App {
             staged_draft: None,
             history: Vec::new(),
             pending: None,
+            transcript_view: TranscriptViewMeta::Main,
+            transcript_view_stack: Vec::new(),
             started_at: Instant::now(),
             busy: false,
             working_span_state: WorkingSpanState::Idle,
@@ -3717,6 +4035,17 @@ impl App {
                 }),
                 Err(e) => self.history.push(HistoryEntry::CommandError {
                     line: format!("/note: {e}"),
+                }),
+            },
+            AsyncActionKind::DaemonRpc("subagent.steer") => match result.payload {
+                Ok(AsyncActionPayload::DelegationSteer(result)) => {
+                    self.apply_subagent_steer_result(result);
+                }
+                Ok(_) => self.history.push(HistoryEntry::CommandError {
+                    line: "subagent steer: unexpected daemon response".to_string(),
+                }),
+                Err(e) => self.history.push(HistoryEntry::CommandError {
+                    line: format!("subagent steer: {e}"),
                 }),
             },
             AsyncActionKind::DaemonRpc("fork.create") => match result.payload {
@@ -7185,6 +7514,7 @@ impl App {
     /// Drain any [`TurnEvent`]s the engine has produced into the
     /// pending+history state machine. Runs each tick.
     pub(super) fn drain_agent_events(&mut self) -> bool {
+        self.refresh_subagent_countdown();
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             return false;
         };
@@ -7887,21 +8217,61 @@ impl App {
                 routing,
             } => {
                 self.pop_agent_path_for_report(&agent);
-                self.settle_subagent(
-                    &agent,
-                    &task_call_id,
-                    &label,
-                    SubagentReportUpdate {
-                        report,
-                        trusted_only,
-                        model_trusted,
-                        routing: subagent_routing_chips_from_value(&routing),
-                    },
-                );
+                let update = SubagentReportUpdate {
+                    report,
+                    trusted_only,
+                    model_trusted,
+                    routing: subagent_routing_chips_from_value(&routing),
+                };
+                let active_matches = self
+                    .active_subagent_view()
+                    .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
+                if active_matches {
+                    if let Some(parent) = self.transcript_view_stack.last_mut() {
+                        settle_subagent_in(
+                            &mut parent.history,
+                            &agent,
+                            &task_call_id,
+                            &label,
+                            update.clone(),
+                        );
+                        parent
+                            .history_render_versions
+                            .resize(parent.history.len(), 0);
+                        parent
+                            .history_render_fingerprints
+                            .resize(parent.history.len(), 0);
+                    } else {
+                        self.settle_subagent(&agent, &task_call_id, &label, update.clone());
+                    }
+                } else {
+                    self.settle_subagent(&agent, &task_call_id, &label, update.clone());
+                }
+                if let Some(view) = self.active_subagent_view_mut()
+                    && view.task_call_id == task_call_id
+                    && view.label == label
+                {
+                    view.read_only = true;
+                    view.finished = true;
+                    if view.countdown_started.is_none() {
+                        view.countdown_started = Some(Instant::now());
+                        view.countdown_cancelled = false;
+                    }
+                }
             }
-            TurnEvent::NestedTurn { .. } => {
-                // Transport foundation only: a later subagent view consumes
-                // nested events. The main transcript remains unchanged.
+            TurnEvent::NestedTurn {
+                task_call_id,
+                label,
+                inner,
+                ..
+            } => {
+                let active_matches = self
+                    .active_subagent_view()
+                    .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
+                if active_matches {
+                    self.apply_event(*inner);
+                }
+                // The main transcript remains unchanged.
             }
             TurnEvent::Usage { usage, .. } => {
                 self.last_usage = Some(usage);
@@ -9224,6 +9594,17 @@ impl App {
             self.toggle_pin_for_seq(seq);
             return;
         }
+        if let Some(entry_idx) = self
+            .chat_row_meta
+            .get(rel)
+            .and_then(|meta| meta.subagent_target)
+        {
+            self.selection = None;
+            if self.open_subagent_view_for_history_index(entry_idx) {
+                return;
+            }
+        }
+
         // Chip click wins over drag-select start: chip rows have a
         // single owning entry whose `expanded` flag we toggle.
         if let Some(entry_idx) = self
@@ -9559,7 +9940,7 @@ impl App {
             AffordanceTarget::ReasoningWindow { history_index } => {
                 self.scroll_reasoning_window(history_index, up)
             }
-            AffordanceTarget::Chip { .. } => false,
+            AffordanceTarget::Chip { .. } | AffordanceTarget::Subagent { .. } => false,
         }
     }
 
@@ -10822,17 +11203,26 @@ fn wire_history_to_entries(wire: Vec<crate::daemon::proto::HistoryEntry>) -> Vec
     for entry in wire {
         match entry {
             Wire::User {
-                text, ts_ms, seq, ..
+                text,
+                ts_ms,
+                seq,
+                origin_principal,
             } => {
-                out.push(HistoryEntry::User {
-                    text,
-                    cleaned: None,
-                    expanded: false,
-                    timestamp: local_from_ts_ms(ts_ms),
-                    seq: (seq != 0).then_some(seq),
-                    preflight_pending: false,
-                    persist_failed: false,
-                });
+                if let Some(origin) = origin_principal.filter(|origin| !origin.trim().is_empty()) {
+                    out.push(HistoryEntry::Plain {
+                        line: format!("steer from {origin}: {text}"),
+                    });
+                } else {
+                    out.push(HistoryEntry::User {
+                        text,
+                        cleaned: None,
+                        expanded: false,
+                        timestamp: local_from_ts_ms(ts_ms),
+                        seq: (seq != 0).then_some(seq),
+                        preflight_pending: false,
+                        persist_failed: false,
+                    });
+                }
             }
             Wire::Assistant {
                 agent,
@@ -11783,6 +12173,7 @@ fn xml_escape(s: &str) -> String {
 /// header — never leaving a dangling animated line. If no running entry
 /// is found (defensive — spawn/report events should pair), a settled
 /// entry is pushed so the report is never lost.
+#[derive(Clone)]
 pub(super) struct SubagentReportUpdate {
     report: String,
     trusted_only: bool,
@@ -12362,6 +12753,7 @@ mod affordance_hover_tests {
             row_kind: ChatRowKind::Other,
             copy_target: None,
             chip_target,
+            subagent_target: None,
             tool_box_target,
             tool_call_target,
             tool_result_scroll: None,
@@ -18709,6 +19101,25 @@ mod resume_history_conversion_tests {
             other => panic!("entries[1] should be InferenceError, got {other:?}"),
         }
         assert!(matches!(entries[2], HistoryEntry::User { .. }));
+    }
+
+    #[test]
+    fn steer_user_snapshot_converts_to_provenance_row() {
+        let entries = wire_history_to_entries(vec![Wire::User {
+            text: "please adjust".into(),
+            ts_ms: 1_700_000_000_000,
+            seq: 7,
+            origin_principal: Some("local:tester".into()),
+        }]);
+
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            HistoryEntry::Plain { line } => {
+                assert!(line.contains("local:tester"));
+                assert!(line.contains("please adjust"));
+            }
+            other => panic!("entries[0] should be steer provenance, got {other:?}"),
+        }
     }
 
     #[test]

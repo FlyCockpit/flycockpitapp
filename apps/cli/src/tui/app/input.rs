@@ -39,6 +39,14 @@ impl App {
             }
         }
 
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && self.active_subagent_view().is_some()
+            && self.cancel_subagent_countdown_or_return()
+        {
+            return false;
+        }
+
         // Ctrl+C: interrupt the running agent; exit only on a second press
         // within the 0.5s window (GOALS §3a). Routed through the
         // double-press state machine. Explicitly exclude Shift so that
@@ -1918,6 +1926,10 @@ impl App {
     }
 
     pub(super) fn submit_input(&mut self) -> bool {
+        if self.active_subagent_view().is_some() {
+            return self.submit_subagent_steer();
+        }
+
         // Daemon draining (`daemon-graceful-drain-shutdown.md`): refuse new
         // input with a short notice rather than dropping or queuing it. The
         // composer keeps the user's text so they can copy it out before the

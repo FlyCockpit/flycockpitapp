@@ -796,6 +796,7 @@ mod tests {
             row_kind: ChatRowKind::Padding,
             copy_target: None,
             chip_target: None,
+            subagent_target: None,
             tool_box_target: None,
             tool_call_target: None,
             tool_result_scroll: None,

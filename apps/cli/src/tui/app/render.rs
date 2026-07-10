@@ -50,6 +50,9 @@ type VisibleRows = (Vec<Line<'static>>, Vec<ChatRowMeta>);
 type ChatRows = (Vec<Line<'static>>, Vec<ChatRowMeta>, HashMap<usize, usize>);
 
 pub(super) fn affordance_target_for_row(meta: &ChatRowMeta) -> Option<AffordanceTarget> {
+    if let Some(history_index) = meta.subagent_target {
+        return Some(AffordanceTarget::Subagent { history_index });
+    }
     if let Some(history_index) = meta.chip_target {
         return Some(AffordanceTarget::Chip { history_index });
     }
@@ -402,6 +405,7 @@ pub(crate) struct ChatRowMeta {
     pub row_kind: ChatRowKind,
     pub copy_target: Option<ChatCopyTarget>,
     pub chip_target: Option<usize>,
+    pub subagent_target: Option<usize>,
     pub tool_box_target: Option<usize>,
     pub tool_call_target: Option<(usize, usize)>,
     pub tool_result_scroll: Option<ToolResultScrollMeta>,
@@ -420,6 +424,7 @@ impl ChatRowMeta {
             row_kind: ChatRowKind::Padding,
             copy_target: None,
             chip_target: None,
+            subagent_target: None,
             tool_box_target: None,
             tool_call_target: None,
             tool_result_scroll: None,
@@ -1462,6 +1467,11 @@ impl App {
                 } else {
                     None
                 };
+                let subagent_target = if i == 0 && matches!(entry, HistoryEntry::Subagent { .. }) {
+                    Some(idx)
+                } else {
+                    None
+                };
                 let pin_hit = match pin_region {
                     Some(r) if Some(all.len() + i) == pin_abs => Some(PinHit {
                         seq: r.seq,
@@ -1470,7 +1480,7 @@ impl App {
                     }),
                     _ => None,
                 };
-                let row_kind = if chip_target.is_some() {
+                let row_kind = if chip_target.is_some() || subagent_target.is_some() {
                     ChatRowKind::Chip
                 } else {
                     base_kind
@@ -1484,6 +1494,7 @@ impl App {
                         base_copy
                     },
                     chip_target,
+                    subagent_target,
                     tool_box_target: is_box.then_some(idx),
                     tool_call_target: tool_call_rows
                         .get(i)
@@ -1568,6 +1579,26 @@ impl App {
         }
         self.history_render_cache
             .retain(|idx, _| *idx < self.history.len());
+
+        if let Some(view) = self.active_subagent_view() {
+            if let Some(line) = self.active_subagent_countdown_line() {
+                row_meta.push(ChatRowMeta::other());
+                all.push(Line::from(vec![Span::styled(
+                    line,
+                    Style::default()
+                        .fg(WARNING_TEXT)
+                        .add_modifier(Modifier::ITALIC),
+                )]));
+            } else if let Some(notice) = &view.notice {
+                row_meta.push(ChatRowMeta::other());
+                all.push(Line::from(vec![Span::styled(
+                    notice.clone(),
+                    Style::default()
+                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                        .add_modifier(Modifier::ITALIC),
+                )]));
+            }
+        }
 
         let (mut all, mut row_meta, msg_abs_line) =
             prewrap_chat_rows(all, row_meta, msg_abs_line, area.width as usize);
@@ -3673,15 +3704,16 @@ mod slash_popup_full_list_tests {
 #[cfg(test)]
 mod render_history_spacing_tests {
     use super::{
-        App, ChatCopyTarget, ChatRowKind, Selection, TranscriptFind, extract_selection_plaintext,
+        App, ChatCopyTarget, ChatRowKind, Selection, TranscriptFind, affordance_target_for_row,
+        extract_selection_plaintext,
     };
     use crate::config::extended::{DiffStyle, ThinkingDisplay};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
     use crate::tokens::{count_call_count, reset_count_call_count};
     use crate::tui::app::AffordanceTarget;
     use crate::tui::history::{
-        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, ToolCall, ToolCallState,
-        render_entry_call_count, render_pending, render_pending_incremental,
+        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
+        ToolCallState, render_entry_call_count, render_pending, render_pending_incremental,
         reset_render_entry_call_count,
     };
     use crate::tui::markdown::{
@@ -3801,6 +3833,21 @@ mod render_history_spacing_tests {
         }
     }
 
+    fn running_subagent() -> HistoryEntry {
+        HistoryEntry::Subagent {
+            parent: "Build".to_string(),
+            child: "explore".to_string(),
+            task_call_id: "call-1".to_string(),
+            label: "default".to_string(),
+            trusted_only: false,
+            model_trusted: true,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: std::time::Instant::now(),
+            outcome: None,
+            expanded: false,
+        }
+    }
+
     fn render_history_no_selection(app: &mut App, width: u16, height: u16) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3816,6 +3863,87 @@ mod render_history_spacing_tests {
             active: false,
         });
         render_history_no_selection(app, width, height);
+    }
+
+    #[test]
+    fn running_subagent_row_exposes_open_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.history.push(running_subagent());
+        app.history_render_versions = vec![0; app.history.len()];
+        app.history_render_fingerprints = vec![0; app.history.len()];
+
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert!(
+            app.chat_row_meta
+                .iter()
+                .any(|meta| meta.subagent_target == Some(0)),
+            "running subagent row should be openable: {:?}",
+            app.chat_row_meta
+        );
+        assert!(
+            app.chat_row_meta
+                .iter()
+                .any(|meta| affordance_target_for_row(meta)
+                    == Some(AffordanceTarget::Subagent { history_index: 0 }))
+        );
+    }
+
+    #[test]
+    fn opening_subagent_view_pushes_and_esc_restores_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.history.push(user("root prompt"));
+        app.history.push(running_subagent());
+        app.history_render_versions = vec![0; app.history.len()];
+        app.history_render_fingerprints = vec![0; app.history.len()];
+
+        assert!(app.open_subagent_view_for_history_index(1));
+        assert!(app.active_subagent_view().is_some());
+        assert_eq!(app.transcript_view_stack.len(), 1);
+        assert!(
+            app.history.is_empty(),
+            "no persisted child rows in this unit test"
+        );
+
+        assert!(app.cancel_subagent_countdown_or_return());
+        assert!(app.active_subagent_view().is_none());
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.transcript_view_stack.len(), 0);
+    }
+
+    #[test]
+    fn subagent_report_while_view_open_settles_parent_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.history.push(running_subagent());
+        app.history_render_versions = vec![0; app.history.len()];
+        app.history_render_fingerprints = vec![0; app.history.len()];
+
+        assert!(app.open_subagent_view_for_history_index(0));
+        app.apply_event(crate::engine::agent::TurnEvent::SubagentReport {
+            agent: "explore".to_string(),
+            task_call_id: "call-1".to_string(),
+            label: "default".to_string(),
+            report: "done".to_string(),
+            trusted_only: false,
+            model_trusted: true,
+            routing: serde_json::Value::Null,
+        });
+
+        assert!(app.active_subagent_view().is_some_and(|view| view.finished));
+        assert!(app.return_from_subagent_view());
+        assert!(matches!(
+            app.history.first(),
+            Some(HistoryEntry::Subagent {
+                outcome: Some(outcome),
+                ..
+            }) if outcome.report == "done"
+        ));
     }
 
     fn render_history_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {

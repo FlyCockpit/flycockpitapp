@@ -749,6 +749,88 @@ pub enum Request {
     StopDaemon,
 }
 
+// Keep daemon command metadata centralized. Callers provide a local callback
+// macro so each module can expand the same exhaustive Request table into the
+// shape it needs without changing Request's serde representation.
+macro_rules! command {
+    ($with_commands:ident $(, $context:ident)*) => {
+        $with_commands! { ($($context),*) [
+            (Request::Attach { session_id, .. }, "attach", custom(authorize_attach), option_field(session_id), true, none);
+            (Request::SubagentTranscript { session_id, .. }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), true, none);
+            (Request::SendUserMessage { .. }, "send_user_message", session_writer, attached, true, none);
+            (Request::SteerDelegation { session_id, .. }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, none);
+            (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, none);
+            (Request::UploadAttachmentChunk { .. }, "upload_attachment_chunk", custom(authorize_attachment_upload_step), attached, true, none);
+            (Request::FinishAttachmentUpload { .. }, "finish_attachment_upload", custom(authorize_attachment_upload_step), attached, true, none);
+            (Request::CancelAttachmentUpload { .. }, "cancel_attachment_upload", custom(authorize_attachment_upload_step), attached, true, none);
+            (Request::RemoveQueuedUserMessage { .. }, "remove_queued_user_message", session_writer, attached, true, none);
+            (Request::RemoveNewestQueuedUserMessage { .. }, "remove_newest_queued_user_message", session_writer, attached, true, none);
+            (Request::RemoveEditableQueuedUserMessages { .. }, "remove_editable_queued_user_messages", session_writer, attached, true, none);
+            (Request::ResumePausedWork { session_id }, "resume_paused_work", session_writer, field(session_id), true, none);
+            (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_writer, field(session_id), true, none);
+            (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, none);
+            (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);
+            (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, none);
+            (Request::FsStat { project_root, .. }, "fs_stat", project_files(project_root), none, false, none);
+            (Request::FsRead { project_root, .. }, "fs_read", project_files(project_root), none, false, none);
+            (Request::FsWrite { project_root, path, .. }, "fs_write", project_files(project_root), none, true, path(path));
+            (Request::FsCreateDir { project_root, path }, "fs_create_dir", project_files(project_root), none, true, path(path));
+            (Request::FsRename { project_root, from_path, to_path }, "fs_rename", project_files(project_root), none, true, rename(from_path, to_path));
+            (Request::FsDelete { path, .. }, "fs_delete", owner_only, none, true, path(path));
+            (Request::GitStatus { project_root }, "git_status", project_files(project_root), none, false, none);
+            (Request::GitDiffFile { project_root, path }, "git_diff_file", project_files(project_root), none, false, path(path));
+            (Request::OpenTerminal { .. }, "open_terminal", terminal, none, true, none);
+            (Request::AttachTerminal { .. }, "attach_terminal", terminal, none, false, none);
+            (Request::TerminalInput { .. }, "terminal_input", terminal, none, false, none);
+            (Request::TerminalResize { .. }, "terminal_resize", terminal, none, false, none);
+            (Request::CloseTerminal { .. }, "close_terminal", terminal, none, true, none);
+            (Request::LspControl { .. }, "lsp_control", custom(authorize_lsp_control), attached, true, none);
+            (Request::ResolveInterrupt { .. }, "resolve_interrupt", session_writer, attached, true, none);
+            (Request::ListSessions { .. }, "list_sessions", public_read, none, false, none);
+            (Request::SessionLiveStatus { .. }, "session_live_status", public_read, none, false, none);
+            (Request::ArchiveSession { session_id, .. }, "archive_session", session_row_writer(session_id), field(session_id), true, none);
+            (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ForkSession { parent_session_id, .. }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, none);
+            (Request::DiscardSession { session_id }, "discard_session", session_row_writer(session_id), field(session_id), true, none);
+            (Request::RenameSession { session_id, .. }, "rename_session", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ShareSession { session_id, .. }, "share_session", owner_only, field(session_id), true, none);
+            (Request::RecordSessionNote { session_id, .. }, "record_session_note", session_row_writer(session_id), field(session_id), true, none);
+            (Request::DeleteSession { session_id, .. }, "delete_session", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ListSkills { project_root }, "list_skills", project_read(project_root), none, false, none);
+            (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, true, none);
+            (Request::PromoteResource { session_id, .. }, "promote_resource", owner_only, option_field(session_id), true, none);
+            (Request::ListAgents, "list_agents", owner_only, none, true, none);
+            (Request::ListModels { .. }, "list_models", owner_only, none, false, none);
+            (Request::SetActiveModel { .. }, "set_active_model", session_writer, attached, true, none);
+            (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, none);
+            (Request::SetLlmMode { .. }, "set_llm_mode", session_writer, attached, true, none);
+            (Request::SetSessionLlmMode { .. }, "set_session_llm_mode", session_writer, attached, true, none);
+            (Request::SetApprovalMode { .. }, "set_approval_mode", session_writer, attached, true, none);
+            (Request::SetDelegationRecursion { .. }, "set_delegation_recursion", session_writer, attached, true, none);
+            (Request::SetSandbox { .. }, "set_sandbox", session_writer, attached, true, none);
+            (Request::SetPreflight { .. }, "set_preflight", session_writer, attached, true, none);
+            (Request::SetTrustedOnly { .. }, "set_trusted_only", session_writer, attached, true, none);
+            (Request::SetRedaction { .. }, "set_redaction", session_writer, attached, true, none);
+            (Request::SetTandemModels { .. }, "set_tandem_models", session_writer, attached, true, none);
+            (Request::SetCaffeinate { .. }, "set_caffeinate", owner_only, none, true, none);
+            (Request::CancelSchedule { .. }, "cancel_schedule", session_writer, attached, true, none);
+            (Request::Prune, "prune", session_writer, attached, true, none);
+            (Request::Compact, "compact", session_writer, attached, true, none);
+            (Request::Pin { .. }, "pin", session_writer, attached, true, none);
+            (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential", owner_only, none, true, none);
+            (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, none);
+            (Request::DaemonStatus, "daemon_status", public_read, none, false, none);
+            (Request::RefreshEnv { .. }, "refresh_env", session_writer, attached, true, none);
+            (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, none);
+            (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, true, none);
+            (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, none);
+            (Request::StopDaemon, "stop_daemon", owner_only, none, true, none);
+        ] }
+    };
+}
+
+pub(crate) use command;
+
 /// Which autocomplete surface a [`Request::RecordUsage`] belongs to.
 /// Serializes to the `kind` column verbatim (`model` / `slash` / `tag`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

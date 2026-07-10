@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::daemon::proto::Request;
+use crate::daemon::proto::{self, Request};
 use crate::daemon::relay_envelope::{RelayGrantScope, RelayPrincipal};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,79 +168,17 @@ fn canonical_if_exists(path: &str) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(path))
 }
 
+macro_rules! command_request_kind_match {
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => $kind,)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
 pub fn request_kind(request: &Request) -> &'static str {
-    match request {
-        Request::Attach { .. } => "attach",
-        Request::SubagentTranscript { .. } => "subagent_transcript",
-        Request::SendUserMessage { .. } => "send_user_message",
-        Request::SteerDelegation { .. } => "steer_delegation",
-        Request::BeginAttachmentUpload { .. } => "begin_attachment_upload",
-        Request::UploadAttachmentChunk { .. } => "upload_attachment_chunk",
-        Request::FinishAttachmentUpload { .. } => "finish_attachment_upload",
-        Request::CancelAttachmentUpload { .. } => "cancel_attachment_upload",
-        Request::RemoveQueuedUserMessage { .. } => "remove_queued_user_message",
-        Request::RemoveNewestQueuedUserMessage { .. } => "remove_newest_queued_user_message",
-        Request::RemoveEditableQueuedUserMessages { .. } => "remove_editable_queued_user_messages",
-        Request::ResumePausedWork { .. } => "resume_paused_work",
-        Request::CancelPausedWork { .. } => "cancel_paused_work",
-        Request::RepairResume { .. } => "repair_resume",
-        Request::CancelTurn => "cancel_turn",
-        Request::LspControl { .. } => "lsp_control",
-        Request::FsList { .. } => "fs_list",
-        Request::FsStat { .. } => "fs_stat",
-        Request::FsRead { .. } => "fs_read",
-        Request::FsWrite { .. } => "fs_write",
-        Request::FsCreateDir { .. } => "fs_create_dir",
-        Request::FsRename { .. } => "fs_rename",
-        Request::FsDelete { .. } => "fs_delete",
-        Request::GitStatus { .. } => "git_status",
-        Request::GitDiffFile { .. } => "git_diff_file",
-        Request::OpenTerminal { .. } => "open_terminal",
-        Request::AttachTerminal { .. } => "attach_terminal",
-        Request::TerminalInput { .. } => "terminal_input",
-        Request::TerminalResize { .. } => "terminal_resize",
-        Request::CloseTerminal { .. } => "close_terminal",
-        Request::ResolveInterrupt { .. } => "resolve_interrupt",
-        Request::ListSessions { .. } => "list_sessions",
-        Request::SessionLiveStatus { .. } => "session_live_status",
-        Request::ArchiveSession { .. } => "archive_session",
-        Request::UnarchiveSession { .. } => "unarchive_session",
-        Request::ForkSession { .. } => "fork_session",
-        Request::DiscardSession { .. } => "discard_session",
-        Request::RenameSession { .. } => "rename_session",
-        Request::RecordSessionNote { .. } => "record_session_note",
-        Request::DeleteSession { .. } => "delete_session",
-        Request::ListSkills { .. } => "list_skills",
-        Request::ResourceSnapshot => "resource_snapshot",
-        Request::PromoteResource { .. } => "promote_resource",
-        Request::ListAgents => "list_agents",
-        Request::ListModels { .. } => "list_models",
-        Request::SetActiveModel { .. } => "set_active_model",
-        Request::SetAgent { .. } => "set_agent",
-        Request::SetLlmMode { .. } => "set_llm_mode",
-        Request::SetSessionLlmMode { .. } => "set_session_llm_mode",
-        Request::SetApprovalMode { .. } => "set_approval_mode",
-        Request::SetDelegationRecursion { .. } => "set_delegation_recursion",
-        Request::SetCaffeinate { .. } => "set_caffeinate",
-        Request::CancelSchedule { .. } => "cancel_schedule",
-        Request::SetSandbox { .. } => "set_sandbox",
-        Request::SetPreflight { .. } => "set_preflight",
-        Request::SetTrustedOnly { .. } => "set_trusted_only",
-        Request::SetRedaction { .. } => "set_redaction",
-        Request::SetTandemModels { .. } => "set_tandem_models",
-        Request::Prune => "prune",
-        Request::Compact => "compact",
-        Request::Pin { .. } => "pin",
-        Request::StoreFlycockpitCredential { .. } => "store_flycockpit_credential",
-        Request::ClearFlycockpitCredential => "clear_flycockpit_credential",
-        Request::DaemonStatus => "daemon_status",
-        Request::RefreshEnv { .. } => "refresh_env",
-        Request::RecordUsage { .. } => "record_usage",
-        Request::GetUsageCounts { .. } => "get_usage_counts",
-        Request::GuidanceEstimate { .. } => "guidance_estimate",
-        Request::StopDaemon => "stop_daemon",
-        Request::ShareSession { .. } => "share_session",
-    }
+    proto::command!(command_request_kind_match, request)
 }
 
 #[cfg(test)]

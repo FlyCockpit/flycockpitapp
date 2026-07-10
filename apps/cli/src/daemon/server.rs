@@ -1345,87 +1345,70 @@ fn require_remote_target_session_writer(
     }
 }
 
+macro_rules! command_session_id_value {
+    ($state:expr, none) => {
+        None
+    };
+    ($state:expr, attached) => {
+        $state.attached.as_ref().map(|att| att.handle.session_id)
+    };
+    ($state:expr, field($field:ident)) => {
+        Some(*$field)
+    };
+    ($state:expr, option_field($field:ident)) => {
+        *$field
+    };
+}
+
+macro_rules! command_request_session_id_match {
+    (($request:ident, $state:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => command_session_id_value!($state, $session $(($session_arg))?),)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
 fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
-    match request {
-        Request::Attach { session_id, .. } => *session_id,
-        Request::ResumePausedWork { session_id }
-        | Request::CancelPausedWork { session_id }
-        | Request::RepairResume { session_id }
-        | Request::SteerDelegation { session_id, .. }
-        | Request::SubagentTranscript { session_id, .. }
-        | Request::ArchiveSession { session_id, .. }
-        | Request::UnarchiveSession { session_id }
-        | Request::DiscardSession { session_id }
-        | Request::RenameSession { session_id, .. }
-        | Request::ShareSession { session_id, .. }
-        | Request::RecordSessionNote { session_id, .. }
-        | Request::DeleteSession { session_id, .. } => Some(*session_id),
-        Request::ForkSession {
-            parent_session_id, ..
-        } => Some(*parent_session_id),
-        Request::PromoteResource { session_id, .. } => *session_id,
-        Request::SendUserMessage { .. }
-        | Request::BeginAttachmentUpload { .. }
-        | Request::UploadAttachmentChunk { .. }
-        | Request::FinishAttachmentUpload { .. }
-        | Request::CancelAttachmentUpload { .. }
-        | Request::RemoveQueuedUserMessage { .. }
-        | Request::RemoveNewestQueuedUserMessage { .. }
-        | Request::RemoveEditableQueuedUserMessages { .. }
-        | Request::CancelTurn
-        | Request::LspControl { .. }
-        | Request::ResolveInterrupt { .. }
-        | Request::SetActiveModel { .. }
-        | Request::SetAgent { .. }
-        | Request::SetLlmMode { .. }
-        | Request::SetSessionLlmMode { .. }
-        | Request::SetApprovalMode { .. }
-        | Request::SetDelegationRecursion { .. }
-        | Request::CancelSchedule { .. }
-        | Request::SetSandbox { .. }
-        | Request::SetPreflight { .. }
-        | Request::SetTrustedOnly { .. }
-        | Request::SetRedaction { .. }
-        | Request::SetTandemModels { .. }
-        | Request::Prune
-        | Request::Compact
-        | Request::Pin { .. }
-        | Request::RefreshEnv { .. } => state.attached.as_ref().map(|att| att.handle.session_id),
-        _ => None,
-    }
+    proto::command!(command_request_session_id_match, request, state)
 }
 
+macro_rules! command_audit_path_value {
+    (none) => {
+        None
+    };
+    (path($path:ident)) => {
+        Some($path.clone())
+    };
+    (rename($from_path:ident, $to_path:ident)) => {
+        Some(format!("{} -> {}", $from_path, $to_path))
+    };
+}
+
+macro_rules! command_request_audit_path_match {
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => command_audit_path_value!($audit_path $(($($audit_arg),+))?),)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
 fn request_audit_path(request: &Request) -> Option<String> {
-    match request {
-        Request::FsWrite { path, .. }
-        | Request::FsCreateDir { path, .. }
-        | Request::FsDelete { path, .. }
-        | Request::GitDiffFile { path, .. } => Some(path.clone()),
-        Request::FsRename {
-            from_path, to_path, ..
-        } => Some(format!("{from_path} -> {to_path}")),
-        _ => None,
-    }
+    proto::command!(command_request_audit_path_match, request)
 }
 
+macro_rules! command_is_remote_mutating_match {
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => $mutating,)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
 fn is_remote_mutating_request(request: &Request) -> bool {
-    !matches!(
-        request,
-        Request::ListSessions { .. }
-            | Request::SessionLiveStatus { .. }
-            | Request::DaemonStatus
-            | Request::ListSkills { .. }
-            | Request::ListModels { .. }
-            | Request::GuidanceEstimate { .. }
-            | Request::FsList { .. }
-            | Request::FsStat { .. }
-            | Request::FsRead { .. }
-            | Request::GitStatus { .. }
-            | Request::GitDiffFile { .. }
-            | Request::AttachTerminal { .. }
-            | Request::TerminalInput { .. }
-            | Request::TerminalResize { .. }
-    )
+    proto::command!(command_is_remote_mutating_match, request)
 }
 
 fn audit_remote_request(
@@ -1451,21 +1434,23 @@ fn audit_remote_request(
     }
 }
 
-fn authorize_request(
+fn authorize_attach(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
-    if principal.is_owner() {
-        return Ok(());
-    }
+    let Request::Attach {
+        session_id,
+        project_root,
+        ..
+    } = request
+    else {
+        unreachable!("authorize_attach called for non-Attach request");
+    };
 
-    match request {
-        Request::Attach {
-            session_id: Some(session_id),
-            ..
-        } => match ctx.db.get_session(*session_id) {
+    if let Some(session_id) = session_id {
+        match ctx.db.get_session(*session_id) {
             Ok(Some(row)) => match session_access_for_row(principal, &row) {
                 SessionAccess::Writer | SessionAccess::Readonly => Ok(()),
                 SessionAccess::Owner => Ok(()),
@@ -1478,213 +1463,226 @@ fn authorize_request(
                 message: format!("unknown session {session_id}"),
             }),
             Err(e) => Err(internal(e)),
+        }
+    } else if let Some(project_root) = project_root {
+        if principal.can_agent_read_project(project_root) {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot create sessions for this project",
+            ))
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn authorize_subagent_transcript(
+    request: &Request,
+    state: &ClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &state.principal;
+    let Request::SubagentTranscript { session_id, .. } = request else {
+        unreachable!("authorize_subagent_transcript called for non-SubagentTranscript request");
+    };
+
+    match ctx.db.get_session(*session_id) {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
         },
-        Request::Attach {
-            session_id: None,
-            project_root: Some(project_root),
-            ..
-        } => {
-            if principal.can_agent_read_project(project_root) {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot create sessions for this project",
-                ))
-            }
-        }
-        Request::Attach {
-            session_id: None,
-            project_root: None,
-            ..
-        } => Ok(()),
-        Request::SubagentTranscript { session_id, .. } => match ctx.db.get_session(*session_id) {
-            Ok(Some(row)) => match session_access_for_row(principal, &row) {
-                SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
-                SessionAccess::None => Err(authorization_error(
-                    "remote principal cannot access this session",
-                )),
-            },
-            Ok(None) => Err(ErrorPayload {
-                code: ErrorCode::UnknownSession,
-                message: format!("unknown session {session_id}"),
-            }),
-            Err(e) => Err(internal(e)),
-        },
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        Err(e) => Err(internal(e)),
+    }
+}
 
-        Request::ListSessions { .. }
-        | Request::SessionLiveStatus { .. }
-        | Request::DaemonStatus => Ok(()),
-        Request::ListSkills { project_root } | Request::GuidanceEstimate { project_root, .. } => {
-            if principal.can_agent_read_project(project_root)
-                || principal.has_project_files(project_root)
-            {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot read this project",
-                ))
-            }
-        }
-        Request::LspControl { project_root, .. } => {
-            if principal.has_terminal() && principal.can_agent_read_project(project_root) {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot control project language servers",
-                ))
-            }
-        }
+fn authorize_begin_attachment_upload(
+    request: &Request,
+    state: &ClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &state.principal;
+    let Request::BeginAttachmentUpload { purpose, .. } = request else {
+        unreachable!(
+            "authorize_begin_attachment_upload called for non-BeginAttachmentUpload request"
+        );
+    };
 
-        Request::FsList { project_root, .. }
-        | Request::FsStat { project_root, .. }
-        | Request::FsRead { project_root, .. }
-        | Request::FsWrite { project_root, .. }
-        | Request::FsCreateDir { project_root, .. }
-        | Request::FsRename { project_root, .. }
-        | Request::GitStatus { project_root }
-        | Request::GitDiffFile { project_root, .. } => {
-            if principal.has_project_files(project_root) {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot access project files for this project",
-                ))
-            }
+    if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
+        if principal.has_terminal() {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot paste into terminals",
+            ))
         }
-        Request::FsDelete { .. } => Err(authorization_error("request requires the local owner")),
+    } else {
+        require_remote_session_writer(principal, state, ctx)
+    }
+}
 
-        Request::OpenTerminal { .. }
-        | Request::AttachTerminal { .. }
-        | Request::TerminalInput { .. }
-        | Request::TerminalResize { .. }
-        | Request::CloseTerminal { .. } => {
-            if principal.has_terminal() {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot access terminals",
-                ))
-            }
-        }
-
-        Request::BeginAttachmentUpload {
-            purpose: proto::AttachmentPurpose::TerminalPasteImage { .. },
-            ..
-        } => {
-            if principal.has_terminal() {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot paste into terminals",
-                ))
-            }
-        }
+fn authorize_attachment_upload_step(
+    request: &Request,
+    state: &ClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &state.principal;
+    let upload_id = match request {
         Request::UploadAttachmentChunk { upload_id, .. }
         | Request::FinishAttachmentUpload { upload_id }
-        | Request::CancelAttachmentUpload { upload_id }
-            if state.pending_uploads.get(upload_id).is_some_and(|upload| {
-                matches!(
-                    upload.purpose,
-                    proto::AttachmentPurpose::TerminalPasteImage { .. }
-                )
-            }) =>
-        {
-            if principal.has_terminal() {
-                Ok(())
-            } else {
-                Err(authorization_error(
-                    "remote principal cannot paste into terminals",
-                ))
-            }
-        }
+        | Request::CancelAttachmentUpload { upload_id } => upload_id,
+        _ => unreachable!("authorize_attachment_upload_step called for non-upload-step request"),
+    };
 
-        Request::SteerDelegation { session_id, .. } => {
-            require_remote_target_session_writer(principal, ctx, *session_id)
+    if state.pending_uploads.get(upload_id).is_some_and(|upload| {
+        matches!(
+            upload.purpose,
+            proto::AttachmentPurpose::TerminalPasteImage { .. }
+        )
+    }) {
+        if principal.has_terminal() {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot paste into terminals",
+            ))
         }
-
-        Request::SendUserMessage { .. }
-        | Request::BeginAttachmentUpload { .. }
-        | Request::UploadAttachmentChunk { .. }
-        | Request::FinishAttachmentUpload { .. }
-        | Request::CancelAttachmentUpload { .. }
-        | Request::RemoveQueuedUserMessage { .. }
-        | Request::RemoveNewestQueuedUserMessage { .. }
-        | Request::RemoveEditableQueuedUserMessages { .. }
-        | Request::ResumePausedWork { .. }
-        | Request::CancelPausedWork { .. }
-        | Request::RepairResume { .. }
-        | Request::CancelTurn
-        | Request::ResolveInterrupt { .. }
-        | Request::SetActiveModel { .. }
-        | Request::SetAgent { .. }
-        | Request::SetLlmMode { .. }
-        | Request::SetSessionLlmMode { .. }
-        | Request::SetApprovalMode { .. }
-        | Request::SetDelegationRecursion { .. }
-        | Request::CancelSchedule { .. }
-        | Request::SetSandbox { .. }
-        | Request::SetPreflight { .. }
-        | Request::SetTrustedOnly { .. }
-        | Request::SetRedaction { .. }
-        | Request::SetTandemModels { .. }
-        | Request::Prune
-        | Request::Compact
-        | Request::Pin { .. }
-        | Request::RefreshEnv { .. } => require_remote_session_writer(principal, state, ctx),
-
-        Request::ForkSession {
-            parent_session_id, ..
-        }
-        | Request::ArchiveSession {
-            session_id: parent_session_id,
-            ..
-        }
-        | Request::UnarchiveSession {
-            session_id: parent_session_id,
-        }
-        | Request::DiscardSession {
-            session_id: parent_session_id,
-        }
-        | Request::RenameSession {
-            session_id: parent_session_id,
-            ..
-        }
-        | Request::RecordSessionNote {
-            session_id: parent_session_id,
-            ..
-        }
-        | Request::DeleteSession {
-            session_id: parent_session_id,
-            ..
-        } => match ctx.db.get_session(*parent_session_id) {
-            Ok(Some(row)) => match session_access_for_row(principal, &row) {
-                SessionAccess::Writer | SessionAccess::Owner => Ok(()),
-                SessionAccess::Readonly => Err(read_only_error(
-                    "remote principal has read-only access to this session",
-                )),
-                SessionAccess::None => Err(authorization_error(
-                    "remote principal cannot access this session",
-                )),
-            },
-            Ok(None) => Err(ErrorPayload {
-                code: ErrorCode::UnknownSession,
-                message: format!("unknown session {parent_session_id}"),
-            }),
-            Err(e) => Err(internal(e)),
-        },
-
-        Request::ShareSession { .. }
-        | Request::ResourceSnapshot
-        | Request::PromoteResource { .. }
-        | Request::ListAgents
-        | Request::ListModels { .. }
-        | Request::SetCaffeinate { .. }
-        | Request::StoreFlycockpitCredential { .. }
-        | Request::ClearFlycockpitCredential
-        | Request::RecordUsage { .. }
-        | Request::GetUsageCounts { .. }
-        | Request::StopDaemon => Err(authorization_error("request requires the local owner")),
+    } else {
+        require_remote_session_writer(principal, state, ctx)
     }
+}
+
+fn authorize_steer_delegation(
+    request: &Request,
+    state: &ClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let Request::SteerDelegation { session_id, .. } = request else {
+        unreachable!("authorize_steer_delegation called for non-SteerDelegation request");
+    };
+    require_remote_target_session_writer(&state.principal, ctx, *session_id)
+}
+
+fn authorize_lsp_control(
+    request: &Request,
+    state: &ClientState,
+    _ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &state.principal;
+    let Request::LspControl { project_root, .. } = request else {
+        unreachable!("authorize_lsp_control called for non-LspControl request");
+    };
+    if principal.has_terminal() && principal.can_agent_read_project(project_root) {
+        Ok(())
+    } else {
+        Err(authorization_error(
+            "remote principal cannot control project language servers",
+        ))
+    }
+}
+
+fn authorize_session_row_writer(
+    principal: &ClientPrincipal,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Writer | SessionAccess::Owner => Ok(()),
+            SessionAccess::Readonly => Err(read_only_error(
+                "remote principal has read-only access to this session",
+            )),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
+        },
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+macro_rules! command_authorize_value {
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, owner_only) => {
+        Err(authorization_error("request requires the local owner"))
+    };
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, public_read) => {
+        Ok(())
+    };
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_writer) => {
+        require_remote_session_writer($principal, $state, $ctx)
+    };
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, terminal) => {{
+        if $principal.has_terminal() {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot access terminals",
+            ))
+        }
+    }};
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, project_files($project_root:ident)) => {{
+        if $principal.has_project_files($project_root) {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot access project files for this project",
+            ))
+        }
+    }};
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, project_read($project_root:ident)) => {{
+        if $principal.can_agent_read_project($project_root)
+            || $principal.has_project_files($project_root)
+        {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot read this project",
+            ))
+        }
+    }};
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_row_writer($session_id:ident)) => {
+        authorize_session_row_writer($principal, $ctx, *$session_id)
+    };
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, custom($handler:ident)) => {
+        $handler($request, $state, $ctx)
+    };
+}
+
+macro_rules! command_authorize_request_match {
+    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => command_authorize_value!($principal, $state, $ctx, $request, $authz $(($authz_arg))?),)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
+fn authorize_request(
+    request: &Request,
+    state: &ClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &state.principal;
+    if principal.is_owner() {
+        return Ok(());
+    }
+
+    proto::command!(
+        command_authorize_request_match,
+        request,
+        state,
+        ctx,
+        principal
+    )
 }
 
 fn prune_expired_attachments(state: &mut ClientState) {
@@ -4543,6 +4541,731 @@ mod tests {
             },
             session_row.session_id,
         )
+    }
+
+    #[test]
+    fn command_table_metadata_is_exhaustive_and_stable() {
+        struct CommandMetadataCase {
+            request: Request,
+            kind: &'static str,
+            session_id: Option<Uuid>,
+            audit_path: Option<&'static str>,
+            mutating: bool,
+        }
+
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, attached_session_id) = attached_state(&ctx, tmp.path());
+        let attach_session_id = Uuid::from_u128(1);
+        let transcript_session_id = Uuid::from_u128(2);
+        let steer_session_id = Uuid::from_u128(3);
+        let paused_session_id = Uuid::from_u128(4);
+        let parent_session_id = Uuid::from_u128(5);
+        let session_id = Uuid::from_u128(6);
+        let promote_session_id = Uuid::from_u128(7);
+        let upload_id = Uuid::from_u128(8);
+        let terminal_id = Uuid::from_u128(9);
+        let queue_item_id = Uuid::from_u128(10);
+        let interrupt_id = Uuid::from_u128(11);
+        let project_root = "/repo".to_string();
+
+        let cases = vec![
+            CommandMetadataCase {
+                request: Request::Attach {
+                    session_id: Some(attach_session_id),
+                    project_root: Some(project_root.clone()),
+                    no_sandbox: false,
+                    interactive: false,
+                    model_override: None,
+                    client_protocol_version: Default::default(),
+                    env_snapshot: None,
+                    env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+                },
+                kind: "attach",
+                session_id: Some(attach_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SubagentTranscript {
+                    session_id: transcript_session_id,
+                    task_call_id: "task-1".into(),
+                    label: "child".into(),
+                },
+                kind: "subagent_transcript",
+                session_id: Some(transcript_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SendUserMessage {
+                    text: "hello".into(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                kind: "send_user_message",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SteerDelegation {
+                    session_id: steer_session_id,
+                    task_call_id: "task-1".into(),
+                    label: "child".into(),
+                    message: "go".into(),
+                },
+                kind: "steer_delegation",
+                session_id: Some(steer_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::BeginAttachmentUpload {
+                    mime: "image/png".into(),
+                    byte_len: 1,
+                    sha256: "0".repeat(64),
+                    purpose: proto::AttachmentPurpose::UserMessageImage,
+                },
+                kind: "begin_attachment_upload",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::UploadAttachmentChunk {
+                    upload_id,
+                    offset: 0,
+                    data_base64: String::new(),
+                },
+                kind: "upload_attachment_chunk",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::FinishAttachmentUpload { upload_id },
+                kind: "finish_attachment_upload",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::CancelAttachmentUpload { upload_id },
+                kind: "cancel_attachment_upload",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RemoveQueuedUserMessage { queue_item_id },
+                kind: "remove_queued_user_message",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RemoveNewestQueuedUserMessage {
+                    target_id: Some("root".into()),
+                },
+                kind: "remove_newest_queued_user_message",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RemoveEditableQueuedUserMessages {
+                    target_id: Some("root".into()),
+                },
+                kind: "remove_editable_queued_user_messages",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ResumePausedWork {
+                    session_id: paused_session_id,
+                },
+                kind: "resume_paused_work",
+                session_id: Some(paused_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::CancelPausedWork {
+                    session_id: paused_session_id,
+                },
+                kind: "cancel_paused_work",
+                session_id: Some(paused_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RepairResume {
+                    session_id: paused_session_id,
+                },
+                kind: "repair_resume",
+                session_id: Some(paused_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::CancelTurn,
+                kind: "cancel_turn",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::FsList {
+                    project_root: project_root.clone(),
+                    path: ".".into(),
+                    show_hidden: false,
+                },
+                kind: "fs_list",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::FsStat {
+                    project_root: project_root.clone(),
+                    path: "src/main.rs".into(),
+                },
+                kind: "fs_stat",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::FsRead {
+                    project_root: project_root.clone(),
+                    path: "src/main.rs".into(),
+                    base64: false,
+                },
+                kind: "fs_read",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::FsWrite {
+                    project_root: project_root.clone(),
+                    path: "src/main.rs".into(),
+                    content: "fn main() {}".into(),
+                    base_hash: None,
+                },
+                kind: "fs_write",
+                session_id: None,
+                audit_path: Some("src/main.rs"),
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::FsCreateDir {
+                    project_root: project_root.clone(),
+                    path: "src".into(),
+                },
+                kind: "fs_create_dir",
+                session_id: None,
+                audit_path: Some("src"),
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::FsRename {
+                    project_root: project_root.clone(),
+                    from_path: "old.rs".into(),
+                    to_path: "new.rs".into(),
+                },
+                kind: "fs_rename",
+                session_id: None,
+                audit_path: Some("old.rs -> new.rs"),
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::FsDelete {
+                    project_root: project_root.clone(),
+                    path: "old.rs".into(),
+                },
+                kind: "fs_delete",
+                session_id: None,
+                audit_path: Some("old.rs"),
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::GitStatus {
+                    project_root: project_root.clone(),
+                },
+                kind: "git_status",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::GitDiffFile {
+                    project_root: project_root.clone(),
+                    path: "src/main.rs".into(),
+                },
+                kind: "git_diff_file",
+                session_id: None,
+                audit_path: Some("src/main.rs"),
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::OpenTerminal {
+                    cwd: Some(project_root.clone()),
+                    cols: 80,
+                    rows: 24,
+                },
+                kind: "open_terminal",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::AttachTerminal {
+                    terminal_id,
+                    cols: 80,
+                    rows: 24,
+                },
+                kind: "attach_terminal",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::TerminalInput {
+                    terminal_id,
+                    bytes: b"pwd".to_vec(),
+                },
+                kind: "terminal_input",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::TerminalResize {
+                    terminal_id,
+                    cols: 100,
+                    rows: 40,
+                },
+                kind: "terminal_resize",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::CloseTerminal { terminal_id },
+                kind: "close_terminal",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::LspControl {
+                    project_root: project_root.clone(),
+                    server_id: "rust-analyzer".into(),
+                    action: proto::LspControlAction::Check,
+                },
+                kind: "lsp_control",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ResolveInterrupt {
+                    interrupt_id,
+                    response: proto::ResolveResponse::Cancel,
+                },
+                kind: "resolve_interrupt",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ListSessions {
+                    project_id: Some("proj".into()),
+                    parent_session_id: None,
+                },
+                kind: "list_sessions",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::SessionLiveStatus {
+                    session_ids: vec![session_id],
+                },
+                kind: "session_live_status",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::ArchiveSession {
+                    session_id,
+                    cascade: false,
+                },
+                kind: "archive_session",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::UnarchiveSession { session_id },
+                kind: "unarchive_session",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ForkSession {
+                    parent_session_id,
+                    fork_point_turn_id: None,
+                    ephemeral: false,
+                },
+                kind: "fork_session",
+                session_id: Some(parent_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::DiscardSession { session_id },
+                kind: "discard_session",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RenameSession {
+                    session_id,
+                    title: "new title".into(),
+                },
+                kind: "rename_session",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ShareSession {
+                    session_id,
+                    shared: true,
+                },
+                kind: "share_session",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RecordSessionNote {
+                    session_id,
+                    text: "note".into(),
+                },
+                kind: "record_session_note",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::DeleteSession {
+                    session_id,
+                    cascade: false,
+                },
+                kind: "delete_session",
+                session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ListSkills {
+                    project_root: project_root.clone(),
+                },
+                kind: "list_skills",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::ResourceSnapshot,
+                kind: "resource_snapshot",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::PromoteResource {
+                    request_id: "rs-0001".into(),
+                    session_id: Some(promote_session_id),
+                },
+                kind: "promote_resource",
+                session_id: Some(promote_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ListAgents,
+                kind: "list_agents",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ListModels {
+                    provider: Some("openai".into()),
+                },
+                kind: "list_models",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::SetActiveModel {
+                    provider: "openai".into(),
+                    model: "gpt".into(),
+                },
+                kind: "set_active_model",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetAgent {
+                    name: "Build".into(),
+                },
+                kind: "set_agent",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetLlmMode {
+                    mode: Some(crate::config::extended::LlmMode::Normal),
+                },
+                kind: "set_llm_mode",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetSessionLlmMode {
+                    mode: crate::config::extended::LlmMode::Defensive,
+                },
+                kind: "set_session_llm_mode",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetApprovalMode {
+                    mode: crate::config::extended::ApprovalMode::Manual,
+                },
+                kind: "set_approval_mode",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetDelegationRecursion {
+                    enabled: true,
+                    default_depth: 2,
+                },
+                kind: "set_delegation_recursion",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetSandbox {
+                    mode: Some(crate::tools::sandbox_mode::SandboxMode::Sandbox),
+                    container_network_enabled: None,
+                },
+                kind: "set_sandbox",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetPreflight {
+                    enabled: Some(true),
+                },
+                kind: "set_preflight",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetTrustedOnly {
+                    enabled: Some(false),
+                },
+                kind: "set_trusted_only",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetRedaction {
+                    scan_environment: Some(true),
+                    scan_dotenv: None,
+                    scan_ssh_keys: None,
+                },
+                kind: "set_redaction",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetTandemModels {
+                    models: vec![(("openai".into()), ("gpt".into()))],
+                },
+                kind: "set_tandem_models",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetCaffeinate {
+                    mode: crate::daemon::caffeinate::CaffeinateMode::Toggle,
+                },
+                kind: "set_caffeinate",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::CancelSchedule {
+                    job_id: "job-1".into(),
+                },
+                kind: "cancel_schedule",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::Prune,
+                kind: "prune",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::Compact,
+                kind: "compact",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::Pin {
+                    text: "remember".into(),
+                },
+                kind: "pin",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::StoreFlycockpitCredential {
+                    credential: flycockpit_credential(),
+                },
+                kind: "store_flycockpit_credential",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ClearFlycockpitCredential,
+                kind: "clear_flycockpit_credential",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::DaemonStatus,
+                kind: "daemon_status",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::RefreshEnv {
+                    vars: HashMap::from([("PATH".into(), "/bin".into())]),
+                },
+                kind: "refresh_env",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RecordUsage {
+                    kind: proto::UsageKind::Slash,
+                    key: "/help".into(),
+                    project_id: None,
+                },
+                kind: "record_usage",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::GetUsageCounts {
+                    project_id: Some("proj".into()),
+                },
+                kind: "get_usage_counts",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::GuidanceEstimate {
+                    project_root: project_root.clone(),
+                    provider: Some("openai".into()),
+                    model: Some("gpt".into()),
+                },
+                kind: "guidance_estimate",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::StopDaemon,
+                kind: "stop_daemon",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+        ];
+
+        assert_eq!(
+            cases.len(),
+            70,
+            "every Request variant has one metadata case"
+        );
+        let mut kinds = HashSet::new();
+        for case in cases {
+            assert_eq!(principal::request_kind(&case.request), case.kind);
+            assert!(
+                kinds.insert(case.kind),
+                "duplicate request kind {}",
+                case.kind
+            );
+            assert_eq!(
+                request_session_id(&case.request, &state),
+                case.session_id,
+                "{} session id",
+                case.kind
+            );
+            assert_eq!(
+                request_audit_path(&case.request).as_deref(),
+                case.audit_path,
+                "{} audit path",
+                case.kind
+            );
+            assert_eq!(
+                is_remote_mutating_request(&case.request),
+                case.mutating,
+                "{} mutating",
+                case.kind
+            );
+        }
     }
 
     fn overlay_value(state: &ClientState, key: &str) -> Option<String> {

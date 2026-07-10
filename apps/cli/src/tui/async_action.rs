@@ -59,6 +59,10 @@ pub enum AsyncActionPayload {
         connector: Option<crate::db::connector::ConnectorDisclosure>,
     },
     ProviderUsage(Vec<crate::providers::usage::ProviderUsageSnapshot>),
+    PasteTokenCount {
+        block_id: u64,
+        tokens: usize,
+    },
     LocalCommand {
         label: String,
         raw_output: String,

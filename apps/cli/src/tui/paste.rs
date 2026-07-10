@@ -52,7 +52,9 @@ pub enum PasteKind {
     /// Condensed text. `full` is the verbatim pasted text the model
     /// receives inline at this block's position (display-only
     /// condensation — the placeholder is never sent for text).
-    Text { full: String },
+    /// `tokens` is display metadata only; `None` means the exact count is
+    /// still being computed off the input path.
+    Text { full: String, tokens: Option<usize> },
     /// Pasted image. `png` is the PNG-encoded bytes; `hash` dedups
     /// repeats; `reference` is true when this is a duplicate paste of an
     /// image already in the buffer (sent as `[reference image #N]`, bytes
@@ -69,6 +71,7 @@ pub enum PasteKind {
 /// keeps it in sync via [`PasteRegistry::shift_for_edit`].
 #[derive(Debug, Clone)]
 pub struct PasteBlock {
+    pub id: u64,
     pub start: usize,
     pub end: usize,
     /// 1-based display number (`#N`): per-composer running index over
@@ -81,9 +84,26 @@ pub struct PasteBlock {
 }
 
 /// The per-composer block registry. Blocks are kept sorted by `start`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PasteRegistry {
     blocks: Vec<PasteBlock>,
+    next_block_id: u64,
+}
+
+impl Default for PasteRegistry {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            next_block_id: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteTextCountReplacement {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
 }
 
 impl PasteRegistry {
@@ -143,9 +163,21 @@ impl PasteRegistry {
         (distinct + 1, false)
     }
 
-    /// Format a condensed text placeholder: `[Pasted text #N, X tokens]`.
+    fn next_block_id(&mut self) -> u64 {
+        let id = self.next_block_id;
+        self.next_block_id = self.next_block_id.saturating_add(1);
+        id
+    }
+
+    /// Format a condensed text placeholder with an exact count:
+    /// `[Pasted text #N, X tokens]`.
     pub fn text_placeholder(number: u32, tokens: usize) -> String {
         format!("[Pasted text #{number}, {tokens} tokens]")
+    }
+
+    /// Format a condensed text placeholder whose exact count is pending.
+    pub fn pending_text_placeholder(number: u32) -> String {
+        format!("[Pasted text #{number}, counting tokens]")
     }
 
     /// Format an image placeholder: `[Pasted image #N]`.
@@ -153,23 +185,43 @@ impl PasteRegistry {
         format!("[Pasted image #{number}]")
     }
 
-    /// Insert a block record for a condensed text paste at byte `at`. The
-    /// caller is responsible for inserting `placeholder` into the buffer
-    /// at the same offset (see [`PasteBlock::placeholder`]). Returns the
-    /// placeholder string + the byte length so the caller can advance the
-    /// cursor. `tokens` is the precomputed token estimate (model counter
-    /// or cl100k — the registry is agnostic to which).
+    /// Insert a block record for a condensed text paste with a known exact
+    /// token count. Mostly used by tests and any caller that has already
+    /// counted off the input path.
+    #[cfg(test)]
     pub fn register_text(&mut self, at: usize, full: String, tokens: usize) -> String {
+        let (_id, placeholder) = self.register_text_with_state(at, full, Some(tokens));
+        placeholder
+    }
+
+    /// Insert a block record for a condensed text paste whose exact token
+    /// count will arrive later. Returns the stable block id plus the
+    /// pending placeholder the caller must insert into the composer buffer.
+    pub fn register_text_pending(&mut self, at: usize, full: String) -> (u64, String) {
+        self.register_text_with_state(at, full, None)
+    }
+
+    fn register_text_with_state(
+        &mut self,
+        at: usize,
+        full: String,
+        tokens: Option<usize>,
+    ) -> (u64, String) {
+        let id = self.next_block_id();
         let number = self.next_text_number();
-        let placeholder = Self::text_placeholder(number, tokens);
+        let placeholder = match tokens {
+            Some(tokens) => Self::text_placeholder(number, tokens),
+            None => Self::pending_text_placeholder(number),
+        };
         let end = at + placeholder.len();
         self.insert_sorted(PasteBlock {
+            id,
             start: at,
             end,
             number,
-            kind: PasteKind::Text { full },
+            kind: PasteKind::Text { full, tokens },
         });
-        placeholder
+        (id, placeholder)
     }
 
     /// Insert a block record for a pasted image at byte `at`. Dedups by
@@ -181,7 +233,9 @@ impl PasteRegistry {
         let (number, reference) = self.image_number_for(hash);
         let placeholder = Self::image_placeholder(number);
         let end = at + placeholder.len();
+        let id = self.next_block_id();
         self.insert_sorted(PasteBlock {
+            id,
             start: at,
             end,
             number,
@@ -192,6 +246,48 @@ impl PasteRegistry {
             },
         });
         placeholder
+    }
+
+    pub fn apply_text_token_count(
+        &mut self,
+        block_id: u64,
+        tokens: usize,
+    ) -> Option<PasteTextCountReplacement> {
+        let idx = self.blocks.iter().position(|b| b.id == block_id)?;
+        let (number, start, old_end) = {
+            let block = &self.blocks[idx];
+            match &block.kind {
+                PasteKind::Text { tokens: None, .. } => (block.number, block.start, block.end),
+                _ => return None,
+            }
+        };
+        let replacement = Self::text_placeholder(number, tokens);
+        let new_end = start + replacement.len();
+        let delta = replacement.len() as isize - (old_end - start) as isize;
+        if let PasteKind::Text { tokens: slot, .. } = &mut self.blocks[idx].kind {
+            *slot = Some(tokens);
+        }
+        self.blocks[idx].end = new_end;
+        if delta != 0 {
+            if delta > 0 {
+                let d = delta as usize;
+                for block in self.blocks.iter_mut().skip(idx + 1) {
+                    block.start += d;
+                    block.end += d;
+                }
+            } else {
+                let d = (-delta) as usize;
+                for block in self.blocks.iter_mut().skip(idx + 1) {
+                    block.start = block.start.saturating_sub(d);
+                    block.end = block.end.saturating_sub(d);
+                }
+            }
+        }
+        Some(PasteTextCountReplacement {
+            start,
+            end: old_end,
+            replacement,
+        })
     }
 
     fn insert_sorted(&mut self, block: PasteBlock) {
@@ -328,7 +424,7 @@ impl PasteRegistry {
         pasted: &str,
     ) -> Option<(usize, usize, String)> {
         self.blocks.iter().find_map(|b| match &b.kind {
-            PasteKind::Text { full } if b.end == cursor && full == pasted => {
+            PasteKind::Text { full, .. } if b.end == cursor && full == pasted => {
                 Some((b.start, b.end, full.clone()))
             }
             _ => None,
@@ -369,7 +465,7 @@ impl PasteRegistry {
         for b in &self.blocks {
             out.push_str(&buffer[prev..b.start]);
             match &b.kind {
-                PasteKind::Text { full } => out.push_str(full),
+                PasteKind::Text { full, .. } => out.push_str(full),
                 PasteKind::Image { png, reference, .. } => {
                     if !vision {
                         out.push_str(&format!(
@@ -424,6 +520,45 @@ mod tests {
         let at = p1.len();
         let p2 = r.register_text(at, "full two".into(), 9);
         assert_eq!(p2, "[Pasted text #2, 9 tokens]");
+    }
+
+    #[test]
+    fn pending_text_placeholder_can_be_completed_by_block_id() {
+        let mut r = PasteRegistry::new();
+        let (id, pending) = r.register_text_pending(0, "full one".into());
+        assert_eq!(pending, "[Pasted text #1, counting tokens]");
+        let replacement = r
+            .apply_text_token_count(id, 5)
+            .expect("pending block accepts count");
+        assert_eq!(
+            replacement,
+            PasteTextCountReplacement {
+                start: 0,
+                end: pending.len(),
+                replacement: "[Pasted text #1, 5 tokens]".to_string(),
+            }
+        );
+        assert!(r.apply_text_token_count(id, 6).is_none());
+    }
+
+    #[test]
+    fn completing_pending_text_count_shifts_later_blocks() {
+        let mut r = PasteRegistry::new();
+        let (id, pending) = r.register_text_pending(0, "full one".into());
+        let ready = r.register_text(pending.len(), "full two".into(), 9);
+
+        let replacement = r.apply_text_token_count(id, 5).unwrap();
+
+        let first = &r.blocks()[0];
+        let second = &r.blocks()[1];
+        assert_eq!(first.end, replacement.replacement.len());
+        assert_eq!(
+            (second.start, second.end),
+            (
+                replacement.replacement.len(),
+                replacement.replacement.len() + ready.len()
+            )
+        );
     }
 
     #[test]

@@ -2609,28 +2609,65 @@ impl App {
         self.paste_registry.shift_for_edit(at, text.len() as isize);
     }
 
-    /// Estimate tokens for a condensed text block: the active model's
-    /// calibrated counter when available, else cl100k_base (GOALS §10
-    /// fallback). v1 has no in-TUI calibrated counter wired, so this is
-    /// cl100k today — the seam is here for when one lands.
-    fn estimate_paste_tokens(&self, text: &str) -> usize {
-        crate::tokens::count(text)
-    }
-
-    /// Condense a long text paste into a `[Pasted text #N, X tokens]`
-    /// block. The placeholder occupies the buffer; the full text lives in
-    /// the registry and is inlined at send time.
+    /// Condense a long text paste into a pending `[Pasted text #N, counting
+    /// tokens]` block. The placeholder occupies the buffer immediately; the
+    /// full text lives in the registry and is inlined at send time. Exact
+    /// token counting runs off the synchronous input path and updates this
+    /// display-only placeholder later if the block is still live.
     fn insert_text_block(&mut self, full: String) {
         let at = self
             .paste_registry
             .resolve_insertion(self.composer.cursor());
         self.composer.set_cursor(at);
-        let tokens = self.estimate_paste_tokens(&full);
-        let placeholder = self.paste_registry.register_text(at, full, tokens);
+        let (block_id, placeholder) = self.paste_registry.register_text_pending(at, full.clone());
         self.composer.insert_str(&placeholder);
-        // `register_text` already recorded the block at `[at, at+len)`;
+        // `register_text_pending` already recorded the block at `[at, at+len)`;
         // shift only the blocks that were *after* the insertion point.
         self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.start_paste_token_count(block_id, full);
+    }
+
+    fn start_paste_token_count(&mut self, block_id: u64, full: String) {
+        self.async_actions.start_blocking(
+            crate::tui::async_action::AsyncActionKind::Internal("paste.token_count"),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            move || {
+                let tokens = std::panic::catch_unwind(|| crate::tokens::count(&full))
+                    .map_err(|_| "paste token count panicked".to_string())?;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::PasteTokenCount {
+                        block_id,
+                        tokens,
+                    },
+                )
+            },
+        );
+    }
+
+    pub(super) fn apply_paste_token_count(&mut self, block_id: u64, tokens: usize) -> bool {
+        let Some(replacement) = self.paste_registry.apply_text_token_count(block_id, tokens) else {
+            return false;
+        };
+        let cursor = self.composer.cursor();
+        let old_len = replacement.end - replacement.start;
+        let new_len = replacement.replacement.len();
+        self.composer
+            .delete_range(replacement.start, replacement.end);
+        self.composer.insert_str(&replacement.replacement);
+        let new_end = replacement.start + new_len;
+        let new_cursor = if cursor <= replacement.start {
+            cursor
+        } else if cursor >= replacement.end {
+            if new_len >= old_len {
+                cursor + (new_len - old_len)
+            } else {
+                cursor.saturating_sub(old_len - new_len)
+            }
+        } else {
+            new_end
+        };
+        self.composer.set_cursor(new_cursor);
+        true
     }
 
     /// Insert a pasted image as a `[Pasted image #N]` block. On a
@@ -3931,6 +3968,7 @@ mod paste_routing_tests {
     use crate::db::pins::PinnedMessage;
     use crate::tui::app::App;
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
+    use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -3951,6 +3989,22 @@ mod paste_routing_tests {
         }
     }
 
+    fn long_paste(label: &str) -> String {
+        format!("{label}\n{}", "body line\n".repeat(40))
+    }
+
+    async fn drain_async_actions_until_idle(app: &mut App) {
+        for _ in 0..100 {
+            app.drain_async_actions();
+            if app.async_actions.pending_count() == 0 {
+                app.drain_async_actions();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("async actions did not finish");
+    }
+
     fn assert_modal_paste_is_dropped<F>(setup: F)
     where
         F: FnOnce(&mut App),
@@ -3962,6 +4016,141 @@ mod paste_routing_tests {
         app.handle_paste("modal paste".to_string());
 
         assert!(app.composer.is_empty());
+        assert!(app.paste_registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_text_paste_inserts_pending_placeholder_then_async_count_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let pasted = long_paste("alpha");
+
+        app.handle_paste(pasted.clone());
+
+        assert_eq!(
+            app.composer.text(),
+            PasteRegistry::pending_text_placeholder(1)
+        );
+        let block = &app.paste_registry.blocks()[0];
+        assert!(matches!(
+            &block.kind,
+            PasteKind::Text { full, tokens: None } if full == &pasted
+        ));
+
+        drain_async_actions_until_idle(&mut app).await;
+
+        let expected = PasteRegistry::text_placeholder(1, crate::tokens::count(&pasted));
+        assert_eq!(app.composer.text(), expected);
+        let block = &app.paste_registry.blocks()[0];
+        assert_eq!((block.start, block.end), (0, expected.len()));
+    }
+
+    #[tokio::test]
+    async fn pending_text_paste_build_wire_expands_full_text_before_count_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let pasted = long_paste("submit early");
+
+        app.handle_paste(pasted.clone());
+
+        let (wire, images) = app.paste_registry.build_wire(app.composer.text(), true);
+        assert_eq!(wire, pasted);
+        assert!(images.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repaste_to_expand_works_while_count_is_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let pasted = long_paste("expand");
+
+        app.handle_paste(pasted.clone());
+        app.handle_paste(pasted.clone());
+
+        assert_eq!(app.composer.text(), pasted);
+        assert!(app.paste_registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_pending_text_block_ignores_late_count_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let pasted = long_paste("delete");
+
+        app.handle_paste(pasted);
+        let block_id = app.paste_registry.blocks()[0].id;
+        let (start, end) = app.paste_block_left().expect("cursor after placeholder");
+        app.delete_paste_block(start, end);
+
+        assert!(!app.apply_paste_token_count(block_id, 123));
+        assert!(app.composer.is_empty());
+        assert!(app.paste_registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn editing_before_pending_text_block_keeps_late_count_targeted_to_same_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let pasted = long_paste("shift");
+
+        app.handle_paste(pasted);
+        let block_id = app.paste_registry.blocks()[0].id;
+        app.composer.set_cursor(0);
+        app.composer_insert_char('>');
+
+        assert_eq!(app.paste_registry.blocks()[0].start, 1);
+        assert!(app.apply_paste_token_count(block_id, 123));
+        let expected = format!(">{}", PasteRegistry::text_placeholder(1, 123));
+        assert_eq!(app.composer.text(), expected);
+        let block = &app.paste_registry.blocks()[0];
+        assert_eq!(
+            &app.composer.text()[block.start..block.end],
+            PasteRegistry::text_placeholder(1, 123)
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_pending_text_counts_can_complete_out_of_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let first = long_paste("first");
+        let second = long_paste("second");
+
+        app.handle_paste(first);
+        app.composer_insert_char(' ');
+        app.handle_paste(second);
+        let first_id = app.paste_registry.blocks()[0].id;
+        let second_id = app.paste_registry.blocks()[1].id;
+
+        assert!(app.apply_paste_token_count(second_id, 22));
+        assert!(app.apply_paste_token_count(first_id, 11));
+
+        let expected = format!(
+            "{} {}",
+            PasteRegistry::text_placeholder(1, 11),
+            PasteRegistry::text_placeholder(2, 22)
+        );
+        assert_eq!(app.composer.text(), expected);
+        for block in app.paste_registry.blocks() {
+            assert_eq!(
+                &app.composer.text()[block.start..block.end],
+                match block.number {
+                    1 => PasteRegistry::text_placeholder(1, 11),
+                    2 => PasteRegistry::text_placeholder(2, 22),
+                    other => panic!("unexpected block number {other}"),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn short_text_paste_still_inserts_raw_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+
+        app.handle_paste("short text".to_string());
+
+        assert_eq!(app.composer.text(), "short text");
         assert!(app.paste_registry.is_empty());
     }
 

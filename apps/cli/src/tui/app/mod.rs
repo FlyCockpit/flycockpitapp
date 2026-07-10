@@ -3973,6 +3973,17 @@ impl App {
                     self.usage_pane = Some(crate::tui::usage_pane::UsagePane::error(e));
                 }
             },
+            AsyncActionKind::Internal("paste.token_count") => match result.payload {
+                Ok(AsyncActionPayload::PasteTokenCount { block_id, tokens }) => {
+                    self.apply_paste_token_count(block_id, tokens);
+                }
+                Ok(_) => {
+                    tracing::debug!("paste token count returned unexpected payload");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "paste token count failed");
+                }
+            },
             AsyncActionKind::DaemonRpc("resources.snapshot") => {
                 if let Some(pane) = self.resources_pane.as_mut() {
                     let payload = match result.payload {

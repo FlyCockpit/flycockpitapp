@@ -1374,8 +1374,7 @@ fn heal_pairing_pending(
                 i += 1;
             }
             Message::User { content } => {
-                let items: Vec<UserContent> = content.iter().cloned().collect();
-                let has_result = items
+                let has_result = content
                     .iter()
                     .any(|c| matches!(c, UserContent::ToolResult(_)));
                 if !has_result {
@@ -1384,18 +1383,26 @@ fn heal_pairing_pending(
                     i += 1;
                     continue;
                 }
+                let has_orphan = content.iter().any(
+                    |c| matches!(c, UserContent::ToolResult(tr) if !open_calls.contains(&tr.id)),
+                );
+                if !has_orphan {
+                    i += 1;
+                    continue;
+                }
                 // Keep only results that pair with an open call; non-result
-                // items (defensive) are always kept.
+                // items (defensive) are always kept. Cloning happens only on
+                // the repair path.
                 let mut kept: Vec<UserContent> = Vec::new();
-                for c in items {
-                    match &c {
+                for c in content.iter() {
+                    match c {
                         UserContent::ToolResult(tr) if !open_calls.contains(&tr.id) => {
                             heals.push(Recovery::ResumeHeal {
                                 kind: "drop_orphan_tool_result",
                                 id: tr.id.clone(),
                             });
                         }
-                        _ => kept.push(c),
+                        _ => kept.push(c.clone()),
                     }
                 }
                 if kept.is_empty() {
@@ -1888,6 +1895,22 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join(""),
+            _ => panic!("not user"),
+        }
+    }
+
+    fn tool_result_text_ptr(m: &Message) -> *const str {
+        match m {
+            Message::User { content } => content
+                .iter()
+                .find_map(|c| match c {
+                    UserContent::ToolResult(tr) => tr.content.iter().find_map(|part| match part {
+                        ToolResultContent::Text(t) => Some(t.text.as_str() as *const str),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .expect("tool result text"),
             _ => panic!("not user"),
         }
     }
@@ -3342,9 +3365,15 @@ mod tests {
         let prompt = Message::user("now what");
 
         let mut subject = history.clone();
+        let before_ptr = tool_result_text_ptr(&subject[2]);
         let heals = heal_live_history(&mut subject, &prompt);
         assert!(heals.is_empty(), "paired history heals nothing");
         assert_eq!(subject, history, "no-op: byte-identical before/after");
+        assert_eq!(
+            tool_result_text_ptr(&subject[2]),
+            before_ptr,
+            "clean path must not clone or replace paired tool-result content"
+        );
     }
 
     /// The live heal is idempotent across turns: after it stubs the sibling,

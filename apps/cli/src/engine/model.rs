@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use futures::{StreamExt, future::BoxFuture};
+use futures::{StreamExt, future::BoxFuture, future::Shared};
 use rig::client::CompletionClient;
 use rig::completion::Completion;
 use rig::message::{
@@ -52,6 +52,36 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::agent::TurnEvent;
 use crate::engine::retry;
+
+pub(crate) type PreDrainFuture = Shared<BoxFuture<'static, std::result::Result<(), String>>>;
+
+#[cfg(test)]
+thread_local! {
+    static PREPARE_HISTORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCRUB_MESSAGE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_request_prep_counts() {
+    PREPARE_HISTORY_CALLS.with(|calls| calls.set(0));
+    SCRUB_MESSAGE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn request_prep_counts() -> (usize, usize) {
+    (
+        PREPARE_HISTORY_CALLS.with(std::cell::Cell::get),
+        SCRUB_MESSAGE_CALLS.with(std::cell::Cell::get),
+    )
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedCompletionRequest {
+    pub system: String,
+    pub history: Vec<Message>,
+    pub prompt: Message,
+    pub captured: serde_json::Value,
+}
 
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
 // Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
@@ -1941,64 +1971,98 @@ impl Model {
         serde_json::Value,
         InferenceTiming,
     )> {
-        self.ensure_trusted_only_dispatch_allowed()?;
-        let history = self.prepare_history_for_request(history);
-
-        // Non-bypassable redaction chokepoint (GOALS §7,
-        // `redaction-cover-all-llm-requests.md`): scrub every dynamic text
-        // field of the request — the system contract, every history message
-        // (including tool results), and the prompt — before assembling the
-        // captured body and before any provider work. Static tool *schemas*
-        // carry no user secrets and are left untouched. `scrub` is
-        // deterministic + idempotent, so re-scrubbing the cached history each
-        // turn yields byte-stable output and prompt caching is unaffected.
-        let dispatched_at = std::time::Instant::now();
-        let redact = self.redact();
-        let system_scrubbed = redact.scrub(system);
-        let system = system_scrubbed.as_str();
-        let mut history: Vec<Message> = history.iter().map(|m| scrub_message(redact, m)).collect();
-        let mut prompt = scrub_message(redact, &prompt);
-        let identity_records =
-            if self.needs_responses_tool_identity_normalization(endpoint_recovery.is_some()) {
-                match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
-                    Ok(records) => records,
-                    Err(err) => {
-                        return Err(anyhow::Error::new(InferenceFailure {
-                            provider: self.provider_label().to_string(),
-                            model: self.model_id().to_string(),
-                            phase: InferencePhase::Prep.as_str().to_string(),
-                            class: "responses_tool_identity".to_string(),
-                            elapsed_ms: dispatched_at.elapsed().as_millis() as u64,
-                            detail: err.to_string(),
-                        }));
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-
-        // Assemble the as-sent request body once: it's both the
-        // `--debug-last-message` dump and the always-on capture payload.
-        let mut captured = assembled_request(
-            self.model_id(),
-            self.provider_label(),
+        self.complete_captured_with_pre_drain(
             system,
-            &history,
+            history,
+            prompt,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_captured_with_pre_drain(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        pre_drain: Option<PreDrainFuture>,
+    ) -> Result<(
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        let prepared = self.prepare_completion_request(
+            system,
+            history,
             &prompt,
             tools,
             &params,
-        );
-        if !identity_records.is_empty() {
-            captured["responses_tool_identity"] = serde_json::to_value(&identity_records)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "serialize responses tool identity records failed");
-                    serde_json::Value::Array(Vec::new())
-                });
-        }
+            endpoint_recovery.is_some(),
+        )?;
+        self.complete_prepared_with_pre_drain(
+            prepared,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            pre_drain,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_prepared_with_pre_drain(
+        &self,
+        prepared: PreparedCompletionRequest,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        pre_drain: Option<PreDrainFuture>,
+    ) -> Result<(
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.ensure_trusted_only_dispatch_allowed()?;
+        let PreparedCompletionRequest {
+            system,
+            history,
+            prompt,
+            captured,
+        } = prepared;
+        let system = system.as_str();
 
         if let Some(path) = debug_last_message_path() {
             write_dump(path, &captured);
         }
+
+        let dispatched_at = std::time::Instant::now();
 
         // Bail before doing any provider work if cancellation already
         // fired (e.g. the user pressed ctrl+c between turns). Cheap and
@@ -2130,6 +2194,7 @@ impl Model {
                                     dispatched_at,
                                     &first_token_ms,
                                     &output_sent,
+                                    pre_drain.clone(),
                                 )
                                 .await
                             }
@@ -2154,6 +2219,7 @@ impl Model {
                                     dispatched_at,
                                     &first_token_ms,
                                     &output_sent,
+                                    pre_drain.clone(),
                                 )
                                 .await
                             }
@@ -2296,6 +2362,7 @@ impl Model {
                         dispatched_at,
                         &first_token_ms,
                         &output_sent,
+                        pre_drain.clone(),
                     )
                     .await
                 };
@@ -2335,6 +2402,7 @@ impl Model {
                         dispatched_at,
                         &first_token_ms,
                         &output_sent,
+                        pre_drain.clone(),
                     )
                     .await
                 };
@@ -2475,7 +2543,79 @@ impl Model {
         matches!(self, Model::Anthropic { .. })
     }
 
+    pub(crate) fn prepare_completion_request(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: &Message,
+        tools: &[ToolDefinition],
+        params: &ModelParams,
+        endpoint_recovery_enabled: bool,
+    ) -> Result<PreparedCompletionRequest> {
+        let prep_started = std::time::Instant::now();
+        let history = self.prepare_history_for_request(history);
+
+        // Non-bypassable redaction chokepoint (GOALS §7,
+        // `redaction-cover-all-llm-requests.md`): scrub every dynamic text
+        // field of the request — the system contract, every history message
+        // (including tool results), and the prompt — before assembling the
+        // captured body and before any provider work. Static tool *schemas*
+        // carry no user secrets and are left untouched.
+        let redact = self.redact();
+        let system = redact.scrub(system);
+        let mut history = history;
+        let mut prompt = prompt.clone();
+        if !redact.is_empty() {
+            history = history.iter().map(|m| scrub_message(redact, m)).collect();
+            prompt = scrub_message(redact, &prompt);
+        }
+        let identity_records =
+            if self.needs_responses_tool_identity_normalization(endpoint_recovery_enabled) {
+                match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
+                    Ok(records) => records,
+                    Err(err) => {
+                        return Err(anyhow::Error::new(InferenceFailure {
+                            provider: self.provider_label().to_string(),
+                            model: self.model_id().to_string(),
+                            phase: InferencePhase::Prep.as_str().to_string(),
+                            class: "responses_tool_identity".to_string(),
+                            elapsed_ms: prep_started.elapsed().as_millis() as u64,
+                            detail: err.to_string(),
+                        }));
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+        let mut captured = assembled_request(
+            self.model_id(),
+            self.provider_label(),
+            &system,
+            &history,
+            &prompt,
+            tools,
+            params,
+        );
+        if !identity_records.is_empty() {
+            captured["responses_tool_identity"] = serde_json::to_value(&identity_records)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "serialize responses tool identity records failed");
+                    serde_json::Value::Array(Vec::new())
+                });
+        }
+
+        Ok(PreparedCompletionRequest {
+            system,
+            history,
+            prompt,
+            captured,
+        })
+    }
+
     fn prepare_history_for_request(&self, history: &[Message]) -> Vec<Message> {
+        #[cfg(test)]
+        PREPARE_HISTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
         if self.preserve_reasoning_for_replay() {
             history
                 .iter()
@@ -2811,6 +2951,7 @@ async fn drain_completion_stream<M>(
     dispatched_at: std::time::Instant,
     first_token_ms: &std::sync::atomic::AtomicU64,
     output_sent: &std::sync::atomic::AtomicBool,
+    pre_drain: Option<PreDrainFuture>,
 ) -> Result<CompleteOut, rig::completion::CompletionError>
 where
     M: rig::completion::CompletionModel,
@@ -2829,6 +2970,7 @@ where
         built = req.stream() => built?,
     };
     bump_phase(phase, InferencePhase::Dispatched);
+    await_pre_drain_record(pre_drain).await?;
     // Drive the chunk loop with TTFT + idle timeouts. The post-loop reads
     // below pick up the aggregated `choice` / `message_id` / `response` rig
     // accumulated as the stream advanced (the loop borrows `&mut stream`).
@@ -2856,6 +2998,19 @@ where
         .map(TokenUsage::from)
         .filter(|u| !u.is_empty());
     Ok((stream.message_id.clone(), stream.choice.clone(), usage))
+}
+
+async fn await_pre_drain_record(
+    pre_drain: Option<PreDrainFuture>,
+) -> Result<(), rig::completion::CompletionError> {
+    if let Some(pre_drain) = pre_drain {
+        pre_drain.await.map_err(|err| {
+            rig::completion::CompletionError::ResponseError(format!(
+                "record_inference_request failed before response processing: {err}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Drive the chunk loop of a streaming completion with the TTFT + idle
@@ -3631,6 +3786,8 @@ pub(crate) fn sanitized_extra_params(
 /// cached history each turn yields byte-stable output — prompt caching is
 /// unaffected (verified by the redact module's determinism test).
 fn scrub_message(redact: &RedactionTable, msg: &Message) -> Message {
+    #[cfg(test)]
+    SCRUB_MESSAGE_CALLS.with(|calls| calls.set(calls.get() + 1));
     match msg {
         Message::System { content } => Message::System {
             content: redact.scrub(content),
@@ -4101,6 +4258,85 @@ impl rig::tool::Tool for StaticTool {
 mod tests {
     use super::*;
     use crate::config::providers::{ModelEntry, ProviderEntry, TimeoutConfig};
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
+        let (_tmp, redact) = secret_table();
+        let model = model_at("http://127.0.0.1:1/v1", redact);
+        let history = vec![Message::user(format!("history has {SECRET}"))];
+        let prompt = Message::user(format!("prompt has {SECRET}"));
+        reset_request_prep_counts();
+
+        let prepared = model
+            .prepare_completion_request(
+                "system",
+                &history,
+                &prompt,
+                &[],
+                &ModelParams::default(),
+                false,
+            )
+            .unwrap();
+        let captured = prepared.captured.clone();
+        assert_eq!(request_prep_counts(), (1, 2));
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = model
+            .complete_prepared_with_pre_drain(
+                prepared,
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect_err("pre-cancelled dispatch should stop before network");
+        assert!(
+            err.downcast_ref::<InferenceCancelled>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(
+            request_prep_counts(),
+            (1, 2),
+            "prepared completion must not re-run history preparation or scrubbing"
+        );
+        assert_eq!(
+            captured,
+            model
+                .prepare_completion_request(
+                    "system",
+                    &history,
+                    &prompt,
+                    &[],
+                    &ModelParams::default(),
+                    false,
+                )
+                .unwrap()
+                .captured,
+            "prepared payload remains byte-identical to the canonical assembly"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_drain_record_failure_aborts_before_response_processing() {
+        let pre_drain = async { Err::<(), _>("write failed".to_string()) }
+            .boxed()
+            .shared();
+        let err = await_pre_drain_record(Some(pre_drain))
+            .await
+            .expect_err("failed pending write aborts before stream drain");
+        assert!(
+            err.to_string().contains(
+                "record_inference_request failed before response processing: write failed"
+            ),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn tandem_failure_response_preserves_kind_and_detail() {

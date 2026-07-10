@@ -185,6 +185,10 @@ pub struct ElisionTarget {
     /// run(s) with a marker pointing at the retaining body. `None` for a
     /// whole-body exact-identity elision (which writes [`Elision::marker_text`]).
     pub partial_body: Option<String>,
+    /// Cached cl100k token saving for this target. Computed once when the
+    /// plan is built so repeated projections do not re-tokenize immutable
+    /// bodies.
+    pub tokens_saved: usize,
     /// The tool-result `id` (== originating tool-call `id`) of the body being
     /// rewritten — the row [`apply_plan`] mutates. For a whole-body elision
     /// this equals `elision.original_event_id`; for an overlap-merge elision
@@ -219,16 +223,9 @@ impl DedupPlan {
     /// cl100k_base token count that would be dropped from the wire by
     /// applying this plan. Each target trades its full body for the
     /// (small) marker, so the saving is `count(body) - count(marker)`,
-    /// floored at zero.
+    /// floored at zero. The per-target values are cached at plan-build time.
     pub fn tokens_saved(&self) -> usize {
-        self.targets
-            .iter()
-            .map(|t| {
-                let before = crate::tokens::count(&t.current_body);
-                let after = crate::tokens::count(&t.replacement_body());
-                before.saturating_sub(after)
-            })
-            .sum()
+        self.targets.iter().map(|t| t.tokens_saved).sum()
     }
 }
 
@@ -324,6 +321,7 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
                     reason: REASON_SNAPSHOT_SUPERSEDED,
                 },
                 partial_body: None,
+                tokens_saved: 0,
                 target_call_id: loc.call_id.clone(),
             });
         }
@@ -347,9 +345,19 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
         }
     }
 
+    for target in &mut targets {
+        target.tokens_saved = cached_tokens_saved(target);
+    }
+
     // Stable order: by history index so application + display agree.
     targets.sort_by_key(|t| t.history_index);
     DedupPlan { targets }
+}
+
+fn cached_tokens_saved(target: &ElisionTarget) -> usize {
+    let before = crate::tokens::count(&target.current_body);
+    let after = crate::tokens::count(&target.replacement_body());
+    before.saturating_sub(after)
 }
 
 /// The canonical file path a `read`/`readlock` call addressed, from its `path`
@@ -725,6 +733,7 @@ impl PruneLedger {
                     // re-renders the marker. Either way the row to write onto is
                     // the entry's own id.
                     partial_body: entry.partial_body.clone(),
+                    tokens_saved: 0,
                     target_call_id: entry.original_event_id.clone(),
                 }),
                 None => missing.push(entry.original_event_id.clone()),
@@ -734,6 +743,9 @@ impl PruneLedger {
             return Err(missing);
         }
         targets.sort_by_key(|t| t.history_index);
+        for target in &mut targets {
+            target.tokens_saved = cached_tokens_saved(target);
+        }
         let plan = DedupPlan { targets };
         Ok(apply_plan(history, &plan))
     }
@@ -988,6 +1000,36 @@ mod tests {
         // saving they got.
         assert_eq!(applied.targets.len(), projected.targets.len());
         assert_eq!(projected_saving, actual_saving);
+    }
+
+    #[test]
+    fn tokens_saved_reuses_plan_time_counts() {
+        let args = json!({ "path": "/abs/big.rs" });
+        let big = "x".repeat(4000);
+        let history = vec![
+            assistant_call("c1", "read", args.clone()),
+            tool_result("c1", &big),
+            assistant_call("c2", "read", args.clone()),
+            tool_result("c2", &big),
+        ];
+
+        crate::tokens::reset_count_call_count();
+        let plan = dedup_plan(&history);
+        assert_eq!(plan.targets.len(), 1);
+        let calls_after_plan = crate::tokens::count_call_count();
+        assert_eq!(
+            calls_after_plan, 2,
+            "one target counts body and replacement once"
+        );
+
+        let first = plan.tokens_saved();
+        let second = plan.tokens_saved();
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::tokens::count_call_count(),
+            calls_after_plan,
+            "repeated projections must not re-tokenize target bodies"
+        );
     }
 
     #[test]

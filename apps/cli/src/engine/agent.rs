@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures::FutureExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -1167,15 +1168,15 @@ fn scrub_sidecar_value(value: Value, redact: &crate::redact::RedactionTable) -> 
         other => other,
     }
 }
-async fn record_inference_request_blocking(
+async fn record_inference_request_async(
     session: Arc<Session>,
     call_id: Uuid,
     payload: Value,
     status: crate::db::session_log::InferenceRequestStatus,
 ) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || session.record_inference_request(call_id, &payload, status))
+    session
+        .record_inference_request_async(call_id, payload, status)
         .await
-        .map_err(|e| anyhow::anyhow!("record_inference_request task join failed: {e}"))?
 }
 
 async fn record_usage_blocking(
@@ -1304,52 +1305,6 @@ pub async fn turn(
         }
     }
 
-    // Dispatch-time recording (`inference-timeout-and-failure-
-    // observability.md` #4): persist the attempt's captured body BEFORE the
-    // call returns, with status `pending`, so a hung or failed turn still
-    // exports an inference record instead of an empty export. The same
-    // `call_id` keys the terminal update below. The timeline EVENT is recorded
-    // once on settle (the `inference_request` event on success, the
-    // `inference_failure` event on failure) — both carry this `call_id`, so the
-    // export's file-per-call pass picks up the record either way without
-    // double-counting. Best-effort: auditing must never break a live turn (same
-    // posture as the existing post-success write).
-    let dispatch_payload =
-        model.assemble_dispatch_request(&agent.system, history, &prompt, &tools, &agent.params);
-    let dispatch_payload =
-        with_phases(dispatch_payload, &serde_json::json!({ "dispatched_ms": 0 }));
-    if let Err(e) = record_inference_request_blocking(
-        session.clone(),
-        call_id,
-        dispatch_payload.clone(),
-        crate::db::session_log::InferenceRequestStatus::Pending,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "record_inference_request (dispatch) failed");
-    }
-
-    // Model-comparison tandem (shadow) dispatch (`model-comparison-
-    // tandem-inference.md`). Fired HERE — right before the main call, after the
-    // exact post-redaction history is assembled (incl. any live guidance-diff
-    // injection above) — so each tandem model receives a byte-identical body to
-    // the main model's, on the SAME `call_id`. A pure DB-only observer: never
-    // executed, never enters history, never affects this turn's control flow.
-    // `None` on the backup attempt so a fallback retry doesn't double-shadow.
-    // Skipped for utility calls automatically — those never run through `turn`.
-    if let Some(set) = tandem.filter(|s| s.is_enabled()) {
-        let dispatch = crate::engine::schedule::TandemDispatch {
-            parent_call_id: call_id.to_string(),
-            agent: agent.name.clone(),
-            system: agent.system.clone(),
-            history: history.clone(),
-            prompt: prompt.clone(),
-            tools: tools.clone(),
-            params: agent.params.clone(),
-        };
-        crate::engine::schedule::tandem::dispatch_turn(&session, set, dispatch);
-    }
-
     let endpoint_recovery =
         interrupts
             .is_interactive_attached()
@@ -1423,23 +1378,92 @@ pub async fn turn(
                 },
             });
 
+    // Dispatch-time recording (`inference-timeout-and-failure-
+    // observability.md` #4): persist the attempt's captured body BEFORE the
+    // call returns, with status `pending`, so a hung or failed turn still
+    // exports an inference record instead of an empty export. The same
+    // `call_id` keys the terminal update below. The timeline EVENT is recorded
+    // once on settle (the `inference_request` event on success, the
+    // `inference_failure` event on failure) — both carry this `call_id`, so the
+    // export's file-per-call pass picks up the record either way without
+    // double-counting. Best-effort: auditing must never break a live turn (same
+    // posture as the existing post-success write).
+    let prepared_request = model.prepare_completion_request(
+        &agent.system,
+        history,
+        &prompt,
+        &tools,
+        &agent.params,
+        endpoint_recovery.is_some(),
+    )?;
+    let dispatch_payload = with_phases(
+        prepared_request.captured.clone(),
+        &serde_json::json!({ "dispatched_ms": 0 }),
+    );
+    let pending_record = {
+        let session = session.clone();
+        let payload = dispatch_payload.clone();
+        let handle = tokio::spawn(async move {
+            record_inference_request_async(
+                session,
+                call_id,
+                payload,
+                crate::db::session_log::InferenceRequestStatus::Pending,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+        async move {
+            handle
+                .await
+                .map_err(|e| format!("record_inference_request task join failed: {e}"))?
+        }
+        .boxed()
+        .shared()
+    };
+
+    // Model-comparison tandem (shadow) dispatch (`model-comparison-
+    // tandem-inference.md`). Fired HERE — right before the main call, after the
+    // exact post-redaction history is assembled (incl. any live guidance-diff
+    // injection above) — so each tandem model receives a byte-identical body to
+    // the main model's, on the SAME `call_id`. A pure DB-only observer: never
+    // executed, never enters history, never affects this turn's control flow.
+    // `None` on the backup attempt so a fallback retry doesn't double-shadow.
+    // Skipped for utility calls automatically — those never run through `turn`.
+    if let Some(set) = tandem.filter(|s| s.is_enabled()) {
+        let dispatch = crate::engine::schedule::TandemDispatch {
+            parent_call_id: call_id.to_string(),
+            agent: agent.name.clone(),
+            system: agent.system.clone(),
+            history: history.clone(),
+            prompt: prompt.clone(),
+            tools: tools.clone(),
+            params: agent.params.clone(),
+        };
+        crate::engine::schedule::tandem::dispatch_turn(&session, set, dispatch);
+    }
+
     let completion = model
-        .complete_captured(
-            &agent.system,
-            history,
-            prompt.clone(),
+        .complete_prepared_with_pre_drain(
+            prepared_request,
             &tools,
             agent.params.clone(),
             &agent.name,
             Some(tx),
             &cancel,
             endpoint_recovery,
+            Some(pending_record.clone()),
         )
         .await;
 
     let ((msg_id, choice, usage), captured_request, timing) = match completion {
         Ok(out) => out,
         Err(e) => {
+            if let Err(record_err) = pending_record.clone().await {
+                return Err(anyhow::anyhow!(
+                    "record_inference_request (dispatch) failed: {record_err}"
+                ));
+            }
             // Settle the dispatch-time record to its terminal status and
             // surface the failure (inline error + recorded event), unless this
             // was a clean cancel / drain unwind (those keep their dedicated
@@ -1473,7 +1497,7 @@ pub async fn turn(
             "completed_ms": timing.completed_ms,
         }),
     );
-    if let Err(e) = record_inference_request_blocking(
+    if let Err(e) = record_inference_request_async(
         session.clone(),
         call_id,
         completed_payload.clone(),
@@ -3529,7 +3553,7 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
             dispatch_payload.clone(),
             &serde_json::json!({ "dispatched_ms": 0 }),
         );
-        if let Err(e) = record_inference_request_blocking(
+        if let Err(e) = record_inference_request_async(
             session.clone(),
             call_id,
             cancelled,
@@ -3549,7 +3573,7 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
             dispatch_payload.clone(),
             &serde_json::json!({ "dispatched_ms": 0 }),
         );
-        if let Err(e) = record_inference_request_blocking(
+        if let Err(e) = record_inference_request_async(
             session.clone(),
             call_id,
             errored,
@@ -3575,8 +3599,7 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
             "failed_ms": failure.elapsed_ms,
         }),
     );
-    if let Err(e) =
-        record_inference_request_blocking(session.clone(), call_id, terminal, status).await
+    if let Err(e) = record_inference_request_async(session.clone(), call_id, terminal, status).await
     {
         tracing::warn!(error = %e, "record_inference_request (terminal failure) failed");
     }

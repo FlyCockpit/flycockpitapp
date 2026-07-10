@@ -258,6 +258,7 @@ pub fn overlap_targets(
             // `apply_plan` writes this verbatim instead of the whole-body
             // marker, so the non-overlapping remainder survives.
             partial_body: Some(new_body),
+            tokens_saved: 0,
             target_call_id: older.call_id.clone(),
         });
     }

@@ -34,6 +34,7 @@
 //! Matches are case-sensitive and substring-aware (so a token embedded
 //! in a longer URL is still redacted).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -485,13 +486,22 @@ impl RedactionTable {
     }
 
     /// Scrub every secret in `body`. Returns the cleaned string. The
-    /// no-table-or-disabled path returns the input unchanged without
-    /// allocating.
-    pub fn scrub(&self, body: &str) -> String {
+    /// no-table-or-disabled path returns a borrowed input, and a configured
+    /// table with no match also avoids allocating.
+    pub fn scrub_cow<'a>(&self, body: &'a str) -> Cow<'a, str> {
         let Some(matcher) = self.matcher.as_ref() else {
-            return body.to_string();
+            return Cow::Borrowed(body);
         };
-        matcher.replace_all(body, &vec![self.placeholder.as_str(); self.origins.len()])
+        if !matcher.is_match(body) {
+            return Cow::Borrowed(body);
+        }
+        let replacements = vec![self.placeholder.as_str(); self.origins.len()];
+        Cow::Owned(matcher.replace_all(body, &replacements))
+    }
+
+    /// Scrub every secret in `body`. Returns the cleaned string.
+    pub fn scrub(&self, body: &str) -> String {
+        self.scrub_cow(body).into_owned()
     }
 
     /// `true` when there's nothing to redact and `scrub` will pass
@@ -1095,6 +1105,41 @@ fn collect_ssh_key_candidates(ssh_key_dir: Option<&Path>) -> Vec<(String, String
         }
     }
     out
+}
+
+#[cfg(test)]
+mod scrub_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn empty_table_scrub_cow_borrows_input() {
+        let table = RedactionTable::empty();
+        let input = "nothing secret here";
+        match table.scrub_cow(input) {
+            Cow::Borrowed(got) => assert_eq!(got.as_ptr(), input.as_ptr()),
+            Cow::Owned(_) => panic!("empty redaction table should not allocate"),
+        }
+    }
+
+    #[test]
+    fn configured_table_borrows_when_there_is_no_match_and_scrubs_match() {
+        let cfg = RedactConfig {
+            enabled: true,
+            scan_environment: false,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            placeholder: "[redacted]".to_string(),
+            denylist: vec!["SECRET".to_string()],
+            ..RedactConfig::default()
+        };
+        let table = RedactionTable::build_with_env(&cfg, Path::new("."), &HashMap::new()).unwrap();
+        let clean = "plain text";
+        match table.scrub_cow(clean) {
+            Cow::Borrowed(got) => assert_eq!(got.as_ptr(), clean.as_ptr()),
+            Cow::Owned(_) => panic!("no-match scrub should not allocate"),
+        }
+        assert_eq!(table.scrub("the SECRET value"), "the [redacted] value");
+    }
 }
 
 #[cfg(test)]

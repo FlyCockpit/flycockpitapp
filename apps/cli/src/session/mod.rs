@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::params;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -1001,6 +1002,38 @@ impl Session {
     ) -> Result<()> {
         self.db
             .insert_inference_request(&call_id.to_string(), self.id, payload, status)
+            .context("inserting inference_request")
+    }
+
+    /// Async variant for inference dispatch hot paths. It uses the DB writer
+    /// actor directly instead of adding another `spawn_blocking` wrapper around
+    /// the synchronous convenience method.
+    pub async fn record_inference_request_async(
+        &self,
+        call_id: Uuid,
+        payload: Value,
+        status: crate::db::session_log::InferenceRequestStatus,
+    ) -> Result<()> {
+        let payload_json =
+            serde_json::to_string(&payload).context("serializing request payload")?;
+        let ts_ms = crate::db::session_log::now_ms();
+        let call_id = call_id.to_string();
+        let session_id = self.id.to_string();
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO inference_requests
+                       (call_id, session_id, ts_ms, payload_json, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(call_id) DO UPDATE SET
+                       payload_json = excluded.payload_json,
+                       status       = excluded.status",
+                    params![call_id, session_id, ts_ms, payload_json, status.as_str()],
+                )
+                .context("inserting inference_request")?;
+                Ok(())
+            })
+            .await
             .context("inserting inference_request")
     }
 

@@ -11,8 +11,8 @@
 //! Concrete tools implement [`Tool`]; the dispatcher holds a
 //! `BTreeMap<String, Arc<dyn Tool>>`.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -608,11 +608,14 @@ impl Capability {
 /// adds **no** new mid-session mutation.
 #[derive(Default, Clone)]
 pub struct ToolBox {
-    tools: std::collections::BTreeMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
     /// Per-tool-name description overrides. Empty (the default) means every
     /// tool renders its own base/per-mode description — byte-identical to the
     /// pre-override behavior.
-    overrides: std::collections::BTreeMap<String, ToolDescOverride>,
+    overrides: BTreeMap<String, ToolDescOverride>,
+    /// Rendered tool schemas for this finalized toolbox, keyed by LLM mode.
+    /// Builder-style mutations clear it so per-agent overrides stay exact.
+    definition_cache: Arc<Mutex<HashMap<crate::config::extended::LlmMode, Vec<ToolDefinition>>>>,
 }
 
 impl ToolBox {
@@ -622,6 +625,7 @@ impl ToolBox {
 
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.insert(tool.name().to_string(), tool);
+        self.definition_cache.lock().unwrap().clear();
         self
     }
 
@@ -637,6 +641,7 @@ impl ToolBox {
         } else {
             self.overrides.insert(name.to_string(), ov);
         }
+        self.definition_cache.lock().unwrap().clear();
         self
     }
 
@@ -650,10 +655,19 @@ impl ToolBox {
     /// agent spawn; the overrides are the ones registered via
     /// [`Self::with_override`] at construction time.
     pub fn definitions(&self, mode: crate::config::extended::LlmMode) -> Vec<ToolDefinition> {
-        self.tools
+        if let Some(cached) = self.definition_cache.lock().unwrap().get(&mode).cloned() {
+            return cached;
+        }
+        let definitions: Vec<ToolDefinition> = self
+            .tools
             .values()
             .map(|t| definition_of(&**t, mode, self.overrides.get(t.name())))
-            .collect()
+            .collect();
+        self.definition_cache
+            .lock()
+            .unwrap()
+            .insert(mode, definitions.clone());
+        definitions
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -678,6 +692,54 @@ mod capability_tests {
         assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
         assert!(Capability::FollowupSeed.enabled(LlmMode::Frontier));
         assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
+    }
+}
+
+#[cfg(test)]
+mod definition_cache_tests {
+    use super::*;
+    use crate::config::extended::LlmMode;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn description(&self) -> &str {
+            "count calls"
+        }
+
+        fn parameters(&self) -> Value {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    #[test]
+    fn definitions_build_schema_once_per_mode() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let toolbox = ToolBox::new().with(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+
+        let first = toolbox.definitions(LlmMode::Normal);
+        let second = toolbox.definitions(LlmMode::Normal);
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _ = toolbox.definitions(LlmMode::Frontier);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
 

@@ -4248,7 +4248,7 @@ impl Driver {
     /// a refreshed `ContextProjection`. Never breaks a warm cache (the
     /// cache-cold or manual paths), so `cache_break = false`.
     async fn do_prune(&mut self, auto: bool, tx: &mpsc::Sender<TurnEvent>) {
-        self.do_prune_inner(auto, false, None, tx).await;
+        self.do_prune_inner(auto, false, None, None, tx).await;
     }
 
     /// Inner prune: `cache_break` flags a ctx%-threshold auto-prune that ran
@@ -4260,6 +4260,7 @@ impl Driver {
         auto: bool,
         cache_break: bool,
         trigger_reason: Option<&'static str>,
+        precomputed_plan: Option<prune::DedupPlan>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         // Capture the inputs the escalation telemetry needs before borrowing
@@ -4277,7 +4278,7 @@ impl Driver {
         // This prune's targets (the bodies elided *this* call) — the
         // `original_event_id`s describing what was removed — and the
         // classifying reason (overlap-merge vs exact-identity vs mixed).
-        let this_prune = prune::dedup_plan(&top.history);
+        let this_prune = precomputed_plan.unwrap_or_else(|| prune::dedup_plan(&top.history));
         let this_elided: Vec<String> = this_prune
             .targets
             .iter()
@@ -4574,7 +4575,7 @@ impl Driver {
         // Warm cache + threshold-driven prune → the cache anchor is broken;
         // surface the same warning the manual prune does.
         let cache_break = auto_prune_trigger_breaks_cache(trigger_reason);
-        self.do_prune_inner(true, cache_break, Some(trigger_reason), tx)
+        self.do_prune_inner(true, cache_break, Some(trigger_reason), Some(plan), tx)
             .await;
         true
     }
@@ -15244,6 +15245,7 @@ mod tests {
                 reason,
             },
             partial_body: None,
+            tokens_saved: 0,
             target_call_id: "x".into(),
         };
         let exact = DedupPlan {

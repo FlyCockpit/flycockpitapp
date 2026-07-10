@@ -2311,6 +2311,8 @@ pub enum InterruptQuestion {
     },
     Freetext {
         prompt: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        masked: bool,
     },
 }
 

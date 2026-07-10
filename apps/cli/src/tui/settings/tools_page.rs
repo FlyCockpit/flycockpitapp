@@ -8,7 +8,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::config::extended::ToolCommandTemplate;
+use crate::config::extended::{ToolCommandTemplate, WebProvider as ConfigWebProvider};
+use crate::credentials::CredentialStore;
+use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
 
 use super::reset::{ResetButton, ResetOutcome};
@@ -39,23 +41,34 @@ pub(super) struct ToolsPage {
     pub(super) reset: ResetButton,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(super) enum WebSetupState {
     Provider,
+    FirecrawlDetails,
+    TinyFishDetails,
+    CustomPresets,
     AgentBrowserSearchEngine,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(super) enum ToolField {
     Command,
     Description,
+    WebKey(WebKeyProvider),
+    FirecrawlBaseUrl,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum WebKeyProvider {
+    Firecrawl,
+    TinyFish,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum WebProvider {
+enum WebChoice {
     Firecrawl,
     TinyFish,
-    AgentBrowser,
+    Custom,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -66,11 +79,9 @@ enum AgentBrowserSearchEngine {
 }
 
 struct WebProviderChoice {
-    provider: WebProvider,
+    provider: WebChoice,
     label: &'static str,
-    command: &'static str,
     docs_url: &'static str,
-    installed: bool,
     hint: &'static str,
 }
 
@@ -110,46 +121,6 @@ pub fn default_template_for(name: &str) -> ToolCommandTemplate {
     }
 }
 
-fn firecrawl_template_for(name: &str) -> Option<ToolCommandTemplate> {
-    match name {
-        "webfetch" => Some(ToolCommandTemplate {
-            enabled: true,
-            command: "firecrawl scrape --format markdown {url}".to_string(),
-            description: Some(
-                "Fetch a URL using Firecrawl. Pass `url`; returns markdown page content. For dependency API usage, use docs when uncertain; web is for what `docs` can't answer.".to_string(),
-            ),
-        }),
-        "websearch" => Some(ToolCommandTemplate {
-            enabled: true,
-            command: "firecrawl search --json --limit 8 {query}".to_string(),
-            description: Some(
-                "Search the web using Firecrawl. Pass `query`; returns compact JSON web results. For dependency API usage, use docs when uncertain; web is for what `docs` can't answer.".to_string(),
-            ),
-        }),
-        _ => None,
-    }
-}
-
-fn tinyfish_template_for(name: &str) -> Option<ToolCommandTemplate> {
-    match name {
-        "webfetch" => Some(ToolCommandTemplate {
-            enabled: true,
-            command: "tinyfish fetch content get --format markdown {url}".to_string(),
-            description: Some(
-                "Fetch a URL using TinyFish. Pass `url`; returns markdown content from the fetched page. For dependency API usage, use docs when uncertain; web is for what `docs` can't answer.".to_string(),
-            ),
-        }),
-        "websearch" => Some(ToolCommandTemplate {
-            enabled: true,
-            command: "tinyfish search query --pretty {query}".to_string(),
-            description: Some(
-                "Search the web using TinyFish. Pass `query`; returns readable search results. For dependency API usage, use docs when uncertain; web is for what `docs` can't answer.".to_string(),
-            ),
-        }),
-        _ => None,
-    }
-}
-
 fn agent_browser_fetch_template() -> ToolCommandTemplate {
     ToolCommandTemplate {
         enabled: true,
@@ -185,33 +156,76 @@ fn agent_browser_engine_label(engine: AgentBrowserSearchEngine) -> &'static str 
     }
 }
 
-fn web_provider_choices(command_installed: fn(&str) -> bool) -> [WebProviderChoice; 3] {
+fn web_provider_choices() -> [WebProviderChoice; 3] {
     [
         WebProviderChoice {
-            provider: WebProvider::Firecrawl,
+            provider: WebChoice::Firecrawl,
             label: "Firecrawl",
-            command: "firecrawl",
-            docs_url: "https://github.com/firecrawl/cli",
-            installed: command_installed("firecrawl"),
-            hint: "commonly requires FIRECRAWL_API_KEY",
+            docs_url: "https://www.firecrawl.dev",
+            hint: "default native backend; no API key required, FIRECRAWL_API_KEY raises limits",
         },
         WebProviderChoice {
-            provider: WebProvider::TinyFish,
+            provider: WebChoice::TinyFish,
             label: "TinyFish",
-            command: "tinyfish",
-            docs_url: "https://docs.tinyfish.ai/cli",
-            installed: command_installed("tinyfish"),
-            hint: "may require TinyFish auth setup",
+            docs_url: "https://agent.tinyfish.ai",
+            hint: "requires TINYFISH_API_KEY or a stored TinyFish key",
         },
         WebProviderChoice {
-            provider: WebProvider::AgentBrowser,
-            label: "agent-browser",
-            command: "agent-browser",
-            docs_url: "https://github.com/vercel-labs/agent-browser",
-            installed: command_installed("agent-browser"),
-            hint: "search may require a configured browser profile/session",
+            provider: WebChoice::Custom,
+            label: "Custom CLI command",
+            docs_url: "",
+            hint: "use configured webfetch/websearch commands and shipped presets",
         },
     ]
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum WebKeyStatus {
+    Env,
+    Stored,
+}
+
+fn web_key_provider_id(provider: WebKeyProvider) -> &'static str {
+    match provider {
+        WebKeyProvider::Firecrawl => "firecrawl",
+        WebKeyProvider::TinyFish => "tinyfish",
+    }
+}
+
+fn web_key_env(provider: WebKeyProvider) -> &'static str {
+    match provider {
+        WebKeyProvider::Firecrawl => "FIRECRAWL_API_KEY",
+        WebKeyProvider::TinyFish => "TINYFISH_API_KEY",
+    }
+}
+
+fn web_key_provider_label(provider: WebKeyProvider) -> &'static str {
+    match provider {
+        WebKeyProvider::Firecrawl => "Firecrawl",
+        WebKeyProvider::TinyFish => "TinyFish",
+    }
+}
+
+fn web_key_status_label(status: Option<WebKeyStatus>) -> String {
+    match status {
+        Some(WebKeyStatus::Env) => format!("detected via env ({MASKED_VALUE})"),
+        Some(WebKeyStatus::Stored) => format!("stored credential ({MASKED_VALUE})"),
+        None => "none".to_string(),
+    }
+}
+
+fn masked_edit_value(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        mask_value().to_string()
+    }
+}
+
+fn valid_http_url(raw: &str) -> bool {
+    reqwest::Url::parse(raw)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 impl SettingsDialog {
@@ -237,27 +251,62 @@ impl SettingsDialog {
     fn handle_tools_page_key(&mut self, key: KeyEvent, p: &mut ToolsPage) -> Nav {
         if let Some(field) = p.editing {
             match key.code {
-                KeyCode::Enter => {
-                    let new = p.buf.text().to_string();
-                    if let Some(name) = p.edit_target.clone() {
-                        let entry = self.extended.tools.entry(name).or_insert_with(|| {
-                            ToolCommandTemplate {
-                                enabled: true,
-                                command: String::new(),
-                                description: None,
-                            }
-                        });
-                        match field {
-                            ToolField::Command => entry.command = new,
-                            ToolField::Description => {
-                                entry.description = if new.is_empty() { None } else { Some(new) };
+                KeyCode::Enter => match field {
+                    ToolField::Command | ToolField::Description => {
+                        let new = p.buf.text().to_string();
+                        if let Some(name) = p.edit_target.clone() {
+                            let entry = self.extended.tools.entry(name).or_insert_with(|| {
+                                ToolCommandTemplate {
+                                    enabled: true,
+                                    command: String::new(),
+                                    description: None,
+                                }
+                            });
+                            match field {
+                                ToolField::Command => entry.command = new,
+                                ToolField::Description => {
+                                    entry.description =
+                                        if new.is_empty() { None } else { Some(new) };
+                                }
+                                _ => unreachable!(),
                             }
                         }
+                        p.status = save_status(self.save_extended());
+                        p.editing = None;
+                        p.edit_target = None;
                     }
-                    p.editing = None;
-                    p.edit_target = None;
-                    p.status = save_status(self.save_extended());
-                }
+                    ToolField::WebKey(provider) => {
+                        let key = p.buf.text().trim().to_string();
+                        if key.is_empty() {
+                            p.status = Some("Paste a non-empty API key.".to_string());
+                        } else {
+                            p.status = Some(match self.save_web_api_key(provider, &key) {
+                                Ok(()) => format!(
+                                    "{} key saved to credentials.",
+                                    web_key_provider_label(provider)
+                                ),
+                                Err(e) => format!("Save failed: {e}"),
+                            });
+                            p.buf = TextField::default();
+                            p.editing = None;
+                            p.edit_target = None;
+                        }
+                    }
+                    ToolField::FirecrawlBaseUrl => {
+                        let raw = p.buf.text().trim().to_string();
+                        if raw.is_empty() {
+                            self.extended.web.firecrawl_base_url = None;
+                            p.status = save_status(self.save_extended());
+                            p.editing = None;
+                        } else if valid_http_url(&raw) {
+                            self.extended.web.firecrawl_base_url = Some(raw);
+                            p.status = save_status(self.save_extended());
+                            p.editing = None;
+                        } else {
+                            p.status = Some("Base URL must be a valid http(s) URL.".to_string());
+                        }
+                    }
+                },
                 KeyCode::Esc => {
                     p.editing = None;
                     p.edit_target = None;
@@ -271,12 +320,19 @@ impl SettingsDialog {
 
         if let Some(setup) = p.setup {
             let total_rows = match setup {
-                WebSetupState::Provider => web_provider_choices(self.command_installed).len(),
+                WebSetupState::Provider => web_provider_choices().len(),
+                WebSetupState::FirecrawlDetails => 3,
+                WebSetupState::TinyFishDetails => 2,
+                WebSetupState::CustomPresets => 3,
                 WebSetupState::AgentBrowserSearchEngine => 3,
             };
             match key.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                    p.setup = None;
+                    p.setup = if matches!(setup, WebSetupState::Provider) {
+                        None
+                    } else {
+                        Some(WebSetupState::Provider)
+                    };
                     p.cursor = 0;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -287,38 +343,102 @@ impl SettingsDialog {
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match setup {
                     WebSetupState::Provider => {
-                        let choices = web_provider_choices(self.command_installed);
+                        let choices = web_provider_choices();
                         if let Some(choice) = choices.get(p.cursor) {
-                            if !choice.installed {
-                                p.status = Some(format!(
-                                    "{} is not on PATH. Install: {}",
-                                    choice.command, choice.docs_url
-                                ));
-                            } else if choice.provider == WebProvider::AgentBrowser {
-                                self.apply_agent_browser_fetch();
-                                p.setup = Some(WebSetupState::AgentBrowserSearchEngine);
-                                p.cursor = 0;
-                                p.status = Some(
-                                    "agent-browser webfetch applied; choose a search engine"
-                                        .to_string(),
-                                );
-                            } else {
-                                self.apply_web_provider(choice.provider, None);
-                                p.setup = None;
-                                p.cursor = 0;
-                                p.status = save_status(self.save_extended());
+                            match choice.provider {
+                                WebChoice::Firecrawl => {
+                                    self.extended.web.provider = ConfigWebProvider::Firecrawl;
+                                    p.status = save_status(self.save_extended());
+                                    p.setup = Some(WebSetupState::FirecrawlDetails);
+                                    p.cursor = 0;
+                                }
+                                WebChoice::TinyFish => {
+                                    p.setup = Some(WebSetupState::TinyFishDetails);
+                                    p.cursor = 0;
+                                    if self.web_key_status(WebKeyProvider::TinyFish).is_some() {
+                                        self.extended.web.provider = ConfigWebProvider::Tinyfish;
+                                        p.status = save_status(self.save_extended());
+                                    } else {
+                                        p.status = Some("TinyFish needs TINYFISH_API_KEY or a stored key before it can be selected.".to_string());
+                                    }
+                                }
+                                WebChoice::Custom => {
+                                    self.extended.web.provider = ConfigWebProvider::Custom;
+                                    p.status = save_status(self.save_extended());
+                                    p.setup = Some(WebSetupState::CustomPresets);
+                                    p.cursor = 0;
+                                }
                             }
                         }
                     }
+                    WebSetupState::FirecrawlDetails => match p.cursor {
+                        0 => {
+                            self.extended.web.provider = ConfigWebProvider::Firecrawl;
+                            p.status = save_status(self.save_extended());
+                        }
+                        1 => {
+                            p.buf = TextField::default();
+                            p.editing = Some(ToolField::WebKey(WebKeyProvider::Firecrawl));
+                        }
+                        2 => {
+                            p.buf = TextField::new(
+                                self.extended
+                                    .web
+                                    .firecrawl_base_url
+                                    .clone()
+                                    .unwrap_or_default(),
+                            );
+                            p.editing = Some(ToolField::FirecrawlBaseUrl);
+                        }
+                        _ => {}
+                    },
+                    WebSetupState::TinyFishDetails => match p.cursor {
+                        0 => {
+                            if self.web_key_status(WebKeyProvider::TinyFish).is_some() {
+                                self.extended.web.provider = ConfigWebProvider::Tinyfish;
+                                p.status = save_status(self.save_extended());
+                            } else {
+                                p.status = Some("TinyFish is disabled until TINYFISH_API_KEY or a stored key is available.".to_string());
+                            }
+                        }
+                        1 => {
+                            p.buf = TextField::default();
+                            p.editing = Some(ToolField::WebKey(WebKeyProvider::TinyFish));
+                        }
+                        _ => {}
+                    },
+                    WebSetupState::CustomPresets => match p.cursor {
+                        0 => {
+                            self.extended.web.provider = ConfigWebProvider::Custom;
+                            p.status = save_status(self.save_extended());
+                        }
+                        1 => {
+                            self.extended.web.provider = ConfigWebProvider::Custom;
+                            self.apply_curl_ddgr_preset();
+                            p.status = save_status(self.save_extended());
+                        }
+                        2 => {
+                            self.extended.web.provider = ConfigWebProvider::Custom;
+                            self.apply_agent_browser_fetch();
+                            p.setup = Some(WebSetupState::AgentBrowserSearchEngine);
+                            p.cursor = 0;
+                            p.status = Some(
+                                "agent-browser webfetch applied; choose a search engine"
+                                    .to_string(),
+                            );
+                        }
+                        _ => {}
+                    },
                     WebSetupState::AgentBrowserSearchEngine => {
                         let engine = match p.cursor {
                             0 => AgentBrowserSearchEngine::Google,
                             1 => AgentBrowserSearchEngine::Bing,
                             _ => AgentBrowserSearchEngine::Brave,
                         };
-                        self.apply_web_provider(WebProvider::AgentBrowser, Some(engine));
-                        p.setup = None;
-                        p.cursor = 0;
+                        self.extended.web.provider = ConfigWebProvider::Custom;
+                        self.apply_agent_browser_search(engine);
+                        p.setup = Some(WebSetupState::CustomPresets);
+                        p.cursor = 2;
                         p.status = save_status(self.save_extended());
                     }
                 },
@@ -436,35 +556,11 @@ impl SettingsDialog {
         }
     }
 
-    fn apply_web_provider(
-        &mut self,
-        provider: WebProvider,
-        engine: Option<AgentBrowserSearchEngine>,
-    ) {
-        match provider {
-            WebProvider::Firecrawl => {
-                for name in builtin_tool_names() {
-                    if let Some(tpl) = firecrawl_template_for(name) {
-                        self.extended.tools.insert(name.to_string(), tpl);
-                    }
-                }
-            }
-            WebProvider::TinyFish => {
-                for name in builtin_tool_names() {
-                    if let Some(tpl) = tinyfish_template_for(name) {
-                        self.extended.tools.insert(name.to_string(), tpl);
-                    }
-                }
-            }
-            WebProvider::AgentBrowser => {
-                self.apply_agent_browser_fetch();
-                if let Some(engine) = engine {
-                    self.extended.tools.insert(
-                        "websearch".to_string(),
-                        agent_browser_search_template(engine),
-                    );
-                }
-            }
+    fn apply_curl_ddgr_preset(&mut self) {
+        for name in builtin_tool_names() {
+            self.extended
+                .tools
+                .insert(name.to_string(), default_template_for(name));
         }
     }
 
@@ -472,6 +568,45 @@ impl SettingsDialog {
         self.extended
             .tools
             .insert("webfetch".to_string(), agent_browser_fetch_template());
+    }
+
+    fn apply_agent_browser_search(&mut self, engine: AgentBrowserSearchEngine) {
+        self.extended.tools.insert(
+            "websearch".to_string(),
+            agent_browser_search_template(engine),
+        );
+    }
+
+    fn credential_store(&self) -> Result<CredentialStore, String> {
+        match &self.credential_store_path {
+            Some(path) => CredentialStore::open(path.clone()).map_err(|e| e.to_string()),
+            None => CredentialStore::open_default().map_err(|e| e.to_string()),
+        }
+    }
+
+    fn stored_web_key(&self, provider: WebKeyProvider) -> Option<String> {
+        self.credential_store()
+            .ok()
+            .and_then(|store| store.api_key(web_key_provider_id(provider)))
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    fn web_key_status(&self, provider: WebKeyProvider) -> Option<WebKeyStatus> {
+        let env_name = web_key_env(provider);
+        (self.env_lookup)(env_name)
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| WebKeyStatus::Env)
+            .or_else(|| self.stored_web_key(provider).map(|_| WebKeyStatus::Stored))
+    }
+
+    fn save_web_api_key(&self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
+        let store = self.credential_store()?;
+        store
+            .save_record_merged(
+                web_key_provider_id(provider),
+                serde_json::json!({ "api_key": key }),
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub(super) fn build_tools_page_lines(&self, width: u16, p: &ToolsPage) -> Vec<Line<'static>> {
@@ -489,25 +624,83 @@ impl SettingsDialog {
             match setup {
                 WebSetupState::Provider => {
                     lines.push(Line::from(Span::styled(
-                        "Choose web CLI provider".to_string(),
+                        "Choose web provider".to_string(),
                         Style::default().add_modifier(Modifier::BOLD),
                     )));
                     lines.push(Line::default());
-                    for (idx, choice) in web_provider_choices(self.command_installed)
-                        .iter()
-                        .enumerate()
-                    {
+                    for (idx, choice) in web_provider_choices().iter().enumerate() {
                         let selected = idx == p.cursor;
                         let marker = if selected { "▸ " } else { "  " };
-                        let state = if choice.installed {
-                            "installed"
+                        let label_style = if selected {
+                            selected_style()
                         } else {
-                            "missing"
+                            focused_field_style()
+                        };
+                        let current = match (choice.provider, self.extended.web.provider) {
+                            (WebChoice::Firecrawl, ConfigWebProvider::Firecrawl)
+                            | (WebChoice::TinyFish, ConfigWebProvider::Tinyfish)
+                            | (WebChoice::Custom, ConfigWebProvider::Custom) => "current; ",
+                            _ => "",
+                        };
+                        let disabled = choice.provider == WebChoice::TinyFish
+                            && self.web_key_status(WebKeyProvider::TinyFish).is_none();
+                        let disabled_hint = if disabled { "disabled; " } else { "" };
+                        let docs = if choice.docs_url.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" - {}", choice.docs_url)
                         };
                         let value = format!(
-                            "{} ({state}) - {} - {}",
-                            choice.label, choice.docs_url, choice.hint
+                            "{}{disabled_hint}{}{} - {}",
+                            current, choice.label, docs, choice.hint
                         );
+                        push_tool_value_row(
+                            &mut lines,
+                            width,
+                            marker,
+                            "  provider",
+                            label_style,
+                            &value,
+                            if disabled { yellow } else { muted },
+                        );
+                    }
+                }
+                WebSetupState::FirecrawlDetails => {
+                    lines.push(Line::from(Span::styled(
+                        "Firecrawl".to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::default());
+                    let key_status =
+                        web_key_status_label(self.web_key_status(WebKeyProvider::Firecrawl));
+                    let env_override = (self.env_lookup)("FIRECRAWL_API_URL")
+                        .filter(|v| !v.trim().is_empty())
+                        .map(|_| "env FIRECRAWL_API_URL overrides config".to_string())
+                        .unwrap_or_else(|| "empty uses https://api.firecrawl.dev".to_string());
+                    let rows = [
+                        (
+                            "  provider",
+                            "native Firecrawl (keyless allowed)".to_string(),
+                        ),
+                        (
+                            "  api key",
+                            format!("{key_status}; env wins over stored credentials"),
+                        ),
+                        (
+                            "  base url",
+                            format!(
+                                "{} ({env_override})",
+                                self.extended
+                                    .web
+                                    .firecrawl_base_url
+                                    .as_deref()
+                                    .unwrap_or("default")
+                            ),
+                        ),
+                    ];
+                    for (idx, (label, value)) in rows.iter().enumerate() {
+                        let selected = idx == p.cursor;
+                        let marker = if selected { "▸ " } else { "  " };
                         let label_style = if selected {
                             selected_style()
                         } else {
@@ -517,9 +710,85 @@ impl SettingsDialog {
                             &mut lines,
                             width,
                             marker,
-                            "  provider",
+                            label,
                             label_style,
-                            &value,
+                            value,
+                            muted,
+                        );
+                    }
+                }
+                WebSetupState::TinyFishDetails => {
+                    lines.push(Line::from(Span::styled(
+                        "TinyFish".to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::default());
+                    let available = self.web_key_status(WebKeyProvider::TinyFish).is_some();
+                    let key_status =
+                        web_key_status_label(self.web_key_status(WebKeyProvider::TinyFish));
+                    let rows = [
+                        (
+                            "  provider",
+                            if available {
+                                "native TinyFish".to_string()
+                            } else {
+                                "disabled until TINYFISH_API_KEY or a stored key is available; https://agent.tinyfish.ai".to_string()
+                            },
+                        ),
+                        (
+                            "  api key",
+                            format!("{key_status}; env wins over stored credentials"),
+                        ),
+                    ];
+                    for (idx, (label, value)) in rows.iter().enumerate() {
+                        let selected = idx == p.cursor;
+                        let marker = if selected { "▸ " } else { "  " };
+                        let label_style = if selected {
+                            selected_style()
+                        } else {
+                            focused_field_style()
+                        };
+                        push_tool_value_row(
+                            &mut lines,
+                            width,
+                            marker,
+                            label,
+                            label_style,
+                            value,
+                            if idx == 0 && !available {
+                                yellow
+                            } else {
+                                muted
+                            },
+                        );
+                    }
+                }
+                WebSetupState::CustomPresets => {
+                    lines.push(Line::from(Span::styled(
+                        "Custom CLI command".to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::default());
+                    let rows = [
+                        ("  provider", "use configured webfetch/websearch commands"),
+                        ("  preset", "curl + ddgr shipped defaults"),
+                        ("  preset", "agent-browser (choose search engine next)"),
+                    ];
+                    for (idx, (label, value)) in rows.iter().enumerate() {
+                        let selected = idx == p.cursor;
+                        let marker = if selected { "▸ " } else { "  " };
+                        let label_style = if selected {
+                            selected_style()
+                        } else {
+                            focused_field_style()
+                        };
+                        push_tool_value_row(
+                            &mut lines,
+                            width,
+                            marker,
+                            label,
+                            label_style,
+                            value,
                             muted,
                         );
                     }
@@ -562,6 +831,23 @@ impl SettingsDialog {
                         muted,
                     )));
                 }
+            }
+            if let Some(field) = p.editing {
+                let label = match field {
+                    ToolField::Command => "command",
+                    ToolField::Description => "description",
+                    ToolField::WebKey(_) => "api key",
+                    ToolField::FirecrawlBaseUrl => "base url",
+                };
+                let visible = match field {
+                    ToolField::WebKey(_) => masked_edit_value(p.buf.text()),
+                    _ => p.buf.text().to_string(),
+                };
+                let cursor = match field {
+                    ToolField::WebKey(_) if !p.buf.text().is_empty() => visible.chars().count(),
+                    _ => p.buf.cursor(),
+                };
+                push_text_field_at_cursor(&mut lines, width, label, &visible, cursor, true, None);
             }
             if let Some(status) = &p.status {
                 lines.push(Line::default());
@@ -626,7 +912,7 @@ impl SettingsDialog {
             marker,
             "Web setup",
             label_style,
-            "choose Firecrawl, TinyFish, or agent-browser presets",
+            "choose native Firecrawl/TinyFish or custom CLI presets",
             muted,
         );
         row_idx += 1;
@@ -648,16 +934,18 @@ impl SettingsDialog {
             let label = match field {
                 ToolField::Command => "command",
                 ToolField::Description => "description",
+                ToolField::WebKey(_) => "api key",
+                ToolField::FirecrawlBaseUrl => "base url",
             };
-            push_text_field_at_cursor(
-                &mut lines,
-                width,
-                label,
-                p.buf.text(),
-                p.buf.cursor(),
-                true,
-                None,
-            );
+            let visible = match field {
+                ToolField::WebKey(_) => masked_edit_value(p.buf.text()),
+                _ => p.buf.text().to_string(),
+            };
+            let cursor = match field {
+                ToolField::WebKey(_) if !p.buf.text().is_empty() => visible.chars().count(),
+                _ => p.buf.cursor(),
+            };
+            push_text_field_at_cursor(&mut lines, width, label, &visible, cursor, true, None);
         }
 
         if let Some(status) = &p.status {

@@ -188,7 +188,10 @@ fn parse_question(q: &Value, index: usize) -> Result<InterruptQuestion> {
         .to_string();
 
     match kind {
-        "text" => Ok(InterruptQuestion::Freetext { prompt }),
+        "text" => Ok(InterruptQuestion::Freetext {
+            prompt,
+            masked: false,
+        }),
         "select" | "multiselect" => {
             let options = parse_options(q, index)?;
             if options.is_empty() {
@@ -254,7 +257,7 @@ fn question_prompt(q: &InterruptQuestion) -> &str {
     match q {
         InterruptQuestion::Single { prompt, .. }
         | InterruptQuestion::Multi { prompt, .. }
-        | InterruptQuestion::Freetext { prompt } => prompt,
+        | InterruptQuestion::Freetext { prompt, .. } => prompt,
     }
 }
 
@@ -374,6 +377,7 @@ mod tests {
                 },
                 InterruptQuestion::Freetext {
                     prompt: "Name?".into(),
+                    masked: false,
                 },
             ],
         };
@@ -393,6 +397,7 @@ mod tests {
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Freetext {
                 prompt: "Name?".into(),
+                masked: false,
             }],
         };
         let answers = ResolveResponse::Cancel.into_batch(1);

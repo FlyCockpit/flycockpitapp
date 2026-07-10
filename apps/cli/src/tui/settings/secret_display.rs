@@ -1,8 +1,8 @@
 //! Shared secret-display helpers for settings surfaces.
 
-pub(super) const MASKED_VALUE: &str = "********";
+pub(crate) const MASKED_VALUE: &str = "********";
 
-pub(super) fn mask_value() -> &'static str {
+pub(crate) fn mask_value() -> &'static str {
     MASKED_VALUE
 }
 

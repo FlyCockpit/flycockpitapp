@@ -2425,6 +2425,7 @@ impl Driver {
                         prompt:
                             "Enter the new injection-check prompt (blank keeps the current one)"
                                 .to_string(),
+                        masked: false,
                     }],
                 };
                 let resp = self

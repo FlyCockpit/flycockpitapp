@@ -90,6 +90,9 @@ pub struct Page {
     /// This is protocol/user-intent state, separate from permission styling;
     /// approval pages force it off via [`Self::permission`].
     allow_custom: bool,
+    /// Presentation-only: text entry renders a fixed mask instead of the
+    /// literal typed value. The collected answer remains the original text.
+    masked_text: bool,
 }
 
 impl Page {
@@ -100,6 +103,7 @@ impl Page {
             options,
             permission: false,
             allow_custom: true,
+            masked_text: false,
         }
     }
 
@@ -110,6 +114,7 @@ impl Page {
             options,
             permission: false,
             allow_custom: true,
+            masked_text: false,
         }
     }
 
@@ -120,7 +125,23 @@ impl Page {
             options: Vec::new(),
             permission: false,
             allow_custom: false,
+            masked_text: false,
         }
+    }
+
+    pub fn text_masked(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            kind: PageKind::Text,
+            options: Vec::new(),
+            permission: false,
+            allow_custom: false,
+            masked_text: true,
+        }
+    }
+
+    pub fn masked_text(&self) -> bool {
+        self.masked_text
     }
 
     /// Mark this page as a permission/approval page (stripped presentation:

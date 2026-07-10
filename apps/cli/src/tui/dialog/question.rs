@@ -21,6 +21,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+use crate::tui::settings::secret_display::mask_value;
+
 use crate::daemon::proto::{
     CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
     SandboxEscalation,
@@ -761,6 +763,11 @@ impl QuestionDialog {
         match page.kind {
             PageKind::Text => {
                 let typed = self.state.custom_text(page_idx);
+                let shown = if page.masked_text() && !typed.is_empty() {
+                    mask_value().to_string()
+                } else {
+                    typed.to_string()
+                };
                 let style = if self.state.is_typing() {
                     accent
                 } else {
@@ -769,12 +776,14 @@ impl QuestionDialog {
                 let row = lines.len() as u16;
                 lines.push(Line::from(vec![
                     Span::raw("▌ "),
-                    Span::styled(typed.to_string(), style),
+                    Span::styled(shown.clone(), style),
                 ]));
-                // Cursor sits after the "▌ " prefix (2 cells) + the caret's
-                // display column within the typed text (so multi-byte / wide
-                // input stays aligned).
-                let col = 2 + self.state.custom_cursor_display_col(page_idx) as u16;
+                // Cursor sits after the "▌ " prefix plus the visible caret column.
+                let col = if page.masked_text() && !typed.is_empty() {
+                    2 + shown.chars().count() as u16
+                } else {
+                    2 + self.state.custom_cursor_display_col(page_idx) as u16
+                };
                 cursor = Some((area.x + col, area.y + row));
             }
             PageKind::Select | PageKind::Multiselect => {
@@ -1231,7 +1240,13 @@ fn page_for(q: &InterruptQuestion) -> Page {
             options,
             allow_freetext,
         } => Page::multiselect(prompt.clone(), opts(options)).allow_custom(*allow_freetext),
-        InterruptQuestion::Freetext { prompt } => Page::text(prompt.clone()),
+        InterruptQuestion::Freetext { prompt, masked } => {
+            if *masked {
+                Page::text_masked(prompt.clone())
+            } else {
+                Page::text(prompt.clone())
+            }
+        }
     }
 }
 
@@ -1270,7 +1285,7 @@ fn question_prompt(q: &InterruptQuestion) -> &str {
     match q {
         InterruptQuestion::Single { prompt, .. }
         | InterruptQuestion::Multi { prompt, .. }
-        | InterruptQuestion::Freetext { prompt } => prompt,
+        | InterruptQuestion::Freetext { prompt, .. } => prompt,
     }
 }
 
@@ -1498,6 +1513,7 @@ mod tests {
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Freetext {
                 prompt: "Name?".into(),
+                masked: false,
             }],
         };
         let mut d = dialog(set);
@@ -1603,6 +1619,33 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn masked_freetext_renders_fixed_mask_but_submits_original_text() {
+        let mut d = QuestionDialog::new(
+            Uuid::new_v4(),
+            "web key".into(),
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Freetext {
+                    prompt: "Paste key".into(),
+                    masked: true,
+                }],
+            },
+            DialogState::NO_LOCKOUT,
+        );
+        d.paste("secret-key-value");
+        let rendered = render_lines(&d, Rect::new(0, 0, 80, 10)).join("\n");
+        assert!(rendered.contains(mask_value()));
+        assert!(!rendered.contains("secret-key-value"));
+
+        let answers = d.state.collect_answers();
+        assert_eq!(
+            answers,
+            vec![crate::tui::dialog::Answer::Text {
+                text: "secret-key-value".into()
+            }]
+        );
     }
 
     #[test]
@@ -1976,6 +2019,7 @@ mod tests {
         let questions: Vec<InterruptQuestion> = (0..15)
             .map(|i| InterruptQuestion::Freetext {
                 prompt: format!("Question number {i} with a reasonably long label"),
+                masked: false,
             })
             .collect();
         let mut d = QuestionDialog::new(

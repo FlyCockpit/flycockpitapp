@@ -279,6 +279,7 @@ mod tests {
                 },
                 InterruptQuestion::Freetext {
                     prompt: "name?".into(),
+                    masked: false,
                 },
             ],
         };

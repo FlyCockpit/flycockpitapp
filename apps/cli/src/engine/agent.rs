@@ -4453,6 +4453,7 @@ async fn result_injection_override(
                 questions: vec![InterruptQuestion::Freetext {
                     prompt: "Enter the replacement result the agent should see (blank drops it)"
                         .to_string(),
+                    masked: false,
                 }],
             };
             let resp = raise_and_wait_in_turn(ctx, "Edit the tool result", edit_set).await;

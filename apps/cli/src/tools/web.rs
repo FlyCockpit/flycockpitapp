@@ -48,7 +48,7 @@ pub(crate) enum WebToolErrorKind {
     General,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum WebProviderRuntime {
     Firecrawl,
     Tinyfish,
@@ -263,7 +263,27 @@ impl Tool for WebSearchTool {
         };
         Ok(match out {
             Ok(results) => capped_text(render_search_results(&results)),
-            Err(err) => ToolOutput::text(err.to_tool_text(WEBSEARCH)),
+            Err(err) => {
+                if maybe_capture_web_key(ctx, &err, WEBSEARCH).await {
+                    let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
+                    let selected = select_backend(&cfg.web, ctx);
+                    let retry = match selected.kind {
+                        SelectedBackendKind::Firecrawl => {
+                            search_firecrawl(&selected, query, limit, ctx).await
+                        }
+                        SelectedBackendKind::Tinyfish => {
+                            search_tinyfish_or_fallback(&selected, query, limit, ctx).await
+                        }
+                        SelectedBackendKind::Custom => Err(err.clone()),
+                    };
+                    match retry {
+                        Ok(results) => capped_text(render_search_results(&results)),
+                        Err(retry_err) => ToolOutput::text(retry_err.to_tool_text(WEBSEARCH)),
+                    }
+                } else {
+                    ToolOutput::text(err.to_tool_text(WEBSEARCH))
+                }
+            }
         })
     }
 }
@@ -318,7 +338,27 @@ impl Tool for WebFetchTool {
         };
         Ok(match out {
             Ok(page) => capped_text(page.markdown),
-            Err(err) => ToolOutput::text(err.to_tool_text(WEBFETCH)),
+            Err(err) => {
+                if maybe_capture_web_key(ctx, &err, WEBFETCH).await {
+                    let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
+                    let selected = select_backend(&cfg.web, ctx);
+                    let retry = match selected.kind {
+                        SelectedBackendKind::Firecrawl => {
+                            fetch_firecrawl(&selected, url, ctx).await
+                        }
+                        SelectedBackendKind::Tinyfish => {
+                            fetch_tinyfish_or_fallback(&selected, url, ctx).await
+                        }
+                        SelectedBackendKind::Custom => Err(err.clone()),
+                    };
+                    match retry {
+                        Ok(page) => capped_text(page.markdown),
+                        Err(retry_err) => ToolOutput::text(retry_err.to_tool_text(WEBFETCH)),
+                    }
+                } else {
+                    ToolOutput::text(err.to_tool_text(WEBFETCH))
+                }
+            }
         })
     }
 }
@@ -520,6 +560,145 @@ fn credential_api_key(provider_id: &str) -> Option<String> {
     crate::credentials::CredentialStore::open_default()
         .ok()
         .and_then(|store| store.api_key(provider_id))
+}
+
+fn web_key_suppression_set() -> &'static Mutex<HashSet<(Uuid, WebProviderRuntime)>> {
+    static SUPPRESSED: OnceLock<Mutex<HashSet<(Uuid, WebProviderRuntime)>>> = OnceLock::new();
+    SUPPRESSED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn provider_id(provider: WebProviderRuntime) -> &'static str {
+    match provider {
+        WebProviderRuntime::Firecrawl => FIRECRAWL_PROVIDER_ID,
+        WebProviderRuntime::Tinyfish => TINYFISH_PROVIDER_ID,
+    }
+}
+
+fn provider_key_env(provider: WebProviderRuntime) -> &'static str {
+    match provider {
+        WebProviderRuntime::Firecrawl => FIRECRAWL_API_KEY_ENV,
+        WebProviderRuntime::Tinyfish => TINYFISH_API_KEY_ENV,
+    }
+}
+
+fn provider_url(provider: WebProviderRuntime) -> &'static str {
+    match provider {
+        WebProviderRuntime::Firecrawl => "https://www.firecrawl.dev",
+        WebProviderRuntime::Tinyfish => "https://agent.tinyfish.ai",
+    }
+}
+
+fn provider_key_resolvable(ctx: &ToolCtx, provider: WebProviderRuntime) -> bool {
+    lookup_env(ctx, provider_key_env(provider))
+        .and_then(ApiKey::new)
+        .is_some()
+        || credential_api_key(provider_id(provider))
+            .and_then(ApiKey::new)
+            .is_some()
+}
+
+fn web_error_qualifies_for_key_prompt(err: &WebToolError) -> bool {
+    match err.kind {
+        WebToolErrorKind::RateLimited { .. } | WebToolErrorKind::QuotaExhausted => {
+            !err.with_api_key
+        }
+        WebToolErrorKind::AuthFailed => true,
+        WebToolErrorKind::General => false,
+    }
+}
+
+fn web_key_prompt_should_raise(ctx: &ToolCtx, err: &WebToolError) -> bool {
+    if !web_error_qualifies_for_key_prompt(err) || !ctx.interrupts.is_interactive_attached() {
+        return false;
+    }
+    let mut guard = match web_key_suppression_set().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let key = (ctx.session.id, err.provider);
+    if guard.contains(&key) {
+        if provider_key_resolvable(ctx, err.provider) {
+            guard.remove(&key);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn suppress_web_key_prompt(ctx: &ToolCtx, provider: WebProviderRuntime) {
+    let mut guard = match web_key_suppression_set().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert((ctx.session.id, provider));
+}
+
+async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) -> bool {
+    if !web_key_prompt_should_raise(ctx, err) {
+        return false;
+    }
+    let env_name = provider_key_env(err.provider);
+    let url = provider_url(err.provider);
+    let failure = match err.kind {
+        WebToolErrorKind::RateLimited { .. } | WebToolErrorKind::QuotaExhausted => {
+            format!(
+                "{} free-tier limit reached while running {tool}.",
+                err.provider.label()
+            )
+        }
+        WebToolErrorKind::AuthFailed => {
+            format!(
+                "{} rejected the configured API key while running {tool}.",
+                err.provider.label()
+            )
+        }
+        WebToolErrorKind::General => return false,
+    };
+    let prompt = format!(
+        "{failure}\nPaste a {} API key to save it and retry once. Set {env_name} for the durable env-var path; env vars override stored keys. Provider site: {url}",
+        err.provider.label()
+    );
+    let set = crate::daemon::proto::InterruptQuestionSet {
+        questions: vec![crate::daemon::proto::InterruptQuestion::Freetext {
+            prompt,
+            masked: true,
+        }],
+    };
+    let response = crate::engine::interrupt::raise_and_wait(
+        &ctx.session.db,
+        &ctx.interrupts,
+        ctx.session.id,
+        &ctx.agent_id,
+        "Web tool API key required",
+        set,
+        "web key prompt",
+    )
+    .await;
+    if ctx.cancel.is_cancelled() {
+        return false;
+    }
+    let Some(key) = crate::engine::interrupt::freetext_of(&response)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        suppress_web_key_prompt(ctx, err.provider);
+        return false;
+    };
+    let saved = crate::credentials::CredentialStore::open_default()
+        .and_then(|store| {
+            store.save_record_merged(
+                provider_id(err.provider),
+                serde_json::json!({ "api_key": key }),
+            )
+        })
+        .is_ok();
+    if saved {
+        true
+    } else {
+        suppress_web_key_prompt(ctx, err.provider);
+        false
+    }
 }
 
 async fn search_tinyfish_or_fallback(
@@ -1104,6 +1283,41 @@ mod tests {
             &|_| None,
         );
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn web_key_popup_trigger_rules_match_prompt_contract() {
+        let keyless_rate = WebToolError {
+            kind: WebToolErrorKind::RateLimited { retry_after: None },
+            provider: WebProviderRuntime::Firecrawl,
+            with_api_key: false,
+            message: String::new(),
+        };
+        assert!(web_error_qualifies_for_key_prompt(&keyless_rate));
+
+        let keyed_quota = WebToolError {
+            kind: WebToolErrorKind::QuotaExhausted,
+            provider: WebProviderRuntime::Firecrawl,
+            with_api_key: true,
+            message: String::new(),
+        };
+        assert!(!web_error_qualifies_for_key_prompt(&keyed_quota));
+
+        let auth = WebToolError {
+            kind: WebToolErrorKind::AuthFailed,
+            provider: WebProviderRuntime::Tinyfish,
+            with_api_key: true,
+            message: String::new(),
+        };
+        assert!(web_error_qualifies_for_key_prompt(&auth));
+
+        let general = WebToolError {
+            kind: WebToolErrorKind::General,
+            provider: WebProviderRuntime::Firecrawl,
+            with_api_key: false,
+            message: String::new(),
+        };
+        assert!(!web_error_qualifies_for_key_prompt(&general));
     }
 
     #[test]

@@ -40,7 +40,7 @@ mod harnesses_page;
 mod mcp_page;
 mod providers;
 mod reset;
-mod secret_display;
+pub(crate) mod secret_display;
 mod settings_editor;
 mod shell;
 mod skills_page;
@@ -149,6 +149,8 @@ pub struct SettingsDialog {
     /// real [`crate::harness::preflight::which_on_path`]; tests inject a
     /// stub so seeding doesn't depend on the CI machine's installed tools.
     pub(super) command_installed: fn(&str) -> bool,
+    pub(super) env_lookup: fn(&str) -> Option<String>,
+    pub(super) credential_store_path: Option<PathBuf>,
     pending_daemon_request: Option<Request>,
     pending_oauth_action: Option<OAuthActionRequest>,
 }
@@ -752,6 +754,8 @@ impl SettingsDialog {
             active_project_root: None,
             back_to_picker: false,
             command_installed: |cmd| crate::harness::preflight::which_on_path(cmd).is_some(),
+            env_lookup: |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
+            credential_store_path: None,
             pending_daemon_request: None,
             pending_oauth_action: None,
         }
@@ -5567,25 +5571,26 @@ mod tests {
     }
 
     #[test]
-    fn tools_web_setup_firecrawl_applies_fetch_and_search_templates() {
+    fn tools_web_setup_firecrawl_selects_native_provider_without_touching_templates() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.command_installed = |cmd| cmd == "firecrawl";
         enter_tools_from_root(&mut d);
 
         cursor_down(&mut d, tools_setup_row());
         d.handle_key(press(KeyCode::Enter));
         d.handle_key(press(KeyCode::Enter));
 
-        let fetch = d.extended.tools.get("webfetch").expect("webfetch set");
-        let search = d.extended.tools.get("websearch").expect("websearch set");
-        assert_eq!(fetch.command, "firecrawl scrape --format markdown {url}");
-        assert_eq!(search.command, "firecrawl search --json --limit 8 {query}");
-        assert!(fetch.enabled);
-        assert!(search.enabled);
+        assert_eq!(
+            d.extended.web.provider,
+            crate::config::extended::WebProvider::Firecrawl
+        );
+        assert!(
+            d.extended.tools.is_empty(),
+            "native Firecrawl does not write CLI templates"
+        );
         match &d.page {
             Page::Tools(p) => {
-                assert!(p.setup.is_none(), "provider setup should close");
+                assert_eq!(p.setup, Some(tools_page::WebSetupState::FirecrawlDetails));
                 assert_eq!(p.cursor, 0);
             }
             other => panic!("expected Tools, got {other:?}"),
@@ -5593,72 +5598,141 @@ mod tests {
     }
 
     #[test]
-    fn tools_web_setup_missing_provider_shows_docs_without_mutating() {
+    fn tools_web_setup_tinyfish_is_gated_until_key_exists() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.command_installed = |_| false;
+        d.credential_store_path = Some(tmp.path().join("credentials.json"));
         enter_tools_from_root(&mut d);
 
         cursor_down(&mut d, tools_setup_row());
         d.handle_key(press(KeyCode::Enter));
+        d.handle_key(press(KeyCode::Down));
         d.handle_key(press(KeyCode::Enter));
 
-        assert!(
-            d.extended.tools.is_empty(),
-            "missing provider must not write templates"
+        assert_eq!(
+            d.extended.web.provider,
+            crate::config::extended::WebProvider::Firecrawl,
+            "TinyFish selection is blocked without a key"
         );
         match &d.page {
-            Page::Tools(p) => {
-                assert!(p.setup.is_some(), "setup should stay open");
-                assert_eq!(
-                    p.status.as_deref(),
-                    Some("firecrawl is not on PATH. Install: https://github.com/firecrawl/cli")
-                );
-            }
+            Page::Tools(p) => assert!(
+                p.status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("TinyFish needs TINYFISH_API_KEY")
+            ),
             other => panic!("expected Tools, got {other:?}"),
         }
+
+        let store =
+            crate::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
+                .unwrap();
+        store
+            .save_record_merged("tinyfish", serde_json::json!({ "api_key": "tf-secret" }))
+            .unwrap();
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            d.extended.web.provider,
+            crate::config::extended::WebProvider::Tinyfish
+        );
     }
 
     #[test]
-    fn tools_web_setup_agent_browser_prompts_for_search_engine() {
+    fn tools_web_key_entry_persists_and_renders_masked() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.command_installed = |cmd| cmd == "agent-browser";
+        d.credential_store_path = Some(tmp.path().join("credentials.json"));
+        enter_tools_from_root(&mut d);
+
+        cursor_down(&mut d, tools_setup_row());
+        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(press(KeyCode::Enter)); // Firecrawl details
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter)); // key field
+        d.paste("fc-secret-value");
+
+        let p = match &d.page {
+            Page::Tools(p) => p,
+            other => panic!("expected Tools, got {other:?}"),
+        };
+        let rendered = d
+            .build_tools_page_lines(80, p)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(secret_display::MASKED_VALUE));
+        assert!(!rendered.contains("fc-secret-value"));
+
+        d.handle_key(press(KeyCode::Enter));
+        let store =
+            crate::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
+                .unwrap();
+        assert_eq!(
+            store.api_key("firecrawl").as_deref(),
+            Some("fc-secret-value")
+        );
+    }
+
+    #[test]
+    fn tools_web_firecrawl_base_url_validates_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_tools_from_root(&mut d);
+
+        cursor_down(&mut d, tools_setup_row());
+        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(press(KeyCode::Enter)); // Firecrawl details
+        cursor_down(&mut d, 2);
+        d.handle_key(press(KeyCode::Enter));
+        d.paste("not-a-url");
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(&d.page, Page::Tools(p) if p.editing.is_some()));
+
+        if let Page::Tools(p) = &mut d.page {
+            p.buf = crate::tui::textfield::TextField::new("https://firecrawl.local");
+        }
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            d.extended.web.firecrawl_base_url.as_deref(),
+            Some("https://firecrawl.local")
+        );
+    }
+
+    #[test]
+    fn tools_web_setup_custom_presets_fill_templates() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
         enter_tools_from_root(&mut d);
 
         cursor_down(&mut d, tools_setup_row());
         d.handle_key(press(KeyCode::Enter));
         cursor_down(&mut d, 2);
-        d.handle_key(press(KeyCode::Enter));
-
-        let fetch = d.extended.tools.get("webfetch").expect("webfetch set");
+        d.handle_key(press(KeyCode::Enter)); // custom details
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter)); // curl + ddgr
         assert_eq!(
-            fetch.command,
-            "agent-browser --session cockpit-webfetch open {url} && agent-browser --session cockpit-webfetch get text body"
+            d.extended.web.provider,
+            crate::config::extended::WebProvider::Custom
         );
-        assert!(
-            !d.extended.tools.contains_key("websearch"),
-            "search waits for engine choice"
+        assert_eq!(
+            d.extended.tools.get("websearch").unwrap().command,
+            "ddgr --json --num 8 -- {query}"
         );
-        match &d.page {
-            Page::Tools(p) => {
-                assert!(p.setup.is_some(), "engine setup should be open");
-                assert_eq!(p.cursor, 0);
-            }
-            other => panic!("expected Tools, got {other:?}"),
-        }
 
         d.handle_key(press(KeyCode::Down));
-        d.handle_key(press(KeyCode::Enter));
-        let search = d.extended.tools.get("websearch").expect("websearch set");
+        d.handle_key(press(KeyCode::Enter)); // agent-browser preset
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter)); // Bing engine
         assert_eq!(
-            search.command,
+            d.extended.tools.get("websearch").unwrap().command,
             "agent-browser --session cockpit-websearch open \"https://www.bing.com/search?q={query}\" && agent-browser --session cockpit-websearch get text body"
         );
-        match &d.page {
-            Page::Tools(p) => assert!(p.setup.is_none(), "engine setup should close"),
-            other => panic!("expected Tools, got {other:?}"),
-        }
     }
 
     /// Move a category page's cursor onto its reset button row (the last

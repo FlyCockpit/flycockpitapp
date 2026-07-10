@@ -177,21 +177,18 @@ pub enum HistoryEntry {
     /// A run of consecutive boxable tool calls (read, readlock, unlock,
     /// bash, webfetch, …) rendered inside a light-grey rounded sidebar.
     /// Diff tools (edit/editunlock), write tools, and subagent calls
-    /// break the run, so a box never holds them. The collapsed view
-    /// shows at most [`TOOLBOX_VISIBLE`] calls with an internal scroll;
-    /// a click expands it to show every call in full.
+    /// break the run, so a box never holds them. When every call is
+    /// collapsed, the box shows at most [`TOOLBOX_VISIBLE`] calls with an
+    /// internal scroll. Clicking a call expands only that call.
     ToolBox {
         calls: Vec<ToolCall>,
-        /// Topmost visible call in collapsed mode. Ignored while
-        /// `follow` or `expanded`.
+        /// Topmost visible call when no individual call is expanded.
+        /// Ignored while `follow` is true.
         view_offset: usize,
         /// Collapsed viewport auto-pins to the newest call as calls
         /// stream in. Cleared when the user scrolls up; restored when
         /// they scroll back to the end.
         follow: bool,
-        /// Click-expanded: render every call in full (input + output for
-        /// output-bearing tools) and disable the internal scroll.
-        expanded: bool,
     },
     /// A standalone tool call rendered as one styled line outside any
     /// box. Used for `write` / `writeunlock`: conceptually diffs that
@@ -378,9 +375,13 @@ pub struct ToolCall {
     /// Full invocation text for the expanded view (e.g. a multi-line
     /// bash command). Equal to `summary` for single-line calls.
     pub full_input: String,
-    /// Full tool output, shown only when the box is expanded *and* the
+    /// Full tool output, shown only when this call is expanded and the
     /// tool is output-bearing. Empty for input-only tools.
     pub output: String,
+    /// Per-call expansion state; neighboring calls remain collapsed.
+    pub expanded: bool,
+    /// Top-anchored offset into this call's wrapped result window.
+    pub result_offset: usize,
     pub state: ToolCallState,
     /// Post-result hint text (`engine::bash_hints`, `data.hint.text`) when a
     /// rule fired on this (`bash`) call. Rendered as a single dim/italic
@@ -392,6 +393,46 @@ pub struct ToolCall {
 /// Max tool-call rows a collapsed [`HistoryEntry::ToolBox`] shows
 /// before it scrolls internally.
 pub const TOOLBOX_VISIBLE: usize = 6;
+
+/// Wrapped result rows shown for one expanded tool call before the result
+/// scrolls internally.
+pub const TOOLCALL_RESULT_VISIBLE: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InnerScrollWindow {
+    pub offset: usize,
+    pub max_offset: usize,
+    pub end: usize,
+    pub more_above: usize,
+    pub more_below: usize,
+}
+
+pub fn inner_scroll_window(
+    total_rows: usize,
+    visible_rows: usize,
+    offset: usize,
+) -> InnerScrollWindow {
+    let visible_rows = visible_rows.max(1);
+    let max_offset = total_rows.saturating_sub(visible_rows);
+    let offset = offset.min(max_offset);
+    let end = total_rows.min(offset.saturating_add(visible_rows));
+    InnerScrollWindow {
+        offset,
+        max_offset,
+        end,
+        more_above: offset,
+        more_below: total_rows.saturating_sub(end),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolResultScrollRegion {
+    pub call_index: usize,
+    pub row_start: usize,
+    pub row_end: usize,
+    pub offset: usize,
+    pub max_offset: usize,
+}
 
 /// Display columns reserved for the tool glyph (emoji + separator) in a
 /// tool-call row when emojis are on. All glyphs are width-2 emoji, so a
@@ -575,6 +616,11 @@ pub struct Rendered {
     /// agent text reconstructs the original paragraph rather than
     /// preserving the screen-level wraps.
     pub continuations: Vec<bool>,
+    /// One optional call index per row in `lines`, for per-call hover and
+    /// click targeting inside a tool box.
+    pub tool_call_rows: Vec<Option<usize>>,
+    /// Relative row ranges for scrollable expanded tool-call result windows.
+    pub tool_result_scroll_regions: Vec<ToolResultScrollRegion>,
     /// Where the clickable `[pin]`/`[unpin]` mouse control landed within
     /// `lines`, when one was drawn (`pinned-messages`). `None` when the
     /// entry is not pinnable, the control is hidden (mouse mode off), or
@@ -911,6 +957,8 @@ pub fn render_entry(
                 lines,
                 chip_row,
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region,
             }
         }
@@ -918,6 +966,8 @@ pub fn render_entry(
             lines: vec![Line::from(line.clone())],
             chip_row: None,
             continuations: vec![false],
+            tool_call_rows: Vec::new(),
+            tool_result_scroll_regions: Vec::new(),
             pin_region: None,
         },
         HistoryEntry::CommandError { line } => Rendered {
@@ -927,6 +977,8 @@ pub fn render_entry(
             ))],
             chip_row: None,
             continuations: vec![false],
+            tool_call_rows: Vec::new(),
+            tool_result_scroll_regions: Vec::new(),
             pin_region: None,
         },
         HistoryEntry::Maintenance { line } => Rendered {
@@ -936,6 +988,8 @@ pub fn render_entry(
             ))],
             chip_row: None,
             continuations: vec![false],
+            tool_call_rows: Vec::new(),
+            tool_result_scroll_regions: Vec::new(),
             pin_region: None,
         },
         HistoryEntry::UserNote {
@@ -947,6 +1001,8 @@ pub fn render_entry(
                 lines,
                 chip_row: None,
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -956,6 +1012,8 @@ pub fn render_entry(
                 lines,
                 chip_row: None,
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -988,6 +1046,8 @@ pub fn render_entry(
                 lines,
                 chip_row: Some(0),
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -1001,6 +1061,8 @@ pub fn render_entry(
                 ))],
                 chip_row: None,
                 continuations: vec![false],
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -1017,6 +1079,8 @@ pub fn render_entry(
                 lines,
                 chip_row: None,
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -1024,16 +1088,7 @@ pub fn render_entry(
             calls,
             view_offset,
             follow,
-            expanded,
-        } => render_toolbox(
-            calls,
-            *view_offset,
-            *follow,
-            *expanded,
-            width,
-            emojis,
-            elided,
-        ),
+        } => render_toolbox(calls, *view_offset, *follow, width, emojis, elided),
         HistoryEntry::ToolLine {
             tool,
             summary,
@@ -1054,6 +1109,8 @@ pub fn render_entry(
                 lines: vec![Line::from(spans)],
                 chip_row: None,
                 continuations: vec![false],
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -1081,6 +1138,8 @@ pub fn render_entry(
                 lines,
                 chip_row: None,
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -1130,6 +1189,8 @@ pub fn render_entry(
                     .is_some_and(|brief| !brief.trim().is_empty())
                     .then_some(0),
                 continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
                 pin_region: None,
             }
         }
@@ -1788,6 +1849,8 @@ fn render_agent(
         lines: out,
         chip_row,
         continuations: conts,
+        tool_call_rows: Vec::new(),
+        tool_result_scroll_regions: Vec::new(),
         pin_region,
     }
 }
@@ -1891,6 +1954,8 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             lines: vec![Line::from(spans)],
             chip_row: None,
             continuations: vec![false],
+            tool_call_rows: Vec::new(),
+            tool_result_scroll_regions: Vec::new(),
             pin_region: None,
         };
     };
@@ -1940,6 +2005,8 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             lines: out,
             chip_row,
             continuations: conts,
+            tool_call_rows: Vec::new(),
+            tool_result_scroll_regions: Vec::new(),
             pin_region: None,
         };
     }
@@ -2010,6 +2077,8 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         lines: out,
         chip_row,
         continuations: conts,
+        tool_call_rows: Vec::new(),
+        tool_result_scroll_regions: Vec::new(),
         pin_region: None,
     }
 }
@@ -2227,24 +2296,64 @@ fn sidebar_glyph(i: usize, n: usize) -> char {
     }
 }
 
+fn push_toolbox_content_row(
+    content: &mut Vec<Vec<Span<'static>>>,
+    tool_call_rows: &mut Vec<Option<usize>>,
+    spans: Vec<Span<'static>>,
+    call_index: Option<usize>,
+) {
+    content.push(spans);
+    tool_call_rows.push(call_index);
+}
+
 /// Render a [`HistoryEntry::ToolBox`]: a light-grey rounded sidebar with
-/// the tool-call lines inside it. Collapsed shows up to
-/// [`TOOLBOX_VISIBLE`] calls (windowed by scroll/follow); expanded shows
-/// every call in full, including input + output for output-bearing
-/// tools.
+/// the tool-call lines inside it. When every call is collapsed, shows up
+/// to [`TOOLBOX_VISIBLE`] calls (windowed by scroll/follow). Expanded
+/// calls render their full input and an independently scrollable result
+/// window, while neighboring calls stay as one-line summaries.
 fn render_toolbox(
     calls: &[ToolCall],
     view_offset: usize,
     follow: bool,
-    expanded: bool,
     width: u16,
     emojis: bool,
     elided: &HashSet<String>,
 ) -> Rendered {
     let mut content: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut tool_call_rows: Vec<Option<usize>> = Vec::new();
+    let mut result_regions: Vec<ToolResultScrollRegion> = Vec::new();
+    let any_expanded = calls.iter().any(|call| call.expanded);
+    let call_body_width = (width as usize).saturating_sub(2).max(1);
 
-    if expanded {
-        for call in calls {
+    let render_collapsed_call = |call: &ToolCall| {
+        let budget = tool_summary_budget(&call.tool, width as usize, 2, emojis);
+        let mut spans = tool_call_spans(
+            &call.tool,
+            &truncate(&call.summary, budget),
+            call.state,
+            emojis,
+        );
+        if elided.contains(&call.call_id) {
+            spans.push(Span::styled(
+                "  (pruned)".to_string(),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            ));
+        }
+        spans
+    };
+
+    if any_expanded {
+        for (call_index, call) in calls.iter().enumerate() {
+            if !call.expanded {
+                push_toolbox_content_row(
+                    &mut content,
+                    &mut tool_call_rows,
+                    render_collapsed_call(call),
+                    Some(call_index),
+                );
+                continue;
+            }
+
             // A call whose wire-side body is currently elided renders its
             // expanded output dimmed (muted) to signal it's out of the
             // model's context. The full text is still shown + selectable;
@@ -2261,61 +2370,120 @@ fn render_toolbox(
                     Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
                 ));
             }
-            content.push(first_spans);
+            push_toolbox_content_row(
+                &mut content,
+                &mut tool_call_rows,
+                first_spans,
+                Some(call_index),
+            );
             for cont in input_lines.iter().skip(1) {
-                content.push(vec![Span::styled(
-                    (*cont).to_string(),
-                    tool_state_style(call.state),
-                )]);
+                push_toolbox_content_row(
+                    &mut content,
+                    &mut tool_call_rows,
+                    vec![Span::styled(
+                        (*cont).to_string(),
+                        tool_state_style(call.state),
+                    )],
+                    Some(call_index),
+                );
             }
+
             if tool_shows_output(&call.tool) && !call.output.is_empty() {
                 let out_style = if is_elided {
                     Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
                 } else {
                     Style::default().fg(TOOL_OUTPUT_FG)
                 };
-                for out_line in call.output.split('\n') {
-                    content.push(vec![Span::styled(format!("    {out_line}"), out_style)]);
+                let output_lines = call
+                    .output
+                    .split('\n')
+                    .map(|out_line| {
+                        Line::from(vec![Span::styled(format!("    {out_line}"), out_style)])
+                    })
+                    .collect::<Vec<_>>();
+                let (wrapped, _) = wrap_lines_to_width(output_lines, call_body_width);
+                let window =
+                    inner_scroll_window(wrapped.len(), TOOLCALL_RESULT_VISIBLE, call.result_offset);
+                let region_start = content.len();
+                if window.more_above > 0 {
+                    push_toolbox_content_row(
+                        &mut content,
+                        &mut tool_call_rows,
+                        vec![Span::styled(
+                            format!("    {} more above", window.more_above),
+                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        )],
+                        Some(call_index),
+                    );
+                }
+                for line in wrapped
+                    .iter()
+                    .skip(window.offset)
+                    .take(window.end.saturating_sub(window.offset))
+                {
+                    push_toolbox_content_row(
+                        &mut content,
+                        &mut tool_call_rows,
+                        line.spans.clone(),
+                        Some(call_index),
+                    );
+                }
+                if window.more_below > 0 {
+                    push_toolbox_content_row(
+                        &mut content,
+                        &mut tool_call_rows,
+                        vec![Span::styled(
+                            format!("    {} more below", window.more_below),
+                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        )],
+                        Some(call_index),
+                    );
+                }
+                let region_end = content.len().saturating_sub(1);
+                if window.max_offset > 0 && region_start <= region_end {
+                    result_regions.push(ToolResultScrollRegion {
+                        call_index,
+                        row_start: region_start,
+                        row_end: region_end,
+                        offset: window.offset,
+                        max_offset: window.max_offset,
+                    });
                 }
             }
+
             // Post-result hint chip: one dim/italic line beneath the command
-            // output (implementation note). There is no
-            // `recovery_kind` chip on a tool-call row to nest under, so this is
-            // the single dim line the spec's fallback specifies.
+            // output (implementation note). There is no `recovery_kind` chip
+            // on a tool-call row to nest under, so this is the single dim line
+            // the spec's fallback specifies.
             if let Some(hint) = &call.hint {
-                content.push(vec![Span::styled(
-                    format!("    hint: {hint}"),
-                    Style::default()
-                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                        .add_modifier(Modifier::ITALIC),
-                )]);
+                push_toolbox_content_row(
+                    &mut content,
+                    &mut tool_call_rows,
+                    vec![Span::styled(
+                        format!("    hint: {hint}"),
+                        Style::default()
+                            .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                            .add_modifier(Modifier::ITALIC),
+                    )],
+                    Some(call_index),
+                );
             }
         }
     } else {
         let top = toolbox_top(calls.len(), view_offset, follow);
-        for call in calls.iter().skip(top).take(TOOLBOX_VISIBLE) {
-            let budget = tool_summary_budget(&call.tool, width as usize, 2, emojis);
-            let mut spans = tool_call_spans(
-                &call.tool,
-                &truncate(&call.summary, budget),
-                call.state,
-                emojis,
+        for (call_index, call) in calls.iter().enumerate().skip(top).take(TOOLBOX_VISIBLE) {
+            push_toolbox_content_row(
+                &mut content,
+                &mut tool_call_rows,
+                render_collapsed_call(call),
+                Some(call_index),
             );
-            // Collapsed view: the body isn't shown, but a muted `(pruned)`
-            // tag on the summary still signals the call's result is out of
-            // context. Expand the box for the dimmed body itself.
-            if elided.contains(&call.call_id) {
-                spans.push(Span::styled(
-                    "  (pruned)".to_string(),
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-                ));
-            }
-            content.push(spans);
         }
     }
 
     if content.is_empty() {
         content.push(Vec::new());
+        tool_call_rows.push(None);
     }
 
     let n = content.len();
@@ -2336,6 +2504,8 @@ fn render_toolbox(
         lines: out,
         chip_row: None,
         continuations,
+        tool_call_rows,
+        tool_result_scroll_regions: result_regions,
         pin_region: None,
     }
 }
@@ -2925,12 +3095,13 @@ mod tests {
                     summary: "a.rs".to_string(),
                     full_input: "a.rs".to_string(),
                     output: "fn main() {}".to_string(),
+                    expanded: false,
+                    result_offset: 0,
                     state: ToolCallState::Success,
                     hint: None,
                 }],
                 view_offset: 0,
                 follow: true,
-                expanded: false,
             },
         ];
 
@@ -3463,6 +3634,8 @@ mod tests {
             summary: summary.into(),
             full_input: summary.into(),
             output: String::new(),
+            expanded: false,
+            result_offset: 0,
             state,
             hint: None,
         }
@@ -3672,7 +3845,7 @@ mod tests {
         let calls: Vec<ToolCall> = (0..9)
             .map(|i| mk_call("bash", &format!("cmd{i}"), ToolCallState::Success))
             .collect();
-        let r = render_toolbox(&calls, 0, true, false, 80, false, &no_elided());
+        let r = render_toolbox(&calls, 0, true, 80, false, &no_elided());
         assert_eq!(r.lines.len(), TOOLBOX_VISIBLE);
         // Rounded caps top and bottom; in between the newest calls show.
         assert!(line_text(&r.lines[0]).starts_with('╭'));
@@ -3684,7 +3857,7 @@ mod tests {
     #[test]
     fn toolbox_processing_call_is_yellow() {
         let calls = vec![mk_call("bash", "build", ToolCallState::Processing)];
-        let r = render_toolbox(&calls, 0, true, false, 80, false, &no_elided());
+        let r = render_toolbox(&calls, 0, true, 80, false, &no_elided());
         assert!(
             r.lines[0]
                 .spans
@@ -3696,13 +3869,103 @@ mod tests {
     #[test]
     fn toolbox_expanded_shows_output_only_for_output_bearing_tools() {
         let mut bash = mk_call("bash", "ls", ToolCallState::Success);
+        bash.expanded = true;
         bash.output = "file_a\nfile_b".into();
         let mut read = mk_call("read", "f.txt", ToolCallState::Success);
+        read.expanded = true;
         read.output = "SHOULD_NOT_SHOW".into(); // input-only — never displayed
-        let r = render_toolbox(&[bash, read], 0, true, true, 80, false, &no_elided());
+        let r = render_toolbox(&[bash, read], 0, true, 80, false, &no_elided());
         let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("file_a") && joined.contains("file_b"));
         assert!(!joined.contains("SHOULD_NOT_SHOW"));
+    }
+
+    #[test]
+    fn inner_scroll_window_clamps_and_reports_more_counts() {
+        let top = inner_scroll_window(25, TOOLCALL_RESULT_VISIBLE, 0);
+        assert_eq!(top.offset, 0);
+        assert_eq!(top.max_offset, 5);
+        assert_eq!(top.more_above, 0);
+        assert_eq!(top.more_below, 5);
+
+        let middle = inner_scroll_window(25, TOOLCALL_RESULT_VISIBLE, 3);
+        assert_eq!(middle.offset, 3);
+        assert_eq!(middle.more_above, 3);
+        assert_eq!(middle.more_below, 2);
+
+        let clamped = inner_scroll_window(25, TOOLCALL_RESULT_VISIBLE, 99);
+        assert_eq!(clamped.offset, 5);
+        assert_eq!(clamped.more_above, 5);
+        assert_eq!(clamped.more_below, 0);
+    }
+
+    #[test]
+    fn toolbox_expands_only_the_selected_call() {
+        let mut expanded = mk_call("bash", "cmd1", ToolCallState::Success);
+        expanded.expanded = true;
+        expanded.full_input = "cmd1\ncontinued".into();
+        expanded.output = "selected output".into();
+        let mut collapsed = mk_call("bash", "cmd2", ToolCallState::Success);
+        collapsed.full_input = "cmd2\nSHOULD_NOT_SHOW".into();
+        collapsed.output = "neighbor output".into();
+
+        let r = render_toolbox(&[expanded, collapsed], 0, true, 80, false, &no_elided());
+        let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(joined.contains("continued"));
+        assert!(joined.contains("selected output"));
+        assert!(joined.contains("bash: cmd2"));
+        assert!(!joined.contains("SHOULD_NOT_SHOW"));
+        assert!(!joined.contains("neighbor output"));
+        assert_eq!(
+            r.tool_call_rows
+                .iter()
+                .filter(|row| **row == Some(0))
+                .count(),
+            3
+        );
+        assert_eq!(
+            r.tool_call_rows
+                .iter()
+                .filter(|row| **row == Some(1))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn toolbox_result_window_caps_and_records_scroll_region() {
+        let mut call = mk_call("bash", "long", ToolCallState::Success);
+        call.expanded = true;
+        call.output = (0..25)
+            .map(|idx| format!("out-{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let r = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+        let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("out-0"));
+        assert!(joined.contains("out-19"));
+        assert!(!joined.contains("out-20"));
+        assert!(joined.contains("5 more below"));
+        assert_eq!(r.tool_result_scroll_regions.len(), 1);
+        assert_eq!(r.tool_result_scroll_regions[0].call_index, 0);
+        assert_eq!(r.tool_result_scroll_regions[0].offset, 0);
+        assert_eq!(r.tool_result_scroll_regions[0].max_offset, 5);
+
+        let mut scrolled = mk_call("bash", "long", ToolCallState::Success);
+        scrolled.expanded = true;
+        scrolled.result_offset = 3;
+        scrolled.output = (0..25)
+            .map(|idx| format!("out-{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = render_toolbox(&[scrolled], 0, true, 80, false, &no_elided());
+        let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("3 more above"));
+        assert!(joined.contains("out-3"));
+        assert!(joined.contains("out-22"));
+        assert!(joined.contains("2 more below"));
     }
 
     #[test]
@@ -3724,7 +3987,6 @@ mod tests {
             &[websearch.clone(), custom.clone()],
             0,
             true,
-            false,
             100,
             false,
             &no_elided(),
@@ -3740,10 +4002,13 @@ mod tests {
         assert!(!collapsed_text.contains("<25c>"));
         assert!(!collapsed_text.contains("<52c>"));
 
+        let mut expanded_websearch = websearch;
+        expanded_websearch.expanded = true;
+        let mut expanded_custom = custom;
+        expanded_custom.expanded = true;
         let expanded = render_toolbox(
-            &[websearch, custom],
+            &[expanded_websearch, expanded_custom],
             0,
-            true,
             true,
             100,
             false,
@@ -3768,11 +4033,11 @@ mod tests {
     fn toolbox_honors_emoji_setting() {
         let calls = vec![mk_call("read", "f.txt", ToolCallState::Success)];
         assert!(
-            !line_text(&render_toolbox(&calls, 0, true, false, 80, false, &no_elided()).lines[0])
+            !line_text(&render_toolbox(&calls, 0, true, 80, false, &no_elided()).lines[0])
                 .contains('📖')
         );
         assert!(
-            line_text(&render_toolbox(&calls, 0, true, false, 80, true, &no_elided()).lines[0])
+            line_text(&render_toolbox(&calls, 0, true, 80, true, &no_elided()).lines[0])
                 .contains('📖')
         );
     }
@@ -3796,21 +4061,15 @@ mod tests {
         // elided, the newer kept.
         let mut older = mk_call("search", "TODO", ToolCallState::Success);
         older.call_id = "c1".into();
+        older.expanded = true;
         older.output = "OLDER RESULTS BODY".into();
         let mut newer = mk_call("search", "TODO", ToolCallState::Success);
         newer.call_id = "c2".into();
+        newer.expanded = true;
         newer.output = "NEWER RESULTS BODY".into();
 
         let elided: HashSet<String> = ["c1".to_string()].into_iter().collect();
-        let r = render_toolbox(
-            &[older, newer],
-            0,
-            true,
-            /* expanded */ true,
-            80,
-            false,
-            &elided,
-        );
+        let r = render_toolbox(&[older, newer], 0, true, 80, false, &elided);
 
         // Locate the body rows (indented output) for each call.
         let older_body = r
@@ -3841,8 +4100,9 @@ mod tests {
     fn no_elisions_means_no_dimming() {
         let mut call = mk_call("search", "TODO", ToolCallState::Success);
         call.call_id = "c1".into();
+        call.expanded = true;
         call.output = "RESULTS".into();
-        let r = render_toolbox(&[call], 0, true, true, 80, false, &no_elided());
+        let r = render_toolbox(&[call], 0, true, 80, false, &no_elided());
         let joined: String = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(!joined.contains("(pruned"));
         assert!(

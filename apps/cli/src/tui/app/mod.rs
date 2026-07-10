@@ -238,6 +238,7 @@ mod selection_copy_state_tests {
             chip_target: None,
             tool_box_target: None,
             tool_call_target: None,
+            tool_result_scroll: None,
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
@@ -7346,6 +7347,8 @@ impl App {
                     summary,
                     full_input,
                     output: String::new(),
+                    expanded: false,
+                    result_offset: 0,
                     state: ToolCallState::Processing,
                     // Populated at ToolEnd from the engine's `hint` field.
                     hint: None,
@@ -7370,7 +7373,6 @@ impl App {
                         calls: vec![call],
                         view_offset: 0,
                         follow: true,
-                        expanded: false,
                     });
                 }
             }
@@ -8972,17 +8974,16 @@ impl App {
             }
             return;
         }
-        // Click anywhere on a tool box toggles its expansion (per-block):
-        // expanded shows every call in full (and disables the internal
-        // scroll); collapsed returns to the windowed view.
+        // Tool-call click wins before generic row selection: it toggles only
+        // the call under the pointer; neighboring calls keep their state.
         if self
             .chat_row_meta
             .get(rel)
-            .and_then(|meta| meta.tool_box_target)
+            .and_then(|meta| meta.tool_call_target)
             .is_some()
         {
             self.selection = None;
-            self.toggle_box_at_row(rel);
+            self.toggle_tool_call_at_row(rel);
             return;
         }
         // Non-chip chat row + left-down: start a fresh drag-select.
@@ -9150,6 +9151,37 @@ impl App {
 
     pub(super) fn build_affordance_scroll_regions(&self) -> Vec<AffordanceScrollRegion> {
         let mut regions = Vec::new();
+
+        let mut row = 0;
+        while row < self.chat_row_meta.len() {
+            let Some(scroll) = self.chat_row_meta[row].tool_result_scroll else {
+                row += 1;
+                continue;
+            };
+            let start = row;
+            while row + 1 < self.chat_row_meta.len()
+                && self.chat_row_meta[row + 1]
+                    .tool_result_scroll
+                    .is_some_and(|next| {
+                        next.history_index == scroll.history_index
+                            && next.call_index == scroll.call_index
+                    })
+            {
+                row += 1;
+            }
+            regions.push(AffordanceScrollRegion {
+                target: AffordanceTarget::ToolCall {
+                    history_index: scroll.history_index,
+                    call_index: scroll.call_index,
+                },
+                row_start: start,
+                row_end: row,
+                offset: scroll.offset,
+                max_offset: scroll.max_offset,
+            });
+            row += 1;
+        }
+
         let mut row = 0;
         while row < self.chat_row_meta.len() {
             let Some(idx) = self.chat_row_meta[row].tool_box_target else {
@@ -9166,9 +9198,8 @@ impl App {
                 calls,
                 view_offset,
                 follow,
-                expanded,
             }) = self.history.get(idx)
-                && !*expanded
+                && !calls.iter().any(|call| call.expanded)
                 && calls.len() > crate::tui::history::TOOLBOX_VISIBLE
             {
                 let max_offset = calls.len() - crate::tui::history::TOOLBOX_VISIBLE;
@@ -9199,9 +9230,52 @@ impl App {
             AffordanceTarget::ToolBox { history_index } => {
                 self.scroll_box_target(history_index, up)
             }
-            AffordanceTarget::Chip { .. }
-            | AffordanceTarget::ToolCall { .. }
-            | AffordanceTarget::ReasoningWindow { .. } => false,
+            AffordanceTarget::ToolCall {
+                history_index,
+                call_index,
+            } => self.scroll_tool_call_result(history_index, call_index, up),
+            AffordanceTarget::Chip { .. } | AffordanceTarget::ReasoningWindow { .. } => false,
+        }
+    }
+
+    fn scroll_tool_call_result(&mut self, idx: usize, call_index: usize, up: bool) -> bool {
+        let Some(HistoryEntry::ToolBox { calls, .. }) = self.history.get_mut(idx) else {
+            return false;
+        };
+        let Some(call) = calls.get_mut(call_index) else {
+            return false;
+        };
+        if !call.expanded
+            || call.output.is_empty()
+            || !crate::tui::history::tool_shows_output(&call.tool)
+        {
+            return false;
+        }
+        let max_offset = self
+            .affordance_scroll_regions
+            .iter()
+            .find_map(|region| match region.target {
+                AffordanceTarget::ToolCall {
+                    history_index,
+                    call_index: region_call,
+                } if history_index == idx && region_call == call_index => Some(region.max_offset),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let cur = call.result_offset.min(max_offset);
+        if up {
+            if cur == 0 {
+                return false;
+            }
+            call.result_offset = cur - 1;
+            true
+        } else {
+            if cur >= max_offset {
+                call.result_offset = max_offset;
+                return false;
+            }
+            call.result_offset = cur + 1;
+            true
         }
     }
 
@@ -9210,12 +9284,11 @@ impl App {
             calls,
             view_offset,
             follow,
-            expanded,
         }) = self.history.get_mut(idx)
         else {
             return false;
         };
-        if *expanded {
+        if calls.iter().any(|call| call.expanded) {
             return false;
         }
         let n = calls.len();
@@ -9250,23 +9323,22 @@ impl App {
         }
     }
 
-    /// Toggle the expansion of the `ToolBox` under chat-relative row
-    /// `rel`. Collapsing resumes `follow` so the newest calls show.
-    /// Returns whether a box was toggled.
-    pub(super) fn toggle_box_at_row(&mut self, rel: usize) -> bool {
-        let Some(idx) = self
+    /// Toggle the expansion of the tool call under chat-relative row `rel`.
+    /// Returns whether a call was toggled.
+    pub(super) fn toggle_tool_call_at_row(&mut self, rel: usize) -> bool {
+        let Some((idx, call_index)) = self
             .chat_row_meta
             .get(rel)
-            .and_then(|meta| meta.tool_box_target)
+            .and_then(|meta| meta.tool_call_target)
         else {
             return false;
         };
-        if let Some(HistoryEntry::ToolBox {
-            expanded, follow, ..
-        }) = self.history.get_mut(idx)
+        if let Some(HistoryEntry::ToolBox { calls, follow, .. }) = self.history.get_mut(idx)
+            && let Some(call) = calls.get_mut(call_index)
         {
-            *expanded = !*expanded;
-            if !*expanded {
+            call.expanded = !call.expanded;
+            if !call.expanded {
+                call.result_offset = 0;
                 *follow = true;
             }
             return true;
@@ -10460,6 +10532,8 @@ fn wire_history_to_entries(wire: Vec<crate::daemon::proto::HistoryEntry>) -> Vec
                     summary,
                     full_input,
                     output,
+                    expanded: false,
+                    result_offset: 0,
                     state,
                     hint,
                 };
@@ -10480,7 +10554,6 @@ fn wire_history_to_entries(wire: Vec<crate::daemon::proto::HistoryEntry>) -> Vec
                         calls: vec![call],
                         view_offset: 0,
                         follow: true,
-                        expanded: false,
                     });
                 }
             }
@@ -11814,7 +11887,8 @@ fn spawn_git_refresh(
 #[cfg(test)]
 mod affordance_hover_tests {
     use super::{AffordanceScrollRegion, AffordanceTarget, App, resolve_inner_scroll_target};
-    use crate::tui::app::render::{ChatRowKind, ChatRowMeta};
+    use crate::tui::app::render::{ChatRowKind, ChatRowMeta, ToolResultScrollMeta};
+    use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
     use crate::tui::settings::Dialog;
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
@@ -11832,11 +11906,26 @@ mod affordance_hover_tests {
             chip_target,
             tool_box_target,
             tool_call_target,
+            tool_result_scroll: None,
             reasoning_window_target,
             diff_path: None,
             pin_hit: None,
             continuation: false,
             selectable: false,
+        }
+    }
+
+    fn tool_call(call_id: &str) -> ToolCall {
+        ToolCall {
+            call_id: call_id.to_string(),
+            tool: "bash".to_string(),
+            summary: call_id.to_string(),
+            full_input: call_id.to_string(),
+            output: String::new(),
+            expanded: false,
+            result_offset: 0,
+            state: ToolCallState::Success,
+            hint: None,
         }
     }
 
@@ -11904,6 +11993,97 @@ mod affordance_hover_tests {
         app.handle_mouse(moved(10));
 
         assert_eq!(app.hovered_affordance, None);
+    }
+
+    #[test]
+    fn click_toggles_only_targeted_tool_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.history = vec![HistoryEntry::ToolBox {
+            calls: vec![tool_call("first"), tool_call("second")],
+            view_offset: 0,
+            follow: true,
+        }];
+        app.chat_row_meta = vec![
+            meta(None, Some(0), Some((0, 0)), None),
+            meta(None, Some(0), Some((0, 1)), None),
+        ];
+
+        assert!(app.toggle_tool_call_at_row(1));
+        match &app.history[0] {
+            HistoryEntry::ToolBox { calls, .. } => {
+                assert!(!calls[0].expanded);
+                assert!(calls[1].expanded);
+            }
+            other => panic!("expected toolbox, got {other:?}"),
+        }
+
+        assert!(app.toggle_tool_call_at_row(1));
+        match &app.history[0] {
+            HistoryEntry::ToolBox { calls, .. } => {
+                assert!(!calls[0].expanded);
+                assert!(!calls[1].expanded);
+            }
+            other => panic!("expected toolbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_scroll_regions_are_registered_before_box_regions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut row = meta(None, Some(0), Some((0, 0)), None);
+        row.tool_result_scroll = Some(ToolResultScrollMeta {
+            history_index: 0,
+            call_index: 0,
+            offset: 1,
+            max_offset: 4,
+        });
+        app.chat_row_meta = vec![row];
+        app.history = vec![HistoryEntry::ToolBox {
+            calls: vec![tool_call("first")],
+            view_offset: 0,
+            follow: true,
+        }];
+
+        let regions = app.build_affordance_scroll_regions();
+        assert_eq!(
+            regions.first().map(|region| region.target),
+            Some(AffordanceTarget::ToolCall {
+                history_index: 0,
+                call_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn inner_scroll_resolver_uses_registration_order_for_overlaps() {
+        let tool_call = AffordanceTarget::ToolCall {
+            history_index: 1,
+            call_index: 2,
+        };
+        let tool_box = AffordanceTarget::ToolBox { history_index: 1 };
+        let regions = [
+            AffordanceScrollRegion {
+                target: tool_call,
+                row_start: 4,
+                row_end: 4,
+                offset: 1,
+                max_offset: 3,
+            },
+            AffordanceScrollRegion {
+                target: tool_box,
+                row_start: 4,
+                row_end: 4,
+                offset: 1,
+                max_offset: 3,
+            },
+        ];
+
+        assert_eq!(
+            resolve_inner_scroll_target(&regions, 4, true),
+            Some(tool_call)
+        );
     }
 
     #[test]
@@ -13854,12 +14034,13 @@ mod prediction_turn_assembly_tests {
                 summary: "ls".into(),
                 full_input: "ls".into(),
                 output: "file.txt".into(),
+                expanded: false,
+                result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
             }],
             view_offset: 0,
             follow: true,
-            expanded: false,
         }
     }
 
@@ -17705,12 +17886,13 @@ mod skill_auto_injected_tests {
                 summary: "firecrawl".to_string(),
                 full_input: "firecrawl".to_string(),
                 output: "Skill `firecrawl`:\n\n…".to_string(),
+                expanded: false,
+                result_offset: 0,
                 state: crate::tui::history::ToolCallState::Success,
                 hint: None,
             }],
             view_offset: 0,
             follow: true,
-            expanded: false,
         };
         let user_line = render_line(&user_typed);
         assert!(

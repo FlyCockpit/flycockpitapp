@@ -94,6 +94,8 @@ fn hash_tool_call(hasher: &mut DefaultHasher, call: &ToolCall) {
     call.summary.hash(hasher);
     call.full_input.hash(hasher);
     call.output.hash(hasher);
+    call.expanded.hash(hasher);
+    call.result_offset.hash(hasher);
     format!("{:?}", call.state).hash(hasher);
     call.hint.hash(hasher);
 }
@@ -182,11 +184,9 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             calls,
             view_offset,
             follow,
-            expanded,
         } => {
             view_offset.hash(hasher);
             follow.hash(hasher);
-            expanded.hash(hasher);
             calls.len().hash(hasher);
             for call in calls {
                 hash_tool_call(hasher, call);
@@ -335,6 +335,14 @@ pub(crate) enum ChatCopyTarget {
     Message { history_index: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolResultScrollMeta {
+    pub history_index: usize,
+    pub call_index: usize,
+    pub offset: usize,
+    pub max_offset: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatRowMeta {
     pub history_index: Option<usize>,
@@ -343,6 +351,7 @@ pub(crate) struct ChatRowMeta {
     pub chip_target: Option<usize>,
     pub tool_box_target: Option<usize>,
     pub tool_call_target: Option<(usize, usize)>,
+    pub tool_result_scroll: Option<ToolResultScrollMeta>,
     pub reasoning_window_target: Option<usize>,
     pub diff_path: Option<String>,
     pub pin_hit: Option<PinHit>,
@@ -359,6 +368,7 @@ impl ChatRowMeta {
             chip_target: None,
             tool_box_target: None,
             tool_call_target: None,
+            tool_result_scroll: None,
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
@@ -724,9 +734,9 @@ impl App {
                     // label row + output rows + trailing gap.
                     (output.lines().count() as u16).saturating_add(2)
                 }
-                HistoryEntry::ToolBox {
-                    calls, expanded, ..
-                } => toolbox_row_estimate(calls, *expanded).saturating_add(1),
+                HistoryEntry::ToolBox { calls, .. } => {
+                    toolbox_row_estimate(calls).saturating_add(1)
+                }
                 HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
                 HistoryEntry::User {
                     text,
@@ -1275,6 +1285,8 @@ impl App {
                 lines,
                 chip_row,
                 continuations,
+                tool_call_rows,
+                tool_result_scroll_regions,
                 pin_region,
             } = rendered;
             let chip_abs = chip_row.map(|cr| all.len() + cr);
@@ -1317,7 +1329,18 @@ impl App {
                     },
                     chip_target,
                     tool_box_target: is_box.then_some(idx),
-                    tool_call_target: None,
+                    tool_call_target: tool_call_rows
+                        .get(i)
+                        .and_then(|call_index| call_index.map(|call_index| (idx, call_index))),
+                    tool_result_scroll: tool_result_scroll_regions
+                        .iter()
+                        .find(|region| i >= region.row_start && i <= region.row_end)
+                        .map(|region| ToolResultScrollMeta {
+                            history_index: idx,
+                            call_index: region.call_index,
+                            offset: region.offset,
+                            max_offset: region.max_offset,
+                        }),
                     reasoning_window_target: None,
                     diff_path: diff_path.clone(),
                     pin_hit,
@@ -3084,9 +3107,7 @@ fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
         HistoryEntry::LocalCommand { output, .. } => {
             (output.lines().count() as u16).saturating_add(1)
         }
-        HistoryEntry::ToolBox {
-            calls, expanded, ..
-        } => toolbox_row_estimate(calls, *expanded),
+        HistoryEntry::ToolBox { calls, .. } => toolbox_row_estimate(calls),
         HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
         HistoryEntry::User { text, .. } => (text.matches('\n').count() as u16 + 1) + 2,
         // Header row + one row per body line (no bubble borders).
@@ -3344,19 +3365,36 @@ fn compact_boundary_row_estimate(brief: Option<&str>, expanded: bool) -> u16 {
     }
 }
 
-/// Approximate rendered row count for a `ToolBox`. Collapsed caps at
-/// [`crate::tui::history::TOOLBOX_VISIBLE`]; expanded sums each call's
-/// input + (non-empty) output lines. Mirrors `render_toolbox`.
-pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall], expanded: bool) -> u16 {
-    use crate::tui::history::TOOLBOX_VISIBLE;
-    if !expanded {
+/// Approximate rendered row count for a `ToolBox`. When every call is
+/// collapsed it caps at [`crate::tui::history::TOOLBOX_VISIBLE`]; expanded
+/// calls add their full input plus a capped result window. Mirrors
+/// `render_toolbox` closely enough for scroll estimates.
+pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall]) -> u16 {
+    use crate::tui::history::{TOOLBOX_VISIBLE, TOOLCALL_RESULT_VISIBLE, tool_shows_output};
+    if !calls.iter().any(|call| call.expanded) {
         return calls.len().clamp(1, TOOLBOX_VISIBLE) as u16;
     }
     let mut rows: u16 = 0;
     for c in calls {
+        if !c.expanded {
+            rows = rows.saturating_add(1);
+            continue;
+        }
         rows = rows.saturating_add(c.full_input.matches('\n').count() as u16 + 1);
-        if !c.output.is_empty() {
-            rows = rows.saturating_add(c.output.matches('\n').count() as u16 + 1);
+        if tool_shows_output(&c.tool) && !c.output.is_empty() {
+            let result_lines = c.output.lines().count().max(1);
+            let indicator_rows = usize::from(c.result_offset > 0)
+                + usize::from(
+                    result_lines > c.result_offset.saturating_add(TOOLCALL_RESULT_VISIBLE),
+                );
+            rows = rows.saturating_add(
+                result_lines
+                    .min(TOOLCALL_RESULT_VISIBLE)
+                    .saturating_add(indicator_rows) as u16,
+            );
+        }
+        if c.hint.is_some() {
+            rows = rows.saturating_add(1);
         }
     }
     rows.max(1)
@@ -3524,12 +3562,13 @@ mod render_history_spacing_tests {
                 summary: "ls".to_string(),
                 full_input: "ls".to_string(),
                 output: String::new(),
+                expanded: false,
+                result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
             }],
             view_offset: 0,
             follow: true,
-            expanded: false,
         }
     }
 
@@ -3541,12 +3580,13 @@ mod render_history_spacing_tests {
                 summary: "printf".to_string(),
                 full_input: "printf".to_string(),
                 output: output.to_string(),
+                expanded: true,
+                result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
             }],
             view_offset: 0,
             follow: true,
-            expanded: true,
         }
     }
 
@@ -4162,7 +4202,7 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn hovered_toolbox_rows_get_background_highlight_only_while_hovered() {
+    fn hovered_tool_call_rows_get_background_highlight_only_while_hovered() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
@@ -4173,7 +4213,10 @@ mod render_history_spacing_tests {
         let agent_row = find_row(&app, "assistant answer");
         let tool_row = find_row(&app, "bash");
         app.selection = None;
-        app.hovered_affordance = Some(AffordanceTarget::ToolBox { history_index: 1 });
+        app.hovered_affordance = Some(AffordanceTarget::ToolCall {
+            history_index: 1,
+            call_index: 0,
+        });
 
         let buffer = render_history_buffer(&mut app, 80, 8);
         assert!(row_has_hover_bg(&buffer, tool_row, 80));

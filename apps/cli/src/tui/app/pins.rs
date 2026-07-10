@@ -766,12 +766,13 @@ mod tests {
                 summary: "a.rs".into(),
                 full_input: "a.rs".into(),
                 output: String::new(),
+                expanded: false,
+                result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
             }],
             view_offset: 0,
             follow: true,
-            expanded: false,
         }
     }
 
@@ -794,6 +795,7 @@ mod tests {
             chip_target: None,
             tool_box_target: None,
             tool_call_target: None,
+            tool_result_scroll: None,
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,

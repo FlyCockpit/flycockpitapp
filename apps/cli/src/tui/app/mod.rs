@@ -23,6 +23,8 @@ use std::future::pending;
 use std::io::{Read, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2799,6 +2801,27 @@ fn clear_redraw(needs_redraw: &mut bool) {
     *needs_redraw = false;
 }
 
+fn take_redraw_request(needs_redraw: &mut bool) -> bool {
+    if !*needs_redraw {
+        return false;
+    }
+    clear_redraw(needs_redraw);
+    true
+}
+
+#[cfg(test)]
+static EVENT_LOOP_DRAW_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_event_loop_draw_call_count() {
+    EVENT_LOOP_DRAW_CALL_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn event_loop_draw_call_count() -> usize {
+    EVENT_LOOP_DRAW_CALL_COUNT.load(Ordering::SeqCst)
+}
+
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
@@ -3417,7 +3440,15 @@ impl App {
     }
 
     pub(super) async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        let mut terminal_input = TerminalInput::new();
+        self.event_loop_with_input(terminal, TerminalInput::new())
+            .await
+    }
+
+    async fn event_loop_with_input(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        mut terminal_input: TerminalInput,
+    ) -> Result<()> {
         let mut needs_redraw = true;
 
         loop {
@@ -3426,8 +3457,9 @@ impl App {
             }
             self.start_startup_background_tasks();
 
-            if needs_redraw {
-                clear_redraw(&mut needs_redraw);
+            if take_redraw_request(&mut needs_redraw) {
+                #[cfg(test)]
+                EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
                 terminal.draw(|frame| self.render(frame))?;
                 // The composer is the user's active input surface this frame iff
                 // no question dialog is displacing it
@@ -12637,6 +12669,35 @@ fn spawn_git_refresh(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod event_loop_redraw_tests {
+    use super::{
+        EVENT_LOOP_DRAW_CALL_COUNT, event_loop_draw_call_count, reset_event_loop_draw_call_count,
+        take_redraw_request,
+    };
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn idle_redraw_gate_draws_initial_frame_once_then_waits_for_wake() {
+        let mut needs_redraw = true;
+        reset_event_loop_draw_call_count();
+
+        if take_redraw_request(&mut needs_redraw) {
+            EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(event_loop_draw_call_count(), 1);
+
+        if take_redraw_request(&mut needs_redraw) {
+            EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            event_loop_draw_call_count(),
+            1,
+            "an idle loop pass without a wake must not redraw"
+        );
+    }
 }
 
 #[cfg(test)]

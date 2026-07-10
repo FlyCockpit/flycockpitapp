@@ -1767,6 +1767,36 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_turn_event_notifies_waiter_without_timer() {
+        use std::future::{Future, poll_fn};
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+            poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let mut notified = Box::pin(notify.notified());
+
+        assert!(matches!(poll_once(notified.as_mut()).await, Poll::Pending));
+        push_turn_event(
+            &events,
+            &notify,
+            TurnEvent::Notice {
+                text: "wake now".into(),
+            },
+        );
+
+        assert!(matches!(
+            poll_once(notified.as_mut()).await,
+            Poll::Ready(())
+        ));
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn turn_event_buffer_push_and_drain_recover_from_poison() {
         let events = Arc::new(Mutex::new(vec![TurnEvent::Notice {

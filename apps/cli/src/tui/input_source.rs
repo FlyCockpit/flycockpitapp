@@ -24,7 +24,7 @@ impl TerminalInput {
     }
 
     #[cfg(test)]
-    fn new_for_test() -> Self {
+    pub(crate) fn new_for_test() -> Self {
         Self {
             stream: Some(TerminalInputStream::TestLive),
             test_stream: true,

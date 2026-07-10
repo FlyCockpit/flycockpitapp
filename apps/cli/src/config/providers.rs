@@ -79,12 +79,26 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "hint_tool_call_corrections",
     "text_embedded_recovery",
     "thinking_params",
+    "system_prompt",
     "capabilities",
     "provider_metadata",
     "last_model_fetch",
 ];
 
 pub const XAI_MULTI_AGENT_TOOLS_ENTITLEMENT: &str = "xai_multi_agent_tools_beta";
+pub const MODEL_SYSTEM_PROMPT_MAX_BYTES: usize = 1024 * 1024;
+
+pub fn normalize_model_system_prompt(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+pub fn model_system_prompt_too_large(value: &str) -> bool {
+    value.len() > MODEL_SYSTEM_PROMPT_MAX_BYTES
+}
 
 pub fn validate_provider_id_for_filename(provider_id: &str) -> Result<()> {
     if provider_id.is_empty() || provider_id == "." || provider_id == ".." {
@@ -865,6 +879,11 @@ pub struct ModelEntry {
     /// that never pin it stay clean.
     #[serde(default, skip_serializing_if = "ThinkingParams::is_empty")]
     pub thinking_params: ThinkingParams,
+    /// User-authored model-specific system instructions. Empty and
+    /// whitespace-only effective values are treated as unset by callers; the
+    /// raw value is preserved byte-for-byte when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Per-model wire-API selector (implementation note):
     /// which OpenAI-compatible endpoint to POST — `/chat/completions` vs
     /// `/responses`. A concrete model value wins over provider-level defaults,
@@ -1302,6 +1321,9 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     if !existing.thinking_params.is_empty() {
         fetched.thinking_params = existing.thinking_params.clone();
     }
+    if existing.system_prompt.is_some() {
+        fetched.system_prompt = existing.system_prompt.clone();
+    }
     if !existing.extra.is_empty() {
         for (key, value) in &existing.extra {
             fetched.extra.insert(key.clone(), value.clone());
@@ -1549,6 +1571,15 @@ impl ProvidersConfig {
     /// provider-level config, else the default (`prune`, 30s margin).
     /// Used by the delegation-shrink decision
     /// (implementation note).
+    pub fn resolve_model_system_prompt(&self, provider: &str, model: &str) -> Option<&str> {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.models.iter().find(|m| m.id == model))
+            .and_then(|m| m.system_prompt.as_deref())
+            .and_then(normalize_model_system_prompt)
+            .filter(|value| !model_system_prompt_too_large(value))
+    }
+
     pub fn resolve_shrink(&self, provider: &str, model: &str) -> ShrinkConfig {
         let Some(entry) = self.providers.get(provider) else {
             return ShrinkConfig::default();

@@ -228,6 +228,8 @@ pub enum Response {
         file: Option<String>,
         tokens: u64,
         system_tokens: u64,
+        #[serde(default)]
+        model_instruction_tokens: u64,
     },
 
     /// The resulting sandbox mode after a [`Request::SetSandbox`].

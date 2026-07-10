@@ -1,13 +1,23 @@
 use super::*;
 
+fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> String {
+    let (_, providers) = crate::auto_title::load_configs_for(project_root);
+    ModelSystemPromptSnapshot::capture(&providers).to_json_string()
+}
+
 impl Session {
     /// Create a brand-new session, inserting its row in the DB.
     #[allow(dead_code)]
     pub fn create(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
+        let mut row = db
+            .new_session_row(&project_id, &project_root_str, active_agent)
+            .context("building session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
         let row = db
-            .create_session(&project_id, &project_root_str, active_agent)
+            .insert_session_row(&row)
             .context("creating session row")?;
         Self::from_row(db, project_root, row)
     }
@@ -21,9 +31,11 @@ impl Session {
     pub fn create_deferred(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
-        let row = db
+        let mut row = db
             .new_session_row(&project_id, &project_root_str, active_agent)
             .context("building deferred session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
         let session = Self::from_row(db, project_root, row.clone())?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -123,6 +135,9 @@ impl Session {
         let started_at =
             DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
         let user_content_turns = count_user_turns_for_title(&db, row.session_id);
+        let model_system_prompt_snapshot = Arc::new(ModelSystemPromptSnapshot::from_json_str(
+            &row.model_system_prompt_snapshot_json,
+        ));
         let short_id = match row.short_id {
             Some(s) => s,
             None => db
@@ -143,6 +158,7 @@ impl Session {
             model: Mutex::new(row.model),
             provider: Mutex::new(row.provider),
             redaction_table_json: Mutex::new(row.redaction_table_json),
+            model_system_prompt_snapshot,
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),

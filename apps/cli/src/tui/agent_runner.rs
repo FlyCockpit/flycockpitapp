@@ -502,6 +502,7 @@ pub struct GuidanceEstimate {
     pub file: Option<String>,
     pub guidance_tokens: u64,
     pub system_tokens: u64,
+    pub model_instruction_tokens: u64,
 }
 
 /// Resolve the fresh-chat sizing for `cwd` and the active model. Prefers
@@ -523,7 +524,7 @@ pub async fn fetch_guidance_estimate_with_socket(
     {
         return est;
     }
-    local_guidance_estimate(cwd)
+    local_guidance_estimate(cwd, provider.as_deref(), model.as_deref())
 }
 
 /// Ask an already-running daemon for the calibrated estimate. Returns
@@ -551,10 +552,12 @@ async fn daemon_guidance_estimate_at_socket(
             file,
             tokens,
             system_tokens,
+            model_instruction_tokens,
         } => Some(GuidanceEstimate {
             file,
             guidance_tokens: tokens,
             system_tokens,
+            model_instruction_tokens,
         }),
         _ => None,
     }
@@ -564,7 +567,11 @@ async fn daemon_guidance_estimate_at_socket(
 /// system prompt in-process with raw cl100k (`crate::tokens::count`).
 /// Cheap and synchronous — `load_agent_guidance` only stats/reads one
 /// small file along the cwd→git-root walk — so it never blocks launch.
-fn local_guidance_estimate(cwd: &Path) -> GuidanceEstimate {
+fn local_guidance_estimate(
+    cwd: &Path,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> GuidanceEstimate {
     let file = crate::engine::builtin::load_agent_guidance(cwd).map(|(path, body)| {
         let name = path
             .file_name()
@@ -576,16 +583,26 @@ fn local_guidance_estimate(cwd: &Path) -> GuidanceEstimate {
     // prompt omits the `Session:` line — matching what the engine sends.
     let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
     let system_tokens = crate::tokens::count(&system_prompt) as u64;
+    let model_instruction_tokens = provider
+        .zip(model)
+        .and_then(|(provider, model)| {
+            let cfg = crate::config::providers::ConfigDoc::load_effective(cwd);
+            cfg.resolve_model_system_prompt(provider, model)
+                .map(|prompt| crate::tokens::count(prompt) as u64)
+        })
+        .unwrap_or(0);
     match file {
         Some((name, guidance_tokens)) => GuidanceEstimate {
             file: Some(name),
             guidance_tokens,
             system_tokens,
+            model_instruction_tokens,
         },
         None => GuidanceEstimate {
             file: None,
             guidance_tokens: 0,
             system_tokens,
+            model_instruction_tokens,
         },
     }
 }
@@ -1531,7 +1548,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "PROJECT RULES\nmore lines\n").unwrap();
 
-        let est = local_guidance_estimate(tmp.path());
+        let est = local_guidance_estimate(tmp.path(), None, None);
         assert_eq!(
             est.file.as_deref(),
             Some("AGENTS.md"),
@@ -1560,7 +1577,7 @@ mod tests {
         let sub = tmp.path().join("empty-project");
         std::fs::create_dir(&sub).unwrap();
 
-        let est = local_guidance_estimate(&sub);
+        let est = local_guidance_estimate(&sub, None, None);
         assert!(
             est.file.is_none(),
             "no guidance file should resolve to None"

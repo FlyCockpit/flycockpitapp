@@ -201,13 +201,16 @@ Provider and model entries can carry policy metadata used by routing, diagnostic
 - `location`: `local`, `remote`, or `private_remote`. Locality is descriptive and never implies trust.
 - `quality_rank` and `cost_rank`: tie-breakers for policy selection. Higher quality is preferred for quality-optimized work; lower cost is preferred for cost-optimized work.
 - `subagent_invokable`: only models with this set, or inherited from their provider, are eligible for subagent routing.
+- `system_prompt`: optional per-model instructions edited from `/settings -> Providers -> Models -> Settings` as `Model instructions`. When set, Cockpit prepends the text before the agent role prompt, then the stable harness/session/cwd block, while project instruction files remain user-role guidance later in history. Empty or whitespace-only values behave as unset and preserve the no-prompt request shape.
 - `trustedOnly`: when enabled in `config.json`, every inference must resolve to a trusted model; untrusted utility or subagent models are refused.
+
+Model instructions are exact to the configured `(provider, model)` and participate in normal global/project config layering; a project value overrides a global value, and deleting it reveals the lower layer. Fresh root sessions snapshot the effective model instructions for the whole conversation lineage, so resumes, model switches, forks, and subagents keep the captured text even if settings change later. New root sessions see the new settings.
 
 Subagent model selection can target exact models, trust classes, or categories such as cheap-code and reasoning work. Hidden models (`subagent_invokable: false`) stay available for direct top-level use but are not advertised or selected for delegated agents. Recursive delegation is bounded by `delegation.defaultRecursionDepth`, `delegation.maxParallel`, and the `swarm.maxDepth` / `swarm.maxConcurrency` limits.
 
 `deepthink` is disabled by default. When enabled, it is a tool-free reasoning-only subagent; completed deepthink prompts are not retained in caller active context, only the response is retained.
 
-Portable provider/model policy can be moved between machines without secrets:
+Portable provider/model policy can be moved between machines without secrets. Policy bundles may contain user-authored `system_prompt` text, so review them like other behavior-shaping instructions before sharing:
 
 ```sh
 cockpit config export-policy -o cockpit-policy.json

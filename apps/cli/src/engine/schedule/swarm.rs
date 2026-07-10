@@ -292,6 +292,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         env_overlay: ctx.agent.env_overlay.clone(),
         cwd: ctx.cwd.clone(),
         session_short_id: ctx.session.short_id.clone(),
+        model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
         llm_mode: ctx.agent.llm_mode,

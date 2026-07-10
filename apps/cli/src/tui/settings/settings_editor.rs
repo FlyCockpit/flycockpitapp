@@ -22,25 +22,26 @@
 //!   4. Quality rank
 //!   5. Cost rank
 //!   6. Subagent available
-//!   7. Auto-compact ctx % (default 80)
-//!   8. Auto-prune (on | off | inherit; default on) — the master switch for
+//!   7. Model instructions (model scope only)
+//!   8. Auto-compact ctx % (default 80)
+//!   9. Auto-prune (on | off | inherit; default on) — the master switch for
 //!      automatic pruning; off protects the provider prompt cache entirely
-//!   9. Auto-prune ctx % (default 50)
-//!   10. Auto-prune prunable % (default 30)
-//!   11. Cache time (seconds) (default 300)
-//!   12. Cache mode (none | ephemeral)
-//!   13. Shrink strategy (prune | compact)
-//!   14. First-token threshold (seconds)
+//!   10. Auto-prune ctx % (default 50)
+//!   11. Auto-prune prunable % (default 30)
+//!   12. Cache time (seconds) (default 300)
+//!   13. Cache mode (none | ephemeral)
+//!   14. Shrink strategy (prune | compact)
+//!   15. First-token threshold (seconds)
 //!   15. Idle threshold (seconds)
-//!   16. Wire API (auto | completions | responses; hidden for native Anthropic)
-//!   17. xAI multi-agent tools beta access (on | off; xAI/Grok providers only)
-//!   18. Backup model (provider:model)
-//!   19. Mode (defensive | normal | frontier | inherit)
-//!   20. Inline `<think>` (on | off | inherit) — the inline-`<think>`
+//!   17. Wire API (auto | completions | responses; hidden for native Anthropic)
+//!   18. xAI multi-agent tools beta access (on | off; xAI/Grok providers only)
+//!   19. Backup model (provider:model)
+//!   20. Mode (defensive | normal | frontier | inherit)
+//!   21. Inline `<think>` (on | off | inherit) — the inline-`<think>`
 //!       reasoning-extraction toggle, a tri-state at **both** scopes (model
 //!       override → provider override → global default,
 //!       implementation note).
-//!   21. Hint tool-call corrections (on | off | inherit)
+//!   22. Hint tool-call corrections (on | off | inherit)
 //!
 //! Percentages, cache time, and timeout thresholds are inline numeric text edits
 //! (`Enter` opens the edit, validated/clamped on commit). Cache mode, shrink
@@ -57,9 +58,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use crate::config::extended::LlmMode;
 use crate::config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
-    ClientSideToolsCapability, ContextConfig, ModelEntry, ModelLocation, ModelTrust, ProviderEntry,
-    ShrinkConfig, ShrinkStrategy, TimeoutConfig, WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT,
-    is_anthropic_native_base_url, is_xai_grok_provider,
+    ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES, ModelEntry,
+    ModelLocation, ModelTrust, ProviderEntry, ShrinkConfig, ShrinkStrategy, TimeoutConfig, WireApi,
+    XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url, is_xai_grok_provider,
+    model_system_prompt_too_large, normalize_model_system_prompt,
 };
 use crate::tui::textfield::TextField;
 
@@ -83,6 +85,7 @@ pub(super) enum SettingsField {
     QualityRank,
     CostRank,
     SubagentInvokable,
+    SystemPrompt,
     AutoCompactPct,
     /// Auto-prune master switch (on | off | inherit). `off` disables the
     /// automatic prune trigger entirely — both branches; manual `/prune`
@@ -126,6 +129,7 @@ impl SettingsField {
             Self::QualityRank => "Quality rank",
             Self::CostRank => "Cost rank",
             Self::SubagentInvokable => "Subagent available",
+            Self::SystemPrompt => "Model instructions",
             Self::AutoCompactPct => "Auto-compact ctx %",
             Self::AutoPruneEnabled => "Auto-prune",
             Self::AutoPrunePct => "Auto-prune ctx %",
@@ -169,6 +173,7 @@ impl SettingsField {
             Self::QualityRank => SettingsGroup::QualityRank,
             Self::CostRank => SettingsGroup::CostRank,
             Self::SubagentInvokable => SettingsGroup::SubagentInvokable,
+            Self::SystemPrompt => SettingsGroup::SystemPrompt,
             Self::AutoCompactPct | Self::AutoPrunePct | Self::AutoPrunePrunablePct => {
                 SettingsGroup::Context
             }
@@ -187,7 +192,7 @@ impl SettingsField {
 
     /// True for the free-text edit fields (currently only the backup model).
     fn is_text(self) -> bool {
-        matches!(self, Self::Backup)
+        matches!(self, Self::Backup | Self::SystemPrompt)
     }
 
     fn help(self) -> Option<&'static str> {
@@ -240,6 +245,9 @@ impl SettingsField {
             Self::SubagentInvokable => {
                 Some("Controls whether this provider/model can be selected for subagent routing.")
             }
+            Self::SystemPrompt => Some(
+                "Trusted model-specific instructions prepended before every agent role prompt. Edits apply only to new root sessions; existing conversations keep their captured instructions.",
+            ),
             Self::TimeoutTtftSecs | Self::TimeoutIdleSecs => Some(
                 "Inference request thresholds. Without a backup they show a warning and keep waiting; with a backup they trigger fallback.",
             ),
@@ -256,6 +264,7 @@ enum SettingsGroup {
     QualityRank,
     CostRank,
     SubagentInvokable,
+    SystemPrompt,
     Context,
     AutoPrune,
     Cache,
@@ -321,6 +330,7 @@ pub(super) struct SettingsEditor {
     quality_rank: Option<i64>,
     cost_rank: Option<i64>,
     subagent_invokable: Option<bool>,
+    system_prompt: Option<String>,
     provider_trust_confirm_pending: bool,
     provider_trust_confirm_ready_at: Option<Instant>,
     provider_trust_confirm_lockout: Duration,
@@ -380,6 +390,7 @@ impl SettingsEditor {
             quality_rank: entry.quality_rank,
             cost_rank: entry.cost_rank,
             subagent_invokable: entry.subagent_invokable,
+            system_prompt: None,
             provider_trust_confirm_pending: false,
             provider_trust_confirm_ready_at: None,
             provider_trust_confirm_lockout: Duration::ZERO,
@@ -463,6 +474,7 @@ impl SettingsEditor {
             quality_rank: model.and_then(|m| m.quality_rank),
             cost_rank: model.and_then(|m| m.cost_rank),
             subagent_invokable: model.and_then(|m| m.subagent_invokable),
+            system_prompt: model.and_then(|m| m.system_prompt.clone()),
             provider_trust_confirm_pending: false,
             provider_trust_confirm_ready_at: None,
             provider_trust_confirm_lockout: Duration::ZERO,
@@ -507,7 +519,7 @@ impl SettingsEditor {
         show_xai_multi_agent_tools_beta: bool,
     ) -> Vec<SettingsField> {
         use SettingsField::*;
-        let mut fields = Vec::with_capacity(21);
+        let mut fields = Vec::with_capacity(22);
         // Provider-only transport security opt-in leads the list; model scope
         // cannot override it.
         if !is_model_scope {
@@ -519,6 +531,11 @@ impl SettingsEditor {
             QualityRank,
             CostRank,
             SubagentInvokable,
+        ]);
+        if is_model_scope {
+            fields.push(SystemPrompt);
+        }
+        fields.extend([
             AutoCompactPct,
             AutoPruneEnabled,
             AutoPrunePct,
@@ -580,6 +597,7 @@ impl SettingsEditor {
             SettingsGroup::QualityRank => self.quality_rank.is_some(),
             SettingsGroup::CostRank => self.cost_rank.is_some(),
             SettingsGroup::SubagentInvokable => self.subagent_invokable.is_some(),
+            SettingsGroup::SystemPrompt => self.system_prompt.is_some(),
             SettingsGroup::Context => self.context_present,
             SettingsGroup::AutoPrune => self.auto_prune.is_some(),
             SettingsGroup::Cache => self.cache_present,
@@ -638,6 +656,11 @@ impl SettingsEditor {
                 None if self.is_model_scope() => "inherit".to_string(),
                 None => "off (default)".to_string(),
             },
+            SettingsField::SystemPrompt => self
+                .system_prompt
+                .as_ref()
+                .map(|prompt| format!("{} characters", prompt.chars().count()))
+                .unwrap_or_else(|| "not set".to_string()),
             SettingsField::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
             SettingsField::AutoPruneEnabled => match self.auto_prune {
                 Some(true) => "on".to_string(),
@@ -710,7 +733,8 @@ impl SettingsEditor {
             | SettingsGroup::Location
             | SettingsGroup::QualityRank
             | SettingsGroup::CostRank
-            | SettingsGroup::SubagentInvokable => {}
+            | SettingsGroup::SubagentInvokable
+            | SettingsGroup::SystemPrompt => {}
             SettingsGroup::Context => self.context_present = true,
             SettingsGroup::Cache => self.cache_present = true,
             SettingsGroup::Shrink => self.shrink_present = true,
@@ -743,6 +767,7 @@ impl SettingsEditor {
             SettingsGroup::QualityRank => self.quality_rank = None,
             SettingsGroup::CostRank => self.cost_rank = None,
             SettingsGroup::SubagentInvokable => self.subagent_invokable = None,
+            SettingsGroup::SystemPrompt => self.system_prompt = None,
             SettingsGroup::Context => self.context_present = false,
             SettingsGroup::Cache => self.cache_present = false,
             SettingsGroup::Shrink => self.shrink_present = false,
@@ -958,6 +983,7 @@ impl SettingsEditor {
                 Some(b) => format!("{}:{}", b.provider, b.model),
                 None => String::new(),
             },
+            SettingsField::SystemPrompt => self.system_prompt.clone().unwrap_or_default(),
             _ => String::new(),
         };
         self.buf = TextField::new(current);
@@ -973,29 +999,50 @@ impl SettingsEditor {
         let Some(field) = self.editing else {
             return;
         };
-        if field != SettingsField::Backup {
-            return;
-        }
-        let raw = self.buf.text().trim();
-        if raw.is_empty() {
-            // Clear the backup (no fallback at this scope / inherit on model).
-            self.backup = None;
-            self.editing = None;
-            self.status = None;
-            return;
-        }
-        match raw.split_once(':') {
-            Some((provider, model)) if !provider.trim().is_empty() && !model.trim().is_empty() => {
-                self.backup = Some(BackupConfig {
-                    provider: provider.trim().to_string(),
-                    model: model.trim().to_string(),
-                });
+        match field {
+            SettingsField::SystemPrompt => {
+                let raw = self.buf.text();
+                if model_system_prompt_too_large(raw) {
+                    self.status = Some(format!(
+                        "model instructions must be at most {} bytes",
+                        MODEL_SYSTEM_PROMPT_MAX_BYTES
+                    ));
+                    return;
+                }
+                self.system_prompt = normalize_model_system_prompt(raw).map(str::to_string);
                 self.editing = None;
-                self.status = None;
+                self.status = Some(
+                    "saved for future root sessions; existing conversations keep their current instructions"
+                        .to_string(),
+                );
             }
-            _ => {
-                self.status = Some("must be provider:model (or empty to clear)".to_string());
+            SettingsField::Backup => {
+                let raw = self.buf.text().trim();
+                if raw.is_empty() {
+                    // Clear the backup (no fallback at this scope / inherit on model).
+                    self.backup = None;
+                    self.editing = None;
+                    self.status = None;
+                    return;
+                }
+                match raw.split_once(':') {
+                    Some((provider, model))
+                        if !provider.trim().is_empty() && !model.trim().is_empty() =>
+                    {
+                        self.backup = Some(BackupConfig {
+                            provider: provider.trim().to_string(),
+                            model: model.trim().to_string(),
+                        });
+                        self.editing = None;
+                        self.status = None;
+                    }
+                    _ => {
+                        self.status =
+                            Some("must be provider:model (or empty to clear)".to_string());
+                    }
+                }
             }
+            _ => {}
         }
     }
 
@@ -1236,6 +1283,7 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     m.quality_rank = e.quality_rank;
     m.cost_rank = e.cost_rank;
     m.subagent_invokable = e.subagent_invokable;
+    m.system_prompt = e.system_prompt.clone();
     m.inline_think = e.inline_think;
     m.hint_tool_call_corrections = e.hint_tool_call_corrections;
     if e.show_xai_multi_agent_tools_beta {
@@ -1326,6 +1374,7 @@ mod tests {
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,
             thinking_params: Default::default(),
+            system_prompt: None,
             wire_api: Default::default(),
             extra: Default::default(),
             capabilities: Default::default(),
@@ -1559,12 +1608,58 @@ mod tests {
     }
 
     #[test]
+    fn model_system_prompt_row_saves_clears_and_rejects_oversize() {
+        let entry = provider_with_model();
+        let mut e = SettingsEditor::for_model("p", &entry, "m1");
+        assert!(e.fields().contains(&SettingsField::SystemPrompt));
+        assert_eq!(e.value_str(SettingsField::SystemPrompt), "not set");
+        assert!(!e.is_overridden(SettingsField::SystemPrompt));
+
+        e.cursor = e
+            .fields()
+            .iter()
+            .position(|f| *f == SettingsField::SystemPrompt)
+            .unwrap();
+        e.handle_key(press(KeyCode::Enter));
+        for ch in "model guidance".chars() {
+            e.handle_key(press(KeyCode::Char(ch)));
+        }
+        e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.value_str(SettingsField::SystemPrompt), "14 characters");
+        assert!(e.is_overridden(SettingsField::SystemPrompt));
+        assert!(
+            e.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("future root sessions")
+        );
+
+        let mut written = entry.clone();
+        e.write_into(&mut written);
+        let m = written.models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m.system_prompt.as_deref(), Some("model guidance"));
+
+        e.handle_key(press(KeyCode::Char('x')));
+        assert_eq!(e.value_str(SettingsField::SystemPrompt), "not set");
+        let mut cleared = entry.clone();
+        e.write_into(&mut cleared);
+        let m = cleared.models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m.system_prompt, None);
+
+        e.handle_key(press(KeyCode::Enter));
+        e.buf = TextField::new("x".repeat(MODEL_SYSTEM_PROMPT_MAX_BYTES + 1));
+        e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.editing, Some(SettingsField::SystemPrompt));
+        assert!(e.status.as_deref().unwrap_or_default().contains("at most"));
+    }
+
+    #[test]
     fn inline_think_model_scope_tri_state_cycles() {
         let entry = provider_with_model();
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 19);
+        assert_eq!(e.field_count(), 20);
         assert_eq!(
             *e.fields().last().unwrap(),
             SettingsField::HintToolCallCorrections
@@ -2061,29 +2156,30 @@ mod tests {
         // order and membership so a future row can't silently go missing from
         // one variant.
         //
-        // (field, provider_only, wire_api_only, xai_only)
-        let canonical: &[(SettingsField, bool, bool, bool)] = &[
-            (AllowInsecureHttp, true, false, false),
-            (TrustPolicy, false, false, false),
-            (Location, false, false, false),
-            (QualityRank, false, false, false),
-            (CostRank, false, false, false),
-            (SubagentInvokable, false, false, false),
-            (AutoCompactPct, false, false, false),
-            (AutoPruneEnabled, false, false, false),
-            (AutoPrunePct, false, false, false),
-            (AutoPrunePrunablePct, false, false, false),
-            (CacheTtlSecs, false, false, false),
-            (CacheMode, false, false, false),
-            (ShrinkStrategy, false, false, false),
-            (TimeoutTtftSecs, false, false, false),
-            (TimeoutIdleSecs, false, false, false),
-            (WireApi, false, true, false),
-            (XaiMultiAgentToolsBeta, false, false, true),
-            (Backup, false, false, false),
-            (Mode, false, false, false),
-            (InlineThink, false, false, false),
-            (HintToolCallCorrections, false, false, false),
+        // (field, provider_only, model_only, wire_api_only, xai_only)
+        let canonical: &[(SettingsField, bool, bool, bool, bool)] = &[
+            (AllowInsecureHttp, true, false, false, false),
+            (TrustPolicy, false, false, false, false),
+            (Location, false, false, false, false),
+            (QualityRank, false, false, false, false),
+            (CostRank, false, false, false, false),
+            (SubagentInvokable, false, false, false, false),
+            (SystemPrompt, false, true, false, false),
+            (AutoCompactPct, false, false, false, false),
+            (AutoPruneEnabled, false, false, false, false),
+            (AutoPrunePct, false, false, false, false),
+            (AutoPrunePrunablePct, false, false, false, false),
+            (CacheTtlSecs, false, false, false, false),
+            (CacheMode, false, false, false, false),
+            (ShrinkStrategy, false, false, false, false),
+            (TimeoutTtftSecs, false, false, false, false),
+            (TimeoutIdleSecs, false, false, false, false),
+            (WireApi, false, false, true, false),
+            (XaiMultiAgentToolsBeta, false, false, false, true),
+            (Backup, false, false, false, false),
+            (Mode, false, false, false, false),
+            (InlineThink, false, false, false, false),
+            (HintToolCallCorrections, false, false, false, false),
         ];
 
         // Drive the visibility flags directly so the assertion covers all eight
@@ -2093,8 +2189,9 @@ mod tests {
                 for xai in [false, true] {
                     let expected: Vec<SettingsField> = canonical
                         .iter()
-                        .filter(|(_, provider_only, wire_only, xai_only)| {
+                        .filter(|(_, provider_only, model_only, wire_only, xai_only)| {
                             (!provider_only || !is_model)
+                                && (!model_only || is_model)
                                 && (!wire_only || wire)
                                 && (!xai_only || xai)
                         })

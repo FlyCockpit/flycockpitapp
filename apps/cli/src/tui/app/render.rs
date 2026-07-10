@@ -2190,7 +2190,7 @@ impl App {
         let mut tokens = self
             .guidance_estimate
             .as_ref()
-            .map(|e| e.system_tokens)
+            .map(|e| e.system_tokens + e.model_instruction_tokens)
             .unwrap_or(0)
             .min(u32::MAX as u64) as usize;
         tokens += self.history_estimate_tokens() as usize;
@@ -2228,9 +2228,15 @@ impl App {
     /// drives the unknown-window path (no pct, no free segment).
     pub(super) fn context_snapshot(&self) -> crate::tui::context_pane::ContextSnapshot {
         let short_id = self.launch.session_short_id.as_deref().unwrap_or_default();
+        let model_instructions = self
+            .guidance_estimate
+            .as_ref()
+            .map(|e| e.model_instruction_tokens)
+            .unwrap_or(0);
         let breakdown =
-            crate::engine::builtin::chat_system_prompt_breakdown(&self.launch.cwd, short_id);
+            crate::engine::builtin::chat_system_prompt_breakdown(&self.launch.cwd, short_id, None);
         let snapshot = crate::tui::context_pane::ContextSnapshot::new(
+            model_instructions.max(breakdown.model_instructions),
             breakdown.base_prompt,
             breakdown.system_block,
             breakdown.guidance,

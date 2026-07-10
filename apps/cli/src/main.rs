@@ -29,6 +29,7 @@ mod harness;
 mod intel;
 mod locks;
 mod mcp;
+mod model_system_prompt;
 mod packages;
 mod private_fs;
 mod process;

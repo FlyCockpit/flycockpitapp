@@ -73,6 +73,7 @@ pub struct SessionRow {
     pub guidance_baseline_path: Option<String>,
     pub guidance_baseline_hash: Option<String>,
     pub redaction_table_json: Option<String>,
+    pub model_system_prompt_snapshot_json: String,
     pub created_by_principal: Option<String>,
     pub shared_with_collaborators: bool,
 }
@@ -110,6 +111,9 @@ impl SessionRow {
             guidance_baseline_path: row.get("guidance_baseline_path")?,
             guidance_baseline_hash: row.get("guidance_baseline_hash")?,
             redaction_table_json: row.get("redaction_table_json")?,
+            model_system_prompt_snapshot_json: row
+                .get("model_system_prompt_snapshot_json")
+                .unwrap_or_else(|_| "{}".to_string()),
             created_by_principal: row.get("created_by_principal")?,
             shared_with_collaborators: row.get::<_, i64>("shared_with_collaborators")? != 0,
         })
@@ -226,6 +230,8 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
     let has_created_by_principal = table_has_column(conn, "sessions", "created_by_principal")?;
     let has_redaction_table = table_has_column(conn, "sessions", "redaction_table_json")?;
+    let has_model_prompt_snapshot =
+        table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")?;
     match (has_created_by_principal, has_redaction_table) {
         (true, true) => {
             conn.execute(
@@ -324,6 +330,17 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             )?;
         }
     }
+    if has_model_prompt_snapshot {
+        conn.execute(
+            "UPDATE sessions
+                SET model_system_prompt_snapshot_json = ?1
+              WHERE session_id = ?2",
+            params![
+                row.model_system_prompt_snapshot_json,
+                row.session_id.to_string(),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -382,6 +399,17 @@ fn execute_fork_insert(
             row.shared_with_collaborators as i64,
         ],
     )?;
+    if table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")? {
+        conn.execute(
+            "UPDATE sessions
+                SET model_system_prompt_snapshot_json = ?1
+              WHERE session_id = ?2",
+            params![
+                row.model_system_prompt_snapshot_json,
+                row.session_id.to_string(),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -466,6 +494,7 @@ fn build_session_row(
         guidance_baseline_path: None,
         guidance_baseline_hash: None,
         redaction_table_json: None,
+        model_system_prompt_snapshot_json: "{}".to_string(),
         created_by_principal: None,
         shared_with_collaborators: false,
     }
@@ -761,6 +790,7 @@ impl Db {
                 guidance_baseline_path: parent.guidance_baseline_path,
                 guidance_baseline_hash: parent.guidance_baseline_hash,
                 redaction_table_json: parent.redaction_table_json,
+                model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
                 created_by_principal: parent.created_by_principal,
                 shared_with_collaborators: false,
             };
@@ -1723,6 +1753,22 @@ mod tests {
     }
 
     #[test]
+    fn insert_session_row_round_trips_model_system_prompt_snapshot_json() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").unwrap();
+        row.model_system_prompt_snapshot_json =
+            r#"{"prompts":{"p":{"m":"model instructions"}}}"#.to_string();
+
+        db.insert_session_row(&row).unwrap();
+
+        let got = db.get_session(row.session_id).unwrap().unwrap();
+        assert_eq!(
+            got.model_system_prompt_snapshot_json,
+            r#"{"prompts":{"p":{"m":"model instructions"}}}"#
+        );
+    }
+
+    #[test]
     fn insert_session_row_round_trips_redaction_table_json() {
         let db = Db::open_in_memory().unwrap();
         let mut row = db.new_session_row("p", "/x", "builder").unwrap();
@@ -1899,17 +1945,16 @@ mod tests {
     #[test]
     fn create_fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
-        db.set_session_model(parent.session_id, "anthropic", "opus-4-7")
-            .unwrap();
-        db.set_session_redaction_table_json(
-            parent.session_id,
-            Some(
-                r#"{"entries":[["fork-secret","$TEST"]],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
-                    .to_string(),
-            ),
-        )
-        .unwrap();
+        let mut parent = db.new_session_row("p", "/proj", "Build").unwrap();
+        parent.provider = Some("anthropic".to_string());
+        parent.model = Some("opus-4-7".to_string());
+        parent.redaction_table_json = Some(
+            r#"{"entries":[["fork-secret","$TEST"]],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
+                .to_string(),
+        );
+        parent.model_system_prompt_snapshot_json =
+            r#"{"prompts":{"anthropic":{"opus-4-7":"fork prompt"}}}"#.to_string();
+        let parent = db.insert_session_row(&parent).unwrap();
         let fork_point = record_message(&db, parent.session_id, "fork here", false).to_string();
         let parent = db.get_session(parent.session_id).unwrap().unwrap();
         let fork = db
@@ -1927,6 +1972,10 @@ mod tests {
         assert_eq!(fork.provider.as_deref(), Some("anthropic"));
         assert_eq!(fork.model.as_deref(), Some("opus-4-7"));
         assert_eq!(fork.redaction_table_json, parent.redaction_table_json);
+        assert_eq!(
+            fork.model_system_prompt_snapshot_json,
+            parent.model_system_prompt_snapshot_json
+        );
         assert_ne!(fork.session_id, parent.session_id);
         assert_ne!(fork.short_id, parent.short_id);
     }

@@ -42,6 +42,7 @@ use crate::tui::theme::{
 /// Solid block glyph for both the bar segments and the legend swatches.
 /// The color carries the category identity, not the glyph (per spec).
 const BLOCK: char = '█';
+const CONTEXT_MODEL_INSTRUCTIONS_INDEX: u8 = 1;
 
 /// Minimum interior width we will draw a segmented bar into. Below this
 /// the bar degrades to the header + legend only (the bar would be too
@@ -84,6 +85,7 @@ impl ContextSnapshot {
     /// Categories are listed in the fixed visual order used by both the
     /// bar and the legend.
     pub fn new(
+        model_instructions: u64,
         base_prompt: u64,
         system_block: u64,
         guidance: u64,
@@ -92,6 +94,11 @@ impl ContextSnapshot {
     ) -> Self {
         Self {
             categories: vec![
+                Category {
+                    name: "model instructions",
+                    color_index: CONTEXT_MODEL_INSTRUCTIONS_INDEX,
+                    tokens: model_instructions,
+                },
                 Category {
                     name: "system",
                     color_index: CONTEXT_SYSTEM_INDEX,
@@ -591,9 +598,18 @@ mod tests {
 
     #[test]
     fn new_builds_categories_in_fixed_order() {
-        let snap = ContextSnapshot::new(100, 50, 25, 200, Some(1_000));
+        let snap = ContextSnapshot::new(0, 100, 50, 25, 200, Some(1_000));
         let names: Vec<&str> = snap.categories.iter().map(|c| c.name).collect();
-        assert_eq!(names, ["system", "sys block", "guidance", "messages"]);
+        assert_eq!(
+            names,
+            [
+                "model instructions",
+                "system",
+                "sys block",
+                "guidance",
+                "messages",
+            ]
+        );
         assert_eq!(snap.used(), 375);
         assert_eq!(snap.window, Some(1_000));
     }

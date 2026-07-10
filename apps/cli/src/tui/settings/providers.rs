@@ -1186,6 +1186,7 @@ impl ModelEditor {
                     timeout: None,
                     backup: None,
                     mode: None,
+                    system_prompt: None,
                     inline_think: None,
                     hint_tool_call_corrections: None,
                     text_embedded_recovery: None,

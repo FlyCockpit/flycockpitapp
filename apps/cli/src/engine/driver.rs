@@ -9974,6 +9974,7 @@ impl Driver {
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
             session_short_id: self.session.short_id.clone(),
+            model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
             // The active LLM mode rides on the root agent; child spawns
             // inherit it so the whole invocation tree renders one mode.
@@ -14974,6 +14975,7 @@ mod tests {
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,
             thinking_params: Default::default(),
+            system_prompt: None,
             wire_api: Default::default(),
             extra: Default::default(),
             capabilities: Default::default(),
@@ -15329,6 +15331,7 @@ mod tests {
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,
             thinking_params: Default::default(),
+            system_prompt: None,
             wire_api: Default::default(),
             extra: Default::default(),
             capabilities: Default::default(),

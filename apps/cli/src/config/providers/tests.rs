@@ -113,6 +113,7 @@ fn round_trips_a_provider_entry() {
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
                 thinking_params: Default::default(),
+                system_prompt: None,
                 wire_api: WireApi::default(),
                 inputs: Some(Inputs {
                     images: Some(true),
@@ -341,6 +342,7 @@ fn resolve_cache_prefers_model_override() {
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
         thinking_params: Default::default(),
+        system_prompt: None,
         wire_api: WireApi::default(),
         inputs: None,
         extra: Default::default(),
@@ -923,11 +925,101 @@ fn model(id: &str, manual: bool) -> ModelEntry {
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
         thinking_params: Default::default(),
+        system_prompt: None,
         wire_api: WireApi::default(),
         extra: Default::default(),
         capabilities: Default::default(),
         provider_metadata: Default::default(),
     }
+}
+
+#[test]
+fn model_system_prompt_serializes_only_when_set_and_resolves_nonblank() {
+    let unset = model("m", false);
+    let unset_json = serde_json::to_string(&unset).unwrap();
+    assert!(!unset_json.contains("system_prompt"), "{unset_json}");
+
+    let mut set = model("m", false);
+    set.system_prompt = Some("line one\nUnicode: café".to_string());
+    let set_json = serde_json::to_string(&set).unwrap();
+    assert!(set_json.contains("system_prompt"), "{set_json}");
+    let parsed: ModelEntry = serde_json::from_str(&set_json).unwrap();
+    assert_eq!(parsed.system_prompt, set.system_prompt);
+
+    let mut cfg = ProvidersConfig::default();
+    let mut provider = ProviderEntry::default();
+    provider.models.push(set);
+    let mut blank = model("blank", false);
+    blank.system_prompt = Some("   \n\t".to_string());
+    provider.models.push(blank);
+    cfg.providers.insert("p".into(), provider);
+
+    assert_eq!(
+        cfg.resolve_model_system_prompt("p", "m"),
+        Some("line one\nUnicode: café")
+    );
+    assert_eq!(cfg.resolve_model_system_prompt("p", "blank"), None);
+}
+
+#[test]
+fn layered_model_system_prompt_project_overrides_and_removal_reveals_home() {
+    let home_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+    let home = home_dir.path().join("config.json");
+    let project = project_dir.path().join("config.json");
+    std::fs::write(&home, "{}").unwrap();
+    std::fs::write(&project, "{}").unwrap();
+    write_provider_file(
+        &home,
+        "p",
+        r#"{"url":"https://home.example.test/v1","models":[{"id":"m","system_prompt":"home prompt"}]}"#,
+    );
+    write_provider_file(
+        &project,
+        "p",
+        r#"{"models":[{"id":"m","system_prompt":"project prompt"}]}"#,
+    );
+
+    let cfg = ConfigDoc::providers_from_paths(&[home.clone(), project.clone()]);
+    assert_eq!(
+        cfg.resolve_model_system_prompt("p", "m"),
+        Some("project prompt")
+    );
+
+    write_provider_file(&project, "p", r#"{"models":[{"id":"m"}]}"#);
+    let cfg = ConfigDoc::providers_from_paths(&[home, project]);
+    assert_eq!(
+        cfg.resolve_model_system_prompt("p", "m"),
+        Some("home prompt")
+    );
+}
+
+#[test]
+fn model_system_prompt_is_typed_not_passthrough_and_survives_refetch() {
+    let parsed: ProviderEntry = serde_json::from_str(
+        r#"{"url":"https://x","models":[{"id":"m","system_prompt":"stay","vendor":"kept"}]}"#,
+    )
+    .unwrap();
+    let parsed_model = &parsed.models[0];
+    assert_eq!(parsed_model.system_prompt.as_deref(), Some("stay"));
+    assert!(!parsed_model.extra.contains_key("system_prompt"));
+
+    let fetched = vec![model("m", false)];
+    let merged = merge_fetched_models_with_policy(
+        None,
+        &parsed.models,
+        fetched,
+        ModelMergePolicy::KeepUnlisted,
+    );
+    assert_eq!(merged[0].system_prompt.as_deref(), Some("stay"));
+
+    let removed = merge_fetched_models_with_policy(
+        None,
+        &parsed.models,
+        Vec::new(),
+        ModelMergePolicy::RemoveUnlisted,
+    );
+    assert!(removed.is_empty());
 }
 
 #[test]

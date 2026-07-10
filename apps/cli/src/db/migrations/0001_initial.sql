@@ -55,6 +55,10 @@ CREATE TABLE sessions (
     -- original env/dotenv source has changed or disappeared.
     redaction_table_json TEXT,
 
+    -- Frozen model-specific system-prompt snapshot for this conversation
+    -- lineage. JSON object keyed provider id -> model id -> prompt body.
+    model_system_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
+
     -- 1 for a throwaway side-conversation fork (`/side`): excluded from
     -- session lists, never auto-titled, discarded when the side
     -- conversation ends (daemon sweeps orphans on boot).

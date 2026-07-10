@@ -808,6 +808,16 @@ async fn handle_request(
             );
             let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
             let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
+            let model_instruction_tokens = provider
+                .as_deref()
+                .zip(model.as_deref())
+                .and_then(|(provider, model)| {
+                    let cfg = crate::config::providers::ConfigDoc::load_effective(cwd);
+                    cfg.resolve_model_system_prompt(provider, model).map(|prompt| {
+                        crate::tokens::scaled_estimate(prompt, strategy, scale)
+                    })
+                })
+                .unwrap_or(0);
             match crate::engine::builtin::load_agent_guidance(cwd) {
                 Some((path, body)) => {
                     let tokens = crate::tokens::scaled_estimate(&body, strategy, scale);
@@ -816,12 +826,14 @@ async fn handle_request(
                         file,
                         tokens,
                         system_tokens,
+                        model_instruction_tokens,
                     })
                 }
                 None => Ok(Response::GuidanceEstimate {
                     file: None,
                     tokens: 0,
                     system_tokens,
+                    model_instruction_tokens,
                 }),
             }
         }

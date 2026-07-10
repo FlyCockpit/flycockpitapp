@@ -15,6 +15,7 @@ use crate::config::extended::ToolCommandTemplate;
 use crate::engine::agent::Agent;
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::tool::ToolBox;
+use crate::model_system_prompt::ModelSystemPromptSnapshot;
 use crate::tools::custom::{CustomBashTool, ToolTemplateProvenance};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +144,8 @@ pub struct SpawnArgs {
     /// is participating in. Empty string is acceptable for legacy /
     /// test paths where a session id isn't yet resolved.
     pub session_short_id: String,
+    /// Frozen model-specific prompt snapshot for this session/invocation.
+    pub model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// Whether this agent is being spawned into a user-facing
     /// interactive session (the daemon root, or an interactive handoff
     /// such as `builder`) versus a one-shot leaf delegation
@@ -461,6 +464,30 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
     compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
 }
 
+fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &SpawnArgs) -> String {
+    let model_prompt = args
+        .model_system_prompt_snapshot
+        .get(model.provider_id(), model.model_id_ref());
+    if let Some(model_prompt) = model_prompt {
+        let role_system = compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd);
+        let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
+        out.push_str(model_prompt);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&role_system);
+        out
+    } else {
+        compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd)
+    }
+}
+
+fn compose_system_prompt_for_effective_model(role_prompt: &str, args: &SpawnArgs) -> String {
+    let model = args.effective_model();
+    compose_system_prompt_for_model(role_prompt, &model, args)
+}
+
 /// Pure assembler for the cached system block, given an already-resolved
 /// [`ExtendedConfig`]. Split out from [`compose_system_prompt`] so the
 /// formatting (line order, name trim/omit) is testable without depending
@@ -548,6 +575,7 @@ pub(crate) fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> 
 /// the wire.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SystemPromptBreakdown {
+    pub model_instructions: u64,
     pub base_prompt: u64,
     pub system_block: u64,
     pub guidance: u64,
@@ -559,11 +587,15 @@ pub struct SystemPromptBreakdown {
 pub(crate) fn chat_system_prompt_breakdown(
     cwd: &Path,
     session_short_id: &str,
+    model_instructions: Option<&str>,
 ) -> SystemPromptBreakdown {
     let cfg = load_extended_config(cwd);
     // The full composed system prompt, then the same prompt without the role
     // body: the difference is the cached identity block. Guidance is counted
     // separately because it is sent as user-role history.
+    let model_instructions = model_instructions
+        .map(|prompt| crate::tokens::count(prompt) as u64)
+        .unwrap_or(0);
     let base_prompt = crate::tokens::count(BUILD_PROMPT) as u64;
     let guidance = find_agent_guidance(cwd, &cfg.agent_guidance_files)
         .map(|(_, body)| crate::tokens::count(&body) as u64)
@@ -576,6 +608,7 @@ pub(crate) fn chat_system_prompt_breakdown(
     )) as u64;
     let system_block = full.saturating_sub(base_prompt);
     SystemPromptBreakdown {
+        model_instructions,
         base_prompt,
         system_block,
         guidance,
@@ -726,6 +759,7 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
             let def = crate::agents::embedded_default(name)
                 .expect("resolved embedded built-in must have embedded default");
             agent.model = resolve_agent_model(&def, args)?;
+            agent.system = compose_system_prompt_for_model(&agent.role_prompt, &agent.model, args);
             agent
         }
         // Not a built-in and no file on disk: unknown agent.
@@ -923,7 +957,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
         let role = def.resolved_prompt_for(args.llm_mode);
         return Ok(Agent {
             name: def.name.clone(),
-            system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+            system: compose_system_prompt_for_model(role, &model, args),
             role_prompt: role.to_string(),
             tools: ToolBox::new(),
             model,
@@ -996,7 +1030,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     let role = def.resolved_prompt_for(args.llm_mode);
     Ok(Agent {
         name: def.name.clone(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_model(role, &model, args),
         role_prompt: role.to_string(),
         tools: tb,
         model,
@@ -1179,7 +1213,7 @@ pub fn auto(args: &SpawnArgs) -> Agent {
     let role = builtin_prompt_for(AUTO_PROMPT, Some(AUTO_PROMPT_NORMAL), None, args.llm_mode);
     Agent {
         name: "Auto".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1282,7 +1316,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
     );
     Agent {
         name: "Build".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1370,7 +1404,7 @@ pub fn builder(args: &SpawnArgs) -> Agent {
     );
     Agent {
         name: "builder".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1419,7 +1453,7 @@ pub fn explore(args: &SpawnArgs) -> Agent {
     );
     Agent {
         name: "explore".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1439,7 +1473,7 @@ pub fn explore(args: &SpawnArgs) -> Agent {
 pub fn deepthink(args: &SpawnArgs) -> Agent {
     Agent {
         name: "deepthink".to_string(),
-        system: compose_system_prompt(DEEPTHINK_PROMPT, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(DEEPTHINK_PROMPT, args),
         role_prompt: DEEPTHINK_PROMPT.to_string(),
         tools: ToolBox::new(),
         model: args.effective_model(),
@@ -1482,7 +1516,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
     let role = builtin_prompt_for(SCOUT_PROMPT, Some(SCOUT_PROMPT_NORMAL), None, args.llm_mode);
     Agent {
         name: "scout".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1525,7 +1559,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
     let role = builtin_prompt_for(PLAN_PROMPT, Some(PLAN_PROMPT_NORMAL), None, args.llm_mode);
     Agent {
         name: "Plan".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1589,7 +1623,7 @@ pub fn swarm(args: &SpawnArgs) -> Agent {
     );
     Agent {
         name: "Swarm".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1634,7 +1668,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
     );
     Agent {
         name: "Multireview".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1697,7 +1731,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
     );
     Agent {
         name: "bee".to_string(),
-        system: compose_system_prompt(role, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
         model: args.effective_model(),
@@ -1744,7 +1778,7 @@ pub fn docs_resolver(
 
     Agent {
         name: "docs-resolver".to_string(),
-        system: compose_system_prompt(DOCS_RESOLVER_PROMPT, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(DOCS_RESOLVER_PROMPT, args),
         role_prompt: DOCS_RESOLVER_PROMPT.to_string(),
         tools,
         model: args.effective_model(),
@@ -1771,7 +1805,7 @@ pub fn docs_answerer(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "docs-answerer".to_string(),
-        system: compose_system_prompt(DOCS_ANSWERER_PROMPT, &args.session_short_id, &args.cwd),
+        system: compose_system_prompt_for_effective_model(DOCS_ANSWERER_PROMPT, args),
         role_prompt: DOCS_ANSWERER_PROMPT.to_string(),
         tools,
         model: args.effective_model(),
@@ -1828,6 +1862,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cwd: cwd.to_path_buf(),
             session_short_id: String::new(),
+            model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
             llm_mode: crate::config::extended::LlmMode::default(),
             model_override: None,
@@ -3018,6 +3053,37 @@ mod tests {
         let def = def_with_model(None);
         let resolved = resolve_agent_model(&def, &args).unwrap();
         assert!(Arc::ptr_eq(&resolved, &args.model));
+    }
+
+    #[test]
+    fn compose_system_prompt_for_model_prepends_model_instructions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        let mut snapshot = ModelSystemPromptSnapshot::empty();
+        snapshot.insert("lmstudio", "local", "MODEL INSTRUCTIONS".to_string());
+        args.model_system_prompt_snapshot = Arc::new(snapshot);
+
+        let out = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        assert!(
+            out.starts_with("MODEL INSTRUCTIONS\n\nROLE PROMPT"),
+            "block was: {out}"
+        );
+        let model_at = out.find("MODEL INSTRUCTIONS").unwrap();
+        let role_at = out.find("ROLE PROMPT").unwrap();
+        let harness_at = out.find("Harness: cockpit").unwrap();
+        assert!(
+            model_at < role_at && role_at < harness_at,
+            "block was: {out}"
+        );
+    }
+
+    #[test]
+    fn compose_system_prompt_for_model_is_byte_identical_without_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
+        let with_snapshot = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        assert_eq!(with_snapshot, existing);
     }
 
     /// Config with a name set, used by the deterministic name-present case.

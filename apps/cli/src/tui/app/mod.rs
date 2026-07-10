@@ -7471,11 +7471,13 @@ impl App {
                         file,
                         tokens,
                         system_tokens,
-                    } if file.is_some() || system_tokens > 0 => Ok(
+                        model_instruction_tokens,
+                    } if file.is_some() || system_tokens > 0 || model_instruction_tokens > 0 => Ok(
                         AsyncActionPayload::GuidanceEstimate(agent_runner::GuidanceEstimate {
                             file,
                             guidance_tokens: tokens,
                             system_tokens,
+                            model_instruction_tokens,
                         }),
                     ),
                     _ => Err("empty guidance estimate".to_string()),
@@ -12704,6 +12706,7 @@ mod startup_first_paint_tests {
             file: Some("AGENTS.md".to_string()),
             guidance_tokens: 10,
             system_tokens: 20,
+            model_instruction_tokens: 0,
         };
 
         app.apply_startup_guidance_estimate(

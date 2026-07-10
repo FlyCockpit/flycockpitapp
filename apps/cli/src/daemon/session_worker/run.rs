@@ -65,6 +65,7 @@ async fn run_worker(
         },
         cwd: project_root.clone(),
         session_short_id: session.short_id.clone(),
+        model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,

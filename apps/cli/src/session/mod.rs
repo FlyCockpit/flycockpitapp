@@ -34,6 +34,7 @@ use crate::db::Db;
 use crate::db::sessions::SessionRow;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::engine::repair::Recovery;
+use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
 mod gitignore;
 mod lifecycle;
@@ -150,6 +151,7 @@ pub struct Session {
     model: Mutex<Option<String>>,
     provider: Mutex<Option<String>>,
     redaction_table_json: Mutex<Option<String>>,
+    model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -263,6 +265,10 @@ struct LastRecoverableToolCall {
 }
 
 impl Session {
+    pub fn model_system_prompt_snapshot(&self) -> Arc<ModelSystemPromptSnapshot> {
+        self.model_system_prompt_snapshot.clone()
+    }
+
     /// Record that the model successfully used the dedicated tool `tool` this
     /// session, for the defensive bash-routing nudge's self-suppression
     /// (implementation note). Only the

@@ -41,6 +41,7 @@ pub mod terminal_host;
 #[cfg(test)]
 pub(crate) mod test_harness;
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +52,9 @@ use crate::private_fs::ensure_private_dir;
 use crate::private_fs::with_private_umask;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio::io::AsyncBufReadExt;
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
@@ -364,11 +367,6 @@ fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-#[cfg(not(unix))]
-fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListener> {
-    UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonStatus {
     /// Daemon is running and the socket accepts a connection.
@@ -382,6 +380,7 @@ pub enum DaemonStatus {
     NotRunning,
 }
 
+#[cfg(unix)]
 async fn socket_responds(socket: &Path) -> bool {
     if !socket.exists() {
         return false;
@@ -399,6 +398,7 @@ async fn socket_responds(socket: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn socket_responds_blocking(socket: &Path) -> bool {
     use std::os::unix::net::UnixStream as StdUnixStream;
 
@@ -416,6 +416,7 @@ fn socket_responds_blocking(socket: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
     let Some(pid) = read_pid(paths) else {
         return DaemonStatus::Stale;
@@ -428,6 +429,11 @@ fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
         }
         PidIdentity::Unverified => DaemonStatus::Stale,
     }
+}
+
+#[cfg(not(unix))]
+fn status_for_unreachable_pid(_paths: &DaemonPaths) -> DaemonStatus {
+    DaemonStatus::Stale
 }
 
 fn endpoint_paths(canonical: &DaemonPaths, record: &DaemonEndpointRecord) -> DaemonPaths {
@@ -519,6 +525,7 @@ pub fn discover_blocking() -> DaemonProbe {
     DaemonProbe::new(probe_direct_blocking(&canonical), canonical)
 }
 
+#[cfg(unix)]
 async fn probe_direct(paths: &DaemonPaths) -> DaemonStatus {
     if socket_responds(&paths.socket).await {
         return DaemonStatus::Running;
@@ -530,10 +537,29 @@ async fn probe_direct(paths: &DaemonPaths) -> DaemonStatus {
     }
 }
 
+#[cfg(not(unix))]
+async fn probe_direct(paths: &DaemonPaths) -> DaemonStatus {
+    if paths.pid_file.exists() {
+        status_for_unreachable_pid(paths)
+    } else {
+        DaemonStatus::NotRunning
+    }
+}
+
+#[cfg(unix)]
 fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonStatus {
     if socket_responds_blocking(&paths.socket) {
         return DaemonStatus::Running;
     }
+    if paths.pid_file.exists() {
+        status_for_unreachable_pid(paths)
+    } else {
+        DaemonStatus::NotRunning
+    }
+}
+
+#[cfg(not(unix))]
+fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonStatus {
     if paths.pid_file.exists() {
         status_for_unreachable_pid(paths)
     } else {
@@ -581,6 +607,7 @@ pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<u32> {
     spawn_detached_inner(Some(paths), false, false)
 }
 
+#[cfg(unix)]
 fn spawn_detached_inner(
     ephemeral: Option<&DaemonPaths>,
     no_sandbox: bool,
@@ -609,6 +636,15 @@ fn spawn_detached_inner(
     }
     let child = command.spawn().context("spawning daemon child")?;
     Ok(child.id())
+}
+
+#[cfg(not(unix))]
+fn spawn_detached_inner(
+    _ephemeral: Option<&DaemonPaths>,
+    _no_sandbox: bool,
+    _resume_all_sessions: bool,
+) -> Result<u32> {
+    anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
 /// Idle grace period for the ephemeral self-reaping watchdog (Layer C).
@@ -670,6 +706,7 @@ pub(crate) fn boot_in_process(paths: DaemonPaths) -> Result<std::sync::Arc<serve
 /// full 30s of wall-clock. `idle_grace` bounds the ephemeral idle watchdog;
 /// `drain_grace` bounds how long teardown awaits in-flight work before
 /// force-aborting it.
+#[cfg(unix)]
 pub async fn run_foreground_inner(
     paths: DaemonPaths,
     idle_grace: Duration,
@@ -827,6 +864,16 @@ pub async fn run_foreground_inner(
     remote_audit_upload_task.abort();
     connector_task.abort();
     result
+}
+
+#[cfg(not(unix))]
+pub async fn run_foreground_inner(
+    _paths: DaemonPaths,
+    _idle_grace: Duration,
+    _drain_grace: Duration,
+    _resume_all_sessions: bool,
+) -> Result<()> {
+    anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
 /// Arm the bounded-grace force timer for a graceful drain
@@ -1153,7 +1200,7 @@ fn read_pid(paths: &DaemonPaths) -> Option<u32> {
     s.trim().parse().ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::daemon::test_harness::{

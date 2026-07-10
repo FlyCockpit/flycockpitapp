@@ -36,9 +36,15 @@ pub fn is_gitignored(path: &Path) -> bool {
         return false;
     };
     let matcher = build_repo_matcher(&root, &resolved);
-    let is_dir = resolved.is_dir();
+    matcher_matches(&matcher, &root, &resolved)
+}
+
+fn matcher_matches(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
+    if path.strip_prefix(root).is_err() {
+        return false;
+    }
     matches!(
-        matcher.matched_path_or_any_parents(&resolved, is_dir),
+        matcher.matched_path_or_any_parents(path, path.is_dir()),
         Match::Ignore(_)
     )
 }
@@ -51,7 +57,7 @@ pub fn is_gitignored(path: &Path) -> bool {
 /// `None` when no ancestor carries either marker (no ignore stack to consult).
 fn gitignore_root(path: &Path) -> Option<PathBuf> {
     if let Some(root) = crate::git::find_worktree_root(path) {
-        return Some(root);
+        return Some(canonicalize_lenient(&root));
     }
     let start = if path.is_dir() { path } else { path.parent()? };
     // Highest ancestor with a `.git` marker (dir or file) wins; failing that,
@@ -66,7 +72,9 @@ fn gitignore_root(path: &Path) -> Option<PathBuf> {
             ignore_root = Some(dir.to_path_buf());
         }
     }
-    git_root.or(ignore_root)
+    git_root
+        .or(ignore_root)
+        .map(|root| canonicalize_lenient(&root))
 }
 
 /// Whether `path` is permitted for a read: permitted when it is not
@@ -86,18 +94,15 @@ pub fn is_permitted(path: &Path, project_root: &Path, allow: &[String]) -> bool 
 /// path's parents. Used both for the read gate and to re-include a
 /// gitignored-but-allowlisted path in the discovery surfaces.
 pub fn allowlist_matches(path: &Path, project_root: &Path, globs: &[String]) -> bool {
-    let matcher = build_allowlist_matcher(project_root, globs);
+    let root = canonicalize_lenient(project_root);
+    let matcher = build_allowlist_matcher(&root, globs);
     if matcher.is_empty() {
         return false;
     }
     let resolved = canonicalize_lenient(path);
-    let is_dir = resolved.is_dir();
     // The allowlist globs are written as *ignore* patterns; a path the
     // allowlist "ignores" is the one we re-permit.
-    matches!(
-        matcher.matched_path_or_any_parents(&resolved, is_dir),
-        Match::Ignore(_)
-    )
+    matcher_matches(&matcher, &root, &resolved)
 }
 
 /// Build a [`Gitignore`] matcher from the allowlist `globs`, rooted at
@@ -228,6 +233,21 @@ mod tests {
 
     /// `is_permitted`: a gitignored path is denied unless an allowlist glob
     /// re-permits it; a non-gitignored path is always permitted.
+
+    #[test]
+    fn allowlist_outside_root_is_not_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = outside.join("target").join("debug.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "log").unwrap();
+
+        assert!(!allowlist_matches(&path, &root, &["target/".to_string()]));
+    }
+
     #[test]
     fn allowlist_repermits_gitignored_paths() {
         let tmp = tempfile::tempdir().unwrap();

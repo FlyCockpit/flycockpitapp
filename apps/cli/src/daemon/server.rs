@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -458,6 +459,7 @@ fn run_boot_housekeeping(db: &Db) {
 /// graceful-shutdown gate leaves `Running`. Each accepted connection spawns
 /// a detached client task. Breaking the loop hands control back to
 /// [`crate::daemon::run_foreground_inner`], which drains the workers.
+#[cfg(unix)]
 pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
     let mut shutdown = ctx.shutdown.subscribe();
     let retention_cfg = retention_config();
@@ -557,14 +559,6 @@ fn validate_peer_owner(stream: &UnixStream) -> Result<()> {
     let peer_uid = peer_uid(stream)?;
     let daemon_uid = current_uid();
     validate_peer_uid(peer_uid, daemon_uid)
-}
-
-#[cfg(not(unix))]
-fn validate_peer_owner(_stream: &UnixStream) -> Result<()> {
-    // Windows currently has no Unix-domain daemon socket in this transport.
-    // If a Windows local-socket transport is added, it needs an equivalent
-    // peer-identity check before serving requests.
-    Ok(())
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -941,6 +935,7 @@ async fn run_in_process_client(
     }
 }
 
+#[cfg(unix)]
 async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {
     handle_client_transport(stream, ctx).await
 }
@@ -5062,7 +5057,10 @@ mod tests {
         );
     }
 
-    async fn recv_body(proto: &mut ProtoStream<UnixStream>) -> Body {
+    async fn recv_body<S>(proto: &mut ProtoStream<S>) -> Body
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         match proto.recv().await.unwrap().unwrap() {
             RecvFrame::Envelope(env) => env.body,
             other => panic!("expected envelope, got {other:?}"),
@@ -5594,7 +5592,7 @@ mod tests {
     #[tokio::test]
     async fn resync_drain_state_sends_nothing_while_running() {
         let ctx = test_ctx();
-        let (left, right) = UnixStream::pair().expect("socket pair");
+        let (left, right) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
         let mut server = ProtoStream::new(left);
         let mut client = ProtoStream::new(right);
 
@@ -5609,7 +5607,7 @@ mod tests {
     #[tokio::test]
     async fn resync_drain_state_replays_draining_and_forced() {
         let ctx = test_ctx();
-        let (left, right) = UnixStream::pair().expect("socket pair");
+        let (left, right) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
         let mut server = ProtoStream::new(left);
         let mut client = ProtoStream::new(right);
 
@@ -5663,7 +5661,7 @@ mod tests {
         ctx.registry.insert_test_worker(handle, join);
         assert!(ctx.shutdown.begin_drain());
 
-        let (left, right) = UnixStream::pair().expect("socket pair");
+        let (left, right) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
         let mut server = ProtoStream::new(left);
         let mut client = ProtoStream::new(right);
         let mut state = ClientState::detached_for_test();

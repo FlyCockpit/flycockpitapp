@@ -273,7 +273,7 @@ fn wait_until_dead(pid: u32) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn verify_test_daemon(pid: u32, owner: &str) -> Result<()> {
     let env = std::fs::read(format!("/proc/{pid}/environ"))
         .with_context(|| format!("reading /proc/{pid}/environ"))?;
@@ -295,7 +295,7 @@ fn verify_test_daemon(pid: u32, owner: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn verify_test_daemon(_pid: u32, _owner: &str) -> Result<()> {
     Err(anyhow!(
         "test daemon process identity is unsupported on this platform"

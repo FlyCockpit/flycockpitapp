@@ -59,7 +59,7 @@ impl Db {
         root_path: &std::path::Path,
         mode: WorkspaceTrustMode,
     ) -> Result<WorkspaceTrustDecision> {
-        let root = root_path.to_string_lossy().into_owned();
+        let root = normalize_trust_root(root_path)?;
         let now = now_epoch_seconds();
         self.write_blocking(move |conn| {
             conn.execute(
@@ -81,7 +81,7 @@ impl Db {
         &self,
         root_path: &std::path::Path,
     ) -> Result<Option<WorkspaceTrustDecision>> {
-        let root = root_path.to_string_lossy().into_owned();
+        let root = normalize_trust_root(root_path)?;
         self.read_blocking(|conn| query_decision_by_root(conn, &root))
     }
 
@@ -92,6 +92,13 @@ impl Db {
         let resolved = crate::config::trust::resolve_trust_root(path)?;
         self.workspace_trust_by_root(&resolved.root)
     }
+}
+
+fn normalize_trust_root(root_path: &std::path::Path) -> Result<String> {
+    Ok(crate::config::trust::resolve_trust_root(root_path)?
+        .root
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn query_decision_by_root(conn: &Connection, root: &str) -> Result<Option<WorkspaceTrustDecision>> {
@@ -136,7 +143,9 @@ mod tests {
     #[test]
     fn set_update_and_read_workspace_trust_decision() {
         let db = Db::open_in_memory().unwrap();
-        let root = std::path::Path::new("/tmp/cockpit-trust");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let canonical_root = root.canonicalize().unwrap().display().to_string();
 
         assert!(db.workspace_trust_by_root(root).unwrap().is_none());
 
@@ -144,7 +153,7 @@ mod tests {
             .set_workspace_trust(root, WorkspaceTrustMode::Trust)
             .unwrap();
         assert_eq!(first.mode, WorkspaceTrustMode::Trust);
-        assert_eq!(first.root_path, "/tmp/cockpit-trust");
+        assert_eq!(first.root_path, canonical_root);
         assert_eq!(first.created_at, first.updated_at);
 
         let second = db
@@ -157,6 +166,42 @@ mod tests {
 
         let loaded = db.workspace_trust_by_root(root).unwrap().expect("stored");
         assert_eq!(loaded, second);
+    }
+
+    #[test]
+    fn set_workspace_trust_stores_resolved_root_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path())
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let subdir = tmp.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let lexical_variant = subdir.join("..");
+        let canonical_root = tmp.path().canonicalize().unwrap().display().to_string();
+
+        let db = Db::open_in_memory().unwrap();
+        let stored = db
+            .set_workspace_trust(&lexical_variant, WorkspaceTrustMode::Trust)
+            .unwrap();
+
+        assert_eq!(stored.root_path, canonical_root);
+        assert_eq!(
+            db.workspace_trust_by_root(tmp.path())
+                .unwrap()
+                .expect("stored")
+                .root_path,
+            stored.root_path
+        );
+        assert_eq!(
+            db.workspace_trust_for_path(&subdir)
+                .unwrap()
+                .expect("stored")
+                .mode,
+            WorkspaceTrustMode::Trust
+        );
     }
 
     #[test]

@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -56,6 +59,7 @@ pub struct DaemonClient {
     events: Arc<tokio::sync::Mutex<mpsc::Receiver<proto::Event>>>,
 }
 
+#[cfg(unix)]
 struct Pending {
     id: Uuid,
     request: Request,
@@ -64,10 +68,12 @@ struct Pending {
 
 #[derive(Clone)]
 enum ClientBackend {
+    #[cfg(unix)]
     Wire(mpsc::Sender<IoCommand>),
     InProcess(mpsc::Sender<crate::daemon::server::InProcessRequest>),
 }
 
+#[cfg(unix)]
 enum IoCommand {
     Request(Box<Pending>),
     Cancel { id: Uuid },
@@ -80,11 +86,20 @@ impl DaemonClient {
         if let Some(ctx) = crate::daemon::server::in_process_context(socket) {
             return Ok(Self::from_in_process(ctx));
         }
-        let stream = UnixStream::connect(socket)
-            .await
-            .with_context(|| format!("connecting to {}", socket.display()))?;
-        let proto = ProtoStream::new(stream);
-        Ok(Self::from_proto(proto))
+        #[cfg(unix)]
+        {
+            let stream = UnixStream::connect(socket)
+                .await
+                .with_context(|| format!("connecting to {}", socket.display()))?;
+            let proto = ProtoStream::new(stream);
+            Ok(Self::from_proto(proto))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(anyhow!(
+                "daemon socket transport is not supported on this platform"
+            ))
+        }
     }
 
     pub(crate) fn from_in_process(ctx: Arc<crate::daemon::server::DaemonContext>) -> Self {
@@ -95,6 +110,7 @@ impl DaemonClient {
         }
     }
 
+    #[cfg(unix)]
     fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
@@ -190,6 +206,7 @@ impl DaemonClient {
     }
 }
 
+#[cfg(unix)]
 async fn run_io(
     mut proto: ProtoStream<UnixStream>,
     mut request_rx: mpsc::Receiver<IoCommand>,
@@ -303,11 +320,13 @@ async fn run_io(
     }
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct InboundBurst {
     frames: usize,
 }
 
+#[cfg(unix)]
 impl InboundBurst {
     fn record_inbound(&mut self) {
         self.frames = self.frames.saturating_add(1);
@@ -322,6 +341,7 @@ impl InboundBurst {
     }
 }
 
+#[cfg(unix)]
 async fn handle_io_command(
     cmd: IoCommand,
     proto: &mut ProtoStream<UnixStream>,
@@ -354,6 +374,7 @@ async fn handle_io_command(
     }
 }
 
+#[cfg(unix)]
 fn remove_pending_request(
     pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
     id: Uuid,

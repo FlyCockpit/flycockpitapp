@@ -25,8 +25,10 @@
 //! automatically.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -41,13 +43,14 @@ use crate::config::extended::{
 use crate::tools::command_resource_profiles::{
     GO_TOOLCHAIN, JAVA_TOOLCHAIN, NODE_PACKAGE_MANAGER, PYTHON_TOOLCHAIN, RUST_TOOLCHAIN,
 };
-use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, suggest_dirs};
+use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode, suggest_paths};
 use crate::tui::textfield::TextField;
+use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
-    TextColumnLayout, heading_style, muted_style, push_label_value_row, push_text_field_at_cursor,
+    TextColumnLayout, heading_style, muted_style, push_label_text_field_row, push_label_value_row,
     push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
@@ -1051,9 +1054,13 @@ pub(super) struct CategoryPage {
     /// selectable rows (settings + the trailing reset button).
     pub(super) rows: Vec<Row>,
     pub(super) cursor: usize,
-    /// `Some(id)` while a text/number field is being edited inline.
+    /// `Some(id)` while a short text/number field is being edited inline.
     pub(super) editing: Option<SettingId>,
     pub(super) buf: TextField,
+    /// Shared full-area editor for long text and JSON settings.
+    pub(super) text_editor: Option<CategoryTextEditor>,
+    pub(super) path_editor: Option<CategoryPathEditor>,
+    pub(super) pending_external_edit: Option<CategoryExternalEdit>,
     pub(super) status: Option<String>,
     pub(super) reset: ResetButton,
     /// Drained by the App on close to reconcile crossterm mouse capture
@@ -1062,10 +1069,235 @@ pub(super) struct CategoryPage {
     /// `Some` while the utility-model picker overlay is open (Behavior only).
     pub(super) utility_picker: Option<Box<UtilityModelPicker>>,
     pub(super) utility_picker_target: Option<SettingId>,
-    /// Directory autosuggest, live only while the `packages dir` field is
-    /// being edited (Behavior). Empty/inert for every other field.
-    pub(super) pkg_suggest: DirSuggestState,
     pub(super) shadowed_global: Option<ShadowedGlobalPrompt>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum CategoryExternalSource {
+    Cursor,
+    Inline,
+    PathEditor,
+    TextEditor,
+}
+
+pub(super) struct CategoryExternalEdit {
+    pub(super) id: SettingId,
+    pub(super) path: tempfile::TempPath,
+    source: CategoryExternalSource,
+    servicing: bool,
+}
+
+impl CategoryExternalEdit {
+    fn new(id: SettingId, text: &str, source: CategoryExternalSource) -> Result<Self, String> {
+        if std::env::var_os("EDITOR").is_none() {
+            return Err("No $EDITOR environment variable".into());
+        }
+        let mut temp = tempfile::Builder::new()
+            .prefix("cockpit-settings-")
+            .suffix(".txt")
+            .tempfile()
+            .map_err(|e| format!("editor: failed to create temp file: {e}"))?;
+        temp.write_all(text.as_bytes())
+            .map_err(|e| format!("editor: failed to write temp file: {e}"))?;
+        temp.flush()
+            .map_err(|e| format!("editor: failed to flush temp file: {e}"))?;
+        Ok(Self {
+            id,
+            path: temp.into_temp_path(),
+            source,
+            servicing: false,
+        })
+    }
+
+    fn service_path(&mut self) -> Option<PathBuf> {
+        if self.servicing {
+            return None;
+        }
+        self.servicing = true;
+        Some(self.path.to_path_buf())
+    }
+}
+
+pub(super) struct CategoryPathEditor {
+    pub(super) id: SettingId,
+    buf: TextField,
+    pub(super) suggest: DirSuggestState,
+    mode: PathSuggestMode,
+}
+
+impl CategoryPathEditor {
+    fn new(id: SettingId, text: String, mode: PathSuggestMode, cwd: &std::path::Path) -> Self {
+        let mut editor = Self {
+            id,
+            buf: TextField::new(text),
+            suggest: DirSuggestState::default(),
+            mode,
+        };
+        editor.refresh(cwd);
+        editor
+    }
+
+    fn text(&self) -> &str {
+        self.buf.text()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_text_for_test(&mut self, text: String, cwd: &std::path::Path) {
+        self.buf.set(text);
+        self.refresh(cwd);
+    }
+
+    fn cursor(&self) -> usize {
+        self.buf.cursor()
+    }
+
+    pub(super) fn paste(&mut self, text: &str, cwd: &std::path::Path) {
+        self.buf.paste(text);
+        self.refresh(cwd);
+    }
+
+    fn refresh(&mut self, cwd: &std::path::Path) {
+        self.suggest.entries = suggest_paths(cwd, self.buf.text(), self.mode);
+        self.suggest.selected = 0;
+        self.suggest.scroll = 0;
+    }
+
+    fn accept(&mut self, replacement: String, cwd: &std::path::Path) {
+        self.buf.set(replacement);
+        self.refresh(cwd);
+    }
+
+    fn render(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("editing {}", self.id.label()),
+                heading_style(),
+            )),
+            Line::default(),
+        ];
+        super::shell::push_text_field_at_cursor(
+            &mut lines,
+            area.width,
+            self.id.label(),
+            self.text(),
+            self.cursor(),
+            true,
+            None,
+        );
+        if let Some(ghost) = self.suggest.ghost_for(self.text())
+            && let Some(last) = lines.last_mut()
+        {
+            last.spans.push(Span::styled(
+                ghost.to_string(),
+                muted_style().add_modifier(Modifier::DIM),
+            ));
+        }
+        if !self.suggest.entries.is_empty() {
+            for (i, entry) in self
+                .suggest
+                .entries
+                .iter()
+                .enumerate()
+                .skip(self.suggest.scroll)
+                .take(DIR_SUGGEST_WINDOW)
+            {
+                let active = i == self.suggest.selected;
+                let suffix = if entry.is_dir { "/" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {}", super::shell::marker(active))),
+                    Span::styled(
+                        format!("{}{}", entry.name, suffix),
+                        if active {
+                            selected_style()
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                ]));
+            }
+            if self.suggest.entries.len() > DIR_SUGGEST_WINDOW {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ... {} more (up/down to scroll)",
+                        self.suggest.entries.len() - DIR_SUGGEST_WINDOW
+                    ),
+                    muted_style(),
+                )));
+            }
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "tab: accept  right: complete  enter: save  esc: cancel".to_string(),
+            muted_style(),
+        )));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+}
+
+fn path_setting_mode(id: SettingId) -> Option<PathSuggestMode> {
+    match id {
+        SettingId::PackagesDir => Some(PathSuggestMode::Directories),
+        SettingId::SandboxDockerfile => Some(PathSuggestMode::FilesAndDirectories),
+        _ => None,
+    }
+}
+
+/// Full-area editor for long text and JSON category settings.
+pub(super) struct CategoryTextEditor {
+    pub(super) id: SettingId,
+    editor: VimEditor,
+    pub(super) error: Option<String>,
+}
+
+impl CategoryTextEditor {
+    fn new(id: SettingId, text: String, vim_enabled: bool) -> Self {
+        Self {
+            id,
+            editor: VimEditor::new(&text, vim_enabled),
+            error: None,
+        }
+    }
+
+    fn text(&self) -> &str {
+        self.editor.text()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_text_for_test(&mut self, text: String) {
+        self.editor = VimEditor::new(&text, false);
+    }
+
+    pub(super) fn paste(&mut self, text: &str) {
+        self.editor.paste(text);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> VimEditorOutcome {
+        self.editor.handle_key(key)
+    }
+
+    fn render(&self, frame: &mut Frame, area: Rect) {
+        let title = match &self.error {
+            Some(error) => format!("editing {} - {error}", self.id.label()),
+            None => format!("editing {}", self.id.label()),
+        };
+        self.editor.render(
+            frame,
+            area,
+            title,
+            "ctrl+s: save  ctrl+g: editor  enter: newline  esc: cancel",
+        );
+    }
+}
+
+fn long_text_setting(id: SettingId) -> bool {
+    matches!(
+        id,
+        SettingId::CompactPrompt
+            | SettingId::InjectionCheckPrompt
+            | SettingId::PreflightPrompt
+            | SettingId::CommandProfileWrappers
+            | SettingId::CommandProfileCustomProfiles
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1112,28 +1344,24 @@ impl CategoryPage {
             cursor: 0,
             editing: None,
             buf: TextField::default(),
+            text_editor: None,
+            path_editor: None,
+            pending_external_edit: None,
             status: None,
             reset: ResetButton::default(),
             pending_mouse_capture: None,
             utility_picker: None,
             utility_picker_target: None,
-            pkg_suggest: DirSuggestState::default(),
             shadowed_global: None,
         }
     }
 
-    /// Re-derive the packages-dir suggestions from the current buffer.
-    pub(super) fn refresh_pkg_suggest(&mut self, cwd: &std::path::Path) {
-        self.pkg_suggest.entries = suggest_dirs(cwd, self.buf.text());
-        self.pkg_suggest.selected = 0;
-        self.pkg_suggest.scroll = 0;
+    pub(super) fn is_path_editing(&self) -> bool {
+        self.path_editor.is_some()
     }
 
-    /// True while inline-editing the packages-dir field, so the dialog's
-    /// top-level Tab→Down rewrite leaves Tab alone (Tab accepts a
-    /// suggestion here).
-    pub(super) fn is_editing_packages_dir(&self) -> bool {
-        self.editing == Some(SettingId::PackagesDir)
+    pub(super) fn is_editing(&self) -> bool {
+        self.editing.is_some() || self.text_editor.is_some() || self.path_editor.is_some()
     }
 
     /// The setting ids in display order (headings filtered out). Index `i`
@@ -1161,11 +1389,6 @@ impl CategoryPage {
         self.category
             .reset_label()
             .map(|_| self.setting_ids().len())
-    }
-
-    /// True while a text/number field is being edited inline.
-    pub(super) fn is_editing(&self) -> bool {
-        self.editing.is_some()
     }
 }
 
@@ -1689,7 +1912,125 @@ impl SettingsDialog {
         self.apply_nav(page, nav)
     }
 
+    pub(super) fn take_pending_category_external_edit(&mut self) -> Option<PathBuf> {
+        let Page::Category(p) = &mut self.page else {
+            return None;
+        };
+        p.pending_external_edit.as_mut()?.service_path()
+    }
+
+    pub(super) fn finish_category_external_edit(&mut self, editor_error: Option<String>) {
+        let cat = match &self.page {
+            Page::Category(p) => p.category,
+            _ => return,
+        };
+        let placeholder = Page::Category(Box::new(CategoryPage::new(cat)));
+        let mut page = std::mem::replace(&mut self.page, placeholder);
+        if let Page::Category(p) = &mut page {
+            self.finish_category_page_external_edit(p, editor_error);
+        }
+        self.page = page;
+    }
+
+    fn finish_category_page_external_edit(
+        &mut self,
+        p: &mut CategoryPage,
+        editor_error: Option<String>,
+    ) {
+        let Some(pending) = p.pending_external_edit.take() else {
+            return;
+        };
+        if let Some(err) = editor_error {
+            match pending.source {
+                CategoryExternalSource::TextEditor => {
+                    if let Some(editor) = p.text_editor.as_mut() {
+                        editor.error = Some(err);
+                    } else {
+                        p.status = Some(err);
+                    }
+                }
+                CategoryExternalSource::PathEditor
+                | CategoryExternalSource::Inline
+                | CategoryExternalSource::Cursor => {
+                    p.status = Some(err);
+                }
+            }
+            return;
+        }
+
+        let raw = match std::fs::read_to_string(pending.path.as_ref() as &std::path::Path) {
+            Ok(text) => text,
+            Err(e) => {
+                p.status = Some(format!("editor: failed to read temp file back: {e}"));
+                return;
+            }
+        };
+        let without_lf = raw.strip_suffix('\n').unwrap_or(&raw);
+        let text = without_lf
+            .strip_suffix('\r')
+            .unwrap_or(without_lf)
+            .to_string();
+        let id = pending.id;
+        match self.commit_category_text(id, &text) {
+            Ok(()) => {
+                p.editing = None;
+                p.text_editor = None;
+                p.path_editor = None;
+                p.status = None;
+                self.finish_category_save(id, p);
+            }
+            Err(reason) => {
+                self.restore_category_external_edit(p, id, text, pending.source, reason);
+            }
+        }
+    }
+
+    fn restore_category_external_edit(
+        &mut self,
+        p: &mut CategoryPage,
+        id: SettingId,
+        text: String,
+        source: CategoryExternalSource,
+        reason: String,
+    ) {
+        if matches!(source, CategoryExternalSource::TextEditor)
+            || matches!(source, CategoryExternalSource::Cursor) && long_text_setting(id)
+        {
+            let mut editor =
+                CategoryTextEditor::new(id, text, self.extended.tui.vim_mode.vim_enabled());
+            editor.error = Some(reason);
+            p.text_editor = Some(editor);
+            p.path_editor = None;
+            p.editing = None;
+            p.status = None;
+            return;
+        }
+
+        if matches!(source, CategoryExternalSource::PathEditor)
+            || matches!(source, CategoryExternalSource::Cursor) && path_setting_mode(id).is_some()
+        {
+            let cwd = self.agents_cwd();
+            if let Some(mode) = path_setting_mode(id) {
+                p.path_editor = Some(CategoryPathEditor::new(id, text, mode, &cwd));
+                p.text_editor = None;
+                p.editing = None;
+                p.status = Some(reason);
+                return;
+            }
+        }
+
+        p.buf = TextField::new(text);
+        p.editing = Some(id);
+        p.text_editor = None;
+        p.path_editor = None;
+        p.status = Some(reason);
+    }
+
     fn handle_category_page_key(&mut self, key: KeyEvent, p: &mut CategoryPage) -> Nav {
+        if p.pending_external_edit.is_some() {
+            return Nav::Stay;
+        }
+
         if let Some(prompt) = p.shadowed_global.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -1714,6 +2055,126 @@ impl SettingsDialog {
             return Nav::Stay;
         }
 
+        // Path editor owns input until save/cancel.
+        if let Some(mut editor) = p.path_editor.take() {
+            let cwd = self.agents_cwd();
+            match key.code {
+                KeyCode::Char('g') if is_ctrl_g(key) => {
+                    match CategoryExternalEdit::new(
+                        editor.id,
+                        editor.text(),
+                        CategoryExternalSource::PathEditor,
+                    ) {
+                        Ok(request) => {
+                            p.pending_external_edit = Some(request);
+                            p.status = Some("opening $EDITOR...".into());
+                        }
+                        Err(reason) => p.status = Some(reason),
+                    }
+                    p.path_editor = Some(editor);
+                }
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let id = editor.id;
+                    let raw = editor.text().to_string();
+                    match self.commit_category_text(id, &raw) {
+                        Ok(()) => {
+                            p.status = None;
+                            self.finish_category_save(id, p);
+                        }
+                        Err(reason) => {
+                            p.status = Some(reason);
+                            p.path_editor = Some(editor);
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') if !editor.suggest.entries.is_empty() => {
+                    let n = editor.suggest.entries.len();
+                    editor.suggest.selected =
+                        crate::tui::nav::wrap_prev(editor.suggest.selected, n);
+                    editor.suggest.scroll = crate::tui::app::windowed_scroll(
+                        editor.suggest.selected,
+                        editor.suggest.scroll,
+                        n,
+                        DIR_SUGGEST_WINDOW,
+                    );
+                    p.path_editor = Some(editor);
+                }
+                KeyCode::Down | KeyCode::Char('j') if !editor.suggest.entries.is_empty() => {
+                    let n = editor.suggest.entries.len();
+                    editor.suggest.selected =
+                        crate::tui::nav::wrap_next(editor.suggest.selected, n);
+                    editor.suggest.scroll = crate::tui::app::windowed_scroll(
+                        editor.suggest.selected,
+                        editor.suggest.scroll,
+                        n,
+                        DIR_SUGGEST_WINDOW,
+                    );
+                    p.path_editor = Some(editor);
+                }
+                KeyCode::Tab => {
+                    if let Some(entry) = editor.suggest.entries.get(editor.suggest.selected) {
+                        editor.accept(entry.replacement.clone(), &cwd);
+                    }
+                    p.path_editor = Some(editor);
+                }
+                KeyCode::Right if editor.suggest.ghost_for(editor.text()).is_some() => {
+                    if let Some(top) = editor.suggest.entries.first() {
+                        editor.accept(top.replacement.clone(), &cwd);
+                    }
+                    p.path_editor = Some(editor);
+                }
+                _ => {
+                    editor.buf.handle_key(key);
+                    editor.refresh(&cwd);
+                    p.path_editor = Some(editor);
+                }
+            }
+            return Nav::Stay;
+        }
+
+        // Full-area long text / JSON editor owns input until save/cancel.
+        if let Some(mut editor) = p.text_editor.take() {
+            match editor.handle_key(key) {
+                VimEditorOutcome::Stay => {
+                    p.text_editor = Some(editor);
+                }
+                VimEditorOutcome::Save => {
+                    let id = editor.id;
+                    let raw = editor.text().to_string();
+                    match self.commit_category_text(id, &raw) {
+                        Ok(()) => {
+                            p.status = None;
+                            self.finish_category_save(id, p);
+                        }
+                        Err(reason) => {
+                            editor.error = Some(reason);
+                            p.text_editor = Some(editor);
+                        }
+                    }
+                }
+                VimEditorOutcome::Cancel => {
+                    p.status = None;
+                }
+                VimEditorOutcome::ExternalEdit => {
+                    match CategoryExternalEdit::new(
+                        editor.id,
+                        editor.text(),
+                        CategoryExternalSource::TextEditor,
+                    ) {
+                        Ok(request) => {
+                            p.pending_external_edit = Some(request);
+                            p.status = Some("opening $EDITOR...".into());
+                            editor.error = None;
+                        }
+                        Err(reason) => editor.error = Some(reason),
+                    }
+                    p.text_editor = Some(editor);
+                }
+            }
+            return Nav::Stay;
+        }
+
         // Utility-model picker overlay owns input while open.
         if p.utility_picker.is_some() {
             self.handle_category_utility_picker_key(key, p);
@@ -1722,20 +2183,25 @@ impl SettingsDialog {
 
         // Inline text/number edit owns input until Enter/Esc.
         if let Some(id) = p.editing {
-            // Packages-dir directory autosuggest: Tab accepts the highlighted
-            // dropdown entry, → accepts the inline ghost, and arrows navigate
-            // the dropdown — all keeping the field in edit mode. Enter always
-            // falls through to the generic save.
-            if id == SettingId::PackagesDir && self.handle_pkg_suggest_key(key, p) {
-                return Nav::Stay;
-            }
             match key.code {
+                KeyCode::Char('g') if is_ctrl_g(key) && category_external_editable(id) => {
+                    match CategoryExternalEdit::new(
+                        id,
+                        p.buf.text(),
+                        CategoryExternalSource::Inline,
+                    ) {
+                        Ok(request) => {
+                            p.pending_external_edit = Some(request);
+                            p.status = Some("opening $EDITOR...".into());
+                        }
+                        Err(reason) => p.status = Some(reason),
+                    }
+                }
                 KeyCode::Enter => {
                     let raw = p.buf.text().to_string();
                     match self.commit_category_text(id, &raw) {
                         Ok(()) => {
                             p.editing = None;
-                            p.pkg_suggest.clear();
                             self.finish_category_save(id, p);
                         }
                         Err(reason) => {
@@ -1746,15 +2212,10 @@ impl SettingsDialog {
                 }
                 KeyCode::Esc => {
                     p.editing = None;
-                    p.pkg_suggest.clear();
                     p.status = None;
                 }
                 _ => {
                     p.buf.handle_key(key);
-                    if id == SettingId::PackagesDir {
-                        let cwd = self.agents_cwd();
-                        p.refresh_pkg_suggest(&cwd);
-                    }
                 }
             }
             return Nav::Stay;
@@ -1762,6 +2223,20 @@ impl SettingsDialog {
 
         let nav_len = p.nav_len();
         match key.code {
+            KeyCode::Char('g') if is_ctrl_g(key) => {
+                if let Some(id) = p.setting_ids().get(p.cursor).copied()
+                    && category_external_editable(id)
+                {
+                    let seed = self.category_edit_seed(id);
+                    match CategoryExternalEdit::new(id, &seed, CategoryExternalSource::Cursor) {
+                        Ok(request) => {
+                            p.pending_external_edit = Some(request);
+                            p.status = Some("opening $EDITOR...".into());
+                        }
+                        Err(reason) => p.status = Some(reason),
+                    }
+                }
+            }
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Back;
@@ -1797,13 +2272,25 @@ impl SettingsDialog {
                         self.finish_category_save(id, p);
                     }
                     ActionKind::EditText => {
-                        p.buf = TextField::new(self.category_edit_seed(id));
-                        p.editing = Some(id);
-                        p.status = None;
-                        if id == SettingId::PackagesDir {
+                        let seed = self.category_edit_seed(id);
+                        if let Some(mode) = path_setting_mode(id) {
                             let cwd = self.agents_cwd();
-                            p.refresh_pkg_suggest(&cwd);
+                            p.path_editor = Some(CategoryPathEditor::new(id, seed, mode, &cwd));
+                            p.text_editor = None;
+                            p.editing = None;
+                        } else if long_text_setting(id) {
+                            p.text_editor = Some(CategoryTextEditor::new(
+                                id,
+                                seed,
+                                self.extended.tui.vim_mode.vim_enabled(),
+                            ));
+                            p.path_editor = None;
+                            p.editing = None;
+                        } else {
+                            p.buf = TextField::new(seed);
+                            p.editing = Some(id);
                         }
+                        p.status = None;
                     }
                     ActionKind::Drill => {
                         return self.drill_category_setting(id, p);
@@ -2346,65 +2833,30 @@ impl SettingsDialog {
             }
         }
     }
+}
 
-    /// Autosuggest key handling for the packages-dir field. Returns `true`
-    /// when the key was an autosuggest action (dropdown navigation, accept a
-    /// dropdown entry, or accept the inline ghost) so the caller stops;
-    /// `false` to fall through to generic field handling.
-    fn handle_pkg_suggest_key(&mut self, key: KeyEvent, p: &mut CategoryPage) -> bool {
-        let n = p.pkg_suggest.entries.len();
-        match key.code {
-            KeyCode::Up if n > 0 => {
-                p.pkg_suggest.selected = crate::tui::nav::wrap_prev(p.pkg_suggest.selected, n);
-                p.pkg_suggest.scroll = crate::tui::app::windowed_scroll(
-                    p.pkg_suggest.selected,
-                    p.pkg_suggest.scroll,
-                    n,
-                    DIR_SUGGEST_WINDOW,
-                );
-                true
-            }
-            KeyCode::Down if n > 0 => {
-                p.pkg_suggest.selected = crate::tui::nav::wrap_next(p.pkg_suggest.selected, n);
-                p.pkg_suggest.scroll = crate::tui::app::windowed_scroll(
-                    p.pkg_suggest.selected,
-                    p.pkg_suggest.scroll,
-                    n,
-                    DIR_SUGGEST_WINDOW,
-                );
-                true
-            }
-            // Tab accepts the highlighted dropdown entry; with no dropdown it
-            // is consumed (so it never inserts a literal tab).
-            KeyCode::Tab => {
-                if let Some(entry) = p.pkg_suggest.entries.get(p.pkg_suggest.selected) {
-                    let replacement = entry.replacement.clone();
-                    self.accept_pkg_suggestion(p, replacement);
-                }
-                true
-            }
-            // → accepts the inline ghost, but only at end-of-buffer.
-            KeyCode::Right
-                if p.buf.cursor() == p.buf.text().len()
-                    && p.pkg_suggest.ghost_for(p.buf.text()).is_some() =>
-            {
-                if let Some(top) = p.pkg_suggest.entries.first() {
-                    let replacement = top.replacement.clone();
-                    self.accept_pkg_suggestion(p, replacement);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
+fn is_ctrl_g(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('g')) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
 
-    /// Replace the packages-dir buffer with an accepted suggestion, stay in
-    /// edit mode, and re-derive suggestions so the user can keep drilling.
-    fn accept_pkg_suggestion(&mut self, p: &mut CategoryPage, replacement: String) {
-        p.buf.set(replacement);
-        let cwd = self.agents_cwd();
-        p.refresh_pkg_suggest(&cwd);
-    }
+fn numeric_text_setting(id: SettingId) -> bool {
+    matches!(
+        id,
+        SettingId::ExitTailLines
+            | SettingId::LoopGuardThreshold
+            | SettingId::MaxPrimaryRounds
+            | SettingId::ScheduleMaxConcurrent
+            | SettingId::DelegationMaxParallel
+            | SettingId::SwarmMaxDepth
+            | SettingId::SwarmMaxConcurrency
+            | SettingId::DialogLockoutMs
+            | SettingId::TimeInjectionInterval
+            | SettingId::RedactMinSecretLength
+    )
+}
+
+fn category_external_editable(id: SettingId) -> bool {
+    matches!(id.action(), ActionKind::EditText) && !numeric_text_setting(id)
 }
 
 /// Parse a `>= min` `u32`, rejecting blank/non-numeric/below-floor input.
@@ -2536,6 +2988,16 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
 
 impl SettingsDialog {
     pub(super) fn render_category_page(&self, frame: &mut Frame, area: Rect, p: &CategoryPage) {
+        if let Some(editor) = &p.path_editor {
+            editor.render(frame, area);
+            return;
+        }
+
+        if let Some(editor) = &p.text_editor {
+            editor.render(frame, area);
+            return;
+        }
+
         if let Some(picker) = &p.utility_picker {
             self.render_utility_picker(frame, area, picker);
             return;
@@ -2577,15 +3039,27 @@ impl SettingsDialog {
                     if on_cursor {
                         selected_line = lines.len();
                     }
-                    push_label_value_row(
-                        &mut lines,
-                        settings_area.width,
-                        on_cursor,
-                        id.label(),
-                        label_w,
-                        &self.category_value(*id),
-                        muted_style(),
-                    );
+                    if p.editing == Some(*id) {
+                        push_label_text_field_row(
+                            &mut lines,
+                            settings_area.width,
+                            on_cursor,
+                            id.label(),
+                            label_w,
+                            p.buf.text(),
+                            p.buf.cursor(),
+                        );
+                    } else {
+                        push_label_value_row(
+                            &mut lines,
+                            settings_area.width,
+                            on_cursor,
+                            id.label(),
+                            label_w,
+                            &self.category_value(*id),
+                            muted_style(),
+                        );
+                    }
                     sel += 1;
                 }
             }
@@ -2600,66 +3074,6 @@ impl SettingsDialog {
                 p.reset
                     .render_line(Some(p.cursor) == p.reset_cursor(), label),
             );
-        }
-
-        if let Some(id) = p.editing {
-            lines.push(Line::default());
-            selected_line = lines.len();
-            push_text_field_at_cursor(
-                &mut lines,
-                settings_area.width,
-                id.label(),
-                p.buf.text(),
-                p.buf.cursor(),
-                true,
-                None,
-            );
-
-            if id == SettingId::PackagesDir
-                && let Some(ghost) = p.pkg_suggest.ghost_for(p.buf.text())
-                && let Some(last) = lines.last_mut()
-            {
-                last.spans.push(Span::styled(
-                    ghost.to_string(),
-                    muted_style().add_modifier(Modifier::DIM),
-                ));
-            }
-
-            if id == SettingId::PackagesDir && !p.pkg_suggest.entries.is_empty() {
-                let entries = &p.pkg_suggest.entries;
-                for (i, entry) in entries
-                    .iter()
-                    .enumerate()
-                    .skip(p.pkg_suggest.scroll)
-                    .take(DIR_SUGGEST_WINDOW)
-                {
-                    let active = i == p.pkg_suggest.selected;
-                    lines.push(Line::from(vec![
-                        Span::raw(format!("  {}", super::shell::marker(active))),
-                        Span::styled(
-                            format!("{}/", entry.name),
-                            if active {
-                                selected_style()
-                            } else {
-                                Style::default()
-                            },
-                        ),
-                    ]));
-                }
-                if entries.len() > DIR_SUGGEST_WINDOW {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "  ... {} more (up/down to scroll)",
-                            entries.len() - DIR_SUGGEST_WINDOW
-                        ),
-                        muted_style(),
-                    )));
-                }
-                lines.push(Line::from(Span::styled(
-                    "  tab/enter: accept  tab/right: complete  esc: cancel".to_string(),
-                    muted_style(),
-                )));
-            }
         }
 
         if let Some(status) = &p.status {

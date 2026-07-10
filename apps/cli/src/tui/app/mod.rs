@@ -3090,6 +3090,7 @@ impl App {
             self.maybe_service_new_session(terminal)?;
             self.maybe_service_external_edit(terminal)?;
             self.maybe_service_agent_file_edit(terminal)?;
+            self.maybe_service_category_setting_edit(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
             self.start_startup_background_tasks();
             // The composer is the user's active input surface this frame iff
@@ -4156,6 +4157,36 @@ impl App {
             )),
         };
         self.dialog.finish_agent_edit(editor_error);
+        Ok(())
+    }
+
+    /// A category setting requested a `$EDITOR` round trip against a private
+    /// tempfile. The dialog owns the temp path and validation; the app only
+    /// suspends the terminal and reports process success/failure.
+    pub(super) fn maybe_service_category_setting_edit(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<()> {
+        let Some(path) = self.dialog.take_pending_category_setting_edit() else {
+            return Ok(());
+        };
+
+        let Some(editor) = std::env::var_os("EDITOR") else {
+            self.dialog
+                .finish_category_setting_edit(Some("$EDITOR is no longer set".to_string()));
+            return Ok(());
+        };
+
+        let status = Self::run_external_editor_command(terminal, &editor, &path)?;
+        let editor_error = match status {
+            Ok(s) if s.success() => None,
+            Ok(s) => Some(format!("editor exited with {s} - value left unchanged")),
+            Err(e) => Some(format!(
+                "invoking `{}`: {e} - value left unchanged",
+                editor.to_string_lossy()
+            )),
+        };
+        self.dialog.finish_category_setting_edit(editor_error);
         Ok(())
     }
 

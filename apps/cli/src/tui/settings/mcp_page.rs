@@ -25,8 +25,8 @@ use crate::tui::textfield::TextField;
 
 use super::secret_display;
 use super::shell::{
-    error_style, marker, muted_style, push_text_field, selected_line_from_marker, selected_style,
-    warning_style,
+    error_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
+    selected_style, warning_style,
 };
 use super::{Nav, Page, SettingsDialog, save_button_line, save_status};
 
@@ -509,11 +509,12 @@ impl SettingsDialog {
             Line::from(""),
             Line::from(Span::styled("Server", muted_style())),
         ];
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "name",
             s.name.text(),
+            s.name.cursor(),
             s.cursor == FIELD_NAME,
             None,
         );
@@ -541,35 +542,39 @@ impl SettingsDialog {
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Connection", muted_style())));
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "endpoint",
             s.endpoint.text(),
+            s.endpoint.cursor(),
             s.cursor == FIELD_ENDPOINT,
             Some("remote transports"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "command",
             s.command.text(),
+            s.command.cursor(),
             s.cursor == FIELD_COMMAND,
             Some("stdio"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "args",
             s.args.text(),
+            s.args.cursor(),
             s.cursor == FIELD_ARGS,
             Some("stdio, space separated"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "base env",
             s.base_env.text(),
+            s.base_env.cursor(),
             s.cursor == FIELD_BASE_ENV,
             Some("stdio env, one KEY=VALUE per row"),
         );
@@ -586,85 +591,95 @@ impl SettingsDialog {
                 },
             ),
         ]));
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "header name",
             s.header_name.text(),
+            s.header_name.cursor(),
             s.cursor == FIELD_HEADER_NAME,
             Some("remote header auth"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "header value",
             s.header_value.text(),
+            s.header_value.cursor(),
             s.cursor == FIELD_HEADER_VALUE,
             Some("literal stored in credentials, or $ENV"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "auth env",
             s.auth_env.text(),
+            s.auth_env.cursor(),
             s.cursor == FIELD_AUTH_ENV,
             Some("stdio env auth, one KEY=VALUE per row"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "oauth authorize",
             s.oauth_authorize_url.text(),
+            s.oauth_authorize_url.cursor(),
             s.cursor == FIELD_OAUTH_AUTHORIZE,
             None,
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "oauth token",
             s.oauth_token_url.text(),
+            s.oauth_token_url.cursor(),
             s.cursor == FIELD_OAUTH_TOKEN,
             None,
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "oauth client id",
             s.oauth_client_id.text(),
+            s.oauth_client_id.cursor(),
             s.cursor == FIELD_OAUTH_CLIENT,
             None,
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "oauth scopes",
             s.oauth_scopes.text(),
+            s.oauth_scopes.cursor(),
             s.cursor == FIELD_OAUTH_SCOPES,
             Some("space separated"),
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Behavior", muted_style())));
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "cache ttl",
             s.cache_ttl_secs.text(),
+            s.cache_ttl_secs.cursor(),
             s.cursor == FIELD_CACHE_TTL,
             Some("seconds"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "connect timeout",
             s.connect_timeout_secs.text(),
+            s.connect_timeout_secs.cursor(),
             s.cursor == FIELD_CONNECT_TIMEOUT,
             Some("seconds, remote"),
         );
-        push_text_field(
+        push_text_field_at_cursor(
             &mut lines,
             area.width,
             "request timeout",
             s.request_timeout_secs.text(),
+            s.request_timeout_secs.cursor(),
             s.cursor == FIELD_REQUEST_TIMEOUT,
             Some("seconds, remote"),
         );

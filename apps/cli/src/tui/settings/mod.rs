@@ -499,6 +499,24 @@ impl Dialog {
         }
     }
 
+    /// Drain a pending category setting `$EDITOR` request. The category page
+    /// retains the temp path until [`Self::finish_category_setting_edit`] reads
+    /// it back and drops it.
+    pub fn take_pending_category_setting_edit(&mut self) -> Option<PathBuf> {
+        let Dialog::Settings(s) = self else {
+            return None;
+        };
+        s.take_pending_category_external_edit()
+    }
+
+    /// Apply the result of a category-setting `$EDITOR` round trip.
+    pub fn finish_category_setting_edit(&mut self, editor_error: Option<String>) {
+        let Dialog::Settings(s) = self else {
+            return;
+        };
+        s.finish_category_external_edit(editor_error);
+    }
+
     /// Called by the event loop each tick so async fetches can apply
     /// their results.
     pub fn tick(&mut self) {
@@ -1000,7 +1018,7 @@ impl SettingsDialog {
     /// there Tab accepts a directory suggestion, so the field-nav Tab→Down
     /// rewrite in [`Self::handle_key`] must leave Tab alone.
     fn in_pkg_dir_autosuggest(&self) -> bool {
-        matches!(&self.page, Page::Category(p) if p.is_editing_packages_dir())
+        matches!(&self.page, Page::Category(p) if p.is_path_editing())
     }
 
     /// Insert pasted text into the page's focused text field, mirroring the
@@ -1042,18 +1060,19 @@ impl SettingsDialog {
                 }
             },
             Page::Category(p) => {
-                // Utility-model picker overlay owns input while open; else the
-                // inline field, refreshing the packages-dir autosuggest as a
-                // typed char would.
-                if let Some(picker) = p.utility_picker.as_mut() {
+                // Full-area editor and utility-model picker own input before
+                // the inline field, refreshing the packages-dir autosuggest as
+                // a typed char would.
+                if let Some(editor) = p.path_editor.as_mut() {
+                    editor.paste(text, &cwd);
+                } else if let Some(editor) = p.text_editor.as_mut() {
+                    editor.paste(text);
+                } else if let Some(picker) = p.utility_picker.as_mut() {
                     if let Some(field) = picker.active_text_field() {
                         field.paste(text);
                     }
-                } else if let Some(id) = p.editing {
+                } else if p.editing.is_some() {
                     p.buf.paste(text);
-                    if id == category::SettingId::PackagesDir {
-                        p.refresh_pkg_suggest(&cwd);
-                    }
                 }
             }
             Page::Instructions(p) => {
@@ -1513,6 +1532,9 @@ impl SettingsDialog {
             Page::Mcp(p) => self.render_mcp_page(frame, layout[0], p),
             Page::Lsp(p) => self.render_lsp_page(frame, layout[0], p),
             Page::Providers(p) => self.render_providers_page(frame, layout[0], p),
+        }
+        if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
+            frame.set_cursor_position(cursor);
         }
         frame.render_widget(help_line(self.help_text()), layout[1]);
     }
@@ -2024,10 +2046,17 @@ fn lsp_edit_row<T: ToString>(
     value: T,
 ) -> Line<'static> {
     if p.editing == Some(edit) {
+        let selected = idx == p.cursor;
         let text = p.buf.text();
         let cursor = shell::clamp_to_char_boundary(text, p.buf.cursor());
         let (before, after) = text.split_at(cursor);
-        lsp_row(idx, p.cursor, label, format!("{before}▎{after}"))
+        Line::from(vec![
+            Span::raw(marker(selected)),
+            Span::styled(format!("{label:<24}"), selected_or_field(selected)),
+            Span::styled(before.to_string(), muted_style()),
+            shell::cursor_marker_span(),
+            Span::styled(after.to_string(), muted_style()),
+        ])
     } else {
         lsp_row(idx, p.cursor, label, value.to_string())
     }
@@ -2304,7 +2333,8 @@ mod tests {
     use crate::config::providers::{ModelEntry, ProviderEntry};
     use providers::{FetchAllState, valid_url};
     use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{Backend, TestBackend};
+    use std::collections::BTreeMap;
 
     fn entry(id_models: &[&str]) -> ProviderEntry {
         ProviderEntry {
@@ -2489,6 +2519,54 @@ mod tests {
             modifiers: KeyModifiers::empty(),
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
+        }
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EditorEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EditorEnv {
+        fn with(value: Option<&str>) -> Self {
+            let guard = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("EDITOR");
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("EDITOR", v),
+                    None => std::env::remove_var("EDITOR"),
+                }
+            }
+            Self {
+                _guard: guard,
+                prev,
+            }
+        }
+
+        fn unset() -> Self {
+            Self::with(None)
+        }
+    }
+
+    impl Drop for EditorEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("EDITOR", v),
+                    None => std::env::remove_var("EDITOR"),
+                }
+            }
         }
     }
 
@@ -2745,7 +2823,7 @@ mod tests {
 
         let rows = render_settings_rows(&d, 100, 30).join("\n");
 
-        assert!(rows.contains("12▎34"), "{rows}");
+        assert!(rows.contains("12 34"), "{rows}");
     }
 
     #[test]
@@ -2874,9 +2952,17 @@ mod tests {
     #[test]
     fn shared_single_line_field_and_text_area_render_caret_and_hint() {
         let mut lines = Vec::new();
-        shell::push_text_field(&mut lines, 24, "name", "alpha", true, None);
+        shell::push_text_field_at_cursor(
+            &mut lines,
+            24,
+            "name",
+            "alpha",
+            "alpha".len(),
+            true,
+            None,
+        );
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("name: alpha▎"));
+        assert!(rendered.contains("name: alpha\u{E000}"));
 
         let area = shell::text_area_lines(
             "editing agent".to_string(),
@@ -2887,7 +2973,7 @@ mod tests {
         );
         let rendered = area.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("ctrl+s: save  enter: newline  esc: cancel"));
-        assert!(rendered.contains("t▎wo"));
+        assert!(rendered.contains("t\u{E000}wo"));
     }
 
     #[test]
@@ -2936,10 +3022,14 @@ mod tests {
         );
         d.handle_key(press(KeyCode::Enter));
         if let Page::Category(p) = &mut d.page {
-            p.buf
-                .set(r#"{"just ci":["rust_toolchain","node_package_manager"]}"#.to_string());
+            p.text_editor
+                .as_mut()
+                .expect("wrappers editor")
+                .set_text_for_test(
+                    r#"{"just ci":["rust_toolchain","node_package_manager"]}"#.to_string(),
+                );
         }
-        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(ctrl('s'));
         let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
         assert_eq!(
             reloaded.command_resource_profiles.wrappers["just ci"],
@@ -2956,11 +3046,14 @@ mod tests {
         );
         d.handle_key(press(KeyCode::Enter));
         if let Page::Category(p) = &mut d.page {
-            p.buf.set(
-                r#"{"terraform_toolchain":{"commands":["terraform"],"roots":[{"kind":"terraform_plugin_cache","path":".terraform","withinCwd":true}]}}"#.to_string(),
-            );
+            p.text_editor
+                .as_mut()
+                .expect("profiles editor")
+                .set_text_for_test(
+                    r#"{"terraform_toolchain":{"commands":["terraform"],"roots":[{"kind":"terraform_plugin_cache","path":".terraform","withinCwd":true}]}}"#.to_string(),
+                );
         }
-        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(ctrl('s'));
         let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
         let profile = &reloaded.command_resource_profiles.profiles["terraform_toolchain"];
         assert_eq!(profile.commands, vec!["terraform".to_string()]);
@@ -3049,13 +3142,132 @@ mod tests {
     }
 
     #[test]
+    fn category_ctrl_g_focused_prose_setting_round_trips_and_commits() {
+        use crate::config::extended::ExtendedConfigDoc;
+
+        let _env = EditorEnv::with(Some("true"));
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        open_category_on(&mut d, Category::Behavior, SettingId::CompactPrompt);
+        d.handle_key(ctrl('g'));
+        let path = d
+            .take_pending_category_external_edit()
+            .expect("category external edit should be pending");
+        assert!(d.take_pending_category_external_edit().is_none());
+        std::fs::write(&path, "external compact prompt\n").unwrap();
+        d.finish_category_external_edit(None);
+
+        assert_eq!(
+            d.extended.compact_prompt.as_deref(),
+            Some("external compact prompt")
+        );
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(
+            reloaded.compact_prompt.as_deref(),
+            Some("external compact prompt")
+        );
+    }
+
+    #[test]
+    fn category_ctrl_g_ignores_numeric_settings_and_reports_missing_editor() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+
+        let _env = EditorEnv::with(Some("true"));
+        open_category_on(&mut d, Category::Behavior, SettingId::ScheduleMaxConcurrent);
+        d.handle_key(ctrl('g'));
+        assert!(d.take_pending_category_external_edit().is_none());
+
+        drop(_env);
+        let _env = EditorEnv::unset();
+        open_category_on(&mut d, Category::Behavior, SettingId::CompactPrompt);
+        d.handle_key(ctrl('g'));
+        assert!(d.take_pending_category_external_edit().is_none());
+        match &d.page {
+            Page::Category(p) => {
+                assert_eq!(p.status.as_deref(), Some("No $EDITOR environment variable"))
+            }
+            _ => panic!("not on category page"),
+        }
+    }
+
+    #[test]
+    fn mcp_add_form_renders_cursor_at_textfield_position() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.page = Page::Mcp(McpPage::Add(Box::new(mcp_page::AddState {
+            original_name: None,
+            name: TextField::new("abcd"),
+            endpoint: TextField::default(),
+            command: TextField::default(),
+            args: TextField::default(),
+            base_env: TextField::default(),
+            stored_base_env_refs: BTreeMap::new(),
+            transport: crate::mcp::config::Transport::Streamable,
+            auth: mcp_page::AuthKind::None,
+            header_name: TextField::default(),
+            header_value: TextField::default(),
+            stored_header_credential_ref: None,
+            auth_env: TextField::default(),
+            stored_auth_env_refs: BTreeMap::new(),
+            oauth_authorize_url: TextField::default(),
+            oauth_token_url: TextField::default(),
+            oauth_client_id: TextField::default(),
+            oauth_scopes: TextField::default(),
+            enabled: true,
+            cache_ttl_secs: TextField::new("3600"),
+            connect_timeout_secs: TextField::default(),
+            request_timeout_secs: TextField::default(),
+            cursor: 0,
+            status: None,
+        })));
+        d.handle_key(press(KeyCode::Home));
+        d.handle_key(press(KeyCode::Right));
+        d.handle_key(press(KeyCode::Right));
+        d.handle_key(press(KeyCode::Char('X')));
+
+        let width = 96;
+        let height = 24;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height)))
+            .expect("draw");
+        let rendered: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+        let y = rendered
+            .iter()
+            .position(|row| row.contains("name: abX"))
+            .expect("name row rendered") as u16;
+        let row = &rendered[usize::from(y)];
+        let value_start = row.find("name: ").expect("name label rendered") + "name: ".len();
+        let value_end = row.find("cd").expect("tail rendered") + "cd".len();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(cursor.y, y);
+        assert!(
+            usize::from(cursor.x) > value_start && usize::from(cursor.x) < value_end,
+            "cursor should be inside the edited value, not pinned at the end: row={row:?}, cursor={cursor:?}"
+        );
+    }
+
+    #[test]
     fn behavior_packages_dir_text_edit_persists() {
         use crate::config::extended::ExtendedConfigDoc;
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         open_category_on(&mut d, Category::Behavior, SettingId::PackagesDir);
-        d.handle_key(press(KeyCode::Enter)); // open edit
-        type_chars(&mut d, "/tmp/pkgs");
+        d.handle_key(press(KeyCode::Enter)); // open path editor
+        if let Page::Category(p) = &mut d.page {
+            p.path_editor
+                .as_mut()
+                .expect("packages path editor")
+                .set_text_for_test("/tmp/pkgs".to_string(), tmp.path());
+        }
         d.handle_key(press(KeyCode::Enter)); // commit
         assert_eq!(
             d.extended.packages_directory.as_deref(),
@@ -3108,20 +3320,34 @@ mod tests {
         d.handle_key(press(KeyCode::Enter));
         assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Sandbox);
 
+        let dockerfile = tmp.path().join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM scratch").unwrap();
         open_category_on(&mut d, Category::Privacy, SettingId::SandboxDockerfile);
         d.handle_key(press(KeyCode::Enter));
-        type_chars(&mut d, "/tmp/cockpit.Dockerfile");
+        if let Page::Category(p) = &mut d.page {
+            let editor = p.path_editor.as_mut().expect("dockerfile path editor");
+            editor.set_text_for_test("Dock".to_string(), tmp.path());
+            assert!(
+                editor
+                    .suggest
+                    .entries
+                    .iter()
+                    .any(|entry| !entry.is_dir && entry.name == "Dockerfile"),
+                "file suggestions should include Dockerfile"
+            );
+        }
+        d.handle_key(press(KeyCode::Tab));
         d.handle_key(press(KeyCode::Enter));
         assert_eq!(
             d.extended.sandbox.dockerfile.as_deref(),
-            Some(std::path::Path::new("/tmp/cockpit.Dockerfile"))
+            Some(std::path::Path::new("Dockerfile"))
         );
 
         let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
         assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Sandbox);
         assert_eq!(
             reloaded.sandbox.dockerfile,
-            Some(std::path::PathBuf::from("/tmp/cockpit.Dockerfile"))
+            Some(std::path::PathBuf::from("Dockerfile"))
         );
     }
 
@@ -3908,7 +4134,7 @@ mod tests {
         let (rows, selected_line) = lsp_rows(&d, p);
 
         assert_eq!(selected_line, row_index(LspRow::DebounceMs) + 1);
-        assert!(line_text(&rows[selected_line]).contains("12▎34"));
+        assert!(line_text(&rows[selected_line]).contains("12\u{E000}34"));
     }
 
     #[test]
@@ -4353,7 +4579,7 @@ mod tests {
 
         let rows = render_settings_rows(&d, 80, 20).join("\n");
 
-        assert!(rows.contains("› a▎b"), "{rows}");
+        assert!(rows.contains("› a b"), "{rows}");
     }
 
     #[test]

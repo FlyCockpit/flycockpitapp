@@ -590,7 +590,7 @@ impl SettingsDialog {
                 lines.push(Line::from(vec![
                     Span::styled("› ".to_string(), muted),
                     Span::styled(before.to_string(), Style::default().fg(Color::White)),
-                    Span::styled("▎".to_string(), yellow),
+                    super::shell::cursor_marker_span(),
                     Span::styled(after.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());

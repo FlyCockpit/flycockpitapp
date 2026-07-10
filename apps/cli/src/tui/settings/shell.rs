@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
@@ -14,7 +14,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 pub(super) const SELECTED_MARKER: &str = "▸ ";
 pub(super) const ROW_MARKER_WIDTH: usize = 2;
-pub(super) const CARET: &str = "▎";
+const CURSOR_MARKER: &str = "\u{E000}";
 pub(super) const TEXT_COLUMN_GUTTER_WIDTH: u16 = 2;
 const TEXT_COLUMN_MIN_LEFT_WIDTH: u16 = 34;
 const TEXT_COLUMN_MIN_RIGHT_WIDTH: u16 = 20;
@@ -80,6 +80,26 @@ pub(super) fn inactive_field_style() -> Style {
 
 pub(super) fn caret_style() -> Style {
     Style::default().fg(Color::Yellow)
+}
+
+pub(super) fn cursor_marker_span() -> Span<'static> {
+    Span::styled(CURSOR_MARKER.to_string(), caret_style())
+}
+
+pub(super) fn park_cursor_from_markers(frame: &mut Frame, area: Rect) -> Option<Position> {
+    let mut cursor = None;
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buf.cell_mut((x, y))
+                && cell.symbol() == CURSOR_MARKER
+            {
+                cell.set_symbol(" ");
+                cursor.get_or_insert(Position::new(x, y));
+            }
+        }
+    }
+    cursor
 }
 
 pub(super) fn success_style() -> Style {
@@ -240,23 +260,38 @@ pub(super) fn push_label_value_row(
     );
 }
 
-pub(super) fn push_text_field(
+pub(super) fn push_label_text_field_row(
     lines: &mut Vec<Line<'static>>,
     width: u16,
+    selected: bool,
     label: &str,
+    label_width: usize,
     value: &str,
-    focused: bool,
-    placeholder: Option<&str>,
+    cursor: usize,
 ) {
-    push_text_field_at_cursor(
-        lines,
-        width,
-        label,
-        value,
-        value.len(),
-        focused,
-        placeholder,
-    );
+    let indent = ROW_MARKER_WIDTH + label_width + 2;
+    let value_width = usize::from(width).saturating_sub(indent).max(1);
+    let visible = cursor_visible_slice(value, cursor, value_width);
+    let cursor = clamp_to_char_boundary(value, cursor);
+    let rel_cursor = cursor.saturating_sub(visible.start).min(visible.text.len());
+    let rel_cursor = clamp_to_char_boundary(&visible.text, rel_cursor);
+    let (before, after) = visible.text.split_at(rel_cursor);
+    let mut spans = vec![
+        Span::raw(marker(selected).to_string()),
+        Span::styled(
+            format!("{label:<width$}", width = label_width),
+            selected_or_field(selected),
+        ),
+        Span::raw("  "),
+    ];
+    if visible.text.is_empty() {
+        spans.push(cursor_marker_span());
+    } else {
+        spans.push(Span::styled(before.to_string(), focused_field_style()));
+        spans.push(cursor_marker_span());
+        spans.push(Span::styled(after.to_string(), focused_field_style()));
+    }
+    lines.push(Line::from(spans));
 }
 
 pub(super) fn push_text_field_at_cursor(
@@ -272,7 +307,7 @@ pub(super) fn push_text_field_at_cursor(
     if focused {
         let mut spans = vec![Span::styled(prompt, muted_style())];
         if value.is_empty() {
-            spans.push(Span::styled(CARET.to_string(), caret_style()));
+            spans.push(cursor_marker_span());
             if let Some(placeholder) = placeholder {
                 spans.push(Span::styled(
                     placeholder.to_string(),
@@ -285,7 +320,7 @@ pub(super) fn push_text_field_at_cursor(
         let cursor = clamp_to_char_boundary(value, cursor);
         let (before, after) = value.split_at(cursor);
         spans.push(Span::styled(before.to_string(), focused_field_style()));
-        spans.push(Span::styled(CARET.to_string(), caret_style()));
+        spans.push(cursor_marker_span());
         spans.push(Span::styled(after.to_string(), focused_field_style()));
         lines.push(Line::from(spans));
         return;
@@ -326,6 +361,39 @@ pub(super) fn push_wrapped_text(
     }
 }
 
+struct VisibleSlice {
+    start: usize,
+    text: String,
+}
+
+fn cursor_visible_slice(value: &str, cursor: usize, max_width: usize) -> VisibleSlice {
+    let cursor = clamp_to_char_boundary(value, cursor);
+    let before = &value[..cursor];
+    let mut start = 0;
+    while before[start..].width() >= max_width && start < cursor {
+        let Some((idx, ch)) = before[start..].char_indices().next() else {
+            break;
+        };
+        start += idx + ch.len_utf8();
+    }
+    let start = clamp_to_char_boundary(value, start);
+    let mut end = cursor;
+    while end < value.len() && value[start..end].width() < max_width.saturating_sub(1) {
+        let Some(ch) = value[end..].chars().next() else {
+            break;
+        };
+        let next = end + ch.len_utf8();
+        if value[start..next].width() > max_width {
+            break;
+        }
+        end = next;
+    }
+    VisibleSlice {
+        start,
+        text: value[start..end].to_string(),
+    }
+}
+
 pub(super) fn clamp_to_char_boundary(value: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(value.len());
     while cursor > 0 && !value.is_char_boundary(cursor) {
@@ -360,7 +428,7 @@ pub(super) fn text_area_lines(
             let after: String = chars[split..].iter().collect();
             lines.push(Line::from(vec![
                 Span::styled(before, focused_field_style()),
-                Span::styled(CARET.to_string(), caret_style()),
+                cursor_marker_span(),
                 Span::styled(after, focused_field_style()),
             ]));
         } else {

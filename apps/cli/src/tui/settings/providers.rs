@@ -3711,10 +3711,7 @@ impl SettingsDialog {
             if editor.editing == Some(*field) {
                 let (before, after) = editor.buf.split_at_cursor();
                 spans.push(Span::styled(before.to_string(), value_style));
-                spans.push(Span::styled(
-                    "▎".to_string(),
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(super::shell::cursor_marker_span());
                 spans.push(Span::styled(after.to_string(), value_style));
             } else {
                 spans.push(Span::styled(editor.value_str(*field), value_style));
@@ -4833,10 +4830,7 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
         let cursor = clamp_to_char_boundary(text, field.cursor());
         let (before, after) = text.split_at(cursor);
         spans.push(Span::styled(before.to_string(), value_style));
-        spans.push(Span::styled(
-            "▎".to_string(),
-            Style::default().fg(Color::Yellow),
-        ));
+        spans.push(super::shell::cursor_marker_span());
         spans.push(Span::styled(after.to_string(), value_style));
     } else {
         spans.push(Span::styled(field.text().to_string(), value_style));
@@ -5725,7 +5719,7 @@ mod tests {
 
         render_field_row(&mut lines, "Name", &field, true);
 
-        assert_eq!(line_text(&lines[0]), "▸ Name: al▎pha");
+        assert_eq!(line_text(&lines[0]), "▸ Name: al\u{E000}pha");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
-use super::shell::clamp_to_char_boundary;
+use super::shell::{clamp_to_char_boundary, cursor_marker_span};
 
 /// Marker prefixing the currently-grabbed (held) row. Distinct from the
 /// browse cursor (`▸ `) so a held row reads as "picked up, moving".
@@ -27,9 +27,6 @@ pub(super) const CURSOR_MARKER: &str = "▸ ";
 
 /// Marker prefixing a non-selected row.
 pub(super) const IDLE_MARKER: &str = "  ";
-
-/// Trailing caret drawn after a grabbed row's live text buffer.
-const GRAB_CARET: &str = "▎";
 
 /// Footer hint shown ONLY while a row is grabbed, for the three sites that
 /// reorder the held row with `↑`/`↓` (string-lists, Instructions, redact).
@@ -55,14 +52,13 @@ pub(super) fn grabbed_row_spans(
     cursor: usize,
     empty_hint: &str,
 ) -> Vec<Span<'static>> {
-    let cyan = Style::default().fg(Color::Cyan);
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let cursor = clamp_to_char_boundary(buf_text, cursor);
     let (before, after) = buf_text.split_at(cursor);
     let mut spans = vec![
         Span::raw(GRAB_MARKER),
         Span::styled(before.to_string(), grabbed_style()),
-        Span::styled(GRAB_CARET.to_string(), cyan),
+        cursor_marker_span(),
     ];
     if buf_text.is_empty() {
         spans.push(Span::styled(empty_hint.to_string(), muted));
@@ -92,6 +88,9 @@ mod tests {
 
     #[test]
     fn grabbed_row_spans_render_caret_at_logical_cursor() {
-        assert_eq!(text(grabbed_row_spans("alpha", 2, "empty")), "✥ al▎pha");
+        assert_eq!(
+            text(grabbed_row_spans("alpha", 2, "empty")),
+            "✥ al\u{E000}pha"
+        );
     }
 }

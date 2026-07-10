@@ -32,16 +32,25 @@ const MAX_RESULTS: usize = 200;
 /// directory with hundreds of thousands of children can't stall the UI.
 const MAX_SCAN_ENTRIES: usize = 10_000;
 
-/// One directory suggestion for the dropdown + ghost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathSuggestMode {
+    Directories,
+    FilesAndDirectories,
+}
+
+/// One path suggestion for the dropdown + ghost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirSuggestion {
-    /// The directory's own name (no path), e.g. `src` or `.config`. Shown
-    /// in the dropdown row.
+    /// The entry's own name (no path), e.g. `src`, `.config`, or `Dockerfile`.
+    /// Shown in the dropdown row.
     pub name: String,
+    /// True when the suggestion is a directory. Directories are accepted with a
+    /// trailing `/` so the user can keep drilling deeper; files are accepted as-is.
+    pub is_dir: bool,
     /// The full value to drop into the field when this entry is accepted:
     /// the typed parent literal (as the user wrote it, including any
-    /// leading `~` and the trailing separator) + this dir's name + a
-    /// trailing `/` so the user can keep drilling deeper.
+    /// leading `~` and the trailing separator) + this entry's name, plus a
+    /// trailing `/` for directories.
     pub replacement: String,
 }
 
@@ -120,7 +129,12 @@ fn match_rank(name: &str, prefix_lower: &str) -> Option<u8> {
 /// children, yields an empty vec — never an error or panic. A single
 /// candidate whose name equals the typed prefix exactly is suppressed (it
 /// would be a redundant suggestion identical to the current input).
+#[cfg(test)]
 pub fn suggest_dirs(cwd: &Path, value: &str) -> Vec<DirSuggestion> {
+    suggest_paths(cwd, value, PathSuggestMode::Directories)
+}
+
+pub fn suggest_paths(cwd: &Path, value: &str, mode: PathSuggestMode) -> Vec<DirSuggestion> {
     let (parent_literal, prefix) = split_value(value);
     let dir = resolve_parent(cwd, parent_literal);
     let prefix_lower = prefix.to_ascii_lowercase();
@@ -131,32 +145,30 @@ pub fn suggest_dirs(cwd: &Path, value: &str) -> Vec<DirSuggestion> {
         Err(_) => return Vec::new(),
     };
 
-    // (rank, lowercased name for ordering, original name).
-    let mut scored: Vec<(u8, String, String)> = Vec::new();
+    // (rank, lowercased name for ordering, original name, is_dir).
+    let mut scored: Vec<(u8, String, String, bool)> = Vec::new();
     let mut scanned = 0usize;
     for ent in read.flatten() {
         scanned += 1;
         if scanned > MAX_SCAN_ENTRIES {
             break;
         }
-        // Directories only — resolve type without following symlinks to a
-        // file (a symlink to a dir is still navigable). `file_type` avoids
-        // a stat per entry where the OS already knows; fall back to a stat
-        // for filesystems that report Unknown.
+        // Resolve type without following symlinks to a file unless we need to
+        // know whether the symlink points at a directory.
         let is_dir = match ent.file_type() {
             Ok(ft) if ft.is_dir() => true,
             Ok(ft) if ft.is_symlink() => ent.path().is_dir(),
             Ok(_) => false,
             Err(_) => ent.path().is_dir(),
         };
-        if !is_dir {
+        if !is_dir && mode == PathSuggestMode::Directories {
             continue;
         }
         let name = ent.file_name().to_string_lossy().into_owned();
         let Some(rank) = match_rank(&name, &prefix_lower) else {
             continue;
         };
-        scored.push((rank, name.to_ascii_lowercase(), name));
+        scored.push((rank, name.to_ascii_lowercase(), name, is_dir));
         if scored.len() >= MAX_RESULTS {
             // Stop accumulating, but keep scanning is pointless — bail.
             break;
@@ -179,9 +191,17 @@ pub fn suggest_dirs(cwd: &Path, value: &str) -> Vec<DirSuggestion> {
 
     scored
         .into_iter()
-        .map(|(_, _, name)| {
-            let replacement = format!("{parent_literal}{name}/");
-            DirSuggestion { name, replacement }
+        .map(|(_, _, name, is_dir)| {
+            let replacement = if is_dir {
+                format!("{parent_literal}{name}/")
+            } else {
+                format!("{parent_literal}{name}")
+            };
+            DirSuggestion {
+                name,
+                is_dir,
+                replacement,
+            }
         })
         .collect()
 }
@@ -370,6 +390,22 @@ mod tests {
         }
         let s = suggest_dirs(root.path(), "dir");
         assert!(s.len() <= MAX_RESULTS, "got {}", s.len());
+    }
+
+    #[test]
+    fn files_and_directories_mode_includes_files_without_trailing_separator() {
+        let root = tmp();
+        fs::create_dir(root.path().join("configs")).unwrap();
+        fs::write(root.path().join("Dockerfile"), "FROM scratch").unwrap();
+        let s = suggest_paths(root.path(), "", PathSuggestMode::FilesAndDirectories);
+        let names: Vec<&str> = s.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["configs", "Dockerfile"]);
+        let dockerfile = s.iter().find(|x| x.name == "Dockerfile").unwrap();
+        assert!(!dockerfile.is_dir);
+        assert_eq!(dockerfile.replacement, "Dockerfile");
+        let configs = s.iter().find(|x| x.name == "configs").unwrap();
+        assert!(configs.is_dir);
+        assert_eq!(configs.replacement, "configs/");
     }
 
     #[test]

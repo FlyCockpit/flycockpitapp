@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::config::extended::persist_review_default_participants;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use unicode_width::UnicodeWidthStr;
 
 pub const DIALOG_HEIGHT: u16 = 20;
 
@@ -113,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_lines_render_caret_at_textfield_cursor() {
+    fn prompt_lines_render_text_without_fake_caret() {
         let mut d = dialog();
         d.prompt.set("alpha".to_string());
         d.prompt.handle_key(key(KeyCode::Home));
@@ -127,7 +128,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("focus: al▎pha"), "{rendered}");
+        assert!(rendered.contains("focus: alpha"), "{rendered}");
     }
 
     #[test]
@@ -484,6 +485,12 @@ impl MultireviewDialog {
             Step::Prompt => self.prompt_lines(),
         };
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
+        if matches!(self.step, Step::Prompt) && chunks[0].height > 1 && chunks[0].width > 0 {
+            let (before, _) = self.prompt.split_at_cursor();
+            let col = "focus: ".width() + before.width();
+            let col = col.min(chunks[0].width.saturating_sub(1) as usize) as u16;
+            frame.set_cursor_position(Position::new(chunks[0].x + col, chunks[0].y + 1));
+        }
         let help = self.error.as_deref().unwrap_or(match self.step {
             Step::Sources => "Space toggles, type PR number on PR row, Enter continues",
             Step::Participants => "Space selects once, a selects and persists, Enter continues",
@@ -550,10 +557,6 @@ impl MultireviewDialog {
                     Style::default().fg(ratatui::style::Color::Indexed(MUTED_COLOR_INDEX)),
                 ),
                 Span::raw(before.to_string()),
-                Span::styled(
-                    "▎".to_string(),
-                    Style::default().fg(ratatui::style::Color::Yellow),
-                ),
                 Span::raw(after.to_string()),
             ]),
         ]

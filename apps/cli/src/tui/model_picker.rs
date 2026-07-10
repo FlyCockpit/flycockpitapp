@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -33,6 +33,7 @@ use crate::config::providers::{
 };
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use unicode_width::UnicodeWidthStr;
 
 pub const DIALOG_HEIGHT: u16 = 18;
 
@@ -517,7 +518,6 @@ impl ModelPickerDialog {
         lines.push(Line::from(vec![
             Span::styled("filter: ".to_string(), muted),
             Span::styled(filter_before.to_string(), Style::default().fg(Color::White)),
-            Span::styled("▎".to_string(), yellow),
             Span::styled(filter_after.to_string(), Style::default().fg(Color::White)),
         ]));
         lines.push(Line::default());
@@ -607,6 +607,11 @@ impl ModelPickerDialog {
         }
         push_error_line(&mut lines, self.error.as_deref());
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        if area.height > 0 && area.width > 0 {
+            let col = "filter: ".width() + filter_before.width();
+            let col = col.min(area.width.saturating_sub(1) as usize) as u16;
+            frame.set_cursor_position(Position::new(area.x + col, area.y));
+        }
     }
 
     fn render_thinking(&mut self, frame: &mut Frame, area: Rect) {
@@ -1096,7 +1101,7 @@ mod tests {
 
         let rendered = rendered_text(&mut d, 60, 12);
 
-        assert!(rendered.contains("filter: aX▎b"), "{rendered}");
+        assert!(rendered.contains("filter: aXb"), "{rendered}");
     }
 
     #[test]
@@ -1108,7 +1113,7 @@ mod tests {
 
         let rendered = rendered_text(&mut d, 60, 12);
 
-        assert!(rendered.contains("filter: 中 ▎a"), "{rendered}");
+        assert!(rendered.contains("filter: 中 a"), "{rendered}");
     }
 
     #[test]

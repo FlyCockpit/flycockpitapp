@@ -619,10 +619,10 @@ impl App {
             return false;
         }
 
-        // Ctrl+Shift+C — copy the active drag-selection's plaintext
-        // through OSC52 (SSH-safe) + local clipboard. No-op when
-        // nothing is selected. (plan.md T8.f copy path)
-        if self.is_ctrl_shift_c(&key) {
+        // Ctrl+Shift+C / forwarded Command+C — copy the active drag-selection
+        // through OSC52 (SSH-safe) + local clipboard. No-op when nothing is
+        // selected. (plan.md T8.f copy path)
+        if self.is_copy_selection_key(&key) {
             self.copy_selection_plaintext();
             return false;
         }
@@ -3246,9 +3246,13 @@ impl App {
         }
     }
 
-    /// True when the key event represents `Ctrl+Shift+C`. Same shape
-    /// dance as `is_ctrl_shift_y` (kitty protocol vs legacy).
-    pub(super) fn is_ctrl_shift_c(&self, key: &KeyEvent) -> bool {
+    /// True when the key event represents copy-selection: `Ctrl+Shift+C`
+    /// (kitty protocol vs legacy forms) or forwarded macOS `Command+C` as
+    /// crossterm `SUPER+C`.
+    pub(super) fn is_copy_selection_key(&self, key: &KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            return matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+        }
         if !key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
         }
@@ -4842,6 +4846,48 @@ mod shift_enter_keyboard_protocol_tests {
         assert!(!exit);
         assert_eq!(app.composer.text(), "@kept\n");
         assert!(!app.composer.text().contains("kept.rs"));
+    }
+
+    #[test]
+    fn copy_selection_key_recognizes_ctrl_shift_and_super_c() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(&tmp);
+
+        assert!(app.is_copy_selection_key(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        assert!(app.is_copy_selection_key(&key(KeyCode::Char('C'), KeyModifiers::CONTROL)));
+        assert!(app.is_copy_selection_key(&key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+        assert!(app.is_copy_selection_key(&key(KeyCode::Char('C'), KeyModifiers::SUPER)));
+        assert!(!app.is_copy_selection_key(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn super_c_without_selection_does_not_edit_composer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app(&tmp);
+        app.composer.set("draft".to_string());
+
+        let exit = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+
+        assert!(!exit);
+        assert_eq!(app.composer.text(), "draft");
+        assert!(app.selection.is_none());
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_without_shift_still_uses_interrupt_exit_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app(&tmp);
+        app.composer.set("draft".to_string());
+
+        let exit = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!exit);
+        assert_eq!(app.composer.text(), "draft");
+        assert!(app.ctrl_c_armed_at.is_some());
     }
 
     #[test]

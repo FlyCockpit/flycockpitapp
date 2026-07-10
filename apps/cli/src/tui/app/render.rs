@@ -3196,6 +3196,78 @@ fn content_bounds(row: &[String]) -> Option<(usize, usize)> {
 ///    with a space instead of a newline so a wrapped paragraph pastes as
 ///    one paragraph, not a stack of short visual lines. Hard line breaks
 ///    (paragraph boundaries) still produce newlines.
+pub(super) fn extract_selection_markdown_source(
+    history: &[HistoryEntry],
+    row_meta: &[ChatRowMeta],
+    area: Rect,
+    sel: Selection,
+) -> Option<String> {
+    let (start, end) = sel.ordered();
+    let mut target: Option<ChatCopyTarget> = None;
+    let mut selected_lines: Vec<usize> = Vec::new();
+    let mut active_target: Option<ChatCopyTarget> = None;
+    let mut source_line: Option<usize> = None;
+
+    for (row_idx, meta) in row_meta.iter().enumerate() {
+        if meta.copy_target != active_target {
+            active_target = meta.copy_target;
+            source_line = if meta.copy_target.is_some() && meta.selectable && !meta.continuation {
+                Some(0)
+            } else {
+                None
+            };
+        } else if meta.copy_target.is_some()
+            && meta.selectable
+            && !meta.continuation
+            && let Some(line) = source_line.as_mut()
+        {
+            *line += 1;
+        }
+
+        let abs_row = area.y.saturating_add(row_idx as u16);
+        if abs_row < start.1 || abs_row > end.1 {
+            continue;
+        }
+        if !meta.selectable {
+            return None;
+        }
+        let copy_target = meta.copy_target?;
+        if target.is_some_and(|existing| existing != copy_target) {
+            return None;
+        }
+        target = Some(copy_target);
+        selected_lines.push(source_line?);
+    }
+
+    let ChatCopyTarget::Message { history_index } = target?;
+    let source = match history.get(history_index)? {
+        HistoryEntry::User { text, .. } | HistoryEntry::Agent { text, .. } => text.as_str(),
+        _ => return None,
+    };
+    let ranges = source_line_ranges(source);
+    let first_line = *selected_lines.iter().min()?;
+    let last_line = *selected_lines.iter().max()?;
+    let start_byte = ranges.get(first_line)?.0;
+    let end_byte = ranges.get(last_line)?.1;
+    let selected = &source[start_byte..end_byte];
+    let selected = selected.strip_suffix('\n').unwrap_or(selected);
+    (!selected.is_empty()).then(|| selected.to_string())
+}
+
+fn source_line_ranges(source: &str) -> Vec<(usize, usize)> {
+    if source.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let end = start + line.len();
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
 pub(super) fn extract_selection_plaintext(
     grid: &[Vec<String>],
     row_meta: &[ChatRowMeta],

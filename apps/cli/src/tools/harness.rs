@@ -380,7 +380,7 @@ impl Tool for HarnessInvokeTool {
                     &harness_name,
                     &provider_id,
                 );
-                return Err(invalid_input(correction.model_message(&ctx.redact)));
+                return Err(invalid_input(correction.model_message()));
             }
             return Err(invalid_input(format!(
                 "model `{m}` is not in `{}`'s configured harness models; run `harness_list` \

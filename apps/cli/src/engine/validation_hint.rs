@@ -1,10 +1,8 @@
 //! Shared terse correction hints for validation failures.
 //!
 //! These are model-facing one-liners. They carry field names and corrected
-//! shapes, not argument values; the final message is still passed through the
-//! session redactor before it is surfaced.
-
-use crate::redact::RedactionTable;
+//! shapes, not argument values. They remain raw until the model dispatch
+//! boundary applies the dispatching model's effective redaction table.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationCorrection {
@@ -37,8 +35,8 @@ impl ValidationCorrection {
         ))
     }
 
-    pub fn model_message(&self, redact: &RedactionTable) -> String {
-        redact.scrub(&self.message)
+    pub fn model_message(&self) -> String {
+        self.message.clone()
     }
 }
 
@@ -47,17 +45,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_message_is_redacted() {
+    fn model_message_remains_raw_until_dispatch() {
         const SECRET: &str = "sk-validation-secret-1234567890";
-        let cfg = crate::config::extended::RedactConfig {
-            denylist: vec![SECRET.to_string()],
-            ..Default::default()
-        };
-        let table = RedactionTable::build(&cfg, std::path::Path::new("/")).unwrap();
         let correction =
             ValidationCorrection::harness_model_is_provider_ref(SECRET, "claude", "openai");
 
-        let msg = correction.model_message(&table);
-        assert!(!msg.contains(SECRET), "{msg}");
+        let msg = correction.model_message();
+        assert!(msg.contains(SECRET), "{msg}");
     }
 }

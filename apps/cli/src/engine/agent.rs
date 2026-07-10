@@ -1151,23 +1151,6 @@ fn task_refusal(id: &str, call_id: Option<String>, body: impl Into<String>) -> T
     }
 }
 
-fn scrub_sidecar_value(value: Value, redact: &crate::redact::RedactionTable) -> Value {
-    match value {
-        Value::String(s) => Value::String(redact.scrub(&s)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|v| scrub_sidecar_value(v, redact))
-                .collect(),
-        ),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(k, v)| (k, scrub_sidecar_value(v, redact)))
-                .collect(),
-        ),
-        other => other,
-    }
-}
 async fn record_inference_request_async(
     session: Arc<Session>,
     call_id: Uuid,
@@ -1194,11 +1177,9 @@ async fn record_usage_blocking(
 /// pushed by the caller; this function appends the assistant turn and
 /// every tool-result message in order.
 ///
-/// `redact` is the §7 chokepoint — tool outputs are scrubbed before
-/// they enter history so a leaked secret from bash / read / edit never
-/// becomes part of the next inference call. The model also never sees
-/// the raw form via the user transcript: `tool_call_events.output` is
-/// the scrubbed text.
+/// Raw turn content is kept in memory and the local session DB. Redaction is
+/// enforced at egress: model dispatch scrubs with the dispatching model's
+/// effective table, and client forwarding scrubs for non-owner principals.
 #[allow(clippy::too_many_arguments)]
 // The `model` parameter is the model to dispatch this turn on (normally
 // `&agent.model`; the per-turn backup wrapper [`turn_with_backup`] passes the
@@ -1476,7 +1457,6 @@ pub async fn turn(
                     agent_name: &agent.name,
                     wire_api: model.wire_api_label(),
                     routing_metadata: model.routing_metadata_json(None),
-                    redact: redact.as_ref(),
                     emit_inference_error_ui,
                     tx,
                 },
@@ -1594,8 +1574,6 @@ pub async fn turn(
         (false, true) => channel_reasoning,
         (false, false) => format!("{channel_reasoning}\n{inline_chip}"),
     };
-    let reasoning = redact.scrub(&reasoning);
-
     if let Some(u) = usage {
         if let Err(e) = record_usage_blocking(session.clone(), call_id, u).await {
             tracing::warn!(error = %e, "session.record_usage failed");
@@ -1905,9 +1883,7 @@ pub async fn turn(
     // call), and the staged system message rides into the next request.
     if let Some((notice, nudge)) = available_nudge {
         let _ = tx.send(TurnEvent::Notice { text: notice }).await;
-        history.push(Message::System {
-            content: redact.scrub(&nudge),
-        });
+        history.push(Message::System { content: nudge });
     }
 
     if calls.is_empty() {
@@ -2864,10 +2840,7 @@ pub async fn turn(
             Err(_) => (None, None, None),
         };
         let output_sidecar = match &result {
-            Ok(out) => out
-                .output_sidecar
-                .as_ref()
-                .map(|s| scrub_sidecar_value(s.payload.clone(), &redact)),
+            Ok(out) => out.output_sidecar.as_ref().map(|s| s.payload.clone()),
             Err(_) => None,
         };
         // Part B: `bash`'s sandbox-state sub-object for the tool_call event.
@@ -2989,12 +2962,9 @@ pub async fn turn(
             })
         });
 
-        // Scrub tool output through the §7 chokepoint before it enters
-        // history or the audit row. The model only ever sees the
-        // redacted form; the user transcript shows the same (audit
-        // expansion of `original_input` does not apply to tool *outputs*,
-        // only to tool *inputs* — see §14e).
-        let mut output_str = redact.scrub(&raw_output);
+        // Keep tool output raw in history and the local audit row. Egress
+        // redaction happens at model dispatch and at the client boundary.
+        let mut output_str = raw_output;
 
         // Result injection re-check (implementation note):
         // when the safety gate flagged this call's result as pulling in
@@ -3525,7 +3495,6 @@ struct InferenceOutcomeRecord<'a> {
     agent_name: &'a str,
     wire_api: &'a str,
     routing_metadata: Value,
-    redact: &'a RedactionTable,
     emit_inference_error_ui: bool,
     tx: &'a mpsc::Sender<TurnEvent>,
 }
@@ -3541,7 +3510,6 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
         agent_name,
         wire_api,
         routing_metadata,
-        redact,
         emit_inference_error_ui,
         tx,
     } = ctx;
@@ -3604,7 +3572,7 @@ async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow:
         tracing::warn!(error = %e, "record_inference_request (terminal failure) failed");
     }
 
-    let diagnostics = inference_failure_diagnostics(failure, wire_api, redact);
+    let diagnostics = inference_failure_diagnostics(failure, wire_api);
 
     // Failure event (Part B): lands in the export's events.json, keyed by the
     // same call_id. Data/export only — never enters model context.
@@ -3664,13 +3632,12 @@ struct InferenceFailureDiagnostics {
 fn inference_failure_diagnostics(
     failure: &crate::engine::model::InferenceFailure,
     _wire_api: &str,
-    redact: &RedactionTable,
 ) -> InferenceFailureDiagnostics {
     let provider_status = failure
         .class
         .strip_prefix("http_")
         .and_then(|s| s.parse::<u16>().ok());
-    let provider_body_snippet = redacted_bounded_snippet(&failure.detail, redact, 800);
+    let provider_body_snippet = bounded_snippet(&failure.detail, 800);
     let (retry_final_decision, classification_rationale) =
         failure_retry_decision_and_rationale(&failure.class, provider_status);
     InferenceFailureDiagnostics {
@@ -3714,19 +3681,14 @@ fn failure_retry_decision_and_rationale(
     }
 }
 
-fn redacted_bounded_snippet(
-    detail: &str,
-    redact: &RedactionTable,
-    max_chars: usize,
-) -> Option<String> {
+fn bounded_snippet(detail: &str, max_chars: usize) -> Option<String> {
     let trimmed = detail.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let scrubbed = redact.scrub(trimmed);
     let mut out = String::new();
     let mut truncated = false;
-    for ch in scrubbed.chars() {
+    for ch in trimmed.chars() {
         if out.chars().count() >= max_chars {
             truncated = true;
             break;
@@ -6279,7 +6241,6 @@ mod inference_outcome_tests {
         .context("completion call for agent `builder`");
 
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
-        let redact = RedactionTable::empty();
         record_inference_outcome(
             InferenceOutcomeRecord {
                 session: session.clone(),
@@ -6288,7 +6249,6 @@ mod inference_outcome_tests {
                 agent_name: "builder",
                 wire_api: "responses",
                 routing_metadata: serde_json::json!({}),
-                redact: &redact,
                 emit_inference_error_ui: true,
                 tx: &tx,
             },
@@ -6349,7 +6309,6 @@ mod inference_outcome_tests {
 
         let err = anyhow::Error::new(crate::engine::model::InferenceCancelled);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
-        let redact = RedactionTable::empty();
         // A cancel emits no UI regardless of the flag; pass `true` to prove it.
         record_inference_outcome(
             InferenceOutcomeRecord {
@@ -6359,7 +6318,6 @@ mod inference_outcome_tests {
                 agent_name: "builder",
                 wire_api: "responses",
                 routing_metadata: serde_json::json!({}),
-                redact: &redact,
                 emit_inference_error_ui: true,
                 tx: &tx,
             },

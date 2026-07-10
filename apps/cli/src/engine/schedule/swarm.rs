@@ -115,7 +115,7 @@ async fn run_swarm_loop(
     let agent = Arc::new(build_swarm_child(spec, ctx)?);
     let mut history: Vec<Message> = Vec::new();
     let brief = compose_child_brief(spec);
-    let mut next_prompt = Message::user(ctx.redact.scrub(&brief));
+    let mut next_prompt = Message::user(brief);
 
     // A background swarm child is a leaf with no human on the other end:
     // a detached interrupt hub + a fresh cancel token satisfy `turn`'s

@@ -256,11 +256,11 @@ fn render_failure_diagnostic(
     name: &str,
     selected: &SelectedTemplate,
     exit_code: Option<i32>,
-    ctx: &ToolCtx,
+    _ctx: &ToolCtx,
 ) -> String {
     format!(
         "\n[tool diagnostic]\ntool: {name}\nselected_command_template: {}\nprovenance: {}\nsource: {}\nexit_code: {}\n",
-        ctx.redact.scrub(&selected.tpl.command),
+        selected.tpl.command,
         selected.provenance.kind(),
         selected.provenance.source(),
         exit_code

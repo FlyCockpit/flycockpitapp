@@ -111,7 +111,7 @@ pub async fn run(
     let resolver_brief = format!("Package: {}", input.package);
     let resolver_report = run_noninteractive(
         resolver,
-        redact.scrub(&resolver_brief),
+        resolver_brief,
         session.clone(),
         locks.clone(),
         redact.clone(),
@@ -158,7 +158,7 @@ pub async fn run(
     );
     let answer = run_noninteractive(
         answerer,
-        redact.scrub(&answerer_brief),
+        answerer_brief,
         session,
         locks,
         redact,

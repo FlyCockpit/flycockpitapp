@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, MatchKind};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
@@ -284,6 +284,14 @@ fn url_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedRedactionTable {
+    entries: Vec<(String, String)>,
+    placeholder: String,
+    disabled: bool,
+    unsupported_files: Vec<String>,
+}
+
 /// A built lookup of `value → origin-name` pairs the next outbound
 /// request must be scrubbed against. Hold one per session (cheap to
 /// rebuild; small in-memory footprint).
@@ -498,6 +506,39 @@ impl RedactionTable {
             self.placeholder.clone(),
             self.disabled && other.disabled,
             unsupported_files,
+        )
+    }
+
+    /// Serialize this accumulated table for session-local persistence. The
+    /// payload intentionally contains literal values: it is stored in the
+    /// same private session DB that now stores raw transcript content.
+    pub fn to_persisted_json(&self) -> Result<String> {
+        let snapshot = PersistedRedactionTable {
+            entries: self.entries.clone(),
+            placeholder: self.placeholder.clone(),
+            disabled: self.disabled,
+            unsupported_files: self
+                .unsupported_files
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        };
+        serde_json::to_string(&snapshot).context("serializing redaction table")
+    }
+
+    /// Rebuild an accumulated table persisted by [`Self::to_persisted_json`].
+    pub fn from_persisted_json(json: &str) -> Result<Self> {
+        let snapshot: PersistedRedactionTable =
+            serde_json::from_str(json).context("deserializing redaction table")?;
+        Self::from_entries(
+            snapshot.entries,
+            snapshot.placeholder,
+            snapshot.disabled,
+            snapshot
+                .unsupported_files
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
         )
     }
 
@@ -1162,6 +1203,36 @@ mod scrub_fast_path_tests {
         assert!(!scrubbed.contains("first-secret-value"), "{scrubbed}");
         assert!(!scrubbed.contains("second-secret-value"), "{scrubbed}");
         assert_eq!(scrubbed.matches("[redacted]").count(), 2);
+    }
+
+    #[test]
+    fn persisted_table_round_trips_entries_and_scrubs() {
+        let first = table_from_env_value("FIRST_SECRET", "first-secret-value");
+        let second = table_from_env_value("SECOND_SECRET", "second-secret-value");
+        let unioned = first.union(&second).unwrap();
+        let json = unioned.to_persisted_json().unwrap();
+        let restored = RedactionTable::from_persisted_json(&json).unwrap();
+
+        let scrubbed = restored.scrub("first-secret-value and second-secret-value");
+        assert!(!scrubbed.contains("first-secret-value"), "{scrubbed}");
+        assert!(!scrubbed.contains("second-secret-value"), "{scrubbed}");
+        assert_eq!(scrubbed.matches("[redacted]").count(), 2);
+    }
+
+    #[test]
+    fn empty_table_does_not_scrub_env_shaped_names() {
+        let table = RedactionTable::empty();
+        for name in [
+            "AWS_SECRET_ACCESS_KEY",
+            "SERVICE_TOKEN",
+            "DATABASE_PASSWORD",
+            "CUSTOM_PIN",
+            "API_CREDENTIALS",
+        ] {
+            assert!(env_scrub_patterns(name));
+            let input = format!("{name}=not-a-secret-value");
+            assert_eq!(table.scrub(&input), input);
+        }
     }
 
     #[test]

@@ -1371,32 +1371,6 @@ impl Model {
     /// uses the freshly rebuilt table while any in-flight request keeps the
     /// table it started with. This legacy setter installs the same table as
     /// both the session and effective table.
-    pub fn set_redact_table(&mut self, table: Arc<RedactionTable>) {
-        match self {
-            Model::OpenAi {
-                session_redact,
-                redact,
-                ..
-            }
-            | Model::ChatGpt {
-                session_redact,
-                redact,
-                ..
-            }
-            | Model::Anthropic {
-                session_redact,
-                redact,
-                ..
-            } => {
-                *session_redact = table.clone();
-                *redact = table;
-            }
-        }
-    }
-
-    /// Replace the session table and re-resolve this model's effective table
-    /// from `providers`. Used after `/toggle-redaction` and turn-boundary
-    /// refreshes so model-level/provider-level trust remains in force.
     pub fn set_redact_table_for_config(
         &mut self,
         providers: &ProvidersConfig,

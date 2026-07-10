@@ -172,7 +172,7 @@ async fn run_iteration(
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
 ) -> anyhow::Result<String> {
-    let mut next_prompt = Message::user(ctx.redact.scrub(prompt));
+    let mut next_prompt = Message::user(prompt.to_string());
     // A loop fork is a leaf with no human on the other end — it can't
     // raise an answerable interrupt (single async-job authority, GOALS
     // §22). A detached hub satisfies the shared `turn` signature. Same for

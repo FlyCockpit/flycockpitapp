@@ -143,6 +143,7 @@ pub struct Session {
     user_renamed: Mutex<bool>,
     model: Mutex<Option<String>>,
     provider: Mutex<Option<String>>,
+    redaction_table_json: Mutex<Option<String>>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -304,6 +305,7 @@ impl Session {
                 Some(mut row) => {
                     row.provider = self.active_provider();
                     row.model = self.active_model();
+                    row.redaction_table_json = self.redaction_table_json.lock().unwrap().clone();
                     row
                 }
                 None => return Ok(false),
@@ -396,6 +398,7 @@ impl Session {
             user_renamed: Mutex::new(row.user_renamed),
             model: Mutex::new(row.model),
             provider: Mutex::new(row.provider),
+            redaction_table_json: Mutex::new(row.redaction_table_json),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),
@@ -817,6 +820,30 @@ impl Session {
 
     pub fn active_provider(&self) -> Option<String> {
         self.provider.lock().unwrap().clone()
+    }
+
+    /// Persist the accumulated egress redaction table with the session so raw
+    /// history remains covered after resume even if env/dotenv sources change.
+    pub fn persist_redaction_table(&self, table: &crate::redact::RedactionTable) -> Result<()> {
+        let json = table.to_persisted_json()?;
+        *self.redaction_table_json.lock().unwrap() = Some(json.clone());
+        if self.stage_pending_row(|row| {
+            row.redaction_table_json = Some(json.clone());
+        }) {
+            return Ok(());
+        }
+        self.db
+            .set_session_redaction_table_json(self.id, Some(json))
+            .context("persisting session redaction table")
+    }
+
+    pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
+        let Some(json) = self.redaction_table_json.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        crate::redact::RedactionTable::from_persisted_json(&json)
+            .map(Some)
+            .context("loading persisted session redaction table")
     }
 
     pub fn set_active_model(&self, provider: &str, model: &str) -> Result<()> {

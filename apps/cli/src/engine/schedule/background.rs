@@ -43,7 +43,7 @@ pub struct BackgroundHandle {
 impl BackgroundHandle {
     /// Budget-capped tail of the last `lines` output lines, scrubbed for
     /// secrets. Returns an empty string when no output has been produced.
-    pub fn tail(&self, lines: usize, redact: &RedactionTable) -> String {
+    pub fn tail(&self, lines: usize, _redact: &RedactionTable) -> String {
         let snapshot: Vec<String> = {
             let ring = self.ring.lock().unwrap();
             ring.snapshot_tail(lines)
@@ -63,11 +63,10 @@ impl BackgroundHandle {
             }
         }
         let body = writer.into_string();
-        let scrubbed = redact.scrub(&body);
-        if scrubbed.is_empty() {
+        if body.is_empty() {
             format!("`{}` has produced no output yet", self.label)
         } else {
-            scrubbed
+            body
         }
     }
 
@@ -262,7 +261,7 @@ async fn run_background(
     command: String,
     cwd: std::path::PathBuf,
     ring: Arc<Mutex<BoundedOutputRing>>,
-    redact: Arc<RedactionTable>,
+    _redact: Arc<RedactionTable>,
     turn_tx: mpsc::Sender<TurnEvent>,
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
@@ -326,7 +325,7 @@ async fn run_background(
             line = out_lines.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(l)) => {
-                        push(&ring, redact.scrub(&l));
+                        push(&ring, l);
                         let _ = turn_tx.try_send(TurnEvent::ScheduleProgress {
                             job_id: job_id.clone(),
                         });
@@ -337,7 +336,7 @@ async fn run_background(
             line = err_lines.next_line(), if !stderr_done => {
                 match line {
                     Ok(Some(l)) => {
-                        push(&ring, redact.scrub(&l));
+                        push(&ring, l);
                         let _ = turn_tx.try_send(TurnEvent::ScheduleProgress {
                             job_id: job_id.clone(),
                         });

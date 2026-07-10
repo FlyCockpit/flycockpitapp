@@ -72,6 +72,7 @@ pub struct SessionRow {
     /// diffs continue from the same system-instruction baseline.
     pub guidance_baseline_path: Option<String>,
     pub guidance_baseline_hash: Option<String>,
+    pub redaction_table_json: Option<String>,
     pub created_by_principal: Option<String>,
     pub shared_with_collaborators: bool,
 }
@@ -108,6 +109,7 @@ impl SessionRow {
             title_stage: row.get("title_stage")?,
             guidance_baseline_path: row.get("guidance_baseline_path")?,
             guidance_baseline_hash: row.get("guidance_baseline_hash")?,
+            redaction_table_json: row.get("redaction_table_json")?,
             created_by_principal: row.get("created_by_principal")?,
             shared_with_collaborators: row.get::<_, i64>("shared_with_collaborators")? != 0,
         })
@@ -222,51 +224,105 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
 }
 
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
-    if table_has_column(conn, "sessions", "created_by_principal")? {
-        conn.execute(
-            "INSERT INTO sessions
-             (session_id, project_id, project_root, started_at,
-              last_active_at, active_agent, short_id, provider, model,
-              guidance_baseline_path, guidance_baseline_hash, created_by_principal,
-              shared_with_collaborators)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                row.session_id.to_string(),
-                row.project_id,
-                row.project_root,
-                row.started_at,
-                row.last_active_at,
-                row.active_agent,
-                row.short_id,
-                row.provider,
-                row.model,
-                row.guidance_baseline_path,
-                row.guidance_baseline_hash,
-                row.created_by_principal,
-                row.shared_with_collaborators as i64,
-            ],
-        )?;
-    } else {
-        conn.execute(
-            "INSERT INTO sessions
-             (session_id, project_id, project_root, started_at,
-              last_active_at, active_agent, short_id, provider, model,
-              guidance_baseline_path, guidance_baseline_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                row.session_id.to_string(),
-                row.project_id,
-                row.project_root,
-                row.started_at,
-                row.last_active_at,
-                row.active_agent,
-                row.short_id,
-                row.provider,
-                row.model,
-                row.guidance_baseline_path,
-                row.guidance_baseline_hash,
-            ],
-        )?;
+    let has_created_by_principal = table_has_column(conn, "sessions", "created_by_principal")?;
+    let has_redaction_table = table_has_column(conn, "sessions", "redaction_table_json")?;
+    match (has_created_by_principal, has_redaction_table) {
+        (true, true) => {
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_id, project_id, project_root, started_at,
+                  last_active_at, active_agent, short_id, provider, model,
+                  guidance_baseline_path, guidance_baseline_hash, redaction_table_json,
+                  created_by_principal, shared_with_collaborators)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    row.session_id.to_string(),
+                    row.project_id,
+                    row.project_root,
+                    row.started_at,
+                    row.last_active_at,
+                    row.active_agent,
+                    row.short_id,
+                    row.provider,
+                    row.model,
+                    row.guidance_baseline_path,
+                    row.guidance_baseline_hash,
+                    row.redaction_table_json,
+                    row.created_by_principal,
+                    row.shared_with_collaborators as i64,
+                ],
+            )?;
+        }
+        (true, false) => {
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_id, project_id, project_root, started_at,
+                  last_active_at, active_agent, short_id, provider, model,
+                  guidance_baseline_path, guidance_baseline_hash, created_by_principal,
+                  shared_with_collaborators)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    row.session_id.to_string(),
+                    row.project_id,
+                    row.project_root,
+                    row.started_at,
+                    row.last_active_at,
+                    row.active_agent,
+                    row.short_id,
+                    row.provider,
+                    row.model,
+                    row.guidance_baseline_path,
+                    row.guidance_baseline_hash,
+                    row.created_by_principal,
+                    row.shared_with_collaborators as i64,
+                ],
+            )?;
+        }
+        (_, true) => {
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_id, project_id, project_root, started_at,
+                  last_active_at, active_agent, short_id, provider, model,
+                  guidance_baseline_path, guidance_baseline_hash, redaction_table_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    row.session_id.to_string(),
+                    row.project_id,
+                    row.project_root,
+                    row.started_at,
+                    row.last_active_at,
+                    row.active_agent,
+                    row.short_id,
+                    row.provider,
+                    row.model,
+                    row.guidance_baseline_path,
+                    row.guidance_baseline_hash,
+                    row.redaction_table_json,
+                ],
+            )?;
+        }
+        (false, false) => {
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_id, project_id, project_root, started_at,
+                  last_active_at, active_agent, short_id, provider, model,
+                  guidance_baseline_path, guidance_baseline_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    row.session_id.to_string(),
+                    row.project_id,
+                    row.project_root,
+                    row.started_at,
+                    row.last_active_at,
+                    row.active_agent,
+                    row.short_id,
+                    row.provider,
+                    row.model,
+                    row.guidance_baseline_path,
+                    row.guidance_baseline_hash,
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -301,9 +357,9 @@ fn execute_fork_insert(
           last_active_at, active_agent, short_id,
           parent_session_id, fork_point_turn_id,
           provider, model, ephemeral, user_content_tokens, title_stage,
-          guidance_baseline_path, guidance_baseline_hash, created_by_principal,
+          guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -321,6 +377,7 @@ fn execute_fork_insert(
             row.title_stage,
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
+            row.redaction_table_json,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
         ],
@@ -408,6 +465,7 @@ fn build_session_row(
         title_stage: 0,
         guidance_baseline_path: None,
         guidance_baseline_hash: None,
+        redaction_table_json: None,
         created_by_principal: None,
         shared_with_collaborators: false,
     }
@@ -702,6 +760,7 @@ impl Db {
                 title_stage: parent.title_stage,
                 guidance_baseline_path: parent.guidance_baseline_path,
                 guidance_baseline_hash: parent.guidance_baseline_hash,
+                redaction_table_json: parent.redaction_table_json,
                 created_by_principal: parent.created_by_principal,
                 shared_with_collaborators: false,
             };
@@ -1155,6 +1214,21 @@ impl Db {
                 params![now, session_id.to_string()],
             )
             .context("touching session")?;
+            Ok(())
+        })
+    }
+
+    pub fn set_session_redaction_table_json(
+        &self,
+        session_id: Uuid,
+        redaction_table_json: Option<String>,
+    ) -> Result<()> {
+        self.write_blocking(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
+                params![redaction_table_json, session_id.to_string()],
+            )
+            .context("setting session redaction table")?;
             Ok(())
         })
     }
@@ -1649,6 +1723,40 @@ mod tests {
     }
 
     #[test]
+    fn insert_session_row_round_trips_redaction_table_json() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").unwrap();
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            ..crate::config::extended::RedactConfig::default()
+        };
+        let env = std::collections::HashMap::from([(
+            "SESSION_SECRET".to_string(),
+            "persisted-secret-value".to_string(),
+        )]);
+        let table =
+            crate::redact::RedactionTable::build_with_env(&cfg, std::path::Path::new("."), &env)
+                .unwrap();
+        row.redaction_table_json = Some(table.to_persisted_json().unwrap());
+        db.insert_session_row(&row).unwrap();
+
+        let got = db.get_session(row.session_id).unwrap().unwrap();
+        let restored = crate::redact::RedactionTable::from_persisted_json(
+            got.redaction_table_json.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !restored
+                .scrub("persisted-secret-value")
+                .contains("persisted-secret-value")
+        );
+    }
+
+    #[test]
     fn touch_updates_last_active() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
@@ -1794,21 +1902,31 @@ mod tests {
         let parent = db.create_session("p", "/proj", "Build").unwrap();
         db.set_session_model(parent.session_id, "anthropic", "opus-4-7")
             .unwrap();
-        let fork_point = record_message(&db, parent.session_id, "fork here", false);
+        db.set_session_redaction_table_json(
+            parent.session_id,
+            Some(
+                r#"{"entries":[["fork-secret","$TEST"]],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        let fork_point = record_message(&db, parent.session_id, "fork here", false).to_string();
+        let parent = db.get_session(parent.session_id).unwrap().unwrap();
         let fork = db
-            .create_fork(parent.session_id, Some(fork_point.to_string()))
+            .create_fork(parent.session_id, Some(fork_point.clone()))
             .unwrap();
+
         assert_eq!(fork.project_id, "p");
         assert_eq!(fork.project_root, "/proj");
         assert_eq!(fork.active_agent, "Build");
         assert_eq!(fork.parent_session_id, Some(parent.session_id));
-        let fork_point = fork_point.to_string();
         assert_eq!(
             fork.fork_point_turn_id.as_deref(),
             Some(fork_point.as_str())
         );
         assert_eq!(fork.provider.as_deref(), Some("anthropic"));
         assert_eq!(fork.model.as_deref(), Some("opus-4-7"));
+        assert_eq!(fork.redaction_table_json, parent.redaction_table_json);
         assert_ne!(fork.session_id, parent.session_id);
         assert_ne!(fork.short_id, parent.short_id);
     }

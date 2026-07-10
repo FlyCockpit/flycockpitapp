@@ -1707,35 +1707,21 @@ impl Driver {
         Arc::new(refreshed)
     }
 
-    fn refresh_agent_model_redaction_fallback(
-        agent: &Arc<Agent>,
-        table: Arc<RedactionTable>,
-    ) -> Arc<Agent> {
-        let mut refreshed = (**agent).clone();
-        let mut model = (*refreshed.model).clone();
-        model.set_redact_table(table);
-        refreshed.model = Arc::new(model);
-        Arc::new(refreshed)
-    }
-
     fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
         self.redact = table.clone();
         let providers = self.live_providers_config().ok();
+        let Some(providers) = providers.as_ref() else {
+            tracing::warn!("providers config unavailable while refreshing redaction table");
+            self.schedule.set_redaction_table(table);
+            return;
+        };
         for frame in &mut self.stack {
-            frame.agent = match providers.as_ref() {
-                Some(providers) => {
-                    Self::refresh_agent_model_redaction(&frame.agent, providers, table.clone())
-                }
-                None => Self::refresh_agent_model_redaction_fallback(&frame.agent, table.clone()),
-            };
+            frame.agent =
+                Self::refresh_agent_model_redaction(&frame.agent, providers, table.clone());
         }
         if let Some(model) = &mut self.model_override {
             let mut refreshed = (**model).clone();
-            if let Some(providers) = providers.as_ref() {
-                refreshed.set_redact_table_for_config(providers, table.clone());
-            } else {
-                refreshed.set_redact_table(table.clone());
-            }
+            refreshed.set_redact_table_for_config(providers, table.clone());
             *model = Arc::new(refreshed);
         }
         self.schedule.set_redaction_table(table);
@@ -1779,8 +1765,17 @@ impl Driver {
         })
         .await
         {
-            Ok(Ok(table)) => {
-                let table = Arc::new(table);
+            Ok(Ok(new_table)) => {
+                let table = match self.redact.union(&new_table) {
+                    Ok(table) => Arc::new(table),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "unioning redaction table failed");
+                        Arc::new(new_table)
+                    }
+                };
+                if let Err(error) = self.session.persist_redaction_table(&table) {
+                    tracing::warn!(error = %error, "persisting redaction table failed");
+                }
                 for path in table.unsupported_files() {
                     if self.redaction_unsupported_notified.insert(path.clone()) {
                         let _ = tx
@@ -3326,7 +3321,7 @@ impl Driver {
         let inbound_text = self.translate_inbound(&raw_text).await;
         Some(UserSubmission {
             kind: UserSubmissionKind::User,
-            text: self.redact.scrub(&inbound_text),
+            text: inbound_text,
             images: submission.images,
             forced_skill,
             origin_principal: submission.origin_principal,
@@ -5050,7 +5045,7 @@ impl Driver {
                 .await;
             let result = tool.call(seed.args.clone(), &ctx).await;
             let body = match result {
-                Ok(out) => self.redact.scrub(&out.content),
+                Ok(out) => out.content,
                 Err(e) => format!("Error: {e}"),
             };
             let _ = tx
@@ -5220,7 +5215,7 @@ impl Driver {
             let started = std::time::Instant::now();
             let result = tool.call(seed.args.clone(), ctx).await;
             let (body, hard_fail) = match result {
-                Ok(out) => (self.redact.scrub(&out.content), false),
+                Ok(out) => (out.content, false),
                 // A seed that fails to execute (e.g. the path doesn't exist in
                 // this cwd) is surfaced as a failed seed — the error body is
                 // injected so the holder sees it — never a hard abort.
@@ -5652,7 +5647,7 @@ impl Driver {
         let started = std::time::Instant::now();
         let result = tool.call(args.clone(), &ctx).await;
         let (body, hard_fail) = match result {
-            Ok(out) => (self.redact.scrub(&out.content), false),
+            Ok(out) => (out.content, false),
             // An unknown/ambiguous skill surfaces the tool's invalid-input
             // error as the recorded result — clear, never a silent no-op.
             Err(e) => (format!("Error: {e}"), true),
@@ -5936,12 +5931,8 @@ impl Driver {
         match event {
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
                 let framed = format!("[loop {job_id}] {prompt}");
-                self.run_user_input(
-                    UserSubmission::text(self.redact.scrub(&framed)),
-                    input_rx,
-                    tx,
-                )
-                .await?;
+                self.run_user_input(UserSubmission::text(framed), input_rx, tx)
+                    .await?;
                 // The iteration's turn finished — advance the schedule.
                 self.schedule.iteration_finished(&job_id);
             }
@@ -6010,7 +6001,7 @@ impl Driver {
                 self.run_user_input(
                     UserSubmission {
                         kind: UserSubmissionKind::User,
-                        text: self.redact.scrub(&injected),
+                        text: injected,
                         images: Vec::new(),
                         forced_skill: None,
                         origin_principal: None,
@@ -6566,7 +6557,7 @@ impl Driver {
         child_agent: &str,
         prompt: &str,
     ) -> Result<String> {
-        let prompt = self.redact.scrub(prompt);
+        let prompt = prompt.to_string();
         self.session
             .db
             .insert_task_delegation_payload(
@@ -7062,7 +7053,7 @@ impl Driver {
                     let collector = crate::engine::seed_collector::SeedCollector::new();
                     match run_noninteractive_resumable(
                         child,
-                        self.redact.scrub(&composed_brief),
+                        composed_brief,
                         prior_history,
                         collector.clone(),
                         self.session.clone(),
@@ -7395,7 +7386,7 @@ impl Driver {
                 if text.trim().is_empty() {
                     return Ok(false);
                 }
-                self.run_user_input(UserSubmission::text(self.redact.scrub(&text)), input_rx, tx)
+                self.run_user_input(UserSubmission::text(text), input_rx, tx)
                     .await?;
                 Ok(true)
             }
@@ -8547,7 +8538,7 @@ impl Driver {
                         let collector = crate::engine::seed_collector::SeedCollector::new();
                         match run_noninteractive_resumable(
                             child,
-                            driver.redact.scrub(&brief),
+                            brief,
                             prior_history,
                             collector,
                             driver.session.clone(),
@@ -9570,7 +9561,7 @@ impl Driver {
                     } else {
                         format!("{skill_block}{brief}")
                     };
-                    next_prompt = Message::user(self.redact.scrub(&brief));
+                    next_prompt = Message::user(brief);
                     continue;
                 }
                 TurnOutcome::SpawnNoninteractive {
@@ -9762,7 +9753,6 @@ impl Driver {
                             )
                         }
                     };
-                    let output = self.redact.scrub(&output);
                     let _ = tx
                         .send(TurnEvent::ToolEnd {
                             agent: agent_name,
@@ -9835,7 +9825,7 @@ impl Driver {
                                     } else {
                                         recovery
                                     };
-                                (self.redact.scrub(&output), false, None, wire_args, recorded)
+                                (output, false, None, wire_args, recorded)
                             }
                             Err(e) => (
                                 format!("Error: {e}"),

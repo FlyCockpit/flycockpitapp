@@ -1098,8 +1098,7 @@ impl LockManager {
                     if !has_read {
                         bail!(
                             "{}",
-                            ValidationCorrection::write_requires_readlock(&canon)
-                                .model_message(&crate::redact::RedactionTable::empty())
+                            ValidationCorrection::write_requires_readlock(&canon).model_message()
                         );
                     }
                     state
@@ -1193,8 +1192,7 @@ impl LockManager {
                 } else {
                     bail!(
                         "{}",
-                        ValidationCorrection::write_requires_readlock(&canon)
-                            .model_message(&crate::redact::RedactionTable::empty())
+                        ValidationCorrection::write_requires_readlock(&canon).model_message()
                     )
                 }
             }

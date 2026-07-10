@@ -419,7 +419,7 @@ fn substitute_bang_commands(body: &str, cwd: &Path, redact: &RedactionTable) -> 
 
 /// Run one inline `!`-command and return the (redacted) stdout, or a
 /// bracketed error marker on failure / nonzero exit. Never panics.
-fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
+fn run_bang_command(cmd: &str, cwd: &Path, _redact: &RedactionTable) -> String {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return "[skill command error: empty command]".to_string();
@@ -436,7 +436,7 @@ fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
             // Trim the trailing newline command stdout usually carries so
             // the substitution reads inline-naturally; redact before it
             // enters context.
-            redact.scrub(stdout.trim_end_matches('\n'))
+            stdout.trim_end_matches('\n').to_string()
         }
         Ok(out) => {
             let code = out
@@ -445,7 +445,7 @@ fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signaled".to_string());
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let stderr = redact.scrub(stderr.trim());
+            let stderr = stderr.trim().to_string();
             if stderr.is_empty() {
                 format!("[skill command `{trimmed}` failed: exit {code}]")
             } else {
@@ -947,9 +947,9 @@ mod tests {
     }
 
     #[test]
-    fn render_body_claude_mode_scrubs_output() {
-        // Build a redaction table that maps a secret value to the
-        // placeholder, then have the command echo the secret.
+    fn render_body_claude_mode_keeps_command_output_raw_until_dispatch() {
+        // Command output remains raw locally; model dispatch applies the
+        // dispatching model's effective redaction table.
         let cfg = RedactConfig {
             denylist: vec!["SUPERSECRETTOKEN".to_string()],
             scan_ssh_keys: false,
@@ -958,11 +958,7 @@ mod tests {
         let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
         let body = "leak: !`echo SUPERSECRETTOKEN`";
         let out = render_body(body, Path::new("."), true, &redact);
-        assert!(
-            !out.contains("SUPERSECRETTOKEN"),
-            "Claude-mode output must be scrubbed, got {out:?}"
-        );
-        assert!(out.contains("REDACTED"), "got {out:?}");
+        assert!(out.contains("SUPERSECRETTOKEN"), "got {out:?}");
     }
 
     #[test]

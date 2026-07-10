@@ -205,6 +205,7 @@ impl RedactionSourceOverrides {
 
 #[allow(clippy::too_many_arguments)]
 async fn refresh_redaction_for_turn(
+    session: &Session,
     session_id: Uuid,
     project_root: &Path,
     overrides: &RedactionSourceOverrides,
@@ -226,6 +227,9 @@ async fn refresh_redaction_for_turn(
                 }
             };
             set_current_redaction(accumulated_redact, table.clone());
+            if let Err(error) = session.persist_redaction_table(&table) {
+                tracing::warn!(error = %error, %session_id, "persisting redaction table failed");
+            }
             for path in table.unsupported_files() {
                 if unsupported_notified.insert(path.clone()) {
                     send_event(
@@ -958,6 +962,23 @@ pub fn spawn(
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
+    let redact = match session.persisted_redaction_table() {
+        Ok(Some(persisted)) => match persisted.union(&redact) {
+            Ok(unioned) => Arc::new(unioned),
+            Err(error) => {
+                tracing::warn!(error = %error, %session_id, "unioning persisted redaction table failed");
+                redact
+            }
+        },
+        Ok(None) => redact,
+        Err(error) => {
+            tracing::warn!(error = %error, %session_id, "loading persisted redaction table failed");
+            redact
+        }
+    };
+    if let Err(error) = session.persist_redaction_table(&redact) {
+        tracing::warn!(error = %error, %session_id, "persisting initial redaction table failed");
+    }
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(redact.clone()));
     let live = Arc::new(LiveState::default());
     // Shared interactive-client counter (GOALS §1/§12). Owned here, handed
@@ -1622,6 +1643,7 @@ async fn run_worker(
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if !refresh_redaction_for_turn(
+                    &session,
                     session_id,
                     &project_root,
                     &redaction_overrides,
@@ -2054,6 +2076,9 @@ async fn run_worker(
                             }
                         };
                         set_current_redaction(&redaction, table.clone());
+                        if let Err(error) = session.persist_redaction_table(&table) {
+                            tracing::warn!(error = %error, %session_id, "persisting redaction table failed");
+                        }
                         for path in table.unsupported_files() {
                             if unsupported_redaction_notified.insert(path.clone()) {
                                 send_current_event(
@@ -3127,7 +3152,7 @@ pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig
 
 fn steer_delegation_side_channel(
     session: &Session,
-    redact: &RedactionTable,
+    _redact: &RedactionTable,
     task_call_id: String,
     label: String,
     message: String,
@@ -3172,8 +3197,7 @@ fn steer_delegation_side_channel(
             format!("child is {}", row.status.as_str()),
         );
     }
-    let scrubbed = redact.scrub(&message);
-    if scrubbed.trim().is_empty() {
+    if message.trim().is_empty() {
         return proto::DelegationSteerResult::not_steerable(
             row.task_call_id.clone(),
             Some(row.label.clone()),
@@ -3183,7 +3207,7 @@ fn steer_delegation_side_channel(
     match session.db.enqueue_task_delegation_steer(
         &row.task_call_id,
         &row.label,
-        &scrubbed,
+        &message,
         &origin_principal,
     ) {
         Ok(()) => proto::DelegationSteerResult::queued(
@@ -3553,7 +3577,7 @@ mod tests {
     }
 
     #[test]
-    fn steer_side_channel_scrubs_and_stamps_origin() {
+    fn steer_side_channel_stores_raw_and_stamps_origin() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
@@ -3598,8 +3622,7 @@ mod tests {
             .unwrap();
         assert_eq!(steers.len(), 1);
         assert_eq!(steers[0].origin_principal, "local:tester");
-        assert!(!steers[0].body.contains("secret-user-steer-token"));
-        assert!(steers[0].body.contains("REDACTED"));
+        assert!(steers[0].body.contains("secret-user-steer-token"));
     }
 
     #[test]
@@ -3659,6 +3682,12 @@ mod tests {
             "SESSION_REFRESH_SECRET=worker-secret\n",
         )
         .unwrap();
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Build",
+        )
+        .unwrap();
         let (event_tx, _event_rx) = broadcast::channel(8);
         let redaction: SharedRedactionTable =
             Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
@@ -3666,7 +3695,8 @@ mod tests {
         let mut notified = HashSet::new();
 
         refresh_redaction_for_turn(
-            Uuid::new_v4(),
+            &session,
+            session.id,
             tmp.path(),
             &RedactionSourceOverrides::default(),
             &mut notified,
@@ -3685,6 +3715,8 @@ mod tests {
         let scrubbed = table.scrub("worker-secret");
         assert!(!scrubbed.contains("worker-secret"));
         assert!(scrubbed.contains("REDACTED"));
+        let persisted = session.persisted_redaction_table().unwrap().unwrap();
+        assert!(!persisted.scrub("worker-secret").contains("worker-secret"));
     }
 
     #[test]

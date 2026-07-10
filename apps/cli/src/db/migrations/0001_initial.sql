@@ -50,6 +50,11 @@ CREATE TABLE sessions (
     guidance_baseline_hash TEXT,
     guidance_baseline_path TEXT,
 
+    -- Accumulated session egress redaction table. Stores literal redaction
+    -- candidates so resumed raw transcripts remain covered even if the
+    -- original env/dotenv source has changed or disappeared.
+    redaction_table_json TEXT,
+
     -- 1 for a throwaway side-conversation fork (`/side`): excluded from
     -- session lists, never auto-titled, discarded when the side
     -- conversation ends (daemon sweeps orphans on boot).

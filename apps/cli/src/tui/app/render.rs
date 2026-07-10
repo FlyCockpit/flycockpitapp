@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -20,8 +21,8 @@ use crate::tui::composer::{
     visual_position_for_byte, wrap_display_chunks,
 };
 use crate::tui::history::{
-    AGENT_INDENT, HistoryEntry, PendingMsg, Rendered, SubagentOutcome, ToolCall,
-    agent_display_label, format_status_elapsed, render_entry, render_pending, thinking_dots_padded,
+    AGENT_INDENT, HistoryEntry, PendingMsg, Rendered, ToolCallState, agent_display_label,
+    format_status_elapsed, render_entry, render_pending, thinking_dots_padded,
 };
 use crate::tui::theme::{
     BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
@@ -88,27 +89,38 @@ fn apply_hover_highlight(
     }
 }
 
-fn hash_tool_call(hasher: &mut DefaultHasher, call: &ToolCall) {
-    call.call_id.hash(hasher);
-    call.tool.hash(hasher);
-    call.summary.hash(hasher);
-    call.full_input.hash(hasher);
-    call.output.hash(hasher);
-    call.expanded.hash(hasher);
-    call.result_offset.hash(hasher);
-    format!("{:?}", call.state).hash(hasher);
-    call.hint.hash(hasher);
+fn tool_call_state_id(state: ToolCallState) -> u8 {
+    match state {
+        ToolCallState::Processing => 0,
+        ToolCallState::Success => 1,
+        ToolCallState::Failed => 2,
+        ToolCallState::BadCall => 3,
+    }
 }
 
-fn hash_subagent_outcome(hasher: &mut DefaultHasher, outcome: &SubagentOutcome) {
-    outcome.report.hash(hasher);
-    outcome.failed.hash(hasher);
-    outcome.duration.hash(hasher);
-    outcome.status.hash(hasher);
+fn thinking_display_id(value: crate::config::extended::ThinkingDisplay) -> u8 {
+    match value {
+        crate::config::extended::ThinkingDisplay::Condensed => 0,
+        crate::config::extended::ThinkingDisplay::Hidden => 1,
+        crate::config::extended::ThinkingDisplay::Verbose => 2,
+    }
 }
 
-fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, preflight_dots_ms: u128) {
-    std::mem::discriminant(entry).hash(hasher);
+fn diff_style_id(value: crate::config::extended::DiffStyle) -> u8 {
+    match value {
+        crate::config::extended::DiffStyle::SideBySide => 0,
+        crate::config::extended::DiffStyle::Inline => 1,
+        crate::config::extended::DiffStyle::Hidden => 2,
+    }
+}
+
+fn hash_len(hasher: &mut DefaultHasher, value: &str) {
+    value.len().hash(hasher);
+}
+
+fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    std::mem::discriminant(entry).hash(&mut hasher);
     match entry {
         HistoryEntry::User {
             text,
@@ -119,38 +131,35 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             preflight_pending,
             persist_failed,
         } => {
-            text.hash(hasher);
-            cleaned.hash(hasher);
-            expanded.hash(hasher);
-            timestamp.hash(hasher);
-            seq.hash(hasher);
-            preflight_pending.hash(hasher);
-            persist_failed.hash(hasher);
-            if *preflight_pending {
-                ((preflight_dots_ms / 333) % 4).hash(hasher);
-            }
+            hash_len(&mut hasher, text);
+            cleaned.hash(&mut hasher);
+            expanded.hash(&mut hasher);
+            timestamp.hash(&mut hasher);
+            seq.hash(&mut hasher);
+            preflight_pending.hash(&mut hasher);
+            persist_failed.hash(&mut hasher);
         }
         HistoryEntry::Plain { line }
         | HistoryEntry::CommandError { line }
         | HistoryEntry::Maintenance { line }
         | HistoryEntry::BackupWarning { line }
-        | HistoryEntry::InferenceWarning { line } => line.hash(hasher),
+        | HistoryEntry::InferenceWarning { line } => hash_len(&mut hasher, line),
         HistoryEntry::UserNote { text, timestamp } => {
-            text.hash(hasher);
-            timestamp.hash(hasher);
+            hash_len(&mut hasher, text);
+            timestamp.hash(&mut hasher);
         }
         HistoryEntry::SkillAutoInjected { name, reason } => {
-            name.hash(hasher);
-            reason.hash(hasher);
+            hash_len(&mut hasher, name);
+            reason.as_ref().map(|value| value.len()).hash(&mut hasher);
         }
         HistoryEntry::InferenceError {
             summary,
             detail,
             expanded,
         } => {
-            summary.hash(hasher);
-            detail.hash(hasher);
-            expanded.hash(hasher);
+            hash_len(&mut hasher, summary);
+            hash_len(&mut hasher, detail);
+            expanded.hash(&mut hasher);
         }
         HistoryEntry::Agent {
             name,
@@ -162,14 +171,14 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             think_duration,
             seq,
         } => {
-            name.hash(hasher);
-            text.hash(hasher);
-            reasoning.hash(hasher);
-            timestamp.hash(hasher);
-            expanded.hash(hasher);
-            reasoning_offset.hash(hasher);
-            think_duration.hash(hasher);
-            seq.hash(hasher);
+            hash_len(&mut hasher, name);
+            hash_len(&mut hasher, text);
+            hash_len(&mut hasher, reasoning);
+            timestamp.hash(&mut hasher);
+            expanded.hash(&mut hasher);
+            reasoning_offset.hash(&mut hasher);
+            think_duration.hash(&mut hasher);
+            seq.hash(&mut hasher);
         }
         HistoryEntry::Diff {
             tool,
@@ -177,21 +186,32 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             old,
             new,
         } => {
-            tool.hash(hasher);
-            path.hash(hasher);
-            old.hash(hasher);
-            new.hash(hasher);
+            hash_len(&mut hasher, tool);
+            hash_len(&mut hasher, path);
+            hash_len(&mut hasher, old);
+            hash_len(&mut hasher, new);
         }
         HistoryEntry::ToolBox {
             calls,
             view_offset,
             follow,
         } => {
-            view_offset.hash(hasher);
-            follow.hash(hasher);
-            calls.len().hash(hasher);
+            view_offset.hash(&mut hasher);
+            follow.hash(&mut hasher);
+            calls.len().hash(&mut hasher);
             for call in calls {
-                hash_tool_call(hasher, call);
+                hash_len(&mut hasher, &call.call_id);
+                hash_len(&mut hasher, &call.tool);
+                hash_len(&mut hasher, &call.summary);
+                hash_len(&mut hasher, &call.full_input);
+                hash_len(&mut hasher, &call.output);
+                call.expanded.hash(&mut hasher);
+                call.result_offset.hash(&mut hasher);
+                tool_call_state_id(call.state).hash(&mut hasher);
+                call.hint
+                    .as_ref()
+                    .map(|value| value.len())
+                    .hash(&mut hasher);
             }
         }
         HistoryEntry::ToolLine {
@@ -200,19 +220,19 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             summary,
             state,
         } => {
-            call_id.hash(hasher);
-            tool.hash(hasher);
-            summary.hash(hasher);
-            format!("{state:?}").hash(hasher);
+            hash_len(&mut hasher, call_id);
+            hash_len(&mut hasher, tool);
+            hash_len(&mut hasher, summary);
+            tool_call_state_id(*state).hash(&mut hasher);
         }
         HistoryEntry::LocalCommand {
             label,
             output,
             failed,
         } => {
-            label.hash(hasher);
-            output.hash(hasher);
-            failed.hash(hasher);
+            hash_len(&mut hasher, label);
+            hash_len(&mut hasher, output);
+            failed.hash(&mut hasher);
         }
         HistoryEntry::Subagent {
             parent,
@@ -222,27 +242,40 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             trusted_only,
             model_trusted,
             routing,
-            spawned_at,
             outcome,
             expanded,
+            ..
         } => {
-            parent.hash(hasher);
-            child.hash(hasher);
-            task_call_id.hash(hasher);
-            label.hash(hasher);
-            trusted_only.hash(hasher);
-            model_trusted.hash(hasher);
-            routing.model.hash(hasher);
-            routing.location.hash(hasher);
-            routing.fallback.hash(hasher);
-            expanded.hash(hasher);
+            hash_len(&mut hasher, parent);
+            hash_len(&mut hasher, child);
+            hash_len(&mut hasher, task_call_id);
+            hash_len(&mut hasher, label);
+            trusted_only.hash(&mut hasher);
+            model_trusted.hash(&mut hasher);
+            routing
+                .model
+                .as_ref()
+                .map(|value| value.len())
+                .hash(&mut hasher);
+            routing
+                .location
+                .as_ref()
+                .map(|value| value.len())
+                .hash(&mut hasher);
+            routing.fallback.hash(&mut hasher);
+            expanded.hash(&mut hasher);
             match outcome {
-                Some(outcome) => hash_subagent_outcome(hasher, outcome),
-                None => {
-                    let elapsed = spawned_at.elapsed();
-                    ((elapsed.as_millis() / 333) % 4).hash(hasher);
-                    elapsed.as_secs().hash(hasher);
+                Some(outcome) => {
+                    hash_len(&mut hasher, &outcome.report);
+                    outcome.failed.hash(&mut hasher);
+                    outcome.duration.hash(&mut hasher);
+                    outcome
+                        .status
+                        .as_ref()
+                        .map(|value| value.len())
+                        .hash(&mut hasher);
                 }
+                None => 0usize.hash(&mut hasher),
             }
         }
         HistoryEntry::CompactBoundary {
@@ -252,18 +285,20 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             brief,
             expanded,
         } => {
-            predecessor_short_id.hash(hasher);
-            seed_tool_count.hash(hasher);
-            seed_tool_tokens.hash(hasher);
-            brief.hash(hasher);
-            expanded.hash(hasher);
+            hash_len(&mut hasher, predecessor_short_id);
+            seed_tool_count.hash(&mut hasher);
+            seed_tool_tokens.hash(&mut hasher);
+            brief.as_ref().map(|value| value.len()).hash(&mut hasher);
+            expanded.hash(&mut hasher);
         }
     }
+    hasher.finish()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn history_render_signature(
     entry: &HistoryEntry,
+    version: u64,
     width: u16,
     thinking: crate::config::extended::ThinkingDisplay,
     md: crate::tui::history::MarkdownOpts,
@@ -274,13 +309,32 @@ fn history_render_signature(
     pin: Option<crate::tui::history::PinControl>,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
-    hash_history_entry(&mut hasher, entry, preflight_dots_ms);
+    version.hash(&mut hasher);
     width.hash(&mut hasher);
-    format!("{thinking:?}").hash(&mut hasher);
+    thinking_display_id(thinking).hash(&mut hasher);
     md.agent.hash(&mut hasher);
     md.user.hash(&mut hasher);
-    format!("{diff_style:?}").hash(&mut hasher);
+    diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
+
+    if let HistoryEntry::User {
+        preflight_pending: true,
+        ..
+    } = entry
+    {
+        ((preflight_dots_ms / 333) % 4).hash(&mut hasher);
+    }
+
+    if let HistoryEntry::Subagent {
+        spawned_at,
+        outcome: None,
+        ..
+    } = entry
+    {
+        let elapsed = spawned_at.elapsed();
+        ((elapsed.as_millis() / 333) % 4).hash(&mut hasher);
+        elapsed.as_secs().hash(&mut hasher);
+    }
 
     if let HistoryEntry::ToolBox { calls, .. } = entry {
         let mut elided_ids: Vec<&str> = calls
@@ -302,8 +356,8 @@ fn history_render_signature(
 fn pending_render_signature(msg: &PendingMsg, width: u16) -> u64 {
     let mut hasher = DefaultHasher::new();
     msg.name.hash(&mut hasher);
-    msg.text.hash(&mut hasher);
-    msg.reasoning.hash(&mut hasher);
+    msg.text.len().hash(&mut hasher);
+    msg.reasoning.len().hash(&mut hasher);
     msg.timestamp.hash(&mut hasher);
     width.hash(&mut hasher);
     hasher.finish()
@@ -1238,9 +1292,73 @@ impl App {
         crate::tui::banner_box::build(&self.launch, pane_w, pane_h).unwrap_or_default()
     }
 
+    pub(super) fn refresh_transcript_find_matches(&mut self) {
+        let top = self.visible_chat_top_line();
+        let Some(find) = self.transcript_find.as_mut() else {
+            return;
+        };
+        find.matches.clear();
+        find.current = None;
+        if find.query.is_empty() {
+            return;
+        }
+        let query = find.query.to_lowercase();
+        find.matches = self
+            .chat_find_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.to_lowercase().contains(&query).then_some(idx))
+            .collect();
+        if find.matches.is_empty() {
+            return;
+        }
+        let current = find
+            .matches
+            .iter()
+            .position(|line| *line >= top)
+            .unwrap_or(0);
+        find.current = Some(current);
+        let abs = find.matches[current];
+        self.scroll_abs_line_into_view(abs);
+    }
+
+    pub(super) fn sync_history_render_versions(&mut self) {
+        if self.history_render_versions.len() > self.history.len() {
+            self.history_render_versions.truncate(self.history.len());
+            self.history_render_fingerprints
+                .truncate(self.history.len());
+            self.history_render_cache
+                .retain(|idx, _| *idx < self.history.len());
+        }
+
+        for idx in 0..self.history.len() {
+            let fingerprint = history_entry_render_fingerprint(&self.history[idx]);
+            if idx >= self.history_render_versions.len() {
+                self.history_render_versions
+                    .push(self.next_history_render_version);
+                self.history_render_fingerprints.push(fingerprint);
+                self.next_history_render_version = self.next_history_render_version.wrapping_add(1);
+                if self.next_history_render_version == 0 {
+                    self.next_history_render_version = 1;
+                }
+                continue;
+            }
+
+            if self.history_render_fingerprints[idx] != fingerprint {
+                self.history_render_versions[idx] = self.next_history_render_version;
+                self.history_render_fingerprints[idx] = fingerprint;
+                self.next_history_render_version = self.next_history_render_version.wrapping_add(1);
+                if self.next_history_render_version == 0 {
+                    self.next_history_render_version = 1;
+                }
+            }
+        }
+    }
+
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
+        self.sync_history_render_versions();
         let previous_top = if self.chat_scroll_offset > 0 {
             Some(chat_visible_top(
                 self.chat_total_lines,
@@ -1288,8 +1406,10 @@ impl App {
             });
             let entry_base = all.len();
             let preflight_dots_ms = self.started_at.elapsed().as_millis();
+            let version = self.history_render_versions[idx];
             let sig = history_render_signature(
                 entry,
+                version,
                 area.width,
                 self.thinking_setting,
                 self.markdown_opts,
@@ -1300,9 +1420,9 @@ impl App {
                 pin,
             );
             let rendered = match self.history_render_cache.get(&idx) {
-                Some(cached) if cached.sig == sig => cached.rendered.clone(),
+                Some(cached) if cached.sig == sig => Rc::clone(&cached.rendered),
                 _ => {
-                    let rendered = render_entry(
+                    let rendered = Rc::new(render_entry(
                         entry,
                         area.width,
                         self.thinking_setting,
@@ -1315,12 +1435,12 @@ impl App {
                         // each 100ms tick (implementation note).
                         preflight_dots_ms,
                         pin,
-                    );
+                    ));
                     self.history_render_cache.insert(
                         idx,
                         HistoryRenderCacheEntry {
                             sig,
-                            rendered: rendered.clone(),
+                            rendered: Rc::clone(&rendered),
                         },
                     );
                     rendered
@@ -1334,7 +1454,7 @@ impl App {
                 tool_result_scroll_regions,
                 reasoning_scroll_region,
                 pin_region,
-            } = rendered;
+            } = rendered.as_ref();
             let chip_abs = chip_row.map(|cr| all.len() + cr);
             // The clickable pin region (when drawn) lands on `pin_region.row`
             // within this entry's lines — offset into the `all` buffer.
@@ -1406,12 +1526,12 @@ impl App {
             // Each entry's renderer returns one bool per emitted line;
             // pad if there's any mismatch (defensive — shouldn't
             // happen but keeps the parallel arrays in lockstep).
-            let mut entry_conts = continuations;
+            let mut entry_conts = continuations.clone();
             entry_conts.resize(lines.len(), false);
             for (meta, continuation) in row_meta[entry_base..].iter_mut().zip(entry_conts) {
                 meta.continuation = continuation;
             }
-            all.extend(lines);
+            all.extend(lines.iter().cloned());
             // One-line gap after a block so it separates from what
             // follows. Consecutive agents share a block, and an immediate
             // ToolBox continues the assistant turn without an inter-entry gap.
@@ -1499,17 +1619,23 @@ impl App {
         let box_lines = self.banner_box_lines(area.width, area.height);
         let b = box_lines.len();
         let m = all.len();
-        self.chat_find_lines = box_lines
-            .iter()
-            .chain(all.iter())
-            .map(rendered_line_text)
-            .collect();
 
         // Total scrollable content height, box included — drives the
         // mouse-wheel scrollback clamp.
         self.chat_total_lines = b + m;
         self.chat_visible_lines = area_h;
         self.chat_banner_lines = b;
+
+        if self.transcript_find.is_some() {
+            self.chat_find_lines = box_lines
+                .iter()
+                .chain(all.iter())
+                .map(rendered_line_text)
+                .collect();
+            self.refresh_transcript_find_matches();
+        } else {
+            self.chat_find_lines.clear();
+        }
 
         let (visible, visible_meta): VisibleRows = if b > 0 && b + m <= area_h {
             // Fits with room to spare: messages stay bottom-aligned and
@@ -2066,6 +2192,24 @@ impl App {
     /// the documented fallback. The finalized-history portion is memoized
     /// (see `history_estimate_tokens`) so the per-frame live counter only
     /// re-tokenizes the small, growing `pending` buffer.
+    fn pending_tokens(&self) -> u32 {
+        let Some(pending) = &self.pending else {
+            self.pending_token_cache.set(None);
+            return 0;
+        };
+        let key = (pending.text.len(), pending.reasoning.len());
+        if let Some((cached_key, tokens)) = self.pending_token_cache.get()
+            && cached_key == key
+        {
+            return tokens;
+        }
+        let tokens = (crate::tokens::count(&pending.text)
+            + crate::tokens::count(&pending.reasoning))
+        .min(u32::MAX as usize) as u32;
+        self.pending_token_cache.set(Some((key, tokens)));
+        tokens
+    }
+
     pub(super) fn estimate_context_tokens(&self) -> u32 {
         // The full composed system prompt is a fixed baseline for the
         // session (computed once at launch); it's present on every turn,
@@ -2077,9 +2221,7 @@ impl App {
             .unwrap_or(0)
             .min(u32::MAX as u64) as usize;
         tokens += self.history_estimate_tokens() as usize;
-        if let Some(p) = &self.pending {
-            tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
-        }
+        tokens += self.pending_tokens() as usize;
         // Buffered `<git>` blocks (GOALS §1l) ride the next user
         // message; surface their cost before the user commits to send.
         for block in &self.pending_git_blocks {
@@ -2096,10 +2238,7 @@ impl App {
     /// `/context` overlay.
     pub(super) fn message_tokens(&self) -> u64 {
         let mut tokens = self.history_estimate_tokens() as u64;
-        if let Some(p) = &self.pending {
-            tokens +=
-                crate::tokens::count(&p.text) as u64 + crate::tokens::count(&p.reasoning) as u64;
-        }
+        tokens += self.pending_tokens() as u64;
         for block in &self.pending_git_blocks {
             tokens += crate::tokens::count(block) as u64;
         }
@@ -3556,6 +3695,7 @@ mod render_history_spacing_tests {
     };
     use crate::config::extended::{DiffStyle, ThinkingDisplay};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
+    use crate::tokens::{count_call_count, reset_count_call_count};
     use crate::tui::app::AffordanceTarget;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, ToolCall, ToolCallState, render_entry_call_count,
@@ -3567,6 +3707,7 @@ mod render_history_spacing_tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
+    use std::rc::Rc;
 
     fn agent(text: &str) -> HistoryEntry {
         HistoryEntry::Agent {
@@ -3943,12 +4084,21 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn render_history_populates_find_lines_without_bottom_padding() {
+    fn render_history_builds_find_lines_only_while_find_is_open() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.history = vec![user("findable target")];
 
+        render_history_no_selection(&mut app, 40, 8);
+        assert!(app.chat_find_lines.is_empty());
+
+        app.transcript_find = Some(TranscriptFind {
+            query: "findable".to_string(),
+            matches: Vec::new(),
+            current: None,
+            saved_offset: 0,
+        });
         render_history_no_selection(&mut app, 40, 8);
 
         assert_eq!(app.chat_find_lines.len(), app.chat_total_lines);
@@ -3957,6 +4107,53 @@ mod render_history_spacing_tests {
                 .iter()
                 .any(|line| line.contains("findable target"))
         );
+        assert!(!app.transcript_find.as_ref().unwrap().matches.is_empty());
+    }
+
+    #[test]
+    fn render_history_cache_hits_reuse_rendered_rc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![agent("stable cached text")];
+
+        render_history_no_selection(&mut app, 80, 8);
+        let first = Rc::clone(&app.history_render_cache.get(&0).unwrap().rendered);
+
+        render_history_no_selection(&mut app, 80, 8);
+        let second = Rc::clone(&app.history_render_cache.get(&0).unwrap().rendered);
+
+        assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn pending_token_count_is_memoized_by_lengths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.pending = Some(PendingMsg {
+            name: "Build".to_string(),
+            text: "hello world".to_string(),
+            reasoning: "thinking".to_string(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: None,
+            inside_think: false,
+            body_started: true,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: false,
+        });
+
+        reset_count_call_count();
+        let first = app.message_tokens();
+        assert_eq!(count_call_count(), 2);
+
+        assert_eq!(app.message_tokens(), first);
+        assert_eq!(count_call_count(), 2);
+
+        app.pending.as_mut().unwrap().text.push('!');
+        let _ = app.message_tokens();
+        assert_eq!(count_call_count(), 4);
     }
 
     #[test]
@@ -4015,16 +4212,10 @@ mod render_history_spacing_tests {
         app.history = vec![HistoryEntry::Plain {
             line: "alpha needle omega".to_string(),
         }];
-        render_history_no_selection(&mut app, 40, 4);
-        let abs = app
-            .chat_find_lines
-            .iter()
-            .position(|line| line.contains("needle"))
-            .unwrap();
         app.transcript_find = Some(TranscriptFind {
             query: "needle".to_string(),
-            matches: vec![abs],
-            current: Some(0),
+            matches: Vec::new(),
+            current: None,
             saved_offset: 0,
         });
 

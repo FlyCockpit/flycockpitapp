@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -44,6 +44,7 @@ pub struct AgentRunner {
     pub record_tx: mpsc::Sender<Request>,
     /// Drained per tick into [`crate::tui::app::App::history`].
     pub events: Arc<Mutex<Vec<TurnEvent>>>,
+    pub(crate) event_notify: Arc<Notify>,
     /// Name of whoever's currently on top of the agent stack. The
     /// chrome reads this for the active-agent slot (GOALS §1a).
     pub active_agent: Arc<Mutex<String>>,
@@ -129,13 +130,18 @@ impl AgentRunner {
     pub fn shutdown(&mut self) {
         self.client_tasks.shutdown();
     }
+
+    pub fn event_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.event_notify)
+    }
 }
 
-fn push_turn_event(events: &Arc<Mutex<Vec<TurnEvent>>>, event: TurnEvent) {
+fn push_turn_event(events: &Arc<Mutex<Vec<TurnEvent>>>, notify: &Arc<Notify>, event: TurnEvent) {
     let mut guard = events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.push(event);
+    notify.notify_one();
 }
 
 pub(crate) fn drain_turn_events(events: &Arc<Mutex<Vec<TurnEvent>>>) -> Vec<TurnEvent> {
@@ -342,6 +348,7 @@ fn try_spawn_inner(
     let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
     let events = Arc::new(Mutex::new(Vec::new()));
+    let event_notify = Arc::new(Notify::new());
     let initial_active_agent_path = if active_agent_path.is_empty() {
         vec![initial_active_agent.clone()]
     } else {
@@ -356,13 +363,17 @@ fn try_spawn_inner(
     {
         let client = client.clone();
         let events = events.clone();
+        let event_notify = event_notify.clone();
         client_tasks.push(tokio::spawn(async move {
             while let Some(sub) = input_rx.recv().await {
                 let refs = match upload_submission_images(&client, &sub.images).await {
                     Ok(refs) => refs,
                     Err(error) => {
-                        crate::sync::lock_or_recover(&events)
-                            .push(TurnEvent::UserMessageDispatchFailed { error });
+                        push_turn_event(
+                            &events,
+                            &event_notify,
+                            TurnEvent::UserMessageDispatchFailed { error },
+                        );
                         continue;
                     }
                 };
@@ -377,6 +388,7 @@ fn try_spawn_inner(
                     Ok(Ok(Response::UserMessageQueued { queue, .. })) => {
                         push_turn_event(
                             &events,
+                            &event_notify,
                             TurnEvent::QueueUpdated {
                                 queue: queue.into_iter().map(queue_item_from_proto).collect(),
                             },
@@ -384,12 +396,17 @@ fn try_spawn_inner(
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
-                        crate::sync::lock_or_recover(&events)
-                            .push(TurnEvent::UserMessageDispatchFailed { error: e.message });
+                        push_turn_event(
+                            &events,
+                            &event_notify,
+                            TurnEvent::UserMessageDispatchFailed { error: e.message },
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(error = ?e, "send_user_message transport failed");
-                        crate::sync::lock_or_recover(&events).push(
+                        push_turn_event(
+                            &events,
+                            &event_notify,
                             TurnEvent::UserMessageDispatchFailed {
                                 error: e.to_string(),
                             },
@@ -417,6 +434,7 @@ fn try_spawn_inner(
     // buffer and update active-agent tracker.
     {
         let events = events.clone();
+        let event_notify = event_notify.clone();
         let active_agent = active_agent.clone();
         let active_agent_path = active_agent_path.clone();
         let client = client.clone();
@@ -441,7 +459,7 @@ fn try_spawn_inner(
                 }
                 update_active_agent(&event, &active_agent, &active_agent_path, &primary_agent);
                 if let Some(translated) = proto_event_to_turn_event(event) {
-                    push_turn_event(&events, translated);
+                    push_turn_event(&events, &event_notify, translated);
                 }
             }
         }));
@@ -451,6 +469,7 @@ fn try_spawn_inner(
         input_tx,
         record_tx,
         events,
+        event_notify,
         active_agent,
         active_agent_path,
         foreground_target: foreground_target.map(queue_target_from_proto),
@@ -1562,6 +1581,7 @@ mod tests {
             input_tx,
             record_tx,
             events,
+            event_notify: Arc::new(Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
@@ -1757,6 +1777,7 @@ mod tests {
 
         push_turn_event(
             &events,
+            &Arc::new(Notify::new()),
             TurnEvent::Notice {
                 text: "after".into(),
             },

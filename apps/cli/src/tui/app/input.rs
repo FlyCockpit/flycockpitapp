@@ -2251,33 +2251,7 @@ impl App {
     }
 
     fn recompute_transcript_find(&mut self) {
-        let top = self.visible_chat_top_line();
-        let Some(find) = self.transcript_find.as_mut() else {
-            return;
-        };
-        find.matches.clear();
-        find.current = None;
-        if find.query.is_empty() {
-            return;
-        }
-        let query = find.query.to_lowercase();
-        find.matches = self
-            .chat_find_lines
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, line)| line.to_lowercase().contains(&query).then_some(idx))
-            .collect();
-        if find.matches.is_empty() {
-            return;
-        }
-        let current = find
-            .matches
-            .iter()
-            .position(|line| *line >= top)
-            .unwrap_or(0);
-        find.current = Some(current);
-        let abs = find.matches[current];
-        self.scroll_abs_line_into_view(abs);
+        self.refresh_transcript_find_matches();
     }
 
     fn cycle_transcript_find(&mut self, delta: isize) {
@@ -2299,7 +2273,7 @@ impl App {
         self.scroll_abs_line_into_view(abs);
     }
 
-    fn visible_chat_top_line(&self) -> usize {
+    pub(super) fn visible_chat_top_line(&self) -> usize {
         self.chat_total_lines
             .saturating_sub(self.chat_visible_lines.max(1))
             .saturating_sub(self.chat_scroll_offset)

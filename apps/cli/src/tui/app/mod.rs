@@ -17,9 +17,12 @@ mod render;
 use input::accepts_key;
 use render::{extract_selection_plaintext, is_edit_tool};
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::io::{Read, Write, stdout};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,9 +30,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseButton,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
+use futures::{FutureExt, StreamExt};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
@@ -56,7 +61,7 @@ const MIN_INPUT_CONTENT: u16 = 1;
 const MAX_INPUT_CONTENT: u16 = 6;
 const INPUT_BORDER: u16 = 2;
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const EVENT_TICK: Duration = Duration::from_millis(100);
+const ANIMATION_TICK: Duration = Duration::from_millis(100);
 const RUN_CAPTURE_MAX_BYTES: usize = 256 * 1024;
 const RUN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUN_CAPTURE_POLL: Duration = Duration::from_millis(10);
@@ -1808,7 +1813,17 @@ pub struct App {
     /// a turn streams, so the per-frame live counter only re-tokenizes
     /// the growing `pending` buffer instead of the whole transcript.
     /// `Cell` because the estimate runs from `&self` render paths.
-    pub(super) history_estimate_cache: std::cell::Cell<Option<(u64, u32)>>,
+    pub(super) history_estimate_cache: Cell<Option<(u64, u32)>>,
+    /// Memoized token count for the in-flight assistant buffer. The
+    /// streaming buffer is append-only within a turn, so lengths are the
+    /// cheap invalidation key for the render-path estimate.
+    pub(super) pending_token_cache: Cell<Option<((usize, usize), u32)>>,
+    /// Per-history-entry render versions. Versions are bumped when a cheap
+    /// shape fingerprint changes, letting render-cache validation compare a
+    /// small integer instead of hashing full transcript text every frame.
+    pub(super) history_render_versions: Vec<u64>,
+    pub(super) history_render_fingerprints: Vec<u64>,
+    pub(super) next_history_render_version: u64,
     /// Per-history-index render cache for stable transcript entries. The
     /// signature includes the entry content plus render-affecting settings and
     /// chrome state; stale indices are evicted at the end of `render_history`.
@@ -2299,7 +2314,7 @@ pub(super) struct ActiveSchedule {
 
 /// Toast intent — drives the message's foreground color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToastKind {
+pub(super) enum ToastKind {
     Success,
     Warning,
     Error,
@@ -2450,7 +2465,7 @@ enum CursorShape {
 #[derive(Clone)]
 pub(super) struct HistoryRenderCacheEntry {
     pub(super) sig: u64,
-    pub(super) rendered: crate::tui::history::Rendered,
+    pub(super) rendered: Rc<crate::tui::history::Rendered>,
 }
 
 #[derive(Clone)]
@@ -2459,7 +2474,17 @@ pub(super) struct PendingRenderCacheEntry {
     pub(super) lines: Vec<ratatui::text::Line<'static>>,
 }
 
-#[allow(private_interfaces)]
+async fn wait_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
+    match notify {
+        Some(notify) => notify.notified().await,
+        None => pending::<()>().await,
+    }
+}
+
+fn clear_redraw(needs_redraw: &mut bool) {
+    *needs_redraw = false;
+}
+
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
@@ -2666,7 +2691,13 @@ impl App {
             pending_new_session: false,
             last_usage: None,
             estimate_at_last_usage: 0,
-            history_estimate_cache: std::cell::Cell::new(None),
+            history_estimate_cache: Cell::new(None),
+            pending_token_cache: Cell::new(None),
+            history_render_versions: Vec::new(),
+            history_render_fingerprints: Vec::new(),
+            next_history_render_version: 1,
+            history_render_cache: HashMap::new(),
+            pending_render_cache: None,
             usage_models: HashMap::new(),
             usage_slash: HashMap::new(),
             usage_tags: HashMap::new(),
@@ -2746,8 +2777,6 @@ impl App {
             pin_count: 0,
             pin_control_rows: Vec::new(),
             msg_abs_line: std::collections::HashMap::new(),
-            history_render_cache: HashMap::new(),
-            pending_render_cache: None,
             chat_banner_lines: 0,
             pin_count_session: None,
             pinned_seqs_cache: HashSet::new(),
@@ -2968,7 +2997,7 @@ impl App {
 
         let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
 
-        let result = self.event_loop(&mut terminal);
+        let result = self.event_loop(&mut terminal).await;
 
         refresh_handle.abort();
 
@@ -3071,68 +3100,163 @@ impl App {
             .collect()
     }
 
-    pub(super) fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        loop {
-            self.ensure_session_for_display();
-            self.sync_repo_status();
-            self.drain_fetch_progress();
-            self.drain_agent_events();
-            self.drain_async_actions();
-            self.drain_prediction();
-            self.sync_prediction_ghost();
-            self.sync_active_agent();
-            self.sync_pin_count();
-            self.sync_mouse_capture_from_dialog();
-            self.tick_toast();
-            self.tick_ctrl_c_window();
-            self.dialog.tick();
-            // Auto-close the embedded pane when its child has exited
-            // (GOALS §1i — e.g. `:q`).
-            self.service_pane();
-            // In alt-screen mode the viewport is always the full
-            // terminal; no need to grow it or spill history into
-            // scrollback (alt screen doesn't have scrollback). The
-            // wheel-scroll path handles in-app scrollback instead.
-            self.maybe_service_new_session(terminal)?;
-            self.maybe_service_external_edit(terminal)?;
-            self.maybe_service_agent_file_edit(terminal)?;
-            self.maybe_service_category_setting_edit(terminal)?;
-            terminal.draw(|frame| self.render(frame))?;
-            self.start_startup_background_tasks();
-            // The composer is the user's active input surface this frame iff
-            // no question dialog is displacing it
-            // (implementation note). A render with no
-            // dialog means the composer has genuinely been usable, so the
-            // next dialog opened from here arms the full anti-misfire
-            // lockout. This render-driven mark is what makes the signal
-            // robust to the same-cycle `None→Some` handoff: a follow-up
-            // dialog installed before any composer render keeps the flag
-            // false and opens immediately answerable.
-            if self.question_dialog.is_none() {
-                self.composer_active_since_dialog = true;
-            }
-            self.sync_cursor_shape();
+    pub(super) async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let mut events = EventStream::new();
+        let mut needs_redraw = true;
 
-            if event::poll(EVENT_TICK)? {
-                match event::read()? {
-                    Event::Key(key) if accepts_key(&key) && self.handle_key(key) => break,
-                    Event::Paste(data) => {
-                        self.handle_paste(data);
+        loop {
+            if self.service_event_loop_wake(terminal)? {
+                needs_redraw = true;
+            }
+            self.start_startup_background_tasks();
+
+            if needs_redraw {
+                clear_redraw(&mut needs_redraw);
+                terminal.draw(|frame| self.render(frame))?;
+                // The composer is the user's active input surface this frame iff
+                // no question dialog is displacing it
+                // (implementation note). A render with no
+                // dialog means the composer has genuinely been usable, so the
+                // next dialog opened from here arms the full anti-misfire
+                // lockout. This render-driven mark is what makes the signal
+                // robust to the same-cycle `None→Some` handoff: a follow-up
+                // dialog installed before any composer render keeps the flag
+                // false and opens immediately answerable.
+                if self.question_dialog.is_none() {
+                    self.composer_active_since_dialog = true;
+                }
+                self.sync_cursor_shape();
+            }
+
+            let agent_notify = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(AgentRunner::event_notifier);
+            let async_notify = self.async_actions.notifier();
+
+            if self.animation_tick_active() {
+                let animation = tokio::time::sleep(ANIMATION_TICK);
+                tokio::pin!(animation);
+                tokio::select! {
+                    maybe_event = events.next() => {
+                        if self.handle_event_stream_item(maybe_event)? {
+                            break;
+                        }
+                        if self.drain_ready_terminal_events(&mut events)? {
+                            break;
+                        }
+                        needs_redraw = true;
                     }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse);
+                    _ = wait_optional_notify(agent_notify) => {
+                        self.drain_agent_events();
+                        needs_redraw = true;
                     }
-                    Event::Resize(_, _) => {
-                        // Alt-screen viewport tracks the terminal
-                        // size automatically; the next draw picks up
-                        // the new dimensions via frame.area().
+                    _ = async_notify.notified() => {
+                        needs_redraw = self.drain_async_actions();
                     }
-                    _ => {}
+                    _ = &mut animation => {
+                        needs_redraw = true;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    maybe_event = events.next() => {
+                        if self.handle_event_stream_item(maybe_event)? {
+                            break;
+                        }
+                        if self.drain_ready_terminal_events(&mut events)? {
+                            break;
+                        }
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_notify(agent_notify) => {
+                        self.drain_agent_events();
+                        needs_redraw = true;
+                    }
+                    _ = async_notify.notified() => {
+                        needs_redraw = self.drain_async_actions();
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn service_event_loop_wake(&mut self, terminal: &mut DefaultTerminal) -> Result<bool> {
+        let mut changed = false;
+        self.ensure_session_for_display();
+        changed |= self.sync_repo_status();
+        changed |= self.drain_fetch_progress();
+        changed |= self.drain_agent_events();
+        changed |= self.drain_async_actions();
+        changed |= self.drain_prediction();
+        self.sync_prediction_ghost();
+        self.sync_active_agent();
+        self.sync_pin_count();
+        self.sync_mouse_capture_from_dialog();
+        changed |= self.tick_toast();
+        changed |= self.tick_ctrl_c_window();
+        self.dialog.tick();
+        // Auto-close the embedded pane when its child has exited
+        // (GOALS §1i — e.g. `:q`).
+        self.service_pane();
+        // In alt-screen mode the viewport is always the full
+        // terminal; no need to grow it or spill history into
+        // scrollback (alt screen doesn't have scrollback). The
+        // wheel-scroll path handles in-app scrollback instead.
+        self.maybe_service_new_session(terminal)?;
+        self.maybe_service_external_edit(terminal)?;
+        self.maybe_service_agent_file_edit(terminal)?;
+        self.maybe_service_category_setting_edit(terminal)?;
+        Ok(changed)
+    }
+
+    fn handle_event_stream_item(&mut self, item: Option<std::io::Result<Event>>) -> Result<bool> {
+        match item {
+            Some(Ok(event)) => Ok(self.handle_terminal_event(event)),
+            Some(Err(error)) => Err(error.into()),
+            None => Ok(true),
+        }
+    }
+
+    fn drain_ready_terminal_events(&mut self, events: &mut EventStream) -> Result<bool> {
+        while let Some(item) = events.next().now_or_never() {
+            if self.handle_event_stream_item(item)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn handle_terminal_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(key) if accepts_key(&key) => self.handle_key(key),
+            Event::Paste(data) => {
+                self.handle_paste(data);
+                false
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                false
+            }
+            Event::Resize(_, _) => false,
+            _ => false,
+        }
+    }
+
+    fn animation_tick_active(&self) -> bool {
+        self.busy
+            || self.pending.is_some()
+            || self.toast.is_some()
+            || self.ctrl_c_armed_at.is_some()
+            || self.reconnect.is_some()
+            || self.pane.is_some()
+            || self.async_actions.pending_count() > 0
+            || self.dialog.is_active()
+            || self.question_dialog.is_some()
+            || self.daemon_prompt.is_some()
     }
 
     /// Show a transient toast (TUI-design-philosophy §7). Replaces
@@ -3194,12 +3318,14 @@ impl App {
     /// Drop the toast if it has expired. Called once per event-loop
     /// tick so a toast left untouched for 3 seconds cleans itself
     /// up without needing a new event to fire.
-    pub(super) fn tick_toast(&mut self) {
+    pub(super) fn tick_toast(&mut self) -> bool {
         if let Some(toast) = &self.toast
             && Instant::now() > toast.expires_at
         {
             self.toast = None;
+            return true;
         }
+        false
     }
 
     /// Handle a ctrl+c press (GOALS §3a). Single press interrupts a
@@ -3267,12 +3393,14 @@ impl App {
     /// event-loop tick so a lone press auto-resets to a fresh first press
     /// without needing another event. The hint toast self-expires on the
     /// same TTL via [`Self::tick_toast`].
-    pub(super) fn tick_ctrl_c_window(&mut self) {
+    pub(super) fn tick_ctrl_c_window(&mut self) -> bool {
         if let Some(armed) = self.ctrl_c_armed_at
             && Instant::now().duration_since(armed) > CTRL_C_EXIT_WINDOW
         {
             self.ctrl_c_armed_at = None;
+            return true;
         }
+        false
     }
 
     /// Flip `tui.mouse_capture` on disk, push/pop the live terminal
@@ -3347,10 +3475,10 @@ impl App {
         }
     }
 
-    pub(super) fn drain_fetch_progress(&mut self) {
+    pub(super) fn drain_fetch_progress(&mut self) -> bool {
         let drained: Vec<String> = match self.fetch_models_progress.lock() {
             Ok(mut buf) if !buf.is_empty() => buf.drain(..).collect(),
-            _ => return,
+            _ => return false,
         };
         let touches_config = drained
             .iter()
@@ -3361,6 +3489,7 @@ impl App {
         if touches_config {
             self.reload_launch_info();
         }
+        true
     }
 
     /// Assemble the prediction input from the visible transcript: the
@@ -3429,13 +3558,13 @@ impl App {
     /// arrives after the user began typing (box non-empty) —
     /// appear-once-ready, never pop in over active input. On a usable
     /// result for the current empty turn, caches it and builds the ghost.
-    pub(super) fn drain_prediction(&mut self) {
+    pub(super) fn drain_prediction(&mut self) -> bool {
         let drained = match self.prediction_result.lock() {
             Ok(mut slot) => slot.take(),
-            Err(_) => return,
+            Err(_) => return false,
         };
         let Some((turn_id, text)) = drained else {
-            return;
+            return false;
         };
         let long_mode = matches!(
             self.predict_setting,
@@ -3443,13 +3572,16 @@ impl App {
         );
         self.prediction_state
             .on_result(turn_id, text, long_mode, self.composer.is_empty());
+        true
     }
 
-    pub(super) fn drain_async_actions(&mut self) {
+    pub(super) fn drain_async_actions(&mut self) -> bool {
         let results = self.async_actions.drain_completed();
+        let changed = !results.is_empty();
         for result in results {
             self.apply_async_action_result(result);
         }
+        changed
     }
 
     fn apply_async_action_result(&mut self, result: AsyncActionResult) {
@@ -3913,12 +4045,14 @@ impl App {
         self.prediction_state.reconcile(self.composer.is_empty());
     }
 
-    pub(super) fn sync_repo_status(&mut self) {
+    pub(super) fn sync_repo_status(&mut self) -> bool {
         if let Ok(guard) = self.repo_status.lock()
             && self.launch.repo_status != *guard
         {
             self.launch.repo_status = guard.clone();
+            return true;
         }
+        false
     }
 
     fn reset_session_live_state(&mut self) {
@@ -7051,14 +7185,16 @@ impl App {
 
     /// Drain any [`TurnEvent`]s the engine has produced into the
     /// pending+history state machine. Runs each tick.
-    pub(super) fn drain_agent_events(&mut self) {
+    pub(super) fn drain_agent_events(&mut self) -> bool {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            return;
+            return false;
         };
         let drained = crate::tui::agent_runner::drain_turn_events(&runner.events);
+        let changed = !drained.is_empty();
         for event in drained {
             self.apply_event(event);
         }
+        changed
     }
 
     pub(super) fn reconcile_queue_update(&mut self, queue: Vec<QueuedUserMessage>) {
@@ -11648,7 +11784,7 @@ fn xml_escape(s: &str) -> String {
 /// header — never leaving a dangling animated line. If no running entry
 /// is found (defensive — spawn/report events should pair), a settled
 /// entry is pushed so the report is never lost.
-struct SubagentReportUpdate {
+pub(super) struct SubagentReportUpdate {
     report: String,
     trusted_only: bool,
     model_trusted: bool,
@@ -16671,6 +16807,7 @@ mod footer_selector_tests {
             input_tx,
             record_tx,
             events: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
@@ -16964,6 +17101,7 @@ mod failed_dispatch_reconciliation_tests {
             input_tx,
             record_tx,
             events,
+            event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),

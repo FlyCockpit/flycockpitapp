@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,6 +149,7 @@ pub struct AsyncActionRunner {
     keyed: HashMap<AsyncActionKey, AsyncActionId>,
     tx: mpsc::UnboundedSender<CompletedAction>,
     rx: mpsc::UnboundedReceiver<CompletedAction>,
+    notify: Arc<Notify>,
 }
 
 impl Default for AsyncActionRunner {
@@ -161,6 +162,7 @@ impl Default for AsyncActionRunner {
             keyed: HashMap::new(),
             tx,
             rx,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -168,6 +170,10 @@ impl Default for AsyncActionRunner {
 impl AsyncActionRunner {
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    pub fn notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
     }
 
     pub fn is_pending(&self, id: AsyncActionId) -> bool {
@@ -183,7 +189,7 @@ impl AsyncActionRunner {
     where
         F: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
     {
-        self.start_with(kind, policy, |tx, id, generation, kind| {
+        self.start_with(kind, policy, |tx, notify, id, generation, kind| {
             tokio::spawn(async move {
                 let payload = future.await;
                 let _ = tx.send(CompletedAction {
@@ -192,6 +198,7 @@ impl AsyncActionRunner {
                     kind,
                     payload,
                 });
+                notify.notify_one();
             })
         })
     }
@@ -205,7 +212,7 @@ impl AsyncActionRunner {
     where
         F: FnOnce() -> Result<AsyncActionPayload, String> + Send + 'static,
     {
-        self.start_with(kind, policy, |tx, id, generation, kind| {
+        self.start_with(kind, policy, |tx, notify, id, generation, kind| {
             tokio::task::spawn_blocking(move || {
                 let payload = work();
                 let _ = tx.send(CompletedAction {
@@ -214,6 +221,7 @@ impl AsyncActionRunner {
                     kind,
                     payload,
                 });
+                notify.notify_one();
             })
         })
     }
@@ -227,6 +235,7 @@ impl AsyncActionRunner {
     where
         F: FnOnce(
             mpsc::UnboundedSender<CompletedAction>,
+            Arc<Notify>,
             AsyncActionId,
             u64,
             AsyncActionKind,
@@ -254,7 +263,13 @@ impl AsyncActionRunner {
 
         let id = AsyncActionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let handle = spawn(self.tx.clone(), id, generation, kind.clone());
+        let handle = spawn(
+            self.tx.clone(),
+            Arc::clone(&self.notify),
+            id,
+            generation,
+            kind.clone(),
+        );
         if let Some(key) = &key {
             self.keyed.insert(key.clone(), id);
         }

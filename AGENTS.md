@@ -6,7 +6,7 @@ Rules for coding agents working in Flycockpit.
 
 Flycockpit is a pnpm/Turborepo monorepo with a React web app, Hono API server, BullMQ worker, Expo native app, relay service, Prisma database package, and shared internal packages under the `@flycockpit/*` scope.
 
-The Rust Cockpit CLI lives in `apps/cli`. It is a standalone Cargo crate, not a pnpm workspace package: pnpm/turbo commands do not build it, and its checks are `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test --locked` run from `apps/cli/`. Its CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` and `crates/relay-protocol`; pnpm/turbo commands do not build or test Rust. Run cargo checks from the repo root: `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked -- -D warnings`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
 
 ## Default Workflow
 

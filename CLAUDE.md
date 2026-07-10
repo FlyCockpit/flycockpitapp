@@ -6,7 +6,7 @@ Also read `AGENTS.md` — it contains the binding rules for coding agents (workf
 
 ## Repository shape
 
-Flycockpit is a pnpm + Turborepo monorepo of TypeScript apps and packages, plus **one standalone Rust crate at `apps/cli`** (the `cockpit` CLI). The Rust crate is NOT a pnpm workspace package: pnpm/turbo commands never build or test it — always work on it with `cargo` from `apps/cli/`.
+Flycockpit is a pnpm + Turborepo monorepo of TypeScript apps and packages, plus a Cargo workspace rooted at `Cargo.toml`. Current Rust members are `apps/cli` (the `cockpit` CLI) and `crates/relay-protocol`. Rust crates are NOT pnpm workspace packages: pnpm/turbo commands never build or test them — run cargo from the repo root.
 
 ### TypeScript side
 
@@ -23,7 +23,7 @@ Data flow: web/native → oRPC client (React Query options) → routers in `pack
 
 **License boundary:** `packages/api/src/enterprise/` is under the FlyCockpit Enterprise License; everything else is Apache-2.0. Keep enterprise-only logic inside that directory.
 
-### Rust CLI (`apps/cli`)
+### Rust (`apps/cli`, `crates/*`)
 
 `cockpit` is an AI coding harness: ratatui TUI (`src/tui/`), persistent session daemon (`src/daemon/`, SQLite-backed sessions), agent engine (`src/engine/` — driver, prompt pruning, tool loop), providers/model catalogs (`src/providers/`, `src/config/`), MCP, file-locking write tools, multi-agent roles. CI is `.github/workflows/cli-ci.yml`; releases via cargo-dist (`.github/workflows/release.yml`, Homebrew tap). Requires Rust 1.95+.
 
@@ -54,11 +54,11 @@ pnpm -F @flycockpit/api exec vitest run src/routers/users.test.ts
 
 Pre-commit (lefthook) runs biome, `pnpm check-types`, and prisma validation — CI runs the same checks.
 
-### Rust CLI (run from `apps/cli/`)
+### Rust workspace (run from repo root)
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --locked -- -D warnings
 cargo test --locked           # all tests; single test: cargo test <name>
 cargo run                     # launches the cockpit TUI
 ```

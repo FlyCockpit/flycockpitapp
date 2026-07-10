@@ -1,0 +1,14 @@
+{
+  "event": "APPROVAL_NEEDED",
+  "payload": {
+    "eventId": "evt-1",
+    "eventType": "APPROVAL_NEEDED",
+    "fixedStringBody": "Open the session to review the request.",
+    "fixedStringTitle": "Approval needed",
+    "projectRoot": "/repo",
+    "sessionId": "session-1",
+    "ts": "2026-07-10T00:00:00.000Z"
+  },
+  "to": "control",
+  "v": 1
+}

@@ -1,0 +1,7 @@
+{
+  "channelId": "ch-stamped",
+  "from": "client",
+  "payload": { "op": "attach" },
+  "principal": { "grants": [{ "projectRoot": null, "scope": "terminal" }], "userId": "user-1" },
+  "v": 1
+}

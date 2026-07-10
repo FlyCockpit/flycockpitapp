@@ -1,0 +1,14 @@
+{
+  "notification": {
+    "body": "Open the session to review the request.",
+    "createdAt": "2026-07-10T00:00:00.000Z",
+    "id": "notification-1",
+    "instanceId": "instance-1",
+    "sessionRef": "session-1",
+    "title": "Approval needed",
+    "type": "APPROVAL_NEEDED",
+    "url": "/en-US/instances/instance-1"
+  },
+  "type": "notify_user",
+  "userId": "user-1"
+}

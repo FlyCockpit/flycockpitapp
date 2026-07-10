@@ -606,6 +606,23 @@ pub async fn run_foreground_with_resume(
     .await
 }
 
+pub(crate) fn boot_in_process(paths: DaemonPaths) -> Result<std::sync::Arc<server::DaemonContext>> {
+    if let Some(ctx) = server::in_process_context(&paths.socket) {
+        return Ok(ctx);
+    }
+
+    let ctx = std::sync::Arc::new(server::boot(paths)?);
+    #[cfg(not(test))]
+    {
+        server::spawn_lock_sweeper(ctx.clone());
+        let _org_sync_task = org_sync::spawn_background(ctx.clone());
+        let _remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
+        let _connector_task = connector::spawn_background(ctx.clone());
+    }
+    server::register_in_process_context(ctx.clone());
+    Ok(ctx)
+}
+
 /// Like [`run_foreground`] but with injectable idle- and drain-grace
 /// durations so tests can exercise the ephemeral watchdog (Layer C) and the
 /// graceful drain (`daemon-graceful-drain-shutdown.md`) without sleeping the

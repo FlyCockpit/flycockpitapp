@@ -44,6 +44,136 @@ const EVENT_BROADCAST_CAPACITY: usize = 1024;
 const LOCK_SNAPSHOT_WORK_LIMIT: usize = 4;
 static LOCK_SNAPSHOT_WORK: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// Maximum time a streaming text/reasoning delta waits before broadcast.
+/// At 25ms this stays below a 30fps frame while collapsing provider token bursts.
+const STREAM_DELTA_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+/// Flush long merged deltas well below the protocol's 8MiB frame limit.
+const STREAM_DELTA_COALESCE_BYTE_CAP: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeltaStreamKey {
+    session_id: Uuid,
+    agent: String,
+    kind: DeltaKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaKind {
+    AssistantText,
+    Reasoning,
+}
+
+#[derive(Debug)]
+struct PendingDelta {
+    key: DeltaStreamKey,
+    delta: String,
+    deadline: tokio::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct StreamDeltaCoalescer {
+    pending: Option<PendingDelta>,
+}
+
+impl StreamDeltaCoalescer {
+    #[cfg(test)]
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending.as_ref().map(|pending| pending.deadline)
+    }
+
+    fn push(&mut self, event: proto::Event) -> Vec<proto::Event> {
+        let Some((key, delta)) = delta_parts(&event) else {
+            let mut out = self.flush();
+            out.push(event);
+            return out;
+        };
+
+        match self.pending.as_mut() {
+            Some(pending) if pending.key == key => {
+                pending.delta.push_str(&delta);
+                if pending.delta.len() >= STREAM_DELTA_COALESCE_BYTE_CAP {
+                    self.flush()
+                } else {
+                    Vec::new()
+                }
+            }
+            Some(_) => {
+                let out = self.flush();
+                self.pending = Some(PendingDelta {
+                    key,
+                    delta,
+                    deadline: tokio::time::Instant::now() + STREAM_DELTA_COALESCE_WINDOW,
+                });
+                out
+            }
+            None => {
+                self.pending = Some(PendingDelta {
+                    key,
+                    delta,
+                    deadline: tokio::time::Instant::now() + STREAM_DELTA_COALESCE_WINDOW,
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Vec<proto::Event> {
+        self.pending
+            .take()
+            .map(|pending| vec![event_from_pending_delta(pending)])
+            .unwrap_or_default()
+    }
+}
+
+fn delta_parts(event: &proto::Event) -> Option<(DeltaStreamKey, String)> {
+    match event {
+        proto::Event::AssistantTextDelta {
+            session_id,
+            agent,
+            delta,
+        } => Some((
+            DeltaStreamKey {
+                session_id: *session_id,
+                agent: agent.clone(),
+                kind: DeltaKind::AssistantText,
+            },
+            delta.clone(),
+        )),
+        proto::Event::ReasoningDelta {
+            session_id,
+            agent,
+            delta,
+        } => Some((
+            DeltaStreamKey {
+                session_id: *session_id,
+                agent: agent.clone(),
+                kind: DeltaKind::Reasoning,
+            },
+            delta.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn event_from_pending_delta(pending: PendingDelta) -> proto::Event {
+    match pending.key.kind {
+        DeltaKind::AssistantText => proto::Event::AssistantTextDelta {
+            session_id: pending.key.session_id,
+            agent: pending.key.agent,
+            delta: pending.delta,
+        },
+        DeltaKind::Reasoning => proto::Event::ReasoningDelta {
+            session_id: pending.key.session_id,
+            agent: pending.key.agent,
+            delta: pending.delta,
+        },
+    }
+}
+
 /// Inbound work-queue capacity. Generous — user messages, cancels,
 /// and resolves are tiny.
 const WORK_QUEUE_CAPACITY: usize = 64;
@@ -978,71 +1108,103 @@ async fn run_worker(
     let locks_for_forward = locks.clone();
     let interactive_clients_for_forward = interactive_clients.clone();
     let forward = tokio::spawn(async move {
-        while let Some(event) = engine_event_rx.recv().await {
-            update_live_foreground(
-                &foreground_for_forward,
-                &foreground_input_target_for_forward,
-                &event,
-            );
-            for ev in turn_event_to_proto(event, session_id) {
-                // Per-session de-dupe (§6.5): the engine emits `SandboxUnavailable`
-                // on every refused `bash` (the verdict is process-lifetime-cached,
-                // so it recurs), but the user needs only one persistent notice.
-                // Forward the first; drop the recurring duplicates. `set_sandbox`
-                // re-arms the latch when the user toggles `/sandbox`.
-                if matches!(ev, proto::Event::SandboxUnavailable { .. })
-                    && !forward_sandbox_unavailable(&sandbox_notice_armed_for_forward)
-                {
-                    continue;
+        let send_event = |ev: proto::Event| {
+            // Per-session de-dupe (§6.5): the engine emits `SandboxUnavailable`
+            // on every refused `bash` (the verdict is process-lifetime-cached,
+            // so it recurs), but the user needs only one persistent notice.
+            // Forward the first; drop the recurring duplicates. `set_sandbox`
+            // re-arms the latch when the user toggles `/sandbox`.
+            if matches!(ev, proto::Event::SandboxUnavailable { .. })
+                && !forward_sandbox_unavailable(&sandbox_notice_armed_for_forward)
+            {
+                return;
+            }
+            match &ev {
+                proto::Event::ThinkingStarted { .. } => {
+                    live_for_forward.processing.store(true, Ordering::Relaxed);
                 }
-                match &ev {
-                    proto::Event::ThinkingStarted { .. } => {
-                        live_for_forward.processing.store(true, Ordering::Relaxed);
-                    }
-                    proto::Event::AgentIdle { .. } => {
-                        live_for_forward.processing.store(false, Ordering::Relaxed);
-                        // Last-detach-while-idle edge, idle side
-                        // (implementation note): the turn
-                        // just finished, so if no interactive client is
-                        // attached, release this session's locks now. Covers the
-                        // case where clients hit zero mid-turn (the detach edge
-                        // declined to release because the agent was still
-                        // running) and this idle boundary is the backstop.
-                        if interactive_clients_for_forward.load(Ordering::SeqCst) == 0 {
-                            schedule_session_locks_unattended(
-                                locks_for_forward.clone(),
-                                interactive_clients_for_forward.clone(),
-                                live_for_forward.clone(),
-                                session_id,
-                                "idle with no attached clients",
-                            );
-                            schedule_session_container_release(
-                                interactive_clients_for_forward.clone(),
-                                live_for_forward.clone(),
-                                session_id,
-                                "idle with no attached clients",
-                            );
-                        }
-                    }
-                    proto::Event::ScheduleStarted { .. } => {
-                        live_for_forward
-                            .active_schedules
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    proto::Event::ScheduleCompleted { .. } => {
-                        // Saturating: never underflow if a completion is
-                        // ever seen without its start (defensive).
-                        let _ = live_for_forward.active_schedules.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |n| Some(n.saturating_sub(1)),
+                proto::Event::AgentIdle { .. } => {
+                    live_for_forward.processing.store(false, Ordering::Relaxed);
+                    // Last-detach-while-idle edge, idle side
+                    // (implementation note): the turn just finished, so if no
+                    // interactive client is attached, release this session's locks now.
+                    if interactive_clients_for_forward.load(Ordering::SeqCst) == 0 {
+                        schedule_session_locks_unattended(
+                            locks_for_forward.clone(),
+                            interactive_clients_for_forward.clone(),
+                            live_for_forward.clone(),
+                            session_id,
+                            "idle with no attached clients",
+                        );
+                        schedule_session_container_release(
+                            interactive_clients_for_forward.clone(),
+                            live_for_forward.clone(),
+                            session_id,
+                            "idle with no attached clients",
                         );
                     }
-                    _ => {}
                 }
-                // `send` returns `Err` only when there are no
-                // subscribers — that's fine, nobody is listening.
-                let _ = event_tx_for_forward.send(ev);
+                proto::Event::ScheduleStarted { .. } => {
+                    live_for_forward
+                        .active_schedules
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                proto::Event::ScheduleCompleted { .. } => {
+                    // Saturating: never underflow if a completion is ever seen without its start.
+                    let _ = live_for_forward.active_schedules.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |n| Some(n.saturating_sub(1)),
+                    );
+                }
+                _ => {}
+            }
+            // `send` returns `Err` only when there are no subscribers — that's fine.
+            let _ = event_tx_for_forward.send(ev);
+        };
+
+        let mut coalescer = StreamDeltaCoalescer::default();
+        loop {
+            if let Some(deadline) = coalescer.deadline() {
+                tokio::select! {
+                    maybe_event = engine_event_rx.recv() => {
+                        let Some(event) = maybe_event else {
+                            for ev in coalescer.flush() {
+                                send_event(ev);
+                            }
+                            break;
+                        };
+                        update_live_foreground(
+                            &foreground_for_forward,
+                            &foreground_input_target_for_forward,
+                            &event,
+                        );
+                        for ev in turn_event_to_proto(event, session_id) {
+                            for ready in coalescer.push(ev) {
+                                send_event(ready);
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        for ev in coalescer.flush() {
+                            send_event(ev);
+                        }
+                    }
+                }
+            } else {
+                let Some(event) = engine_event_rx.recv().await else {
+                    break;
+                };
+                update_live_foreground(
+                    &foreground_for_forward,
+                    &foreground_input_target_for_forward,
+                    &event,
+                );
+                for ev in turn_event_to_proto(event, session_id) {
+                    for ready in coalescer.push(ev) {
+                        send_event(ready);
+                    }
+                }
             }
         }
     });
@@ -3113,6 +3275,127 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             CaptureGuard(self.0.clone())
         }
+    }
+
+    fn text_delta(agent: &str, delta: &str) -> proto::Event {
+        proto::Event::AssistantTextDelta {
+            session_id: Uuid::nil(),
+            agent: agent.to_string(),
+            delta: delta.to_string(),
+        }
+    }
+
+    fn reasoning_delta(agent: &str, delta: &str) -> proto::Event {
+        proto::Event::ReasoningDelta {
+            session_id: Uuid::nil(),
+            agent: agent.to_string(),
+            delta: delta.to_string(),
+        }
+    }
+
+    #[test]
+    fn stream_delta_coalescer_merges_rapid_consecutive_text() {
+        let mut c = StreamDeltaCoalescer::default();
+        assert!(c.push(text_delta("builder", "hel")).is_empty());
+        assert!(c.push(text_delta("builder", "lo")).is_empty());
+        let flushed = c.flush();
+        assert_eq!(flushed.len(), 1);
+        assert!(matches!(
+            &flushed[0],
+            proto::Event::AssistantTextDelta { agent, delta, .. }
+                if agent == "builder" && delta == "hello"
+        ));
+    }
+
+    #[test]
+    fn stream_delta_coalescer_flushes_before_non_delta_event() {
+        let mut c = StreamDeltaCoalescer::default();
+        assert!(c.push(text_delta("builder", "a")).is_empty());
+        let out = c.push(proto::Event::AgentIdle {
+            session_id: Uuid::nil(),
+            turn_id: None,
+        });
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            &out[0],
+            proto::Event::AssistantTextDelta { delta, .. } if delta == "a"
+        ));
+        assert!(matches!(&out[1], proto::Event::AgentIdle { .. }));
+    }
+
+    #[test]
+    fn stream_delta_coalescer_keeps_agents_and_delta_kinds_separate() {
+        let mut c = StreamDeltaCoalescer::default();
+        assert!(c.push(text_delta("builder", "a")).is_empty());
+        let out = c.push(text_delta("reviewer", "b"));
+        assert_eq!(out.len(), 1, "agent change flushes prior stream");
+        assert!(matches!(
+            &out[0],
+            proto::Event::AssistantTextDelta { agent, delta, .. }
+                if agent == "builder" && delta == "a"
+        ));
+        let out = c.push(reasoning_delta("reviewer", "r"));
+        assert_eq!(out.len(), 1, "kind change flushes prior stream");
+        assert!(matches!(
+            &out[0],
+            proto::Event::AssistantTextDelta { agent, delta, .. }
+                if agent == "reviewer" && delta == "b"
+        ));
+        let flushed = c.flush();
+        assert!(matches!(
+            &flushed[0],
+            proto::Event::ReasoningDelta { agent, delta, .. }
+                if agent == "reviewer" && delta == "r"
+        ));
+    }
+
+    #[test]
+    fn stream_delta_coalescer_byte_cap_flushes_before_window() {
+        let mut c = StreamDeltaCoalescer::default();
+        assert!(c.push(text_delta("builder", "a")).is_empty());
+        let big = "x".repeat(STREAM_DELTA_COALESCE_BYTE_CAP);
+        let out = c.push(text_delta("builder", &big));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            proto::Event::AssistantTextDelta { delta, .. }
+                if delta.len() == STREAM_DELTA_COALESCE_BYTE_CAP + 1
+        ));
+        assert!(!c.has_pending());
+    }
+
+    #[test]
+    fn stream_delta_coalescer_sets_flush_deadline_only_while_buffered() {
+        let mut c = StreamDeltaCoalescer::default();
+        assert!(c.deadline().is_none());
+        assert!(c.push(text_delta("builder", "a")).is_empty());
+        assert!(c.deadline().is_some());
+        let _ = c.flush();
+        assert!(c.deadline().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_delta_coalescer_timer_flushes_after_window() {
+        let mut c = StreamDeltaCoalescer::default();
+        assert!(c.push(text_delta("builder", "a")).is_empty());
+        assert!(c.push(text_delta("builder", "b")).is_empty());
+
+        let mut sleeper = Box::pin(tokio::time::sleep_until(c.deadline().unwrap()));
+        tokio::time::advance(STREAM_DELTA_COALESCE_WINDOW - std::time::Duration::from_millis(1))
+            .await;
+        tokio::select! {
+            _ = &mut sleeper => panic!("coalescing timer fired before the flush window elapsed"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        sleeper.await;
+        let flushed = c.flush();
+        assert_eq!(flushed.len(), 1);
+        assert!(matches!(
+            &flushed[0],
+            proto::Event::AssistantTextDelta { delta, .. } if delta == "ab"
+        ));
     }
 
     fn capture_warn_log(f: impl FnOnce()) -> String {

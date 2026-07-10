@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,7 +17,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
@@ -41,6 +41,11 @@ use crate::locks::LockManager;
 /// Daemon-wide broadcast capacity for global (non-session) events such as
 /// [`proto::Event::CaffeinateState`]. Generous — these are rare.
 const GLOBAL_EVENT_CAPACITY: usize = 64;
+const IN_PROCESS_REQUEST_QUEUE: usize = 64;
+const IN_PROCESS_EVENT_QUEUE: usize = 1024;
+
+static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
+    OnceLock::new();
 
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
@@ -75,6 +80,24 @@ pub struct DaemonContext {
 }
 
 impl DaemonContext {
+    fn caffeinate_state_event(&self) -> proto::Event {
+        let snap = self.caffeinate.snapshot();
+        proto::Event::CaffeinateState {
+            active: snap.active,
+            lid_close_guaranteed: false,
+            message: None,
+        }
+    }
+
+    fn drain_state_event(&self) -> Option<proto::Event> {
+        match self.shutdown.phase() {
+            ShutdownPhase::Running => None,
+            ShutdownPhase::Draining | ShutdownPhase::Forced => Some(proto::Event::DaemonDraining {
+                forced: self.shutdown.is_forced(),
+            }),
+        }
+    }
+
     pub fn new(db: Db, locks: Arc<LockManager>, paths: DaemonPaths) -> Self {
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
@@ -140,13 +163,8 @@ impl DaemonContext {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let snap = self.caffeinate.snapshot();
         proto
-            .send(&Envelope::event(proto::Event::CaffeinateState {
-                active: snap.active,
-                lid_close_guaranteed: false,
-                message: None,
-            }))
+            .send(&Envelope::event(self.caffeinate_state_event()))
             .await
     }
 
@@ -154,15 +172,10 @@ impl DaemonContext {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        match self.shutdown.phase() {
-            ShutdownPhase::Running => Ok(()),
-            ShutdownPhase::Draining | ShutdownPhase::Forced => {
-                proto
-                    .send(&Envelope::event(proto::Event::DaemonDraining {
-                        forced: self.shutdown.is_forced(),
-                    }))
-                    .await
-            }
+        if let Some(event) = self.drain_state_event() {
+            proto.send(&Envelope::event(event)).await
+        } else {
+            Ok(())
         }
     }
 
@@ -219,6 +232,29 @@ impl Drop for ClientGuard {
         self.ctx
             .client_count
             .send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+pub(crate) fn register_in_process_context(ctx: Arc<DaemonContext>) {
+    let contexts = IN_PROCESS_CONTEXTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.insert(ctx.paths.socket.clone(), Arc::downgrade(&ctx));
+}
+
+pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
+    let contexts = IN_PROCESS_CONTEXTS.get()?;
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let weak = contexts.get(socket)?;
+    match weak.upgrade() {
+        Some(ctx) => Some(ctx),
+        None => {
+            contexts.remove(socket);
+            None
+        }
     }
 }
 
@@ -690,6 +726,103 @@ struct AttachedSession {
     /// count so the loop guard reverts to headless behavior. `None` for a
     /// non-interactive attach (e.g. `cockpit run`'s event pump).
     _interactive_guard: Option<crate::daemon::session_worker::InteractiveClientGuard>,
+}
+
+pub(crate) struct InProcessRequest {
+    pub request: Request,
+    pub reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
+}
+
+pub(crate) fn spawn_in_process_client(
+    ctx: Arc<DaemonContext>,
+) -> (mpsc::Sender<InProcessRequest>, mpsc::Receiver<proto::Event>) {
+    let (request_tx, request_rx) = mpsc::channel(IN_PROCESS_REQUEST_QUEUE);
+    let (event_tx, event_rx) = mpsc::channel(IN_PROCESS_EVENT_QUEUE);
+    tokio::spawn(run_in_process_client(ctx, request_rx, event_tx));
+    (request_tx, event_rx)
+}
+
+async fn run_in_process_client(
+    ctx: Arc<DaemonContext>,
+    mut request_rx: mpsc::Receiver<InProcessRequest>,
+    event_tx: mpsc::Sender<proto::Event>,
+) {
+    let _client_guard = ctx.track_client();
+    let mut state = ClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        ClientPrincipal::owner(),
+        ctx.terminal_host.clone(),
+    );
+    let mut global_rx = ctx.subscribe_global();
+
+    if event_tx.send(ctx.caffeinate_state_event()).await.is_err() {
+        return;
+    }
+
+    loop {
+        let event_branch = async {
+            match state.attached.as_mut() {
+                Some(att) => Some(att.event_rx.recv().await),
+                None => std::future::pending().await,
+            }
+        };
+
+        tokio::select! {
+            biased;
+            global = global_rx.recv() => {
+                match global {
+                    Ok(ev) => {
+                        if event_tx.send(ev).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "in-process client global event stream lagged");
+                        if event_tx.send(ctx.caffeinate_state_event()).await.is_err() {
+                            return;
+                        }
+                        if let Some(event) = ctx.drain_state_event()
+                            && event_tx.send(event).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
+            event = event_branch => {
+                match event {
+                    Some(Ok(ev)) => {
+                        if event_tx.send(ev).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Err(broadcast::error::RecvError::Lagged(n))) => {
+                        tracing::warn!(missed = n, "in-process client event stream lagged; reattach to resync");
+                    }
+                    Some(Err(broadcast::error::RecvError::Closed)) => {
+                        state.attached = None;
+                    }
+                    None => unreachable!("event_branch is pending when not attached"),
+                }
+            }
+            cmd = request_rx.recv() => {
+                let Some(InProcessRequest { request, reply }) = cmd else {
+                    return;
+                };
+                let is_attach = matches!(&request, Request::Attach { .. });
+                let result = handle_request(request, &mut state, &ctx).await;
+                let attached = matches!(&result, Ok(Response::Attached { .. }));
+                let _ = reply.send(result);
+                if is_attach && attached
+                    && let Some(event) = ctx.drain_state_event()
+                    && event_tx.send(event).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {

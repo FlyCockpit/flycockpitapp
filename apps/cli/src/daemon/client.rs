@@ -48,7 +48,7 @@ const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 /// differs.
 #[derive(Clone)]
 pub struct DaemonClient {
-    request_tx: mpsc::Sender<IoCommand>,
+    backend: ClientBackend,
     /// One channel per `DaemonClient` clone, hydrated by the reader
     /// task. We use `Arc<Mutex<_>>` because `mpsc::Receiver` isn't
     /// `Clone` — clones of `DaemonClient` share access to the
@@ -62,6 +62,12 @@ struct Pending {
     reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
 }
 
+#[derive(Clone)]
+enum ClientBackend {
+    Wire(mpsc::Sender<IoCommand>),
+    InProcess(mpsc::Sender<crate::daemon::server::InProcessRequest>),
+}
+
 enum IoCommand {
     Request(Pending),
     Cancel { id: Uuid },
@@ -71,6 +77,9 @@ impl DaemonClient {
     /// Connect to the daemon at `socket`. Spawns the background task
     /// before returning.
     pub async fn connect(socket: &Path) -> Result<Self> {
+        if let Some(ctx) = crate::daemon::server::in_process_context(socket) {
+            return Ok(Self::from_in_process(ctx));
+        }
         let stream = UnixStream::connect(socket)
             .await
             .with_context(|| format!("connecting to {}", socket.display()))?;
@@ -78,12 +87,20 @@ impl DaemonClient {
         Ok(Self::from_proto(proto))
     }
 
+    pub(crate) fn from_in_process(ctx: Arc<crate::daemon::server::DaemonContext>) -> Self {
+        let (request_tx, event_rx) = crate::daemon::server::spawn_in_process_client(ctx);
+        Self {
+            backend: ClientBackend::InProcess(request_tx),
+            events: Arc::new(tokio::sync::Mutex::new(event_rx)),
+        }
+    }
+
     fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
         tokio::spawn(run_io(proto, request_rx, event_tx));
         Self {
-            request_tx,
+            backend: ClientBackend::Wire(request_tx),
             events: Arc::new(tokio::sync::Mutex::new(event_rx)),
         }
     }
@@ -98,20 +115,35 @@ impl DaemonClient {
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let (tx, rx) = oneshot::channel();
         let id = Uuid::new_v4();
-        self.request_tx
-            .send(IoCommand::Request(Pending {
-                id,
-                request,
-                reply: tx,
-            }))
-            .await
-            .map_err(|_| anyhow!("daemon client task has stopped"))?;
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(anyhow!("daemon client dropped reply channel")),
-            Err(_) => {
-                let _ = self.request_tx.send(IoCommand::Cancel { id }).await;
-                Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT))
+        match &self.backend {
+            ClientBackend::Wire(request_tx) => {
+                request_tx
+                    .send(IoCommand::Request(Pending {
+                        id,
+                        request,
+                        reply: tx,
+                    }))
+                    .await
+                    .map_err(|_| anyhow!("daemon client task has stopped"))?;
+                match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(_)) => Err(anyhow!("daemon client dropped reply channel")),
+                    Err(_) => {
+                        let _ = request_tx.send(IoCommand::Cancel { id }).await;
+                        Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT))
+                    }
+                }
+            }
+            ClientBackend::InProcess(request_tx) => {
+                request_tx
+                    .send(crate::daemon::server::InProcessRequest { request, reply: tx })
+                    .await
+                    .map_err(|_| anyhow!("in-process daemon client task has stopped"))?;
+                match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(_)) => Err(anyhow!("in-process daemon client dropped reply channel")),
+                    Err(_) => Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT)),
+                }
             }
         }
     }
@@ -374,7 +406,7 @@ pub struct ConnectedDaemon {
 /// connected client. Honors [`LifecycleMode`].
 pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
     use crate::daemon::{
-        DaemonPaths, DaemonStatus, discover, probe, spawn_detached, spawn_detached_ephemeral,
+        DaemonPaths, DaemonStatus, discover, spawn_detached, spawn_detached_ephemeral,
     };
 
     let canonical = DaemonPaths::resolve_canonical()?;
@@ -398,21 +430,17 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             }
         }
         LifecycleMode::AttachOwnEphemeral => {
-            // The daemonless TUI re-attaching to its *own* cached ephemeral
-            // daemon: if it's already up (a `/compact` / resume / `/new`
-            // re-attach within the same TUI), reconnect to it rather than
-            // spawning a second one. We still own it (we spawned it the
-            // first time), so `owns_daemon = true`. It never touches the
-            // canonical socket.
+            // Daemonless TUI sessions stay in this process. Existing helpers
+            // still carry the owned ephemeral socket path as a stable lookup
+            // key, but `DaemonClient::connect` resolves it to the registered
+            // in-process context instead of opening a Unix socket.
             let own = own_ephemeral_paths()?;
-            if matches!(probe(&own).await, DaemonStatus::Running) {
-                let client = DaemonClient::connect(&own.socket).await?;
-                return Ok(ConnectedDaemon {
-                    client,
-                    owns_daemon: true,
-                    socket: own.socket,
-                });
-            }
+            let ctx = crate::daemon::boot_in_process(own.clone())?;
+            return Ok(ConnectedDaemon {
+                client: DaemonClient::from_in_process(ctx),
+                owns_daemon: false,
+                socket: own.socket,
+            });
         }
         LifecycleMode::AlwaysEphemeral => {
             // Always spawn fresh on a unique pid+nonce ephemeral path
@@ -528,8 +556,8 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use crate::daemon::DaemonPaths;
     use crate::daemon::test_harness::DaemonEnvGuard;
-    use crate::daemon::{DaemonPaths, run_foreground_inner};
 
     static OWN_EPHEMERAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -657,66 +685,74 @@ mod tests {
     /// daemon is run in-process at the cached path with isolated XDG dirs, so
     /// the spawn branch (which would launch a child) is never taken.
     #[tokio::test]
-    async fn attach_own_ephemeral_attaches_and_reports_ownership() {
+    async fn connect_uses_registered_in_process_context_without_socket() {
         let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
         reset_own_ephemeral_paths_for_test();
         let root = tempfile::tempdir().expect("daemon path tempdir");
         let data = tempfile::tempdir().expect("daemon data tempdir");
-        // `server::boot` opens the default DB from XDG_DATA_HOME before
-        // binding. Keep the shared daemon env guard for the test body so
-        // daemon env mutation serializes with daemon/mod.rs tests.
         let mut env = DaemonEnvGuard::new();
         env.set_path("XDG_DATA_HOME", data.path());
 
-        // Stand up *our own* ephemeral daemon in-process — exactly the path
-        // `AttachOwnEphemeral` will probe from the process-local owner cache.
+        let paths = temp_ephemeral_paths(root.path(), "cockpit-in-process-test");
+        assert!(
+            !paths.socket.exists(),
+            "in-process transport must not require a socket file"
+        );
+        let ctx = crate::daemon::boot_in_process(paths.clone()).expect("boot local daemon context");
+        let client = DaemonClient::connect(&paths.socket)
+            .await
+            .expect("connect by local socket key");
+        let response = client
+            .request_ok(Request::DaemonStatus)
+            .await
+            .expect("local daemon status");
+        match response {
+            Response::DaemonStatus { socket_path, .. } => {
+                assert_eq!(socket_path, paths.socket.display().to_string());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert!(
+            !paths.socket.exists(),
+            "in-process transport must not create a socket file"
+        );
+        drop(client);
+        drop(ctx);
+        reset_own_ephemeral_paths_for_test();
+    }
+
+    #[tokio::test]
+    async fn attach_own_ephemeral_uses_in_process_context() {
+        let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
+        reset_own_ephemeral_paths_for_test();
+        let root = tempfile::tempdir().expect("daemon path tempdir");
+        let data = tempfile::tempdir().expect("daemon data tempdir");
+        let mut env = DaemonEnvGuard::new();
+        env.set_path("XDG_DATA_HOME", data.path());
+
         let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-owned");
         set_own_ephemeral_paths_for_test(own.clone());
-        let own_clone = own.clone();
-        let grace = Duration::from_secs(3600); // never idle-reap during the test
-        let daemon =
-            tokio::spawn(async move { run_foreground_inner(own_clone, grace, grace, false).await });
 
-        // Wait for it to come up.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !own.socket.exists() {
-            if daemon.is_finished() {
-                let result = daemon.await.expect("daemon task join");
-                panic!("daemon exited before binding: {result:#?}");
-            }
-            assert!(std::time::Instant::now() < deadline, "daemon never bound");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        // The daemonless re-attach path: attach to our own daemon, owns it.
         let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)
             .await
-            .expect("attach to own ephemeral");
+            .expect("attach to own in-process daemon");
         assert!(
-            connected.owns_daemon,
-            "a daemonless TUI owns its cached ephemeral daemon"
+            !connected.owns_daemon,
+            "in-process daemonless mode needs no child-process guard"
         );
         assert_eq!(
             connected.socket, own.socket,
-            "must reconnect to the same owned socket, not spawn a new one"
+            "must reuse the process-local owned path as the local transport key"
         );
-        // Confirm it's live (handshake) and never the canonical socket.
-        let canonical = DaemonPaths::resolve_canonical().expect("canonical");
-        assert_ne!(
-            connected.socket, canonical.socket,
-            "daemonless never binds the canonical socket"
+        assert!(
+            !connected.socket.exists(),
+            "in-process daemonless mode must not bind a Unix socket"
         );
         connected
             .client
             .request_ok(Request::DaemonStatus)
             .await
-            .expect("owned daemon answers");
-
-        // Tear the in-process daemon down so the test leaves nothing behind.
-        drop(connected);
-        crate::daemon::ephemeral_guard::stop_daemon_blocking(&own.socket);
-        let _ = tokio::time::timeout(Duration::from_secs(3), daemon).await;
-        let _ = std::fs::remove_file(&own.socket);
-        let _ = std::fs::remove_file(&own.pid_file);
+            .expect("owned in-process daemon answers");
 
         reset_own_ephemeral_paths_for_test();
     }

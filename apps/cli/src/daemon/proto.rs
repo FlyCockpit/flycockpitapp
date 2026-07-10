@@ -38,10 +38,10 @@ use uuid::Uuid;
 
 /// Current wire schema version. Bumped only with a written migration
 /// note in `the design notes`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest wire schema version this binary accepts.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 3;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -81,14 +81,6 @@ pub struct Envelope {
     pub v: u32,
     #[serde(flatten)]
     pub body: Body,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct EnvelopeHeader {
-    v: u32,
-    kind: String,
-    #[serde(default)]
-    id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -2497,17 +2489,27 @@ where
             None => Ok(None),
             Some(Err(e)) => Err(codec_error(e)).context("reading envelope"),
             Some(Ok(line)) => {
-                let header: EnvelopeHeader =
-                    serde_json::from_str(&line).context("deserializing envelope header")?;
-                if !is_protocol_compatible(header.v) {
-                    return Ok(Some(RecvFrame::VersionMismatch {
-                        v: header.v,
-                        kind: header.kind,
-                        id: header.id,
-                    }));
+                let value: serde_json::Value =
+                    serde_json::from_str(&line).context("deserializing envelope")?;
+                let v = value
+                    .get("v")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .context("deserializing envelope: missing or invalid v")?;
+                if !is_protocol_compatible(v) {
+                    let kind = value
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let id = value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| Uuid::parse_str(raw).ok());
+                    return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
                 }
                 let env: Envelope =
-                    serde_json::from_str(&line).context("deserializing envelope")?;
+                    serde_json::from_value(value).context("deserializing envelope")?;
                 Ok(Some(RecvFrame::Envelope(Box::new(env))))
             }
         }

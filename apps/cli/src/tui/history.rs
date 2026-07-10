@@ -157,6 +157,8 @@ pub enum HistoryEntry {
         reasoning: String,
         timestamp: DateTime<Local>,
         expanded: bool,
+        /// Top-anchored offset into the wrapped reasoning window.
+        reasoning_offset: usize,
         think_duration: Option<Duration>,
         /// `session_events.seq` of this message (the stable id a pin
         /// references — `pinned-messages`). `None` only when the timeline
@@ -398,6 +400,10 @@ pub const TOOLBOX_VISIBLE: usize = 6;
 /// scrolls internally.
 pub const TOOLCALL_RESULT_VISIBLE: usize = 20;
 
+/// Wrapped reasoning rows shown for one expanded thinking block before
+/// the reasoning scrolls internally.
+pub const THINKING_VISIBLE: usize = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InnerScrollWindow {
     pub offset: usize,
@@ -428,6 +434,14 @@ pub fn inner_scroll_window(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToolResultScrollRegion {
     pub call_index: usize,
+    pub row_start: usize,
+    pub row_end: usize,
+    pub offset: usize,
+    pub max_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReasoningScrollRegion {
     pub row_start: usize,
     pub row_end: usize,
     pub offset: usize,
@@ -621,6 +635,8 @@ pub struct Rendered {
     pub tool_call_rows: Vec<Option<usize>>,
     /// Relative row ranges for scrollable expanded tool-call result windows.
     pub tool_result_scroll_regions: Vec<ToolResultScrollRegion>,
+    /// Relative row range for a scrollable expanded reasoning window.
+    pub reasoning_scroll_region: Option<ReasoningScrollRegion>,
     /// Where the clickable `[pin]`/`[unpin]` mouse control landed within
     /// `lines`, when one was drawn (`pinned-messages`). `None` when the
     /// entry is not pinnable, the control is hidden (mouse mode off), or
@@ -959,6 +975,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region,
             }
         }
@@ -968,6 +985,7 @@ pub fn render_entry(
             continuations: vec![false],
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
+            reasoning_scroll_region: None,
             pin_region: None,
         },
         HistoryEntry::CommandError { line } => Rendered {
@@ -979,6 +997,7 @@ pub fn render_entry(
             continuations: vec![false],
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
+            reasoning_scroll_region: None,
             pin_region: None,
         },
         HistoryEntry::Maintenance { line } => Rendered {
@@ -990,6 +1009,7 @@ pub fn render_entry(
             continuations: vec![false],
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
+            reasoning_scroll_region: None,
             pin_region: None,
         },
         HistoryEntry::UserNote {
@@ -1003,6 +1023,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1014,6 +1035,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1048,6 +1070,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1063,6 +1086,7 @@ pub fn render_entry(
                 continuations: vec![false],
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1081,6 +1105,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1111,6 +1136,7 @@ pub fn render_entry(
                 continuations: vec![false],
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1140,6 +1166,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1191,6 +1218,7 @@ pub fn render_entry(
                 continuations,
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
                 pin_region: None,
             }
         }
@@ -1200,6 +1228,7 @@ pub fn render_entry(
             reasoning,
             timestamp,
             expanded,
+            reasoning_offset,
             think_duration,
             ..
         } => {
@@ -1218,6 +1247,7 @@ pub fn render_entry(
                 effective_reasoning,
                 *timestamp,
                 effective_expanded,
+                *reasoning_offset,
                 *think_duration,
                 width,
                 md.agent,
@@ -1254,6 +1284,7 @@ pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
         &msg.reasoning,
         msg.timestamp,
         false,
+        0,
         None,
         width,
         true,
@@ -1582,6 +1613,7 @@ fn render_agent(
     reasoning: &str,
     timestamp: DateTime<Local>,
     expanded: bool,
+    reasoning_offset: usize,
     think_duration: Option<Duration>,
     width: u16,
     markdown: bool,
@@ -1614,6 +1646,7 @@ fn render_agent(
     // newline.
     let mut conts: Vec<bool> = Vec::new();
     let mut chip_row = None;
+    let mut reasoning_scroll_region: Option<ReasoningScrollRegion> = None;
 
     // When the agent produced reasoning, the *first* row of this entry
     // is the bullet + chip line — replacing the "Thinking…" placeholder
@@ -1703,6 +1736,7 @@ fn render_agent(
             conts.push(false);
             let reasoning_indent = AGENT_INDENT + 2;
             let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
+            let mut reasoning_rows: Vec<(Line<'static>, bool)> = Vec::new();
             for raw_line in reasoning.lines() {
                 let chunks = if raw_line.is_empty() {
                     vec![String::new()]
@@ -1710,12 +1744,54 @@ fn render_agent(
                     wrap_with_reserved_first_line_and_prefix(raw_line, reasoning_w, 0, 0)
                 };
                 for (i, chunk) in chunks.into_iter().enumerate() {
-                    out.push(Line::from(vec![
-                        Span::raw(" ".repeat(reasoning_indent)),
-                        Span::styled(chunk, Style::default().fg(REASONING_FG)),
-                    ]));
-                    conts.push(i > 0);
+                    reasoning_rows.push((
+                        Line::from(vec![
+                            Span::raw(" ".repeat(reasoning_indent)),
+                            Span::styled(chunk, Style::default().fg(REASONING_FG)),
+                        ]),
+                        i > 0,
+                    ));
                 }
+            }
+            let window =
+                inner_scroll_window(reasoning_rows.len(), THINKING_VISIBLE, reasoning_offset);
+            let region_start = out.len();
+            if window.more_above > 0 {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(reasoning_indent)),
+                    Span::styled(
+                        format!("{} more above", window.more_above),
+                        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    ),
+                ]));
+                conts.push(false);
+            }
+            for (line, continuation) in reasoning_rows
+                .iter()
+                .skip(window.offset)
+                .take(window.end.saturating_sub(window.offset))
+            {
+                out.push(line.clone());
+                conts.push(*continuation);
+            }
+            if window.more_below > 0 {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(reasoning_indent)),
+                    Span::styled(
+                        format!("{} more below", window.more_below),
+                        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    ),
+                ]));
+                conts.push(false);
+            }
+            let region_end = out.len().saturating_sub(1);
+            if window.max_offset > 0 && region_start <= region_end {
+                reasoning_scroll_region = Some(ReasoningScrollRegion {
+                    row_start: region_start,
+                    row_end: region_end,
+                    offset: window.offset,
+                    max_offset: window.max_offset,
+                });
             }
             out.extend(body_lines);
             conts.extend(body_conts);
@@ -1851,6 +1927,7 @@ fn render_agent(
         continuations: conts,
         tool_call_rows: Vec::new(),
         tool_result_scroll_regions: Vec::new(),
+        reasoning_scroll_region,
         pin_region,
     }
 }
@@ -1956,6 +2033,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             continuations: vec![false],
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
+            reasoning_scroll_region: None,
             pin_region: None,
         };
     };
@@ -2007,6 +2085,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             continuations: conts,
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
+            reasoning_scroll_region: None,
             pin_region: None,
         };
     }
@@ -2079,6 +2158,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         continuations: conts,
         tool_call_rows: Vec::new(),
         tool_result_scroll_regions: Vec::new(),
+        reasoning_scroll_region: None,
         pin_region: None,
     }
 }
@@ -2506,6 +2586,7 @@ fn render_toolbox(
         continuations,
         tool_call_rows,
         tool_result_scroll_regions: result_regions,
+        reasoning_scroll_region: None,
         pin_region: None,
     }
 }
@@ -3084,6 +3165,7 @@ mod tests {
                 reasoning: "thinking".to_string(),
                 timestamp: ts,
                 expanded: false,
+                reasoning_offset: 0,
                 think_duration: Some(Duration::from_millis(1200)),
                 seq: Some(2),
             },
@@ -3150,6 +3232,7 @@ mod tests {
                 reasoning: String::new(),
                 timestamp: ts,
                 expanded: false,
+                reasoning_offset: 0,
                 think_duration: None,
                 seq: Some(2),
             },
@@ -3427,6 +3510,7 @@ mod tests {
             "",
             fixed_ts(),
             false,
+            0,
             None,
             width,
             false,
@@ -3454,12 +3538,149 @@ mod tests {
             "some hidden reasoning",
             fixed_ts(),
             /* expanded */ false,
+            0,
             Some(Duration::from_secs(3)),
             width,
             /* markdown */ false,
             None,
         );
         assert!(line_width(&rendered.lines[0]) <= width as usize);
+    }
+
+    #[test]
+    fn expanded_short_reasoning_renders_without_window_ui() {
+        let reasoning = "r0\nr1\nr2";
+        let rendered = render_agent(
+            "builder",
+            "final answer",
+            reasoning,
+            fixed_ts(),
+            true,
+            0,
+            None,
+            80,
+            false,
+            None,
+        );
+        let text = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("r0"));
+        assert!(text.contains("r1"));
+        assert!(text.contains("r2"));
+        assert!(text.contains("final answer"));
+        assert!(!text.contains("more below"));
+        assert!(rendered.reasoning_scroll_region.is_none());
+    }
+
+    #[test]
+    fn expanded_long_reasoning_windows_and_keeps_answer_after_it() {
+        let reasoning = (0..25)
+            .map(|idx| format!("r{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = render_agent(
+            "builder",
+            "final answer",
+            &reasoning,
+            fixed_ts(),
+            true,
+            0,
+            None,
+            80,
+            false,
+            None,
+        );
+        let text = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("r0"));
+        assert!(text.contains("r19"));
+        assert!(!text.contains("r20"));
+        assert!(text.contains("5 more below"));
+        assert!(text.contains("final"));
+        assert!(text.contains("answer"));
+        let region = rendered
+            .reasoning_scroll_region
+            .expect("long reasoning scroll region");
+        assert_eq!(region.offset, 0);
+        assert_eq!(region.max_offset, 5);
+    }
+
+    #[test]
+    fn expanded_long_reasoning_offset_clamps_and_shows_more_above() {
+        let reasoning = (0..25)
+            .map(|idx| format!("r{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = render_agent(
+            "builder",
+            "final answer",
+            &reasoning,
+            fixed_ts(),
+            true,
+            99,
+            None,
+            80,
+            false,
+            None,
+        );
+        let text = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("5 more above"));
+        assert!(text.contains("r5"));
+        assert!(text.contains("r24"));
+        assert!(!text.contains("more below"));
+        let region = rendered
+            .reasoning_scroll_region
+            .expect("long reasoning scroll region");
+        assert_eq!(region.offset, 5);
+        assert_eq!(region.max_offset, 5);
+    }
+
+    #[test]
+    fn expanded_long_wrapped_reasoning_windows_by_display_rows() {
+        let reasoning = "word ".repeat(80);
+        let rendered = render_agent(
+            "builder",
+            "final answer",
+            &reasoning,
+            fixed_ts(),
+            true,
+            0,
+            None,
+            12,
+            false,
+            None,
+        );
+        let text = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("more below"));
+        assert!(text.contains("final"));
+        assert!(text.contains("answer"));
+        let region = rendered
+            .reasoning_scroll_region
+            .expect("wrapped reasoning scroll region");
+        assert_eq!(region.offset, 0);
+        assert_eq!(region.row_end - region.row_start + 1, THINKING_VISIBLE + 1);
     }
 
     #[test]
@@ -3479,6 +3700,7 @@ mod tests {
             "",
             fixed_ts(),
             false,
+            0,
             None,
             width,
             true,
@@ -3670,6 +3892,7 @@ mod tests {
                 "",
                 fixed_ts(),
                 false,
+                0,
                 None,
                 width,
                 false,
@@ -3724,6 +3947,7 @@ mod tests {
             "",
             fixed_ts(),
             false,
+            0,
             None,
             width,
             false,

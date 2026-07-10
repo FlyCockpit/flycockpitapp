@@ -239,6 +239,7 @@ mod selection_copy_state_tests {
             tool_box_target: None,
             tool_call_target: None,
             tool_result_scroll: None,
+            reasoning_window_scroll: None,
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
@@ -8154,6 +8155,7 @@ impl App {
                 reasoning: p.reasoning,
                 timestamp: p.timestamp,
                 expanded: false,
+                reasoning_offset: 0,
                 think_duration,
                 seq: p.seq,
             });
@@ -8574,31 +8576,28 @@ impl App {
     }
 
     pub(super) fn toggle_recent_reasoning(&mut self) {
-        let any_collapsed = self.history.iter().any(|e| {
-            matches!(e,
+        let any_collapsed = self.history.iter().any(|entry| {
+            matches!(entry,
                 HistoryEntry::Agent { reasoning, expanded, .. }
                     if !reasoning.trim().is_empty() && !*expanded)
         });
-        for entry in self.history.iter_mut() {
+        for entry in &mut self.history {
             if let HistoryEntry::Agent {
                 expanded,
                 reasoning,
+                reasoning_offset,
                 ..
             } = entry
                 && !reasoning.trim().is_empty()
             {
                 *expanded = any_collapsed;
+                if !*expanded {
+                    *reasoning_offset = 0;
+                }
             }
         }
     }
 
-    /// Handle a mouse event. Routing:
-    /// - context menu open → route into the menu (click to select,
-    ///   click outside to dismiss);
-    /// - text popup open → any click dismisses;
-    /// - right-down in chat area → open the context menu (T8.f menu);
-    /// - wheel up/down inside the chat area → scroll chat history;
-    /// - left-down in composer input area → position the cursor (T8.d);
     /// - left-down on a chat thinking-chip → toggle reasoning expansion;
     /// - left-down on a non-chip chat row → start drag-select (T8.f);
     /// - left-drag → extend the active drag-select;
@@ -8946,8 +8945,17 @@ impl App {
         {
             self.selection = None;
             match self.history.get_mut(entry_idx) {
-                Some(HistoryEntry::Agent { expanded, .. })
-                | Some(HistoryEntry::Subagent { expanded, .. }) => {
+                Some(HistoryEntry::Agent {
+                    expanded,
+                    reasoning_offset,
+                    ..
+                }) => {
+                    *expanded = !*expanded;
+                    if !*expanded {
+                        *reasoning_offset = 0;
+                    }
+                }
+                Some(HistoryEntry::Subagent { expanded, .. }) => {
                     *expanded = !*expanded;
                 }
                 // A preflighted user message: clicking the `⚙ preflighted`
@@ -9154,6 +9162,32 @@ impl App {
 
         let mut row = 0;
         while row < self.chat_row_meta.len() {
+            let Some(scroll) = self.chat_row_meta[row].reasoning_window_scroll else {
+                row += 1;
+                continue;
+            };
+            let start = row;
+            while row + 1 < self.chat_row_meta.len()
+                && self.chat_row_meta[row + 1]
+                    .reasoning_window_scroll
+                    .is_some_and(|next| next.history_index == scroll.history_index)
+            {
+                row += 1;
+            }
+            regions.push(AffordanceScrollRegion {
+                target: AffordanceTarget::ReasoningWindow {
+                    history_index: scroll.history_index,
+                },
+                row_start: start,
+                row_end: row,
+                offset: scroll.offset,
+                max_offset: scroll.max_offset,
+            });
+            row += 1;
+        }
+
+        let mut row = 0;
+        while row < self.chat_row_meta.len() {
             let Some(scroll) = self.chat_row_meta[row].tool_result_scroll else {
                 row += 1;
                 continue;
@@ -9234,7 +9268,50 @@ impl App {
                 history_index,
                 call_index,
             } => self.scroll_tool_call_result(history_index, call_index, up),
-            AffordanceTarget::Chip { .. } | AffordanceTarget::ReasoningWindow { .. } => false,
+            AffordanceTarget::ReasoningWindow { history_index } => {
+                self.scroll_reasoning_window(history_index, up)
+            }
+            AffordanceTarget::Chip { .. } => false,
+        }
+    }
+
+    fn scroll_reasoning_window(&mut self, idx: usize, up: bool) -> bool {
+        let Some(HistoryEntry::Agent {
+            expanded,
+            reasoning,
+            reasoning_offset,
+            ..
+        }) = self.history.get_mut(idx)
+        else {
+            return false;
+        };
+        if !*expanded || reasoning.trim().is_empty() {
+            return false;
+        }
+        let max_offset = self
+            .affordance_scroll_regions
+            .iter()
+            .find_map(|region| match region.target {
+                AffordanceTarget::ReasoningWindow { history_index } if history_index == idx => {
+                    Some(region.max_offset)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let cur = (*reasoning_offset).min(max_offset);
+        if up {
+            if cur == 0 {
+                return false;
+            }
+            *reasoning_offset = cur - 1;
+            true
+        } else {
+            if cur >= max_offset {
+                *reasoning_offset = max_offset;
+                return false;
+            }
+            *reasoning_offset = cur + 1;
+            true
         }
     }
 
@@ -10479,6 +10556,7 @@ fn wire_history_to_entries(wire: Vec<crate::daemon::proto::HistoryEntry>) -> Vec
                     reasoning,
                     timestamp: local_from_ts_ms(ts_ms),
                     expanded: false,
+                    reasoning_offset: 0,
                     // Wall-clock thinking duration isn't persisted; a restored
                     // turn shows the reasoning chip (when present) without the
                     // "thought for X" sub-line.
@@ -11887,7 +11965,9 @@ fn spawn_git_refresh(
 #[cfg(test)]
 mod affordance_hover_tests {
     use super::{AffordanceScrollRegion, AffordanceTarget, App, resolve_inner_scroll_target};
-    use crate::tui::app::render::{ChatRowKind, ChatRowMeta, ToolResultScrollMeta};
+    use crate::tui::app::render::{
+        ChatRowKind, ChatRowMeta, ReasoningScrollMeta, ToolResultScrollMeta,
+    };
     use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
     use crate::tui::settings::Dialog;
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
@@ -11907,6 +11987,7 @@ mod affordance_hover_tests {
             tool_box_target,
             tool_call_target,
             tool_result_scroll: None,
+            reasoning_window_scroll: None,
             reasoning_window_target,
             diff_path: None,
             pin_hit: None,
@@ -11926,6 +12007,19 @@ mod affordance_hover_tests {
             result_offset: 0,
             state: ToolCallState::Success,
             hint: None,
+        }
+    }
+
+    fn reasoning_agent(offset: usize) -> HistoryEntry {
+        HistoryEntry::Agent {
+            name: "agent".to_string(),
+            text: "answer".to_string(),
+            reasoning: "thinking".to_string(),
+            timestamp: chrono::Local::now(),
+            expanded: true,
+            reasoning_offset: offset,
+            think_duration: None,
+            seq: None,
         }
     }
 
@@ -12084,6 +12178,63 @@ mod affordance_hover_tests {
             resolve_inner_scroll_target(&regions, 4, true),
             Some(tool_call)
         );
+    }
+
+    #[test]
+    fn reasoning_window_scrolls_until_both_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.history = vec![reasoning_agent(0)];
+        app.affordance_scroll_regions = vec![AffordanceScrollRegion {
+            target: AffordanceTarget::ReasoningWindow { history_index: 0 },
+            row_start: 2,
+            row_end: 4,
+            offset: 0,
+            max_offset: 2,
+        }];
+
+        assert!(!app.scroll_inner_region_at_row(3, true));
+        assert!(app.scroll_inner_region_at_row(3, false));
+        match &app.history[0] {
+            HistoryEntry::Agent {
+                reasoning_offset, ..
+            } => assert_eq!(*reasoning_offset, 1),
+            other => panic!("expected agent, got {other:?}"),
+        }
+
+        app.affordance_scroll_regions[0].offset = 1;
+        assert!(app.scroll_inner_region_at_row(3, false));
+        match &app.history[0] {
+            HistoryEntry::Agent {
+                reasoning_offset, ..
+            } => assert_eq!(*reasoning_offset, 2),
+            other => panic!("expected agent, got {other:?}"),
+        }
+
+        app.affordance_scroll_regions[0].offset = 2;
+        assert!(!app.scroll_inner_region_at_row(3, false));
+    }
+
+    #[test]
+    fn reasoning_window_regions_register_with_shared_resolver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut row = meta(None, None, None, Some(0));
+        row.reasoning_window_scroll = Some(ReasoningScrollMeta {
+            history_index: 0,
+            offset: 1,
+            max_offset: 3,
+        });
+        app.chat_row_meta = vec![row];
+        app.history = vec![reasoning_agent(1)];
+
+        let regions = app.build_affordance_scroll_regions();
+        assert_eq!(
+            regions.first().map(|region| region.target),
+            Some(AffordanceTarget::ReasoningWindow { history_index: 0 })
+        );
+        assert_eq!(regions.first().map(|region| region.offset), Some(1));
+        assert_eq!(regions.first().map(|region| region.max_offset), Some(3));
     }
 
     #[test]
@@ -14021,6 +14172,7 @@ mod prediction_turn_assembly_tests {
             reasoning: reasoning.into(),
             timestamp: chrono::Local::now(),
             expanded: false,
+            reasoning_offset: 0,
             think_duration: None,
             seq: None,
         }
@@ -14246,6 +14398,7 @@ mod copy_cmd_tests {
             reasoning: String::new(),
             timestamp: chrono::Local::now(),
             expanded: false,
+            reasoning_offset: 0,
             think_duration: None,
             seq: None,
         }
@@ -15734,6 +15887,7 @@ mod reasoning_toggle_key_tests {
             reasoning: reasoning.to_string(),
             timestamp: chrono::Local::now(),
             expanded,
+            reasoning_offset: 0,
             think_duration: None,
             seq: None,
         }

@@ -158,6 +158,7 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             reasoning,
             timestamp,
             expanded,
+            reasoning_offset,
             think_duration,
             seq,
         } => {
@@ -166,6 +167,7 @@ fn hash_history_entry(hasher: &mut DefaultHasher, entry: &HistoryEntry, prefligh
             reasoning.hash(hasher);
             timestamp.hash(hasher);
             expanded.hash(hasher);
+            reasoning_offset.hash(hasher);
             think_duration.hash(hasher);
             seq.hash(hasher);
         }
@@ -343,6 +345,13 @@ pub(crate) struct ToolResultScrollMeta {
     pub max_offset: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReasoningScrollMeta {
+    pub history_index: usize,
+    pub offset: usize,
+    pub max_offset: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatRowMeta {
     pub history_index: Option<usize>,
@@ -352,6 +361,7 @@ pub(crate) struct ChatRowMeta {
     pub tool_box_target: Option<usize>,
     pub tool_call_target: Option<(usize, usize)>,
     pub tool_result_scroll: Option<ToolResultScrollMeta>,
+    pub reasoning_window_scroll: Option<ReasoningScrollMeta>,
     pub reasoning_window_target: Option<usize>,
     pub diff_path: Option<String>,
     pub pin_hit: Option<PinHit>,
@@ -369,6 +379,7 @@ impl ChatRowMeta {
             tool_box_target: None,
             tool_call_target: None,
             tool_result_scroll: None,
+            reasoning_window_scroll: None,
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
@@ -783,7 +794,14 @@ impl App {
                     let mut rows = body;
                     if !reasoning.trim().is_empty() && *expanded {
                         rows = rows.saturating_add(1);
-                        rows = rows.saturating_add(reasoning.lines().count() as u16);
+                        let reasoning_rows = reasoning.lines().count();
+                        rows = rows.saturating_add(
+                            reasoning_rows
+                                .min(crate::tui::history::THINKING_VISIBLE)
+                                .saturating_add(usize::from(
+                                    reasoning_rows > crate::tui::history::THINKING_VISIBLE,
+                                )) as u16,
+                        );
                     }
                     // Trailing gap row after agent — skipped when the
                     // previous entry was also an agent and when an immediate
@@ -1287,6 +1305,7 @@ impl App {
                 continuations,
                 tool_call_rows,
                 tool_result_scroll_regions,
+                reasoning_scroll_region,
                 pin_region,
             } = rendered;
             let chip_abs = chip_row.map(|cr| all.len() + cr);
@@ -1341,7 +1360,16 @@ impl App {
                             offset: region.offset,
                             max_offset: region.max_offset,
                         }),
-                    reasoning_window_target: None,
+                    reasoning_window_scroll: reasoning_scroll_region
+                        .filter(|region| i >= region.row_start && i <= region.row_end)
+                        .map(|region| ReasoningScrollMeta {
+                            history_index: idx,
+                            offset: region.offset,
+                            max_offset: region.max_offset,
+                        }),
+                    reasoning_window_target: reasoning_scroll_region
+                        .filter(|region| i >= region.row_start && i <= region.row_end)
+                        .map(|_| idx),
                     diff_path: diff_path.clone(),
                     pin_hit,
                     continuation: false,
@@ -3125,7 +3153,14 @@ fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
             if !reasoning.trim().is_empty() {
                 rows = rows.saturating_add(1);
                 if *expanded {
-                    rows = rows.saturating_add(reasoning.lines().count() as u16);
+                    let reasoning_rows = reasoning.lines().count();
+                    rows = rows.saturating_add(
+                        reasoning_rows
+                            .min(crate::tui::history::THINKING_VISIBLE)
+                            .saturating_add(usize::from(
+                                reasoning_rows > crate::tui::history::THINKING_VISIBLE,
+                            )) as u16,
+                    );
                 }
             }
             rows
@@ -3513,6 +3548,7 @@ mod render_history_spacing_tests {
             reasoning: String::new(),
             timestamp: chrono::Local::now(),
             expanded: false,
+            reasoning_offset: 0,
             think_duration: None,
             seq: None,
         }

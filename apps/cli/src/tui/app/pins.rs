@@ -744,6 +744,7 @@ mod tests {
             reasoning: String::new(),
             timestamp: chrono::Local::now(),
             expanded: false,
+            reasoning_offset: 0,
             think_duration: None,
             seq,
         }
@@ -796,6 +797,7 @@ mod tests {
             tool_box_target: None,
             tool_call_target: None,
             tool_result_scroll: None,
+            reasoning_window_scroll: None,
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
@@ -1012,6 +1014,7 @@ mod tests {
             reasoning: String::new(),
             timestamp: chrono::Local::now(),
             expanded: false,
+            reasoning_offset: 0,
             think_duration: None,
             seq: Some(1),
         }];

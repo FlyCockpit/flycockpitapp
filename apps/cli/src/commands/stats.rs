@@ -32,7 +32,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
     // Heavy aggregate scan → run off the executor (the layer's docstring
     // calls this out).
     let rollup = db
-        .run_blocking(move |conn| stats::rollup(conn, &scope, range, &prices, by_role, now))
+        .read(move |conn| stats::rollup(conn, &scope, range, &prices, by_role, now))
         .await?;
 
     match args.format {

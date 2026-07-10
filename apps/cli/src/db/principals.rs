@@ -21,7 +21,7 @@ impl Db {
         session_id: Uuid,
         shared: bool,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET shared_with_collaborators = ?1 WHERE session_id = ?2",
                 params![shared as i64, session_id.to_string()],
@@ -50,7 +50,11 @@ impl Db {
         path: Option<&str>,
     ) -> Result<()> {
         let ts_ms = crate::db::session_log::now_ms();
-        self.with_conn(|conn| {
+        let principal = principal.to_owned();
+        let request_kind = request_kind.to_owned();
+        let verdict = verdict.to_owned();
+        let path = path.map(str::to_owned);
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO remote_principal_audit
                    (ts_ms, principal, request_kind, session_id, verdict, path)
@@ -72,7 +76,7 @@ impl Db {
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn list_remote_audit(&self) -> Result<Vec<RemoteAuditRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT audit_id, principal, request_kind, session_id, verdict, path
@@ -118,7 +122,7 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<RemoteAuditRow>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT audit_id, principal, request_kind, session_id, verdict, path
@@ -162,7 +166,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn session_shared_with_collaborators(&self, session_id: Uuid) -> Result<Option<bool>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT shared_with_collaborators FROM sessions WHERE session_id = ?1",
                 [session_id.to_string()],

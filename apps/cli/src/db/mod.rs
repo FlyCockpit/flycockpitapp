@@ -1,11 +1,10 @@
 //! SQLite persistence layer.
 //!
-//! Single connection, wrapped in `Arc<Mutex<>>`. Reads and writes are
-//! cheap enough (point lookups, single-row inserts) to hold the lock
-//! synchronously from tokio tasks; the multi-threaded runtime keeps
-//! other tasks moving while one is in a critical section. Aggregate
-//! queries that scan many rows go through [`Db::run_blocking`] so the
-//! executor thread isn't pinned.
+//! File-backed databases use one dedicated writer thread plus a small
+//! read-only WAL connection pool. Async call sites use [`Db::read`] and
+//! [`Db::write`]; synchronous CLI/test paths use explicit blocking wrappers
+//! over the same pool/actor so file-backed access no longer serializes on a
+//! process-wide `Mutex<Connection>`.
 //!
 //! Layout:
 //!
@@ -56,12 +55,15 @@ pub mod tool_calls;
 pub mod usage_events;
 pub mod workspace_trust;
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -80,11 +82,202 @@ pub(crate) fn open_default_call_count() -> usize {
     OPEN_DEFAULT_CALLS.with(std::cell::Cell::get)
 }
 
-/// Wrapper around a single `rusqlite::Connection`. Cheap to clone
-/// (everything is behind `Arc<Mutex<>>`).
+type DbJob = Box<dyn FnOnce(&Connection) -> Result<Box<dyn Any + Send>> + Send + 'static>;
+
+struct WriteRequest {
+    job: DbJob,
+    reply: mpsc::SyncSender<Result<Box<dyn Any + Send>>>,
+}
+
+#[derive(Clone)]
+struct Writer {
+    tx: mpsc::SyncSender<WriteRequest>,
+}
+
+impl Writer {
+    fn start(path: PathBuf) -> Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<WriteRequest>(1024);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("cockpit-db-writer".into())
+            .spawn(move || {
+                let conn = match Connection::open(&path)
+                    .with_context(|| format!("opening sqlite writer at {}", path.display()))
+                    .and_then(|conn| {
+                        apply_connection_pragmas(&conn, true).with_context(|| {
+                            format!("setting writer pragmas on {}", path.display())
+                        })?;
+                        Ok(conn)
+                    }) {
+                    Ok(conn) => {
+                        let _ = ready_tx.send(Ok(()));
+                        conn
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+
+                while let Ok(request) = rx.recv() {
+                    let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
+                        .map_err(|_| anyhow::anyhow!("db writer job panicked"))
+                        .and_then(|result| result);
+                    let _ = request.reply.send(result);
+                }
+            })
+            .context("spawning db writer thread")?;
+        match ready_rx.recv().context("waiting for db writer startup")? {
+            Ok(()) => Ok(Self { tx }),
+            Err(e) => anyhow::bail!(e),
+        }
+    }
+
+    fn submit<F, T>(&self, f: F) -> Result<mpsc::Receiver<Result<Box<dyn Any + Send>>>>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (reply, rx) = mpsc::sync_channel(1);
+        let job: DbJob = Box::new(move |conn| {
+            let value = f(conn)?;
+            Ok(Box::new(value) as Box<dyn Any + Send>)
+        });
+        self.tx
+            .send(WriteRequest { job, reply })
+            .map_err(|_| anyhow::anyhow!("db writer is shut down"))?;
+        Ok(rx)
+    }
+}
+
+fn run_blocking_sync<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+struct ReadPool {
+    path: PathBuf,
+    max: usize,
+    total: AtomicUsize,
+    idle: Mutex<Vec<Connection>>,
+    available: Condvar,
+}
+
+impl ReadPool {
+    fn new(path: PathBuf) -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        Self {
+            path,
+            max: cores.clamp(1, 4),
+            total: AtomicUsize::new(0),
+            idle: Mutex::new(Vec::new()),
+            available: Condvar::new(),
+        }
+    }
+
+    fn open_conn(&self) -> Result<Connection> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening sqlite read connection at {}", self.path.display()))?;
+        apply_connection_pragmas(&conn, false)
+            .with_context(|| format!("setting read pragmas on {}", self.path.display()))?;
+        conn.execute_batch("PRAGMA query_only = ON;")
+            .context("enforcing read-only sqlite connection")?;
+        Ok(conn)
+    }
+
+    fn checkout(&self) -> Result<Connection> {
+        loop {
+            if let Some(conn) = self
+                .idle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?
+                .pop()
+            {
+                return Ok(conn);
+            }
+
+            let total = self.total.load(Ordering::SeqCst);
+            if total < self.max {
+                if self
+                    .total
+                    .compare_exchange(total, total + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    match self.open_conn() {
+                        Ok(conn) => return Ok(conn),
+                        Err(e) => {
+                            self.total.fetch_sub(1, Ordering::SeqCst);
+                            self.available.notify_one();
+                            return Err(e);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let guard = self
+                .idle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
+            let mut guard = self
+                .available
+                .wait(guard)
+                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
+            if let Some(conn) = guard.pop() {
+                return Ok(conn);
+            }
+        }
+    }
+
+    fn checkin(&self, conn: Connection) -> Result<()> {
+        self.idle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?
+            .push(conn);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn run<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let conn = self.checkout()?;
+        let result = f(&conn);
+        let checkin = self.checkin(conn);
+        match (result, checkin) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+        }
+    }
+}
+
+/// Cloneable SQLite handle. File-backed databases use a writer thread and a
+/// small WAL read pool; in-memory test databases use the single SQLite
+/// connection because separate in-memory connections do not share state.
 #[derive(Clone)]
 pub struct Db {
-    inner: Arc<Mutex<Connection>>,
+    memory: Option<Arc<Mutex<Connection>>>,
+    writer: Option<Writer>,
+    read_pool: Option<Arc<ReadPool>>,
     /// `None` for in-memory databases (tests).
     path: Option<PathBuf>,
 }
@@ -122,12 +315,16 @@ impl Db {
             .with_context(|| format!("setting pragmas on {}", path.display()))?;
         repair_db_file_permissions(path);
         timer.phase("connect_and_pragmas");
+        migrate(&conn)?;
+        timer.phase("migrate");
+        drop(conn);
+        let writer = Writer::start(path.to_path_buf())?;
         let db = Self {
-            inner: Arc::new(Mutex::new(conn)),
+            memory: None,
+            writer: Some(writer),
+            read_pool: Some(Arc::new(ReadPool::new(path.to_path_buf()))),
             path: Some(path.to_path_buf()),
         };
-        db.migrate()?;
-        timer.phase("migrate");
         timer.done();
         Ok(db)
     }
@@ -139,10 +336,12 @@ impl Db {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         apply_connection_pragmas(&conn, false).context("setting pragmas on in-memory db")?;
         let db = Self {
-            inner: Arc::new(Mutex::new(conn)),
+            memory: Some(Arc::new(Mutex::new(conn))),
+            writer: None,
+            read_pool: None,
             path: None,
         };
-        db.migrate()?;
+        db.write_blocking(migrate)?;
         Ok(db)
     }
 
@@ -153,45 +352,114 @@ impl Db {
         self.path.as_deref()
     }
 
-    /// Run an idempotent closure against the connection synchronously.
-    /// Holds the connection lock for the duration of `f`. Use for cheap
-    /// queries (single-row reads, inserts, schema metadata).
-    pub fn with_conn<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&Connection) -> Result<T>,
-    {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
-        f(&guard)
-    }
-
-    /// Async variant that runs the closure on a blocking thread. Use for
-    /// queries that scan many rows (`/stats`, exports). The connection
-    /// lock is still per-call so writes serialize correctly.
-    pub async fn run_blocking<F, T>(&self, f: F) -> Result<T>
+    pub async fn read<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
+        if let Some(pool) = self.read_pool.clone() {
+            tokio::task::spawn_blocking(move || pool.run(f))
+                .await
+                .context("db read worker thread joined")?
+        } else {
+            let inner = self
+                .memory
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
+            tokio::task::spawn_blocking(move || {
+                let guard = inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+                f(&guard)
+            })
+            .await
+            .context("db read worker thread joined")?
+        }
+    }
+
+    pub async fn write<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(writer) = &self.writer {
+            let rx = writer.submit(f)?;
+            let boxed = tokio::task::spawn_blocking(move || {
+                rx.recv()
+                    .map_err(|_| anyhow::anyhow!("db writer reply dropped"))?
+            })
+            .await
+            .context("db writer reply worker joined")??;
+            boxed
+                .downcast::<T>()
+                .map(|value| *value)
+                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+        } else {
+            let inner = self
+                .memory
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
+            tokio::task::spawn_blocking(move || {
+                let guard = inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+                f(&guard)
+            })
+            .await
+            .context("db write worker thread joined")?
+        }
+    }
+
+    /// Explicit blocking read access for synchronous CLI/test paths.
+    /// Async code should prefer [`Self::read`].
+    pub fn read_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        if let Some(pool) = self.read_pool.as_ref() {
+            return run_blocking_sync(|| pool.run(f));
+        }
+        let inner = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
+        run_blocking_sync(|| {
             let guard = inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
             f(&guard)
         })
-        .await
-        .context("db worker thread joined")?
     }
 
-    /// Apply every pending migration. Forward-only; downgrades are not
-    /// supported. The runner takes a SQLite write lock before reading
-    /// the current version so concurrent openers cannot race into the
-    /// same pending DDL.
-    fn migrate(&self) -> Result<()> {
-        self.with_conn(migrate)
+    /// Explicit blocking write access for synchronous CLI/test paths.
+    /// Async code should prefer [`Self::write`].
+    pub fn write_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(writer) = &self.writer {
+            let rx = writer.submit(f)?;
+            return run_blocking_sync(|| {
+                let boxed = rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
+                boxed
+                    .downcast::<T>()
+                    .map(|value| *value)
+                    .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+            });
+        }
+        let inner = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
+        run_blocking_sync(|| {
+            let guard = inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            f(&guard)
+        })
     }
 }
 
@@ -396,9 +664,9 @@ mod tests {
     fn migrate_idempotent() {
         let db = Db::open_in_memory().unwrap();
         // Second migrate call is a no-op.
-        db.with_conn(migrate).unwrap();
+        db.read_blocking(migrate).unwrap();
         let v: i64 = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 Ok(
                     conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                         row.get(0)
@@ -413,7 +681,7 @@ mod tests {
     fn connection_pragmas_set_busy_timeout_to_five_seconds() {
         let db = Db::open_in_memory().unwrap();
         let timeout_ms: i64 = db
-            .with_conn(|conn| Ok(conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))?))
+            .read_blocking(|conn| Ok(conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))?))
             .unwrap();
         assert_eq!(timeout_ms, 5000);
     }
@@ -504,6 +772,136 @@ mod tests {
         drop(seed);
     }
 
+    #[tokio::test]
+    async fn write_actor_applies_writes_in_submission_order() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("actor.db")).unwrap();
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE actor_order (value INTEGER NOT NULL);")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.write(|conn| {
+            conn.execute("INSERT INTO actor_order (value) VALUES (1)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.write(|conn| {
+            conn.execute("INSERT INTO actor_order (value) VALUES (2)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let values = db
+            .read(|conn| {
+                let mut stmt = conn.prepare("SELECT value FROM actor_order ORDER BY rowid")?;
+                Ok(stmt
+                    .query_map([], |row| row.get::<_, i64>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn panicking_write_returns_error_and_actor_keeps_serving() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("panic.db")).unwrap();
+        let err = db
+            .write(|_conn| -> Result<()> { panic!("intentional db writer panic") })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("panicked"));
+
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE after_panic (value INTEGER NOT NULL);")?;
+            conn.execute("INSERT INTO after_panic (value) VALUES (7)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let value: i64 = db
+            .read(|conn| Ok(conn.query_row("SELECT value FROM after_panic", [], |row| row.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn read_pool_rejects_writes() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("readonly.db")).unwrap();
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE readonly_probe (value INTEGER NOT NULL);")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let err = db
+            .read(|conn| {
+                conn.execute("INSERT INTO readonly_probe (value) VALUES (1)", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readonly") || msg.contains("attempt to write"),
+            "unexpected read-only error: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_read_completes_while_writer_transaction_is_open() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("wal.db")).unwrap();
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE wal_probe (value INTEGER NOT NULL);\n                 INSERT INTO wal_probe (value) VALUES (1);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let slow_db = db.clone();
+        let writer = tokio::spawn(async move {
+            slow_db
+                .write(move |conn| {
+                    conn.execute_batch("BEGIN IMMEDIATE;")?;
+                    let _ = entered_tx.send(());
+                    std::thread::sleep(Duration::from_millis(250));
+                    conn.execute("INSERT INTO wal_probe (value) VALUES (2)", [])?;
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer transaction should start");
+
+        let start = Instant::now();
+        let count: i64 = db
+            .read(
+                |conn| Ok(conn.query_row("SELECT COUNT(*) FROM wal_probe", [], |row| row.get(0))?),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "reader should see the pre-commit snapshot");
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "read waited for slow writer: {:?}",
+            start.elapsed()
+        );
+        writer.await.unwrap().unwrap();
+    }
+
     #[test]
     fn busy_timeout_waits_for_short_write_contention() {
         let tmp = TempDir::new().unwrap();
@@ -511,7 +909,7 @@ mod tests {
         let db_a = Db::open(&path).unwrap();
         let db_b = Db::open(&path).unwrap();
 
-        db_a.with_conn(|conn| {
+        db_a.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TABLE busy_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
             )?;
@@ -519,7 +917,7 @@ mod tests {
         })
         .unwrap();
 
-        db_a.with_conn(|conn| {
+        db_a.write_blocking(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             conn.execute("INSERT INTO busy_probe (value) VALUES ('held')", [])?;
             Ok(())
@@ -529,7 +927,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
         let writer = std::thread::spawn(move || {
-            let result = db_b.with_conn(|conn| {
+            let result = db_b.write_blocking(move |conn| {
                 conn.execute("INSERT INTO busy_probe (value) VALUES ('waited')", [])?;
                 Ok(())
             });
@@ -542,7 +940,7 @@ mod tests {
             "second writer returned immediately instead of waiting for busy timeout"
         );
 
-        db_a.with_conn(|conn| {
+        db_a.write_blocking(move |conn| {
             conn.execute_batch("COMMIT;")?;
             Ok(())
         })
@@ -557,7 +955,7 @@ mod tests {
         );
 
         let count: i64 = db_a
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 Ok(conn.query_row("SELECT COUNT(*) FROM busy_probe", [], |row| row.get(0))?)
             })
             .unwrap();
@@ -874,7 +1272,7 @@ mod tests {
             "needs_attention",
         ] {
             let count: i64 = db
-                .with_conn(|conn| {
+                .read_blocking(|conn| {
                     Ok(conn.query_row(
                         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                         [table],
@@ -886,7 +1284,7 @@ mod tests {
         }
         // And the view.
         let view_count: i64 = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='tool_call_stats'",
                     [],

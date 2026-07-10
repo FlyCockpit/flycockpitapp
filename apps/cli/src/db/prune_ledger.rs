@@ -25,7 +25,7 @@ impl Db {
     pub fn save_prune_ledger(&self, session_id: Uuid, ledger: &PruneLedger) -> Result<()> {
         let ledger_json = serde_json::to_string(ledger).context("serializing prune ledger")?;
         let now = chrono::Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO prune_ledger (session_id, ledger_json, updated_at)
                  VALUES (?1, ?2, ?3)
@@ -47,7 +47,7 @@ impl Db {
     /// (corrupt row) so the caller can treat it as a missing ledger and
     /// fall back to the full unpruned form with a warning.
     pub fn load_prune_ledger(&self, session_id: Uuid) -> Result<Option<PruneLedger>> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let row: Option<String> = conn
                 .query_row(
                     "SELECT ledger_json FROM prune_ledger WHERE session_id = ?1",

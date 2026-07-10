@@ -1029,7 +1029,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
             Vec<String>,
             Vec<String>,
             Vec<String>,
-        ) = db.with_conn(|conn| {
+        ) = db.read_blocking(|conn| {
             let read_keys = |sql: &str| -> Result<Vec<String>> {
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([session_id.as_str()], |row| row.get::<_, String>(0))?;
@@ -2621,7 +2621,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/proj", "builder").unwrap();
         let sid = s.session_id;
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO approval_grants \
                  (session_id, grant_kind, grant_key, granted_at) \
@@ -3304,7 +3304,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let a = db.create_session("p1", "/x", "builder").unwrap();
         let b = db.create_session("p2", "/y", "builder").unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET short_id = 'same42' WHERE session_id IN (?1, ?2)",
                 rusqlite::params![a.session_id.to_string(), b.session_id.to_string()],

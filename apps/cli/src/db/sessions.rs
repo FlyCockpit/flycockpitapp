@@ -603,7 +603,7 @@ impl Db {
         project_root: &str,
         active_agent: &str,
     ) -> Result<SessionRow> {
-        let short_id = self.with_conn(|conn| {
+        let short_id = self.read_blocking(|conn| {
             generate_unique_short_id(conn, project_id).context("generating session short_id")
         })?;
         Ok(build_session_row(
@@ -619,7 +619,8 @@ impl Db {
     /// second half of [`Self::create_session`]. Idempotent at the
     /// application layer is **not** assumed — callers persist exactly once.
     pub fn insert_session_row(&self, row: &SessionRow) -> Result<SessionRow> {
-        self.with_conn(|conn| {
+        let row = row.clone();
+        self.write_blocking(move |conn| {
             insert_session_row_with_short_id_retry(conn, row.clone()).context("inserting session")
         })
     }
@@ -629,7 +630,8 @@ impl Db {
         session_id: Uuid,
         principal: Option<&str>,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        let principal = principal.map(str::to_owned);
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
                 params![principal, session_id.to_string()],
@@ -671,7 +673,7 @@ impl Db {
     ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin create_fork tx")?;
@@ -718,7 +720,7 @@ impl Db {
     }
 
     pub fn get_session(&self, session_id: Uuid) -> Result<Option<SessionRow>> {
-        self.with_conn(|conn| Self::get_session_conn(conn, session_id))
+        self.read_blocking(|conn| Self::get_session_conn(conn, session_id))
     }
 
     pub fn get_session_conn(conn: &Connection, session_id: Uuid) -> Result<Option<SessionRow>> {
@@ -732,7 +734,7 @@ impl Db {
         project_id: &str,
         short_id: &str,
     ) -> Result<Option<SessionRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let result = conn.query_row(
                 "SELECT * FROM sessions
                  WHERE project_id = ?1 AND short_id = ?2",
@@ -752,7 +754,7 @@ impl Db {
     /// project context. Returns all matches so the caller can report an
     /// ambiguous identifier (a short_id is unique only within a project).
     pub fn find_sessions_by_short_id_global(&self, short_id: &str) -> Result<Vec<SessionRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT * FROM sessions WHERE short_id = ?1")
                 .context("preparing find_sessions_by_short_id_global")?;
@@ -770,7 +772,7 @@ impl Db {
     /// Ensure the session has a short_id (lazy backfill for rows
     /// migrated from pre-§17 schemas). Returns the resolved short_id.
     pub fn ensure_short_id(&self, session_id: Uuid) -> Result<String> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let row = get_session_inner(conn, session_id)?
                 .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
             if let Some(existing) = row.short_id {
@@ -785,7 +787,8 @@ impl Db {
     /// Set or replace the session's title. `user_renamed` flips to true
     /// to lock out the auto-titling pass (GOALS §17d).
     pub fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
-        self.with_conn(|conn| {
+        let title = title.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
                 params![title, session_id.to_string()],
@@ -798,7 +801,8 @@ impl Db {
     /// Set the title from the auto-titling pass. Refuses to overwrite a
     /// user-set title — auto-titling never clobbers manual labels.
     pub fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
-        self.with_conn(|conn| {
+        let title = title.to_owned();
+        self.write_blocking(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE sessions SET title = ?1
@@ -815,7 +819,8 @@ impl Db {
     /// `user_renamed`; future scheduled auto-refreshes may replace it until the
     /// user manually names the session again.
     pub fn set_explicit_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
-        self.with_conn(|conn| {
+        let title = title.to_owned();
+        self.write_blocking(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE sessions SET title = ?1, user_renamed = 0
@@ -838,7 +843,7 @@ impl Db {
         user_content_tokens: i64,
         title_stage: i64,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions
                  SET user_content_tokens = ?1, title_stage = ?2
@@ -852,7 +857,7 @@ impl Db {
 
     /// Direct children of a session in the fork tree. Most-recent-first.
     pub fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
-        self.with_conn(|conn| Self::list_forks_conn(conn, parent_session_id))
+        self.read_blocking(|conn| Self::list_forks_conn(conn, parent_session_id))
     }
 
     pub fn list_forks_conn(conn: &Connection, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
@@ -876,7 +881,7 @@ impl Db {
     /// browser. Counts immediate children only (depth-1).
     #[allow(dead_code)]
     pub fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
-        self.with_conn(|conn| Self::count_forks_for_conn(conn, parent_session_id))
+        self.read_blocking(|conn| Self::count_forks_for_conn(conn, parent_session_id))
     }
 
     fn count_forks_for_conn(conn: &Connection, parent_session_id: Uuid) -> Result<u32> {
@@ -895,7 +900,7 @@ impl Db {
     /// via [`Self::list_forks`].
     #[allow(dead_code)]
     pub fn list_root_sessions(&self, project_id: &str, limit: u32) -> Result<Vec<SessionRow>> {
-        self.with_conn(|conn| Self::list_root_sessions_conn(conn, project_id, limit))
+        self.read_blocking(|conn| Self::list_root_sessions_conn(conn, project_id, limit))
     }
 
     pub fn list_root_sessions_conn(
@@ -924,7 +929,7 @@ impl Db {
     /// descendant fork (depth-unbounded). FK CASCADE on tool_call_events
     /// / inference_calls / lock state takes care of dependent rows.
     pub fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin delete_session tx")?;
@@ -974,7 +979,7 @@ impl Db {
     /// row behind, and this clears it so ephemeral sessions never accumulate.
     /// Returns the number of root ephemeral sessions removed.
     pub fn sweep_ephemeral_sessions(&self) -> Result<usize> {
-        let roots = self.with_conn(|conn| {
+        let roots = self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT session_id FROM sessions WHERE ephemeral = 1")
                 .context("preparing ephemeral sweep")?;
@@ -1013,7 +1018,7 @@ impl Db {
     /// unread.
     pub fn mark_session_viewed(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
                 params![now, session_id.to_string()],
@@ -1031,7 +1036,7 @@ impl Db {
     /// has activity and was never viewed).
     #[allow(dead_code)]
     pub fn latest_agent_activity_at(&self, session_id: Uuid) -> Result<Option<i64>> {
-        self.with_conn(|conn| Self::latest_agent_activity_at_conn(conn, session_id))
+        self.read_blocking(|conn| Self::latest_agent_activity_at_conn(conn, session_id))
     }
 
     fn latest_agent_activity_at_conn(conn: &Connection, session_id: Uuid) -> Result<Option<i64>> {
@@ -1056,7 +1061,7 @@ impl Db {
     /// re-archiving an already-archived row just re-stamps `archived_at`.
     pub fn archive_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin archive_session tx")?;
@@ -1080,7 +1085,7 @@ impl Db {
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
     pub fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
                 [session_id.to_string()],
@@ -1095,7 +1100,7 @@ impl Db {
     /// dialog to state how many sessions the cascade will affect.
     #[allow(dead_code)]
     pub fn count_descendants(&self, session_id: Uuid) -> Result<u32> {
-        self.with_conn(|conn| Self::count_descendants_conn(conn, session_id))
+        self.read_blocking(|conn| Self::count_descendants_conn(conn, session_id))
     }
 
     fn count_descendants_conn(conn: &Connection, session_id: Uuid) -> Result<u32> {
@@ -1113,7 +1118,7 @@ impl Db {
         if root == node {
             return Ok(true);
         }
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut cur = node;
             // Bound the walk so a corrupted parent cycle can't spin.
             for _ in 0..10_000 {
@@ -1144,7 +1149,7 @@ impl Db {
     /// interaction so `cockpit -c` resumes the actually-recent one.
     pub fn touch_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
                 params![now, session_id.to_string()],
@@ -1155,7 +1160,9 @@ impl Db {
     }
 
     pub fn set_session_model(&self, session_id: Uuid, provider: &str, model: &str) -> Result<()> {
-        self.with_conn(|conn| {
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
                 params![provider, model, session_id.to_string()],
@@ -1166,7 +1173,8 @@ impl Db {
     }
 
     pub fn set_session_agent(&self, session_id: Uuid, active_agent: &str) -> Result<()> {
-        self.with_conn(|conn| {
+        let active_agent = active_agent.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
                 params![active_agent, session_id.to_string()],
@@ -1178,7 +1186,7 @@ impl Db {
 
     pub fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
                 params![now, session_id.to_string()],
@@ -1191,7 +1199,7 @@ impl Db {
     /// Sessions newest-first. `only_open = true` filters out ended ones.
     #[allow(dead_code)]
     pub fn list_sessions(&self, only_open: bool, limit: u32) -> Result<Vec<SessionRow>> {
-        self.with_conn(|conn| Self::list_sessions_conn(conn, only_open, limit))
+        self.read_blocking(|conn| Self::list_sessions_conn(conn, only_open, limit))
     }
 
     pub fn list_sessions_conn(
@@ -1240,7 +1248,7 @@ impl Db {
         parent_session_id: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<crate::daemon::proto::SessionSummary>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             Self::list_session_summaries_conn(conn, project_id, parent_session_id, limit)
         })
     }
@@ -1341,7 +1349,7 @@ impl Db {
     // Retained for the not-yet-wired `cockpit -c` continue flow.
     #[allow(dead_code)]
     pub fn most_recent_open_session_for(&self, project_id: &str) -> Result<Option<SessionRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let result = conn.query_row(
                 "SELECT * FROM sessions
                  WHERE project_id = ?1 AND ended_at IS NULL AND ephemeral = 0
@@ -1555,7 +1563,7 @@ mod tests {
     }
 
     fn fork_tool_call_ids(db: &Db, session_id: Uuid) -> Vec<String> {
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT call_id FROM tool_call_events WHERE session_id = ?1 ORDER BY call_id",
@@ -1574,7 +1582,7 @@ mod tests {
     }
 
     fn fork_rows_for_parent(db: &Db, parent_session_id: Uuid) -> Vec<Uuid> {
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT session_id FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at",
@@ -1592,8 +1600,10 @@ mod tests {
     }
 
     fn install_trigger(db: &Db, sql: &str) {
-        db.with_conn(|conn| {
-            conn.execute_batch(sql)?;
+        let db = db.clone();
+        let sql = sql.to_owned();
+        db.write_blocking(move |conn| {
+            conn.execute_batch(&sql)?;
             Ok(())
         })
         .unwrap();
@@ -1745,7 +1755,7 @@ mod tests {
 
         set_test_short_ids(&["bbbbbb"]);
         let target = db.create_session("p", "/x", "a").unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
                 [target.session_id.to_string()],
@@ -2340,7 +2350,7 @@ mod tests {
 
         let wrapped = db.list_session_summaries(Some("pid"), None, 100).unwrap();
         let direct = db
-            .with_conn(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, 100))
+            .read_blocking(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, 100))
             .unwrap();
 
         assert_eq!(
@@ -2386,7 +2396,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
         // Simulate a pre-0002 row by clearing the short_id.
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
                 [s.session_id.to_string()],
@@ -2506,7 +2516,7 @@ mod tests {
         let root = db.create_session("p", "/x", "a").unwrap();
         let blocked = db.create_ephemeral_fork(root.session_id, None).unwrap();
         let removed = db.create_ephemeral_fork(root.session_id, None).unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(&format!(
                 "CREATE TRIGGER block_ephemeral_delete
                  BEFORE DELETE ON sessions

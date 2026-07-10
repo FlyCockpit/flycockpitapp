@@ -1918,7 +1918,7 @@ async fn handle_request(
             let task_call_id_for_read = task_call_id.clone();
             let label_for_read = label.clone();
             let history = db
-                .run_blocking(move |conn| {
+                .read(move |conn| {
                     crate::engine::rehydrate::subagent_history_snapshot_conn(
                         conn,
                         session_id,
@@ -2999,7 +2999,7 @@ async fn attach(
     let extended_cfg_for_attach = extended_cfg.clone();
     let active_subagent_for_attach = foreground.active_subagent.clone();
     let (history, paused_work): (Vec<proto::HistoryEntry>, Vec<proto::PausedWorkSummary>) = db
-        .run_blocking(move |conn| {
+        .read(move |conn| {
             let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
                 conn,
                 session_id,
@@ -3152,7 +3152,7 @@ async fn list_sessions(
     // the client via `SessionLiveStatus`, not here.
     let db = ctx.db.clone();
     let mut sessions = db
-        .run_blocking(move |conn| {
+        .read(move |conn| {
             crate::db::Db::list_session_summaries_conn(
                 conn,
                 project_id.as_deref(),
@@ -4160,7 +4160,7 @@ mod tests {
     async fn retention_tick_runs_one_pass_without_sleep() {
         let db = Db::open_in_memory().expect("in-memory db");
         let session = db.create_session("p", "/x", "Build").unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
                 [session.session_id.to_string()],
@@ -4182,7 +4182,7 @@ mod tests {
         run_retention_tick_db(db.clone(), cfg).await;
 
         let rows: i64 = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
                     [session.session_id.to_string()],

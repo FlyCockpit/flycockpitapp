@@ -27,7 +27,9 @@ impl Db {
         intentional_steer: bool,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let call_id = call_id.to_owned();
+        let owner = owner.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO skill_pairs
                     (session_id, call_id, owner, intentional_steer, created_at, updated_at)
@@ -50,7 +52,7 @@ impl Db {
     }
 
     pub fn list_skill_pairs(&self, session_id: Uuid) -> Result<Vec<SkillPairRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT call_id, owner, intentional_steer
@@ -88,7 +90,7 @@ impl Db {
         if ids.is_empty() {
             return Ok(0);
         }
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin skill_pair delete")?;

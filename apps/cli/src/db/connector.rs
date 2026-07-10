@@ -31,7 +31,9 @@ impl Db {
     ) -> Result<()> {
         let now = now_ms();
         let status = if enabled { "reconnecting" } else { "off" };
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO connector_state
                        (server_url, instance_id, enabled, status, updated_at_ms)
@@ -52,7 +54,7 @@ impl Db {
         server_url: &str,
         instance_id: &str,
     ) -> Result<Option<ConnectorState>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT server_url, instance_id, enabled, status, relay_url,
                         last_connected_at_ms, last_error
@@ -91,7 +93,12 @@ impl Db {
     ) -> Result<()> {
         let now = now_ms();
         let last_connected_at_ms: Option<i64> = (status == "connected").then_some(now);
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        let status = status.to_owned();
+        let relay_url = relay_url.map(str::to_owned);
+        let last_error = last_error.map(str::to_owned);
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO connector_state
                        (server_url, instance_id, enabled, status, relay_url,

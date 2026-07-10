@@ -361,7 +361,7 @@ fn run_rollup(
         ScopeToggle::All => StatsScope::All,
     };
     let now = chrono::Utc::now().timestamp();
-    db.with_conn(|conn| {
+    db.read_blocking(|conn| {
         crate::db::stats::rollup(conn, &stats_scope, range.to_range(), prices, false, now)
     })
     .map_err(|e| e.to_string())

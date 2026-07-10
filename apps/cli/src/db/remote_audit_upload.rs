@@ -23,7 +23,9 @@ impl Db {
         instance_id: &str,
     ) -> Result<()> {
         let now = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO remote_audit_upload_state
                    (server_url, instance_id, cursor_audit_id, updated_at_ms)
@@ -42,7 +44,7 @@ impl Db {
         server_url: &str,
         instance_id: &str,
     ) -> Result<Option<RemoteAuditUploadState>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT server_url, instance_id, cursor_audit_id,
                         last_uploaded_at_ms, last_error, updated_at_ms
@@ -57,7 +59,7 @@ impl Db {
     }
 
     pub fn list_remote_audit_upload_states(&self) -> Result<Vec<RemoteAuditUploadState>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT server_url, instance_id, cursor_audit_id,
@@ -84,7 +86,9 @@ impl Db {
         cursor_audit_id: i64,
     ) -> Result<()> {
         let now = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO remote_audit_upload_state
                    (server_url, instance_id, cursor_audit_id, last_uploaded_at_ms, last_error, updated_at_ms)
@@ -108,7 +112,10 @@ impl Db {
         error: &str,
     ) -> Result<()> {
         let now = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        let error = error.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO remote_audit_upload_state
                    (server_url, instance_id, cursor_audit_id, last_error, updated_at_ms)

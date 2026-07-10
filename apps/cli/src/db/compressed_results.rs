@@ -49,19 +49,29 @@ impl Db {
         hash: &str,
         entry: NewCompressedToolResult<'_>,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        let hash = hash.to_owned();
+        let session_id = entry.session_id;
+        let agent_id = entry.agent_id.to_owned();
+        let tool = entry.tool.to_owned();
+        let call_id = entry.call_id.to_owned();
+        let original_byte_len = entry.original_byte_len;
+        let compressed_byte_len = entry.compressed_byte_len;
+        let created_at = entry.created_at;
+        let kind = entry.kind.to_owned();
+        let content = entry.content.to_owned();
+        self.write_blocking(move |conn| {
             let existing: Option<String> = conn
                 .query_row(
                     "SELECT content
                        FROM compressed_tool_results
                       WHERE session_id = ?1 AND hash = ?2",
-                    params![entry.session_id.to_string(), hash],
+                    params![session_id.to_string(), hash],
                     |row| row.get(0),
                 )
                 .optional()
                 .context("querying compressed_tool_results collision candidate")?;
             if let Some(existing) = existing {
-                if existing == entry.content {
+                if existing == content {
                     return Ok(());
                 }
                 bail!("compressed tool result hash collision for {hash}");
@@ -74,15 +84,15 @@ impl Db {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     hash,
-                    entry.session_id.to_string(),
-                    entry.agent_id,
-                    entry.tool,
-                    entry.call_id,
-                    entry.original_byte_len as i64,
-                    entry.compressed_byte_len.map(|n| n as i64),
-                    entry.created_at,
-                    entry.kind,
-                    entry.content,
+                    session_id.to_string(),
+                    agent_id,
+                    tool,
+                    call_id,
+                    original_byte_len as i64,
+                    compressed_byte_len.map(|n| n as i64),
+                    created_at,
+                    kind,
+                    content,
                 ],
             )
             .context("inserting compressed_tool_result")?;
@@ -95,7 +105,7 @@ impl Db {
         session_id: Uuid,
         hash: &str,
     ) -> Result<Option<CompressedToolResultEntry>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT hash, session_id, agent_id, tool, call_id,
                         original_byte_len, compressed_byte_len, created_at, kind, content
@@ -110,7 +120,7 @@ impl Db {
     }
 
     pub fn session_has_compressed_tool_results(&self, session_id: Uuid) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -128,7 +138,7 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<CompressedToolResultEntry>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT hash, session_id, agent_id, tool, call_id,

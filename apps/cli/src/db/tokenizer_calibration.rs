@@ -22,7 +22,7 @@ impl Db {
     /// `(strategy, scale)` even if expired; falls back to
     /// `(cl100k_base, 1.0)` when there's no row.
     pub fn resolve_tokenizer(&self, provider: &str, model: &str) -> (TokenizerStrategy, f64) {
-        let row = match self.with_conn(|conn| {
+        let row = match self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT strategy, scale FROM tokenizer_calibration
                       WHERE provider = ?1 AND model = ?2",
@@ -53,7 +53,7 @@ impl Db {
     /// model)`. The calibration accumulator skips recomputing while one
     /// does.
     pub fn tokenizer_calibration_fresh(&self, provider: &str, model: &str, now: i64) -> bool {
-        match self.with_conn(|conn| {
+        match self.read_blocking(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM tokenizer_calibration
                   WHERE provider = ?1 AND model = ?2 AND expires_at > ?3",
@@ -88,7 +88,10 @@ impl Db {
         sample_total_tokens: i64,
         sample_calls: i64,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        let strategy = strategy.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO tokenizer_calibration
                    (provider, model, strategy, scale, computed_at, expires_at,

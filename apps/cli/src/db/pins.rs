@@ -44,7 +44,7 @@ impl Db {
     /// new pin was created, `false` when it was already pinned.
     pub fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let n = conn
                 .execute(
                     "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
@@ -60,7 +60,7 @@ impl Db {
     /// was removed, `false` when there was none. The unpin path for both
     /// `d` (delete) and checking a checklist item in `/pins`.
     pub fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let n = conn
                 .execute(
                     "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -73,7 +73,7 @@ impl Db {
 
     /// Whether the message at `(session_id, seq)` is currently pinned.
     pub fn is_pinned(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let found: Option<i64> = conn
                 .query_row(
                     "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -103,7 +103,7 @@ impl Db {
     /// below-input indicator and the `/sessions` per-session chrome read
     /// this.
     pub fn count_pins(&self, session_id: Uuid) -> Result<i64> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pins WHERE session_id = ?1",
@@ -119,7 +119,7 @@ impl Db {
     /// Bare seqs, no text — for callers that only need the set (e.g. the
     /// mouse control's pinned/unpinned decision per rendered message).
     pub fn list_pin_seqs(&self, session_id: Uuid) -> Result<Vec<i64>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq FROM pins WHERE session_id = ?1 ORDER BY pinned_ms ASC, rowid ASC",
@@ -146,7 +146,7 @@ impl Db {
     /// CASCADE makes this unreachable in practice, but the read stays
     /// defensive).
     pub fn list_pins_with_text(&self, session_id: Uuid) -> Result<Vec<PinnedMessage>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT e.seq, e.type, e.data_json
@@ -341,7 +341,7 @@ mod tests {
         db.pin_message(sid, u).unwrap();
         assert_eq!(db.count_pins(sid).unwrap(), 1);
 
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?1",
                 [sid.to_string()],

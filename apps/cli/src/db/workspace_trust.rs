@@ -61,7 +61,7 @@ impl Db {
     ) -> Result<WorkspaceTrustDecision> {
         let root = root_path.to_string_lossy().into_owned();
         let now = now_epoch_seconds();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO workspace_trust (root_path, mode, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?3)
@@ -82,7 +82,7 @@ impl Db {
         root_path: &std::path::Path,
     ) -> Result<Option<WorkspaceTrustDecision>> {
         let root = root_path.to_string_lossy().into_owned();
-        self.with_conn(|conn| query_decision_by_root(conn, &root))
+        self.read_blocking(|conn| query_decision_by_root(conn, &root))
     }
 
     pub fn workspace_trust_for_path(

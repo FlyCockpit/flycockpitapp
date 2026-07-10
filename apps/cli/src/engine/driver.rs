@@ -17224,7 +17224,7 @@ mod tests {
         driver
             .session
             .db
-            .with_conn(|conn| {
+            .write_blocking(move |conn| {
                 conn.execute(
                     "UPDATE task_delegation_children SET report = 'db report' WHERE task_call_id = 'task-db' AND label = 'default'",
                     [],

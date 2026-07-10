@@ -59,6 +59,31 @@ pub struct DelegationChildInit<'a> {
 }
 
 #[derive(Debug, Clone)]
+struct DelegationChildInitOwned {
+    label: String,
+    child_agent: String,
+    model: Option<String>,
+    output_dir: Option<String>,
+    requested_cwd: Option<String>,
+    resolved_cwd: Option<String>,
+    todo_ids_json: Option<String>,
+}
+
+impl From<&DelegationChildInit<'_>> for DelegationChildInitOwned {
+    fn from(value: &DelegationChildInit<'_>) -> Self {
+        Self {
+            label: value.label.to_owned(),
+            child_agent: value.child_agent.to_owned(),
+            model: value.model.map(str::to_owned),
+            output_dir: value.output_dir.map(str::to_owned),
+            requested_cwd: value.requested_cwd.map(str::to_owned),
+            resolved_cwd: value.resolved_cwd.map(str::to_owned),
+            todo_ids_json: value.todo_ids_json.map(str::to_owned),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct DelegationChildRow {
     pub task_call_id: String,
@@ -107,7 +132,15 @@ impl Db {
         children: &[DelegationChildInit<'_>],
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let function_call_id = function_call_id.map(str::to_owned);
+        let parent_agent = parent_agent.to_owned();
+        let original_args_json = original_args_json.map(str::to_owned);
+        let children: Vec<DelegationChildInitOwned> = children
+            .iter()
+            .map(DelegationChildInitOwned::from)
+            .collect();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO task_delegation_jobs (
                     task_call_id, function_call_id, parent_session_id, parent_agent,
@@ -169,7 +202,9 @@ impl Db {
         label: &str,
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.write_blocking(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning background delegation transaction",
@@ -215,7 +250,11 @@ impl Db {
         } else {
             DelegationStatus::Completed
         };
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        let report = report.to_owned();
+        let snapshot_json = snapshot_json.map(str::to_owned);
+        self.write_blocking(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning complete delegation transaction",
@@ -277,7 +316,7 @@ impl Db {
         &self,
         task_call_id: &str,
     ) -> Result<Vec<DelegationChildRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT task_call_id, label, child_agent, status, report, result_delivered
@@ -302,7 +341,9 @@ impl Db {
         label: &str,
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.write_blocking(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning delivered delegation transaction",
@@ -346,7 +387,7 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<DelegationChildDetail>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT c.task_call_id, c.label, c.child_agent, c.model, c.status,
@@ -372,7 +413,9 @@ impl Db {
 
     pub fn cancel_task_delegation_child(&self, task_call_id: &str, label: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.write_blocking(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning cancel delegation transaction",
@@ -420,15 +463,17 @@ impl Db {
 
     pub fn mark_task_delegation_child_lost(&self, task_call_id: &str, label: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.write_blocking(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning lost delegation transaction",
                 "committing lost delegation transaction",
                 || {
-                    let changed = mark_child_lost(conn, task_call_id, label, now)?;
+                    let changed = mark_child_lost(conn, &task_call_id, &label, now)?;
                     if changed {
-                        reconcile_job_after_lost(conn, task_call_id, now)?;
+                        reconcile_job_after_lost(conn, &task_call_id, now)?;
                     }
                     Ok(changed)
                 },
@@ -438,7 +483,7 @@ impl Db {
 
     pub fn reconcile_orphaned_task_delegations(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning orphaned delegation reconcile",
@@ -505,7 +550,11 @@ impl Db {
             anyhow::bail!("steer origin principal must not be empty");
         }
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        let body = body.to_owned();
+        let origin_principal = origin_principal.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO task_delegation_steers (task_call_id, label, body, origin_principal, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -522,7 +571,9 @@ impl Db {
         label: &str,
     ) -> Result<Vec<TaskDelegationSteerRow>> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.write_blocking(move |conn| {
             let pending = {
                 let mut stmt = conn
                     .prepare(
@@ -557,7 +608,7 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<TaskDelegationSteerRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT s.id, s.task_call_id, s.label, s.body, s.origin_principal,
@@ -972,7 +1023,7 @@ mod tests {
         .unwrap();
         db.complete_task_delegation_child("task-1", "done", "done report", false, None)
             .unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE task_delegation_jobs SET status = 'completed' WHERE task_call_id = 'task-1'",
                 [],
@@ -1031,7 +1082,7 @@ mod tests {
     fn complete_child_rolls_back_when_job_update_fails() {
         let db = Db::open_in_memory().unwrap();
         let session_id = seed_job(&db, "task-rollback", &["default"]);
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_task_job_update
                  BEFORE UPDATE ON task_delegation_jobs
@@ -1058,7 +1109,7 @@ mod tests {
     }
 
     fn job_status(db: &Db, task_call_id: &str) -> DelegationStatus {
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             let status: String = conn.query_row(
                 "SELECT status FROM task_delegation_jobs WHERE task_call_id = ?1",
                 params![task_call_id],

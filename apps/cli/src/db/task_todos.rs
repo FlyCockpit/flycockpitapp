@@ -134,7 +134,8 @@ impl Db {
         }
         let id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let content = content.to_owned();
+        self.write_blocking(move |conn| {
             let pos: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM task_todos WHERE session_id = ?1",
@@ -170,7 +171,7 @@ impl Db {
     }
 
     pub fn list_task_todos(&self, session_id: Uuid) -> Result<Vec<TaskTodo>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, session_id, content, status, priority, position, outcome_summary, version
@@ -197,9 +198,12 @@ impl Db {
         outcome_summary: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let content = content.map(str::to_owned);
+        let outcome_summary = outcome_summary.map(str::to_owned);
+        self.write_blocking(move |conn| {
             let existing = load_todo(conn, session_id, todo_id)?;
             let new_content = content
+                .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&existing.content);
@@ -216,7 +220,10 @@ impl Db {
                     new_content,
                     status.unwrap_or(existing.status).as_str(),
                     priority.unwrap_or(existing.priority),
-                    outcome_summary.map(str::trim).filter(|s| !s.is_empty()),
+                    outcome_summary
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty()),
                     now,
                     todo_id.to_string(),
                     session_id.to_string()
@@ -242,7 +249,9 @@ impl Db {
         }
         let id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let body = body.to_owned();
+        let author_agent = author_agent.to_owned();
+        self.write_blocking(move |conn| {
             load_todo(conn, session_id, todo_id)?;
             conn.execute(
                 "INSERT INTO task_todo_notes
@@ -273,13 +282,17 @@ impl Db {
         child_agent: &str,
     ) -> Result<Vec<TaskTodo>> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let todo_ids = todo_ids.to_vec();
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        let child_agent = child_agent.to_owned();
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin assign_task_todos tx")?;
             let mut assigned = Vec::new();
             for todo_id in todo_ids {
-                let todo = load_todo(&tx, session_id, *todo_id)?;
+                let todo = load_todo(&tx, session_id, todo_id)?;
                 let assignment_id = Uuid::new_v4();
                 tx.execute(
                     "INSERT OR IGNORE INTO task_todo_assignments
@@ -304,7 +317,7 @@ impl Db {
                     )
                     .context("marking assigned todo in_progress")?;
                 }
-                assigned.push(load_todo(&tx, session_id, *todo_id)?);
+                assigned.push(load_todo(&tx, session_id, todo_id)?);
             }
             tx.commit().context("commit assign_task_todos tx")?;
             Ok(assigned)
@@ -320,7 +333,10 @@ impl Db {
         child_session_id: Option<Uuid>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        let state = state.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE task_todo_assignments
                     SET state = ?1, child_session_id = COALESCE(?2, child_session_id), updated_at = ?3
@@ -348,7 +364,7 @@ impl Db {
         if key.is_empty() {
             anyhow::bail!("todo id or name must not be empty");
         }
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let todo = if let Ok(id) = Uuid::parse_str(key) {
                 load_todo_opt(conn, session_id, id)?
             } else {

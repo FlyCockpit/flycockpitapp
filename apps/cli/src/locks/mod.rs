@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     fn fail_lock_reads_inserts(db: &Db) {
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_reads_insert
                  BEFORE INSERT ON lock_reads
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     fn fail_lock_reads_deletes(db: &Db) {
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_reads_delete
                  BEFORE DELETE ON lock_reads
@@ -1364,7 +1364,7 @@ mod tests {
     }
 
     fn fail_lock_state_deletes(db: &Db) {
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_state_delete
                  BEFORE DELETE ON lock_state

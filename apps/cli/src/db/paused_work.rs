@@ -65,7 +65,11 @@ impl Db {
         daemon_version: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let active_agent = active_agent.to_owned();
+        let project_root = project_root.to_owned();
+        let reason = reason.to_owned();
+        let daemon_version = daemon_version.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO paused_session_work (
                     session_id, status, active_agent, project_root, reason,
@@ -109,7 +113,7 @@ impl Db {
         status: PausedWorkStatus,
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let changed = conn
                 .execute(
                     "UPDATE paused_session_work
@@ -124,7 +128,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn paused_session_work(&self, session_id: Uuid) -> Result<Option<PausedWorkRow>> {
-        self.with_conn(|conn| Self::paused_session_work_conn(conn, session_id))
+        self.read_blocking(|conn| Self::paused_session_work_conn(conn, session_id))
     }
 
     pub fn paused_session_work_conn(
@@ -145,7 +149,7 @@ impl Db {
     }
 
     pub fn paused_session_work_all(&self) -> Result<Vec<PausedWorkRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT session_id, status, active_agent, project_root, reason,

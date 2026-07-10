@@ -221,7 +221,8 @@ impl Db {
     ) -> Result<()> {
         let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
         let ts_ms = now_ms();
-        self.with_conn(|conn| {
+        let call_id = call_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO inference_requests
                    (call_id, session_id, ts_ms, payload_json, status)
@@ -289,7 +290,12 @@ impl Db {
     ) -> Result<i64> {
         let data_json = serde_json::to_string(data).context("serializing event data")?;
         let ts_ms = now_ms();
-        self.with_conn(|conn| {
+        let agent = agent.map(str::to_owned);
+        let call_id = call_id.map(str::to_owned);
+        let task_call_id = context.task_call_id.map(str::to_owned);
+        let label = context.label.map(str::to_owned);
+        let origin_principal = context.origin_principal.map(str::to_owned);
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO session_events
                  (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json)
@@ -300,9 +306,9 @@ impl Db {
                     kind.as_str(),
                     agent,
                     call_id,
-                    context.task_call_id,
-                    context.label,
-                    context.origin_principal,
+                    task_call_id,
+                    label,
+                    origin_principal,
                     data_json,
                 ],
             )
@@ -314,7 +320,7 @@ impl Db {
     /// All events for one session, ordered by `seq` (oldest first). Used
     /// by the exporter to merge per-fork timelines.
     pub fn list_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEventRow>> {
-        self.with_conn(|conn| Self::list_session_events_conn(conn, session_id))
+        self.read_blocking(|conn| Self::list_session_events_conn(conn, session_id))
     }
 
     pub fn list_session_events_conn(
@@ -345,7 +351,7 @@ impl Db {
     /// status on the emitted file so a hung/failed turn's record carries its
     /// non-`completed` status.
     pub fn get_inference_request(&self, call_id: &str) -> Result<Option<(Value, String)>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let result: rusqlite::Result<(String, String)> = conn.query_row(
                 "SELECT payload_json, status FROM inference_requests WHERE call_id = ?1",
                 [call_id],
@@ -454,7 +460,7 @@ mod tests {
 
         // Exactly one row — the update collapsed onto the dispatch row.
         let count: i64 = db
-            .with_conn(|c| {
+            .read_blocking(|c| {
                 c.query_row(
                     "SELECT COUNT(*) FROM inference_requests WHERE call_id = ?1",
                     [&call_id],

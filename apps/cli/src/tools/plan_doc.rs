@@ -421,7 +421,7 @@ mod tests {
         assert!(output.contains("created Build session"));
 
         let rows: Vec<(String, String)> = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT session_id, active_agent FROM sessions WHERE session_id != ?1",
                 )?;
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(rows[0].1, "Build");
 
         let events: Vec<(String, serde_json::Value)> = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT type, data_json FROM session_events WHERE session_id = ?1 ORDER BY seq",
                 )?;

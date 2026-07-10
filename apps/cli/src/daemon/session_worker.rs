@@ -3113,7 +3113,7 @@ pub(crate) fn resolve_root_agent(
     db: &crate::db::Db,
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> String {
-    db.with_conn(|conn| Ok(resolve_root_agent_conn(conn, session_id, cfg)))
+    db.read_blocking(|conn| Ok(resolve_root_agent_conn(conn, session_id, cfg)))
         .unwrap_or_else(|_| initial_active_agent(cfg).to_string())
 }
 

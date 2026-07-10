@@ -26,7 +26,8 @@ impl Db {
         seeds: &[SeedTool],
         #[cfg_attr(not(test), allow(unused_variables))] fail_after_inserts: Option<usize>,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        let seeds = seeds.to_vec();
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin set_seed_tools tx")?;
@@ -64,7 +65,7 @@ impl Db {
         session_id: Uuid,
         #[cfg_attr(not(test), allow(unused_variables))] fail_after_delete: bool,
     ) -> Result<Vec<SeedTool>> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin take_seed_tools tx")?;
@@ -139,7 +140,7 @@ mod tests {
     }
 
     fn stored_seed_tools(db: &Db, session_id: Uuid) -> Vec<SeedTool> {
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT tool, args_json FROM seed_tools
@@ -234,7 +235,7 @@ mod tests {
     fn malformed_args_json_still_drains_as_null_compatibly() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO seed_tools (session_id, seq, tool, args_json)
                  VALUES (?1, 0, 'read', '{malformed')",

@@ -77,7 +77,12 @@ impl Db {
             .transpose()
             .context("serializing tandem usage")?;
         let ts_ms = now_ms();
-        self.with_conn(|conn| {
+        let id = id.to_owned();
+        let parent_call_id = parent_call_id.to_owned();
+        let agent = agent.map(str::to_owned);
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO tandem_inference
                    (id, session_id, parent_call_id, parent_seq, agent,
@@ -117,7 +122,7 @@ impl Db {
     /// by `/export debug` to emit the `inference_requests_tandem/` files and
     /// the `tandem_inference` events.
     pub fn list_tandem_inference(&self, session_id: Uuid) -> Result<Vec<TandemRecord>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT session_id, parent_call_id, parent_seq, agent,

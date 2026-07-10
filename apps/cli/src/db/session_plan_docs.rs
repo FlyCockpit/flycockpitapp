@@ -17,7 +17,7 @@ pub struct SessionPlanDoc {
 
 impl Db {
     pub fn get_session_plan_doc(&self, session_id: Uuid) -> Result<Option<SessionPlanDoc>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT session_id, content, revision, updated_at
                    FROM session_plan_docs
@@ -51,7 +51,8 @@ impl Db {
         content: &str,
     ) -> Result<SessionPlanDoc> {
         let updated_at = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let content = content.to_owned();
+        self.write_blocking(move |conn| {
             let next_revision: i64 = conn
                 .query_row(
                     "SELECT COALESCE(revision, 0) + 1

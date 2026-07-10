@@ -47,7 +47,7 @@ impl Db {
     /// otherwise. The feature must never silently degrade to LIKE
     /// (prompt decision), so callers surface this and stop.
     pub fn fts5_available(&self) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE VIRTUAL TABLE temp.__cockpit_fts5_probe USING fts5(x);
                  INSERT INTO temp.__cockpit_fts5_probe (x) VALUES ('cockpit');
@@ -83,7 +83,7 @@ impl Db {
         since: Option<i64>,
         pool: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             search_candidates_inner(conn, query, project_id, exclude_session, since, pool)
         })
     }
@@ -93,7 +93,7 @@ impl Db {
     /// windowing — the tool slices this in Rust per the `read`-tool
     /// pagination conventions. Non-message events are skipped.
     pub fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq, type, json_extract(data_json, '$.text') AS text
@@ -131,7 +131,7 @@ impl Db {
     /// oldest first. `session_read` centers its window on these. Empty
     /// when the thread has no textual match.
     pub fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let Some(match_query) = literal_fts_match_query(query) else {
                 return Ok(Vec::new());
             };
@@ -626,7 +626,7 @@ mod tests {
         let secret = "secret_like_indexed_value_123";
         msg(&db, s.session_id, SessionEventKind::UserMessage, secret);
 
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             let ddl: String = conn.query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_fts'",
                 [],
@@ -702,7 +702,7 @@ mod tests {
             1
         );
 
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE session_events
                     SET data_json = json_object('text', 'updated body keyword')
@@ -724,7 +724,7 @@ mod tests {
             1
         );
 
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute("DELETE FROM session_events WHERE seq = ?1", [seq])?;
             Ok(())
         })
@@ -735,7 +735,7 @@ mod tests {
                 .is_empty()
         );
 
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?1",
                 [s.session_id.to_string()],
@@ -773,7 +773,7 @@ mod tests {
 
         // Drop the FTS contents and re-run the backfill to prove the
         // backfill SQL (not just the triggers) reconstructs the index.
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "INSERT INTO session_fts(session_fts) VALUES('delete-all');
                  DELETE FROM session_fts_docs;",

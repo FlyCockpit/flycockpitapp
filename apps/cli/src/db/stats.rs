@@ -329,7 +329,7 @@ impl PriceTable {
 /// tests).
 ///
 /// Heavy scan — drive it through [`Db::run_blocking`] (async, off the
-/// executor) or [`Db::with_conn`] (sync); the free-function shape
+/// executor) or [`Db::read_blocking`] (sync); the free-function shape
 /// mirrors `intel::ensure_fresh_blocking` so callers own the
 /// connection-acquisition strategy.
 pub fn rollup(
@@ -848,7 +848,7 @@ mod tests {
 
     fn run(db: &Db, scope: StatsScope, range: StatsRange, prices: &PriceTable) -> StatsRollup {
         // now = 1_000_000 keeps the 7d window's lower bound well-defined.
-        db.with_conn(|conn| super::rollup(conn, &scope, range, prices, false, 1_000_000))
+        db.read_blocking(|conn| super::rollup(conn, &scope, range, prices, false, 1_000_000))
             .unwrap()
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
         );
 
         let r = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 super::rollup(
                     conn,
                     &StatsScope::Project("p1".into()),
@@ -1255,7 +1255,7 @@ mod tests {
         }
 
         let r = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 super::rollup(
                     conn,
                     &StatsScope::Project("p1".into()),

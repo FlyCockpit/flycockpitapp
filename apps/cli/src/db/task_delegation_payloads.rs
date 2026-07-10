@@ -70,8 +70,16 @@ impl Db {
         let created_at = Utc::now().timestamp();
         let (body_inline, sidecar_path) =
             self.persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)?;
+        let task_call_id = payload.task_call_id.to_owned();
+        let label = payload.label.to_owned();
+        let parent_session_id = payload.parent_session_id;
+        let parent_agent = payload.parent_agent.to_owned();
+        let function_call_id = payload.function_call_id.map(str::to_owned);
+        let child_agent = payload.child_agent.to_owned();
+        let lookup_task_call_id = task_call_id.clone();
+        let lookup_label = label.clone();
 
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO task_delegation_payloads (
                     task_call_id, label, payload_hash, parent_session_id, parent_agent,
@@ -90,13 +98,13 @@ impl Db {
                     created_at = excluded.created_at,
                     delivered_at = NULL",
                 params![
-                    payload.task_call_id,
-                    payload.label,
+                    task_call_id,
+                    label,
                     hash,
-                    payload.parent_session_id.to_string(),
-                    payload.parent_agent,
-                    payload.function_call_id,
-                    payload.child_agent,
+                    parent_session_id.to_string(),
+                    parent_agent,
+                    function_call_id,
+                    child_agent,
                     byte_len as i64,
                     body_inline.as_deref(),
                     sidecar_path.as_deref(),
@@ -107,7 +115,7 @@ impl Db {
             Ok(())
         })?;
 
-        self.task_delegation_payload(payload.task_call_id, payload.label)?
+        self.task_delegation_payload(&lookup_task_call_id, &lookup_label)?
             .context("inserted task delegation payload missing")
     }
 
@@ -116,7 +124,7 @@ impl Db {
         task_call_id: &str,
         label: &str,
     ) -> Result<Option<TaskDelegationPayloadRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT task_call_id, label, payload_hash, parent_session_id,
                         parent_agent, function_call_id, child_agent, prompt_byte_len,
@@ -136,7 +144,7 @@ impl Db {
         session_id: Uuid,
         hash: &str,
     ) -> Result<Option<TaskDelegationPayloadRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT task_call_id, label, payload_hash, parent_session_id,
                         parent_agent, function_call_id, child_agent, prompt_byte_len,
@@ -183,7 +191,9 @@ impl Db {
         label: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE task_delegation_payloads
                     SET delivered_at = COALESCE(delivered_at, ?3)
@@ -196,7 +206,7 @@ impl Db {
     }
 
     pub fn session_has_task_delegation_payloads(&self, session_id: Uuid) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -214,7 +224,7 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<TaskDelegationPayloadRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT task_call_id, label, payload_hash, parent_session_id,

@@ -35,7 +35,7 @@ impl Db {
     /// authoring order, independent of name/timestamps). Empty when the
     /// project has no notes yet.
     pub fn list_project_notes(&self, project_root: &str) -> Result<Vec<ProjectNote>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_root, name, content
@@ -45,7 +45,7 @@ impl Db {
                 )
                 .context("preparing list_project_notes")?;
             let rows = stmt
-                .query_map([project_root], |row| {
+                .query_map([&project_root], |row| {
                     let id: String = row.get(0)?;
                     Ok((
                         id,
@@ -82,13 +82,15 @@ impl Db {
         }
         let now = Utc::now().timestamp();
         let id = Uuid::new_v4();
-        self.with_conn(|conn| {
-            let unique = disambiguate_name(conn, project_root, base, None)?;
+        let project_root = project_root.to_owned();
+        let name = base.to_owned();
+        self.write_blocking(move |conn| {
+            let unique = disambiguate_name(conn, &project_root, &name, None)?;
             // Append after any existing notes for stable sidebar order.
             let next_pos: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM project_notes WHERE project_root = ?1",
-                    [project_root],
+                    [&project_root],
                     |row| row.get(0),
                 )
                 .context("computing next note position")?;
@@ -112,7 +114,8 @@ impl Db {
     /// doesn't exist. Bumps `updated_at`.
     pub fn set_project_note_content(&self, id: Uuid, content: &str) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let content = content.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE project_notes SET content = ?1, updated_at = ?2 WHERE id = ?3",
                 params![content, now, id.to_string()],
@@ -133,7 +136,8 @@ impl Db {
             anyhow::bail!("note name must not be empty");
         }
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let name = base.to_owned();
+        self.write_blocking(move |conn| {
             let project_root: Option<String> = conn
                 .query_row(
                     "SELECT project_root FROM project_notes WHERE id = ?1",
@@ -144,7 +148,7 @@ impl Db {
                 .context("looking up note for rename")?;
             let project_root =
                 project_root.ok_or_else(|| anyhow::anyhow!("note `{id}` not found"))?;
-            let unique = disambiguate_name(conn, &project_root, base, Some(id))?;
+            let unique = disambiguate_name(conn, &project_root, &name, Some(id))?;
             conn.execute(
                 "UPDATE project_notes SET name = ?1, updated_at = ?2 WHERE id = ?3",
                 params![unique, now, id.to_string()],
@@ -156,7 +160,7 @@ impl Db {
 
     /// Delete a note by id. No-op (Ok) if it doesn't exist.
     pub fn delete_project_note(&self, id: Uuid) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute("DELETE FROM project_notes WHERE id = ?1", [id.to_string()])
                 .context("deleting project_note")?;
             Ok(())

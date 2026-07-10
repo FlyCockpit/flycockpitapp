@@ -49,7 +49,9 @@ impl Db {
             Some(q) => Some(serde_json::to_string(q).context("serializing question")?),
             None => None,
         };
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        let description = description.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, question_json, raised_at)
@@ -83,7 +85,9 @@ impl Db {
         let interrupt_id = Uuid::new_v4();
         let raised_at = Utc::now().timestamp();
         let questions_json = serde_json::to_string(questions).context("serializing questions")?;
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        let description = description.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, questions_json, raised_at)
@@ -107,7 +111,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let response_json =
             serde_json::to_string(response).context("serializing resolve response")?;
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -125,7 +129,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn list_open_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
@@ -147,7 +151,7 @@ impl Db {
     }
 
     pub fn get_interrupt(&self, interrupt_id: Uuid) -> Result<Option<NeedsAttentionRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,

@@ -269,7 +269,7 @@ pub fn history_snapshot(
     session_id: Uuid,
     root_agent: &str,
 ) -> Result<Vec<proto::HistoryEntry>> {
-    db.with_conn(|conn| history_snapshot_conn(conn, session_id, root_agent))
+    db.read_blocking(|conn| history_snapshot_conn(conn, session_id, root_agent))
 }
 
 pub fn history_snapshot_conn(
@@ -3653,7 +3653,7 @@ mod tests {
 
         let wrapped = history_snapshot(&s.db, s.id, "Build").unwrap();
         let direct =
-            s.db.with_conn(|conn| history_snapshot_conn(conn, s.id, "Build"))
+            s.db.read_blocking(|conn| history_snapshot_conn(conn, s.id, "Build"))
                 .unwrap();
 
         assert_eq!(
@@ -3672,7 +3672,7 @@ mod tests {
         let cfg = crate::config::extended::ExtendedConfig::default();
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-            db.run_blocking(move |conn| {
+            db.read(move |conn| {
                 let root_agent =
                     crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &cfg);
                 let history = history_snapshot_conn(conn, session_id, &root_agent)?;
@@ -3876,7 +3876,7 @@ mod tests {
             label: "default".into(),
         };
         let snap =
-            s.db.with_conn(|conn| {
+            s.db.read_blocking(|conn| {
                 history_snapshot_with_active_subagent_conn(conn, s.id, "Build", Some(&active))
             })
             .unwrap();
@@ -3996,7 +3996,7 @@ mod subagent_observe_tests {
         .unwrap();
 
         let child_a = db
-            .with_conn(|conn| subagent_history_snapshot_conn(conn, sid, "task-a", "default"))
+            .read_blocking(|conn| subagent_history_snapshot_conn(conn, sid, "task-a", "default"))
             .unwrap();
         assert_eq!(child_a.len(), 2);
         assert!(matches!(&child_a[0], proto::HistoryEntry::User { text, .. } if text == "brief a"));
@@ -4005,7 +4005,7 @@ mod subagent_observe_tests {
         );
 
         let child_b = db
-            .with_conn(|conn| subagent_history_snapshot_conn(conn, sid, "task-b", "default"))
+            .read_blocking(|conn| subagent_history_snapshot_conn(conn, sid, "task-b", "default"))
             .unwrap();
         assert_eq!(child_b.len(), 2);
         assert!(matches!(&child_b[0], proto::HistoryEntry::User { text, .. } if text == "brief b"));
@@ -4044,7 +4044,9 @@ mod subagent_observe_tests {
         .unwrap();
 
         let root = db
-            .with_conn(|conn| history_snapshot_with_active_subagent_conn(conn, sid, "Build", None))
+            .read_blocking(|conn| {
+                history_snapshot_with_active_subagent_conn(conn, sid, "Build", None)
+            })
             .unwrap();
         assert_eq!(root.len(), 1);
         assert!(

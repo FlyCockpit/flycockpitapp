@@ -37,7 +37,7 @@ impl Db {
     /// guidance file resolved at session start — feature inert for that
     /// session).
     pub fn guidance_baseline(&self, session_id: Uuid) -> Result<Option<GuidanceBaseline>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let row: Option<(Option<String>, Option<String>)> = conn
                 .query_row(
                     "SELECT guidance_baseline_path, guidance_baseline_hash
@@ -64,10 +64,10 @@ impl Db {
         baseline: Option<&GuidanceBaseline>,
     ) -> Result<()> {
         let (path, hash) = match baseline {
-            Some(b) => (Some(b.path.as_str()), Some(b.hash.as_str())),
+            Some(b) => (Some(b.path.clone()), Some(b.hash.clone())),
             None => (None, None),
         };
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions
                  SET guidance_baseline_path = ?1, guidance_baseline_hash = ?2
@@ -85,7 +85,9 @@ impl Db {
     /// never churn the row.
     pub fn put_guidance_contents(&self, hash: &str, contents: &str) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let hash = hash.to_owned();
+        let contents = contents.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO guidance_contents (hash, contents, created_at)
                  VALUES (?1, ?2, ?3)",
@@ -98,7 +100,7 @@ impl Db {
 
     /// Fetch the stored guidance body for a hash, or `None` if absent.
     pub fn guidance_contents(&self, hash: &str) -> Result<Option<String>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let contents: Option<String> = conn
                 .query_row(
                     "SELECT contents FROM guidance_contents WHERE hash = ?1",

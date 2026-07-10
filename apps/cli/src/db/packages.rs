@@ -115,7 +115,7 @@ pub struct NewPackage {
 impl Db {
     /// Look a package up by its canonical `identifier`.
     pub fn package_by_identifier(&self, identifier: &str) -> Result<Option<PackageRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT * FROM packages WHERE identifier = ?1",
                 params![identifier],
@@ -129,7 +129,7 @@ impl Db {
     /// Look a Git package up by its `source_url` — the repo-dedupe key.
     /// Returns the first match (a monorepo cloned once is reused).
     pub fn package_by_source_url(&self, source_url: &str) -> Result<Option<PackageRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT * FROM packages WHERE source_url = ?1 ORDER BY created_at LIMIT 1",
                 params![source_url],
@@ -142,7 +142,7 @@ impl Db {
 
     /// Every registered package, alphabetical by identifier.
     pub fn list_packages(&self) -> Result<Vec<PackageRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT * FROM packages ORDER BY identifier")
                 .context("preparing list_packages")?;
@@ -163,7 +163,8 @@ impl Db {
     /// one row (the UNIQUE constraint + upsert serialize them).
     pub fn upsert_package(&self, pkg: &NewPackage) -> Result<PackageRow> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| upsert_package_inner(conn, pkg, now))
+        let pkg = pkg.clone();
+        self.write_blocking(move |conn| upsert_package_inner(conn, &pkg, now))
     }
 
     /// Insert `pkg` only if no row with its `identifier` exists yet.
@@ -172,7 +173,8 @@ impl Db {
     /// overwrites a row cockpit already has.
     pub fn insert_package_if_absent(&self, pkg: &NewPackage) -> Result<(PackageRow, bool)> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let pkg = pkg.clone();
+        self.write_blocking(move |conn| {
             if let Some(existing) = conn
                 .query_row(
                     "SELECT * FROM packages WHERE identifier = ?1",
@@ -184,7 +186,7 @@ impl Db {
             {
                 return Ok((existing, false));
             }
-            let row = insert_package_inner(conn, pkg, now)?;
+            let row = insert_package_inner(conn, &pkg, now)?;
             Ok((row, true))
         })
     }

@@ -1164,7 +1164,8 @@ mod tests {
             prepare_scope: "global".into(),
         })
         .unwrap();
-        db.with_conn(|conn| {
+        let identifier = identifier.to_owned();
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE packages SET updated_at = ?1 WHERE identifier = ?2",
                 rusqlite::params![updated_at, identifier],

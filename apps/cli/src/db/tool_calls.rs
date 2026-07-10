@@ -76,7 +76,8 @@ impl Db {
             .map(|h| serde_json::to_string(h).context("serializing hint"))
             .transpose()?;
 
-        self.with_conn(|conn| {
+        let ev = ev.clone();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO tool_call_events (
                     event_id, session_id, call_id, timestamp,
@@ -150,7 +151,7 @@ impl Db {
     ///   patterns the catalog is already catching.
     /// - `limit`: max rows returned.
     pub fn list_failed_tool_calls(&self, filter: FailedCallsFilter) -> Result<Vec<ToolCallEvent>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut where_sql = PredicateBuilder::new();
             where_sql.push_value("timestamp >=", filter.since_epoch);
             if filter.include_recovered {
@@ -206,7 +207,7 @@ impl Db {
     /// All tool-call rows for one session, oldest-first. Used by
     /// `Attach` to rebuild the user transcript on the client.
     pub fn list_tool_calls_for_session(&self, session_id: Uuid) -> Result<Vec<ToolCallEvent>> {
-        self.with_conn(|conn| Self::list_tool_calls_for_session_conn(conn, session_id))
+        self.read_blocking(|conn| Self::list_tool_calls_for_session_conn(conn, session_id))
     }
 
     pub fn list_tool_calls_for_session_conn(
@@ -667,7 +668,7 @@ mod tests {
         };
         db.insert_tool_call(&ev).unwrap();
         let language: Option<String> = db
-            .with_conn(|c| {
+            .read_blocking(|c| {
                 Ok(
                     c.query_row("SELECT language FROM tool_call_events LIMIT 1", [], |r| {
                         r.get(0)
@@ -729,7 +730,7 @@ mod tests {
 
         // Grouping by (model, fingerprint) — the failed-calls audit query.
         let counts: Vec<(String, String, i64)> = db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT model, shape_fingerprint, COUNT(*)
                        FROM tool_call_events

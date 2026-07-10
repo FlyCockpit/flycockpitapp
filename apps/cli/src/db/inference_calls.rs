@@ -38,7 +38,8 @@ pub struct InferenceCallRow {
 
 impl Db {
     pub fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
-        self.with_conn(|conn| {
+        let row = row.clone();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO inference_calls (
                     call_id, session_id, project_id, project_root,
@@ -84,7 +85,7 @@ impl Db {
         if call_ids.is_empty() {
             return Ok(out);
         }
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT is_utility FROM inference_calls WHERE call_id = ?1")
                 .context("preparing utility_call_ids")?;
@@ -130,7 +131,7 @@ mod tests {
         };
         db.insert_inference_call(&row).unwrap();
         let count: i64 = db
-            .with_conn(|c| {
+            .read_blocking(|c| {
                 Ok(c.query_row("SELECT COUNT(*) FROM inference_calls", [], |r| r.get(0))?)
             })
             .unwrap();
@@ -138,7 +139,7 @@ mod tests {
         // The cache-creation column round-trips
         // (prompt `prompt-caching-strategy.md`).
         let creation: i64 = db
-            .with_conn(|c| {
+            .read_blocking(|c| {
                 Ok(c.query_row(
                     "SELECT cache_creation_input_tokens FROM inference_calls WHERE call_id = ?1",
                     params![row.call_id.to_string()],

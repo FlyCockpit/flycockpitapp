@@ -19,7 +19,7 @@ impl Db {
         if payload_cutoff_secs <= 0 {
             return Ok(0);
         }
-        self.with_conn(|conn| prune_session_payloads_conn(conn, payload_cutoff_secs))
+        self.write_blocking(move |conn| prune_session_payloads_conn(conn, payload_cutoff_secs))
     }
 
     /// Delete old closed, non-ephemeral root sessions whose subtrees are closed.
@@ -27,7 +27,7 @@ impl Db {
         if session_cutoff_secs <= 0 {
             return Ok(0);
         }
-        let roots = self.with_conn(|conn| old_session_roots(conn, session_cutoff_secs))?;
+        let roots = self.read_blocking(|conn| old_session_roots(conn, session_cutoff_secs))?;
         let mut removed = 0;
         for root in roots {
             self.delete_session(root, true)
@@ -51,7 +51,7 @@ impl Db {
 
     /// Record a successful retention vacuum timestamp.
     pub fn record_vacuum(&self, now_secs: i64) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO retention_meta (key, value) VALUES ('last_vacuum_secs', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -92,28 +92,23 @@ impl Db {
     }
 
     fn vacuum_retention_database(&self) -> Result<bool> {
-        let Some(path) = self.path.as_deref() else {
+        if self.path.is_none() {
             return Ok(false);
-        };
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening sqlite vacuum connection at {}", path.display()))?;
-        crate::db::apply_connection_pragmas(&conn, true)
-            .with_context(|| format!("setting vacuum connection pragmas on {}", path.display()))?;
-        // VACUUM under WAL still needs exclusive access to rewrite the DB. Run it on a
-        // short-lived connection with the standard busy timeout so the daemon-wide shared
-        // connection mutex stays available while SQLite waits or declines the vacuum.
-        match conn.execute_batch("VACUUM") {
+        }
+        // VACUUM under WAL still needs exclusive access to rewrite the DB. Keep it on
+        // the writer connection so retention does not bypass writer serialization.
+        self.write_blocking(|conn| match conn.execute_batch("VACUUM") {
             Ok(()) => Ok(true),
             Err(err) if sqlite_busy(&err) => {
                 tracing::debug!(error = %err, "retention vacuum skipped because sqlite is busy");
                 Ok(false)
             }
             Err(err) => Err(err).context("vacuuming after retention pass"),
-        }
+        })
     }
 
     fn last_vacuum_secs(&self) -> Result<Option<i64>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT value FROM retention_meta WHERE key = 'last_vacuum_secs'",
                 [],
@@ -210,7 +205,7 @@ fn parse_uuid_sql(raw: String) -> rusqlite::Result<Uuid> {
 mod tests {
     use super::*;
     fn close_session(db: &Db, id: Uuid, ts: i64) {
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at = ?2, last_active_at = ?2 WHERE session_id = ?1",
                 params![id.to_string(), ts],
@@ -221,7 +216,8 @@ mod tests {
     }
 
     fn insert_payload_rows(db: &Db, session_id: Uuid, call_id: &str, ts_secs: i64) {
-        db.with_conn(|conn| {
+        let call_id = call_id.to_owned();
+        db.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO inference_requests (call_id, session_id, ts_ms, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -257,7 +253,7 @@ mod tests {
     }
 
     fn payload_count(db: &Db, table: &str, session_id: Uuid) -> i64 {
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             conn.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
                 params![session_id.to_string()],
@@ -296,7 +292,7 @@ mod tests {
         let s = db.create_session("p", "/x", "Build").unwrap();
         close_session(&db, s.session_id, 10);
         insert_payload_rows(&db, s.session_id, "closed", 10);
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_session_event_prune
                  BEFORE DELETE ON session_events
@@ -375,7 +371,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").unwrap();
         close_session(&db, s.session_id, 10);
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ephemeral = 1 WHERE session_id = ?1",
                 params![s.session_id.to_string()],
@@ -427,7 +423,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open(&tmp.path().join("retention.db")).unwrap();
         let db_for_vacuum = db.clone();
-        db.with_conn(|_conn| {
+        db.read_blocking(|_conn| {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 tx.send(db_for_vacuum.vacuum_retention_database()).unwrap();

@@ -512,7 +512,7 @@ impl GrantStore {
 
     fn session_loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
         self.db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 let verdict: Option<String> = conn
                     .query_row(
                         "SELECT rule_verdict FROM loop_guard_rules \
@@ -529,7 +529,9 @@ impl GrantStore {
     }
 
     fn session_record_loop_rule(&self, signature: &str, verdict: LoopVerdict) -> Result<()> {
-        self.db.with_conn(|conn| {
+        let session_id = self.session_id;
+        let signature = signature.to_owned();
+        self.db.write_blocking(move |conn| {
             // `INSERT OR REPLACE` on the (session_id, signature) primary
             // key flips an existing opposite verdict in place — no
             // contradictory pair can persist.
@@ -538,7 +540,7 @@ impl GrantStore {
                  (session_id, signature, rule_verdict, recorded_at) \
                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![
-                    self.session_id.to_string(),
+                    session_id.to_string(),
                     signature,
                     verdict.as_str(),
                     now_epoch_seconds()
@@ -644,7 +646,7 @@ impl GrantStore {
 
     fn session_has(&self, kind: GrantKind, key: &str, verdict: Verdict) -> bool {
         self.db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 let n: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = ?2 AND grant_key = ?3 \
@@ -668,7 +670,7 @@ impl GrantStore {
     /// clever SQL.)
     fn session_path_has(&self, verdict: Verdict, matches: impl Fn(&str) -> bool) -> bool {
         self.db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT grant_key FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = 'path' AND verdict = ?2",
@@ -688,7 +690,9 @@ impl GrantStore {
     }
 
     fn session_insert(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
-        self.db.with_conn(|conn| {
+        let session_id = self.session_id;
+        let key = key.to_owned();
+        self.db.write_blocking(move |conn| {
             // `INSERT OR REPLACE` on the (session_id, grant_kind, grant_key)
             // primary key flips an existing opposite verdict in place — a key
             // can never carry both polarities at session scope.
@@ -697,7 +701,7 @@ impl GrantStore {
                  (session_id, grant_kind, grant_key, granted_at, verdict) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
-                    self.session_id.to_string(),
+                    session_id.to_string(),
                     kind.as_str(),
                     key,
                     now_epoch_seconds(),
@@ -712,17 +716,14 @@ impl GrantStore {
     /// Remove a session-scope grant of `verdict` polarity for an exact
     /// `(kind, key)`. Used to clear the opposite polarity before writing.
     fn session_remove(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
-        self.db.with_conn(|conn| {
+        let session_id = self.session_id;
+        let key = key.to_owned();
+        self.db.write_blocking(move |conn| {
             conn.execute(
                 "DELETE FROM approval_grants \
                  WHERE session_id = ?1 AND grant_kind = ?2 AND grant_key = ?3 \
                    AND verdict = ?4",
-                rusqlite::params![
-                    self.session_id.to_string(),
-                    kind.as_str(),
-                    key,
-                    verdict.as_str()
-                ],
+                rusqlite::params![session_id.to_string(), kind.as_str(), key, verdict.as_str()],
             )
             .context("removing session approval grant")?;
             Ok(())
@@ -1229,7 +1230,7 @@ mod tests {
     #[test]
     fn approval_timestamp_columns_are_integer() {
         let db = Db::open_in_memory().unwrap();
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             assert_eq!(
                 column_type(conn, "approval_grants", "granted_at")?,
                 "INTEGER"
@@ -1256,7 +1257,7 @@ mod tests {
 
         let (value, sqlite_type): (i64, String) = store
             .db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 conn.query_row(
                     "SELECT granted_at, typeof(granted_at) FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = 'command' AND grant_key = 'grep'",
@@ -1286,7 +1287,7 @@ mod tests {
 
         let (value, sqlite_type): (i64, String) = store
             .db
-            .with_conn(|conn| {
+            .read_blocking(|conn| {
                 conn.query_row(
                     "SELECT recorded_at, typeof(recorded_at) FROM loop_guard_rules \
                      WHERE session_id = ?1 AND signature = ?2",
@@ -1493,7 +1494,7 @@ mod tests {
         // `verdict` so the migration's column default (`'allow'`) supplies it.
         store
             .db
-            .with_conn(|conn| {
+            .write_blocking(move |conn| {
                 conn.execute(
                     "INSERT INTO approval_grants \
                      (session_id, grant_kind, grant_key, granted_at) \

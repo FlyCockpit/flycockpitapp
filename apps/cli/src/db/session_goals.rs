@@ -99,7 +99,10 @@ impl Db {
         }
         let id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let project_id = project_id.to_owned();
+        let objective = objective.to_owned();
+        let context = context.map(str::to_owned);
+        self.write_blocking(move |conn| {
             let open_statuses = open_status_placeholders(2);
             let existing_params = bind_session_and_open_statuses(session_id.to_string());
             let existing_param_refs = param_refs(&existing_params);
@@ -128,7 +131,7 @@ impl Db {
                     session_id.to_string(),
                     project_id,
                     objective,
-                    clean_opt(context),
+                    clean_opt(context.as_deref()),
                     token_budget,
                     now
                 ],
@@ -144,7 +147,7 @@ impl Db {
         mark_read: bool,
     ) -> Result<Option<SessionGoal>> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let open_statuses = open_status_placeholders(2);
             let goal_params = bind_session_and_open_statuses(session_id.to_string());
             let goal_param_refs = param_refs(&goal_params);
@@ -194,11 +197,14 @@ impl Db {
         context_delta: Option<&str>,
     ) -> Result<GoalUpdateOutcome> {
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let evidence = evidence.map(str::to_owned);
+        let blocker = blocker.map(str::to_owned);
+        let context_delta = context_delta.map(str::to_owned);
+        self.write_blocking(move |conn| {
             let mut goal = current_goal_required(conn, session_id)?;
             match status {
                 GoalStatus::Complete => {
-                    if clean_opt(evidence).is_none() {
+                    if clean_opt(evidence.as_deref()).is_none() {
                         anyhow::bail!("complete requires evidence");
                     }
                     let read_at = goal
@@ -209,7 +215,7 @@ impl Db {
                     }
                 }
                 GoalStatus::Blocked => {
-                    if clean_opt(blocker).is_none() {
+                    if clean_opt(blocker.as_deref()).is_none() {
                         anyhow::bail!("blocked requires blocker");
                     }
                     let attempts = goal.blocked_attempts + 1;
@@ -235,7 +241,7 @@ impl Db {
                 GoalStatus::Draft => anyhow::bail!("update_goal cannot set draft"),
             }
 
-            let context = append_context(goal.context.as_deref(), context_delta);
+            let context = append_context(goal.context.as_deref(), context_delta.as_deref());
             conn.execute(
                 "UPDATE session_goals
                     SET status = ?1,
@@ -260,7 +266,7 @@ impl Db {
     }
 
     pub fn clear_session_goal(&self, session_id: Uuid) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let now = Utc::now().timestamp();
             let open_statuses = open_status_placeholders(3);
             let mut bind: Vec<Box<dyn rusqlite::ToSql>> =
@@ -293,7 +299,7 @@ impl Db {
             anyhow::bail!("set_session_goal_status supports active or paused");
         }
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let goal = current_goal_required(conn, session_id)?;
             conn.execute(
                 "UPDATE session_goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -305,7 +311,7 @@ impl Db {
     }
 
     pub fn refresh_session_goal_usage(&self, session_id: Uuid) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let open_statuses = open_status_placeholders(2);
             let bind = bind_session_and_open_statuses(session_id.to_string());
             let bind_refs = param_refs(&bind);

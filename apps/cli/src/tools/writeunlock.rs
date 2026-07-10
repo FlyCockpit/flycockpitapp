@@ -185,7 +185,7 @@ mod tests {
     use crate::tools::readlock::ReadlockTool;
 
     fn fail_lock_state_deletes(db: &Db) {
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_state_delete
                  BEFORE DELETE ON lock_state

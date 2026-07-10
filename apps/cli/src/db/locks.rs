@@ -29,8 +29,9 @@ impl Db {
     pub fn lock_acquire(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
-        self.with_conn(|conn| {
-            guarded_lock_acquire(conn, &p, agent_id, session_id, now)?;
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
+            guarded_lock_acquire(conn, &p, &agent_id, session_id, now)?;
             Ok(())
         })
     }
@@ -48,7 +49,8 @@ impl Db {
         now: i64,
     ) -> Result<()> {
         let p = path_string(path);
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE lock_state SET acquired_at = ?4
                  WHERE path = ?1 AND agent_id = ?2 AND session_id = ?3",
@@ -64,7 +66,8 @@ impl Db {
     /// disk consistent).
     pub fn lock_release(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let p = path_string(path);
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "DELETE FROM lock_state
                  WHERE path = ?1 AND agent_id = ?2 AND session_id = ?3",
@@ -79,7 +82,8 @@ impl Db {
     pub fn lock_note_read(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO lock_reads (session_id, agent_id, path, read_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -100,11 +104,12 @@ impl Db {
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin lock_acquire_with_read tx")?;
-            guarded_lock_acquire(&tx, &p, agent_id, session_id, now)?;
+            guarded_lock_acquire(&tx, &p, &agent_id, session_id, now)?;
             tx.execute(
                 "INSERT INTO lock_reads (session_id, agent_id, path, read_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -129,7 +134,8 @@ impl Db {
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin lock_force_acquire_with_read tx")?;
@@ -160,7 +166,8 @@ impl Db {
     /// failed drift/taken resume. No-op when the row is already gone.
     pub fn lock_delete_read(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let p = path_string(path);
-        self.with_conn(|conn| {
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "DELETE FROM lock_reads
                  WHERE session_id = ?1 AND agent_id = ?2 AND path = ?3",
@@ -176,12 +183,13 @@ impl Db {
         if entries.is_empty() {
             return Ok(());
         }
-        self.with_conn(|conn| {
+        let entries = entries.to_vec();
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin lock release/read cleanup tx")?;
             for (path, session_id, agent_id) in entries {
-                let p = path_string(path);
+                let p = path_string(&path);
                 tx.execute(
                     "DELETE FROM lock_state
                      WHERE path = ?1 AND agent_id = ?2 AND session_id = ?3",
@@ -211,7 +219,9 @@ impl Db {
         if from_agent == to_agent {
             return Ok(());
         }
-        self.with_conn(|conn| {
+        let from_agent = from_agent.to_owned();
+        let to_agent = to_agent.to_owned();
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin lock agent-transfer tx")?;
@@ -243,7 +253,7 @@ impl Db {
 
     /// Permanently remove every persisted lock/read row for an ended session.
     pub fn lock_cleanup_session(&self, session_id: Uuid) -> Result<()> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin lock session cleanup tx")?;
@@ -265,7 +275,7 @@ impl Db {
     /// All currently-held locks. Loaded on daemon startup to rebuild
     /// the in-memory manager.
     pub fn list_held_locks(&self) -> Result<Vec<LockStateRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT path, agent_id, session_id, acquired_at FROM lock_state")
                 .context("preparing list_held_locks")?;
@@ -299,7 +309,7 @@ impl Db {
     /// targeted queries and tests; startup loads all reads in one pass.
     #[allow(dead_code)]
     pub fn list_reads_for_session(&self, session_id: Uuid) -> Result<Vec<(String, String)>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT agent_id, path FROM lock_reads WHERE session_id = ?1")
                 .context("preparing list_reads_for_session")?;
@@ -322,7 +332,7 @@ impl Db {
     /// Every persisted read record. Loaded on daemon startup independently of
     /// held locks so read-only pre-write guards survive restart too.
     pub fn list_lock_reads(&self) -> Result<Vec<(Uuid, String, String)>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare("SELECT session_id, agent_id, path FROM lock_reads")
                 .context("preparing list_lock_reads")?;
@@ -520,7 +530,7 @@ mod tests {
     }
 
     fn assert_transaction_closed(db: &Db) {
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")?;
             Ok(())
         })
@@ -532,7 +542,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
         let p = std::path::PathBuf::from("/x/fail.rs");
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_read_insert
                  BEFORE INSERT ON lock_reads
@@ -565,7 +575,7 @@ mod tests {
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire_with_read(&p, "builder", s.session_id)
             .unwrap();
-        db.with_conn(|conn| {
+        db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_transfer_read_copy
                  BEFORE INSERT ON lock_reads

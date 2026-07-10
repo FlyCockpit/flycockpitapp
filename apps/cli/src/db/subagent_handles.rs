@@ -36,7 +36,11 @@ impl Db {
         transcript_json: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let handle = handle.to_owned();
+        let agent = agent.to_owned();
+        let cwd = cwd.map(str::to_owned);
+        let transcript_json = transcript_json.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO subagent_handles
                      (handle, session_id, agent, cwd, transcript_json, created_at, updated_at)
@@ -68,7 +72,7 @@ impl Db {
         handle: &str,
         session_id: Uuid,
     ) -> Result<Option<SubagentHandle>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let row = conn
                 .query_row(
                     "SELECT agent, cwd, transcript_json FROM subagent_handles

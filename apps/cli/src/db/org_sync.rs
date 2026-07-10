@@ -38,7 +38,10 @@ impl Db {
         let policy_json =
             serde_json::to_string(policy_json).context("serializing org sync policy")?;
         let updated_at_ms = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let org_id = org_id.to_owned();
+        let policy_version = policy_version.map(str::to_owned);
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO sync_state
                    (server_url, org_id, cursor_seq, policy_version, policy_json, enabled, last_error, updated_at_ms)
@@ -64,7 +67,7 @@ impl Db {
     }
 
     pub fn org_sync_state(&self, server_url: &str, org_id: &str) -> Result<Option<OrgSyncState>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT server_url, org_id, cursor_seq, policy_version, enabled,
                         last_synced_at_ms, last_error, updated_at_ms
@@ -82,7 +85,7 @@ impl Db {
         &self,
         server_url: &str,
     ) -> Result<Option<OrgSyncState>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             conn.query_row(
                 "SELECT server_url, org_id, cursor_seq, policy_version, enabled,
                         last_synced_at_ms, last_error, updated_at_ms
@@ -112,7 +115,7 @@ impl Db {
     }
 
     pub fn list_org_sync_states(&self) -> Result<Vec<OrgSyncState>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT server_url, org_id, cursor_seq, policy_version, enabled,
@@ -134,7 +137,8 @@ impl Db {
 
     pub fn mark_org_sync_disabled(&self, server_url: &str) -> Result<()> {
         let updated_at_ms = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sync_state
                     SET enabled = 0, updated_at_ms = ?2
@@ -153,7 +157,9 @@ impl Db {
         cursor_seq: i64,
     ) -> Result<()> {
         let now = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let org_id = org_id.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sync_state
                     SET cursor_seq = MAX(cursor_seq, ?3),
@@ -170,7 +176,10 @@ impl Db {
 
     pub fn update_org_sync_error(&self, server_url: &str, org_id: &str, error: &str) -> Result<()> {
         let now = now_ms();
-        self.with_conn(|conn| {
+        let server_url = server_url.to_owned();
+        let org_id = org_id.to_owned();
+        let error = error.to_owned();
+        self.write_blocking(move |conn| {
             conn.execute(
                 "UPDATE sync_state
                     SET last_error = ?3,
@@ -188,7 +197,7 @@ impl Db {
         cursor_seq: i64,
         limit: usize,
     ) -> Result<Vec<SessionEventRow>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, data_json

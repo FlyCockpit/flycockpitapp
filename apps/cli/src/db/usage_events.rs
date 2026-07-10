@@ -32,7 +32,10 @@ impl Db {
         project_id: Option<&str>,
         ts: i64,
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        let kind = kind.to_owned();
+        let key = key.to_owned();
+        let project_id = project_id.map(str::to_owned);
+        self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO usage_events (kind, key, project_id, ts) VALUES (?1, ?2, ?3, ?4)",
                 params![kind, key, project_id, ts],
@@ -52,7 +55,7 @@ impl Db {
         project_filter: Option<&str>,
         since: i64,
     ) -> Result<HashMap<String, u64>> {
-        self.with_conn(|conn| {
+        self.read_blocking(|conn| {
             let mut map = HashMap::new();
             match project_filter {
                 Some(pid) => {
@@ -91,7 +94,7 @@ impl Db {
     /// Delete rows older than `before` (unix seconds). Returns the number
     /// pruned. Called on daemon startup.
     pub fn prune_usage_events(&self, before: i64) -> Result<usize> {
-        self.with_conn(|conn| {
+        self.write_blocking(move |conn| {
             let n = conn
                 .execute("DELETE FROM usage_events WHERE ts < ?1", params![before])
                 .context("pruning usage_events")?;

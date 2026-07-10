@@ -58,6 +58,7 @@ pub struct Index {
 }
 
 /// A file as found on disk during the freshness scan.
+#[derive(Clone)]
 struct DiskFile {
     /// Relative, forward-slash path (the `path` column).
     rel: String,
@@ -125,16 +126,84 @@ impl Index {
     }
 
     /// The single on-demand chokepoint. Re-stats the gitignore-walked
-    /// file set, deletes removed files in one tx (cascade purges
-    /// children), then re-indexes new/stale files (parallel parse,
-    /// serial chunked write). Runs entirely on a blocking thread.
+    /// file set, deletes removed files in one writer transaction, then
+    /// re-indexes new/stale files. Disk walking, hashing, and parsing run
+    /// off the DB writer; the writer only owns short metadata/chunk writes.
     pub async fn ensure_fresh(&self) -> Result<()> {
         let root = self.root.clone();
         let root_key = self.root_key.clone();
         let allow = self.gitignore_allow.clone();
-        self.db
-            .run_blocking(move |conn| ensure_fresh_blocking(conn, &root, &root_key, &allow))
+        let disk = tokio::task::spawn_blocking(move || scan_disk(&root, &allow))
             .await
+            .context("intel scan worker joined")??;
+        let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
+
+        let read_root_key = root_key.clone();
+        let indexed = self
+            .db
+            .read(move |conn| load_indexed(conn, &read_root_key))
+            .await?;
+        let work = tokio::task::spawn_blocking(move || plan_fresh_work(disk, indexed))
+            .await
+            .context("intel planning worker joined")??;
+        let removed_any = !work.removed.is_empty();
+
+        if removed_any || !work.stat_updates.is_empty() {
+            let write_root_key = root_key.clone();
+            let removed = work.removed.clone();
+            let stat_updates = work.stat_updates.clone();
+            self.db
+                .write(move |conn| {
+                    apply_fresh_metadata(conn, &write_root_key, &removed, &stat_updates)
+                })
+                .await?;
+        }
+
+        if work.to_index.is_empty() {
+            if removed_any {
+                let write_root_key = root_key.clone();
+                self.db
+                    .write(move |conn| Ok(callgraph::recompute_centrality(conn, &write_root_key)?))
+                    .await?;
+            }
+            return Ok(());
+        }
+        if work.to_index.len() >= COLD_THRESHOLD {
+            tracing::info!(files = work.to_index.len(), "intel: cold-indexing");
+        }
+
+        let module_root = self.root.clone();
+        let module_prefix = tokio::task::spawn_blocking(move || go_module_prefix(&module_root))
+            .await
+            .context("intel module-prefix worker joined")?;
+        let now = now_secs();
+        for chunk in work.to_index.chunks(CHUNK) {
+            let chunk = chunk.to_vec();
+            let parsed = tokio::task::spawn_blocking(move || parse_files_capped(chunk))
+                .await
+                .context("intel parse worker joined")??;
+            let write_root_key = root_key.clone();
+            let write_disk_paths = disk_paths.clone();
+            let write_module_prefix = module_prefix.clone();
+            self.db
+                .write(move |conn| {
+                    write_chunk(
+                        conn,
+                        &write_root_key,
+                        &write_disk_paths,
+                        &write_module_prefix,
+                        &parsed,
+                        now,
+                    )
+                })
+                .await?;
+        }
+
+        let write_root_key = root_key.clone();
+        self.db
+            .write(move |conn| Ok(callgraph::recompute_centrality(conn, &write_root_key)?))
+            .await?;
+        Ok(())
     }
 
     // ---- query methods (each assumes ensure_fresh already ran) --------
@@ -145,7 +214,7 @@ impl Index {
     /// in `intel_files` has been indexed, so count is always `Some`).
     pub fn tree_rows(&self) -> Result<Vec<(String, String, i64, i64)>> {
         let root_key = self.root_key.clone();
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT path, language, size, \
                  (SELECT COUNT(*) FROM intel_symbols s WHERE s.root = f.root AND s.path = f.path) \
@@ -169,7 +238,7 @@ impl Index {
     pub fn outline_rows(&self, rel: &str) -> Result<OutlineData> {
         let root_key = self.root_key.clone();
         let rel_owned = rel.to_string();
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let language: Option<String> = conn
                 .query_row(
                     "SELECT language FROM intel_files WHERE root = ?1 AND path = ?2",
@@ -207,7 +276,7 @@ impl Index {
         let root_key = self.root_key.clone();
         let name = name.to_string();
         let kind = kind.map(|s| s.to_string());
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let base = "SELECT path, name, kind, line, end_line, parent, visibility, signature \
                  FROM intel_symbols WHERE root = ?1 AND ";
             if exact {
@@ -239,7 +308,7 @@ impl Index {
     ) -> Result<Vec<(String, Vec<i64>)>> {
         let root_key = self.root_key.clone();
         let token = token.to_string();
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let sql = if case_insensitive {
                 "SELECT path, line FROM intel_identifiers \
                  WHERE root = ?1 AND token = ?2 COLLATE NOCASE ORDER BY path, line"
@@ -267,7 +336,7 @@ impl Index {
     /// All dependency edges for the project (`deps` / `circular`).
     pub fn dep_edges(&self) -> Result<Vec<DepEdge>> {
         let root_key = self.root_key.clone();
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT importer, importee, raw_target, line FROM intel_deps \
                  WHERE root = ?1 ORDER BY importer, line",
@@ -292,7 +361,7 @@ impl Index {
     pub fn centrality_scores(&self) -> Result<HashMap<String, f64>> {
         let root_key = self.root_key.clone();
         self.db
-            .with_conn(|conn| Ok(callgraph::load_centrality(conn, &root_key)?))
+            .read_blocking(|conn| Ok(callgraph::load_centrality(conn, &root_key)?))
     }
 
     /// Resolve `name` (+ optional `path`/`kind` disambiguators, matching
@@ -308,7 +377,7 @@ impl Index {
         let name = name.to_string();
         let path = path.map(|s| s.to_string());
         let kind = kind.map(|s| s.to_string());
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let mut sql = String::from(
                 "SELECT path, line, kind FROM intel_symbols WHERE root = ?1 AND name = ?2",
             );
@@ -350,7 +419,7 @@ impl Index {
     ) -> Result<Vec<(String, i64, Option<String>)>> {
         let root_key = self.root_key.clone();
         let target_path = target_path.to_string();
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             // Only callsites naming `target` can possibly resolve to it —
             // restrict by the (root, callee_name) index. The target's own
             // name is what an incoming call writes.
@@ -394,7 +463,7 @@ impl Index {
     pub fn impact_calls(&self, target_name: &str) -> Result<Vec<(String, String, i64)>> {
         let root_key = self.root_key.clone();
         let target_name = target_name.to_string();
-        self.db.with_conn(|conn| {
+        self.db.read_blocking(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT callee_name, callee_kind FROM intel_callsites \
                  WHERE root = ?1 AND caller_symbol = ?2 ORDER BY callee_name",
@@ -493,104 +562,93 @@ fn escape_like(s: &str) -> String {
 
 // ---- the freshness chokepoint ---------------------------------------------
 
-fn ensure_fresh_blocking(
-    conn: &Connection,
-    root: &Path,
-    root_key: &str,
-    gitignore_allow: &[String],
-) -> Result<()> {
-    // 1. Build the on-disk set via the gitignore-aware walk, re-including
-    //    gitignored paths matching the read-allowlist.
-    let disk = scan_disk(root, gitignore_allow)?;
+struct FreshWork {
+    removed: Vec<String>,
+    stat_updates: Vec<DiskFile>,
+    to_index: Vec<DiskFile>,
+}
+
+fn plan_fresh_work(disk: Vec<DiskFile>, indexed: IndexedMap) -> Result<FreshWork> {
     let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
-
-    // 2. Load current index state (path → (mtime_ns, size, hash)).
-    let indexed = load_indexed(conn, root_key)?;
-
-    // 3. Removed files: in the index but absent from disk → delete in
-    //    ONE tx BEFORE the parse pass so the cascade purges their
-    //    children. This is the deleted-file regression kcl hit.
-    let removed: Vec<&String> = indexed
+    let removed = indexed
         .keys()
         .filter(|p| !disk_paths.contains(*p))
+        .cloned()
         .collect();
-    let removed_any = !removed.is_empty();
-    if removed_any {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut del = tx.prepare("DELETE FROM intel_files WHERE root = ?1 AND path = ?2")?;
-            for path in &removed {
-                del.execute(rusqlite::params![root_key, path])?;
-            }
-        }
-        tx.commit()?;
-    }
-
-    // 4. Determine the to-index set: new files + stale files
-    //    (mtime/size changed, confirmed by hash tiebreaker).
-    let mut to_index: Vec<DiskFile> = Vec::new();
+    let mut stat_updates = Vec::new();
+    let mut to_index = Vec::new();
     for f in disk {
         match indexed.get(&f.rel) {
             None => to_index.push(f),
             Some((mtime, size, hash)) => {
                 if *mtime == f.mtime_ns && *size == f.size {
-                    continue; // fast-path: unchanged.
+                    continue;
                 }
                 if f.size as u64 >= LARGE_FILE_BYTES {
                     to_index.push(f);
                     continue;
                 }
-                // Tiebreaker: hash the file; if it matches, refresh just
-                // the stat columns (cheap) and skip re-parsing.
                 match hash_file(&f.abs) {
-                    Ok(h) if &h == hash => {
-                        conn.execute(
-                            "UPDATE intel_files SET mtime_ns = ?3, size = ?4 \
-                             WHERE root = ?1 AND path = ?2",
-                            rusqlite::params![root_key, f.rel, f.mtime_ns, f.size],
-                        )?;
-                    }
+                    Ok(h) if &h == hash => stat_updates.push(f),
                     _ => to_index.push(f),
                 }
             }
         }
     }
+    Ok(FreshWork {
+        removed,
+        stat_updates,
+        to_index,
+    })
+}
 
-    if to_index.is_empty() {
-        // No new/stale file was parsed this pass. Centrality is a
-        // whole-graph property: if any file was *removed* its callsites/
-        // symbols are gone (FK cascade), so the materialized scores are
-        // stale and must be rebuilt. If nothing changed at all, leave the
-        // table as-is (cheap no-op for the hot read path).
-        if removed_any {
-            callgraph::recompute_centrality(conn, root_key)?;
-        }
+fn apply_fresh_metadata(
+    conn: &Connection,
+    root_key: &str,
+    removed: &[String],
+    stat_updates: &[DiskFile],
+) -> Result<()> {
+    if removed.is_empty() && stat_updates.is_empty() {
         return Ok(());
     }
-    if to_index.len() >= COLD_THRESHOLD {
-        tracing::info!(files = to_index.len(), "intel: cold-indexing");
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut del = tx.prepare("DELETE FROM intel_files WHERE root = ?1 AND path = ?2")?;
+        for path in removed {
+            del.execute(rusqlite::params![root_key, path])?;
+        }
     }
+    {
+        let mut update = tx.prepare(
+            "UPDATE intel_files SET mtime_ns = ?3, size = ?4 WHERE root = ?1 AND path = ?2",
+        )?;
+        for f in stat_updates {
+            update.execute(rusqlite::params![root_key, f.rel, f.mtime_ns, f.size])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
 
-    // Go module prefix (empty if no go.mod) for the resolver.
-    let module_prefix = go_module_prefix(root);
+fn intel_parse_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
+}
 
-    // 5. Parse in rayon chunks, write each chunk serially in one tx.
-    let now = now_secs();
-    for chunk in to_index.chunks(CHUNK) {
-        let parsed: Vec<ParsedFile> = chunk
+fn parse_files_capped(files: Vec<DiskFile>) -> Result<Vec<ParsedFile>> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(intel_parse_threads())
+        .build()
+        .context("building intel parse pool")?;
+    Ok(pool.install(|| {
+        files
             .par_iter()
             .filter_map(|f| parse_one(f).ok().flatten())
-            .collect();
-        write_chunk(conn, root_key, &disk_paths, &module_prefix, &parsed, now)?;
-    }
-
-    // 6. Wholesale-recompute centrality once per pass that wrote any chunk
-    //    (cheap aggregate join over intel_callsites ⋈ intel_symbols — no
-    //    re-parse). Keeps the whole-graph score correct after this
-    //    incremental re-index; an absent/empty table degrades to unranked
-    //    order on the read side.
-    callgraph::recompute_centrality(conn, root_key)?;
-    Ok(())
+            .collect()
+    }))
 }
 
 /// Walk `root` gitignore-aware and stat every regular file. Any gitignored
@@ -880,6 +938,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_pool_leaves_interactive_headroom() {
+        let cores = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let expected = cores.saturating_sub(1).max(1);
+        assert_eq!(intel_parse_threads(), expected);
+        assert!(intel_parse_threads() <= cores.max(1));
+    }
+
+    #[test]
     fn parse_one_large_file_skips_read_and_parse() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("huge.rs");
@@ -908,7 +976,7 @@ mod tests {
     }
 
     fn count_rows(db: &Db, table: &str, root_key: &str, path: &str) -> i64 {
-        db.with_conn(|conn| {
+        db.read_blocking(|conn| {
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE root = ?1 AND path = ?2");
             Ok(conn.query_row(&sql, rusqlite::params![root_key, path], |r| r.get(0))?)
         })

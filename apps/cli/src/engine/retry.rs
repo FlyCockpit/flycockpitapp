@@ -84,6 +84,34 @@ pub enum RetryDecision {
     FailFast,
 }
 
+pub(crate) fn failure_retry_decision_and_rationale(
+    class: &str,
+    provider_status: Option<u16>,
+) -> (&'static str, &'static str) {
+    match class {
+        "timeout_ttft" => ("fail_fast", "time_to_first_token_timeout"),
+        "timeout_idle" => ("fail_fast", "stream_idle_timeout"),
+        "network" => (
+            "terminal_after_retry_layer",
+            "transport_or_provider_failure_after_retry_layer",
+        ),
+        "missing_tool_entitlement" | "client_side_tools_unsupported" => {
+            ("fail_fast", "client_side_capability_block")
+        }
+        _ if provider_status.is_some_and(|status| status == 429 || status == 503) => (
+            "terminal_after_retry_layer",
+            "retryable_http_status_terminal",
+        ),
+        _ if provider_status.is_some_and(|status| (500..=599).contains(&status)) => {
+            ("terminal_after_retry_layer", "server_http_status_terminal")
+        }
+        _ if provider_status.is_some_and(|status| (400..=499).contains(&status)) => {
+            ("fail_fast", "non_retryable_http_status")
+        }
+        _ => ("fail_fast", "non_retryable_or_unclassified_failure"),
+    }
+}
+
 /// Classify a [`CompletionError`] into the retry taxonomy.
 ///
 /// Built on how rig 0.37 + reqwest 0.13 surface errors (verified via
@@ -637,6 +665,47 @@ mod tests {
             reqwest::StatusCode::from_u16(code).unwrap(),
             "boom".into(),
         ))
+    }
+
+    #[test]
+    fn failure_retry_decision_rationale_covers_representative_arms() {
+        assert_eq!(
+            failure_retry_decision_and_rationale("timeout_ttft", None),
+            ("fail_fast", "time_to_first_token_timeout")
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale("network", None),
+            (
+                "terminal_after_retry_layer",
+                "transport_or_provider_failure_after_retry_layer"
+            )
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale("http_429", Some(429)),
+            (
+                "terminal_after_retry_layer",
+                "retryable_http_status_terminal"
+            )
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale("http_503", Some(503)),
+            (
+                "terminal_after_retry_layer",
+                "retryable_http_status_terminal"
+            )
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale("http_502", Some(502)),
+            ("terminal_after_retry_layer", "server_http_status_terminal")
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale("http_400", Some(400)),
+            ("fail_fast", "non_retryable_http_status")
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale("weird", None),
+            ("fail_fast", "non_retryable_or_unclassified_failure")
+        );
     }
 
     #[test]

@@ -3639,9 +3639,9 @@ fn inference_failure_diagnostics(
         .class
         .strip_prefix("http_")
         .and_then(|s| s.parse::<u16>().ok());
-    let provider_body_snippet = bounded_snippet(&failure.detail, 800);
+    let provider_body_snippet = crate::text::bounded_snippet(&failure.detail, 800);
     let (retry_final_decision, classification_rationale) =
-        failure_retry_decision_and_rationale(&failure.class, provider_status);
+        crate::engine::retry::failure_retry_decision_and_rationale(&failure.class, provider_status);
     InferenceFailureDiagnostics {
         provider_status,
         provider_body_snippet,
@@ -3653,54 +3653,6 @@ fn inference_failure_diagnostics(
         classification_rationale,
         recommended_action: "retry_same_turn",
     }
-}
-
-fn failure_retry_decision_and_rationale(
-    class: &str,
-    provider_status: Option<u16>,
-) -> (&'static str, &'static str) {
-    match class {
-        "timeout_ttft" => ("fail_fast", "time_to_first_token_timeout"),
-        "timeout_idle" => ("fail_fast", "stream_idle_timeout"),
-        "network" => (
-            "terminal_after_retry_layer",
-            "transport_or_provider_failure_after_retry_layer",
-        ),
-        "missing_tool_entitlement" | "client_side_tools_unsupported" => {
-            ("fail_fast", "client_side_capability_block")
-        }
-        _ if provider_status.is_some_and(|status| status == 429 || status == 503) => (
-            "terminal_after_retry_layer",
-            "retryable_http_status_terminal",
-        ),
-        _ if provider_status.is_some_and(|status| (500..=599).contains(&status)) => {
-            ("terminal_after_retry_layer", "server_http_status_terminal")
-        }
-        _ if provider_status.is_some_and(|status| (400..=499).contains(&status)) => {
-            ("fail_fast", "non_retryable_http_status")
-        }
-        _ => ("fail_fast", "non_retryable_or_unclassified_failure"),
-    }
-}
-
-fn bounded_snippet(detail: &str, max_chars: usize) -> Option<String> {
-    let trimmed = detail.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let mut truncated = false;
-    for ch in trimmed.chars() {
-        if out.chars().count() >= max_chars {
-            truncated = true;
-            break;
-        }
-        out.push(ch);
-    }
-    if truncated {
-        out.push_str("...");
-    }
-    Some(out)
 }
 
 /// Build the assistant turn that enters stored wire history, given how the

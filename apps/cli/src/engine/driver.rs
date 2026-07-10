@@ -3135,7 +3135,10 @@ impl Driver {
             .strip_prefix("http_")
             .and_then(|s| s.parse::<u16>().ok());
         let (retry_final_decision, classification_rationale) =
-            failure_retry_decision_and_rationale(&failure.class, provider_status);
+            crate::engine::retry::failure_retry_decision_and_rationale(
+                &failure.class,
+                provider_status,
+            );
         let provider_body_snippet =
             redacted_bounded_snippet(&failure.detail, self.redact.as_ref(), 800);
         let recovery_id = call_id.to_string();
@@ -7946,7 +7949,7 @@ impl Driver {
                         "children": [task_child_detail_json(row, &orphaned)],
                     });
                     if let Some(report) = &row.report {
-                        value["report"] = serde_json::json!(cap_text(report, 1200));
+                        value["report"] = serde_json::json!(crate::text::cap_chars(report, 1200).0);
                     }
                     return task_envelope(value);
                 }
@@ -7977,7 +7980,7 @@ impl Driver {
                     "child_state_unchanged": true,
                     "report_source": report_source,
                     "children": [task_child_detail_json(row, &orphaned)],
-                    "report": cap_text(&report, 1200),
+                    "report": crate::text::cap_chars(&report, 1200).0,
                 }))
             }
             TaskControlAction::Steer => {
@@ -10340,17 +10343,6 @@ fn task_control_row_status_name(
     }
 }
 
-fn cap_text(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars().take(max_chars) {
-        out.push(ch);
-    }
-    if out.len() < text.len() {
-        out.push_str("\n[truncated]");
-    }
-    out
-}
-
 fn resolve_task_control_targets(
     rows: &[crate::db::task_delegations::DelegationChildDetail],
     task_call_id: Option<String>,
@@ -10453,7 +10445,7 @@ fn task_child_detail_json(
         "updated_at": row.updated_at,
     });
     if let Some(report) = &row.report {
-        child["report"] = serde_json::json!(cap_text(report, 500));
+        child["report"] = serde_json::json!(crate::text::cap_chars(report, 500).0);
     }
     child
 }
@@ -11545,56 +11537,11 @@ fn prompt_summary(msg: &Message, max_chars: usize) -> FailedTurnPromptSummary {
         Message::Assistant { content, .. } => (extract_text(content), true),
         Message::System { content } => (content.clone(), false),
     };
-    let (text, truncated) = cap_chars(&text, max_chars);
+    let (text, truncated) = crate::text::cap_chars(&text, max_chars);
     FailedTurnPromptSummary {
         text,
         truncated,
         has_non_text_parts,
-    }
-}
-
-fn cap_chars(text: &str, max_chars: usize) -> (String, bool) {
-    let mut out = String::new();
-    let mut chars = text.chars();
-    for _ in 0..max_chars {
-        let Some(ch) = chars.next() else {
-            return (out, false);
-        };
-        out.push(ch);
-    }
-    if chars.next().is_some() {
-        out.push_str("...");
-        (out, true)
-    } else {
-        (out, false)
-    }
-}
-
-fn failure_retry_decision_and_rationale(
-    class: &str,
-    provider_status: Option<u16>,
-) -> (&'static str, &'static str) {
-    match class {
-        "timeout_ttft" => ("fail_fast", "time_to_first_token_timeout"),
-        "timeout_idle" => ("fail_fast", "stream_idle_timeout"),
-        "network" => (
-            "terminal_after_retry_layer",
-            "transport_or_provider_failure_after_retry_layer",
-        ),
-        "missing_tool_entitlement" | "client_side_tools_unsupported" => {
-            ("fail_fast", "client_side_capability_block")
-        }
-        _ if provider_status.is_some_and(|status| status == 429 || status == 503) => (
-            "terminal_after_retry_layer",
-            "retryable_http_status_terminal",
-        ),
-        _ if provider_status.is_some_and(|status| (500..=599).contains(&status)) => {
-            ("terminal_after_retry_layer", "server_http_status_terminal")
-        }
-        _ if provider_status.is_some_and(|status| (400..=499).contains(&status)) => {
-            ("fail_fast", "non_retryable_http_status")
-        }
-        _ => ("fail_fast", "non_retryable_or_unclassified_failure"),
     }
 }
 
@@ -11607,7 +11554,7 @@ fn redacted_bounded_snippet(
     if trimmed.is_empty() {
         return None;
     }
-    Some(cap_chars(&redact.scrub(trimmed), max_chars).0)
+    crate::text::bounded_snippet(&redact.scrub(trimmed), max_chars)
 }
 
 /// Resolve and build the backup-model fallback for `model`, loading the
@@ -11747,7 +11694,7 @@ fn partial_progress_from_history(history: &[Message]) -> DelegationPartialProgre
                         .get("command")
                         .and_then(serde_json::Value::as_str)
                     {
-                        let command = first_line_capped_ascii(command, 100);
+                        let command = crate::text::first_line_capped(command, 100);
                         commands.push(PartialProgressCommand {
                             verification: is_verification_command(&command),
                             command: command.clone(),
@@ -11880,17 +11827,6 @@ fn render_failed_subagent_report(
         }
     }
     out
-}
-
-fn first_line_capped_ascii(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
-    if line.chars().count() > max {
-        let mut capped: String = line.chars().take(max).collect();
-        capped.push_str("...");
-        capped
-    } else {
-        line.to_string()
-    }
 }
 
 fn is_verification_command(command: &str) -> bool {

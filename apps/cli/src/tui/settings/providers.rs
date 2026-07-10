@@ -44,7 +44,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
-use super::shell::{clamp_to_char_boundary, selected_line_from_marker};
+use super::shell::selected_line_from_marker;
 use super::{Nav, Page, RowDeleteConfirm, SettingsDialog, save_button_line};
 
 /// One selectable action on the Edit-provider menu. The menu is built
@@ -4827,7 +4827,7 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
     ];
     if active {
         let text = field.text();
-        let cursor = clamp_to_char_boundary(text, field.cursor());
+        let cursor = crate::text::floor_char_boundary(text, field.cursor());
         let (before, after) = text.split_at(cursor);
         spans.push(Span::styled(before.to_string(), value_style));
         spans.push(super::shell::cursor_marker_span());

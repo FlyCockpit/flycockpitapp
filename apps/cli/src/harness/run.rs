@@ -34,7 +34,7 @@ use crate::harness::preflight::preflight_with_env;
 use crate::harness::prepare::{agent_file_env, prepare_invocation};
 use crate::harness::spawn::{RunOutcome, run_to_completion};
 use crate::redact::RedactionTable;
-use crate::tools::common::{ceil_char_boundary, floor_char_boundary};
+use crate::text::{ceil_char_boundary, floor_char_boundary};
 
 /// Token cap on the harness output text returned to the calling agent —
 /// the async-result budget (≈8K, below the ≈10K hard cap). Output over this

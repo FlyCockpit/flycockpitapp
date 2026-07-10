@@ -100,8 +100,7 @@ pub fn fs_read(
     }
 
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    let cap =
-        crate::tools::common::floor_char_boundary(&text, FS_TEXT_READ_BYTE_CAP.min(text.len()));
+    let cap = crate::text::floor_char_boundary(&text, FS_TEXT_READ_BYTE_CAP.min(text.len()));
     let truncated = text.len() > cap;
     Ok(Response::FsRead {
         content: Some(text[..cap].to_string()),
@@ -226,7 +225,7 @@ pub fn git_diff_file(project_root: &str, path: &str) -> Result<Response, ErrorPa
     if !outcome.success {
         return Err(bad_request(outcome.stderr.trim().to_string()));
     }
-    let cap = crate::tools::common::floor_char_boundary(
+    let cap = crate::text::floor_char_boundary(
         &outcome.stdout,
         FS_TEXT_READ_BYTE_CAP.min(outcome.stdout.len()),
     );

@@ -135,18 +135,13 @@ pub async fn run_to_completion(
             })
         }
         _ = tokio::time::sleep(timeout) => {
-            // Fan the kill to the whole process group on Unix so a
-            // harness's grandchildren are torn down with it.
-            #[cfg(unix)]
-            {
-                if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
-                    // SAFETY: kill(2) with a negative pid signals the
-                    // process group; harmless if the group is already gone.
-                    unsafe { libc::kill(-pid, libc::SIGKILL); }
-                }
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let child_pid = child.id();
+            crate::process::terminate_group_async(
+                &mut child,
+                child_pid,
+                std::time::Duration::from_millis(200),
+            )
+            .await;
             let stdout = join_string(stdout_task).await;
             let stderr = join_string(stderr_task).await;
             Ok(RunOutcome::TimedOut {

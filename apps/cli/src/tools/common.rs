@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::engine::tool::ToolCtx;
+use crate::text::{ceil_char_boundary, floor_char_boundary};
 
 /// Resolve a path argument the way every file tool does:
 ///   - tilde-expand,
@@ -28,31 +29,6 @@ pub const READ_LINE_CAP: usize = 2000;
 /// the model should issue.
 pub fn truncation_marker(next_offset: usize) -> String {
     format!("... [truncated, ask read with offset {next_offset} to see more]")
-}
-
-/// Largest char boundary `<= index`. Polyfill for nightly-only
-/// `str::floor_char_boundary`; shared by every tool that caps output.
-pub fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while !s.is_char_boundary(i) && i > 0 {
-        i -= 1;
-    }
-    i
-}
-
-/// Smallest char boundary `>= index`.
-pub fn ceil_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while !s.is_char_boundary(i) && i < s.len() {
-        i += 1;
-    }
-    i
 }
 
 /// Cap `s` to `cap` bytes, byte-boundary-safe, keeping a **head and a

@@ -2048,7 +2048,7 @@ fn lsp_edit_row<T: ToString>(
     if p.editing == Some(edit) {
         let selected = idx == p.cursor;
         let text = p.buf.text();
-        let cursor = shell::clamp_to_char_boundary(text, p.buf.cursor());
+        let cursor = crate::text::floor_char_boundary(text, p.buf.cursor());
         let (before, after) = text.split_at(cursor);
         Line::from(vec![
             Span::raw(marker(selected)),

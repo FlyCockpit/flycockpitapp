@@ -1896,7 +1896,6 @@ async fn run_prepared_command(
         Ok(c) => c,
         Err(e) => return RunOutcome::SpawnError(e),
     };
-    #[cfg(unix)]
     let child_pid = child.id();
 
     use tokio::io::AsyncReadExt;
@@ -1921,7 +1920,7 @@ async fn run_prepared_command(
     let status = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => {
-            kill_child(&mut child, #[cfg(unix)] child_pid).await;
+            kill_child(&mut child, child_pid).await;
             stdout_task.abort();
             stderr_task.abort();
             return RunOutcome::Cancelled;
@@ -1930,7 +1929,7 @@ async fn run_prepared_command(
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return RunOutcome::WaitError(e),
             Err(_) => {
-                kill_child(&mut child, #[cfg(unix)] child_pid).await;
+                kill_child(&mut child, child_pid).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 return RunOutcome::TimedOut;
@@ -1952,52 +1951,9 @@ async fn run_prepared_command(
     })
 }
 
-/// Terminate a cancelled `bash` child. On Unix the child was spawned in
-/// its own process group (`process_group(0)`), so we signal the **negated
-/// pgid** to take down the `sh -c` and every descendant it spawned (a test
-/// runner, a `make`, …) — killing only the immediate child would orphan
-/// the real work. We send `SIGTERM` for a graceful stop, give it a brief
-/// grace window, then `SIGKILL` anything still alive. On Windows there is
-/// no process group; `Child::kill` (the immediate child) is the fallback.
-async fn kill_child(child: &mut tokio::process::Child, #[cfg(unix)] pid: Option<u32>) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = pid {
-            // SAFETY: `libc::kill` with a negative pid signals the process
-            // group; passing a valid pgid (== the leader pid, since we set
-            // `process_group(0)`) is sound. Failure (ESRCH — already gone)
-            // is ignored.
-            let pgid = pid as i32;
-            let term_result = unsafe { libc::kill(-pgid, libc::SIGTERM) };
-            if term_result != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                let _ = child.wait().await;
-                return;
-            }
-            // Give the leader a brief chance to exit cleanly. If it does,
-            // skip SIGKILL and return promptly; otherwise force the group.
-            tokio::select! {
-                _ = child.wait() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
-                    }
-                }
-            }
-        } else {
-            // No pid (already reaped) — fall back to the immediate child.
-            let _ = child.kill().await;
-        }
-        // Reap the leader so it doesn't linger as a zombie.
-        let _ = child.wait().await;
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: no process groups. Kill the immediate child and reap.
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
+/// Terminate a cancelled `bash` child.
+async fn kill_child(child: &mut tokio::process::Child, pid: Option<u32>) {
+    crate::process::terminate_group_async(child, pid, std::time::Duration::from_millis(200)).await;
 }
 
 fn format_combined(stdout: &str, stderr: &str, exit: i32, signaled: bool) -> String {

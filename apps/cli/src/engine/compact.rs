@@ -217,7 +217,7 @@ pub fn build_appendix(
             "bash" => {
                 if let Some(cmd) = call.wire_input_json.get("command").and_then(Value::as_str) {
                     commands.push(CommandRun {
-                        command: first_line_capped(cmd, 100),
+                        command: crate::text::first_line_capped(cmd, 100),
                         failed: call.hard_fail,
                     });
                 }
@@ -386,16 +386,6 @@ pub(crate) fn hash_from_output(output: &str) -> Option<String> {
         None
     } else {
         Some(rest[..end].to_string())
-    }
-}
-
-fn first_line_capped(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
-    if line.chars().count() > max {
-        let t: String = line.chars().take(max).collect();
-        format!("{t}…")
-    } else {
-        line.to_string()
     }
 }
 

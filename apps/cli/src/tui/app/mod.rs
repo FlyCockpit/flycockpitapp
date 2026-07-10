@@ -11952,17 +11952,7 @@ fn run_capture(command: std::process::Command) -> (String, bool) {
 }
 
 fn kill_capture_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pgid = child.id() as libc::pid_t;
-        if pgid > 0 {
-            let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-            if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                return;
-            }
-        }
-    }
-    let _ = child.kill();
+    crate::process::terminate_group_sync(child, std::time::Duration::from_millis(200));
 }
 
 fn run_capture_with_options(

@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/cli", "crates/relay-protocol"]
+members = ["apps/cli", "apps/relay-rs", "crates/relay-protocol"]
 resolver = "3"
 
 [workspace.dependencies]

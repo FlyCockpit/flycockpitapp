@@ -10099,11 +10099,11 @@ impl App {
     /// Translate an absolute mouse position into a `(line, col)` in
     /// the composer's text buffer, or `None` if the click landed
     /// outside the input area. The inner-rect calculation mirrors
-    /// the render path: a 1-cell border on left/right, and a 1-cell
-    /// border on top *unless* the queue strip is above, in which
-    /// case its bottom row is our top border (no top border of our
-    /// own). Continuation lines render with `prefix_width` spaces
-    /// of indent so the click-to-col math is uniform across lines.
+    /// the render path: a 1-cell border on every side. When the queue
+    /// strip is above, the input top border is overlapped by the queue
+    /// bottom border but still occupies the input rect's first row.
+    /// Continuation lines render with `prefix_width` spaces of indent
+    /// so the click-to-col math is uniform across lines.
     pub(super) fn composer_cursor_target_for_click(
         &self,
         outer: Rect,
@@ -10115,8 +10115,7 @@ impl App {
         if mouse.column < outer.x || mouse.column >= outer.x + outer.width {
             return None;
         }
-        let queue_above = !self.queue.is_empty();
-        let top_border: u16 = if queue_above { 0 } else { 1 };
+        let top_border: u16 = 1;
         let bottom_border: u16 = 1;
         let inner_top = outer.y.saturating_add(top_border);
         let inner_bottom = outer.y + outer.height.saturating_sub(bottom_border);

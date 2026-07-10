@@ -23,8 +23,9 @@ pub struct PaneGeometry {
     /// when shown.
     pub indicator: u16,
     /// Queued-messages strip above the input. Zero when nothing is
-    /// queued. Includes its top border AND its shared bottom border
-    /// (the row that visually doubles as the input's top edge).
+    /// queued. Includes its top border and its bottom border. When the
+    /// input is present, the queue's last row overlaps the input's top
+    /// border row.
     pub queue: u16,
     /// Slash-popup / vim-hint height. Zero when there's no slash query
     /// or a dialog is open.
@@ -139,16 +140,11 @@ impl PaneGeometry {
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
             }
         } else {
-            // Queue (when present) owns its top border, N message
-            // rows, and a shared bottom row that doubles as the
-            // input's top edge. So input drops its own top border
-            // when the queue is up — net: one fewer row goes to
-            // input.
-            let input = if queue_height > 0 {
-                input_height.saturating_sub(1)
-            } else {
-                input_height
-            };
+            // Queue and input are both full bordered rects. When the
+            // queue is present, its bottom border overlaps the input's
+            // top border; aggregate height accounting subtracts that
+            // overlap instead of shrinking either rect.
+            let input = input_height;
             // The pins indicator + sandbox-down notice only take rows when
             // nothing else owns the below-input slot (no slash/at popup
             // competing). The persistent sandbox notice (§6.5) sits below the
@@ -185,13 +181,17 @@ impl PaneGeometry {
             self.history
                 + self.indicator
                 + self.queue
-                + self.input
+                + self.input.saturating_sub(self.queue_input_overlap())
                 + self.popup
                 + self.pins
                 + self.sandbox_notice
                 + self.compact
                 + self.status
         }
+    }
+
+    fn queue_input_overlap(&self) -> u16 {
+        u16::from(self.queue > 0 && self.input > 0)
     }
 
     /// Sum of every section above `body`. Used by `maybe_spill_history` to
@@ -204,7 +204,7 @@ impl PaneGeometry {
         } else {
             self.indicator
                 + self.queue
-                + self.input
+                + self.input.saturating_sub(self.queue_input_overlap())
                 + self.popup
                 + self.pins
                 + self.sandbox_notice
@@ -230,11 +230,13 @@ impl PaneGeometry {
                 status: parts[1],
             }
         } else {
+            let queue_input_overlap = self.queue_input_overlap();
+            let input_slot = self.input.saturating_sub(queue_input_overlap);
             let parts = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(self.indicator),
                 Constraint::Length(self.queue),
-                Constraint::Length(self.input),
+                Constraint::Length(input_slot),
                 Constraint::Length(self.popup),
                 Constraint::Length(self.pins),
                 Constraint::Length(self.sandbox_notice),
@@ -242,11 +244,21 @@ impl PaneGeometry {
                 Constraint::Length(self.status),
             ])
             .split(area);
+            let input = if queue_input_overlap > 0 {
+                Rect::new(
+                    parts[3].x,
+                    parts[3].y.saturating_sub(queue_input_overlap),
+                    parts[3].width,
+                    self.input,
+                )
+            } else {
+                parts[3]
+            };
             PaneRects {
                 body: parts[0],
                 indicator: parts[1],
                 queue: parts[2],
-                input: parts[3],
+                input,
                 popup: parts[4],
                 pins: parts[5],
                 sandbox_notice: parts[6],
@@ -254,5 +266,24 @@ impl PaneGeometry {
                 status: parts[8],
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_and_input_rects_overlap_on_one_border_row() {
+        let geom = PaneGeometry::compute(3, 0, 3, 0, 0, 0, 1, 0, 0);
+
+        assert_eq!(geom.input, 3);
+        assert_eq!(geom.queue, 3);
+        assert_eq!(geom.chrome_height(), 6);
+
+        let rects = geom.layout(Rect::new(0, 0, 20, 8));
+        assert_eq!(rects.queue.y + rects.queue.height - 1, rects.input.y);
+        assert_eq!(rects.input.height, 3);
+        assert_eq!(rects.status.y, 7);
     }
 }

@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::{border, merge::MergeStrategy};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -615,9 +616,8 @@ impl App {
 
     /// Height of the queued-messages strip above the input box. Zero
     /// when nothing's queued; otherwise top border (1) + N messages +
-    /// shared bottom (1). The shared bottom is the queue's bottom AND
-    /// the input's top, with T-joins where the inset side rails meet
-    /// the input's wider top edge.
+    /// bottom border (1). Geometry overlaps that bottom border with
+    /// the input's top border.
     pub(super) fn queue_lines(&self) -> u16 {
         if self.queue.is_empty() {
             0
@@ -1026,10 +1026,10 @@ impl App {
             if geom.indicator > 0 {
                 self.render_status_indicator(frame, rects.indicator);
             }
+            let cursor_pos = self.render_input(frame, rects.input);
             if geom.queue > 0 {
                 self.render_queue(frame, rects.queue);
             }
-            let cursor_pos = self.render_input(frame, rects.input, geom.queue > 0);
             if geom.popup > 0 {
                 self.render_popup(frame, rects.popup);
             }
@@ -1177,14 +1177,50 @@ impl App {
         }
     }
 
+    const CONNECTED_INPUT_STRIP_BORDER_SET: border::Set<'static> = border::Set {
+        top_left: "╭",
+        top_right: "╮",
+        bottom_left: "└",
+        bottom_right: "┘",
+        vertical_left: "│",
+        vertical_right: "│",
+        horizontal_top: "─",
+        horizontal_bottom: "─",
+    };
+
+    /// Render a strip whose bottom border merges into the prompt input's
+    /// top border. This is the reusable connected-box chrome for
+    /// `tui-suggestion-box-above-input`; callers render the input block
+    /// first, then this strip, so ratatui can collapse the overlap.
+    fn render_connected_input_top_strip(
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        border_color: Color,
+    ) -> Option<Rect> {
+        if area.height < 2 || area.width < 5 {
+            return None;
+        }
+        let strip = Rect::new(area.x + 1, area.y, area.width - 2, area.height);
+        let content = Rect::new(
+            strip.x + 1,
+            strip.y + 1,
+            strip.width.saturating_sub(2),
+            strip.height.saturating_sub(2),
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(Self::CONNECTED_INPUT_STRIP_BORDER_SET)
+            .border_style(Style::default().fg(border_color))
+            .merge_borders(MergeStrategy::Exact);
+        frame.render_widget(block, strip);
+        Some(content)
+    }
+
     /// Queued-messages box. Inset one column from each side of the
-    /// input box; rounded top corners (`╭ ╮`); white border throughout;
-    /// shared bottom row with the input box rendered as `╭┴────┴╮`
-    /// (input's rounded top corners with `┴` T-joins where the queue's
-    /// inset side rails terminate). The shared row counts as the
-    /// queue's bottom border AND the input's top border.
+    /// input box, with a bottom border that overlaps the input's top
+    /// border and relies on ratatui border merging for the junctions.
     pub(super) fn render_queue(&self, frame: &mut ratatui::Frame, area: Rect) {
-        if area.height < 2 || area.width < 5 || self.queue.is_empty() {
+        if self.queue.is_empty() {
             return;
         }
         // Border tracks the input box: visibly-grey for the whole span
@@ -1193,26 +1229,15 @@ impl App {
         // the queue strip, so it reuses the same helper with
         // `shell_mode = false`.
         let border_color = Self::input_border_color(self.busy, false);
+        let Some(content_area) = Self::render_connected_input_top_strip(frame, area, border_color)
+        else {
+            return;
+        };
         let queue_text_style = Style::default().fg(MUTED_TEXT);
         let non_foreground_style = queue_text_style.add_modifier(Modifier::DIM);
-        let outer_w = area.width as usize;
-        // Queue is inset 1 col on each side; inside the inset, 1 col
-        // is the rail and 1 col is padding before/after the text.
-        let inset = 1usize;
-        let queue_w = outer_w.saturating_sub(inset * 2);
-        let inner_w = queue_w.saturating_sub(4); // 1 rail + 1 pad on each side
-        let inner_w = inner_w.max(1);
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+        let inner_w = content_area.width.saturating_sub(2).max(1) as usize;
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.queue.len());
 
-        // Top row: `  ╭─────────╮  ` — rounded corners, inset.
-        let top_bar = "─".repeat(queue_w.saturating_sub(2));
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(inset)),
-            Span::styled(format!("╭{top_bar}╮"), Style::default().fg(border_color)),
-            Span::raw(" ".repeat(inset)),
-        ]));
-
-        // Content rows: `  │ message │  `.
         for msg in &self.queue {
             let non_foreground = self
                 .foreground_input_target
@@ -1237,47 +1262,15 @@ impl App {
             };
             let annotation_w = display_width(&annotation);
             let trailing = inner_w.saturating_sub(body_w + annotation_w);
-            let mut spans = vec![
-                Span::raw(" ".repeat(inset)),
-                Span::styled("│", Style::default().fg(border_color)),
-                Span::raw(" "),
-                Span::styled(body, style),
-            ];
+            let mut spans = vec![Span::raw(" "), Span::styled(body, style)];
             if !annotation.is_empty() {
                 spans.push(Span::styled(annotation, style));
             }
-            spans.extend([
-                Span::raw(" ".repeat(trailing)),
-                Span::raw(" "),
-                Span::styled("│", Style::default().fg(border_color)),
-                Span::raw(" ".repeat(inset)),
-            ]);
+            spans.extend([Span::raw(" ".repeat(trailing)), Span::raw(" ")]);
             lines.push(Line::from(spans));
         }
 
-        // Shared bottom row: `╭┴────────┴╮`. Spans the full input
-        // width — `╭` and `╮` at the corners (these are the input's
-        // rounded top), and `┴` where the queue's inset side rails
-        // terminate. The horizontal fills between use `─`.
-        let mut shared: String = String::with_capacity(outer_w * 3);
-        for col in 0..outer_w {
-            let ch = if col == 0 {
-                '╭'
-            } else if col == outer_w - 1 {
-                '╮'
-            } else if col == inset || col == outer_w - 1 - inset {
-                '┴'
-            } else {
-                '─'
-            };
-            shared.push(ch);
-        }
-        lines.push(Line::from(vec![Span::styled(
-            shared,
-            Style::default().fg(border_color),
-        )]));
-
-        frame.render_widget(Paragraph::new(lines), area);
+        frame.render_widget(Paragraph::new(lines), content_area);
     }
 
     /// Build the launch-banner box lines for the current pane, or an
@@ -1800,22 +1793,10 @@ impl App {
         Some(format!("History: {current}/{total}"))
     }
 
-    pub(super) fn render_input(
-        &mut self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-        queue_above: bool,
-    ) -> Position {
+    pub(super) fn render_input(&mut self, frame: &mut ratatui::Frame, area: Rect) -> Position {
         // Stash for the mouse handler so a click can route to
         // click-to-position-cursor (plan.md T8.d).
         self.input_area = Some(area);
-        // When the queue strip is above, its shared bottom row IS our
-        // top border — render only sides + bottom here.
-        let borders = if queue_above {
-            Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
-        } else {
-            Borders::ALL
-        };
         // Visibly-grey border for the whole span the agent is busy;
         // white when idle. Gated on `busy` (not `pending.is_some()`) so
         // it stays dim across reasoning, streaming, AND tool execution —
@@ -1830,26 +1811,24 @@ impl App {
         let shell_mode = self.composer.text().starts_with('!');
         let border_color = Self::input_border_color(self.busy, shell_mode);
         let mut input_block = Block::default()
-            .borders(borders)
+            .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
-        if !queue_above {
-            if let Some(label) = self.history_position_label() {
-                input_block = input_block.title(Line::from(Span::styled(
-                    format!(" {label} "),
-                    Style::default()
-                        .fg(Color::Indexed(255))
-                        .add_modifier(Modifier::BOLD),
-                )));
-            } else if shell_mode {
-                input_block = input_block.title(Line::from(Span::styled(
-                    " shell mode ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(SHELL_MODE_BADGE_BG)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
+        if let Some(label) = self.history_position_label() {
+            input_block = input_block.title(Line::from(Span::styled(
+                format!(" {label} "),
+                Style::default()
+                    .fg(Color::Indexed(255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if shell_mode {
+            input_block = input_block.title(Line::from(Span::styled(
+                " shell mode ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(SHELL_MODE_BADGE_BG)
+                    .add_modifier(Modifier::BOLD),
+            )));
         }
         let input_inner = input_block.inner(area);
 
@@ -5113,7 +5092,7 @@ mod prediction_ghost_context_indicator_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                app.render_input(f, Rect::new(0, 0, width, 3), false);
+                app.render_input(f, Rect::new(0, 0, width, 3));
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -5125,7 +5104,7 @@ mod prediction_ghost_context_indicator_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                app.render_input(f, Rect::new(0, 0, width, 3), false);
+                app.render_input(f, Rect::new(0, 0, width, 3));
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -5137,17 +5116,18 @@ mod prediction_ghost_context_indicator_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                app.render_input(f, Rect::new(0, 0, width, height), false);
+                app.render_input(f, Rect::new(0, 0, width, height));
             })
             .unwrap();
         terminal.backend().buffer().clone()
     }
 
     fn render_queue_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
+        let backend = TestBackend::new(width, height + 2);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
+                app.render_input(f, Rect::new(0, height - 1, width, 3));
                 app.render_queue(f, Rect::new(0, 0, width, height));
             })
             .unwrap();
@@ -5167,6 +5147,22 @@ mod prediction_ghost_context_indicator_tests {
             text: text.to_string(),
             target,
         }
+    }
+
+    #[test]
+    fn queue_connected_chrome_merges_with_input_top_border() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.queue
+            .push(queued_item("queued text", QueueTarget::root("Build")));
+
+        let width = 32;
+        let buf = render_queue_buffer(&mut app, width, 3);
+        let top = row_text(&buf, 0, width);
+        let bottom = row_text(&buf, 2, width);
+
+        assert_eq!(top, format!(" ╭{}╮ ", "─".repeat(width as usize - 4)));
+        assert_eq!(bottom, format!("╭┴{}┴╮", "─".repeat(width as usize - 4)));
     }
 
     #[test]

@@ -264,7 +264,9 @@ pub(super) fn build_model(
     redact: Arc<RedactionTable>,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Model> {
-    let is_codex_oauth = models_fetch::is_codex_oauth_provider(provider_id, entry);
+    let registry = crate::providers::ProviderRegistry::standard();
+    let is_codex_oauth =
+        registry.provider_for(provider_id, entry).id() == crate::auth::codex_oauth::CREDENTIAL_KEY;
     if is_codex_oauth && provider_id.eq_ignore_ascii_case("openai-compatible") {
         anyhow::bail!(
             "Codex OAuth cannot be used through the generic `openai-compatible` provider; remove the stale provider entry and select `codex-oauth` in /settings -> Providers."

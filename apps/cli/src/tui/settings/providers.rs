@@ -37,7 +37,7 @@ use crate::config::providers::{
     redact_model_fetch_reason,
 };
 use crate::envref;
-use crate::providers::models_fetch::{self, FetchOutcome};
+use crate::providers::models_fetch::FetchOutcome;
 use crate::providers::{self as templates, ProviderTemplate};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -55,7 +55,7 @@ use super::{Nav, Page, RowDeleteConfirm, SettingsDialog, save_button_line};
 enum EditAction {
     Url,
     Headers,
-    /// Only present for Copilot providers (see [`is_github_copilot_provider`]).
+    /// Only present for Copilot providers.
     CopilotAuth,
     /// Present for xAI SuperGrok OAuth providers.
     GrokOAuthAuth,
@@ -76,14 +76,13 @@ enum EditAction {
 /// and the handler dispatches on the action, never a literal index.
 fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec<EditAction> {
     let mut actions = vec![EditAction::Url, EditAction::Headers];
-    if models_fetch::is_github_copilot_provider(provider_id, entry) {
-        actions.push(EditAction::CopilotAuth);
-    }
-    if models_fetch::is_xai_oauth_provider(provider_id, entry) {
-        actions.push(EditAction::GrokOAuthAuth);
-    }
-    if models_fetch::is_codex_oauth_provider(provider_id, entry) {
-        actions.push(EditAction::CodexOAuthAuth);
+    let registry = templates::ProviderRegistry::standard();
+    let provider = registry.provider_for(provider_id, entry);
+    match provider.id() {
+        "copilot" => actions.push(EditAction::CopilotAuth),
+        crate::auth::xai_oauth::CREDENTIAL_KEY => actions.push(EditAction::GrokOAuthAuth),
+        crate::auth::codex_oauth::CREDENTIAL_KEY => actions.push(EditAction::CodexOAuthAuth),
+        _ => {}
     }
     actions.extend([
         EditAction::Models,

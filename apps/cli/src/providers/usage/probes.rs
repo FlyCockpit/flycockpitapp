@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -8,6 +7,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 
 use crate::config::providers::{ProviderEntry, ProvidersConfig};
+use crate::providers::ProviderRegistry;
 use crate::providers::models_fetch;
 
 use super::{ProviderUsageSnapshot, UsageAvailability, UsageWindow};
@@ -18,56 +18,21 @@ const GROK_USAGE_REASON: &str = "xAI does not expose a subscription usage API. S
 
 #[async_trait]
 pub trait ProviderUsageProbe: Send + Sync {
-    fn provider_ids(&self) -> &'static [&'static str];
-
     async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot;
-}
-
-#[derive(Clone)]
-pub struct ProbeRegistry {
-    probes: Vec<Arc<dyn ProviderUsageProbe>>,
-}
-
-impl ProbeRegistry {
-    pub fn new(probes: Vec<Arc<dyn ProviderUsageProbe>>) -> Self {
-        Self { probes }
-    }
-
-    pub fn standard() -> Self {
-        Self::new(vec![
-            Arc::new(CodexOAuthUsageProbe),
-            Arc::new(GrokOAuthUsageProbe),
-        ])
-    }
-
-    pub async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
-        if let Some(probe) = self.probe_for(provider_id) {
-            return probe.fetch(provider_id, entry).await;
-        }
-        unsupported_snapshot(provider_id, entry)
-    }
-
-    fn probe_for(&self, provider_id: &str) -> Option<&Arc<dyn ProviderUsageProbe>> {
-        self.probes.iter().find(|probe| {
-            probe
-                .provider_ids()
-                .iter()
-                .any(|id| id.eq_ignore_ascii_case(provider_id))
-        })
-    }
 }
 
 pub async fn fetch_all_provider_usage(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
-    fetch_all_provider_usage_with_registry(config, provider_filter, ProbeRegistry::standard()).await
+    fetch_all_provider_usage_with_registry(config, provider_filter, ProviderRegistry::standard())
+        .await
 }
 
 pub async fn fetch_all_provider_usage_with_registry(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
-    registry: ProbeRegistry,
+    registry: ProviderRegistry,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
     let providers: Vec<(String, ProviderEntry)> = if let Some(filter) = provider_filter {
         let Some((id, entry)) = config.providers.get_key_value(filter) else {
@@ -97,8 +62,14 @@ pub async fn fetch_all_provider_usage_with_registry(
     for (provider_id, entry) in providers {
         let registry = registry.clone();
         pending.push(async move {
-            match tokio::time::timeout(DEFAULT_TIMEOUT, registry.fetch(&provider_id, &entry)).await
-            {
+            let usage = async {
+                if let Some(probe) = registry.provider_for(&provider_id, &entry).usage_probe() {
+                    probe.fetch(&provider_id, &entry).await
+                } else {
+                    unsupported_snapshot(&provider_id, &entry)
+                }
+            };
+            match tokio::time::timeout(DEFAULT_TIMEOUT, usage).await {
                 Ok(snapshot) => snapshot,
                 Err(_) => error_snapshot(&provider_id, &entry, "usage probe timed out after 10s"),
             }
@@ -117,10 +88,6 @@ pub struct CodexOAuthUsageProbe;
 
 #[async_trait]
 impl ProviderUsageProbe for CodexOAuthUsageProbe {
-    fn provider_ids(&self) -> &'static [&'static str] {
-        &["codex-oauth"]
-    }
-
     async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
         match fetch_codex_usage(provider_id, entry).await {
             Ok((plan, windows, details)) => fetched_snapshot(
@@ -284,10 +251,6 @@ pub struct GrokOAuthUsageProbe;
 
 #[async_trait]
 impl ProviderUsageProbe for GrokOAuthUsageProbe {
-    fn provider_ids(&self) -> &'static [&'static str] {
-        &["grok-oauth"]
-    }
-
     async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
         ProviderUsageSnapshot {
             provider_id: provider_id.to_string(),
@@ -361,7 +324,9 @@ fn display_name(provider_id: &str, entry: &ProviderEntry) -> String {
 mod tests {
     use super::*;
     use crate::config::providers::ProvidersConfig;
+    use crate::providers::registry::Provider;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestUsageResponse {
@@ -534,26 +499,45 @@ mod tests {
 
     #[tokio::test]
     async fn default_unknown_provider_is_unsupported() {
-        let registry = ProbeRegistry::new(Vec::new());
-        let snap = registry.fetch("anthropic", &entry("Anthropic")).await;
+        let registry = ProviderRegistry::new(Vec::new());
+        let entry = entry("Anthropic");
+        let snap = if let Some(probe) = registry.provider_for("anthropic", &entry).usage_probe() {
+            probe.fetch("anthropic", &entry).await
+        } else {
+            unsupported_snapshot("anthropic", &entry)
+        };
         assert!(matches!(
             snap.availability,
             UsageAvailability::Unsupported { .. }
         ));
     }
 
+    struct CountingProvider {
+        id: &'static str,
+        probe: CountingProbe,
+    }
+
+    impl Provider for CountingProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn matches(&self, provider_id: &str, _entry: &ProviderEntry) -> bool {
+            provider_id == self.id
+        }
+
+        fn usage_probe(&self) -> Option<&dyn ProviderUsageProbe> {
+            Some(&self.probe)
+        }
+    }
+
     struct CountingProbe {
-        ids: &'static [&'static str],
         label: &'static str,
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
     impl ProviderUsageProbe for CountingProbe {
-        fn provider_ids(&self) -> &'static [&'static str] {
-            self.ids
-        }
-
         async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
             self.calls.fetch_add(1, Ordering::SeqCst);
             fetched_snapshot(provider_id, entry, self.label, None, Vec::new(), Vec::new())
@@ -561,41 +545,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_first_matching_probe_wins() {
-        let first = Arc::new(AtomicUsize::new(0));
-        let second = Arc::new(AtomicUsize::new(0));
-        let registry = ProbeRegistry::new(vec![
-            Arc::new(CountingProbe {
-                ids: &["p"],
-                label: "first",
-                calls: first.clone(),
-            }),
-            Arc::new(CountingProbe {
-                ids: &["p"],
-                label: "second",
-                calls: second.clone(),
-            }),
-        ]);
-        let snap = registry.fetch("p", &entry("P")).await;
+    async fn registry_matching_provider_exposes_usage_probe() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = ProviderRegistry::new(vec![Arc::new(CountingProvider {
+            id: "p",
+            probe: CountingProbe {
+                label: "usage",
+                calls: calls.clone(),
+            },
+        })]);
+        let entry = entry("P");
+        let snap = registry
+            .provider_for("p", &entry)
+            .usage_probe()
+            .unwrap()
+            .fetch("p", &entry)
+            .await;
         assert!(matches!(
             snap.availability,
             UsageAvailability::Fetched {
-                source: "first",
+                source: "usage",
                 ..
             }
         ));
-        assert_eq!(first.load(Ordering::SeqCst), 1);
-        assert_eq!(second.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    struct SlowProbe;
+    struct SlowProvider;
 
-    #[async_trait]
-    impl ProviderUsageProbe for SlowProbe {
-        fn provider_ids(&self) -> &'static [&'static str] {
-            &["slow"]
+    impl Provider for SlowProvider {
+        fn id(&self) -> &'static str {
+            "slow"
         }
 
+        fn matches(&self, provider_id: &str, _entry: &ProviderEntry) -> bool {
+            provider_id == "slow"
+        }
+
+        fn usage_probe(&self) -> Option<&dyn ProviderUsageProbe> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl ProviderUsageProbe for SlowProvider {
         async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
             tokio::time::sleep(Duration::from_secs(11)).await;
             unsupported_snapshot(provider_id, entry)
@@ -611,7 +604,7 @@ mod tests {
             providers,
             ..ProvidersConfig::default()
         };
-        let registry = ProbeRegistry::new(vec![Arc::new(SlowProbe)]);
+        let registry = ProviderRegistry::new(vec![Arc::new(SlowProvider)]);
         let rows = fetch_all_provider_usage_with_registry(&cfg, None, registry)
             .await
             .unwrap();

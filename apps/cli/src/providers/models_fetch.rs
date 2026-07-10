@@ -23,11 +23,14 @@ use reqwest::{StatusCode, Url};
 use serde_json::{Map, Value};
 
 use crate::config::providers::{
-    AuthKind, CapabilitySource, CapabilityStatus, CapabilityValue, ClientSideToolsCapability,
-    HeaderSpec, ModelCapabilities, ModelEntry, ProviderEntry, ProviderModelCatalog,
-    ReasoningEffortCapability, ReasoningEffortRequestMapping, ThinkingMode,
+    CapabilitySource, CapabilityStatus, CapabilityValue, ClientSideToolsCapability, HeaderSpec,
+    ModelCapabilities, ModelEntry, ProviderEntry, ProviderModelCatalog, ReasoningEffortCapability,
+    ReasoningEffortRequestMapping, ThinkingMode,
 };
 use crate::envref;
+use crate::providers::registry::{
+    OAuthCredential, ProviderCredentialKind, ProviderRegistry, ProviderRequestKind,
+};
 
 const COPILOT_TOKEN_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 const COPILOT_DIRECT_API_TOKEN_ENV: &str = "GITHUB_COPILOT_API_TOKEN";
@@ -36,7 +39,7 @@ const ERROR_BODY_SNIPPET_CHARS: usize = 256;
 const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_MODEL_LIST_CLIENT_VERSION: &str = "0.0.0";
 
-fn codex_model_list_client_version() -> &'static str {
+pub(crate) fn codex_model_list_client_version() -> &'static str {
     // This value is the Codex backend model-list compatibility contract,
     // not Cockpit's package version. Current Codex source resolves the
     // model-list client version to 0.0.0.
@@ -111,13 +114,12 @@ pub fn resolve_provider_request(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
-    if is_codex_oauth_provider(provider_id, entry) {
-        anyhow::bail!("Codex subscription auth required — set up OAuth in /settings → Providers.");
+    let registry = ProviderRegistry::standard();
+    let provider = registry.provider_for(provider_id, entry);
+    if let Some(message) = provider.sync_auth_error() {
+        anyhow::bail!(message);
     }
-    if is_xai_oauth_provider(provider_id, entry) {
-        anyhow::bail!("Grok subscription auth required — set up OAuth in /settings → Providers.");
-    }
-    resolve_provider_request_inner(provider_id, entry, None, |name| std::env::var(name).ok())
+    provider.request(provider_id, entry, None, &|name| std::env::var(name).ok())
 }
 
 pub fn resolve_provider_request_with_env<F>(
@@ -128,38 +130,34 @@ pub fn resolve_provider_request_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if is_codex_oauth_provider(provider_id, entry) {
-        anyhow::bail!("Codex subscription auth required — set up OAuth in /settings → Providers.");
+    let registry = ProviderRegistry::standard();
+    let provider = registry.provider_for(provider_id, entry);
+    if let Some(message) = provider.sync_auth_error() {
+        anyhow::bail!(message);
     }
-    if is_xai_oauth_provider(provider_id, entry) {
-        anyhow::bail!("Grok subscription auth required — set up OAuth in /settings → Providers.");
-    }
-    resolve_provider_request_inner(provider_id, entry, None, lookup)
+    provider.request(provider_id, entry, None, &lookup)
 }
 
 pub async fn resolve_provider_request_async(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
-    if is_codex_oauth_provider(provider_id, entry) {
-        let credential = crate::auth::codex_oauth::credential().await?;
-        resolve_provider_request_inner(
-            provider_id,
-            entry,
-            Some(OAuthCredential::Codex(credential)),
-            |name| std::env::var(name).ok(),
-        )
-    } else if is_xai_oauth_provider(provider_id, entry) {
-        let token = crate::auth::xai_oauth::bearer_token().await?;
-        resolve_provider_request_inner(
-            provider_id,
-            entry,
-            Some(OAuthCredential::Bearer(token)),
-            |name| std::env::var(name).ok(),
-        )
-    } else {
-        resolve_provider_request_inner(provider_id, entry, None, |name| std::env::var(name).ok())
-    }
+    let registry = ProviderRegistry::standard();
+    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
+    let credential = match credential_kind {
+        Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
+            crate::auth::codex_oauth::credential().await?,
+        )),
+        Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
+            crate::auth::xai_oauth::bearer_token().await?,
+        )),
+        None => None,
+    };
+    registry
+        .provider_for(provider_id, entry)
+        .request(provider_id, entry, credential, &|name| {
+            std::env::var(name).ok()
+        })
 }
 
 async fn resolve_model_list_request_async(
@@ -167,25 +165,38 @@ async fn resolve_model_list_request_async(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
 ) -> Result<ResolvedRequest> {
-    if !is_codex_oauth_provider(provider_id, entry) {
-        return Ok(resolved.clone());
-    }
-
-    let credential = crate::auth::codex_oauth::credential().await?;
-    resolve_codex_model_list_request(provider_id, entry, credential, |name| {
-        std::env::var(name).ok()
-    })
+    let registry = ProviderRegistry::standard();
+    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
+    let credential = match credential_kind {
+        Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
+            crate::auth::codex_oauth::credential().await?,
+        )),
+        Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
+            crate::auth::xai_oauth::bearer_token().await?,
+        )),
+        None => None,
+    };
+    registry
+        .provider_for(provider_id, entry)
+        .model_list_request(provider_id, entry, resolved, credential, &|name| {
+            std::env::var(name).ok()
+        })
 }
 
 pub fn resolve_provider_request_blocking(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
-    if !is_xai_oauth_provider(provider_id, entry) && !is_codex_oauth_provider(provider_id, entry) {
+    let registry = ProviderRegistry::standard();
+    if registry
+        .provider_for(provider_id, entry)
+        .credential_kind()
+        .is_none()
+    {
         return resolve_provider_request(provider_id, entry);
     }
     let handle = tokio::runtime::Handle::try_current()
-        .context("Grok subscription auth requires an async runtime")?;
+        .context("subscription auth requires an async runtime")?;
     tokio::task::block_in_place(|| {
         handle.block_on(resolve_provider_request_async(provider_id, entry))
     })
@@ -199,35 +210,25 @@ pub fn resolve_provider_request_blocking_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if !is_xai_oauth_provider(provider_id, entry) && !is_codex_oauth_provider(provider_id, entry) {
+    let registry = ProviderRegistry::standard();
+    if registry
+        .provider_for(provider_id, entry)
+        .credential_kind()
+        .is_none()
+    {
         return resolve_provider_request_with_env(provider_id, entry, lookup);
     }
     resolve_provider_request_blocking(provider_id, entry)
 }
 
-pub fn is_xai_oauth_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
-    provider_id.eq_ignore_ascii_case(crate::auth::xai_oauth::CREDENTIAL_KEY)
-        || entry.credential_ref.as_deref() == Some(crate::auth::xai_oauth::CREDENTIAL_KEY)
-        || (matches!(entry.auth, Some(AuthKind::OAuth)) && entry.url.contains("api.x.ai"))
-}
-
-pub fn is_codex_oauth_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
-    provider_id.eq_ignore_ascii_case(crate::auth::codex_oauth::CREDENTIAL_KEY)
-        || entry.credential_ref.as_deref() == Some(crate::auth::codex_oauth::CREDENTIAL_KEY)
-        || (matches!(entry.auth, Some(AuthKind::OAuth))
-            && entry
-                .url
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(crate::auth::codex_oauth::DEFAULT_BASE_URL))
-}
-
-fn resolve_provider_request_inner(
+pub(crate) fn resolve_provider_request_inner(
     provider_id: &str,
     entry: &ProviderEntry,
     oauth_credential: Option<OAuthCredential>,
-    lookup: impl Fn(&str) -> Option<String>,
+    request_kind: ProviderRequestKind,
+    lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
-    let is_copilot = is_github_copilot_provider(provider_id, entry);
+    let is_copilot = request_kind == ProviderRequestKind::Copilot;
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(entry.headers.len() + 1);
     let mut missing_other: Vec<String> = Vec::new();
     let mut errors_other: Vec<String> = Vec::new();
@@ -236,7 +237,7 @@ fn resolve_provider_request_inner(
     let mut auth_errors: Vec<String> = Vec::new();
 
     for h in &entry.headers {
-        let resolved = envref::resolve_with(&h.value, &lookup);
+        let resolved = envref::resolve_with(&h.value, lookup);
         if h.name.eq_ignore_ascii_case("authorization") {
             if resolved.has_errors() {
                 push_missing(&mut auth_errors, &resolved.errors);
@@ -313,7 +314,7 @@ fn resolve_provider_request_inner(
     } else if let Some(auth) = auth_header {
         headers.push(auth);
     } else if is_copilot {
-        match resolve_copilot_token_with_env(&lookup)? {
+        match resolve_copilot_token_with_env(lookup)? {
             Some(token) => headers.push(ResolvedHeader {
                 name: "Authorization".to_string(),
                 value: format!("Bearer {token}"),
@@ -347,16 +348,16 @@ fn resolve_provider_request_inner(
     // 401 from `fetch_models`.
 
     Ok(ResolvedRequest {
-        base_url: resolve_provider_base_url_with_env(provider_id, entry, &lookup)?,
+        base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, lookup)?,
         headers,
     })
 }
 
-fn resolve_codex_model_list_request(
+pub(crate) fn resolve_codex_model_list_request(
     provider_id: &str,
     entry: &ProviderEntry,
     tokens: crate::auth::codex_oauth::StoredTokens,
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(2);
 
@@ -375,23 +376,9 @@ fn resolve_codex_model_list_request(
     });
 
     Ok(ResolvedRequest {
-        base_url: resolve_provider_base_url_with_env(provider_id, entry, &lookup)?,
+        base_url: resolve_provider_base_url_with_env(provider_id, entry, false, lookup)?,
         headers,
     })
-}
-
-enum OAuthCredential {
-    Bearer(String),
-    Codex(crate::auth::codex_oauth::StoredTokens),
-}
-
-impl OAuthCredential {
-    fn access_token(&self) -> &str {
-        match self {
-            OAuthCredential::Bearer(token) => token,
-            OAuthCredential::Codex(tokens) => &tokens.access_token,
-        }
-    }
 }
 
 /// Outcome of [`fetch_models`].
@@ -423,26 +410,9 @@ pub async fn fetch_models(
 }
 
 fn models_url_for_provider(provider_id: &str, entry: &ProviderEntry, base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if is_codex_oauth_provider(provider_id, entry) {
-        let mut url = Url::parse(&format!("{base}/models"))
-            .expect("resolved provider base URL must parse as URL");
-        url.query_pairs_mut()
-            .append_pair("client_version", codex_model_list_client_version());
-        url.to_string()
-    } else {
-        format!("{base}/models")
-    }
-}
-
-fn codex_oauth_fallback_models() -> Vec<ModelEntry> {
-    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
-        .into_iter()
-        .map(|id| ModelEntry {
-            id: id.to_string(),
-            ..ModelEntry::default()
-        })
-        .collect()
+    ProviderRegistry::standard()
+        .provider_for(provider_id, entry)
+        .models_url(entry, base_url)
 }
 
 async fn fetch_models_at(
@@ -548,9 +518,13 @@ pub async fn fetch_models_for_provider(
     timeout: Duration,
 ) -> Result<FetchOutcome> {
     let request = resolve_model_list_request_async(provider_id, entry, resolved).await?;
-    let url = models_url_for_provider(provider_id, entry, &request.base_url);
+    let registry = ProviderRegistry::standard();
+    let provider = registry.provider_for(provider_id, entry);
+    let url = provider.models_url(entry, &request.base_url);
+    let fallback_models = provider.fallback_models();
+    let fallback_catalog = provider.fallback_catalog();
     let outcome = fetch_models_at_detailed(&url, &request.headers, timeout).await;
-    if !is_codex_oauth_provider(provider_id, entry) {
+    if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
     match outcome {
@@ -561,11 +535,11 @@ pub async fn fetch_models_for_provider(
             tracing::warn!(
                 provider_id,
                 url,
-                "Codex /models unavailable; fallback catalog available"
+                "provider /models unavailable; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: codex_oauth_fallback_models(),
-                catalog: ProviderModelCatalog::CodexFallback,
+                models: fallback_models,
+                catalog: fallback_catalog,
                 reason: format!("{url} returned 404"),
             })
         }
@@ -578,11 +552,11 @@ pub async fn fetch_models_for_provider(
                 provider_id,
                 url,
                 %status,
-                "Codex /models returned an empty model list; fallback catalog available"
+                "provider /models returned an empty model list; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: codex_oauth_fallback_models(),
-                catalog: ProviderModelCatalog::CodexFallback,
+                models: fallback_models,
+                catalog: fallback_catalog,
                 reason: format!("{url} returned an empty model list (status {status})"),
             })
         }
@@ -591,10 +565,10 @@ pub async fn fetch_models_for_provider(
             if reason.contains("returned 401") || reason.contains("returned 403") {
                 return Err(error);
             }
-            tracing::warn!(provider_id, url, error = %reason, "Codex /models fetch failed; fallback catalog available");
+            tracing::warn!(provider_id, url, error = %reason, "provider /models fetch failed; fallback catalog available");
             Ok(FetchOutcome::FallbackAvailable {
-                models: codex_oauth_fallback_models(),
-                catalog: ProviderModelCatalog::CodexFallback,
+                models: fallback_models,
+                catalog: fallback_catalog,
                 reason,
             })
         }
@@ -964,27 +938,22 @@ pub(crate) fn response_body_snippet(body: &str) -> String {
     format!("body_bytes={}, body_prefix={snippet:?}", body.len())
 }
 
-pub(crate) fn is_github_copilot_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
-    provider_id.eq_ignore_ascii_case("copilot")
-        || entry.credential_ref.as_deref() == Some("copilot")
-        || entry.url.contains("githubcopilot.com")
-}
-
 fn resolve_provider_base_url(provider_id: &str, entry: &ProviderEntry) -> Result<String> {
-    resolve_provider_base_url_with_env(provider_id, entry, |name| std::env::var(name).ok())
+    let registry = ProviderRegistry::standard();
+    let is_copilot =
+        registry.provider_for(provider_id, entry).request_kind() == ProviderRequestKind::Copilot;
+    resolve_provider_base_url_with_env(provider_id, entry, is_copilot, &|name| {
+        std::env::var(name).ok()
+    })
 }
 
-fn resolve_provider_base_url_with_env<F>(
+fn resolve_provider_base_url_with_env(
     provider_id: &str,
     entry: &ProviderEntry,
-    lookup: F,
-) -> Result<String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let url = if is_github_copilot_provider(provider_id, entry)
-        && let Some(url) = env_var_nonempty_with(COPILOT_API_URL_ENV, &lookup)
-    {
+    is_copilot: bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let url = if is_copilot && let Some(url) = env_var_nonempty_with(COPILOT_API_URL_ENV, lookup) {
         url.trim_end_matches('/').to_string()
     } else {
         entry.url.trim_end_matches('/').to_string()
@@ -1088,6 +1057,7 @@ fn push_missing(dst: &mut Vec<String>, src: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::providers::AuthKind;
     /// Cargo runs tests in parallel by default. Several tests below
     /// mutate process-wide env vars (`COPILOT_GITHUB_TOKEN`,
     /// `XDG_STATE_HOME`, and friends) to exercise resolver fallbacks, so
@@ -1285,6 +1255,14 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], "NONEXISTENT_VAR_123");
+    }
+
+    fn header_pairs(request: &ResolvedRequest) -> Vec<(&str, &str)> {
+        request
+            .headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+            .collect()
     }
 
     #[test]
@@ -1489,7 +1467,12 @@ mod tests {
             credential_ref: Some(crate::auth::xai_oauth::CREDENTIAL_KEY.to_string()),
             ..ProviderEntry::default()
         };
-        assert!(is_xai_oauth_provider("custom-grok", &entry));
+        assert_eq!(
+            ProviderRegistry::standard()
+                .provider_for("custom-grok", &entry)
+                .id(),
+            crate::auth::xai_oauth::CREDENTIAL_KEY
+        );
         let err = resolve_provider_request("custom-grok", &entry).unwrap_err();
         assert!(err.to_string().contains("Grok subscription auth required"));
     }
@@ -1538,7 +1521,12 @@ mod tests {
             auth: Some(AuthKind::OAuth),
             ..ProviderEntry::default()
         };
-        assert!(is_codex_oauth_provider("custom-codex", &entry));
+        assert_eq!(
+            ProviderRegistry::standard()
+                .provider_for("custom-codex", &entry)
+                .id(),
+            crate::auth::codex_oauth::CREDENTIAL_KEY
+        );
         let err = resolve_provider_request("custom-codex", &entry).unwrap_err();
         assert!(err.to_string().contains("Codex subscription auth required"));
     }
@@ -1756,7 +1744,7 @@ mod tests {
             "codex-oauth",
             &entry,
             codex_tokens(Some("acc_123")),
-            |_| None,
+            &|_| None,
         )
         .unwrap();
         let url = models_url_for_provider("codex-oauth", &entry, &resolved.base_url);
@@ -2044,7 +2032,7 @@ mod tests {
         };
 
         let err =
-            resolve_codex_model_list_request("codex-oauth", &entry, codex_tokens(None), |_| None)
+            resolve_codex_model_list_request("codex-oauth", &entry, codex_tokens(None), &|_| None)
                 .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -2092,8 +2080,95 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_openai_compatible_template_uses_template_provider_fallback() {
+        let template = crate::providers::ProviderTemplate {
+            id: "synthetic-openai-compatible",
+            display: "Synthetic OpenAI-compatible",
+            url: "https://synthetic.example/v1",
+            auth: AuthKind::ApiKey,
+            default_env_var: Some("SYNTHETIC_API_KEY"),
+            env_var_candidates: &[],
+            default_headers: &[("Authorization", "Bearer $SYNTHETIC_API_KEY")],
+            supports_models_endpoint: true,
+            hint: None,
+            use_id_as_default: true,
+            default_wire_api: crate::config::providers::WireApi::Auto,
+        };
+        let entry = ProviderEntry {
+            url: template.url.to_string(),
+            headers: crate::providers::default_headers_for(&template),
+            ..ProviderEntry::default()
+        };
+        let lookup = |name: &str| (name == "SYNTHETIC_API_KEY").then(|| "key-1".to_string());
+        let registry = ProviderRegistry::standard();
+        let provider = registry.provider_for(template.id, &entry);
+
+        assert_eq!(provider.id(), "template");
+
+        let via_registry = provider
+            .request(template.id, &entry, None, &lookup)
+            .unwrap();
+        let via_public = resolve_provider_request_with_env(template.id, &entry, lookup).unwrap();
+        assert_eq!(via_registry.base_url, via_public.base_url);
+        assert_eq!(header_pairs(&via_registry), header_pairs(&via_public));
+        assert_eq!(
+            provider.models_url(&entry, &via_registry.base_url),
+            models_url_for_provider(template.id, &entry, &via_public.base_url)
+        );
+    }
+
+    #[test]
+    fn standard_special_provider_matches_are_mutually_exclusive() {
+        let registry = ProviderRegistry::standard();
+        let cases = [
+            (
+                "codex-oauth",
+                ProviderEntry {
+                    url: crate::auth::codex_oauth::DEFAULT_BASE_URL.into(),
+                    auth: Some(AuthKind::OAuth),
+                    ..ProviderEntry::default()
+                },
+                crate::auth::codex_oauth::CREDENTIAL_KEY,
+            ),
+            (
+                "grok-oauth",
+                ProviderEntry {
+                    url: "https://api.x.ai/v1".into(),
+                    auth: Some(AuthKind::OAuth),
+                    ..ProviderEntry::default()
+                },
+                crate::auth::xai_oauth::CREDENTIAL_KEY,
+            ),
+            (
+                "copilot",
+                ProviderEntry {
+                    url: "https://api.githubcopilot.com".into(),
+                    ..ProviderEntry::default()
+                },
+                "copilot",
+            ),
+        ];
+
+        for (provider_id, entry, expected) in cases {
+            let matches = registry.special_match_ids(provider_id, &entry);
+            assert_eq!(
+                matches,
+                vec![expected],
+                "unexpected matches for {provider_id}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_model_list_fallback_catalog_is_hardcoded_and_effort_free() {
-        let models = codex_oauth_fallback_models();
+        let entry = ProviderEntry {
+            url: crate::auth::codex_oauth::DEFAULT_BASE_URL.into(),
+            credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.to_string()),
+            ..ProviderEntry::default()
+        };
+        let models = ProviderRegistry::standard()
+            .provider_for("codex-oauth", &entry)
+            .fallback_models();
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]);
         assert!(models.iter().all(|m| m.thinking_modes.is_empty()));

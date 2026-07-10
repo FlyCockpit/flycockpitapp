@@ -13,7 +13,10 @@
 
 pub(crate) mod http_retry;
 pub mod models_fetch;
+pub(crate) mod registry;
 pub mod usage;
+
+pub(crate) use registry::ProviderRegistry;
 
 use std::env;
 

@@ -1,59 +1,302 @@
-import type { AddressInfo } from "node:net";
-import {
-  relayTokenPayloadSchema,
-  signRelayToken,
-  verifyRelayTokenWithSecret,
-} from "@flycockpit/relay-protocol/tokens";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server } from "node:http";
+import { join } from "node:path";
+import type {
+  ClientRelayFrame,
+  DaemonClientRelayFrame,
+  RelayControlMessage,
+} from "@flycockpit/relay-protocol";
+import { afterEach, expect, it } from "vitest";
 import WebSocket from "ws";
-import { MemoryPresenceStore } from "./presence";
-import { createRelayServer, type RelayServerConfig, type RelayServerHandle } from "./server";
+import { type RelayUnderTest, startRelayUnderTest } from "./conformance-fixture";
 
-const secret = "1234567890abcdef1234567890abcdef";
-const issuer = "https://app.example.test";
+let relay: RelayUnderTest | undefined;
+let ingestServer: Server | undefined;
 
-let handles: RelayServerHandle[] = [];
+const backpressureIt = process.env.RELAY_UNDER_TEST_BIN ? it : it.fails;
 
-afterEach(async () => {
-  await Promise.allSettled(handles.map((handle) => handle.close()));
-  handles = [];
+// Backpressure is expected to fail against the TypeScript relay until rust-relay-implementation
+// lands bounded buffering behavior. The Rust implementation must make this same test pass.
+backpressureIt(
+  "closes or throttles a slow peer instead of buffering daemon output indefinitely",
+  async () => {
+    relay = await startRelayUnderTest();
+    const daemon = await openDaemon(relay);
+    const client = await openClient(relay, {
+      tokenType: "client",
+      instanceId: "instance-1",
+      userId: "user-1",
+    });
+    pauseSocket(client);
+    const clientFrame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
+    const daemonFrame = loadFixture<DaemonClientRelayFrame>("daemon-client-relay-frame.json");
+    client.send(JSON.stringify(clientFrame));
+    await nextMessage(daemon);
+
+    for (let index = 0; index < 10_000; index += 1) {
+      daemon.send(JSON.stringify({ ...daemonFrame, channelId: clientFrame.channelId }));
+    }
+
+    await sleep(100);
+    expect(client.readyState).not.toBe(WebSocket.OPEN);
+  },
+);
+
+it("rejects garbage tokens during websocket upgrade", async () => {
+  relay = await startRelayUnderTest();
+  const ws = connect(relay, "/ws/daemon", "garbage");
+
+  await expect(rejected(ws)).resolves.toMatchObject({ message: expect.stringContaining("401") });
 });
 
-async function token(input: Parameters<typeof signRelayToken>[0], audience = "relay-test") {
-  return (await signRelayToken(input, { secret, issuer, audience })).token;
-}
+it("refuses tokens minted for a different relay during websocket upgrade", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = connect(
+    relay,
+    "/ws/daemon",
+    await relay.signToken(
+      { tokenType: "connector", instanceId: "instance-1", userId: "owner-1" },
+      "relay-other",
+    ),
+  );
 
-async function startRelay(logs: string[] = [], overrides: Partial<RelayServerConfig> = {}) {
-  const presenceStore = new MemoryPresenceStore();
-  const handle = createRelayServer({
-    relayId: "relay-test",
-    jwksUrl: "https://app.example.test/api/relay/jwks.json",
-    tokenIssuer: issuer,
-    heartbeatMs: 1_000,
-    leaseTtlMs: 30_000,
-    maxFrameBytes: 1024 * 1024,
-    maxChannelsPerClient: 2,
-    maxConnectionsPerInstance: 10,
-    clientRateLimitPerSecond: 100,
-    presenceStore,
-    verifyToken: (raw) =>
-      verifyRelayTokenWithSecret(raw, { secret, issuer, audience: "relay-test" }),
-    logger: {
-      info: (...args) => logs.push(args.join(" ")),
-      warn: (...args) => logs.push(args.join(" ")),
-      error: (...args) => logs.push(args.join(" ")),
-    },
-    ...overrides,
+  await expect(rejected(daemon)).resolves.toMatchObject({
+    message: expect.stringContaining("401"),
   });
-  await new Promise<void>((resolve) => handle.server.listen(0, resolve));
-  handles.push(handle);
-  const port = (handle.server.address() as AddressInfo).port;
-  return { handle, url: `ws://127.0.0.1:${port}` };
+});
+
+it("closes post-upgrade connections with 4401 when the token type is wrong for the route", async () => {
+  relay = await startRelayUnderTest();
+  const client = connect(
+    relay,
+    "/ws/client",
+    await relay.signToken({ tokenType: "user", userId: "user-1" }),
+  );
+  const close = closed(client);
+
+  await opened(client);
+  await expect(close).resolves.toMatchObject({ code: 4401 });
+});
+
+it("accepts a client connection but closes it with instance_offline when no daemon is present", async () => {
+  relay = await startRelayUnderTest();
+  const client = connect(
+    relay,
+    "/ws/client",
+    await relay.signToken({ tokenType: "client", instanceId: "instance-1", userId: "user-1" }),
+  );
+  const message = nextMessage(client);
+  const close = closed(client);
+  await opened(client);
+
+  await expect(message).resolves.toMatchObject({ type: "system", code: "instance_offline" });
+  await expect(close).resolves.toMatchObject({ code: 4404 });
+});
+
+it("closes a replaced daemon with 4409", async () => {
+  relay = await startRelayUnderTest();
+  const first = await openDaemon(relay);
+  const firstMessage = nextMessage(first);
+  const firstClose = closed(first);
+  await openDaemon(relay, "instance-1", "owner-2");
+
+  await expect(firstMessage).resolves.toMatchObject({ type: "system", code: "daemon_replaced" });
+  await expect(firstClose).resolves.toMatchObject({ code: 4409 });
+});
+
+it("pairs a daemon and client, stamps principals, and routes daemon replies by channel", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+    grants: [{ scope: "terminal", projectRoot: null }],
+  });
+  const clientFrame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
+  const daemonFrame = loadFixture<DaemonClientRelayFrame>("daemon-client-relay-frame.json");
+
+  client.send(JSON.stringify(clientFrame));
+  await expect(nextMessage(daemon)).resolves.toMatchObject({
+    v: 1,
+    channelId: clientFrame.channelId,
+    from: "client",
+    principal: { userId: "user-1", grants: [{ scope: "terminal", projectRoot: null }] },
+    payload: clientFrame.payload,
+  });
+
+  daemon.send(JSON.stringify({ ...daemonFrame, channelId: clientFrame.channelId }));
+  await expect(nextMessage(client)).resolves.toMatchObject({
+    v: 1,
+    channelId: clientFrame.channelId,
+    payload: daemonFrame.payload,
+  });
+});
+
+it("passes opaque payloads byte-identically after canonical key normalization", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+  const source = loadFixture<{ payload: unknown }>("daemon-control-relay-frame.json").payload;
+  const frame = { ...loadFixture<ClientRelayFrame>("client-relay-frame.json"), payload: source };
+
+  client.send(JSON.stringify(frame));
+  const received = (await nextMessage(daemon)) as { payload: unknown };
+
+  expect(stableJson(received.payload)).toBe(stableJson(source));
+});
+
+it("rejects clients that try to supply their own principal", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+  const daemonMessage = noMessage(daemon, 75);
+  const close = closed(client);
+
+  client.send(
+    JSON.stringify({
+      ...loadFixture<ClientRelayFrame>("client-relay-frame.json"),
+      principal: { userId: "spoofed", grants: [] },
+    }),
+  );
+
+  await expect(close).resolves.toMatchObject({ code: 4400 });
+  await expect(daemonMessage).resolves.toBeUndefined();
+});
+
+it("closes oversized frames with 1009", async () => {
+  relay = await startRelayUnderTest({ maxFrameBytes: 16 });
+  await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+  const close = closed(client);
+
+  client.send(JSON.stringify(loadFixture<ClientRelayFrame>("client-relay-frame.json")));
+
+  await expect(close).resolves.toMatchObject({ code: 1009 });
+});
+
+it("rate limits clients with 4429", async () => {
+  relay = await startRelayUnderTest({ clientRateLimitPerSecond: 1 });
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+  const frame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
+  const close = closed(client);
+
+  client.send(JSON.stringify(frame));
+  await nextMessage(daemon);
+  client.send(JSON.stringify({ ...frame, channelId: "ch-client-2" }));
+
+  await expect(close).resolves.toMatchObject({ code: 4429 });
+});
+
+it("disconnects daemon and clients through forced-disconnect control messages", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+
+  const clientMessage = nextMessage(client);
+  const clientClose = closed(client);
+  const daemonClose = closed(daemon);
+  await relay.publishControl(loadFixture<RelayControlMessage>("control-disconnect-instance.json"));
+
+  await expect(clientMessage).resolves.toMatchObject({
+    type: "system",
+    code: "forced_disconnect",
+  });
+  await expect(clientClose).resolves.toMatchObject({ code: 4410 });
+  await expect(daemonClose).resolves.toMatchObject({ code: 4410 });
+});
+
+it("sends the relay control secret on user-presence and daemon control ingest", async () => {
+  const ingest = await startIngestServer();
+  ingestServer = ingest.server;
+  relay = await startRelayUnderTest({ controlIngestUrl: ingest.url });
+
+  const user = connect(
+    relay,
+    "/ws/user",
+    await relay.signToken({ tokenType: "user", userId: "user-1" }),
+  );
+  await opened(user);
+  user.send(JSON.stringify(loadFixture("user-presence-relay-frame.json")));
+
+  await waitFor(() => expect(ingest.requests).toHaveLength(1));
+
+  const daemon = await openDaemon(relay);
+  daemon.send(JSON.stringify(loadFixture("daemon-control-relay-frame.json")));
+
+  await waitFor(() => expect(ingest.requests).toHaveLength(2));
+  for (const request of ingest.requests) {
+    expect(request.headers.authorization).toBe("Bearer control-secret-control-secret-1234");
+  }
+});
+
+it("does not write frame bodies to logs", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+  const frame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
+
+  client.send(JSON.stringify(frame));
+  await nextMessage(daemon);
+
+  expect(relay.logs()).not.toContain(stableJson(frame.payload));
+});
+
+afterEach(async () => {
+  await Promise.allSettled([relay?.stop(), closeServer(ingestServer)]);
+  relay = undefined;
+  ingestServer = undefined;
+});
+
+function connect(current: RelayUnderTest, path: string, rawToken: string) {
+  return new WebSocket(`${current.wsUrl}${path}`, {
+    headers: { authorization: `Bearer ${rawToken}` },
+  });
 }
 
-function connect(url: string, path: string, rawToken: string) {
-  const ws = new WebSocket(`${url}${path}`, { headers: { authorization: `Bearer ${rawToken}` } });
-  return ws;
+async function openDaemon(current: RelayUnderTest, instanceId = "instance-1", userId = "owner-1") {
+  const daemon = connect(
+    current,
+    "/ws/daemon",
+    await current.signToken({ tokenType: "connector", instanceId, userId }),
+  );
+  await opened(daemon);
+  await waitForDaemon(current);
+  return daemon;
+}
+
+async function openClient(
+  current: RelayUnderTest,
+  tokenInput: Parameters<RelayUnderTest["signToken"]>[0],
+) {
+  const client = connect(current, "/ws/client", await current.signToken(tokenInput));
+  await opened(client);
+  return client;
 }
 
 function opened(ws: WebSocket) {
@@ -73,8 +316,9 @@ function closed(ws: WebSocket) {
 }
 
 function rejected(ws: WebSocket) {
-  return new Promise<void>((resolve) => {
-    ws.once("error", () => resolve());
+  return new Promise<Error>((resolve, reject) => {
+    ws.once("error", (err) => resolve(err));
+    ws.once("open", () => reject(new Error("websocket unexpectedly opened")));
   });
 }
 
@@ -84,215 +328,87 @@ function nextMessage(ws: WebSocket) {
   });
 }
 
-async function waitForLease(handle: RelayServerHandle, instanceId: string) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const lease = await handle.presenceStore.getDaemonLease(instanceId);
-    if (lease) return lease;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("lease was not created");
+async function noMessage(ws: WebSocket, ms: number) {
+  const message = Symbol("message");
+  const result = await Promise.race([nextMessage(ws).then(() => message), sleep(ms)]);
+  if (result === message) throw new Error("unexpected relay frame");
 }
 
-describe("relay server", () => {
-  it("rejects garbage tokens during websocket upgrade", async () => {
-    const { url } = await startRelay();
-    const ws = connect(url, "/ws/daemon", "garbage");
-
-    await expect(rejected(ws)).resolves.toBeUndefined();
+async function waitForDaemon(current: RelayUnderTest) {
+  await waitFor(async () => {
+    const response = await fetch(`${current.httpUrl}/metrics`);
+    const metrics = (await response.json()) as { daemons?: number };
+    expect(metrics.daemons).toBeGreaterThanOrEqual(1);
   });
+}
 
-  it("refuses tokens minted for a different relay during websocket upgrade", async () => {
-    const { url } = await startRelay();
-    const daemon = connect(
-      url,
-      "/ws/daemon",
-      await token(
-        { tokenType: "connector", instanceId: "instance-1", userId: "owner-1" },
-        "relay-other",
-      ),
-    );
-
-    await expect(rejected(daemon)).resolves.toBeUndefined();
-  });
-
-  it("accepts array-form audiences when the verifier accepts this relay id", async () => {
-    const { handle, url } = await startRelay([], {
-      verifyToken: async () =>
-        relayTokenPayloadSchema.parse({
-          iss: issuer,
-          aud: ["relay-test"],
-          tokenType: "connector",
-          instanceId: "instance-1",
-          userId: "owner-1",
-          grants: [],
-          iat: 1,
-          exp: Math.floor(Date.now() / 1000) + 300,
-          jti: "array-audience",
-        }),
-    });
-    const daemon = connect(url, "/ws/daemon", "array-audience-token");
-
-    await opened(daemon);
-    await expect(waitForLease(handle, "instance-1")).resolves.toMatchObject({
-      relayId: "relay-test",
-    });
-  });
-
-  it("accepts a client connection but closes it with instance_offline when no daemon is present", async () => {
-    const { url } = await startRelay();
-    const client = connect(
-      url,
-      "/ws/client",
-      await token({ tokenType: "client", instanceId: "instance-1", userId: "user-1" }),
-    );
-    const message = nextMessage(client);
-    const close = closed(client);
-    await opened(client);
-
-    await expect(message).resolves.toMatchObject({ type: "system", code: "instance_offline" });
-    await expect(close).resolves.toMatchObject({ code: 4404 });
-  });
-
-  it("pairs a daemon and client, stamps principals, and routes daemon replies by channel", async () => {
-    const { handle, url } = await startRelay();
-    const daemon = connect(
-      url,
-      "/ws/daemon",
-      await token({ tokenType: "connector", instanceId: "instance-1", userId: "owner-1" }),
-    );
-    await opened(daemon);
-    await waitForLease(handle, "instance-1");
-
-    const client = connect(
-      url,
-      "/ws/client",
-      await token({
-        tokenType: "client",
-        instanceId: "instance-1",
-        userId: "user-1",
-        grants: [{ scope: "terminal", projectRoot: null }],
-      }),
-    );
-    await opened(client);
-
-    client.send(JSON.stringify({ v: 1, channelId: "ch-1", payload: { text: "hello" } }));
-    await expect(nextMessage(daemon)).resolves.toMatchObject({
-      v: 1,
-      channelId: "ch-1",
-      from: "client",
-      principal: { userId: "user-1", grants: [{ scope: "terminal", projectRoot: null }] },
-      payload: { text: "hello" },
-    });
-
-    daemon.send(JSON.stringify({ v: 1, channelId: "ch-1", payload: { text: "world" } }));
-    await expect(nextMessage(client)).resolves.toMatchObject({
-      v: 1,
-      channelId: "ch-1",
-      payload: { text: "world" },
-    });
-  });
-
-  it("disconnects daemon and clients through forced-disconnect control messages", async () => {
-    const { handle, url } = await startRelay();
-    const daemon = connect(
-      url,
-      "/ws/daemon",
-      await token({ tokenType: "connector", instanceId: "instance-1", userId: "owner-1" }),
-    );
-    await opened(daemon);
-    await waitForLease(handle, "instance-1");
-
-    const client = connect(
-      url,
-      "/ws/client",
-      await token({ tokenType: "client", instanceId: "instance-1", userId: "user-1" }),
-    );
-    await opened(client);
-
-    const clientMessage = nextMessage(client);
-    const clientClose = closed(client);
-    const daemonClose = closed(daemon);
-    await handle.publishControl({ type: "disconnect_instance", instanceId: "instance-1" });
-
-    await expect(clientMessage).resolves.toMatchObject({
-      type: "system",
-      code: "forced_disconnect",
-    });
-    await expect(clientClose).resolves.toMatchObject({ code: 4410 });
-    await expect(daemonClose).resolves.toMatchObject({ code: 4410 });
-  });
-
-  it("sends the relay control secret on user-presence and daemon control ingest", async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    const { url } = await startRelay([], {
-      controlIngestUrl: "https://api.example.test/api/relay/control-ingest",
-      controlSecret: "control-secret-control-secret-1234",
-    });
-
-    const user = connect(url, "/ws/user", await token({ tokenType: "user", userId: "user-1" }));
-    await opened(user);
-    user.send(
-      JSON.stringify({
-        v: 1,
-        type: "presence",
-        clientId: "client-1",
-        visible: true,
-        ts: "2026-07-10T00:00:00.000Z",
-      }),
-    );
-
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-
-    const daemon = connect(
-      url,
-      "/ws/daemon",
-      await token({ tokenType: "connector", instanceId: "instance-1", userId: "owner-1" }),
-    );
-    await opened(daemon);
-    daemon.send(
-      JSON.stringify({
-        v: 1,
-        to: "control",
-        event: "APPROVAL_NEEDED",
-        payload: { eventId: "evt-1" },
-      }),
-    );
-
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    for (const call of fetchMock.mock.calls) {
-      expect(call[1]).toMatchObject({
-        headers: expect.objectContaining({
-          authorization: "Bearer control-secret-control-secret-1234",
-        }),
-      });
+async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1_000) {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      await assertion();
+      return;
+    } catch (err) {
+      lastError = err;
+      await sleep(20);
     }
-    fetchMock.mockRestore();
+  }
+  throw lastError;
+}
+
+async function startIngestServer() {
+  const requests: Array<{ headers: IncomingMessage["headers"]; body: unknown }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request)
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    requests.push({
+      headers: request.headers,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown,
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true }));
   });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  return { server, requests, url: `http://127.0.0.1:${port}/api/relay/control-ingest` };
+}
 
-  it("does not write frame bodies to logs", async () => {
-    const logs: string[] = [];
-    const { handle, url } = await startRelay(logs);
-    const daemon = connect(
-      url,
-      "/ws/daemon",
-      await token({ tokenType: "connector", instanceId: "instance-1", userId: "owner-1" }),
-    );
-    await opened(daemon);
-    await waitForLease(handle, "instance-1");
-    const client = connect(
-      url,
-      "/ws/client",
-      await token({ tokenType: "client", instanceId: "instance-1", userId: "user-1" }),
-    );
-    await opened(client);
+async function closeServer(server?: Server) {
+  if (!server?.listening) return;
+  await new Promise<void>((resolve, reject) =>
+    server.close((err) => (err ? reject(err) : resolve())),
+  );
+}
 
-    client.send(
-      JSON.stringify({ v: 1, channelId: "secret", payload: { value: "DO_NOT_LOG_SECRET" } }),
-    );
-    await nextMessage(daemon);
+function loadFixture<T = unknown>(name: string): T {
+  return JSON.parse(
+    readFileSync(
+      join(import.meta.dirname, "../../../packages/relay-protocol/fixtures", name),
+      "utf8",
+    ),
+  ) as T;
+}
 
-    expect(logs.join("\n")).not.toContain("DO_NOT_LOG_SECRET");
-  });
-});
+function stableJson(value: unknown): string {
+  return JSON.stringify(sortKeys(value));
+}
+
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, child]) => [key, sortKeys(child)]),
+  );
+}
+
+function pauseSocket(ws: WebSocket) {
+  (ws as unknown as { _socket?: { pause(): void } })._socket?.pause();
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

@@ -1130,10 +1130,22 @@ impl App {
     /// live buffer into `staged_draft` so a later Down can restore
     /// it.
     pub(super) fn history_up(&mut self) {
+        self.history_up_with_queue_edit(Self::edit_queued_messages);
+    }
+
+    fn history_up_with_queue_edit<F>(&mut self, edit_queue: F)
+    where
+        F: FnOnce(&mut Self) -> bool,
+    {
         // Buffer empty + queue non-empty -> ask the daemon to unqueue every
-        // editable foreground item before making the group editable.
-        if self.prompt_history_cursor == 0 && self.composer.is_empty() && !self.queue.is_empty() {
-            self.edit_queued_messages();
+        // editable foreground item before making the group editable. If the
+        // daemon reports that nothing belongs to this foreground target, let
+        // Up fall through to normal prompt-history navigation.
+        if self.prompt_history_cursor == 0
+            && self.composer.is_empty()
+            && !self.queue.is_empty()
+            && edit_queue(self)
+        {
             return;
         }
         if !cursor_on_first_line(self.composer.text(), self.composer.cursor()) {
@@ -1161,6 +1173,24 @@ impl App {
             self.composer.set(self.prompt_history[idx].clone());
             self.paste_registry.clear();
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn history_up_with_queue_edit_response_for_test(&mut self, response: Response) {
+        self.history_up_with_queue_edit_result_for_test(Ok(response));
+    }
+
+    #[cfg(test)]
+    pub(super) fn history_up_with_queue_edit_result_for_test(
+        &mut self,
+        response: Result<Response, String>,
+    ) {
+        let mut response = Some(response);
+        self.history_up_with_queue_edit(|app| {
+            app.edit_queued_messages_result_for_test(
+                response.take().expect("queue edit response used once"),
+            )
+        });
     }
 
     /// Counterpart to [`Self::history_up`]. Down only steps history
@@ -2279,24 +2309,39 @@ impl App {
 enum QueueEditOutcome {
     Edited { text: String, partial: bool },
     AlreadyStarted,
-    Unavailable,
+    Fallthrough,
+    NotConnected,
+    TransportError,
 }
 
 impl App {
-    fn edit_queued_messages(&mut self) {
-        match self.remove_editable_queued_messages() {
+    fn edit_queued_messages(&mut self) -> bool {
+        let outcome = self.remove_editable_queued_messages();
+        self.apply_queue_edit_outcome(outcome)
+    }
+
+    fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
+        match outcome {
             QueueEditOutcome::Edited { text, partial } => {
                 self.composer.set(text);
                 self.paste_registry.clear();
                 if partial {
                     self.push_queue_edit_notice("some queued messages already started");
                 }
+                true
             }
             QueueEditOutcome::AlreadyStarted => {
                 self.push_queue_edit_notice("queued message already started");
+                true
             }
-            QueueEditOutcome::Unavailable => {
-                self.push_queue_edit_notice("queued messages could not be edited");
+            QueueEditOutcome::Fallthrough => false,
+            QueueEditOutcome::NotConnected => {
+                self.push_queue_edit_notice("not connected to the session");
+                true
+            }
+            QueueEditOutcome::TransportError => {
+                self.push_queue_edit_notice("could not reach the session");
+                true
             }
         }
     }
@@ -2308,7 +2353,7 @@ impl App {
     fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
         let socket = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => runner.socket.clone(),
-            _ => return QueueEditOutcome::Unavailable,
+            _ => return QueueEditOutcome::NotConnected,
         };
         self.remove_editable_queued_messages_with(|| {
             crate::tui::agent_runner::daemon_request_at_blocking(
@@ -2346,11 +2391,17 @@ impl App {
                     proto::RemoveQueuedUserMessageReason::AlreadyStarted => {
                         QueueEditOutcome::AlreadyStarted
                     }
-                    proto::RemoveQueuedUserMessageReason::NotFound => QueueEditOutcome::Unavailable,
-                    proto::RemoveQueuedUserMessageReason::Removed => QueueEditOutcome::Unavailable,
+                    proto::RemoveQueuedUserMessageReason::NotFound => QueueEditOutcome::Fallthrough,
+                    proto::RemoveQueuedUserMessageReason::Removed => {
+                        debug_assert!(
+                            false,
+                            "daemon returned Removed without removed queued messages"
+                        );
+                        QueueEditOutcome::TransportError
+                    }
                 }
             }
-            _ => QueueEditOutcome::Unavailable,
+            _ => QueueEditOutcome::TransportError,
         }
     }
 
@@ -2374,22 +2425,17 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(super) fn edit_queued_messages_for_test(&mut self, response: Response) {
-        match self.remove_editable_queued_messages_with(|| Ok(response)) {
-            QueueEditOutcome::Edited { text, partial } => {
-                self.composer.set(text);
-                self.paste_registry.clear();
-                if partial {
-                    self.push_queue_edit_notice("some queued messages already started");
-                }
-            }
-            QueueEditOutcome::AlreadyStarted => {
-                self.push_queue_edit_notice("queued message already started");
-            }
-            QueueEditOutcome::Unavailable => {
-                self.push_queue_edit_notice("queued messages could not be edited");
-            }
-        }
+    pub(super) fn edit_queued_messages_for_test(&mut self, response: Response) -> bool {
+        self.edit_queued_messages_result_for_test(Ok(response))
+    }
+
+    #[cfg(test)]
+    pub(super) fn edit_queued_messages_result_for_test(
+        &mut self,
+        response: Result<Response, String>,
+    ) -> bool {
+        let outcome = self.remove_editable_queued_messages_with(|| response);
+        self.apply_queue_edit_outcome(outcome)
     }
 }
 
@@ -3553,7 +3599,6 @@ mod queued_message_edit_tests {
     };
     use crate::engine::message::QueueItemStatus as EngineQueueItemStatus;
     use crate::tui::app::App;
-    use crate::tui::history::HistoryEntry;
 
     fn proto_target(id: &str) -> crate::daemon::proto::QueueTarget {
         crate::daemon::proto::QueueTarget {
@@ -3706,9 +3751,10 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn up_edit_not_found_keeps_other_target_queue_and_shows_toast_only() {
+    fn up_edit_not_found_falls_through_to_prompt_history() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
+        app.prompt_history.push("previous prompt".to_string());
         let other = proto_item_with_target(
             "other target",
             QueueItemStatus::Queued,
@@ -3716,24 +3762,105 @@ mod queued_message_edit_tests {
         );
         app.queue.push(queue_item_from_proto(other.clone()));
 
-        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
-            applied: false,
-            reason: RemoveQueuedUserMessageReason::NotFound,
-            removed_items: Vec::new(),
-            queue: vec![other],
-        });
+        app.history_up_with_queue_edit_response_for_test(
+            Response::RemoveQueuedUserMessagesResult {
+                applied: false,
+                reason: RemoveQueuedUserMessageReason::NotFound,
+                removed_items: Vec::new(),
+                queue: vec![other],
+            },
+        );
+
+        assert_eq!(app.composer.text(), "previous prompt");
+        assert_eq!(app.prompt_history_cursor, 1);
+        assert!(app.toast.is_none());
+        assert_eq!(app.queue[0].text, "other target");
+    }
+
+    #[test]
+    fn up_edit_already_started_consumes_without_history_navigation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prompt_history.push("previous prompt".to_string());
+        app.queue.push(queue_item_from_proto(proto_item(
+            "started",
+            QueueItemStatus::Folding,
+        )));
+
+        app.history_up_with_queue_edit_response_for_test(
+            Response::RemoveQueuedUserMessagesResult {
+                applied: false,
+                reason: RemoveQueuedUserMessageReason::AlreadyStarted,
+                removed_items: Vec::new(),
+                queue: vec![proto_item("started", QueueItemStatus::Folding)],
+            },
+        );
 
         assert!(app.composer.is_empty());
-        assert_eq!(app.queue[0].text, "other target");
+        assert_eq!(app.prompt_history_cursor, 0);
         assert!(
-            matches!(&app.toast, Some(toast) if toast.text == "queued messages could not be edited"),
-            "target-miss removal failure is visible"
+            matches!(&app.toast, Some(toast) if toast.text == "queued message already started"),
+            "already-started outcome consumes Up"
         );
+    }
+
+    #[test]
+    fn up_edit_mixed_queue_edits_foreground_and_keeps_other_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let root =
+            proto_item_with_target("root edit", QueueItemStatus::Queued, proto_target("root"));
+        let child = proto_item_with_target(
+            "child stays",
+            QueueItemStatus::Queued,
+            proto_target("task:1:child"),
+        );
+        app.queue.push(queue_item_from_proto(root.clone()));
+        app.queue.push(queue_item_from_proto(child.clone()));
+
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
+            applied: true,
+            reason: RemoveQueuedUserMessageReason::Removed,
+            removed_items: vec![root],
+            queue: vec![child],
+        });
+
+        assert_eq!(app.composer.text(), "root edit");
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue[0].text, "child stays");
+    }
+
+    #[test]
+    fn up_edit_without_runner_reports_not_connected_and_consumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prompt_history.push("previous prompt".to_string());
+        app.queue.push(optimistic_queue_item("queued".to_string()));
+
+        app.history_up();
+
+        assert!(app.composer.is_empty());
+        assert_eq!(app.prompt_history_cursor, 0);
         assert!(
-            !app.history
-                .iter()
-                .any(|entry| matches!(entry, HistoryEntry::Plain { .. })),
-            "queue-edit failures use a toast instead of transcript noise"
+            matches!(&app.toast, Some(toast) if toast.text == "not connected to the session"),
+            "runner absence has a distinct queue-edit notice"
+        );
+    }
+
+    #[test]
+    fn up_edit_transport_error_reports_reachability_and_consumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prompt_history.push("previous prompt".to_string());
+        app.queue.push(optimistic_queue_item("queued".to_string()));
+
+        app.history_up_with_queue_edit_result_for_test(Err("socket closed".to_string()));
+
+        assert!(app.composer.is_empty());
+        assert_eq!(app.prompt_history_cursor, 0);
+        assert!(
+            matches!(&app.toast, Some(toast) if toast.text == "could not reach the session"),
+            "transport failures have a distinct queue-edit notice"
         );
     }
 

@@ -3374,12 +3374,14 @@ impl Driver {
 
         let last_index = submissions.len() - 1;
         let mut leading_history = Vec::with_capacity(last_index);
+        let mut leading_queue_item_ids = Vec::new();
         let mut last = None;
         for (idx, submission) in submissions.into_iter().enumerate() {
             if idx == last_index {
                 last = Some(submission);
                 break;
             }
+            leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
             self.record_queued_user_fold(&submission, tx).await;
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
@@ -3394,8 +3396,11 @@ impl Driver {
             }));
         }
         let last = last.expect("non-empty queued batch has a final user turn");
-        self.run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
-            .await
+        let result = self
+            .run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
+            .await;
+        input_rx.finish(&leading_queue_item_ids).await;
+        result
     }
 
     async fn run_folded_submission_commands(
@@ -3407,7 +3412,7 @@ impl Driver {
         let mut pending_users = Vec::new();
         for item in items {
             match item {
-                FoldedSubmission::Compact => {
+                FoldedSubmission::Compact(queue_item_ids) => {
                     self.run_prepared_queued_user_batch(
                         std::mem::take(&mut pending_users),
                         input_rx,
@@ -3415,10 +3420,13 @@ impl Driver {
                     )
                     .await?;
                     self.do_compact(tx).await;
+                    input_rx.finish(&queue_item_ids).await;
                 }
                 FoldedSubmission::User(submission) => {
+                    let queue_item_ids = submission.queue_item_ids.clone();
                     let Some(prepared) = self.prepare_queued_user_submission(*submission, tx).await
                     else {
+                        input_rx.finish(&queue_item_ids).await;
                         self.run_prepared_queued_user_batch(
                             std::mem::take(&mut pending_users),
                             input_rx,
@@ -8772,6 +8780,28 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        let queue_item_ids = submission.queue_item_ids.clone();
+        let result = self
+            .run_user_input_with_leading_history_inner(
+                submission,
+                leading_history,
+                time_prelude_as_system,
+                input_rx,
+                tx,
+            )
+            .await;
+        input_rx.finish(&queue_item_ids).await;
+        result
+    }
+
+    async fn run_user_input_with_leading_history_inner(
+        &mut self,
+        submission: UserSubmission,
+        leading_history: Vec<Message>,
+        time_prelude_as_system: bool,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
@@ -9203,6 +9233,7 @@ impl Driver {
                     let mut queued: Vec<UserSubmission> = Vec::new();
                     drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
                     if let Some(queued) = queued.into_iter().next() {
+                        let queue_item_ids = queued.queue_item_ids.clone();
                         self.stack
                             .last_mut()
                             .expect("stack never empty")
@@ -9222,6 +9253,7 @@ impl Driver {
                                 let Some(prepared) =
                                     self.prepare_queued_user_submission(queued, tx).await
                                 else {
+                                    input_rx.finish(&queue_item_ids).await;
                                     return Ok(());
                                 };
                                 self.record_queued_user_fold(&prepared, tx).await;
@@ -9274,15 +9306,18 @@ impl Driver {
                     let target_id = self.active_queue_target_id();
                     drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
                     if let Some(queued) = queued.into_iter().next() {
+                        let queue_item_ids = queued.queue_item_ids.clone();
                         match queued.kind {
                             UserSubmissionKind::Compact => {
                                 self.do_compact(tx).await;
+                                input_rx.finish(&queue_item_ids).await;
                                 continue;
                             }
                             UserSubmissionKind::User => {
                                 let Some(prepared) =
                                     self.prepare_queued_user_submission(queued, tx).await
                                 else {
+                                    input_rx.finish(&queue_item_ids).await;
                                     continue;
                                 };
                                 self.record_queued_user_fold(&prepared, tx).await;
@@ -10615,7 +10650,7 @@ fn format_async_delegation_result(
 
 enum FoldedSubmission {
     User(Box<UserSubmission>),
-    Compact,
+    Compact(Vec<uuid::Uuid>),
 }
 
 fn fold_submission_commands(submissions: Vec<UserSubmission>) -> Vec<FoldedSubmission> {
@@ -10623,7 +10658,7 @@ fn fold_submission_commands(submissions: Vec<UserSubmission>) -> Vec<FoldedSubmi
         .into_iter()
         .map(|submission| match submission.kind {
             UserSubmissionKind::User => FoldedSubmission::User(Box::new(submission)),
-            UserSubmissionKind::Compact => FoldedSubmission::Compact,
+            UserSubmissionKind::Compact => FoldedSubmission::Compact(submission.queue_item_ids),
         })
         .collect()
 }
@@ -18608,16 +18643,16 @@ mod tests {
         assert_eq!(folded.len(), 4);
         match &folded[0] {
             FoldedSubmission::User(submission) => assert_eq!(submission.text, "before"),
-            FoldedSubmission::Compact => panic!("expected leading user turn"),
+            FoldedSubmission::Compact(_) => panic!("expected leading user turn"),
         }
-        assert!(matches!(folded[1], FoldedSubmission::Compact));
+        assert!(matches!(folded[1], FoldedSubmission::Compact(_)));
         match &folded[2] {
             FoldedSubmission::User(submission) => assert_eq!(submission.text, "after one"),
-            FoldedSubmission::Compact => panic!("expected first trailing user turn"),
+            FoldedSubmission::Compact(_) => panic!("expected first trailing user turn"),
         }
         match &folded[3] {
             FoldedSubmission::User(submission) => assert_eq!(submission.text, "after two"),
-            FoldedSubmission::Compact => panic!("expected second trailing user turn"),
+            FoldedSubmission::Compact(_) => panic!("expected second trailing user turn"),
         }
     }
 
@@ -18625,7 +18660,7 @@ mod tests {
     fn fold_submission_commands_runs_lone_compact_without_dummy_user_turn() {
         let folded = fold_submission_commands(vec![UserSubmission::compact_notice()]);
         assert_eq!(folded.len(), 1);
-        assert!(matches!(folded[0], FoldedSubmission::Compact));
+        assert!(matches!(folded[0], FoldedSubmission::Compact(_)));
     }
 
     // --- Mid-session model switch (implementation note) ---

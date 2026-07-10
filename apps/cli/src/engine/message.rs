@@ -207,6 +207,17 @@ impl UserSubmissionQueue {
         snapshot
     }
 
+    pub async fn finish(&self, ids: &[Uuid]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut state = self.inner.lock().await;
+        for id in ids {
+            state.started.remove(id);
+            state.started_targets.remove(id);
+        }
+    }
+
     pub async fn remove(&self, id: Uuid) -> (RemoveQueuedMessageResult, Vec<QueuedUserMessage>) {
         let (result, snapshot) = {
             let mut state = self.inner.lock().await;
@@ -915,6 +926,123 @@ mod tests {
 
         let (result, snapshot) = queue.remove(id).await;
         assert_eq!(result, RemoveQueuedMessageResult::AlreadyStarted);
+        assert!(snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_remove_after_finish_reports_not_found() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+
+        let (id, _) = queue
+            .push(UserSubmission::text("started"), QueueTarget::root("Build"))
+            .await;
+        assert_eq!(queue.recv().await.expect("started").text, "started");
+        queue.finish(&[id]).await;
+
+        let (result, snapshot) = queue.remove(id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::NotFound);
+        assert!(snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_remove_editable_reports_started_only_while_in_flight() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+
+        let (id, _) = queue
+            .push(UserSubmission::text("started"), root.clone())
+            .await;
+        assert_eq!(
+            queue.recv_for(Some(&root.id)).await.expect("started").text,
+            "started"
+        );
+
+        let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::AlreadyStarted);
+        assert!(removed.is_empty());
+        assert!(snapshot.is_empty());
+
+        queue.finish(&[id]).await;
+        let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::NotFound);
+        assert!(removed.is_empty());
+        assert!(snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_finish_prevents_stale_started_target_mirror_case() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+
+        let (root_id, _) = queue
+            .push(UserSubmission::text("root started"), root.clone())
+            .await;
+        assert_eq!(
+            queue.recv_for(Some(&root.id)).await.expect("root").text,
+            "root started"
+        );
+        queue.finish(&[root_id]).await;
+        queue
+            .push(UserSubmission::text("child pending"), child.clone())
+            .await;
+
+        let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::NotFound);
+        assert!(removed.is_empty());
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child pending"]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_finish_is_idempotent_with_requeue_front() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+
+        let (id, _) = queue
+            .push(UserSubmission::text("first"), root.clone())
+            .await;
+        let first = queue.recv_for(Some(&root.id)).await.expect("first");
+        queue.requeue_front(first, root.clone()).await;
+        queue.finish(&[id]).await;
+
+        let first_again = queue.recv_for(Some(&root.id)).await.expect("first again");
+        assert_eq!(first_again.queue_item_ids, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn user_submission_queue_finish_clears_folded_submission_ids() {
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+
+        queue
+            .push(UserSubmission::text("first"), root.clone())
+            .await;
+        queue
+            .push(UserSubmission::text("second"), root.clone())
+            .await;
+        let mut drained = Vec::new();
+        queue.drain_into_for(&mut drained, 2, Some(&root.id)).await;
+        let ids = drained
+            .iter()
+            .flat_map(|submission| submission.queue_item_ids.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+
+        queue.finish(&ids).await;
+        let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
+        assert_eq!(result, RemoveQueuedMessageResult::NotFound);
+        assert!(removed.is_empty());
         assert!(snapshot.is_empty());
     }
 

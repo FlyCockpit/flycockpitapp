@@ -17255,9 +17255,11 @@ mod footer_selector_tests {
 
     fn runner_with_record_tx(record_tx: mpsc::Sender<Request>) -> AgentRunner {
         let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(8);
+        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         AgentRunner {
             input_tx,
             record_tx,
+            attached_request_tx,
             events: Arc::new(Mutex::new(Vec::new())),
             event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
@@ -17550,9 +17552,11 @@ mod failed_dispatch_reconciliation_tests {
         record_tx: mpsc::Sender<crate::daemon::proto::Request>,
         events: Arc<Mutex<Vec<crate::engine::TurnEvent>>>,
     ) -> AgentRunner {
+        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         AgentRunner {
             input_tx,
             record_tx,
+            attached_request_tx,
             events,
             event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),

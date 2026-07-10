@@ -2337,13 +2337,13 @@ impl App {
     }
 
     fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
-        let socket = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.socket.clone(),
+        let attached_request_tx = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.attached_request_tx.clone(),
             _ => return QueueEditOutcome::NotConnected,
         };
         self.remove_editable_queued_messages_with(|| {
-            crate::tui::agent_runner::daemon_request_at_blocking(
-                &socket,
+            crate::tui::agent_runner::attached_request_tx_blocking(
+                attached_request_tx,
                 Request::RemoveEditableQueuedUserMessages { target_id: None },
             )
         })
@@ -3618,10 +3618,43 @@ mod tag_delete_tests {
 mod queued_message_edit_tests {
     use super::{optimistic_queue_item, queue_item_from_proto};
     use crate::daemon::proto::{
-        QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Response,
+        QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
-    use crate::engine::message::QueueItemStatus as EngineQueueItemStatus;
+    use crate::engine::message::{QueueItemStatus as EngineQueueItemStatus, UserSubmission};
+    use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
     use crate::tui::app::App;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    fn runner_with_attached_request_tx(
+        attached_request_tx: mpsc::Sender<AttachedRequest>,
+    ) -> AgentRunner {
+        let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        AgentRunner {
+            input_tx,
+            record_tx,
+            attached_request_tx,
+            events: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
+            active_agent: Arc::new(Mutex::new("Build".to_string())),
+            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            session_id: uuid::Uuid::new_v4(),
+            short_id: "abc123".to_string(),
+            project_id: "project".to_string(),
+            usage: UsageCounts::default(),
+            owns_daemon: false,
+            socket: PathBuf::from("/tmp/cockpit-test.sock"),
+            history: Vec::new(),
+            paused_work: Vec::new(),
+            repair_required: None,
+            daemon_version: "test".to_string(),
+            daemon_compatible: true,
+            client_tasks: ClientTasks::default(),
+        }
+    }
 
     fn proto_target(id: &str) -> crate::daemon::proto::QueueTarget {
         crate::daemon::proto::QueueTarget {
@@ -3868,6 +3901,44 @@ mod queued_message_edit_tests {
             matches!(&app.toast, Some(toast) if toast.text == "not connected to the session"),
             "runner absence has a distinct queue-edit notice"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn up_edit_uses_attached_runner_request_channel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prompt_history.push("previous prompt".to_string());
+        app.queue.push(optimistic_queue_item("queued".to_string()));
+        let (attached_request_tx, mut attached_request_rx) = mpsc::channel(1);
+        app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
+
+        let responder = tokio::spawn(async move {
+            let attached_request = attached_request_rx
+                .recv()
+                .await
+                .expect("queue edit sends attached request");
+            assert!(matches!(
+                attached_request.request,
+                Request::RemoveEditableQueuedUserMessages { target_id: None }
+            ));
+            let _ =
+                attached_request
+                    .response_tx
+                    .send(Ok(Response::RemoveQueuedUserMessagesResult {
+                        applied: true,
+                        reason: RemoveQueuedUserMessageReason::Removed,
+                        removed_items: vec![proto_item("queued", QueueItemStatus::Queued)],
+                        queue: Vec::new(),
+                    }));
+        });
+
+        app.history_up();
+        responder.await.unwrap();
+
+        assert_eq!(app.composer.text(), "queued");
+        assert_eq!(app.prompt_history_cursor, 0);
+        assert!(app.queue.is_empty());
+        assert!(app.toast.is_none());
     }
 
     #[test]

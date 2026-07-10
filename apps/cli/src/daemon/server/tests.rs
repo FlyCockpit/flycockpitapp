@@ -68,6 +68,20 @@ mod tests {
         Arc::new(RedactionTable::build(&cfg, Path::new(".")).unwrap())
     }
 
+    #[tokio::test]
+    async fn detached_client_cannot_remove_editable_queued_messages() {
+        let ctx = test_ctx();
+        let client = crate::daemon::client::DaemonClient::from_in_process(ctx);
+
+        let err = client
+            .request(Request::RemoveEditableQueuedUserMessages { target_id: None })
+            .await
+            .expect("detached client receives typed daemon response")
+            .expect_err("attached-session request is rejected before attach");
+
+        assert_eq!(err.code, ErrorCode::NotAttached);
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");

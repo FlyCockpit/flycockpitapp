@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -35,6 +35,11 @@ pub struct UsageCounts {
 }
 
 /// Handle the TUI keeps to talk to the engine (now via the daemon).
+pub struct AttachedRequest {
+    pub request: Request,
+    pub response_tx: oneshot::Sender<Result<Response, String>>,
+}
+
 pub struct AgentRunner {
     /// Send user submissions here (text + any pasted image parts). Each
     /// becomes one `SendUserMessage` request; the daemon's queue-folding
@@ -42,6 +47,8 @@ pub struct AgentRunner {
     pub input_tx: mpsc::Sender<crate::engine::message::UserSubmission>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
     pub record_tx: mpsc::Sender<Request>,
+    /// Response-bearing requests sent over the already-attached daemon client.
+    pub attached_request_tx: mpsc::Sender<AttachedRequest>,
     /// Drained per tick into [`crate::tui::app::App::history`].
     pub events: Arc<Mutex<Vec<TurnEvent>>>,
     pub(crate) event_notify: Arc<Notify>,
@@ -347,6 +354,7 @@ fn try_spawn_inner(
 
     let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
+    let (attached_request_tx, mut attached_request_rx) = mpsc::channel::<AttachedRequest>(32);
     let events = Arc::new(Mutex::new(Vec::new()));
     let event_notify = Arc::new(Notify::new());
     let initial_active_agent_path = if active_agent_path.is_empty() {
@@ -430,6 +438,22 @@ fn try_spawn_inner(
         }));
     }
 
+    // Outbound: response-bearing attached-session RPCs. These must use the
+    // same daemon client that completed Attach because attachment is stored in
+    // per-client daemon state, not in the socket path.
+    {
+        let client = client.clone();
+        client_tasks.push(tokio::spawn(async move {
+            while let Some(attached_request) = attached_request_rx.recv().await {
+                let response = client
+                    .request_ok(attached_request.request)
+                    .await
+                    .map_err(|e| format!("daemon request: {e}"));
+                let _ = attached_request.response_tx.send(response);
+            }
+        }));
+    }
+
     // Inbound: daemon events → translate → push into the shared
     // buffer and update active-agent tracker.
     {
@@ -468,6 +492,7 @@ fn try_spawn_inner(
     Ok(AgentRunner {
         input_tx,
         record_tx,
+        attached_request_tx,
         events,
         event_notify,
         active_agent,
@@ -605,6 +630,32 @@ fn local_guidance_estimate(
             model_instruction_tokens,
         },
     }
+}
+
+/// Run one request-response RPC over the runner's already-attached daemon
+/// client. Unlike socket helpers, this preserves daemon-side per-client
+/// attached session state.
+pub fn attached_request_tx_blocking(
+    attached_request_tx: mpsc::Sender<AttachedRequest>,
+    req: Request,
+) -> Result<Response, String> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            attached_request_tx
+                .send(AttachedRequest {
+                    request: req,
+                    response_tx,
+                })
+                .await
+                .map_err(|_| "daemon client task has stopped".to_string())?;
+            response_rx
+                .await
+                .map_err(|_| "daemon client dropped reply channel".to_string())?
+        })
+    })
 }
 
 /// Run one blocking daemon request against an already-running daemon and
@@ -1596,11 +1647,13 @@ mod tests {
     ) -> AgentRunner {
         let (input_tx, _input_rx) = mpsc::channel(1);
         let (record_tx, _record_rx) = mpsc::channel(1);
+        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         let mut client_tasks = ClientTasks::default();
         client_tasks.push(handle);
         AgentRunner {
             input_tx,
             record_tx,
+            attached_request_tx,
             events,
             event_notify: Arc::new(Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),

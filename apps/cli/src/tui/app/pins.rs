@@ -690,9 +690,11 @@ mod tests {
     fn runner() -> AgentRunner {
         let (input_tx, _input_rx) = mpsc::channel(1);
         let (record_tx, _record_rx) = mpsc::channel(1);
+        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         AgentRunner {
             input_tx,
             record_tx,
+            attached_request_tx,
             events: Arc::new(Mutex::new(Vec::new())),
             event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),

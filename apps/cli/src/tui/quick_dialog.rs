@@ -108,12 +108,12 @@ impl QuickDialog {
             title: "Quick settings",
             bindings: &[
                 KeyBinding {
-                    key: "Tab",
+                    key: "Tab/→/l",
                     action: "next",
                     desc: "switch to the next settings tab",
                 },
                 KeyBinding {
-                    key: "Shift+Tab",
+                    key: "Shift+Tab/←/h",
                     action: "previous",
                     desc: "switch to the previous settings tab",
                 },
@@ -170,8 +170,12 @@ impl QuickDialog {
                 self.tab = crate::tui::nav::wrap_prev(self.tab, TABS.len());
                 None
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.tab = crate::tui::nav::wrap_next(self.tab, TABS.len());
+                None
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.tab = crate::tui::nav::wrap_prev(self.tab, TABS.len());
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -213,7 +217,7 @@ impl QuickDialog {
         frame.render_widget(Paragraph::new(self.option_lines()), layout[1]);
         frame.render_widget(
             Paragraph::new(
-                "tab: next  shift+tab: previous  ↑/↓/j/k: move  space: stage  enter: commit  esc: discard",
+                "tab/→/l: next  shift+tab/←/h: previous  ↑/↓/j/k: move  space: stage  enter: commit  esc: discard",
             )
             .style(Style::default().fg(Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX))),
             layout[2],
@@ -775,6 +779,47 @@ mod tests {
         assert_eq!(dialog.active_tab(), Tab::Recursion);
         dialog.handle_key(shift_tab());
         assert_eq!(dialog.active_tab(), Tab::Mode);
+    }
+
+    #[test]
+    fn horizontal_keys_switch_tabs_with_wrap_and_preserve_cursors() {
+        let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
+        dialog.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(dialog.active_tab(), Tab::Model);
+        dialog.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(dialog.active_tab(), Tab::Mode);
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.active_tab(), Tab::Recursion);
+        dialog.handle_key(key(KeyCode::Down));
+        let recursion_cursor = dialog.active_cursor();
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.active_tab(), Tab::Trust);
+        let trust_cursor = dialog.active_cursor();
+        dialog.handle_key(key(KeyCode::Right));
+        assert_ne!(dialog.active_cursor(), trust_cursor);
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.active_tab(), Tab::Trust);
+        assert_eq!(dialog.active_cursor(), trust_cursor);
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.active_tab(), Tab::Recursion);
+        assert_eq!(dialog.active_cursor(), recursion_cursor);
+    }
+
+    #[test]
+    fn keybindings_advertise_horizontal_tab_switching() {
+        let group = QuickDialog::keybindings();
+        assert!(
+            group
+                .bindings
+                .iter()
+                .any(|binding| binding.key == "Tab/→/l")
+        );
+        assert!(
+            group
+                .bindings
+                .iter()
+                .any(|binding| binding.key == "Shift+Tab/←/h")
+        );
     }
 
     #[test]

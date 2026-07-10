@@ -4,7 +4,7 @@ title: Relay Signaling Service
 
 Flycockpit remote control uses a dedicated WebSocket relay service in `apps/relay`. Daemons connect outbound to `/ws/daemon`, browser/native clients connect to `/ws/client`, and user-level notification sockets connect to `/ws/user`.
 
-The relay verifies short-lived ES256 JWTs against the control plane JWKS endpoint at `/api/relay/jwks.json`. It never needs `BETTER_AUTH_SECRET`, model provider keys, or user credentials. Server deployments that run the relay on a separate origin should set `COCKPIT_RELAY_URL` to the public WebSocket base, for example `wss://relay.example.com/ws`, and set the same `RELAY_CONTROL_SECRET` on the server and relay.
+The relay verifies short-lived ES256 JWTs against the control plane JWKS endpoint at `/api/relay/jwks.json`. It never needs `BETTER_AUTH_SECRET`, model provider keys, or user credentials. Server deployments that run the relay on a separate origin should set `COCKPIT_RELAY_ID` and the relay process `RELAY_ID` to the same stable value, set `COCKPIT_RELAY_URL` to the public WebSocket base such as `wss://relay.example.com/ws`, and set the same `RELAY_CONTROL_SECRET` on the server and relay.
 
 Security posture for v1:
 
@@ -17,6 +17,7 @@ Security posture for v1:
 Key relay env vars:
 
 - `BETTER_AUTH_URL` or `RELAY_TOKEN_ISSUER`: issuer expected in relay JWTs.
+- `RELAY_ID`: stable relay identity used as the JWT audience. It must match the server's `COCKPIT_RELAY_ID` for the relay URL it returns.
 - `RELAY_JWKS_URL`: optional override for the control-plane JWKS URL; defaults to `<issuer>/api/relay/jwks.json`.
 - `RELAY_PORT`: HTTP/WebSocket listen port, default `3010`.
 - `RELAY_CONTROL_SECRET`: shared bearer secret used for relay-to-server ingest and server-to-relay control messages.

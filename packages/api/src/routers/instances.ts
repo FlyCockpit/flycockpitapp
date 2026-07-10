@@ -14,8 +14,8 @@ import {
   ownerTerminalGrant,
   requireActiveInstanceForAccess,
 } from "../lib/instance-sharing";
-import { relayWebSocketUrl } from "../lib/relay-config";
 import { createRelayToken } from "../lib/relay-tokens";
+import { requireConfiguredRelayForMint } from "../lib/relay-url";
 
 const TERMINAL_STEP_UP_GRACE_MS = 5 * 60 * 1000;
 
@@ -234,13 +234,17 @@ export const instancesRouter = {
       where: { id: instance.id },
       data: { lastSeenAt: new Date() },
     });
-    const relay = await createRelayToken({
-      tokenType: "connector",
-      instanceId: instance.id,
-      userId: instance.userId,
-      grants: [],
-    });
-    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayWebSocketUrl() };
+    const relayTarget = requireConfiguredRelayForMint();
+    const relay = await createRelayToken(
+      {
+        tokenType: "connector",
+        instanceId: instance.id,
+        userId: instance.userId,
+        grants: [],
+      },
+      relayTarget.relayId,
+    );
+    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayTarget.relayUrl };
   }),
 
   mintClientToken: protectedProcedure
@@ -258,13 +262,17 @@ export const instancesRouter = {
       if (!isOwner && grants.length === 0) {
         throw new ORPCError("NOT_FOUND", { message: "Instance not found." });
       }
-      const relay = await createRelayToken({
-        tokenType: "client",
-        instanceId: instance.id,
-        userId: context.session.user.id,
-        grants,
-      });
-      return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayWebSocketUrl() };
+      const relayTarget = requireConfiguredRelayForMint();
+      const relay = await createRelayToken(
+        {
+          tokenType: "client",
+          instanceId: instance.id,
+          userId: context.session.user.id,
+          grants,
+        },
+        relayTarget.relayId,
+      );
+      return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayTarget.relayUrl };
     }),
 
   mintTerminalClientToken: protectedProcedure
@@ -299,16 +307,20 @@ export const instancesRouter = {
           ? terminalStepUpExpiresAt(context.session.session.createdAt)
           : null;
       }
-      const relay = await createRelayToken({
-        tokenType: "client",
-        instanceId: instance.id,
-        userId: context.session.user.id,
-        grants,
-      });
+      const relayTarget = requireConfiguredRelayForMint();
+      const relay = await createRelayToken(
+        {
+          tokenType: "client",
+          instanceId: instance.id,
+          userId: context.session.user.id,
+          grants,
+        },
+        relayTarget.relayId,
+      );
       return {
         token: relay.token,
         expiresAt: relay.expiresAt,
-        relayUrl: relayWebSocketUrl(),
+        relayUrl: relayTarget.relayUrl,
         stepUpExpiresAt,
       };
     }),

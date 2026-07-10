@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createEnv } from "@t3-oss/env-core";
 import { config as loadEnv } from "dotenv";
@@ -44,7 +43,14 @@ export const env = createEnv({
   emptyStringAsUndefined: true,
 });
 
-export const RELAY_ID = env.RELAY_ID ?? os.hostname() + "-" + process.pid;
+function requiredRelayId(): string {
+  if (!env.RELAY_ID) {
+    throw new Error("[env] RELAY_ID is required for the relay.");
+  }
+  return env.RELAY_ID;
+}
+
+export const RELAY_ID: string = requiredRelayId();
 export const RELAY_PORT = env.RELAY_PORT ?? env.PORT ?? 3010;
 function requiredRelayIssuer(): string {
   const issuer = env.RELAY_TOKEN_ISSUER ?? env.BETTER_AUTH_URL;

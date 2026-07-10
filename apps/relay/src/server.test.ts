@@ -1,5 +1,9 @@
 import type { AddressInfo } from "node:net";
-import { signRelayToken, verifyRelayTokenWithSecret } from "@flycockpit/relay-protocol/tokens";
+import {
+  relayTokenPayloadSchema,
+  signRelayToken,
+  verifyRelayTokenWithSecret,
+} from "@flycockpit/relay-protocol/tokens";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { MemoryPresenceStore } from "./presence";
@@ -15,8 +19,8 @@ afterEach(async () => {
   handles = [];
 });
 
-async function token(input: Parameters<typeof signRelayToken>[0]) {
-  return (await signRelayToken(input, { secret, issuer })).token;
+async function token(input: Parameters<typeof signRelayToken>[0], audience = "relay-test") {
+  return (await signRelayToken(input, { secret, issuer, audience })).token;
 }
 
 async function startRelay(logs: string[] = [], overrides: Partial<RelayServerConfig> = {}) {
@@ -32,7 +36,8 @@ async function startRelay(logs: string[] = [], overrides: Partial<RelayServerCon
     maxConnectionsPerInstance: 10,
     clientRateLimitPerSecond: 100,
     presenceStore,
-    verifyToken: (raw) => verifyRelayTokenWithSecret(raw, { secret, issuer }),
+    verifyToken: (raw) =>
+      verifyRelayTokenWithSecret(raw, { secret, issuer, audience: "relay-test" }),
     logger: {
       info: (...args) => logs.push(args.join(" ")),
       warn: (...args) => logs.push(args.join(" ")),
@@ -94,6 +99,43 @@ describe("relay server", () => {
     const ws = connect(url, "/ws/daemon", "garbage");
 
     await expect(rejected(ws)).resolves.toBeUndefined();
+  });
+
+  it("refuses tokens minted for a different relay during websocket upgrade", async () => {
+    const { url } = await startRelay();
+    const daemon = connect(
+      url,
+      "/ws/daemon",
+      await token(
+        { tokenType: "connector", instanceId: "instance-1", userId: "owner-1" },
+        "relay-other",
+      ),
+    );
+
+    await expect(rejected(daemon)).resolves.toBeUndefined();
+  });
+
+  it("accepts array-form audiences when the verifier accepts this relay id", async () => {
+    const { handle, url } = await startRelay([], {
+      verifyToken: async () =>
+        relayTokenPayloadSchema.parse({
+          iss: issuer,
+          aud: ["relay-test"],
+          tokenType: "connector",
+          instanceId: "instance-1",
+          userId: "owner-1",
+          grants: [],
+          iat: 1,
+          exp: Math.floor(Date.now() / 1000) + 300,
+          jti: "array-audience",
+        }),
+    });
+    const daemon = connect(url, "/ws/daemon", "array-audience-token");
+
+    await opened(daemon);
+    await expect(waitForLease(handle, "instance-1")).resolves.toMatchObject({
+      relayId: "relay-test",
+    });
   });
 
   it("accepts a client connection but closes it with instance_offline when no daemon is present", async () => {

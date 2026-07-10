@@ -7,8 +7,8 @@ import {
   NOTIFICATION_TYPES,
   recordUserPresenceHeartbeat,
 } from "../lib/notifications";
-import { relayWebSocketUrl } from "../lib/relay-config";
 import { createRelayToken } from "../lib/relay-tokens";
+import { requireConfiguredRelayForMint } from "../lib/relay-url";
 
 function serializeNotification(notification: {
   id: string;
@@ -109,12 +109,16 @@ export const notificationsRouter = {
     }),
 
   mintUserRelayToken: protectedProcedure.handler(async ({ context }) => {
-    const relay = await createRelayToken({
-      tokenType: "user",
-      userId: context.session.user.id,
-      grants: [],
-    });
-    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayWebSocketUrl() };
+    const relayTarget = requireConfiguredRelayForMint();
+    const relay = await createRelayToken(
+      {
+        tokenType: "user",
+        userId: context.session.user.id,
+        grants: [],
+      },
+      relayTarget.relayId,
+    );
+    return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayTarget.relayUrl };
   }),
 
   myPreferences: protectedProcedure.handler(async ({ context }) => {

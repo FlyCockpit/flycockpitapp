@@ -74,6 +74,9 @@
     },
     "./lib/relay-credentials": {
       "default": "./src/lib/relay-credentials.ts"
+    },
+    "./lib/relay-url": {
+      "default": "./src/lib/relay-url.ts"
     }
   },
   "scripts": {

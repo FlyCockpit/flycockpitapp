@@ -21,6 +21,7 @@ vi.mock("@flycockpit/env/server", () => ({
     PRODUCT_NAME: "Flycockpit",
     COCKPIT_INSTANCE_LIMIT: 2,
     COCKPIT_INSTANCE_GRANTEE_LIMIT: 2,
+    COCKPIT_RELAY_ID: "relay-test",
     COCKPIT_RELAY_URL: "wss://relay.example.test/ws",
     RELAY_CONTROL_SECRET: "1234567890abcdef1234567890abcdef",
   },

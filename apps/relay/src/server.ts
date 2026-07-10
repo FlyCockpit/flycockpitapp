@@ -134,7 +134,11 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
   const presenceStore = config.presenceStore ?? createPresenceStore(config.redisUrl);
   const verifyToken =
     config.verifyToken ??
-    createRemoteRelayTokenVerifier({ jwksUrl: config.jwksUrl, issuer: config.tokenIssuer });
+    createRemoteRelayTokenVerifier({
+      jwksUrl: config.jwksUrl,
+      issuer: config.tokenIssuer,
+      audience: config.relayId,
+    });
   const daemonWss = new WebSocketServer({
     noServer: true,
     maxPayload: config.maxFrameBytes,

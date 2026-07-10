@@ -22,14 +22,19 @@ vi.mock("@flycockpit/env/server", () => ({
     DEPLOYMENT_PROFILE: "oss",
     PRODUCT_NAME: "Flycockpit",
     COCKPIT_INSTANCE_LIMIT: 2,
+    COCKPIT_RELAY_ID: "relay-test",
     COCKPIT_RELAY_URL: "wss://relay.example.test/ws",
+    RELAY_CONTROL_SECRET: "x".repeat(32),
   },
 }));
 
 const { default: prisma } = await import("@flycockpit/db");
 const { env } = await import("@flycockpit/env/server");
 
-const mutableEnv = env as unknown as { DEPLOYMENT_PROFILE: "hosted" | "enterprise" | "oss" };
+const mutableEnv = env as unknown as {
+  DEPLOYMENT_PROFILE: "hosted" | "enterprise" | "oss";
+  COCKPIT_RELAY_ID?: string;
+};
 
 const db = prisma as unknown as {
   appSetting: { findMany: MockInstance };
@@ -103,6 +108,7 @@ describe("instancesRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mutableEnv.DEPLOYMENT_PROFILE = "oss";
+    mutableEnv.COCKPIT_RELAY_ID = "relay-test";
     db.appSetting.findMany.mockResolvedValue([]);
     db.user.findUnique.mockResolvedValue({ plan: "FREE", hostedTrialEndsAt: null });
     db.instanceAccessGrant.findMany.mockResolvedValue([]);
@@ -187,15 +193,34 @@ describe("instancesRouter", () => {
     });
 
     expect(result.relayUrl).toBe("wss://relay.example.test/ws");
-    const payload = await verifyRelayToken(result.token);
+    const payload = await verifyRelayToken(result.token, "relay-test");
     expect(payload).toMatchObject({
-      aud: "relay",
+      aud: "relay-test",
       tokenType: "connector",
       instanceId: "instance-1",
       userId: "user-1",
       grants: [],
     });
     expect(payload!.exp - payload!.iat).toBe(300);
+  });
+
+  it("returns service unavailable when no relay id is configured for minting", async () => {
+    const credential = createInstanceCredential();
+    mutableEnv.COCKPIT_RELAY_ID = undefined;
+    db.cockpitInstance.findUnique.mockResolvedValue(
+      instance({ secretPrefix: credential.prefix, secretHash: credential.hash }),
+    );
+    db.cockpitInstance.update.mockResolvedValue(instance());
+
+    const client = createRouterClient(instancesRouter, { context: buildContext(null) });
+
+    await expect(
+      client.mintConnectorToken({ instanceId: "instance-1", instanceToken: credential.token }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("SERVICE_UNAVAILABLE");
+      expect(error.message).toContain("COCKPIT_RELAY_ID");
+      return true;
+    });
   });
 
   it("blocks connector tokens when the owner's plan has no instance entitlement", async () => {
@@ -242,9 +267,13 @@ describe("instancesRouter", () => {
 
     const client = createRouterClient(instancesRouter, { context: buildContext() });
     const result = await client.mintClientToken({ instanceId: "instance-1" });
-    const payload = await verifyRelayToken(result.token);
+    const payload = await verifyRelayToken(result.token, "relay-test");
 
-    expect(payload).toMatchObject({ tokenType: "client", aud: "relay", instanceId: "instance-1" });
+    expect(payload).toMatchObject({
+      tokenType: "client",
+      aud: "relay-test",
+      instanceId: "instance-1",
+    });
     expect(payload?.grants.map((grant) => grant.scope).sort()).toEqual([
       "agent",
       "agent_readonly",
@@ -263,7 +292,7 @@ describe("instancesRouter", () => {
       context: buildContext({ id: "grantee-1", email: "grantee@example.test" }),
     });
     const result = await client.mintClientToken({ instanceId: "instance-1" });
-    const payload = await verifyRelayToken(result.token);
+    const payload = await verifyRelayToken(result.token, "relay-test");
 
     expect(payload).toMatchObject({
       tokenType: "client",
@@ -305,7 +334,7 @@ describe("instancesRouter", () => {
       >),
     });
     const result = await client.mintTerminalClientToken({ instanceId: "instance-1" });
-    const payload = await verifyRelayToken(result.token);
+    const payload = await verifyRelayToken(result.token, "relay-test");
 
     expect(payload?.grants).toEqual([{ scope: "terminal", projectRoot: null }]);
     expect(result.stepUpExpiresAt).toBeInstanceOf(Date);

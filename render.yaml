@@ -115,6 +115,8 @@ services:
         value: "10485760"          # 10 MiB hard cap on a single asset upload
       # Public WebSocket base returned by instances.mint*Token. Set this to the
       # relay service URL with /ws, e.g. wss://relay-xxxx.onrender.com/ws.
+      - key: COCKPIT_RELAY_ID
+        value: relay-primary
       - key: COCKPIT_RELAY_URL
         sync: false
       # ---- SSO / enterprise login (opt-in, server-only) ---------------------
@@ -196,6 +198,8 @@ services:
         sync: false
       - key: RELAY_TOKEN_ISSUER
         sync: false
+      - key: RELAY_ID
+        value: relay-primary
       - key: RELAY_JWKS_URL
         sync: false
       - key: RELAY_CONTROL_INGEST_URL

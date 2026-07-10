@@ -19,6 +19,7 @@ vi.mock("@flycockpit/env/server", () => ({
   env: {
     BETTER_AUTH_SECRET: "1234567890abcdef1234567890abcdef",
     BETTER_AUTH_URL: "http://localhost:3000",
+    COCKPIT_RELAY_ID: "relay-test",
     COCKPIT_RELAY_URL: "wss://relay.example.test/ws",
     RELAY_CONTROL_SECRET: "1234567890abcdef1234567890abcdef",
   },

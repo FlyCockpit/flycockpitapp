@@ -8681,12 +8681,16 @@ impl App {
                 enabled,
                 status,
                 relay_url,
+                relay_id,
+                relay_region,
                 last_error,
             } => {
                 self.connector_disclosure = Some(crate::db::connector::ConnectorDisclosure {
                     enabled,
                     status,
                     relay_url,
+                    relay_id,
+                    relay_region,
                     last_error,
                 });
             }

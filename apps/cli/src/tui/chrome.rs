@@ -477,6 +477,8 @@ mod connector_tests {
             enabled: true,
             status: "connected".to_string(),
             relay_url: Some("wss://relay.example/ws".to_string()),
+            relay_id: Some("relay-1".to_string()),
+            relay_region: Some("iad".to_string()),
             last_error: None,
         };
         let spans = connector_spans(Some(&disclosure));

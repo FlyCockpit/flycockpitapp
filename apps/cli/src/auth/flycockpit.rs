@@ -34,6 +34,34 @@ pub struct StoredFlycockpitCredential {
     pub account: AccountInfo,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_choice: Option<RelayChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayChoice {
+    pub relay_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    pub ws_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
+    pub chosen_at: i64,
+}
+
+impl RelayChoice {
+    pub fn is_fresh_at(&self, now_ms: i64) -> bool {
+        const TTL_MS: i64 = 30 * 60 * 1000;
+        now_ms.saturating_sub(self.chosen_at) < TTL_MS
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCandidate {
+    pub relay_id: String,
+    pub region: Option<String>,
+    pub ws_url: String,
 }
 
 impl fmt::Debug for StoredFlycockpitCredential {
@@ -44,6 +72,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
             .field("instance_token", &"<redacted>")
             .field("account", &self.account)
             .field("display_name", &self.display_name)
+            .field("relay_choice", &self.relay_choice)
             .finish()
     }
 }
@@ -117,6 +146,22 @@ struct ConnectorTokenResponse {
     expires_at: Option<String>,
     #[serde(default, alias = "relayUrl")]
     relay_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RelayCandidatesResponse {
+    #[serde(default)]
+    relays: Vec<RelayCandidateResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RelayCandidateResponse {
+    #[serde(alias = "relayId")]
+    relay_id: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(alias = "wsUrl")]
+    ws_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +291,7 @@ impl FlycockpitClient {
                 email: registered.account.email,
             },
             display_name: display_name.or_else(|| Some(default_display_name())),
+            relay_choice: None,
         })
     }
 
@@ -372,9 +418,46 @@ impl FlycockpitClient {
         Err(classify_http_error("instance.revoke", status, &body))
     }
 
+    pub async fn list_relay_candidates(
+        &self,
+        credential: &StoredFlycockpitCredential,
+    ) -> Result<Vec<RelayCandidate>> {
+        let url = endpoint(&self.server_url, "/rpc/instances/listRelayCandidates")?;
+        let resp = self
+            .http
+            .post(url)
+            .header("x-csrf-token", "cockpit-cli")
+            .json(&json!({
+                "json": {
+                    "instanceId": credential.instance_id,
+                    "instanceToken": credential.instance_token,
+                }
+            }))
+            .send()
+            .await
+            .context("listing Flycockpit relay candidates")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            let parsed: RelayCandidatesResponse =
+                parse_orpc_json(&body).context("parsing Flycockpit relay candidate response")?;
+            return Ok(parsed
+                .relays
+                .into_iter()
+                .map(|relay| RelayCandidate {
+                    relay_id: relay.relay_id,
+                    region: relay.region,
+                    ws_url: relay.ws_url,
+                })
+                .collect());
+        }
+        Err(classify_http_error("relay candidates", status, &body))
+    }
+
     pub async fn mint_connector_token(
         &self,
         credential: &StoredFlycockpitCredential,
+        relay_id: &str,
     ) -> Result<ConnectorToken> {
         let url = endpoint(&self.server_url, "/rpc/instances/mintConnectorToken")?;
         let resp = self
@@ -385,6 +468,7 @@ impl FlycockpitClient {
                 "json": {
                     "instanceId": credential.instance_id,
                     "instanceToken": credential.instance_token,
+                    "relayId": relay_id,
                 }
             }))
             .send()
@@ -417,7 +501,19 @@ impl FlycockpitClient {
         &self,
         credential: &StoredFlycockpitCredential,
     ) -> ConnectionStatus {
-        match self.mint_connector_token(credential).await {
+        let relay_id = match credential.relay_choice.as_ref() {
+            Some(choice) if choice.is_fresh_at(chrono::Utc::now().timestamp_millis()) => {
+                choice.relay_id.clone()
+            }
+            _ => match self.list_relay_candidates(credential).await {
+                Ok(candidates) => match candidates.first() {
+                    Some(candidate) => candidate.relay_id.clone(),
+                    None => return ConnectionStatus::Unknown,
+                },
+                Err(error) => return ConnectionStatus::Error(error.to_string()),
+            },
+        };
+        match self.mint_connector_token(credential, &relay_id).await {
             Ok(token) => ConnectionStatus::Online {
                 relay_url: Some(token.relay_url),
             },
@@ -458,6 +554,16 @@ pub fn store_credential(credential: &StoredFlycockpitCredential) -> Result<()> {
     store.save()?;
     register_credential_for_redaction(credential);
     Ok(())
+}
+
+pub fn store_relay_choice(
+    credential: &StoredFlycockpitCredential,
+    choice: Option<RelayChoice>,
+) -> Result<StoredFlycockpitCredential> {
+    let mut next = credential.clone();
+    next.relay_choice = choice;
+    store_credential(&next)?;
+    Ok(next)
 }
 
 pub fn clear_credential() -> Result<()> {
@@ -824,6 +930,52 @@ mod tests {
         let register_request = seen[3].to_ascii_lowercase();
         assert!(register_request.contains("authorization: bearer session-token"));
         assert!(seen[3].contains("\"displayName\":\"Devbox\""));
+    }
+
+    #[tokio::test]
+    async fn relay_candidates_and_connector_mint_use_orpc_envelopes() {
+        let (server, requests) = start_test_server(vec![
+            response(
+                200,
+                r#"{"json":{"relays":[{"relayId":"relay-fast","region":"iad","wsUrl":"wss://relay-fast.example.test/ws"}]}}"#,
+            ),
+            response(
+                200,
+                r#"{"json":{"token":"relay-token","expiresAt":"2026-07-10T12:00:00.000Z","relayUrl":"wss://relay-fast.example.test/ws"}}"#,
+            ),
+        ])
+        .await;
+        let credential = StoredFlycockpitCredential {
+            server_url: server.clone(),
+            instance_id: "inst-1".to_string(),
+            instance_token: "fci_secret".to_string(),
+            account: AccountInfo {
+                user_id: "user-1".to_string(),
+                email: "user@example.test".to_string(),
+            },
+            display_name: Some("Devbox".to_string()),
+            relay_choice: None,
+        };
+        let client = FlycockpitClient::new(&server).unwrap();
+
+        let candidates = client.list_relay_candidates(&credential).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relay_id, "relay-fast");
+        assert_eq!(candidates[0].region.as_deref(), Some("iad"));
+
+        let token = client
+            .mint_connector_token(&credential, "relay-fast")
+            .await
+            .unwrap();
+        assert_eq!(token.relay_url, "wss://relay-fast.example.test/ws");
+
+        let seen = requests.lock().await;
+        assert!(seen[0].contains("POST /rpc/instances/listRelayCandidates "));
+        assert!(
+            seen[0].contains(r#"{"json":{"instanceId":"inst-1","instanceToken":"fci_secret"}}"#)
+        );
+        assert!(seen[1].contains("POST /rpc/instances/mintConnectorToken "));
+        assert!(seen[1].contains(r#""relayId":"relay-fast""#));
     }
 
     #[tokio::test]

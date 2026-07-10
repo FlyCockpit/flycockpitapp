@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, future::join_all};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -13,7 +13,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
 use crate::auth::flycockpit::{
-    FlycockpitClient, StoredFlycockpitCredential, clear_credential, maybe_load_credential,
+    FlycockpitClient, RelayCandidate, RelayChoice, StoredFlycockpitCredential, clear_credential,
+    maybe_load_credential, store_relay_choice,
 };
 use crate::daemon::principal::ClientPrincipal;
 use crate::daemon::proto::{self, Body, Envelope, Event, InterruptQuestion};
@@ -21,8 +22,8 @@ use crate::daemon::relay_envelope::{
     IncomingRelayFrame, RelayPrincipal, daemon_client_frame, daemon_control_frame, parse_incoming,
 };
 use crate::daemon::server::DaemonContext;
+use crate::db::connector::ConnectorStatusUpdate;
 
-const CONNECTOR_POLL_SECS: u64 = 60;
 const CHANNEL_BUFFER: usize = 128;
 const OUTBOUND_BUFFER: usize = 256;
 const CHANNEL_DUPLEX_BYTES: usize = proto::MAX_FRAME_BYTES;
@@ -30,6 +31,9 @@ const ATTENTION_EVENT: &str = "attention";
 const PRESENCE_EVENT: &str = "presence";
 const HEARTBEAT_SECS: u64 = 30;
 const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const COLD_PROBE_JITTER_MAX: Duration = Duration::from_secs(3);
+const STABLE_CONNECTION_RESET: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorRunOutcome {
@@ -60,8 +64,7 @@ pub fn spawn_background(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> 
             match sync_once(ctx.clone(), &mut wake_rx).await {
                 Ok(ConnectorRunOutcome::Revoked) => break,
                 Ok(ConnectorRunOutcome::Disabled) => {
-                    sleep_or_connector_wake(&mut wake_rx, Duration::from_secs(CONNECTOR_POLL_SECS))
-                        .await;
+                    sleep_or_connector_wake(&mut wake_rx, Duration::from_secs(60)).await;
                 }
                 Ok(ConnectorRunOutcome::Disconnected) => {
                     sleep_or_connector_wake(&mut wake_rx, Duration::from_secs(1)).await;
@@ -101,9 +104,13 @@ async fn sync_once(
             &ctx,
             &credential,
             false,
-            "off",
-            state.relay_url.as_deref(),
-            None,
+            ConnectorStatusUpdate {
+                status: "off",
+                relay_url: state.relay_url.as_deref(),
+                relay_id: state.relay_id.as_deref(),
+                relay_region: state.relay_region.as_deref(),
+                last_error: None,
+            },
         );
         return Ok(ConnectorRunOutcome::Disabled);
     }
@@ -113,10 +120,12 @@ async fn sync_once(
 
 async fn run_enabled_connector(
     ctx: Arc<DaemonContext>,
-    credential: StoredFlycockpitCredential,
+    mut credential: StoredFlycockpitCredential,
     wake_rx: &mut watch::Receiver<u64>,
 ) -> Result<ConnectorRunOutcome> {
     let mut backoff = Backoff::default();
+    let mut jitter = SystemJitter;
+    let mut first_connect = true;
     loop {
         if ctx.shutdown_signal().is_draining() {
             return Ok(ConnectorRunOutcome::Disconnected);
@@ -132,9 +141,13 @@ async fn run_enabled_connector(
                 &ctx,
                 &credential,
                 false,
-                "off",
-                state.relay_url.as_deref(),
-                None,
+                ConnectorStatusUpdate {
+                    status: "off",
+                    relay_url: state.relay_url.as_deref(),
+                    relay_id: state.relay_id.as_deref(),
+                    relay_region: state.relay_region.as_deref(),
+                    last_error: None,
+                },
             );
             return Ok(ConnectorRunOutcome::Disabled);
         }
@@ -143,46 +156,185 @@ async fn run_enabled_connector(
             &ctx,
             &credential,
             true,
-            "reconnecting",
-            state.relay_url.as_deref(),
-            None,
+            ConnectorStatusUpdate {
+                status: "reconnecting",
+                relay_url: state.relay_url.as_deref(),
+                relay_id: state.relay_id.as_deref(),
+                relay_region: state.relay_region.as_deref(),
+                last_error: None,
+            },
         );
-        let token = match FlycockpitClient::new(&credential.server_url) {
-            Ok(client) => client.mint_connector_token(&credential).await,
-            Err(error) => Err(error),
-        };
-        let token = match token {
-            Ok(token) => token,
+
+        let client = match FlycockpitClient::new(&credential.server_url) {
+            Ok(client) => client,
             Err(error) => {
                 let message = error.to_string();
                 publish_status(
                     &ctx,
                     &credential,
                     true,
-                    "reconnecting",
-                    state.relay_url.as_deref(),
-                    Some(&message),
+                    ConnectorStatusUpdate {
+                        status: "reconnecting",
+                        relay_url: state.relay_url.as_deref(),
+                        relay_id: state.relay_id.as_deref(),
+                        relay_region: state.relay_region.as_deref(),
+                        last_error: Some(&message),
+                    },
                 );
-                if is_terminal_auth_error(&message) {
-                    let _ = clear_credential();
-                    let _ = ctx.db.set_connector_enabled(
-                        &credential.server_url,
-                        &credential.instance_id,
-                        false,
-                    );
-                    publish_status(&ctx, &credential, false, "off", None, Some(&message));
-                    return Ok(ConnectorRunOutcome::Revoked);
-                }
-                sleep_or_connector_wake(wake_rx, backoff.next()).await;
+                sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
                 continue;
             }
         };
-        let relay_url = token.relay_url.clone();
+
+        let mut stale_cache_retry = false;
+        let (choice, token) = loop {
+            let selected =
+                match select_relay(&client, &credential, first_connect, &mut jitter).await {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => {
+                        let message = "no relay candidates available";
+                        publish_status(
+                            &ctx,
+                            &credential,
+                            true,
+                            ConnectorStatusUpdate {
+                                status: "reconnecting",
+                                relay_url: state.relay_url.as_deref(),
+                                relay_id: state.relay_id.as_deref(),
+                                relay_region: state.relay_region.as_deref(),
+                                last_error: Some(message),
+                            },
+                        );
+                        first_connect = false;
+                        sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        publish_status(
+                            &ctx,
+                            &credential,
+                            true,
+                            ConnectorStatusUpdate {
+                                status: "reconnecting",
+                                relay_url: state.relay_url.as_deref(),
+                                relay_id: state.relay_id.as_deref(),
+                                relay_region: state.relay_region.as_deref(),
+                                last_error: Some(&message),
+                            },
+                        );
+                        if is_terminal_auth_error(&message) {
+                            let _ = clear_credential();
+                            let _ = ctx.db.set_connector_enabled(
+                                &credential.server_url,
+                                &credential.instance_id,
+                                false,
+                            );
+                            publish_status(
+                                &ctx,
+                                &credential,
+                                false,
+                                ConnectorStatusUpdate {
+                                    status: "off",
+                                    relay_url: None,
+                                    relay_id: None,
+                                    relay_region: None,
+                                    last_error: Some(&message),
+                                },
+                            );
+                            return Ok(ConnectorRunOutcome::Revoked);
+                        }
+                        first_connect = false;
+                        sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
+                        continue;
+                    }
+                };
+
+            match client
+                .mint_connector_token(&credential, &selected.choice.relay_id)
+                .await
+            {
+                Ok(token) => break (selected.choice, token),
+                Err(error)
+                    if selected.from_cache
+                        && !stale_cache_retry
+                        && is_not_found_error(&error.to_string()) =>
+                {
+                    stale_cache_retry = true;
+                    first_connect = false;
+                    match store_relay_choice(&credential, None) {
+                        Ok(next) => credential = next,
+                        Err(store_error) => {
+                            tracing::warn!(error = %store_error, "clearing cached relay choice failed");
+                            credential.relay_choice = None;
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    publish_status(
+                        &ctx,
+                        &credential,
+                        true,
+                        ConnectorStatusUpdate {
+                            status: "reconnecting",
+                            relay_url: Some(&selected.choice.ws_url),
+                            relay_id: Some(&selected.choice.relay_id),
+                            relay_region: selected.choice.region.as_deref(),
+                            last_error: Some(&message),
+                        },
+                    );
+                    if is_terminal_auth_error(&message) {
+                        let _ = clear_credential();
+                        let _ = ctx.db.set_connector_enabled(
+                            &credential.server_url,
+                            &credential.instance_id,
+                            false,
+                        );
+                        publish_status(
+                            &ctx,
+                            &credential,
+                            false,
+                            ConnectorStatusUpdate {
+                                status: "off",
+                                relay_url: None,
+                                relay_id: None,
+                                relay_region: None,
+                                last_error: Some(&message),
+                            },
+                        );
+                        return Ok(ConnectorRunOutcome::Revoked);
+                    }
+                    first_connect = false;
+                    sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
+                    continue;
+                }
+            }
+        };
+
+        first_connect = false;
+        match store_relay_choice(&credential, Some(choice.clone())) {
+            Ok(next) => credential = next,
+            Err(error) => tracing::warn!(error = %error, "storing cached relay choice failed"),
+        }
+        let relay_url = choice.ws_url.clone();
         let ws_url = daemon_ws_url(&relay_url)?;
         match connect_relay_socket(&ws_url, &token.token).await {
             Ok(ws) => {
-                backoff.reset();
-                publish_status(&ctx, &credential, true, "connected", Some(&relay_url), None);
+                publish_status(
+                    &ctx,
+                    &credential,
+                    true,
+                    ConnectorStatusUpdate {
+                        status: "connected",
+                        relay_url: Some(&relay_url),
+                        relay_id: Some(&choice.relay_id),
+                        relay_region: choice.region.as_deref(),
+                        last_error: None,
+                    },
+                );
+                let connected_at = Instant::now();
                 let refresh_after = token_refresh_delay(token.expires_at.as_deref());
                 let mut socket_wake_rx = wake_rx.clone();
                 let outcome = tokio::select! {
@@ -195,6 +347,9 @@ async fn run_enabled_connector(
                     ) => outcome,
                     _ = socket_wake_rx.changed() => Ok(ConnectorRunOutcome::Refresh),
                 };
+                if connected_at.elapsed() >= STABLE_CONNECTION_RESET {
+                    backoff.reset();
+                }
                 match outcome {
                     Ok(ConnectorRunOutcome::Revoked) => return Ok(ConnectorRunOutcome::Revoked),
                     Ok(ConnectorRunOutcome::Refresh) => {
@@ -202,9 +357,13 @@ async fn run_enabled_connector(
                             &ctx,
                             &credential,
                             true,
-                            "reconnecting",
-                            Some(&relay_url),
-                            Some("refreshing connector token"),
+                            ConnectorStatusUpdate {
+                                status: "reconnecting",
+                                relay_url: Some(&relay_url),
+                                relay_id: Some(&choice.relay_id),
+                                relay_region: choice.region.as_deref(),
+                                last_error: Some("refreshing connector token"),
+                            },
                         );
                         continue;
                     }
@@ -213,9 +372,13 @@ async fn run_enabled_connector(
                             &ctx,
                             &credential,
                             true,
-                            "reconnecting",
-                            Some(&relay_url),
-                            Some("relay socket disconnected"),
+                            ConnectorStatusUpdate {
+                                status: "reconnecting",
+                                relay_url: Some(&relay_url),
+                                relay_id: Some(&choice.relay_id),
+                                relay_region: choice.region.as_deref(),
+                                last_error: Some("relay socket disconnected"),
+                            },
                         );
                     }
                     Err(error) => {
@@ -224,9 +387,13 @@ async fn run_enabled_connector(
                             &ctx,
                             &credential,
                             true,
-                            "reconnecting",
-                            Some(&relay_url),
-                            Some(&message),
+                            ConnectorStatusUpdate {
+                                status: "reconnecting",
+                                relay_url: Some(&relay_url),
+                                relay_id: Some(&choice.relay_id),
+                                relay_region: choice.region.as_deref(),
+                                last_error: Some(&message),
+                            },
                         );
                     }
                 }
@@ -237,14 +404,178 @@ async fn run_enabled_connector(
                     &ctx,
                     &credential,
                     true,
-                    "reconnecting",
-                    Some(&relay_url),
-                    Some(&message),
+                    ConnectorStatusUpdate {
+                        status: "reconnecting",
+                        relay_url: Some(&relay_url),
+                        relay_id: Some(&choice.relay_id),
+                        relay_region: choice.region.as_deref(),
+                        last_error: Some(&message),
+                    },
                 );
             }
         }
-        sleep_or_connector_wake(wake_rx, backoff.next()).await;
+        sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
     }
+}
+
+#[derive(Debug, Clone)]
+struct SelectedRelay {
+    choice: RelayChoice,
+    from_cache: bool,
+}
+
+trait JitterSource {
+    fn duration_below(&mut self, cap: Duration) -> Duration;
+}
+
+struct SystemJitter;
+
+impl JitterSource for SystemJitter {
+    fn duration_below(&mut self, cap: Duration) -> Duration {
+        random_duration_below(cap)
+    }
+}
+
+async fn select_relay(
+    client: &FlycockpitClient,
+    credential: &StoredFlycockpitCredential,
+    first_connect: bool,
+    jitter: &mut impl JitterSource,
+) -> Result<Option<SelectedRelay>> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(choice) = credential
+        .relay_choice
+        .as_ref()
+        .filter(|choice| choice.is_fresh_at(now_ms))
+    {
+        return Ok(Some(SelectedRelay {
+            choice: choice.clone(),
+            from_cache: true,
+        }));
+    }
+
+    let candidates = client.list_relay_candidates(credential).await?;
+    select_relay_from_candidates(candidates, first_connect, jitter).await
+}
+
+async fn select_relay_from_candidates(
+    candidates: Vec<RelayCandidate>,
+    first_connect: bool,
+    jitter: &mut impl JitterSource,
+) -> Result<Option<SelectedRelay>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if candidates.len() == 1 {
+        return Ok(Some(SelectedRelay {
+            choice: choice_from_candidate(candidates[0].clone(), None),
+            from_cache: false,
+        }));
+    }
+
+    if !first_connect {
+        tokio::time::sleep(jitter.duration_below(COLD_PROBE_JITTER_MAX)).await;
+    }
+
+    let http = reqwest::Client::new();
+    let probes = join_all(
+        candidates
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, candidate)| probe_candidate(http.clone(), idx, candidate)),
+    )
+    .await;
+    let mut best: Option<ProbeResult> = None;
+    for probe in probes.into_iter().flatten() {
+        match best.as_ref() {
+            None => best = Some(probe),
+            Some(current) => {
+                if probe.rtt + Duration::from_millis(10) < current.rtt {
+                    best = Some(probe);
+                }
+            }
+        }
+    }
+
+    let choice = if let Some(best) = best {
+        choice_from_candidate(
+            best.candidate,
+            Some(best.rtt.as_millis().min(u128::from(u64::MAX)) as u64),
+        )
+    } else {
+        tracing::warn!("all relay health probes failed; falling back to first listed relay");
+        choice_from_candidate(candidates[0].clone(), None)
+    };
+    Ok(Some(SelectedRelay {
+        choice,
+        from_cache: false,
+    }))
+}
+
+#[derive(Debug)]
+struct ProbeResult {
+    candidate: RelayCandidate,
+    rtt: Duration,
+}
+
+async fn probe_candidate(
+    http: reqwest::Client,
+    _idx: usize,
+    candidate: RelayCandidate,
+) -> Option<ProbeResult> {
+    let url = healthz_url(&candidate.ws_url).ok()?;
+    let started = Instant::now();
+    let response = tokio::time::timeout(PROBE_TIMEOUT, http.get(url).send())
+        .await
+        .ok()?
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    Some(ProbeResult {
+        candidate,
+        rtt: started.elapsed(),
+    })
+}
+
+fn choice_from_candidate(candidate: RelayCandidate, rtt_ms: Option<u64>) -> RelayChoice {
+    RelayChoice {
+        relay_id: candidate.relay_id,
+        region: candidate.region,
+        ws_url: candidate.ws_url,
+        rtt_ms,
+        chosen_at: chrono::Utc::now().timestamp_millis(),
+    }
+}
+
+fn healthz_url(ws_url: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(ws_url).context("parsing relay candidate URL")?;
+    match url.scheme() {
+        "wss" => url
+            .set_scheme("https")
+            .map_err(|_| anyhow::anyhow!("invalid https scheme"))?,
+        "ws" => url
+            .set_scheme("http")
+            .map_err(|_| anyhow::anyhow!("invalid http scheme"))?,
+        scheme => anyhow::bail!("relay URL must use ws or wss, got {scheme}"),
+    }
+    url.set_path("/healthz");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn is_not_found_error(message: &str) -> bool {
+    message.contains("404") || message.to_ascii_lowercase().contains("not found")
+}
+
+fn random_duration_below(cap: Duration) -> Duration {
+    let max_millis = cap.as_millis().min(u128::from(u64::MAX)) as u64;
+    if max_millis == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(rand::random_range(0..=max_millis))
 }
 
 async fn connect_relay_socket(
@@ -472,24 +803,21 @@ fn publish_status(
     ctx: &DaemonContext,
     credential: &StoredFlycockpitCredential,
     enabled: bool,
-    status: &str,
-    relay_url: Option<&str>,
-    last_error: Option<&str>,
+    update: ConnectorStatusUpdate<'_>,
 ) {
-    if let Err(error) = ctx.db.update_connector_status(
-        &credential.server_url,
-        &credential.instance_id,
-        status,
-        relay_url,
-        last_error,
-    ) {
+    if let Err(error) =
+        ctx.db
+            .update_connector_status(&credential.server_url, &credential.instance_id, update)
+    {
         tracing::warn!(error = %error, "updating connector status failed");
     }
     ctx.broadcast_global(Event::ConnectorStatus {
         enabled,
-        status: status.to_string(),
-        relay_url: relay_url.map(str::to_string),
-        last_error: last_error.map(str::to_string),
+        status: update.status.to_string(),
+        relay_url: update.relay_url.map(str::to_string),
+        relay_id: update.relay_id.map(str::to_string),
+        relay_region: update.relay_region.map(str::to_string),
+        last_error: update.last_error.map(str::to_string),
     });
 }
 
@@ -599,34 +927,42 @@ fn token_refresh_delay(expires_at: Option<&str>) -> Option<Duration> {
     Some(Duration::from_millis(millis))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Backoff {
-    idx: usize,
+    attempt: u32,
+    base: Duration,
+    cap: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            attempt: 0,
+            base: Duration::from_secs(1),
+            cap: Duration::from_secs(60),
+        }
+    }
 }
 
 impl Backoff {
-    fn next(&mut self) -> Duration {
-        const STEPS: &[u64] = &[1, 2, 5, 15, 60];
-        let secs = STEPS[self.idx.min(STEPS.len() - 1)];
-        self.idx = self.idx.saturating_add(1);
-        Duration::from_secs(secs) + jitter_for_step(secs)
+    fn next(&mut self, jitter: &mut impl JitterSource) -> Duration {
+        let shift = self.attempt.min(20);
+        let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let max = self.base.saturating_mul(multiplier).min(self.cap);
+        self.attempt = self.attempt.saturating_add(1);
+        jitter.duration_below(max)
     }
 
     fn reset(&mut self) {
-        self.idx = 0;
+        self.attempt = 0;
     }
-}
-
-fn jitter_for_step(secs: u64) -> Duration {
-    let max_millis = (secs * 250).max(1);
-    let now = chrono::Utc::now().timestamp_millis().unsigned_abs();
-    Duration::from_millis(now % max_millis)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::auth::flycockpit::AccountInfo;
     use crate::daemon::proto::{ErrorCode, ErrorPayload, Request, Response};
@@ -645,6 +981,7 @@ mod tests {
                 email: "owner@example.test".to_string(),
             },
             display_name: Some("devbox".to_string()),
+            relay_choice: None,
         }
     }
 
@@ -701,6 +1038,73 @@ mod tests {
                 return msg.into_text().unwrap().to_string();
             }
         }
+    }
+
+    #[derive(Default)]
+    struct ZeroJitter;
+
+    impl JitterSource for ZeroJitter {
+        fn duration_below(&mut self, _cap: Duration) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    struct AlternatingJitter {
+        high: bool,
+    }
+
+    impl JitterSource for AlternatingJitter {
+        fn duration_below(&mut self, cap: Duration) -> Duration {
+            self.high = !self.high;
+            if self.high { cap } else { Duration::ZERO }
+        }
+    }
+
+    struct RecordingJitter {
+        calls: usize,
+        value: Duration,
+    }
+
+    impl JitterSource for RecordingJitter {
+        fn duration_below(&mut self, cap: Duration) -> Duration {
+            self.calls += 1;
+            self.value.min(cap)
+        }
+    }
+
+    async fn health_server(delay: Duration, status: u16) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.readable().await;
+                    let _ = stream.try_read(&mut buf);
+                    tokio::time::sleep(delay).await;
+                    let status_text = if status == 200 { "OK" } else { "ERROR" };
+                    let body = if status == 200 {
+                        r#"{"ok":true}"#
+                    } else {
+                        r#"{"ok":false}"#
+                    };
+                    let raw = format!(
+                        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.writable().await;
+                    let _ = stream.try_write(raw.as_bytes());
+                });
+            }
+        });
+        (format!("ws://{addr}/ws"), count)
     }
 
     #[test]
@@ -893,14 +1297,196 @@ mod tests {
     }
 
     #[test]
-    fn backoff_ladder_adds_bounded_jitter() {
+    fn backoff_uses_full_jitter_and_varies_attempts() {
         let mut backoff = Backoff::default();
-        let first = backoff.next();
-        assert!(first >= Duration::from_secs(1));
-        assert!(first < Duration::from_millis(1250));
-        let second = backoff.next();
-        assert!(second >= Duration::from_secs(2));
-        assert!(second < Duration::from_millis(2500));
+        let mut jitter = AlternatingJitter { high: false };
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen.push(backoff.next(&mut jitter));
+        }
+        assert!(seen.iter().any(|duration| *duration == Duration::ZERO));
+        assert!(
+            seen.iter()
+                .any(|duration| *duration == Duration::from_secs(60))
+        );
+        assert!(seen.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[tokio::test]
+    async fn fresh_cached_choice_skips_listing_and_probe() {
+        let mut credential = credential();
+        credential.server_url = "http://localhost:9".to_string();
+        credential.relay_choice = Some(RelayChoice {
+            relay_id: "relay-cached".to_string(),
+            region: Some("iad".to_string()),
+            ws_url: "ws://cached.example.test/ws".to_string(),
+            rtt_ms: Some(7),
+            chosen_at: chrono::Utc::now().timestamp_millis(),
+        });
+        let client = FlycockpitClient::new(&credential.server_url).unwrap();
+        let mut jitter = RecordingJitter {
+            calls: 0,
+            value: Duration::from_millis(1),
+        };
+
+        let selected = select_relay(&client, &credential, false, &mut jitter)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(selected.from_cache);
+        assert_eq!(selected.choice.relay_id, "relay-cached");
+        assert_eq!(jitter.calls, 0);
+    }
+
+    #[tokio::test]
+    async fn single_candidate_skips_probe() {
+        let (ws_url, requests) = health_server(Duration::ZERO, 200).await;
+        let candidate = RelayCandidate {
+            relay_id: "relay-one".to_string(),
+            region: None,
+            ws_url,
+        };
+        let mut jitter = ZeroJitter;
+
+        let selected = select_relay_from_candidates(vec![candidate], true, &mut jitter)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.choice.relay_id, "relay-one");
+        assert_eq!(selected.choice.rtt_ms, None);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn probes_all_candidates_and_selects_fastest_response() {
+        let (fast, fast_requests) = health_server(Duration::from_millis(5), 200).await;
+        let (medium, medium_requests) = health_server(Duration::from_millis(50), 200).await;
+        let (slow, slow_requests) = health_server(Duration::from_millis(200), 200).await;
+        let candidates = vec![
+            RelayCandidate {
+                relay_id: "relay-slow".to_string(),
+                region: Some("sfo".to_string()),
+                ws_url: slow,
+            },
+            RelayCandidate {
+                relay_id: "relay-fast".to_string(),
+                region: Some("iad".to_string()),
+                ws_url: fast,
+            },
+            RelayCandidate {
+                relay_id: "relay-medium".to_string(),
+                region: Some("fra".to_string()),
+                ws_url: medium,
+            },
+        ];
+        let mut jitter = ZeroJitter;
+
+        let selected = select_relay_from_candidates(candidates, true, &mut jitter)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.choice.relay_id, "relay-fast");
+        assert_eq!(fast_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(medium_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_timeouts_fall_back_to_responding_or_first_candidate() {
+        let (timeout_a, _) = health_server(Duration::from_secs(3), 200).await;
+        let (ok, _) = health_server(Duration::from_millis(5), 200).await;
+        let (timeout_b, _) = health_server(Duration::from_secs(3), 200).await;
+        let mut jitter = ZeroJitter;
+        let selected = select_relay_from_candidates(
+            vec![
+                RelayCandidate {
+                    relay_id: "relay-a".to_string(),
+                    region: None,
+                    ws_url: timeout_a.clone(),
+                },
+                RelayCandidate {
+                    relay_id: "relay-ok".to_string(),
+                    region: None,
+                    ws_url: ok,
+                },
+                RelayCandidate {
+                    relay_id: "relay-b".to_string(),
+                    region: None,
+                    ws_url: timeout_b,
+                },
+            ],
+            true,
+            &mut jitter,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.choice.relay_id, "relay-ok");
+
+        let (timeout_c, _) = health_server(Duration::from_secs(3), 200).await;
+        let (timeout_d, _) = health_server(Duration::from_secs(3), 200).await;
+        let (timeout_e, _) = health_server(Duration::from_secs(3), 200).await;
+        let selected = select_relay_from_candidates(
+            vec![
+                RelayCandidate {
+                    relay_id: "relay-first".to_string(),
+                    region: None,
+                    ws_url: timeout_c,
+                },
+                RelayCandidate {
+                    relay_id: "relay-second".to_string(),
+                    region: None,
+                    ws_url: timeout_d,
+                },
+                RelayCandidate {
+                    relay_id: "relay-third".to_string(),
+                    region: None,
+                    ws_url: timeout_e,
+                },
+            ],
+            true,
+            &mut jitter,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.choice.relay_id, "relay-first");
+    }
+
+    #[tokio::test]
+    async fn cold_probe_jitter_is_skipped_only_on_first_connect() {
+        let (a, _) = health_server(Duration::ZERO, 200).await;
+        let (b, _) = health_server(Duration::ZERO, 200).await;
+        let candidates = || {
+            vec![
+                RelayCandidate {
+                    relay_id: "relay-a".to_string(),
+                    region: None,
+                    ws_url: a.clone(),
+                },
+                RelayCandidate {
+                    relay_id: "relay-b".to_string(),
+                    region: None,
+                    ws_url: b.clone(),
+                },
+            ]
+        };
+        let mut jitter = RecordingJitter {
+            calls: 0,
+            value: Duration::from_millis(1),
+        };
+        let _ = select_relay_from_candidates(candidates(), true, &mut jitter)
+            .await
+            .unwrap();
+        assert_eq!(jitter.calls, 0);
+
+        let _ = select_relay_from_candidates(candidates(), false, &mut jitter)
+            .await
+            .unwrap();
+        assert_eq!(jitter.calls, 1);
     }
 
     #[tokio::test]

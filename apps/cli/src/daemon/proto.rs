@@ -1889,6 +1889,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relay_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
     },
 

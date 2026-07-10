@@ -1105,6 +1105,8 @@ CREATE TABLE connector_state (
     enabled              INTEGER NOT NULL DEFAULT 1,
     status               TEXT    NOT NULL DEFAULT 'off',
     relay_url            TEXT,
+    relay_id             TEXT,
+    relay_region         TEXT,
     last_connected_at_ms INTEGER,
     last_error           TEXT,
     updated_at_ms        INTEGER NOT NULL,

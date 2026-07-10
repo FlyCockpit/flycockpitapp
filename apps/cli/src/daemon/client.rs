@@ -69,7 +69,7 @@ enum ClientBackend {
 }
 
 enum IoCommand {
-    Request(Pending),
+    Request(Box<Pending>),
     Cancel { id: Uuid },
 }
 
@@ -118,11 +118,11 @@ impl DaemonClient {
         match &self.backend {
             ClientBackend::Wire(request_tx) => {
                 request_tx
-                    .send(IoCommand::Request(Pending {
+                    .send(IoCommand::Request(Box::new(Pending {
                         id,
                         request,
                         reply: tx,
-                    }))
+                    })))
                     .await
                     .map_err(|_| anyhow!("daemon client task has stopped"))?;
                 match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {

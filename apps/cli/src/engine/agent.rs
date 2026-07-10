@@ -762,6 +762,8 @@ pub enum TurnEvent {
         enabled: bool,
         status: String,
         relay_url: Option<String>,
+        relay_id: Option<String>,
+        relay_region: Option<String>,
         last_error: Option<String>,
     },
 

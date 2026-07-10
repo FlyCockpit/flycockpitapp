@@ -513,6 +513,7 @@ mod tests {
                 email: "user@example.test".to_string(),
             },
             display_name: Some("Devbox".to_string()),
+            relay_choice: None,
         }
     }
 

@@ -238,7 +238,18 @@ pub fn render_whoami_with_sync_and_connector(
     if let Some(connector) = connector {
         let label = if connector.enabled {
             match connector.relay_url.as_deref() {
-                Some(url) if connector.status == "connected" => format!("connected ({url})"),
+                Some(url) if connector.status == "connected" => {
+                    match (
+                        connector.relay_id.as_deref(),
+                        connector.relay_region.as_deref(),
+                    ) {
+                        (Some(relay_id), Some(region)) => {
+                            format!("connected ({url}, {relay_id}, {region})")
+                        }
+                        (Some(relay_id), None) => format!("connected ({url}, {relay_id})"),
+                        _ => format!("connected ({url})"),
+                    }
+                }
                 _ => connector.status.clone(),
             }
         } else {
@@ -306,6 +317,7 @@ mod tests {
                 email: "user@example.test".to_string(),
             },
             display_name: Some("Workstation".to_string()),
+            relay_choice: None,
         }
     }
 
@@ -366,6 +378,8 @@ mod tests {
             enabled: true,
             status: "connected".to_string(),
             relay_url: Some("wss://relay.example.test/ws".to_string()),
+            relay_id: Some("relay-1".to_string()),
+            relay_region: Some("iad".to_string()),
             last_error: None,
         };
         let out = render_whoami_with_sync_and_connector(
@@ -374,7 +388,7 @@ mod tests {
             None,
             Some(&connector),
         );
-        assert!(out.contains("remote:     connected (wss://relay.example.test/ws)"));
+        assert!(out.contains("remote:     connected (wss://relay.example.test/ws, relay-1, iad)"));
         assert!(!out.contains("fci_secret"));
     }
 

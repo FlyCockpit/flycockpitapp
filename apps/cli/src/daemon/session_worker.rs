@@ -2956,7 +2956,10 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             waiting,
         }],
         TurnEvent::QueueUpdated { .. } => vec![],
-        TurnEvent::ForegroundInputTarget { .. } => vec![],
+        TurnEvent::ForegroundInputTarget { target } => vec![proto::Event::ForegroundInputTarget {
+            session_id,
+            target: queue_target_to_proto(target),
+        }],
         TurnEvent::ConnectorStatus { .. } => vec![],
     }
 }
@@ -3724,6 +3727,30 @@ mod tests {
                 assert_eq!(turn_id.as_deref(), Some("turn-1"));
             }
             other => panic!("expected one AgentIdle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreground_input_target_maps_to_proto_event() {
+        let sid = Uuid::new_v4();
+        let out = turn_event_to_proto(
+            TurnEvent::ForegroundInputTarget {
+                target: crate::engine::message::QueueTarget::child(
+                    "explore", 1, "call-1", "default",
+                ),
+            },
+            sid,
+        );
+
+        match out.as_slice() {
+            [proto::Event::ForegroundInputTarget { session_id, target }] => {
+                assert_eq!(*session_id, sid);
+                assert_eq!(target.id, "task:call-1:default");
+                assert_eq!(target.agent, "explore");
+                assert_eq!(target.depth, 1);
+                assert_eq!(target.task_call_id.as_deref(), Some("call-1"));
+            }
+            other => panic!("expected one ForegroundInputTarget, got {other:?}"),
         }
     }
 

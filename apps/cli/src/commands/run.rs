@@ -700,6 +700,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     Some(match event {
         ThinkingStarted { session_id, .. }
         | QueueUpdated { session_id, .. }
+        | ForegroundInputTarget { session_id, .. }
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }

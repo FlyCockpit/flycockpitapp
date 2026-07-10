@@ -36,7 +36,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
 use crate::engine::TurnEvent;
-use crate::engine::message::QueuedUserMessage;
+use crate::engine::message::{QueueTarget, QueuedUserMessage};
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::async_action::{
@@ -1457,6 +1457,11 @@ pub struct App {
     /// truth; local code only adds optimistic placeholders while awaiting
     /// the daemon ack.
     pub(super) queue: Vec<QueuedUserMessage>,
+    /// Current queue-edit foreground target. Seeded from the daemon attach
+    /// snapshot and kept current by `ForegroundInputTarget` events. `None`
+    /// means the client lacks enough information to mark any queue item as
+    /// non-editable.
+    pub(super) foreground_input_target: Option<QueueTarget>,
     /// Fresh idle submits render immediately as a transcript row. The daemon
     /// still acknowledges them through the queue API, so the originating TUI
     /// suppresses that one daemon queue item until the row is recorded.
@@ -2578,6 +2583,7 @@ impl App {
             use_emojis,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
+            foreground_input_target: None,
             fresh_queue_ack: FreshQueueAck::None,
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
@@ -6907,6 +6913,7 @@ impl App {
             merge_counts(&mut self.usage_slash, &r.usage.slash);
             merge_counts(&mut self.usage_tags, &r.usage.tags);
             self.project_id = Some(r.project_id.clone());
+            self.foreground_input_target = r.foreground_target.clone();
             self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
             // Flush records buffered before the runner existed,
             // backfilling tag project ids now that we know the project.
@@ -7226,7 +7233,9 @@ impl App {
                     preflight_cleaned,
                 );
             }
-            TurnEvent::ForegroundInputTarget { .. } => {}
+            TurnEvent::ForegroundInputTarget { target } => {
+                self.foreground_input_target = Some(target);
+            }
             TurnEvent::ThinkingStarted { agent, turn_id } => {
                 // Note: a `ThinkingStarted` does NOT clear the reconnect
                 // status. It fires once at turn start, before the retry loop
@@ -16664,6 +16673,7 @@ mod footer_selector_tests {
             events: Arc::new(Mutex::new(Vec::new())),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
@@ -16956,6 +16966,7 @@ mod failed_dispatch_reconciliation_tests {
             events,
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
@@ -17431,6 +17442,39 @@ mod fresh_queue_ack_tests {
             text: text.to_string(),
             target: crate::engine::message::QueueTarget::root("Build"),
         }
+    }
+
+    #[test]
+    fn foreground_input_target_event_updates_tracked_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.foreground_input_target = Some(crate::engine::message::QueueTarget::root("Build"));
+
+        app.apply_event(TurnEvent::ForegroundInputTarget {
+            target: crate::engine::message::QueueTarget::child("explore", 1, "call-1", "default"),
+        });
+        assert_eq!(
+            app.foreground_input_target
+                .as_ref()
+                .map(|target| target.id.as_str()),
+            Some("task:call-1:default")
+        );
+        assert_eq!(
+            app.foreground_input_target
+                .as_ref()
+                .map(|target| target.agent.as_str()),
+            Some("explore")
+        );
+
+        app.apply_event(TurnEvent::ForegroundInputTarget {
+            target: crate::engine::message::QueueTarget::root("Build"),
+        });
+        assert_eq!(
+            app.foreground_input_target
+                .as_ref()
+                .map(|target| target.id.as_str()),
+            Some("root")
+        );
     }
 
     fn push_fresh_optimistic(app: &mut App, text: &str) {

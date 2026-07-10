@@ -1297,6 +1297,13 @@ pub enum Event {
         queue: Vec<QueueItem>,
     },
 
+    /// Current queue-edit foreground target for one session. Clients seed this
+    /// from `Attached::foreground_target`; this event supplies live changes.
+    ForegroundInputTarget {
+        session_id: Uuid,
+        target: QueueTarget,
+    },
+
     /// Model inference started. TUI shows `Thinking…` until the first
     /// `AssistantTextDelta` arrives.
     ThinkingStarted {
@@ -3085,6 +3092,32 @@ mod tests {
                 assert_eq!(queue[0].target.agent, "Build");
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+
+        let event = Envelope::event(Event::ForegroundInputTarget {
+            session_id,
+            target: QueueTarget {
+                id: "task:call-1:default".to_string(),
+                agent: "Explore".to_string(),
+                depth: 1,
+                task_call_id: Some("call-1".to_string()),
+            },
+        });
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        match back.body {
+            Body::Event {
+                event:
+                    Event::ForegroundInputTarget {
+                        session_id: got_session,
+                        target,
+                    },
+            } => {
+                assert_eq!(got_session, session_id);
+                assert_eq!(target.id, "task:call-1:default");
+                assert_eq!(target.agent, "Explore");
+                assert_eq!(target.task_call_id.as_deref(), Some("call-1"));
+            }
+            other => panic!("unexpected foreground event: {other:?}"),
         }
 
         let request = Envelope::request(

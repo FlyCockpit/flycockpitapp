@@ -1144,7 +1144,8 @@ impl App {
         // the queue strip, so it reuses the same helper with
         // `shell_mode = false`.
         let border_color = Self::input_border_color(self.busy, false);
-        let dim_white = MUTED_TEXT;
+        let queue_text_style = Style::default().fg(MUTED_TEXT);
+        let non_foreground_style = queue_text_style.add_modifier(Modifier::DIM);
         let outer_w = area.width as usize;
         // Queue is inset 1 col on each side; inside the inset, 1 col
         // is the rail and 1 col is padding before/after the text.
@@ -1164,19 +1165,45 @@ impl App {
 
         // Content rows: `  │ message │  `.
         for msg in &self.queue {
+            let non_foreground = self
+                .foreground_input_target
+                .as_ref()
+                .is_some_and(|target| msg.target.id != target.id);
+            let style = if non_foreground {
+                non_foreground_style
+            } else {
+                queue_text_style
+            };
             let body = first_line_truncated(&msg.text, inner_w);
-            let body_w = body.chars().count();
-            let trailing = inner_w.saturating_sub(body_w);
-            lines.push(Line::from(vec![
+            let body_w = display_width(&body);
+            let annotation = if non_foreground {
+                let remaining = inner_w.saturating_sub(body_w);
+                if remaining > 0 {
+                    first_line_truncated(&format!(" · {}", msg.target.agent), remaining)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            let annotation_w = display_width(&annotation);
+            let trailing = inner_w.saturating_sub(body_w + annotation_w);
+            let mut spans = vec![
                 Span::raw(" ".repeat(inset)),
                 Span::styled("│", Style::default().fg(border_color)),
                 Span::raw(" "),
-                Span::styled(body, Style::default().fg(dim_white)),
+                Span::styled(body, style),
+            ];
+            if !annotation.is_empty() {
+                spans.push(Span::styled(annotation, style));
+            }
+            spans.extend([
                 Span::raw(" ".repeat(trailing)),
                 Span::raw(" "),
                 Span::styled("│", Style::default().fg(border_color)),
                 Span::raw(" ".repeat(inset)),
-            ]));
+            ]);
+            lines.push(Line::from(spans));
         }
 
         // Shared bottom row: `╭┴────────┴╮`. Spans the full input
@@ -4688,7 +4715,9 @@ mod render_history_spacing_tests {
 #[cfg(test)]
 mod prediction_ghost_context_indicator_tests {
     use super::{App, first_line_truncated, input_visual_rows, wrap_ghost_line_chunks};
+    use crate::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
+    use crate::tui::theme::MUTED_TEXT;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -4729,6 +4758,32 @@ mod prediction_ghost_context_indicator_tests {
         terminal.backend().buffer().clone()
     }
 
+    fn render_queue_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                app.render_queue(f, Rect::new(0, 0, width, height));
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer[(x, row)].symbol())
+            .collect::<String>()
+    }
+
+    fn queued_item(text: &str, target: QueueTarget) -> QueuedUserMessage {
+        QueuedUserMessage {
+            id: uuid::Uuid::new_v4(),
+            status: QueueItemStatus::Queued,
+            text: text.to_string(),
+            target,
+        }
+    }
+
     #[test]
     fn input_visual_rows_measure_cjk_and_emoji_by_display_width() {
         let prefix = input_prefix_width();
@@ -4743,6 +4798,109 @@ mod prediction_ghost_context_indicator_tests {
         assert!(display_width(&truncated) <= 14);
         assert!(truncated.ends_with('…'));
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn queue_foreground_item_uses_existing_style_without_annotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.foreground_input_target = Some(QueueTarget::root("Build"));
+        app.queue
+            .push(queued_item("root message", QueueTarget::root("Build")));
+
+        let buf = render_queue_buffer(&mut app, 50, 3);
+        let row = row_text(&buf, 1, 50);
+        assert!(row.contains("root message"), "{row:?}");
+        assert!(
+            !row.contains(" · Build"),
+            "foreground item is not annotated"
+        );
+        let x = row.find("root message").unwrap() as u16;
+        let style = buf[(x, 1)].style();
+        assert_eq!(style.fg, Some(MUTED_TEXT));
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn queue_non_foreground_item_is_dimmed_and_annotated_by_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.foreground_input_target = Some(QueueTarget::root("Build"));
+        app.queue.push(queued_item(
+            "child message",
+            QueueTarget::child("explore", 1, "call-1", "default"),
+        ));
+
+        let buf = render_queue_buffer(&mut app, 56, 3);
+        let row = row_text(&buf, 1, 56);
+        assert!(row.contains("child message"), "{row:?}");
+        assert!(row.contains(" · explore"), "{row:?}");
+        assert!(
+            !row.contains("task:"),
+            "raw target ids must not render: {row:?}"
+        );
+
+        for needle in ["child message", "explore"] {
+            let x = row.find(needle).unwrap() as u16;
+            let style = buf[(x, 1)].style();
+            assert_eq!(style.fg, Some(MUTED_TEXT));
+            assert!(style.add_modifier.contains(Modifier::DIM));
+        }
+    }
+
+    #[test]
+    fn queue_unknown_foreground_target_marks_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.foreground_input_target = None;
+        app.queue.push(queued_item(
+            "child message",
+            QueueTarget::child("explore", 1, "call-1", "default"),
+        ));
+
+        let buf = render_queue_buffer(&mut app, 56, 3);
+        let row = row_text(&buf, 1, 56);
+        assert!(row.contains("child message"), "{row:?}");
+        assert!(
+            !row.contains("explore"),
+            "missing target info must not annotate"
+        );
+        assert!(
+            !row.contains("task:"),
+            "raw target ids must not render: {row:?}"
+        );
+        for x in 0..56 {
+            assert!(
+                !buf[(x, 1)].style().add_modifier.contains(Modifier::DIM),
+                "no queue cell should be dimmed when foreground target is unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_narrow_render_preserves_message_and_border_while_truncating_annotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.foreground_input_target = Some(QueueTarget::root("Build"));
+        app.queue.push(queued_item(
+            "queued text",
+            QueueTarget::child("verylongagent", 1, "call-1", "default"),
+        ));
+
+        let buf = render_queue_buffer(&mut app, 30, 3);
+        let top = row_text(&buf, 0, 30);
+        let row = row_text(&buf, 1, 30);
+        let bottom = row_text(&buf, 2, 30);
+        assert!(row.contains("queued text"), "{row:?}");
+        assert!(
+            !row.contains("task:"),
+            "raw target ids must not render: {row:?}"
+        );
+        assert!(top.contains('╭') && top.contains('╮'), "{top:?}");
+        assert!(
+            bottom.starts_with('╭') && bottom.ends_with('╮'),
+            "{bottom:?}"
+        );
     }
 
     #[test]

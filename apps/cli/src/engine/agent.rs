@@ -303,8 +303,8 @@ pub enum TurnEvent {
     QueueUpdated {
         queue: Vec<crate::engine::message::QueuedUserMessage>,
     },
-    /// Engine-internal foreground input target snapshot. The daemon uses it
-    /// to stamp queued user messages; it is not a user-facing protocol event.
+    /// Foreground input target snapshot. The daemon uses it to stamp queued
+    /// user messages and forwards it to clients so queue editability is visible.
     ForegroundInputTarget {
         target: crate::engine::message::QueueTarget,
     },

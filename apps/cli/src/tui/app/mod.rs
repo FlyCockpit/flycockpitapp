@@ -3541,7 +3541,7 @@ impl App {
         // terminal; no need to grow it or spill history into
         // scrollback (alt screen doesn't have scrollback). The
         // wheel-scroll path handles in-app scrollback instead.
-        self.maybe_service_new_session(terminal)?;
+        changed |= self.maybe_service_new_session(terminal)?;
         self.maybe_service_external_edit(terminal, terminal_input)?;
         self.maybe_service_agent_file_edit(terminal, terminal_input)?;
         self.maybe_service_category_setting_edit(terminal, terminal_input)?;
@@ -4431,9 +4431,16 @@ impl App {
     pub(super) fn maybe_service_new_session(
         &mut self,
         terminal: &mut DefaultTerminal,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        self.maybe_service_new_session_with_clear(|| terminal.clear().map_err(Into::into))
+    }
+
+    fn maybe_service_new_session_with_clear(
+        &mut self,
+        mut clear_terminal: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
         if !self.pending_new_session {
-            return Ok(());
+            return Ok(false);
         }
         self.pending_new_session = false;
 
@@ -4469,9 +4476,6 @@ impl App {
         self.reload_launch_info();
         self.reload_tui_config();
 
-        // Repaint the cleared canvas on the next draw.
-        terminal.clear()?;
-
         // Drop the runner so the next submit re-attaches the daemon
         // with `session_id: None`, opening a fresh session.
         self.agent_runner = None;
@@ -4493,7 +4497,15 @@ impl App {
         self.last_usage = None;
         self.estimate_at_last_usage = 0;
 
-        Ok(())
+        // Repaint the cleared canvas on the next draw. `Terminal::clear`
+        // invalidates ratatui's buffers on success, but crossterm may fail
+        // its cursor-position probe. That UI cleanup must never abort the
+        // already-completed fresh-session state transition.
+        if let Err(error) = clear_terminal() {
+            tracing::warn!(error = %error, "terminal clear after /new failed; continuing with redraw");
+        }
+
+        Ok(true)
     }
 
     fn run_external_editor_command(
@@ -17506,9 +17518,10 @@ mod failed_dispatch_reconciliation_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
+    use ratatui::layout::Rect;
     use tokio::sync::mpsc;
 
-    use super::{App, DispatchOutcome};
+    use super::{App, DispatchOutcome, SideConversation};
     use crate::engine::message::UserSubmission;
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
     use crate::tui::history::HistoryEntry;
@@ -17615,6 +17628,77 @@ mod failed_dispatch_reconciliation_tests {
         );
     }
 
+    fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
+        SideConversation {
+            side_session_id: uuid::Uuid::new_v4(),
+            socket: tmp.join("missing-daemon.sock"),
+            saved_runner: None,
+            saved_history: vec![HistoryEntry::Plain {
+                line: "main history".to_string(),
+            }],
+            saved_queue: vec![crate::tui::app::input::optimistic_queue_item(
+                "queued main message".to_string(),
+            )],
+            saved_queued_tag_batches: Vec::new(),
+            saved_folding_tag_batches: std::collections::HashMap::new(),
+            saved_pending: None,
+            saved_prunable_tokens: 42,
+            saved_cache_cold: false,
+            saved_elided_event_ids: std::collections::HashSet::from(["event-1".to_string()]),
+            saved_active_schedules: std::collections::BTreeMap::new(),
+            saved_pending_stop_confirm: Some(vec!["stop-me".to_string()]),
+            saved_chat_scroll_offset: 7,
+            saved_project_id: Some("project-main".to_string()),
+            saved_session_id: Some(uuid::Uuid::new_v4()),
+            saved_session_short_id: Some("main123".to_string()),
+            saved_current_session_persisted: true,
+        }
+    }
+
+    fn seed_new_session_reset_state(
+        app: &mut App,
+    ) -> mpsc::Receiver<crate::daemon::proto::Request> {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (record_tx, record_rx) = mpsc::channel(4);
+        app.agent_runner = Some(Ok(runner_with_channels(
+            input_tx,
+            record_tx,
+            Arc::new(Mutex::new(Vec::new())),
+        )));
+        app.pending_new_session = true;
+        app.busy = true;
+        app.history.push(HistoryEntry::Plain {
+            line: "old transcript".to_string(),
+        });
+        seed_session_live_state(app);
+        app.clickable_rows = vec![Some(0)];
+        app.box_rows = vec![Some(0)];
+        app.chat_area = Some(Rect::new(0, 0, 80, 20));
+        app.chat_text_grid = vec![vec!["x".to_string()]];
+        app.chat_cont_rows = vec![true];
+        app.selection = Some(super::Selection {
+            anchor: (0, 0),
+            focus: (1, 1),
+            active: false,
+        });
+        app.display_attach_backoff.record_failure(Instant::now());
+        app.current_session_persisted = true;
+        app.usage_models.insert("p/m".to_string(), 2);
+        app.usage_slash.insert("/new".to_string(), 1);
+        app.usage_tags.insert("src/lib.rs".to_string(), 1);
+        app.project_id = Some("project-old".to_string());
+        app.pending_usage
+            .push(crate::daemon::proto::Request::CancelTurn);
+        app.last_usage = Some(crate::tokens::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cached_input_tokens: 3,
+            cache_creation_input_tokens: 4,
+        });
+        app.estimate_at_last_usage = 99;
+        record_rx
+    }
+
     #[test]
     fn queued_submit_from_off_tail_returns_to_live_tail_immediately() {
         let tmp = tempfile::tempdir().unwrap();
@@ -17699,6 +17783,106 @@ mod failed_dispatch_reconciliation_tests {
             Ok(crate::daemon::proto::Request::CancelTurn)
         ));
         assert!(record_rx.try_recv().is_err(), "only one cancel is sent");
+    }
+
+    #[test]
+    fn new_session_without_pending_does_not_clear_or_request_redraw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut clear_called = false;
+
+        let changed = app
+            .maybe_service_new_session_with_clear(|| {
+                clear_called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!changed);
+        assert!(!clear_called);
+    }
+
+    #[test]
+    fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut record_rx = seed_new_session_reset_state(&mut app);
+
+        let changed = app
+            .maybe_service_new_session_with_clear(|| {
+                Err(anyhow::anyhow!(
+                    "The cursor position could not be read within a normal duration"
+                ))
+            })
+            .unwrap();
+
+        assert!(changed, "serviced /new must request a follow-up redraw");
+        assert!(matches!(
+            record_rx.try_recv(),
+            Ok(crate::daemon::proto::Request::CancelTurn)
+        ));
+        assert!(record_rx.try_recv().is_err(), "only one cancel is sent");
+        assert!(!app.pending_new_session);
+        assert!(app.history.is_empty());
+        assert!(app.queue.is_empty());
+        assert!(app.pending.is_none());
+        assert!(app.clickable_rows.is_empty());
+        assert!(app.box_rows.is_empty());
+        assert!(app.chat_area.is_none());
+        assert!(app.chat_text_grid.is_empty());
+        assert!(app.chat_cont_rows.is_empty());
+        assert!(app.selection.is_none());
+        assert!(app.agent_runner.is_none());
+        assert!(app.display_attach_backoff.can_attempt(Instant::now()));
+        assert!(!app.current_session_persisted);
+        assert!(app.usage_models.is_empty());
+        assert!(app.usage_slash.is_empty());
+        assert!(app.usage_tags.is_empty());
+        assert!(app.project_id.is_none());
+        assert!(app.pending_usage.is_empty());
+        assert!(app.last_usage.is_none());
+        assert_eq!(app.estimate_at_last_usage, 0);
+        assert!(!app.busy);
+        assert!(app.toast.is_none(), "clear failure should not show a toast");
+    }
+
+    #[test]
+    fn new_session_success_invokes_terminal_clear_and_requests_redraw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.pending_new_session = true;
+        let mut clear_count = 0;
+
+        let changed = app
+            .maybe_service_new_session_with_clear(|| {
+                clear_count += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(changed);
+        assert_eq!(clear_count, 1);
+    }
+
+    #[tokio::test]
+    async fn new_session_from_side_conversation_discards_side_before_resetting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.side_conversation = Some(fake_side_conversation(tmp.path()));
+        app.pending_new_session = true;
+        app.history.push(HistoryEntry::Plain {
+            line: "side-only history".to_string(),
+        });
+
+        let changed = app.maybe_service_new_session_with_clear(|| Ok(())).unwrap();
+
+        assert!(changed);
+        assert!(app.side_conversation.is_none());
+        assert!(app.history.is_empty());
+        assert!(app.queue.is_empty());
+        assert!(app.project_id.is_none());
+        assert!(!app.current_session_persisted);
+        assert_eq!(app.async_actions.pending_count(), 1);
     }
 
     fn newest_user_failed(app: &App) -> bool {

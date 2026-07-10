@@ -316,6 +316,13 @@ pub(super) enum WorkingSpanState {
 const ENABLE_ANY_MOUSE_MOTION: &str = "\x1b[?1003h";
 const DISABLE_ANY_MOUSE_MOTION: &str = "\x1b[?1003l";
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
 fn enable_mouse_capture_with_motion() -> std::io::Result<()> {
     crossterm::execute!(stdout(), EnableMouseCapture)?;
     if let Err(err) =
@@ -3283,7 +3290,7 @@ impl App {
 
         if crossterm::execute!(
             stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         )
         .is_ok()
         {
@@ -13058,9 +13065,10 @@ mod affordance_hover_tests {
 mod terminal_mode_guard_tests {
     use super::{
         DISABLE_ANY_MOUSE_MOTION, ENABLE_ANY_MOUSE_MOTION, TerminalCleanupCommand,
-        TerminalModeGuard, TerminalModeSink,
+        TerminalModeGuard, TerminalModeSink, keyboard_enhancement_flags,
     };
     use anyhow::Result;
+    use crossterm::event::KeyboardEnhancementFlags;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -13109,6 +13117,15 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
+    }
+
+    #[test]
+    fn requested_keyboard_enhancement_flags_match_crossterm_enhanced_event_set() {
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
     }
 
     #[test]

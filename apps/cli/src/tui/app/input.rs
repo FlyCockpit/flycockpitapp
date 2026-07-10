@@ -4513,6 +4513,100 @@ mod chat_scrollback_key_tests {
 }
 
 #[cfg(test)]
+mod shift_enter_keyboard_protocol_tests {
+    use super::*;
+    use crate::tui::settings::Dialog;
+    use crossterm::event::{KeyCode, KeyEventState};
+    use crossterm::event::{KeyEventKind, KeyModifiers, ModifierKeyCode};
+    use std::fs;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn app(tmp: &tempfile::TempDir) -> App {
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        app.composer.set_vim_enabled(false);
+        app
+    }
+
+    fn at_popup_app(tmp: &tempfile::TempDir) -> App {
+        let mut app = app(tmp);
+        let cwd = app.launch.cwd.clone();
+        fs::create_dir(cwd.join(".git")).unwrap();
+        fs::write(cwd.join("kept.rs"), "").unwrap();
+        app.composer.insert_str("@kept");
+        assert!(app.at_popup_active());
+        assert_eq!(app.at_suggestions().len(), 1);
+        app
+    }
+
+    #[test]
+    fn shift_enter_in_insert_mode_inserts_newline_without_submitting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app(&tmp);
+        app.composer.set("line one".to_string());
+
+        let exit = app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert!(!exit);
+        assert_eq!(app.composer.text(), "line one\n");
+    }
+
+    #[test]
+    fn plain_enter_in_insert_mode_still_submits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app(&tmp);
+        app.composer.set("send me".to_string());
+
+        let exit = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(!exit);
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = at_popup_app(&tmp);
+
+        let exit = app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert!(!exit);
+        assert_eq!(app.composer.text(), "@kept\n");
+        assert!(!app.composer.text().contains("kept.rs"));
+    }
+
+    #[test]
+    fn pure_modifier_event_is_ignored_and_does_not_mutate_composer_or_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app(&tmp);
+        app.composer.set("draft".to_string());
+        app.selection = Some(super::super::Selection {
+            anchor: (0, 0),
+            focus: (1, 1),
+            active: false,
+        });
+
+        let exit = app.handle_key(key(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        ));
+
+        assert!(!exit);
+        assert_eq!(app.composer.text(), "draft");
+        assert!(app.selection.is_some());
+    }
+}
+
+#[cfg(test)]
 mod dispatch_span_tests {
     use super::super::DispatchOutcome;
 

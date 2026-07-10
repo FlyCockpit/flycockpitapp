@@ -77,6 +77,9 @@
     },
     "./lib/relay-url": {
       "default": "./src/lib/relay-url.ts"
+    },
+    "./enterprise/relay-fleet": {
+      "default": "./src/enterprise/relay-fleet.ts"
     }
   },
   "scripts": {

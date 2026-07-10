@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { env } from "@flycockpit/env/server";
 import { getRelayControlConfig } from "./relay-config";
 
 export type RelayIdentity = { relayId: string; mode: "embedded" | "fleet" };
@@ -29,14 +30,20 @@ function constantTimeEquals(actual: string, expected: string) {
   return timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
-export function verifyRelayCredential(request: Request): RelayIdentity {
-  const config = getRelayControlConfig();
-  if (!config) throw new RelayControlNotConfiguredError();
-
+export async function verifyRelayCredential(request: Request): Promise<RelayIdentity> {
   const token = extractBearer(request.headers.get("authorization"));
-  if (!token || !constantTimeEquals(token, config.controlSecret)) {
-    throw new RelayCredentialUnauthorizedError();
+  const config = getRelayControlConfig();
+
+  if (config && token && constantTimeEquals(token, config.controlSecret)) {
+    return { relayId: config.relayId, mode: "embedded" };
   }
 
-  return { relayId: config.relayId, mode: "embedded" };
+  if (env.DEPLOYMENT_PROFILE !== "oss" && token) {
+    const { verifyFleetSessionToken } = await import("@flycockpit/api/enterprise/relay-fleet");
+    const session = await verifyFleetSessionToken(token);
+    if (session) return { relayId: session.relayId, mode: "fleet" };
+  }
+
+  if (!config && env.DEPLOYMENT_PROFILE === "oss") throw new RelayControlNotConfiguredError();
+  throw new RelayCredentialUnauthorizedError();
 }

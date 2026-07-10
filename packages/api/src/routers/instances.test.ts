@@ -8,6 +8,14 @@ import { createInstanceCredential } from "../lib/instance-credentials";
 import { verifyRelayToken } from "../lib/relay-tokens";
 import { instancesRouter } from "./instances";
 
+const enterpriseMocks = vi.hoisted(() => ({
+  listRelayCandidates: vi.fn(),
+  recordConnectorRelayLease: vi.fn(),
+  resolveRelayForInstance: vi.fn(),
+}));
+
+vi.mock("../enterprise/relay-fleet", () => enterpriseMocks);
+
 vi.mock("@flycockpit/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   const db = mockDeep();
@@ -109,6 +117,19 @@ describe("instancesRouter", () => {
     vi.clearAllMocks();
     mutableEnv.DEPLOYMENT_PROFILE = "oss";
     mutableEnv.COCKPIT_RELAY_ID = "relay-test";
+    enterpriseMocks.listRelayCandidates.mockResolvedValue([
+      { relayId: "relay-fleet", region: "iad", wsUrl: "wss://fleet.example.test/ws" },
+    ]);
+    enterpriseMocks.recordConnectorRelayLease.mockResolvedValue({
+      relayId: "relay-fleet",
+      region: "iad",
+      wsUrl: "wss://fleet.example.test/ws",
+    });
+    enterpriseMocks.resolveRelayForInstance.mockResolvedValue({
+      relayId: "relay-fleet",
+      region: "iad",
+      wsUrl: "wss://fleet.example.test/ws",
+    });
     db.appSetting.findMany.mockResolvedValue([]);
     db.user.findUnique.mockResolvedValue({ plan: "FREE", hostedTrialEndsAt: null });
     db.instanceAccessGrant.findMany.mockResolvedValue([]);
@@ -190,6 +211,7 @@ describe("instancesRouter", () => {
     const result = await client.mintConnectorToken({
       instanceId: "instance-1",
       instanceToken: credential.token,
+      relayId: "relay-test",
     });
 
     expect(result.relayUrl).toBe("wss://relay.example.test/ws");
@@ -204,6 +226,71 @@ describe("instancesRouter", () => {
     expect(payload!.exp - payload!.iat).toBe(300);
   });
 
+  it("lists the configured relay as the only OSS candidate", async () => {
+    const credential = createInstanceCredential();
+    db.cockpitInstance.findUnique.mockResolvedValue(
+      instance({ secretPrefix: credential.prefix, secretHash: credential.hash }),
+    );
+
+    const client = createRouterClient(instancesRouter, { context: buildContext(null) });
+
+    await expect(
+      client.listRelayCandidates({ instanceId: "instance-1", instanceToken: credential.token }),
+    ).resolves.toEqual({
+      relays: [{ relayId: "relay-test", region: null, wsUrl: "wss://relay.example.test/ws" }],
+    });
+    expect(enterpriseMocks.listRelayCandidates).not.toHaveBeenCalled();
+  });
+
+  it("rejects an OSS connector relay token when the selected relay id is not configured", async () => {
+    const credential = createInstanceCredential();
+    db.cockpitInstance.findUnique.mockResolvedValue(
+      instance({ secretPrefix: credential.prefix, secretHash: credential.hash }),
+    );
+    db.cockpitInstance.update.mockResolvedValue(instance());
+
+    const client = createRouterClient(instancesRouter, { context: buildContext(null) });
+
+    await expect(
+      client.mintConnectorToken({
+        instanceId: "instance-1",
+        instanceToken: credential.token,
+        relayId: "other-relay",
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("NOT_FOUND");
+      return true;
+    });
+    expect(enterpriseMocks.recordConnectorRelayLease).not.toHaveBeenCalled();
+  });
+
+  it("uses the enterprise fleet lease when minting hosted connector tokens", async () => {
+    const credential = createInstanceCredential();
+    mutableEnv.DEPLOYMENT_PROFILE = "hosted";
+    db.user.findUnique.mockResolvedValue({ plan: "PRO", hostedTrialEndsAt: null });
+    db.cockpitInstance.findUnique.mockResolvedValue(
+      instance({ secretPrefix: credential.prefix, secretHash: credential.hash }),
+    );
+    db.cockpitInstance.update.mockResolvedValue(instance());
+
+    const client = createRouterClient(instancesRouter, { context: buildContext(null) });
+    const result = await client.mintConnectorToken({
+      instanceId: "instance-1",
+      instanceToken: credential.token,
+      relayId: "relay-fleet",
+    });
+
+    expect(enterpriseMocks.recordConnectorRelayLease).toHaveBeenCalledWith(
+      "relay-fleet",
+      "instance-1",
+    );
+    expect(result.relayUrl).toBe("wss://fleet.example.test/ws");
+    await expect(verifyRelayToken(result.token, "relay-fleet")).resolves.toMatchObject({
+      aud: "relay-fleet",
+      tokenType: "connector",
+    });
+  });
+
   it("returns service unavailable when no relay id is configured for minting", async () => {
     const credential = createInstanceCredential();
     mutableEnv.COCKPIT_RELAY_ID = undefined;
@@ -215,7 +302,11 @@ describe("instancesRouter", () => {
     const client = createRouterClient(instancesRouter, { context: buildContext(null) });
 
     await expect(
-      client.mintConnectorToken({ instanceId: "instance-1", instanceToken: credential.token }),
+      client.mintConnectorToken({
+        instanceId: "instance-1",
+        instanceToken: credential.token,
+        relayId: "relay-test",
+      }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error.code).toBe("SERVICE_UNAVAILABLE");
       expect(error.message).toContain("COCKPIT_RELAY_ID");
@@ -233,7 +324,11 @@ describe("instancesRouter", () => {
 
     const client = createRouterClient(instancesRouter, { context: buildContext(null) });
     await expect(
-      client.mintConnectorToken({ instanceId: "instance-1", instanceToken: credential.token }),
+      client.mintConnectorToken({
+        instanceId: "instance-1",
+        instanceToken: credential.token,
+        relayId: "relay-test",
+      }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error.code).toBe("FORBIDDEN");
       expect(error.message).toMatch(/current plan/i);
@@ -255,10 +350,62 @@ describe("instancesRouter", () => {
 
     const client = createRouterClient(instancesRouter, { context: buildContext(null) });
     await expect(
-      client.mintConnectorToken({ instanceId: "instance-1", instanceToken: credential.token }),
+      client.mintConnectorToken({
+        instanceId: "instance-1",
+        instanceToken: credential.token,
+        relayId: "relay-test",
+      }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error.code).toBe("FORBIDDEN");
       return true;
+    });
+  });
+
+  it("returns hosted relay candidates from the enterprise fleet", async () => {
+    const credential = createInstanceCredential();
+    mutableEnv.DEPLOYMENT_PROFILE = "hosted";
+    db.cockpitInstance.findUnique.mockResolvedValue(
+      instance({ secretPrefix: credential.prefix, secretHash: credential.hash }),
+    );
+
+    const client = createRouterClient(instancesRouter, { context: buildContext(null) });
+
+    await expect(
+      client.listRelayCandidates({ instanceId: "instance-1", instanceToken: credential.token }),
+    ).resolves.toEqual({
+      relays: [{ relayId: "relay-fleet", region: "iad", wsUrl: "wss://fleet.example.test/ws" }],
+    });
+    expect(enterpriseMocks.listRelayCandidates).toHaveBeenCalledOnce();
+  });
+
+  it("requires a hosted instance relay lease before minting client tokens", async () => {
+    mutableEnv.DEPLOYMENT_PROFILE = "hosted";
+    enterpriseMocks.resolveRelayForInstance.mockRejectedValue(
+      new ORPCError("NOT_FOUND", { message: "Instance is not connected." }),
+    );
+    db.cockpitInstance.findUnique.mockResolvedValue(instance());
+
+    const client = createRouterClient(instancesRouter, { context: buildContext() });
+
+    await expect(client.mintClientToken({ instanceId: "instance-1" })).rejects.toSatisfy(
+      (error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      },
+    );
+  });
+
+  it("uses the hosted instance relay lease when minting client tokens", async () => {
+    mutableEnv.DEPLOYMENT_PROFILE = "hosted";
+    db.cockpitInstance.findUnique.mockResolvedValue(instance());
+
+    const client = createRouterClient(instancesRouter, { context: buildContext() });
+    const result = await client.mintClientToken({ instanceId: "instance-1" });
+
+    expect(result.relayUrl).toBe("wss://fleet.example.test/ws");
+    await expect(verifyRelayToken(result.token, "relay-fleet")).resolves.toMatchObject({
+      aud: "relay-fleet",
+      tokenType: "client",
     });
   });
 

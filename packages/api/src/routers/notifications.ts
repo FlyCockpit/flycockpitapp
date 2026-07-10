@@ -1,4 +1,5 @@
 import prisma from "@flycockpit/db";
+import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -47,6 +48,17 @@ const instanceSettingInput = z.object({
   muted: z.boolean().optional(),
   ownerReceivesSharedSessions: z.boolean().optional(),
 });
+
+async function resolveUserRelayTarget(userId: string) {
+  if (env.DEPLOYMENT_PROFILE === "oss") {
+    const target = requireConfiguredRelayForMint();
+    return { relayId: target.relayId, relayUrl: target.relayUrl };
+  }
+
+  const { selectUserRelay } = await import("../enterprise/relay-fleet");
+  const target = await selectUserRelay(userId);
+  return { relayId: target.relayId, relayUrl: target.wsUrl };
+}
 
 export const notificationsRouter = {
   listMine: protectedProcedure
@@ -109,7 +121,7 @@ export const notificationsRouter = {
     }),
 
   mintUserRelayToken: protectedProcedure.handler(async ({ context }) => {
-    const relayTarget = requireConfiguredRelayForMint();
+    const relayTarget = await resolveUserRelayTarget(context.session.user.id);
     const relay = await createRelayToken(
       {
         tokenType: "user",

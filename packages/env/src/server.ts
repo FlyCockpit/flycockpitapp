@@ -96,6 +96,8 @@ export const env = createEnv({
     COCKPIT_RELAY_ID: z.string().trim().min(1).max(120).optional(),
     COCKPIT_RELAY_URL: z.string().url().optional(),
     RELAY_CONTROL_SECRET: z.string().min(32).optional(),
+    RELAY_CA_PUBLIC_KEYS: z.string().optional(),
+    RELAY_REVOKED_IDS: z.string().optional(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

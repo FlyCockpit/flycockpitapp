@@ -8,8 +8,10 @@ import { getMissingRelayControlConfigKeys } from "@flycockpit/api/lib/relay-conf
 import {
   RelayControlNotConfiguredError,
   RelayCredentialUnauthorizedError,
+  type RelayIdentity,
   verifyRelayCredential,
 } from "@flycockpit/api/lib/relay-credentials";
+import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
 import type { Env, Hono, MiddlewareHandler } from "hono";
 
@@ -37,9 +39,73 @@ export function mountRelayRoutes<E extends Env>(app: Hono<E>, options: RelayRout
     );
   }
 
+  app.post("/api/relay/register", async (c) => {
+    if (env.DEPLOYMENT_PROFILE === "oss") return c.json({ error: "not_found" }, 404);
+
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_json" }, 400);
+    }
+
+    try {
+      const { registerRelay } = await import("@flycockpit/api/enterprise/relay-fleet");
+      return c.json(await registerRelay(body));
+    } catch (err) {
+      if (err instanceof ORPCError && err.code === "UNAUTHORIZED") {
+        return c.json({ error: "unauthorized" }, 401);
+      }
+      if (err instanceof ORPCError) {
+        const response = orpcErrorResponse(err);
+        return c.json(response.body, response.status as 400);
+      }
+      return c.json({ error: "bad_request" }, 400);
+    }
+  });
+
+  app.post("/api/relay/heartbeat", async (c) => {
+    if (env.DEPLOYMENT_PROFILE === "oss") return c.json({ error: "not_found" }, 404);
+
+    let identity: RelayIdentity;
+    try {
+      identity = await verifyRelayCredential(c.req.raw);
+      if (identity.mode !== "fleet") return c.json({ error: "unauthorized" }, 401);
+    } catch (err) {
+      if (
+        err instanceof RelayControlNotConfiguredError ||
+        err instanceof RelayCredentialUnauthorizedError
+      ) {
+        return c.json({ error: "unauthorized" }, 401);
+      }
+      throw err;
+    }
+
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_json" }, 400);
+    }
+
+    try {
+      const { recordRelayHeartbeat } = await import("@flycockpit/api/enterprise/relay-fleet");
+      return c.json(await recordRelayHeartbeat(identity, body));
+    } catch (err) {
+      if (err instanceof ORPCError && err.code === "UNAUTHORIZED") {
+        return c.json({ error: "unauthorized" }, 401);
+      }
+      if (err instanceof ORPCError) {
+        const response = orpcErrorResponse(err);
+        return c.json(response.body, response.status as 400);
+      }
+      return c.json({ error: "bad_request" }, 400);
+    }
+  });
+
   app.post("/api/relay/control-ingest", async (c) => {
     try {
-      verifyRelayCredential(c.req.raw);
+      await verifyRelayCredential(c.req.raw);
     } catch (err) {
       if (err instanceof RelayControlNotConfiguredError) {
         return c.json({ error: "relay_control_not_configured" }, 503);

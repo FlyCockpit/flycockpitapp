@@ -12,13 +12,19 @@ vi.mock("@flycockpit/db", () => ({
   },
 }));
 
-vi.mock("@flycockpit/env/server", () => ({
-  env: {
-    BETTER_AUTH_URL: "https://app.example.test",
-    COCKPIT_RELAY_URL: "wss://relay.example.test/ws",
-    RELAY_CONTROL_SECRET: "x".repeat(32),
-  },
+const envState = vi.hoisted(() => ({
+  BETTER_AUTH_URL: "https://app.example.test",
+  DEPLOYMENT_PROFILE: "oss" as "hosted" | "enterprise" | "oss",
+  COCKPIT_RELAY_URL: "wss://relay.example.test/ws",
+  RELAY_CONTROL_SECRET: "x".repeat(32),
 }));
+
+const fleetMocks = vi.hoisted(() => ({
+  resolveRelayForUser: vi.fn(),
+}));
+
+vi.mock("@flycockpit/env/server", () => ({ env: envState }));
+vi.mock("../enterprise/relay-fleet", () => fleetMocks);
 
 vi.mock("./web-push", () => ({
   sendPushNotification: vi.fn(),
@@ -179,6 +185,13 @@ describe("relay attention ingest parsing", () => {
 describe("publishToast", () => {
   beforeEach(() => {
     resetRelayControlConfig();
+    envState.DEPLOYMENT_PROFILE = "oss";
+    fleetMocks.resolveRelayForUser.mockResolvedValue({
+      relayId: "relay-fleet",
+      region: "iad",
+      wsUrl: "wss://fleet.example.test/ws",
+      controlUrl: "https://fleet.example.test/control",
+    });
   });
 
   it("logs and returns false when relay control config is missing", async () => {
@@ -204,6 +217,39 @@ describe("publishToast", () => {
 
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("RELAY_CONTROL_SECRET"));
     warn.mockRestore();
+  });
+
+  it("publishes hosted user toasts to the user's leased relay", async () => {
+    envState.DEPLOYMENT_PROFILE = "hosted";
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 202 }));
+
+    await expect(
+      publishToast({
+        type: "notify_user",
+        userId: "user-1",
+        notification: {
+          id: "notification-1",
+          type: "APPROVAL_NEEDED",
+          title: "Approval needed",
+          body: "Open the session to review the request.",
+          url: "/en-US/instances",
+          instanceId: "instance-1",
+          sessionRef: "session-1",
+          createdAt: "2026-07-06T00:00:01.000Z",
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(fleetMocks.resolveRelayForUser).toHaveBeenCalledWith("user-1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://fleet.example.test/control",
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: `Bearer ${"x".repeat(32)}` }),
+      }),
+    );
+    fetchMock.mockRestore();
   });
 
   it("logs the response status when relay control returns non-2xx", async () => {

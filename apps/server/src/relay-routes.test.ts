@@ -6,15 +6,19 @@ const mocks = vi.hoisted(() => ({
   ingestAttentionNotification: vi.fn(),
   ingestRemoteInstanceAuditEvents: vi.fn(),
   recordUserPresenceHeartbeat: vi.fn(),
+  registerRelay: vi.fn(),
+  recordRelayHeartbeat: vi.fn(),
+  verifyFleetSessionToken: vi.fn(),
 }));
 
-vi.mock("@flycockpit/env/server", () => ({
-  env: {
-    BETTER_AUTH_URL: "https://app.example.test",
-    COCKPIT_RELAY_URL: undefined,
-    RELAY_CONTROL_SECRET: undefined,
-  },
+const envState = vi.hoisted(() => ({
+  BETTER_AUTH_URL: "https://app.example.test",
+  COCKPIT_RELAY_URL: undefined as string | undefined,
+  RELAY_CONTROL_SECRET: undefined as string | undefined,
+  DEPLOYMENT_PROFILE: "oss" as "hosted" | "enterprise" | "oss",
 }));
+
+vi.mock("@flycockpit/env/server", () => ({ env: envState }));
 
 vi.mock("@flycockpit/api/lib/notifications", () => ({
   ingestAttentionNotification: mocks.ingestAttentionNotification,
@@ -34,6 +38,12 @@ vi.mock("@flycockpit/api/lib/notifications", () => ({
 
 vi.mock("@flycockpit/api/lib/instance-sharing", () => ({
   ingestRemoteInstanceAuditEvents: mocks.ingestRemoteInstanceAuditEvents,
+}));
+
+vi.mock("@flycockpit/api/enterprise/relay-fleet", () => ({
+  registerRelay: mocks.registerRelay,
+  recordRelayHeartbeat: mocks.recordRelayHeartbeat,
+  verifyFleetSessionToken: mocks.verifyFleetSessionToken,
 }));
 
 const { resetRelayControlConfig, setRelayControlConfig } = await import(
@@ -86,8 +96,18 @@ describe("relay routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetRelayControlConfig();
+    envState.DEPLOYMENT_PROFILE = "oss";
     mocks.ingestAttentionNotification.mockResolvedValue({ eventId: "evt-1", recipients: [] });
     mocks.recordUserPresenceHeartbeat.mockResolvedValue({ present: true });
+    mocks.registerRelay.mockResolvedValue({
+      sessionToken: "fleet-session",
+      expiresAt: "2026-07-10T12:30:00.000Z",
+    });
+    mocks.recordRelayHeartbeat.mockResolvedValue({ ok: true });
+    mocks.verifyFleetSessionToken.mockResolvedValue({
+      relayId: "relay-fleet",
+      expiresAt: Date.now() + 60_000,
+    });
   });
 
   it("rejects missing and wrong relay credentials before ingest side effects", async () => {
@@ -146,5 +166,43 @@ describe("relay routes", () => {
 
     const limited = await app.request("/api/relay/control-ingest", jsonRequest());
     expect(limited.status).toBe(429);
+  });
+  it("registers enterprise relays through the fleet registrar", async () => {
+    envState.DEPLOYMENT_PROFILE = "hosted";
+    const { app } = buildApp({ configured: false });
+
+    const res = await app.request("/api/relay/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ certificate: "payload" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      sessionToken: "fleet-session",
+      expiresAt: "2026-07-10T12:30:00.000Z",
+    });
+    expect(mocks.registerRelay).toHaveBeenCalledWith({ certificate: "payload" });
+  });
+
+  it("records enterprise relay heartbeats authenticated by fleet session", async () => {
+    envState.DEPLOYMENT_PROFILE = "hosted";
+    const { app } = buildApp({ configured: false });
+
+    const res = await app.request("/api/relay/heartbeat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer fleet-session",
+      },
+      body: JSON.stringify({ relayId: "relay-fleet", accepting: true, connections: 3 }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(mocks.recordRelayHeartbeat).toHaveBeenCalledWith(
+      { relayId: "relay-fleet", mode: "fleet" },
+      { relayId: "relay-fleet", accepting: true, connections: 3 },
+    );
   });
 });

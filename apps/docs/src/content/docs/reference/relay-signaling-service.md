@@ -4,7 +4,7 @@ title: Relay Signaling Service
 
 Flycockpit remote control uses a dedicated WebSocket relay service in `apps/relay`. Daemons connect outbound to `/ws/daemon`, browser/native clients connect to `/ws/client`, and user-level notification sockets connect to `/ws/user`.
 
-The relay verifies short-lived ES256 JWTs against the control plane JWKS endpoint at `/api/relay/jwks.json`. It never needs `BETTER_AUTH_SECRET`, model provider keys, or user credentials. Server deployments that run the relay on a separate origin should set `COCKPIT_RELAY_ID` and the relay process `RELAY_ID` to the same stable value, set `COCKPIT_RELAY_URL` to the public WebSocket base such as `wss://relay.example.com/ws`, and set the same `RELAY_CONTROL_SECRET` on the server and relay.
+The relay verifies short-lived ES256 JWTs against the control plane JWKS endpoint at `/api/relay/jwks.json`. It never needs `BETTER_AUTH_SECRET`, model provider keys, or user credentials. Server deployments that run one relay on a separate origin should set `COCKPIT_RELAY_ID` and the relay process `RELAY_ID` to the same stable value, set `COCKPIT_RELAY_URL` to the public WebSocket base such as `wss://relay.example.com/ws`, and set the same `RELAY_CONTROL_SECRET` on the server and relay. Enterprise fleet deployments keep that shared control secret for server-to-relay `/control` posts, but relay discovery and client routing come from the fleet registration and heartbeat endpoints instead of `COCKPIT_RELAY_URL`.
 
 Security posture for v1:
 
@@ -24,6 +24,17 @@ Conforming relay implementations must accept this env surface:
 - `RELAY_CONTROL_INGEST_URL`: server endpoint for daemon attention events and user presence, usually `<server-origin>/api/relay/control-ingest`.
 - `REDIS_URL`: optional presence directory and forced-disconnect pub/sub backend.
 - `RELAY_HEARTBEAT_MS`, `RELAY_LEASE_TTL_MS`, `RELAY_MAX_FRAME_BYTES`, `RELAY_MAX_CHANNELS_PER_CLIENT`, `RELAY_MAX_CONNECTIONS_PER_INSTANCE`, `RELAY_CLIENT_RATE_LIMIT_PER_SECOND`, `RELAY_SHUTDOWN_GRACE_MS`: runtime timing and abuse limits.
+
+Enterprise fleet control planes additionally accept this server env surface:
+
+- `RELAY_CA_PUBLIC_KEYS`: JSON array of `{ "kid": string, "publicKey": string }` CA public keys used to verify relay certificates. Multiple keys are supported for rotation.
+- `RELAY_REVOKED_IDS`: optional comma-separated relay ids rejected during registration even if their certificates are otherwise valid.
+
+Enterprise fleet relays register and report health through these server endpoints:
+
+- `POST /api/relay/register` accepts `{ certificate, challengeSignature, nonce, timestamp }`. The certificate payload attests `relayId`, `subdomain`, `region`, `relayPublicKey`, `notBefore`, and `notAfter`; the challenge proves possession of the relay private key. Success returns an opaque 30-minute session token. Authentication failures return identical `401` responses.
+- `POST /api/relay/heartbeat` requires `Authorization: Bearer <fleet-session-token>` and accepts `{ relayId, accepting, connections, leaseDeltas, userDeltas }`, or a full reconcile with `leases` and `users`. Heartbeats refresh 45-second relay, instance, and user leases.
+- `instances.listRelayCandidates({ instanceId, instanceToken })` returns one fresh accepting relay per region. On `DEPLOYMENT_PROFILE=oss`, it returns the configured single relay with `region: null` and never loads the enterprise fleet registry.
 
 Conforming relays expose these HTTP endpoints:
 
@@ -55,5 +66,6 @@ Manual smoke test after deployment:
 
 1. Confirm `GET /healthz` on the relay returns `{ "ok": true }`.
 2. Confirm `GET /api/relay/jwks.json` on the server returns a JWKS with one public EC signing key.
-3. Mint a connector token through `instances.mintConnectorToken`; its `relayUrl` should point at the relay service.
-4. Connect a daemon to `/ws/daemon`, then a client to `/ws/client`, and verify frames relay with `principal.userId` stamped server-side.
+3. In OSS, call `instances.listRelayCandidates` and confirm it returns the configured relay with `region: null`; in enterprise fleet mode, confirm it returns one candidate per healthy region.
+4. Mint a connector token through `instances.mintConnectorToken` with the selected `relayId`; its `relayUrl` should point at the selected relay service.
+5. Connect a daemon to `/ws/daemon`, then a client to `/ws/client`, and verify frames relay with `principal.userId` stamped server-side.

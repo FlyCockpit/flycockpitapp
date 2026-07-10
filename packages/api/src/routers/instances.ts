@@ -1,4 +1,5 @@
 import prisma from "@flycockpit/db";
+import { env } from "@flycockpit/env/server";
 import { ORPCError } from "@orpc/server";
 import { z } from "zod";
 import { authenticatedProcedure, protectedProcedure, publicProcedure } from "../index";
@@ -36,6 +37,10 @@ const displayNameInput = z.object({
 const instanceTokenInput = z.object({
   instanceId: z.string().min(1),
   instanceToken: z.string().min(1),
+});
+
+const connectorTokenInput = instanceTokenInput.extend({
+  relayId: z.string().min(1),
 });
 
 const userCodeInput = z.object({
@@ -102,6 +107,48 @@ function hasRecentStepUp(sessionCreatedAt: Date) {
 
 function terminalStepUpExpiresAt(sessionCreatedAt: Date) {
   return new Date(sessionCreatedAt.getTime() + TERMINAL_STEP_UP_GRACE_MS);
+}
+
+type RelayMintTarget = { relayId: string; relayUrl: string };
+
+function ossRelayTarget(): RelayMintTarget {
+  const target = requireConfiguredRelayForMint();
+  return { relayId: target.relayId, relayUrl: target.relayUrl };
+}
+
+async function resolveConnectorRelayTarget(
+  relayId: string,
+  instanceId: string,
+): Promise<RelayMintTarget> {
+  if (env.DEPLOYMENT_PROFILE === "oss") {
+    const target = ossRelayTarget();
+    if (target.relayId !== relayId) {
+      throw new ORPCError("NOT_FOUND", { message: "Relay not found." });
+    }
+    return target;
+  }
+
+  const { recordConnectorRelayLease } = await import("../enterprise/relay-fleet");
+  const target = await recordConnectorRelayLease(relayId, instanceId);
+  return { relayId: target.relayId, relayUrl: target.wsUrl };
+}
+
+async function resolveClientRelayTarget(instanceId: string): Promise<RelayMintTarget> {
+  if (env.DEPLOYMENT_PROFILE === "oss") return ossRelayTarget();
+
+  const { resolveRelayForInstance } = await import("../enterprise/relay-fleet");
+  const target = await resolveRelayForInstance(instanceId);
+  return { relayId: target.relayId, relayUrl: target.wsUrl };
+}
+
+async function relayCandidatesForInstance() {
+  if (env.DEPLOYMENT_PROFILE === "oss") {
+    const target = ossRelayTarget();
+    return [{ relayId: target.relayId, region: null, wsUrl: target.relayUrl }];
+  }
+
+  const { listRelayCandidates } = await import("../enterprise/relay-fleet");
+  return listRelayCandidates();
 }
 
 async function requireOwnedActiveInstance(instanceId: string, userId: string) {
@@ -222,7 +269,7 @@ export const instancesRouter = {
       return { success: true };
     }),
 
-  mintConnectorToken: publicProcedure.input(instanceTokenInput).handler(async ({ input }) => {
+  mintConnectorToken: publicProcedure.input(connectorTokenInput).handler(async ({ input }) => {
     const instance = await findInstanceForToken(input.instanceId, input.instanceToken);
     const maxInstances = await limit(instance.userId, "instances");
     if (maxInstances < 1) {
@@ -234,7 +281,7 @@ export const instancesRouter = {
       where: { id: instance.id },
       data: { lastSeenAt: new Date() },
     });
-    const relayTarget = requireConfiguredRelayForMint();
+    const relayTarget = await resolveConnectorRelayTarget(input.relayId, instance.id);
     const relay = await createRelayToken(
       {
         tokenType: "connector",
@@ -245,6 +292,11 @@ export const instancesRouter = {
       relayTarget.relayId,
     );
     return { token: relay.token, expiresAt: relay.expiresAt, relayUrl: relayTarget.relayUrl };
+  }),
+
+  listRelayCandidates: publicProcedure.input(instanceTokenInput).handler(async ({ input }) => {
+    await findInstanceForToken(input.instanceId, input.instanceToken);
+    return { relays: await relayCandidatesForInstance() };
   }),
 
   mintClientToken: protectedProcedure
@@ -262,7 +314,7 @@ export const instancesRouter = {
       if (!isOwner && grants.length === 0) {
         throw new ORPCError("NOT_FOUND", { message: "Instance not found." });
       }
-      const relayTarget = requireConfiguredRelayForMint();
+      const relayTarget = await resolveClientRelayTarget(instance.id);
       const relay = await createRelayToken(
         {
           tokenType: "client",
@@ -307,7 +359,7 @@ export const instancesRouter = {
           ? terminalStepUpExpiresAt(context.session.session.createdAt)
           : null;
       }
-      const relayTarget = requireConfiguredRelayForMint();
+      const relayTarget = await resolveClientRelayTarget(instance.id);
       const relay = await createRelayToken(
         {
           tokenType: "client",

@@ -1,5 +1,6 @@
 import { DEFAULT_LOCALE, isSupportedLocale } from "@flycockpit/config/locales";
 import prisma from "@flycockpit/db";
+import { env } from "@flycockpit/env/server";
 import {
   type AttentionEventType,
   type AttentionNotificationPayload,
@@ -199,7 +200,7 @@ async function sendWebPushToUser(
 }
 
 export async function publishToast(message: RelayControlMessage) {
-  const config = getRelayControlConfigForPublish();
+  const config = await getRelayControlConfigForPublish(message);
   if (!config) return false;
   try {
     const controller = new AbortController();
@@ -225,7 +226,23 @@ export async function publishToast(message: RelayControlMessage) {
   }
 }
 
-function getRelayControlConfigForPublish() {
+async function getRelayControlConfigForPublish(message: RelayControlMessage) {
+  if (env.DEPLOYMENT_PROFILE !== "oss" && message.type === "notify_user") {
+    if (!env.RELAY_CONTROL_SECRET) {
+      console.warn("[relay-control] publishToast skipped; missing RELAY_CONTROL_SECRET.");
+      return null;
+    }
+    const { resolveRelayForUser } = await import("../enterprise/relay-fleet");
+    const target = await resolveRelayForUser(message.userId);
+    if (!target) {
+      console.warn(
+        `[relay-control] publishToast skipped; no relay lease for user=${message.userId}.`,
+      );
+      return null;
+    }
+    return { url: target.controlUrl, controlSecret: env.RELAY_CONTROL_SECRET };
+  }
+
   const url = relayControlUrl();
   if (!url) {
     const missing = getMissingRelayControlConfigKeys();

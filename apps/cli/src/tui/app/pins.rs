@@ -611,9 +611,6 @@ impl App {
     }
 
     pub(super) fn scroll_abs_line_into_view(&mut self, abs: usize) {
-        self.chat_fresh_anchor_top = None;
-        self.pending_fresh_turn_history_idx = None;
-        self.chat_fresh_tail_padding = 0;
         let total = self.chat_total_lines;
         let visible = self.chat_visible_lines.max(1);
         if total <= visible {

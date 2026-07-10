@@ -1347,17 +1347,9 @@ impl App {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
         self.sync_history_render_versions();
-        let fresh_padding_was_stale = self.chat_fresh_tail_padding > 0
-            && (self.chat_fresh_anchor_top.is_none() || !(self.busy || self.pending.is_some()));
-        let previous_total_lines = if fresh_padding_was_stale {
-            self.chat_total_lines
-                .saturating_sub(self.chat_fresh_tail_padding)
-        } else {
-            self.chat_total_lines
-        };
         let previous_top = if self.chat_scroll_offset > 0 {
             Some(chat_visible_top(
-                previous_total_lines,
+                self.chat_total_lines,
                 self.chat_visible_lines.max(1),
                 self.chat_scroll_offset,
             ))
@@ -1601,31 +1593,10 @@ impl App {
             }
         }
 
-        let (mut all, mut row_meta, msg_abs_line) =
+        let (all, row_meta, msg_abs_line) =
             prewrap_chat_rows(all, row_meta, msg_abs_line, area.width as usize);
         // Record the abs-line map for pick/review jump after wrapping so
         // pinned messages target the visual row model used for scrolling.
-        if let Some(idx) = self.pending_fresh_turn_history_idx.take()
-            && let Some(abs) = msg_abs_line.get(&idx).copied()
-        {
-            self.chat_fresh_anchor_top = Some(abs.saturating_sub(2));
-            self.chat_fresh_tail_padding = area_h;
-        }
-        let fresh_padding_active = self.chat_fresh_anchor_top.is_some()
-            && self.chat_fresh_tail_padding > 0
-            && (self.busy || self.pending.is_some());
-        if !fresh_padding_active {
-            if !(self.busy || self.pending.is_some()) {
-                self.chat_fresh_anchor_top = None;
-            }
-            self.chat_fresh_tail_padding = 0;
-        }
-        if fresh_padding_active {
-            for _ in 0..self.chat_fresh_tail_padding {
-                all.push(Line::default());
-                row_meta.push(ChatRowMeta::padding());
-            }
-        }
         self.msg_abs_line = msg_abs_line;
 
         // The launch-banner box is the topmost scroll entry (GOALS
@@ -1689,7 +1660,7 @@ impl App {
 
             let total = combined.len();
             let max_offset = total.saturating_sub(area_h);
-            if let Some(top) = self.chat_fresh_anchor_top.or(previous_top) {
+            if let Some(top) = previous_top {
                 self.chat_scroll_offset = chat_offset_for_top(total, area_h, top);
             } else if self.chat_scroll_offset > max_offset {
                 self.chat_scroll_offset = max_offset;
@@ -3694,7 +3665,7 @@ mod slash_popup_full_list_tests {
 mod render_history_spacing_tests {
     use super::{
         App, ChatCopyTarget, ChatRowKind, Selection, TranscriptFind, affordance_target_for_row,
-        chat_visible_top, extract_selection_plaintext,
+        extract_selection_plaintext,
     };
     use crate::config::extended::{DiffStyle, ThinkingDisplay};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
@@ -5011,98 +4982,6 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn fresh_turn_padding_collapse_preserves_top_after_user_scrolls_up() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.launch.banner_enabled = false;
-        app.history = (0..12)
-            .map(|idx| HistoryEntry::Plain {
-                line: format!("context {idx}"),
-            })
-            .collect();
-        app.history.push(HistoryEntry::User {
-            text: "new question".to_string(),
-            cleaned: None,
-            expanded: false,
-            timestamp: chrono::Local::now(),
-            seq: None,
-            preflight_pending: false,
-            persist_failed: false,
-        });
-        app.pending_fresh_turn_history_idx = Some(app.history.len() - 1);
-        app.busy = true;
-        render_history(&mut app, 28, 8);
-        assert!(app.chat_fresh_tail_padding > 0);
-
-        app.scroll_chat_up(1);
-        let expected_top = chat_visible_top(
-            app.chat_total_lines
-                .saturating_sub(app.chat_fresh_tail_padding),
-            app.chat_visible_lines,
-            app.chat_scroll_offset,
-        );
-
-        render_history(&mut app, 28, 8);
-
-        assert_eq!(
-            chat_visible_top(
-                app.chat_total_lines,
-                app.chat_visible_lines,
-                app.chat_scroll_offset
-            ),
-            expected_top
-        );
-        assert_eq!(app.chat_fresh_tail_padding, 0);
-        assert!(app.chat_scroll_offset > 0, "must not slam to live tail");
-    }
-
-    #[test]
-    fn fresh_turn_padding_collapse_preserves_top_when_turn_completes_off_tail() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.launch.banner_enabled = false;
-        app.history = (0..12)
-            .map(|idx| HistoryEntry::Plain {
-                line: format!("context {idx}"),
-            })
-            .collect();
-        app.history.push(HistoryEntry::User {
-            text: "new question".to_string(),
-            cleaned: None,
-            expanded: false,
-            timestamp: chrono::Local::now(),
-            seq: None,
-            preflight_pending: false,
-            persist_failed: false,
-        });
-        app.pending_fresh_turn_history_idx = Some(app.history.len() - 1);
-        app.busy = true;
-        render_history(&mut app, 28, 8);
-        assert!(app.chat_scroll_offset > 0);
-        assert!(app.chat_fresh_tail_padding > 0);
-        let expected_top = chat_visible_top(
-            app.chat_total_lines
-                .saturating_sub(app.chat_fresh_tail_padding),
-            app.chat_visible_lines,
-            app.chat_scroll_offset,
-        );
-
-        app.busy = false;
-        render_history(&mut app, 28, 8);
-
-        assert_eq!(
-            chat_visible_top(
-                app.chat_total_lines,
-                app.chat_visible_lines,
-                app.chat_scroll_offset
-            ),
-            expected_top
-        );
-        assert_eq!(app.chat_fresh_tail_padding, 0);
-        assert!(app.chat_scroll_offset > 0, "must not slam to live tail");
-    }
-
-    #[test]
     fn live_tail_render_follows_appended_content() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -5124,7 +5003,7 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn fresh_turn_anchor_places_user_near_top_with_tail_room() {
+    fn fresh_turn_at_live_tail_stays_bottom_pinned() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
@@ -5142,21 +5021,25 @@ mod render_history_spacing_tests {
             preflight_pending: false,
             persist_failed: false,
         });
-        app.pending_fresh_turn_history_idx = Some(app.history.len() - 1);
         app.busy = true;
 
         let rows = buffer_rows(&render_history_buffer(&mut app, 28, 8), 28, 8);
-        let user_row = rows
-            .iter()
-            .position(|row| row.contains("new question"))
-            .expect("fresh user row visible");
 
-        assert!(user_row <= 3, "fresh row should be near top: {rows:?}");
+        let last_nonblank = rows
+            .iter()
+            .rposition(|row| !row.trim().is_empty())
+            .expect("fresh turn renders nonblank rows");
         assert!(
-            app.chat_scroll_offset > 0,
-            "fresh turn should leave live-tail mode"
+            rows.iter()
+                .skip(last_nonblank.saturating_sub(2))
+                .any(|row| row.contains("new question")),
+            "fresh row should stay at live tail: {rows:?}"
         );
-        assert!(app.chat_fresh_tail_padding > 0);
+        assert!(
+            rows.len() - 1 - last_nonblank <= 1,
+            "fresh turn should not append viewport padding: {rows:?}"
+        );
+        assert_eq!(app.chat_scroll_offset, 0);
     }
 
     #[test]

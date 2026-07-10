@@ -1675,15 +1675,6 @@ pub struct App {
     /// Same purpose — clamp scrollback so the bottom of the visible
     /// window can't go below the top of the content.
     pub(super) chat_visible_lines: usize,
-    /// One-shot history index for a freshly submitted user turn that should be
-    /// placed near the top of the viewport on the next render.
-    pub(super) pending_fresh_turn_history_idx: Option<usize>,
-    /// Desired absolute top row while the fresh turn is streaming into the
-    /// reserved tail room. Cleared by explicit scroll/jump navigation.
-    pub(super) chat_fresh_anchor_top: Option<usize>,
-    /// Virtual blank rows appended below a fresh turn while the agent is busy,
-    /// so the user row can sit near the top before assistant text exists.
-    pub(super) chat_fresh_tail_padding: usize,
     /// Plain-text copy of the full banner-inclusive visual line model
     /// from the last render. Indices match `chat_total_lines` absolute
     /// lines and are searched by transcript find.
@@ -2513,9 +2504,6 @@ pub(super) struct StoredTranscriptView {
     pub(super) history_render_cache: HashMap<usize, HistoryRenderCacheEntry>,
     pub(super) pending_render_cache: Option<PendingRenderCacheEntry>,
     pub(super) chat_scroll_offset: usize,
-    pub(super) chat_fresh_anchor_top: Option<usize>,
-    pub(super) chat_fresh_tail_padding: usize,
-    pub(super) pending_fresh_turn_history_idx: Option<usize>,
 }
 
 impl App {
@@ -2529,9 +2517,6 @@ impl App {
             history_render_cache: std::mem::take(&mut self.history_render_cache),
             pending_render_cache: self.pending_render_cache.take(),
             chat_scroll_offset: self.chat_scroll_offset,
-            chat_fresh_anchor_top: self.chat_fresh_anchor_top.take(),
-            chat_fresh_tail_padding: self.chat_fresh_tail_padding,
-            pending_fresh_turn_history_idx: self.pending_fresh_turn_history_idx.take(),
         }
     }
 
@@ -2544,9 +2529,6 @@ impl App {
         self.history_render_cache = std::mem::take(&mut view.history_render_cache);
         self.pending_render_cache = view.pending_render_cache.take();
         self.chat_scroll_offset = view.chat_scroll_offset;
-        self.chat_fresh_anchor_top = view.chat_fresh_anchor_top;
-        self.chat_fresh_tail_padding = view.chat_fresh_tail_padding;
-        self.pending_fresh_turn_history_idx = view.pending_fresh_turn_history_idx;
         self.chat_row_meta.clear();
         self.clickable_rows.clear();
         self.box_rows.clear();
@@ -2610,9 +2592,6 @@ impl App {
         self.history_render_cache.clear();
         self.pending_render_cache = None;
         self.chat_scroll_offset = 0;
-        self.chat_fresh_anchor_top = None;
-        self.chat_fresh_tail_padding = 0;
-        self.pending_fresh_turn_history_idx = None;
         self.hovered_affordance = None;
         true
     }
@@ -2999,9 +2978,6 @@ impl App {
             chat_scroll_offset: 0,
             chat_total_lines: 0,
             chat_visible_lines: 0,
-            pending_fresh_turn_history_idx: None,
-            chat_fresh_anchor_top: None,
-            chat_fresh_tail_padding: 0,
             chat_find_lines: Vec::new(),
             transcript_find: None,
             selection: None,
@@ -4990,7 +4966,6 @@ impl App {
         tag_expansions: &[crate::tui::file_tag::TagExpansion],
     ) -> DispatchOutcome {
         self.lock_pending_agent_switch_log();
-        let fresh_history_idx = self.history.len();
         self.history.push(HistoryEntry::User {
             text: display,
             cleaned: None,
@@ -5000,10 +4975,6 @@ impl App {
             preflight_pending: false,
             persist_failed: false,
         });
-        if owns_working_span {
-            self.pending_fresh_turn_history_idx = Some(fresh_history_idx);
-            self.chat_fresh_anchor_top = None;
-        }
         self.push_tag_call_entries(tag_expansions);
         self.ensure_agent_runner();
         let outcome = match self.agent_runner.as_ref() {
@@ -7670,7 +7641,6 @@ impl App {
             }
         }
         if !stamped_existing {
-            let fresh_history_idx = self.history.len();
             self.history.push(HistoryEntry::User {
                 text,
                 cleaned: preflight_cleaned,
@@ -7680,10 +7650,6 @@ impl App {
                 preflight_pending: false,
                 persist_failed: false,
             });
-            if self.chat_scroll_offset == 0 {
-                self.pending_fresh_turn_history_idx = Some(fresh_history_idx);
-                self.chat_fresh_anchor_top = None;
-            }
         }
         if !calls.is_empty() {
             self.push_tag_call_entries(&calls);
@@ -9848,8 +9814,6 @@ impl App {
     /// so the top of the buffer can sit at the top of the pane but
     /// no further.
     pub(super) fn scroll_chat_up(&mut self, n: usize) {
-        self.chat_fresh_anchor_top = None;
-        self.pending_fresh_turn_history_idx = None;
         let max_offset = self
             .chat_total_lines
             .saturating_sub(self.chat_visible_lines);
@@ -9859,12 +9823,7 @@ impl App {
     /// Scroll the chat history down (toward the live tail) by `n`
     /// logical lines. Saturates at 0 (pinned to bottom = live).
     pub(super) fn scroll_chat_down(&mut self, n: usize) {
-        self.chat_fresh_anchor_top = None;
-        self.pending_fresh_turn_history_idx = None;
         self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(n);
-        if self.chat_scroll_offset == 0 {
-            self.chat_fresh_tail_padding = 0;
-        }
     }
 
     pub(super) fn build_affordance_scroll_regions(&self) -> Vec<AffordanceScrollRegion> {
@@ -17637,6 +17596,27 @@ mod failed_dispatch_reconciliation_tests {
     }
 
     #[test]
+    fn queued_submit_from_off_tail_returns_to_live_tail_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        app.agent_runner = Some(Ok(runner_with_sender(
+            input_tx,
+            Arc::new(Mutex::new(Vec::new())),
+        )));
+        app.busy = true;
+        app.chat_scroll_offset = 6;
+        app.composer.set("queued while busy".to_string());
+
+        let keep_running = app.submit_input();
+
+        assert!(!keep_running);
+        assert_eq!(app.chat_scroll_offset, 0);
+        let submission = input_rx.try_recv().expect("queued submission sent");
+        assert_eq!(submission.text, "queued while busy");
+    }
+
+    #[test]
     fn reset_session_live_state_clears_hidden_per_session_state() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -17657,9 +17637,6 @@ mod failed_dispatch_reconciliation_tests {
         assert!(app.active_schedules.is_empty());
         assert!(app.pending_stop_confirm.is_none());
         assert_eq!(app.chat_scroll_offset, 0);
-        assert!(app.pending_fresh_turn_history_idx.is_none());
-        assert!(app.chat_fresh_anchor_top.is_none());
-        assert_eq!(app.chat_fresh_tail_padding, 0);
         assert!(!app.busy);
         assert!(app.span_started_at.is_none());
         assert!(app.reconnect.is_none());
@@ -18128,7 +18105,7 @@ mod fresh_queue_ack_tests {
     }
 
     #[test]
-    fn queued_fold_off_tail_does_not_arm_fresh_turn_anchor() {
+    fn queued_fold_off_tail_preserves_scroll_position() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.chat_scroll_offset = 4;
@@ -18142,12 +18119,11 @@ mod fresh_queue_ack_tests {
         });
 
         assert_eq!(user_rows(&app), vec![("queued while reading", Some(70))]);
-        assert!(app.pending_fresh_turn_history_idx.is_none());
-        assert!(app.chat_fresh_anchor_top.is_none());
+        assert_eq!(app.chat_scroll_offset, 4);
     }
 
     #[test]
-    fn queued_fold_at_tail_arms_fresh_turn_anchor() {
+    fn queued_fold_at_tail_stays_live_tail() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.chat_scroll_offset = 0;
@@ -18161,8 +18137,7 @@ mod fresh_queue_ack_tests {
         });
 
         assert_eq!(user_rows(&app), vec![("queued at tail", Some(72))]);
-        assert_eq!(app.pending_fresh_turn_history_idx, Some(0));
-        assert!(app.chat_fresh_anchor_top.is_none());
+        assert_eq!(app.chat_scroll_offset, 0);
     }
 
     #[test]

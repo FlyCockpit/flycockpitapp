@@ -483,12 +483,16 @@ pub struct GuidanceEstimate {
 /// a local raw-cl100k computation via [`crate::engine::builtin`]. The two
 /// modes may differ by the calibration factor; each is the best available
 /// for its mode. Best-effort and non-blocking for launch.
-pub async fn fetch_guidance_estimate(
+pub async fn fetch_guidance_estimate_with_socket(
     cwd: &Path,
     provider: Option<String>,
     model: Option<String>,
+    socket: Option<std::path::PathBuf>,
 ) -> GuidanceEstimate {
-    if let Some(est) = daemon_guidance_estimate(cwd, provider, model).await {
+    if let Some(socket) = socket
+        && let Some(est) =
+            daemon_guidance_estimate_at_socket(cwd, provider.clone(), model.clone(), &socket).await
+    {
         return est;
     }
     local_guidance_estimate(cwd)
@@ -497,17 +501,13 @@ pub async fn fetch_guidance_estimate(
 /// Ask an already-running daemon for the calibrated estimate. Returns
 /// `None` on any failure (no daemon, transport error, or a malformed
 /// response) so the caller can fall back to the local computation.
-async fn daemon_guidance_estimate(
+async fn daemon_guidance_estimate_at_socket(
     cwd: &Path,
     provider: Option<String>,
     model: Option<String>,
+    socket: &Path,
 ) -> Option<GuidanceEstimate> {
-    use crate::daemon::{DaemonStatus, discover};
-    let probe = discover().await;
-    if !matches!(probe.status, DaemonStatus::Running) {
-        return None;
-    }
-    let client = crate::daemon::client::DaemonClient::connect(&probe.paths.socket)
+    let client = crate::daemon::client::DaemonClient::connect(socket)
         .await
         .ok()?;
     let resp = client

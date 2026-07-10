@@ -10,7 +10,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::banner::render_unconditional;
-use crate::config::provider::detect_provider_model;
 use crate::git::{self, RepoStatus};
 use crate::tui::chrome::repo_counts;
 use crate::tui::composer::INPUT_PREFIX;
@@ -28,6 +27,13 @@ const BADGE_LEFT_EDGE: &str = "\x1b[38;5;220m▐\x1b[0m";
 /// Left half-block (▌) in yellow-220 foreground — right edge of the
 /// pill, same fade behavior as `BADGE_LEFT_EDGE`.
 const BADGE_RIGHT_EDGE: &str = "\x1b[38;5;220m▌\x1b[0m";
+
+#[derive(Debug, Clone)]
+pub struct LaunchBundle {
+    pub launch: LaunchInfo,
+    pub providers: crate::config::providers::ProvidersConfig,
+    pub extended: crate::config::extended::ExtendedConfig,
+}
 
 #[derive(Debug, Clone)]
 pub struct LaunchInfo {
@@ -87,19 +93,36 @@ pub struct LaunchInfo {
 /// poller populate `repo_status` a few ms after the first frame — so a
 /// giant-repo `git status` never blocks the first paint.
 pub fn load(project: Option<&Path>, fetch_git: bool) -> LaunchInfo {
+    load_bundle(project, fetch_git).launch
+}
+
+pub fn load_bundle(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
     let cwd = resolve_launch_dir(project);
-    let active_model = detect_provider_model(&cwd);
+    let providers = crate::config::providers::ConfigDoc::load_effective(&cwd);
+    let extended = crate::config::extended::load_for_cwd(&cwd);
+    let launch = build_launch_info(cwd, fetch_git, &providers, &extended);
+    LaunchBundle {
+        launch,
+        providers,
+        extended,
+    }
+}
+
+fn build_launch_info(
+    cwd: PathBuf,
+    fetch_git: bool,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended: &crate::config::extended::ExtendedConfig,
+) -> LaunchInfo {
+    let active_model = detect_provider_model_from_loaded(providers);
     let provider_line = active_model
         .clone()
         .map(|(provider, model)| format!("{provider} / {model}"))
         .unwrap_or_else(|| "No providers configured - run /settings to edit".to_string());
 
-    let providers = crate::config::providers::ConfigDoc::load_effective(&cwd);
-    let extended = crate::config::extended::load_for_cwd(&cwd);
-
     let active_model_is_favorite = active_model
         .as_ref()
-        .map(|(p, m)| is_favorite_model(&providers, p, m))
+        .map(|(p, m)| is_favorite_model(providers, p, m))
         .unwrap_or(false);
     let active_model_is_trusted = active_model
         .as_ref()
@@ -107,10 +130,10 @@ pub fn load(project: Option<&Path>, fetch_git: bool) -> LaunchInfo {
         .unwrap_or(false);
     let active_model_max_context = active_model
         .as_ref()
-        .and_then(|(p, m)| lookup_model_context(&providers, p, m));
+        .and_then(|(p, m)| lookup_model_context(providers, p, m));
     let active_model_supports_images = active_model
         .as_ref()
-        .map(|(p, m)| model_supports_images(&providers, p, m))
+        .map(|(p, m)| model_supports_images(providers, p, m))
         .unwrap_or(false);
     let repo_status = if fetch_git {
         git::repo_status(&cwd).ok().flatten()
@@ -124,10 +147,6 @@ pub fn load(project: Option<&Path>, fetch_git: bool) -> LaunchInfo {
         .filter(|name| !name.is_empty())
         .map(ToString::to_string);
     let banner_enabled = extended.tui.banner.enabled;
-    // Seed the displayed primary from the same config-resolved default the
-    // daemon uses (`session_worker::initial_active_agent`), reusing the
-    // `DefaultPrimaryAgent::agent_name()` mapping — so the banner shows the
-    // real primary on the first frame instead of flashing a hardcoded one.
     let agent_name = crate::agents::resolve_primary_for_flag(
         extended.default_primary_agent.agent_name(),
         extended.experimental_mode,
@@ -150,6 +169,33 @@ pub fn load(project: Option<&Path>, fetch_git: bool) -> LaunchInfo {
         user_name,
         banner_enabled,
     }
+}
+
+fn detect_provider_model_from_loaded(
+    cfg: &crate::config::providers::ProvidersConfig,
+) -> Option<(String, String)> {
+    let provider = env::var("COCKPIT_PROVIDER")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let model = env::var("COCKPIT_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    match (provider, model) {
+        (Some(provider), Some(model)) => return Some((provider, model)),
+        (None, Some(model)) => return crate::config::provider::split_provider_model(&model),
+        _ => {}
+    }
+
+    if let Some(active) = &cfg.active_model {
+        return Some((active.provider.clone(), active.model.clone()));
+    }
+    for (provider, entry) in &cfg.providers {
+        if let Some(model) = entry.models.first() {
+            return Some((provider.clone(), model.id.clone()));
+        }
+    }
+    None
 }
 
 fn is_favorite_model(

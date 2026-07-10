@@ -6,31 +6,13 @@
 //!   2. The effective layered provider config: `active_model`, then the first
 //!      configured provider/model from `providers/*.json`.
 
-use std::env;
+#[cfg(test)]
 use std::path::Path;
 
+#[cfg(test)]
 use crate::config::providers::ConfigDoc;
 
-/// Detected (provider, model) pair, or `None` if nothing is configured.
-pub fn detect_provider_model(cwd: &Path) -> Option<(String, String)> {
-    detect_from_env().or_else(|| detect_from_configs(cwd))
-}
-
-fn detect_from_env() -> Option<(String, String)> {
-    let provider = env::var("COCKPIT_PROVIDER")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let model = env::var("COCKPIT_MODEL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
-    match (provider, model) {
-        (Some(provider), Some(model)) => Some((provider, model)),
-        (None, Some(model)) => split_provider_model(&model),
-        _ => None,
-    }
-}
-
+#[cfg(test)]
 fn detect_from_configs(cwd: &Path) -> Option<(String, String)> {
     let cfg = ConfigDoc::load_effective(cwd);
     if let Some(active) = cfg.active_model {

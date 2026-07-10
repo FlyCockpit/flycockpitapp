@@ -2589,12 +2589,29 @@ pub struct ConfigDoc {
     raw: Value,
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOAD_EFFECTIVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_load_effective_call_count() {
+    LOAD_EFFECTIVE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn load_effective_call_count() -> usize {
+    LOAD_EFFECTIVE_CALLS.with(std::cell::Cell::get)
+}
+
 impl ConfigDoc {
     /// Load the effective provider config for `cwd` by merging every
     /// applicable config layer from least-specific to most-specific.
     /// `COCKPIT_CONFIG` supplies the only config.json path when set; provider
     /// files live beside that file under `providers/`.
     pub fn load_effective(cwd: &Path) -> ProvidersConfig {
+        #[cfg(test)]
+        LOAD_EFFECTIVE_CALLS.with(|calls| calls.set(calls.get() + 1));
         let paths = crate::config::dirs::config_file_paths_for_load(cwd);
         Self::providers_from_paths(&paths)
     }

@@ -18,9 +18,31 @@ use tiktoken_rs::{
     r50k_base_singleton,
 };
 
+#[cfg(test)]
+thread_local! {
+    static COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_count_call_count() {
+    COUNT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn count_call_count() -> usize {
+    COUNT_CALLS.with(std::cell::Cell::get)
+}
+
+/// Warm the default cl100k tokenizer singleton without counting user text.
+pub fn warm_cl100k() {
+    let _ = cl100k_base_singleton();
+}
+
 /// Count tokens in `text` using cl100k_base — the documented global
 /// default / fallback (GOALS §10).
 pub fn count(text: &str) -> usize {
+    #[cfg(test)]
+    COUNT_CALLS.with(|calls| calls.set(calls.get() + 1));
     count_with(text, TokenizerStrategy::Cl100k)
 }
 

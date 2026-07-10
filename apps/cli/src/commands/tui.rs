@@ -13,13 +13,13 @@ pub async fn run(project: Option<&Path>, no_sandbox: bool) -> Result<()> {
         return Ok(());
     }
 
-    ensure_tui_workspace_trust(project)?;
+    let db = ensure_tui_workspace_trust(project)?;
 
-    let mut app = App::new(project, no_sandbox);
+    let mut app = App::new_with_db(project, no_sandbox, db);
     app.run().await
 }
 
-fn ensure_tui_workspace_trust(project: Option<&Path>) -> Result<()> {
+fn ensure_tui_workspace_trust(project: Option<&Path>) -> Result<crate::db::Db> {
     let opened = match project {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().context("resolving cwd")?,
@@ -27,12 +27,14 @@ fn ensure_tui_workspace_trust(project: Option<&Path>) -> Result<()> {
     let root = crate::config::trust::resolve_trust_root(&opened)?;
     let db = crate::db::Db::open_default().context("opening cockpit DB")?;
     if let Some(decision) = db.workspace_trust_by_root(&root.root)? {
-        return crate::config::trust::apply_trusted_workspace(root, decision.mode);
+        crate::config::trust::apply_trusted_workspace(root, decision.mode)?;
+        return Ok(db);
     }
 
     let mode = prompt_workspace_trust_choice(&root.root)?;
     db.set_workspace_trust(&root.root, mode)?;
-    crate::config::trust::apply_trusted_workspace(root, mode)
+    crate::config::trust::apply_trusted_workspace(root, mode)?;
+    Ok(db)
 }
 
 fn prompt_workspace_trust_choice(root: &Path) -> Result<WorkspaceTrustMode> {

@@ -427,7 +427,28 @@ pub async fn discover() -> DaemonProbe {
     DaemonProbe::new(probe_direct(&canonical).await, canonical)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BLOCKING_PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_blocking_probe_call_count() {
+    BLOCKING_PROBE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn blocking_probe_call_count() -> usize {
+    BLOCKING_PROBE_CALLS.with(std::cell::Cell::get)
+}
+
+fn note_blocking_probe_call() {
+    #[cfg(test)]
+    BLOCKING_PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
 pub fn discover_blocking() -> DaemonProbe {
+    note_blocking_probe_call();
     let canonical = match DaemonPaths::resolve_canonical() {
         Ok(paths) => paths,
         Err(_) => {
@@ -489,6 +510,7 @@ pub async fn probe(paths: &DaemonPaths) -> DaemonStatus {
 
 /// Sync version of `probe`. Useful before the tokio runtime is up.
 pub fn probe_blocking(paths: &DaemonPaths) -> DaemonStatus {
+    note_blocking_probe_call();
     probe_direct_blocking(paths)
 }
 

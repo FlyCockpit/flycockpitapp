@@ -50,7 +50,7 @@ use crate::tui::history::{
     ToolCallState, classify_subagent_status, route_text_delta,
 };
 use crate::tui::settings::{self, Dialog, OAuthActionRequest};
-use crate::welcome::{self, LaunchInfo};
+use crate::welcome::{self, LaunchBundle, LaunchInfo};
 
 const MIN_INPUT_CONTENT: u16 = 1;
 const MAX_INPUT_CONTENT: u16 = 6;
@@ -177,14 +177,14 @@ fn footer_agent_picker_height(picker: Option<&FooterAgentPicker>) -> u16 {
 }
 
 fn resolve_tui_llm_mode(
-    cwd: &Path,
     active_model: Option<&(String, String)>,
     global: crate::config::extended::LlmMode,
+    providers: &crate::config::providers::ProvidersConfig,
 ) -> crate::config::extended::LlmMode {
     let Some((provider, model)) = active_model else {
         return global;
     };
-    crate::config::providers::ConfigDoc::load_effective(cwd).resolve_mode(provider, model, global)
+    providers.resolve_mode(provider, model, global)
 }
 
 fn persist_trusted_only_default(cwd: &Path, enabled: bool) -> anyhow::Result<()> {
@@ -1416,6 +1416,13 @@ pub(super) enum PaneSide {
     Bottom,
 }
 
+#[derive(Debug, Clone)]
+struct StartupBackground {
+    daemon_socket: Option<PathBuf>,
+    db: Option<crate::db::Db>,
+    started: bool,
+}
+
 #[allow(private_interfaces)]
 pub struct App {
     pub(super) launch: LaunchInfo,
@@ -1626,6 +1633,7 @@ pub struct App {
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
+    startup_background: StartupBackground,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
     /// click-to-expand works on thinking blocks.
@@ -2064,6 +2072,7 @@ pub struct App {
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
     pub(super) connector_disclosure: Option<crate::db::connector::ConnectorDisclosure>,
+    has_no_providers_at_startup: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -2447,26 +2456,40 @@ pub(super) struct PendingRenderCacheEntry {
 
 #[allow(private_interfaces)]
 impl App {
+    #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
+        Self::new_inner(project, no_sandbox, None)
+    }
+
+    pub fn new_with_db(project: Option<&Path>, no_sandbox: bool, db: crate::db::Db) -> Self {
+        Self::new_inner(project, no_sandbox, Some(db))
+    }
+
+    fn new_inner(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        startup_db: Option<crate::db::Db>,
+    ) -> Self {
         let mut timer = crate::startup::PhaseTimer::start("App::new");
         // Skip the synchronous `git status` here — it can take seconds in a
         // giant repo and would block the first frame. `spawn_git_refresh`
         // does an immediate background refresh and the branch pill pops in
         // a tick later (chrome guards on `repo_status.is_some()`).
-        let launch = welcome::load(project, false);
+        let LaunchBundle {
+            launch,
+            providers,
+            extended,
+        } = welcome::load_bundle(project, false);
         timer.phase("welcome_load");
-        let tui_cfg = load_tui_config(&launch.cwd);
-        // The active LLM mode (implementation note),
-        // resolved from the same layered config the daemon root reads.
-        let extended = crate::config::extended::load_for_cwd(&launch.cwd);
+        let tui_cfg = extended.tui.clone();
         timer.phase("config_load");
         // Discovered skills surfaced as bare-`/<name>` slash-menu entries
         // (implementation note); builtin-colliding names are
         // dropped here (still reachable via `/skill <name>`).
-        let skill_commands = discover_bare_skill_commands(&launch.cwd);
+        let skill_commands = discover_bare_skill_commands(&launch.cwd, &extended);
         timer.phase("skill_discovery");
         let llm_mode =
-            resolve_tui_llm_mode(&launch.cwd, launch.active_model.as_ref(), extended.llm_mode);
+            resolve_tui_llm_mode(launch.active_model.as_ref(), extended.llm_mode, &providers);
         let approval_mode = extended.default_approval_mode;
         let delegation_recursion_enabled = extended.delegation.recursion_enabled
             && extended.delegation.default_recursion_depth > 0;
@@ -2480,8 +2503,9 @@ impl App {
         // Session-only request-preflight state, seeded from the layered
         // config (project wins); the daemon keeps it in sync via
         // `PreflightState` broadcasts (`/preflight`).
-        let preflight_enabled = crate::config::extended::resolve_preflight(&launch.cwd).enabled;
+        let preflight_enabled = extended.preflight.enabled;
         let trusted_only_enabled = extended.trusted_only;
+        let has_no_providers_at_startup = providers.providers.is_empty();
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -2499,49 +2523,42 @@ impl App {
 
         // Probe the daemon synchronously up front so the prompt shows
         // immediately when we open the TUI rather than after a tick.
-        let (daemon_prompt, daemon_connected) = match crate::daemon::DaemonPaths::resolve() {
-            Ok(paths) if paths.ephemeral => match crate::daemon::probe_blocking(&paths) {
-                crate::daemon::DaemonStatus::Running => (None, true),
-                status => (
-                    Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
-                        status, paths,
-                    )),
-                    false,
-                ),
-            },
-            Ok(_) => {
-                let probe = crate::daemon::discover_blocking();
-                match probe.status {
-                    crate::daemon::DaemonStatus::Running => (None, true),
+        let (daemon_prompt, daemon_connected, startup_daemon_socket) =
+            match crate::daemon::DaemonPaths::resolve() {
+                Ok(paths) if paths.ephemeral => match crate::daemon::probe_blocking(&paths) {
+                    crate::daemon::DaemonStatus::Running => {
+                        (None, true, Some(paths.socket.clone()))
+                    }
                     status => (
                         Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
-                            status,
-                            probe.paths,
+                            status, paths,
                         )),
                         false,
+                        None,
                     ),
+                },
+                Ok(_) => {
+                    let probe = crate::daemon::discover_blocking();
+                    match probe.status {
+                        crate::daemon::DaemonStatus::Running => {
+                            (None, true, Some(probe.paths.socket.clone()))
+                        }
+                        status => (
+                            Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
+                                status,
+                                probe.paths,
+                            )),
+                            false,
+                            None,
+                        ),
+                    }
                 }
-            }
-            Err(_) => (None, false),
-        };
+                Err(_) => (None, false, None),
+            };
         timer.phase("daemon_probe");
-        let (org_sync_disclosure, connector_disclosure) =
-            crate::auth::flycockpit::maybe_load_credential()
-                .and_then(|credential| {
-                    crate::db::Db::open_default().ok().map(|db| {
-                        let org = db
-                            .org_sync_disclosure_for_server(&credential.server_url)
-                            .ok()
-                            .flatten();
-                        let connector = db
-                            .connector_disclosure(&credential.server_url, &credential.instance_id)
-                            .ok()
-                            .flatten();
-                        (org, connector)
-                    })
-                })
-                .unwrap_or((None, None));
-        timer.phase("remote_disclosures");
+        let org_sync_disclosure = None;
+        let connector_disclosure = None;
+        timer.phase("remote_disclosures_deferred");
         timer.done();
 
         let diff_style = tui_cfg.diff_style;
@@ -2602,6 +2619,11 @@ impl App {
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
             completed_async_actions: Vec::new(),
+            startup_background: StartupBackground {
+                daemon_socket: startup_daemon_socket,
+                db: startup_db,
+                started: false,
+            },
             chat_area: None,
             input_area: None,
             chat_scroll_offset: 0,
@@ -2683,7 +2705,7 @@ impl App {
             no_sandbox,
             sandbox_mode: crate::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
             container_network_enabled: false,
-            container_availability: crate::container::availability_snapshot(),
+            container_availability: crate::container::initial_availability_unknown(),
             caffeinate_active: false,
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),
@@ -2705,6 +2727,7 @@ impl App {
             pending_tandem_options: Vec::new(),
             org_sync_disclosure,
             connector_disclosure,
+            has_no_providers_at_startup,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,
@@ -2745,10 +2768,88 @@ impl App {
         if self.dialog.is_active() {
             return;
         }
-        if !crate::tui::settings::Dialog::has_no_providers(&self.launch.cwd) {
+        if !self.has_no_providers_at_startup {
             return;
         }
         self.dialog = crate::tui::settings::Dialog::open_providers_add(&self.launch.cwd);
+    }
+
+    fn apply_startup_guidance_estimate(
+        &mut self,
+        cwd: PathBuf,
+        active_model: Option<(String, String)>,
+        estimate: agent_runner::GuidanceEstimate,
+    ) {
+        if cwd == self.launch.cwd && active_model == self.launch.active_model {
+            self.guidance_estimate = Some(estimate);
+        }
+    }
+
+    fn start_startup_background_tasks(&mut self) {
+        if self.startup_background.started {
+            return;
+        }
+        self.startup_background.started = true;
+
+        tokio::task::spawn_blocking(crate::tokens::warm_cl100k);
+
+        let cwd = self.launch.cwd.clone();
+        let active_model = self.launch.active_model.clone();
+        let socket = self.startup_background.daemon_socket.clone();
+        self.async_actions.start(
+            AsyncActionKind::Internal("startup.guidance.estimate"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.guidance.estimate")),
+            async move {
+                let (provider, model) = match &active_model {
+                    Some((p, m)) => (Some(p.clone()), Some(m.clone())),
+                    None => (None, None),
+                };
+                let estimate = agent_runner::fetch_guidance_estimate_with_socket(
+                    &cwd, provider, model, socket,
+                )
+                .await;
+                Ok(AsyncActionPayload::StartupGuidanceEstimate {
+                    cwd,
+                    active_model,
+                    estimate,
+                })
+            },
+        );
+
+        self.async_actions.start_blocking(
+            AsyncActionKind::Refresh("container.availability"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("container.availability")),
+            || {
+                Ok(AsyncActionPayload::ContainerAvailability(
+                    crate::container::availability_snapshot(),
+                ))
+            },
+        );
+
+        let db = self.startup_background.db.clone();
+        self.async_actions.start_blocking(
+            AsyncActionKind::Internal("startup.remote_disclosures"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
+            move || {
+                let Some(credential) = crate::auth::flycockpit::maybe_load_credential() else {
+                    return Ok(AsyncActionPayload::RemoteDisclosures {
+                        org: None,
+                        connector: None,
+                    });
+                };
+                let db = match db {
+                    Some(db) => db,
+                    None => crate::db::Db::open_default().map_err(|e| e.to_string())?,
+                };
+                let org = db
+                    .org_sync_disclosure_for_server(&credential.server_url)
+                    .map_err(|e| e.to_string())?;
+                let connector = db
+                    .connector_disclosure(&credential.server_url, &credential.instance_id)
+                    .map_err(|e| e.to_string())?;
+                Ok(AsyncActionPayload::RemoteDisclosures { org, connector })
+            },
+        );
     }
 
     pub(super) fn geometry(&self) -> PaneGeometry {
@@ -2822,18 +2923,6 @@ impl App {
         // top of the chat pane (see `render_history` / `banner_box`),
         // so we no longer dump it to stdout before entering the alt
         // screen — that only ever showed up in scrollback after exit.
-
-        // Pre-flight: size the instruction file + full system prompt for
-        // the fresh-chat context indicator (`X tokens in <file>` plus the
-        // baseline the running estimate folds in). Prefers a running
-        // daemon's calibrated count, falls back to a local raw-cl100k
-        // computation. Best-effort and non-blocking for launch.
-        let (provider, model) = match &self.launch.active_model {
-            Some((p, m)) => (Some(p.clone()), Some(m.clone())),
-            None => (None, None),
-        };
-        self.guidance_estimate =
-            Some(agent_runner::fetch_guidance_estimate(&self.launch.cwd, provider, model).await);
 
         // `try_init` enters the alternate screen and uses a full-
         // terminal viewport by default. GOALS §1d: alt screen during
@@ -3002,6 +3091,7 @@ impl App {
             self.maybe_service_external_edit(terminal)?;
             self.maybe_service_agent_file_edit(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
+            self.start_startup_background_tasks();
             // The composer is the user's active input surface this frame iff
             // no question dialog is displacing it
             // (implementation note). A render with no
@@ -3380,6 +3470,29 @@ impl App {
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
                 if let Ok(AsyncActionPayload::GuidanceEstimate(estimate)) = result.payload {
                     self.guidance_estimate = Some(estimate);
+                }
+            }
+            AsyncActionKind::Internal("startup.guidance.estimate") => {
+                if let Ok(AsyncActionPayload::StartupGuidanceEstimate {
+                    cwd,
+                    active_model,
+                    estimate,
+                }) = result.payload
+                {
+                    self.apply_startup_guidance_estimate(cwd, active_model, estimate);
+                }
+            }
+            AsyncActionKind::Refresh("container.availability") => {
+                if let Ok(AsyncActionPayload::ContainerAvailability(availability)) = result.payload
+                {
+                    self.container_availability = availability;
+                }
+            }
+            AsyncActionKind::Internal("startup.remote_disclosures") => {
+                if let Ok(AsyncActionPayload::RemoteDisclosures { org, connector }) = result.payload
+                {
+                    self.org_sync_disclosure = org;
+                    self.connector_disclosure = connector;
                 }
             }
             AsyncActionKind::Refresh("provider.usage") => match result.payload {
@@ -10150,16 +10263,19 @@ impl App {
         // Skip the synchronous git fetch: the freshly-loaded `repo_status`
         // is discarded below in favor of the live polled one, so re-running
         // `git status` here is pure waste.
-        let mut fresh = welcome::load(Some(&self.launch.cwd), false);
+        let LaunchBundle {
+            launch: mut fresh,
+            providers,
+            extended,
+        } = welcome::load_bundle(Some(&self.launch.cwd), false);
         // Don't clobber the live repo status — it's maintained by the
         // background poller and is fresher than a re-read here.
         fresh.repo_status = self.launch.repo_status.clone();
         if let Some(active_agent) = self.agent_path.last() {
             fresh.agent_name = active_agent.clone();
         }
-        let extended = crate::config::extended::load_for_cwd(&fresh.cwd);
         self.llm_mode =
-            resolve_tui_llm_mode(&fresh.cwd, fresh.active_model.as_ref(), extended.llm_mode);
+            resolve_tui_llm_mode(fresh.active_model.as_ref(), extended.llm_mode, &providers);
         self.launch = fresh;
     }
 
@@ -10167,7 +10283,8 @@ impl App {
     /// markdown rendering) so changes made via `/settings` take effect
     /// immediately on dialog close.
     pub(super) fn reload_tui_config(&mut self) {
-        let tui_cfg = load_tui_config(&self.launch.cwd);
+        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
+        let tui_cfg = extended.tui.clone();
         self.vim_setting = tui_cfg.vim_mode;
         self.thinking_setting = tui_cfg.thinking;
         self.markdown_opts = MarkdownOpts {
@@ -10187,8 +10304,7 @@ impl App {
         // root (not in `tui`); reload it so a `/settings` change takes
         // effect on subsequent turns. Turning it `off` also drops any
         // pending ghost/cache immediately.
-        let predict_setting =
-            crate::config::extended::load_for_cwd(&self.launch.cwd).predict_next_message;
+        let predict_setting = extended.predict_next_message;
         self.predict_setting = predict_setting;
         if !predict_setting.is_enabled() {
             self.prediction_state.clear();
@@ -11839,8 +11955,10 @@ pub(super) fn builtin_slash_name_taken(name: &str) -> bool {
 /// colliding skill is dropped from the bare entries (logged once) but stays
 /// invokable via the `/skill <name>` dispatcher. Discovery is frontmatter-only
 /// (cheap) and tolerant — a discovery failure yields no skill entries.
-pub(super) fn discover_bare_skill_commands(cwd: &Path) -> Vec<SkillCommand> {
-    let extended = crate::config::extended::load_for_cwd(cwd);
+pub(super) fn discover_bare_skill_commands(
+    cwd: &Path,
+    extended: &crate::config::extended::ExtendedConfig,
+) -> Vec<SkillCommand> {
     let skills = crate::skills::discover(cwd, &extended.skills).unwrap_or_default();
     bare_skill_commands_from(skills)
 }
@@ -11923,11 +12041,6 @@ pub(super) fn resolve_skill_dispatch(args: &str, names: &[&str]) -> SkillDispatc
     }
 }
 
-/// Return the effective layered `tui` config slice.
-fn load_tui_config(cwd: &Path) -> crate::config::extended::TuiConfig {
-    crate::config::extended::load_for_cwd(cwd).tui
-}
-
 /// Resolve the answering-dialog config (GOALS §3b) from the effective layered
 /// `config.json`. Used to read the anti-misfire lockout delay.
 fn load_dialog_config(cwd: &Path) -> crate::config::extended::DialogConfig {
@@ -11960,6 +12073,96 @@ fn spawn_git_refresh(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod startup_first_paint_tests {
+    use super::App;
+    use crate::tui::agent_runner::GuidanceEstimate;
+
+    fn reset_startup_counters() {
+        crate::config::extended::reset_load_for_cwd_call_count();
+        crate::config::providers::reset_load_effective_call_count();
+        crate::container::reset_detect_runtime_call_count();
+        crate::daemon::reset_blocking_probe_call_count();
+        crate::db::reset_open_default_call_count();
+        crate::tokens::reset_count_call_count();
+    }
+
+    #[test]
+    fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        reset_startup_counters();
+
+        let app = App::new_with_db(Some(tmp.path()), false, db);
+
+        assert_eq!(crate::config::extended::load_for_cwd_call_count(), 1);
+        assert_eq!(crate::config::providers::load_effective_call_count(), 1);
+        assert_eq!(crate::daemon::blocking_probe_call_count(), 1);
+        assert_eq!(crate::db::open_default_call_count(), 0);
+        assert_eq!(crate::container::detect_runtime_call_count(), 0);
+        assert_eq!(crate::tokens::count_call_count(), 0);
+        assert!(app.guidance_estimate.is_none());
+        assert!(!app.startup_background.started);
+    }
+
+    #[test]
+    fn startup_guidance_backfill_discards_stale_session_or_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_db(
+            Some(tmp.path()),
+            false,
+            crate::db::Db::open_in_memory().unwrap(),
+        );
+        app.launch.active_model = Some(("provider".to_string(), "model-a".to_string()));
+        let estimate = GuidanceEstimate {
+            file: Some("AGENTS.md".to_string()),
+            guidance_tokens: 10,
+            system_tokens: 20,
+        };
+
+        app.apply_startup_guidance_estimate(
+            app.launch.cwd.clone(),
+            Some(("provider".to_string(), "model-b".to_string())),
+            estimate.clone(),
+        );
+        assert!(app.guidance_estimate.is_none());
+
+        app.apply_startup_guidance_estimate(
+            app.launch.cwd.join("other"),
+            app.launch.active_model.clone(),
+            estimate.clone(),
+        );
+        assert!(app.guidance_estimate.is_none());
+
+        app.apply_startup_guidance_estimate(
+            app.launch.cwd.clone(),
+            app.launch.active_model.clone(),
+            estimate,
+        );
+        assert_eq!(
+            app.guidance_estimate.as_ref().map(|e| e.system_tokens),
+            Some(20)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_background_tasks_are_explicitly_started_after_construction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_db(
+            Some(tmp.path()),
+            false,
+            crate::db::Db::open_in_memory().unwrap(),
+        );
+        assert!(!app.startup_background.started);
+        assert_eq!(app.async_actions.pending_count(), 0);
+
+        app.start_startup_background_tasks();
+
+        assert!(app.startup_background.started);
+        assert!(app.async_actions.pending_count() >= 2);
+    }
 }
 
 #[cfg(test)]

@@ -47,6 +47,16 @@ pub enum AsyncActionPayload {
         text: String,
     },
     GuidanceEstimate(crate::tui::agent_runner::GuidanceEstimate),
+    StartupGuidanceEstimate {
+        cwd: std::path::PathBuf,
+        active_model: Option<(String, String)>,
+        estimate: crate::tui::agent_runner::GuidanceEstimate,
+    },
+    ContainerAvailability(crate::container::ContainerAvailability),
+    RemoteDisclosures {
+        org: Option<crate::db::org_sync::OrgSyncDisclosure>,
+        connector: Option<crate::db::connector::ConnectorDisclosure>,
+    },
     ProviderUsage(Vec<crate::providers::usage::ProviderUsageSnapshot>),
     LocalCommand {
         label: String,

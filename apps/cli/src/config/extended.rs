@@ -2898,6 +2898,21 @@ fn default_agent_guidance_files() -> Vec<String> {
     vec!["AGENTS.md".into()]
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOAD_FOR_CWD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_load_for_cwd_call_count() {
+    LOAD_FOR_CWD_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn load_for_cwd_call_count() -> usize {
+    LOAD_FOR_CWD_CALLS.with(std::cell::Cell::get)
+}
+
 /// Load the effective [`ExtendedConfig`] for `cwd`: all existing
 /// `config.json` layers are merged from least-specific to most-specific, or —
 /// when **none** exists anywhere (a genuinely *fresh install*) — `Default` with
@@ -2911,6 +2926,8 @@ fn default_agent_guidance_files() -> Vec<String> {
 /// on-disk config whose `scan_dirs` is absent/empty (clean break: scan
 /// nothing).
 pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
+    #[cfg(test)]
+    LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
     if let Some(mut cfg) = load_merged_from_paths(&paths) {
         cfg.gitignore_allow = resolve_gitignore_allow_from_paths(&paths);

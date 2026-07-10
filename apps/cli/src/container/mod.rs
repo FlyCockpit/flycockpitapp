@@ -137,7 +137,24 @@ where
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static DETECT_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_detect_runtime_call_count() {
+    DETECT_RUNTIME_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn detect_runtime_call_count() -> usize {
+    DETECT_RUNTIME_CALLS.with(std::cell::Cell::get)
+}
+
 pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
+    #[cfg(test)]
+    DETECT_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
     let harness = harness_in_container();
     let docker = which::which("docker").ok();
     let podman = which::which("podman").ok();
@@ -389,6 +406,15 @@ impl ContainerManager {
 pub fn container_manager() -> &'static OnceCell<ContainerManager> {
     static CELL: OnceCell<ContainerManager> = OnceCell::const_new();
     &CELL
+}
+
+pub fn initial_availability_unknown() -> ContainerAvailability {
+    ContainerAvailability {
+        runtime: None,
+        harness_in_container: false,
+        available: false,
+        reason: Some(ContainerUnavailableReason::NoRuntime),
+    }
 }
 
 pub fn availability_snapshot() -> ContainerAvailability {

@@ -30,6 +30,7 @@ pub mod dir_suggest;
 pub mod file_tag;
 pub mod geometry;
 pub mod history;
+pub mod input_source;
 pub mod keys_overlay;
 pub mod markdown;
 pub mod math_render;

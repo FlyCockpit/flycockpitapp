@@ -30,11 +30,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
-    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use futures::{FutureExt, StreamExt};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
@@ -54,6 +52,7 @@ use crate::tui::history::{
     HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
     ToolCallState, classify_subagent_status, route_text_delta,
 };
+use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput, with_input_suspended};
 use crate::tui::settings::{self, Dialog, OAuthActionRequest};
 use crate::welcome::{self, LaunchBundle, LaunchInfo};
 
@@ -3418,11 +3417,11 @@ impl App {
     }
 
     pub(super) async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        let mut events = EventStream::new();
+        let mut terminal_input = TerminalInput::new();
         let mut needs_redraw = true;
 
         loop {
-            if self.service_event_loop_wake(terminal)? {
+            if self.service_event_loop_wake(terminal, &mut terminal_input)? {
                 needs_redraw = true;
             }
             self.start_startup_background_tasks();
@@ -3456,11 +3455,11 @@ impl App {
                 let animation = tokio::time::sleep(ANIMATION_TICK);
                 tokio::pin!(animation);
                 tokio::select! {
-                    maybe_event = events.next() => {
+                    maybe_event = terminal_input.next() => {
                         if self.handle_event_stream_item(maybe_event)? {
                             break;
                         }
-                        if self.drain_ready_terminal_events(&mut events)? {
+                        if terminal_input.drain_ready(MAX_DRAIN_PER_PASS, |item| self.handle_event_stream_item(item)).await? {
                             break;
                         }
                         needs_redraw = true;
@@ -3478,11 +3477,11 @@ impl App {
                 }
             } else {
                 tokio::select! {
-                    maybe_event = events.next() => {
+                    maybe_event = terminal_input.next() => {
                         if self.handle_event_stream_item(maybe_event)? {
                             break;
                         }
-                        if self.drain_ready_terminal_events(&mut events)? {
+                        if terminal_input.drain_ready(MAX_DRAIN_PER_PASS, |item| self.handle_event_stream_item(item)).await? {
                             break;
                         }
                         needs_redraw = true;
@@ -3501,7 +3500,11 @@ impl App {
         Ok(())
     }
 
-    fn service_event_loop_wake(&mut self, terminal: &mut DefaultTerminal) -> Result<bool> {
+    fn service_event_loop_wake(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        terminal_input: &mut TerminalInput,
+    ) -> Result<bool> {
         let mut changed = false;
         self.ensure_session_for_display();
         changed |= self.sync_repo_status();
@@ -3524,9 +3527,9 @@ impl App {
         // scrollback (alt screen doesn't have scrollback). The
         // wheel-scroll path handles in-app scrollback instead.
         self.maybe_service_new_session(terminal)?;
-        self.maybe_service_external_edit(terminal)?;
-        self.maybe_service_agent_file_edit(terminal)?;
-        self.maybe_service_category_setting_edit(terminal)?;
+        self.maybe_service_external_edit(terminal, terminal_input)?;
+        self.maybe_service_agent_file_edit(terminal, terminal_input)?;
+        self.maybe_service_category_setting_edit(terminal, terminal_input)?;
         Ok(changed)
     }
 
@@ -3536,15 +3539,6 @@ impl App {
             Some(Err(error)) => Err(error.into()),
             None => Ok(true),
         }
-    }
-
-    fn drain_ready_terminal_events(&mut self, events: &mut EventStream) -> Result<bool> {
-        while let Some(item) = events.next().now_or_never() {
-            if self.handle_event_stream_item(item)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn handle_terminal_event(&mut self, event: Event) -> bool {
@@ -4489,26 +4483,29 @@ impl App {
 
     fn run_external_editor_command(
         terminal: &mut DefaultTerminal,
+        terminal_input: &mut TerminalInput,
         editor: &std::ffi::OsStr,
         path: &std::path::Path,
     ) -> Result<std::io::Result<std::process::ExitStatus>> {
-        // Suspend ratatui's input handling for the editor invocation.
-        // We disable the keyboard-enhancement flags / cursor styles
-        // crossterm pushed for us, leave raw mode, and let the editor
-        // own the TTY. Re-enable everything after it exits.
-        use crossterm::terminal::{
-            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        };
-        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+        with_input_suspended(terminal_input, |_| {
+            // Suspend ratatui's input handling for the editor invocation.
+            // We disable the keyboard-enhancement flags / cursor styles
+            // crossterm pushed for us, leave raw mode, and let the editor
+            // own the TTY. Re-enable everything after it exits.
+            use crossterm::terminal::{
+                EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+            };
+            let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
 
-        let status = std::process::Command::new(editor).arg(path).status();
+            let status = std::process::Command::new(editor).arg(path).status();
 
-        let _ = enable_raw_mode();
-        let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
-        terminal.clear()?;
+            let _ = enable_raw_mode();
+            let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
+            terminal.clear()?;
 
-        Ok(status)
+            Ok(status)
+        })
     }
 
     /// Ctrl+G was pressed: pop the composer text out into `$EDITOR`,
@@ -4517,6 +4514,7 @@ impl App {
     pub(super) fn maybe_service_external_edit(
         &mut self,
         terminal: &mut DefaultTerminal,
+        terminal_input: &mut TerminalInput,
     ) -> Result<()> {
         if !self.pending_external_edit {
             return Ok(());
@@ -4555,7 +4553,7 @@ impl App {
         }
         let path = temp.path().to_path_buf();
 
-        let status = Self::run_external_editor_command(terminal, &editor, &path)?;
+        let status = Self::run_external_editor_command(terminal, terminal_input, &editor, &path)?;
 
         match status {
             Ok(s) if s.success() => match std::fs::read_to_string(&path) {
@@ -4601,6 +4599,7 @@ impl App {
     pub(super) fn maybe_service_agent_file_edit(
         &mut self,
         terminal: &mut DefaultTerminal,
+        terminal_input: &mut TerminalInput,
     ) -> Result<()> {
         let Some(path) = self.dialog.take_pending_agent_edit() else {
             return Ok(());
@@ -4614,7 +4613,7 @@ impl App {
             return Ok(());
         };
 
-        let status = Self::run_external_editor_command(terminal, &editor, &path)?;
+        let status = Self::run_external_editor_command(terminal, terminal_input, &editor, &path)?;
 
         let editor_error = match status {
             Ok(s) if s.success() => None,
@@ -4634,6 +4633,7 @@ impl App {
     pub(super) fn maybe_service_category_setting_edit(
         &mut self,
         terminal: &mut DefaultTerminal,
+        terminal_input: &mut TerminalInput,
     ) -> Result<()> {
         let Some(path) = self.dialog.take_pending_category_setting_edit() else {
             return Ok(());
@@ -4645,7 +4645,7 @@ impl App {
             return Ok(());
         };
 
-        let status = Self::run_external_editor_command(terminal, &editor, &path)?;
+        let status = Self::run_external_editor_command(terminal, terminal_input, &editor, &path)?;
         let editor_error = match status {
             Ok(s) if s.success() => None,
             Ok(s) => Some(format!("editor exited with {s} - value left unchanged")),

@@ -18,6 +18,28 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[cfg(test)]
+thread_local! {
+    static RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RENDER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_render_counters() {
+    RENDER_BYTES.with(|bytes| bytes.set(0));
+    RENDER_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn render_byte_count() -> usize {
+    RENDER_BYTES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn render_call_count() -> usize {
+    RENDER_CALLS.with(std::cell::Cell::get)
+}
+
 const CODE_FG: Color = Color::Indexed(229); // soft yellow
 const CODE_BG: Color = Color::Indexed(236); // near-black grey
 const HEADING_FG: Color = Color::Indexed(81); // light cyan
@@ -32,6 +54,11 @@ const MATH_FG: Color = Color::Indexed(151); // soft green
 /// `width` falls back to its raw source rather than producing broken/
 /// wrapped typesetting.
 pub fn render_with_width(src: &str, width: usize) -> Vec<Line<'static>> {
+    #[cfg(test)]
+    {
+        RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + src.len()));
+        RENDER_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
     if src.is_empty() {
         return vec![Line::default()];
     }

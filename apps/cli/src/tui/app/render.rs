@@ -21,8 +21,8 @@ use crate::tui::composer::{
     visual_position_for_byte, wrap_display_chunks,
 };
 use crate::tui::history::{
-    AGENT_INDENT, HistoryEntry, PendingMsg, Rendered, ToolCallState, agent_display_label,
-    format_status_elapsed, render_entry, render_pending, thinking_dots_padded,
+    AGENT_INDENT, HistoryEntry, Rendered, ToolCallState, agent_display_label,
+    format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
 };
 use crate::tui::theme::{
     BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
@@ -32,8 +32,8 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, INPUT_BORDER,
-    MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide, PendingRenderCacheEntry, Selection, Toast,
-    ToastKind, TranscriptFind, WORKING_MESSAGES,
+    MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide, Selection, Toast, ToastKind, TranscriptFind,
+    WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -350,16 +350,6 @@ fn history_render_signature(
     }
 
     pin.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn pending_render_signature(msg: &PendingMsg, width: u16) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    msg.name.hash(&mut hasher);
-    msg.text.len().hash(&mut hasher);
-    msg.reasoning.len().hash(&mut hasher);
-    msg.timestamp.hash(&mut hasher);
-    width.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1565,18 +1555,10 @@ impl App {
             }
         }
         if let Some(pending) = &self.pending {
-            let sig = pending_render_signature(pending, area.width);
-            let pending_lines = match self.pending_render_cache.as_ref() {
-                Some(cached) if cached.sig == sig => cached.lines.clone(),
-                _ => {
-                    let lines = render_pending(pending, area.width);
-                    self.pending_render_cache = Some(PendingRenderCacheEntry {
-                        sig,
-                        lines: lines.clone(),
-                    });
-                    lines
-                }
-            };
+            let cache = self
+                .pending_render_cache
+                .get_or_insert_with(Default::default);
+            let pending_lines = render_pending_incremental(pending, area.width, &mut cache.state);
             for _ in 0..pending_lines.len() {
                 row_meta.push(ChatRowMeta::other());
             }
@@ -3698,8 +3680,14 @@ mod render_history_spacing_tests {
     use crate::tokens::{count_call_count, reset_count_call_count};
     use crate::tui::app::AffordanceTarget;
     use crate::tui::history::{
-        HistoryEntry, MarkdownOpts, PendingMsg, ToolCall, ToolCallState, render_entry_call_count,
-        render_pending_call_count, reset_render_entry_call_count, reset_render_pending_call_count,
+        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, ToolCall, ToolCallState,
+        render_entry_call_count, render_pending, render_pending_incremental,
+        reset_render_entry_call_count,
+    };
+    use crate::tui::markdown::{
+        render_byte_count as markdown_render_byte_count,
+        render_call_count as markdown_render_call_count,
+        reset_render_counters as reset_markdown_counters,
     };
     use crate::tui::theme::TRANSCRIPT_HOVER_BG;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -3959,20 +3947,98 @@ mod render_history_spacing_tests {
             strip_think: true,
         });
 
-        reset_render_pending_call_count();
+        reset_markdown_counters();
         render_history_no_selection(&mut app, 80, 8);
-        assert_eq!(render_pending_call_count(), 1);
-        reset_render_pending_call_count();
+        assert!(markdown_render_call_count() > 0);
+
+        reset_markdown_counters();
         app.working_msg_idx = app.working_msg_idx.wrapping_add(1);
         render_history_no_selection(&mut app, 80, 8);
-        assert_eq!(render_pending_call_count(), 0);
+        assert_eq!(markdown_render_call_count(), 0);
 
         app.pending.as_mut().unwrap().text.push_str(" more");
         render_history_no_selection(&mut app, 80, 8);
-        assert_eq!(render_pending_call_count(), 1);
-        reset_render_pending_call_count();
+        assert!(markdown_render_call_count() > 0);
+
+        reset_markdown_counters();
         render_history_no_selection(&mut app, 81, 8);
-        assert_eq!(render_pending_call_count(), 1);
+        assert!(markdown_render_call_count() > 0);
+    }
+
+    #[test]
+    fn pending_incremental_render_matches_full_render_for_markdown_corpus() {
+        let cases = [
+            "# Heading\n\nParagraph with **bold**, _italic_, and `code`.\n\n",
+            "- one\n- two\n  - nested\n\nfinal paragraph\n",
+            "> quoted\n> continued\n\nplain\n",
+            "name | value\n--- | ---\na | b\n\nnext\n",
+            "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nafter fence\n",
+            "Setext heading\n---\n\nbody\n",
+            "inline math \\(a+b\\) and display:\n\n\\[x^2\\]\n\n",
+        ];
+
+        for case in cases {
+            let mut msg = PendingMsg {
+                name: "Build".to_string(),
+                text: String::new(),
+                reasoning: String::new(),
+                timestamp: chrono::Local::now(),
+                started_at: std::time::Instant::now(),
+                text_started_at: Some(std::time::Instant::now()),
+                inside_think: false,
+                body_started: true,
+                tag_partial: String::new(),
+                seq: None,
+                strip_think: true,
+            };
+            let mut state = PendingRenderState::default();
+            for chunk in case.as_bytes().chunks(7) {
+                msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+                let incremental = render_pending_incremental(&msg, 72, &mut state);
+                let full = render_pending(&msg, 72);
+                assert_eq!(incremental, full, "case failed after {:?}", msg.text);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_incremental_render_matches_full_render_and_bounds_parse_bytes() {
+        let mut msg = PendingMsg {
+            name: "Build".to_string(),
+            text: String::new(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: Some(std::time::Instant::now()),
+            inside_think: false,
+            body_started: true,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: true,
+        };
+        let doc = (0..400)
+            .map(|idx| format!("paragraph {idx} has **bold** text and `code`\n\n"))
+            .collect::<String>();
+        let mut state = PendingRenderState::default();
+        let mut incremental_bytes = 0usize;
+
+        for chunk in doc.as_bytes().chunks(53) {
+            msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+
+            reset_markdown_counters();
+            let incremental = render_pending_incremental(&msg, 96, &mut state);
+            incremental_bytes += markdown_render_byte_count();
+
+            reset_markdown_counters();
+            let full = render_pending(&msg, 96);
+            assert_eq!(incremental, full);
+        }
+
+        assert!(
+            incremental_bytes < doc.len() * 8,
+            "incremental parser read {incremental_bytes} bytes for {} bytes of input",
+            doc.len()
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! parsing tricks at render time.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -693,7 +694,6 @@ pub struct PinRegion {
 #[cfg(test)]
 thread_local! {
     static RENDER_ENTRY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static RENDER_PENDING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -704,16 +704,6 @@ pub(crate) fn reset_render_entry_call_count() {
 #[cfg(test)]
 pub(crate) fn render_entry_call_count() -> usize {
     RENDER_ENTRY_CALLS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_render_pending_call_count() {
-    RENDER_PENDING_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn render_pending_call_count() -> usize {
-    RENDER_PENDING_CALLS.with(std::cell::Cell::get)
 }
 
 /// The user-facing string for a [`ToolCallState`] — the recovery view
@@ -1257,6 +1247,157 @@ pub fn render_entry(
     }
 }
 
+#[derive(Clone, Default)]
+pub struct PendingRenderState {
+    width: u16,
+    body_width: usize,
+    source_len: usize,
+    commit_byte: usize,
+    committed_lines: Vec<Rc<Line<'static>>>,
+    rendered_lines: Vec<Line<'static>>,
+}
+
+impl PendingRenderState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+pub fn render_pending_incremental(
+    msg: &PendingMsg,
+    width: u16,
+    state: &mut PendingRenderState,
+) -> Vec<Line<'static>> {
+    if msg.text.trim().is_empty() {
+        state.reset();
+        return Vec::new();
+    }
+    if !msg.reasoning.trim().is_empty() {
+        state.reset();
+        return render_pending(msg, width);
+    }
+
+    let body_width = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+    if state.width != width || state.body_width != body_width || msg.text.len() < state.source_len {
+        state.reset();
+        state.width = width;
+        state.body_width = body_width;
+    }
+
+    if state.source_len == msg.text.len() && !state.rendered_lines.is_empty() {
+        return state.rendered_lines.clone();
+    }
+
+    let new_commit = stable_pending_commit_byte(&msg.text);
+    if new_commit < state.commit_byte || !msg.text.is_char_boundary(new_commit) {
+        state.reset();
+        state.width = width;
+        state.body_width = body_width;
+    }
+
+    let new_commit = stable_pending_commit_byte(&msg.text);
+    if new_commit > state.commit_byte {
+        let committed = &msg.text[state.commit_byte..new_commit];
+        if !committed.trim().is_empty() {
+            if state.commit_byte > 0 && !state.committed_lines.is_empty() {
+                state.committed_lines.push(Rc::new(Line::default()));
+            }
+            state.committed_lines.extend(
+                markdown::render_with_width(committed, body_width)
+                    .into_iter()
+                    .map(Rc::new),
+            );
+        }
+        state.commit_byte = new_commit;
+    }
+
+    let tail = &msg.text[state.commit_byte..];
+    let mut markdown_lines: Vec<Line<'static>> = state
+        .committed_lines
+        .iter()
+        .map(|line| line.as_ref().clone())
+        .collect();
+    if !tail.trim().is_empty() {
+        if state.commit_byte > 0 && !markdown_lines.is_empty() {
+            markdown_lines.push(Line::default());
+        }
+        markdown_lines.extend(markdown::render_with_width(tail, body_width));
+    }
+
+    state.source_len = msg.text.len();
+    state.rendered_lines = render_pending_markdown_lines(markdown_lines, msg.timestamp, width);
+    state.rendered_lines.clone()
+}
+
+fn stable_pending_commit_byte(text: &str) -> usize {
+    if text.contains("]: ") || text.contains("]:") {
+        return 0;
+    }
+
+    let mut in_fence: Option<char> = None;
+    let mut line_start = 0usize;
+    let mut boundaries = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let trimmed = line.trim_end_matches('\n').trim();
+        if let Some(fence) = markdown_fence_marker(trimmed) {
+            match in_fence {
+                Some(open) if open == fence => in_fence = None,
+                None => in_fence = Some(fence),
+                _ => {}
+            }
+        }
+        if in_fence.is_none() && trimmed.is_empty() {
+            boundaries.push(line_end);
+        }
+        line_start = line_end;
+    }
+
+    if in_fence.is_some() {
+        return 0;
+    }
+
+    boundaries.last().copied().unwrap_or(0)
+}
+
+fn markdown_fence_marker(trimmed_line: &str) -> Option<char> {
+    let mut chars = trimmed_line.chars();
+    let first = chars.next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let mut count = 1usize;
+    for ch in chars {
+        if ch == first {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    (count >= 3).then_some(first)
+}
+
+fn render_pending_markdown_lines(
+    markdown_lines: Vec<Line<'static>>,
+    timestamp: DateTime<Local>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+    let (wrapped_md, md_conts) =
+        wrap_lines_to_width_reserving_first(markdown_lines, body_content_w, TIMESTAMP_WIDTH + 1);
+    let body = indent_lines(wrapped_md, AGENT_INDENT);
+    if body.is_empty() {
+        return vec![render_first_line_with_pin_and_timestamp(vec![], timestamp, width, None).0];
+    }
+
+    let mut out = Vec::with_capacity(body.len());
+    let mut iter = body.into_iter().zip(md_conts);
+    let (first, _) = iter.next().expect("body non-empty");
+    out.push(render_first_line_with_pin_and_timestamp(first.spans, timestamp, width, None).0);
+    out.extend(iter.map(|(line, _)| line));
+    out
+}
+
 /// Render an in-flight pending message: the agent's text as it streams
 /// in. The live "Thinking…"/status readout (with its elapsed clock) is
 /// owned by the status indicator (`render_status_indicator`), so before
@@ -1265,8 +1406,6 @@ pub fn render_entry(
 /// Reasoning is captured but not displayed live (the user can expand
 /// once the turn finalizes).
 pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
-    #[cfg(test)]
-    RENDER_PENDING_CALLS.with(|calls| calls.set(calls.get() + 1));
     if msg.text.trim().is_empty() {
         return Vec::new();
     }

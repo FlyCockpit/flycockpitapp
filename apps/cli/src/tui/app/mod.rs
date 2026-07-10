@@ -2468,10 +2468,9 @@ pub(super) struct HistoryRenderCacheEntry {
     pub(super) rendered: Rc<crate::tui::history::Rendered>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct PendingRenderCacheEntry {
-    pub(super) sig: u64,
-    pub(super) lines: Vec<ratatui::text::Line<'static>>,
+    pub(super) state: crate::tui::history::PendingRenderState,
 }
 
 async fn wait_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {

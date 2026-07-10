@@ -1347,9 +1347,17 @@ impl App {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
         self.sync_history_render_versions();
+        let fresh_padding_was_stale = self.chat_fresh_tail_padding > 0
+            && (self.chat_fresh_anchor_top.is_none() || !(self.busy || self.pending.is_some()));
+        let previous_total_lines = if fresh_padding_was_stale {
+            self.chat_total_lines
+                .saturating_sub(self.chat_fresh_tail_padding)
+        } else {
+            self.chat_total_lines
+        };
         let previous_top = if self.chat_scroll_offset > 0 {
             Some(chat_visible_top(
-                self.chat_total_lines,
+                previous_total_lines,
                 self.chat_visible_lines.max(1),
                 self.chat_scroll_offset,
             ))
@@ -1603,14 +1611,16 @@ impl App {
             self.chat_fresh_anchor_top = Some(abs.saturating_sub(2));
             self.chat_fresh_tail_padding = area_h;
         }
-        if !(self.busy || self.pending.is_some()) {
-            self.chat_fresh_anchor_top = None;
+        let fresh_padding_active = self.chat_fresh_anchor_top.is_some()
+            && self.chat_fresh_tail_padding > 0
+            && (self.busy || self.pending.is_some());
+        if !fresh_padding_active {
+            if !(self.busy || self.pending.is_some()) {
+                self.chat_fresh_anchor_top = None;
+            }
             self.chat_fresh_tail_padding = 0;
         }
-        if self.chat_fresh_anchor_top.is_some()
-            && self.chat_fresh_tail_padding > 0
-            && (self.busy || self.pending.is_some())
-        {
+        if fresh_padding_active {
             for _ in 0..self.chat_fresh_tail_padding {
                 all.push(Line::default());
                 row_meta.push(ChatRowMeta::padding());
@@ -3684,7 +3694,7 @@ mod slash_popup_full_list_tests {
 mod render_history_spacing_tests {
     use super::{
         App, ChatCopyTarget, ChatRowKind, Selection, TranscriptFind, affordance_target_for_row,
-        extract_selection_plaintext,
+        chat_visible_top, extract_selection_plaintext,
     };
     use crate::config::extended::{DiffStyle, ThinkingDisplay};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
@@ -4998,6 +5008,98 @@ mod render_history_spacing_tests {
         let after = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
 
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn fresh_turn_padding_collapse_preserves_top_after_user_scrolls_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..12)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("context {idx}"),
+            })
+            .collect();
+        app.history.push(HistoryEntry::User {
+            text: "new question".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.pending_fresh_turn_history_idx = Some(app.history.len() - 1);
+        app.busy = true;
+        render_history(&mut app, 28, 8);
+        assert!(app.chat_fresh_tail_padding > 0);
+
+        app.scroll_chat_up(1);
+        let expected_top = chat_visible_top(
+            app.chat_total_lines
+                .saturating_sub(app.chat_fresh_tail_padding),
+            app.chat_visible_lines,
+            app.chat_scroll_offset,
+        );
+
+        render_history(&mut app, 28, 8);
+
+        assert_eq!(
+            chat_visible_top(
+                app.chat_total_lines,
+                app.chat_visible_lines,
+                app.chat_scroll_offset
+            ),
+            expected_top
+        );
+        assert_eq!(app.chat_fresh_tail_padding, 0);
+        assert!(app.chat_scroll_offset > 0, "must not slam to live tail");
+    }
+
+    #[test]
+    fn fresh_turn_padding_collapse_preserves_top_when_turn_completes_off_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..12)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("context {idx}"),
+            })
+            .collect();
+        app.history.push(HistoryEntry::User {
+            text: "new question".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.pending_fresh_turn_history_idx = Some(app.history.len() - 1);
+        app.busy = true;
+        render_history(&mut app, 28, 8);
+        assert!(app.chat_scroll_offset > 0);
+        assert!(app.chat_fresh_tail_padding > 0);
+        let expected_top = chat_visible_top(
+            app.chat_total_lines
+                .saturating_sub(app.chat_fresh_tail_padding),
+            app.chat_visible_lines,
+            app.chat_scroll_offset,
+        );
+
+        app.busy = false;
+        render_history(&mut app, 28, 8);
+
+        assert_eq!(
+            chat_visible_top(
+                app.chat_total_lines,
+                app.chat_visible_lines,
+                app.chat_scroll_offset
+            ),
+            expected_top
+        );
+        assert_eq!(app.chat_fresh_tail_padding, 0);
+        assert!(app.chat_scroll_offset > 0, "must not slam to live tail");
     }
 
     #[test]

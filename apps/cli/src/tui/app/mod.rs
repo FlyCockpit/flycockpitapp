@@ -7638,6 +7638,7 @@ impl App {
             }
         }
         if !stamped_existing {
+            let fresh_history_idx = self.history.len();
             self.history.push(HistoryEntry::User {
                 text,
                 cleaned: preflight_cleaned,
@@ -7647,6 +7648,10 @@ impl App {
                 preflight_pending: false,
                 persist_failed: false,
             });
+            if self.chat_scroll_offset == 0 {
+                self.pending_fresh_turn_history_idx = Some(fresh_history_idx);
+                self.chat_fresh_anchor_top = None;
+            }
         }
         if !calls.is_empty() {
             self.push_tag_call_entries(&calls);
@@ -18059,6 +18064,44 @@ mod fresh_queue_ack_tests {
             "the original optimistic row receives the persisted seq"
         );
         assert_eq!(app.fresh_queue_ack, FreshQueueAck::None);
+    }
+
+    #[test]
+    fn queued_fold_off_tail_does_not_arm_fresh_turn_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.chat_scroll_offset = 4;
+
+        app.apply_event(TurnEvent::QueuedUserMessagesFolded {
+            text: "queued while reading".to_string(),
+            queue_item_ids: vec![uuid::Uuid::from_u128(10)],
+            target: crate::engine::message::QueueTarget::root("Build"),
+            seq: Some(70),
+            preflight_cleaned: None,
+        });
+
+        assert_eq!(user_rows(&app), vec![("queued while reading", Some(70))]);
+        assert!(app.pending_fresh_turn_history_idx.is_none());
+        assert!(app.chat_fresh_anchor_top.is_none());
+    }
+
+    #[test]
+    fn queued_fold_at_tail_arms_fresh_turn_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.chat_scroll_offset = 0;
+
+        app.apply_event(TurnEvent::QueuedUserMessagesFolded {
+            text: "queued at tail".to_string(),
+            queue_item_ids: vec![uuid::Uuid::from_u128(12)],
+            target: crate::engine::message::QueueTarget::root("Build"),
+            seq: Some(72),
+            preflight_cleaned: None,
+        });
+
+        assert_eq!(user_rows(&app), vec![("queued at tail", Some(72))]);
+        assert_eq!(app.pending_fresh_turn_history_idx, Some(0));
+        assert!(app.chat_fresh_anchor_top.is_none());
     }
 
     #[test]

@@ -41,7 +41,9 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{push_wrapped_text, selected_line_from_marker};
-use super::{Nav, Page, SettingsDialog};
+use super::{Nav, SettingsCx, SettingsPage};
+#[cfg(test)]
+use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
 
 /// `/settings → Agents` state.
 pub(super) struct AgentsPage {
@@ -170,7 +172,7 @@ fn normalize_model(model: Option<String>) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
-impl SettingsDialog {
+impl SettingsCx {
     /// The cwd agents are discovered against: the picker's cwd when the
     /// dialog was opened from one, else the directory holding the config
     /// being edited, else the process cwd. Agents resolve through the
@@ -197,26 +199,6 @@ impl SettingsDialog {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
-    }
-
-    pub(super) fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
-        let placeholder = Page::Agents(AgentsPage {
-            cursor: 0,
-            confirm_reset: false,
-            delete: ResetButton::default(),
-            reset_one: ResetButton::default(),
-            status: None,
-            rows: Vec::new(),
-            editing: None,
-            pending_external_edit: None,
-        });
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::Agents(p) = &mut page {
-            self.handle_agents_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
     }
 
     fn handle_agents_page_key(&mut self, key: KeyEvent, p: &mut AgentsPage) -> Nav {
@@ -587,20 +569,20 @@ mod tests {
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
         let mut d = SettingsDialog::open_from_picker(config_path, tmp.path().to_path_buf());
-        d.page = Page::Agents(AgentsPage::new(tmp.path()));
+        d.set_test_page(Page::Agents(AgentsPage::new(tmp.path())));
         d
     }
 
     fn page(d: &SettingsDialog) -> &AgentsPage {
-        match &d.page {
-            Page::Agents(p) => p,
+        match d.test_page() {
+            TestPageRef::Agents(p) => p,
             _ => panic!("expected Agents page"),
         }
     }
 
     fn page_mut(d: &mut SettingsDialog) -> &mut AgentsPage {
-        match &mut d.page {
-            Page::Agents(p) => p,
+        match d.test_page_mut() {
+            TestPageMut::Agents(p) => p,
             _ => panic!("expected Agents page"),
         }
     }
@@ -929,7 +911,7 @@ mod tests {
         )
         .unwrap();
         // Refresh the page so it sees the custom agent.
-        if let Page::Agents(p) = &mut d.page {
+        if let TestPageMut::Agents(p) = d.test_page_mut() {
             *p = AgentsPage::new(tmp.path());
         }
         // `R` then `y` resets.
@@ -955,5 +937,34 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+}
+
+impl SettingsPage for AgentsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_agents_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_agents_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!("{} › Agents", crate::welcome::display_path(&cx.config_path))
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        self.help_text()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Agents"
     }
 }

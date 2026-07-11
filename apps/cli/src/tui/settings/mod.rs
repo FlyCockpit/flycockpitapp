@@ -49,6 +49,8 @@ mod string_list;
 mod tools_page;
 mod ui_page;
 
+use std::any::Any;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -110,13 +112,195 @@ pub enum Dialog {
 }
 
 pub struct SettingsDialog {
+    pub(super) page: PageBox,
+    /// Live parent pages for drill-down navigation. Popping restores the
+    /// exact boxed page object, including cursor and scroll state.
+    stack: Vec<PageBox>,
+    cx: SettingsCx,
+}
+
+impl Deref for SettingsDialog {
+    type Target = SettingsCx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cx
+    }
+}
+
+impl DerefMut for SettingsDialog {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cx
+    }
+}
+
+pub(super) type PageBox = Box<dyn SettingsPage>;
+
+pub(super) struct RootPage {
+    cursor: usize,
+}
+
+/// Stateful `/settings` page behavior.
+///
+/// Adding a page should require one localized implementation:
+///
+/// 1. Define the page state type.
+/// 2. Implement [`SettingsPage`] for that type.
+/// 3. Construct a boxed page at the navigation site that opens it.
+///
+/// Page code uses [`SettingsCx`] for shared configuration, persistence,
+/// pending requests, and scroll state; it returns [`Nav`] instead of touching
+/// the navigation stack directly. The outer [`SettingsDialog`] stores the
+/// current page and stack as boxed trait objects, so pushing and popping
+/// preserves the live concrete page state without adding central render,
+/// title, help, or key-dispatch arms.
+pub(super) trait SettingsPage: Any {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav;
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect);
+    fn title(&self, cx: &SettingsCx) -> String;
+    fn help_text(&self, cx: &SettingsCx) -> &'static str;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str;
+}
+
+impl std::fmt::Debug for dyn SettingsPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(test)]
+        {
+            return f.write_str(self.test_name());
+        }
+        #[cfg(not(test))]
+        {
+            f.write_str("SettingsPage")
+        }
+    }
+}
+
+impl dyn SettingsPage {
+    fn downcast_ref<T: SettingsPage>(&self) -> Option<&T> {
+        self.as_any().downcast_ref::<T>()
+    }
+
+    fn downcast_mut<T: SettingsPage>(&mut self) -> Option<&mut T> {
+        self.as_any_mut().downcast_mut::<T>()
+    }
+}
+
+#[cfg(test)]
+enum Page {
+    Root { cursor: usize },
+    Agents(AgentsPage),
+    Tools(ToolsPage),
+    Harnesses(HarnessesPage),
+    Providers(ProvidersPage),
+    Category(Box<CategoryPage>),
+    Instructions(InstructionsPage),
+    RedactPatterns(RedactPatternsPage),
+    StringList(Box<StringListPage>),
+    Skills(SkillsPage),
+    Mcp(McpPage),
+    Lsp(LspPage),
+}
+
+#[cfg(test)]
+fn boxed_page(page: Page) -> PageBox {
+    match page {
+        Page::Root { cursor } => root_page(cursor),
+        Page::Agents(page) => agents_page(page),
+        Page::Tools(page) => tools_page(page),
+        Page::Harnesses(page) => harnesses_page(page),
+        Page::Providers(page) => providers_page(page),
+        Page::Category(page) => category_page(*page),
+        Page::Instructions(page) => instructions_page(page),
+        Page::RedactPatterns(page) => redact_patterns_page(page),
+        Page::StringList(page) => string_list_page(*page),
+        Page::Skills(page) => skills_page(page),
+        Page::Mcp(page) => mcp_page(page),
+        Page::Lsp(page) => lsp_page(page),
+    }
+}
+
+#[allow(private_interfaces)]
+#[cfg(test)]
+enum TestPageRef<'a> {
+    Root { cursor: usize },
+    Agents(&'a AgentsPage),
+    Tools(&'a ToolsPage),
+    Harnesses(&'a HarnessesPage),
+    Providers(&'a ProvidersPage),
+    Category(&'a CategoryPage),
+    Instructions(&'a InstructionsPage),
+    RedactPatterns(&'a RedactPatternsPage),
+    StringList(&'a StringListPage),
+    Skills(&'a SkillsPage),
+    Mcp(&'a McpPage),
+    Lsp(&'a LspPage),
+}
+
+#[cfg(test)]
+enum TestPageMut<'a> {
+    Root { cursor: &'a mut usize },
+    Agents(&'a mut AgentsPage),
+    Tools(&'a mut ToolsPage),
+    Harnesses(&'a mut HarnessesPage),
+    Providers(&'a mut ProvidersPage),
+    Category(&'a mut CategoryPage),
+    Instructions(&'a mut InstructionsPage),
+    RedactPatterns(&'a mut RedactPatternsPage),
+    StringList(&'a mut StringListPage),
+    Skills(&'a mut SkillsPage),
+    Mcp(&'a mut McpPage),
+    Lsp(&'a mut LspPage),
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestPageRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root { cursor } => write!(f, "Root({cursor})"),
+            Self::Agents(_) => f.write_str("Agents"),
+            Self::Tools(_) => f.write_str("Tools"),
+            Self::Harnesses(_) => f.write_str("Harnesses"),
+            Self::Providers(_) => f.write_str("Providers"),
+            Self::Category(_) => f.write_str("Category"),
+            Self::Instructions(_) => f.write_str("Instructions"),
+            Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
+            Self::StringList(_) => f.write_str("StringList"),
+            Self::Skills(_) => f.write_str("Skills"),
+            Self::Mcp(_) => f.write_str("Mcp"),
+            Self::Lsp(_) => f.write_str("Lsp"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestPageMut<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root { cursor } => write!(f, "Root({})", **cursor),
+            Self::Agents(_) => f.write_str("Agents"),
+            Self::Tools(_) => f.write_str("Tools"),
+            Self::Harnesses(_) => f.write_str("Harnesses"),
+            Self::Providers(_) => f.write_str("Providers"),
+            Self::Category(_) => f.write_str("Category"),
+            Self::Instructions(_) => f.write_str("Instructions"),
+            Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
+            Self::StringList(_) => f.write_str("StringList"),
+            Self::Skills(_) => f.write_str("Skills"),
+            Self::Mcp(_) => f.write_str("Mcp"),
+            Self::Lsp(_) => f.write_str("Lsp"),
+        }
+    }
+}
+
+pub struct SettingsCx {
     pub config_path: PathBuf,
     /// Path to the cockpit-only config keys. Same `config.json` as
     /// [`config_path`](Self::config_path) (GOALS §2a) — the provider/model
     /// keys and the former-`ExtendedConfig` keys share one file. Loaded
     /// lazily when the UI / Tools pages open; saved on each edit there.
     pub(super) extended_path: PathBuf,
-    pub(super) page: Page,
     scroll_states: SettingsScrollStates,
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
@@ -131,9 +315,6 @@ pub struct SettingsDialog {
     /// recent load. Unknown raw keys are preserved separately by
     /// [`ExtendedConfigDoc`].
     pub(super) extended_warnings: Vec<String>,
-    /// Live parent pages for drill-down navigation. Popping restores the
-    /// exact page struct, including cursor and scroll state.
-    stack: Vec<Page>,
     /// The cwd this dialog was opened against. Held so Root's `h`/←
     /// can reopen the picker without losing context. `None` when the
     /// settings dialog was opened from a flow that has no picker to
@@ -156,48 +337,52 @@ pub struct SettingsDialog {
     pending_oauth_action: Option<OAuthActionRequest>,
 }
 
-#[allow(private_interfaces)]
-pub(super) enum Page {
-    Root {
-        cursor: usize,
-    },
-    Agents(AgentsPage),
-    Tools(ToolsPage),
-    Harnesses(HarnessesPage),
-    Providers(ProvidersPage),
-    /// One of the five reorganized category pages (Interface, Behavior,
-    /// Privacy & Safety, Translation, Profile). Boxed because [`CategoryPage`]
-    /// (descriptor list + optional picker) is much larger than the other
-    /// variants, which would otherwise bloat the enum.
-    Category(Box<CategoryPage>),
-    Instructions(InstructionsPage),
-    RedactPatterns(RedactPatternsPage),
-    /// A generic grab/reorder string-list editor (`agent_dirs`,
-    /// `redact.extra_dotenv_paths`, `redact.denylist`, `redact.allowlist`).
-    StringList(Box<StringListPage>),
-    Skills(SkillsPage),
-    Mcp(McpPage),
-    Lsp(LspPage),
+fn root_page(cursor: usize) -> PageBox {
+    Box::new(RootPage { cursor })
 }
 
-#[cfg(test)]
-impl Page {
-    fn test_name(&self) -> &'static str {
-        match self {
-            Page::Root { .. } => "Root",
-            Page::Agents(_) => "Agents",
-            Page::Tools(_) => "Tools",
-            Page::Harnesses(_) => "Harnesses",
-            Page::Providers(_) => "Providers",
-            Page::Category(_) => "Category",
-            Page::Instructions(_) => "Instructions",
-            Page::RedactPatterns(_) => "RedactPatterns",
-            Page::StringList(_) => "StringList",
-            Page::Skills(_) => "Skills",
-            Page::Mcp(_) => "MCP",
-            Page::Lsp(_) => "LSP",
-        }
-    }
+fn agents_page(page: AgentsPage) -> PageBox {
+    Box::new(page)
+}
+
+fn tools_page(page: ToolsPage) -> PageBox {
+    Box::new(page)
+}
+
+fn harnesses_page(page: HarnessesPage) -> PageBox {
+    Box::new(page)
+}
+
+fn providers_page(page: ProvidersPage) -> PageBox {
+    Box::new(page)
+}
+
+fn category_page(page: CategoryPage) -> PageBox {
+    Box::new(page)
+}
+
+fn instructions_page(page: InstructionsPage) -> PageBox {
+    Box::new(page)
+}
+
+fn redact_patterns_page(page: RedactPatternsPage) -> PageBox {
+    Box::new(page)
+}
+
+fn string_list_page(page: StringListPage) -> PageBox {
+    Box::new(page)
+}
+
+fn skills_page(page: SkillsPage) -> PageBox {
+    Box::new(page)
+}
+
+fn mcp_page(page: McpPage) -> PageBox {
+    Box::new(page)
+}
+
+fn lsp_page(page: LspPage) -> PageBox {
+    Box::new(page)
 }
 
 use agents_page::AgentsPage;
@@ -291,23 +476,16 @@ impl RowDeleteConfirm {
     }
 }
 
-/// Navigation intent returned by an inner page handler. The outer
-/// [`SettingsDialog::handle_providers_key`] applies it *after* swapping
-/// the borrowed sub-page back in. Inner handlers cannot write
-/// `self.page` directly — the swap-back would discard the write.
-#[allow(private_interfaces)]
-// `Nav` is a short-lived return value (never stored), so the size gap is
-// harmless; boxing `Replace` would churn its ~60 construction sites for no
-// real gain. `Page` already boxes its own large variants.
-#[allow(clippy::large_enum_variant)]
+/// Navigation intent returned by a settings page. Page handlers return boxed
+/// pages to keep the outer dialog as the only owner of stack mutation.
 pub(super) enum Nav {
     /// Stay on the current page; sub-state mutations have already been
     /// applied to the borrowed `&mut SubState`.
     Stay,
-    /// Navigate to `Page::...` without preserving the current page.
-    Replace(Page),
-    /// Push the current page and navigate to `Page::...`.
-    Push(Page),
+    /// Navigate without preserving the current page.
+    Replace(PageBox),
+    /// Push the current page and navigate to another page.
+    Push(PageBox),
     /// Pop one page from the navigation stack.
     Back,
     /// Close the whole dialog.
@@ -394,10 +572,10 @@ impl Dialog {
     pub fn open_gitignore_allow(cwd: &std::path::Path, glob: Option<&str>) -> Self {
         let path = nearest_project_config_path(cwd);
         let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
-        match glob {
-            Some(g) if !g.trim().is_empty() => s.quick_add_gitignore_allow(g),
-            _ => s.enter_gitignore_allow(),
+        if let Some(g) = glob.filter(|g| !g.trim().is_empty()) {
+            s.quick_add_gitignore_allow(g);
         }
+        s.enter_gitignore_allow();
         Dialog::Settings(Box::new(s))
     }
 
@@ -427,7 +605,7 @@ impl Dialog {
         {
             let path = dir.path.join(CONFIG_FILE);
             let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
-            s.page = Page::Providers(ProvidersPage::Add(AddState::new()));
+            s.page = providers_page(ProvidersPage::Add(AddState::new()));
             d = Dialog::Settings(Box::new(s));
         }
         d
@@ -463,10 +641,9 @@ impl Dialog {
         let Dialog::Settings(s) = self else {
             return None;
         };
-        let Page::Category(p) = &mut s.page else {
-            return None;
-        };
-        p.pending_mouse_capture.take()
+        s.page
+            .downcast_mut::<CategoryPage>()
+            .and_then(|p| p.pending_mouse_capture.take())
     }
 
     /// Drain a pending external-editor (`$EDITOR`) request from the Agents
@@ -479,10 +656,9 @@ impl Dialog {
         let Dialog::Settings(s) = self else {
             return None;
         };
-        let Page::Agents(p) = &mut s.page else {
-            return None;
-        };
-        p.pending_external_edit.take()
+        s.page
+            .downcast_mut::<AgentsPage>()
+            .and_then(|p| p.pending_external_edit.take())
     }
 
     /// Apply the result of an external-editor session the event loop ran on
@@ -495,7 +671,7 @@ impl Dialog {
             return;
         };
         let cwd = s.agents_cwd();
-        if let Page::Agents(p) = &mut s.page {
+        if let Some(p) = s.page.downcast_mut::<AgentsPage>() {
             p.finish_external_edit(&cwd, editor_error);
         }
     }
@@ -739,6 +915,102 @@ impl Dialog {
 // ── SettingsDialog ───────────────────────────────────────────────────────
 
 impl SettingsDialog {
+    #[cfg(test)]
+    fn set_test_page(&mut self, page: Page) {
+        self.page = boxed_page(page);
+    }
+
+    #[cfg(test)]
+    fn test_page(&self) -> TestPageRef<'_> {
+        if let Some(p) = self.page.downcast_ref::<RootPage>() {
+            return TestPageRef::Root { cursor: p.cursor };
+        }
+        if let Some(p) = self.page.downcast_ref::<AgentsPage>() {
+            return TestPageRef::Agents(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<ToolsPage>() {
+            return TestPageRef::Tools(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<HarnessesPage>() {
+            return TestPageRef::Harnesses(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<ProvidersPage>() {
+            return TestPageRef::Providers(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<CategoryPage>() {
+            return TestPageRef::Category(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<InstructionsPage>() {
+            return TestPageRef::Instructions(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<RedactPatternsPage>() {
+            return TestPageRef::RedactPatterns(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<StringListPage>() {
+            return TestPageRef::StringList(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<SkillsPage>() {
+            return TestPageRef::Skills(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<McpPage>() {
+            return TestPageRef::Mcp(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<LspPage>() {
+            return TestPageRef::Lsp(p);
+        }
+        unreachable!("unknown settings page")
+    }
+
+    #[cfg(test)]
+    fn test_page_mut(&mut self) -> TestPageMut<'_> {
+        if self.page.as_any().is::<RootPage>() {
+            let p = self.page.downcast_mut::<RootPage>().unwrap();
+            return TestPageMut::Root {
+                cursor: &mut p.cursor,
+            };
+        }
+        if self.page.as_any().is::<AgentsPage>() {
+            return TestPageMut::Agents(self.page.downcast_mut::<AgentsPage>().unwrap());
+        }
+        if self.page.as_any().is::<ToolsPage>() {
+            return TestPageMut::Tools(self.page.downcast_mut::<ToolsPage>().unwrap());
+        }
+        if self.page.as_any().is::<HarnessesPage>() {
+            return TestPageMut::Harnesses(self.page.downcast_mut::<HarnessesPage>().unwrap());
+        }
+        if self.page.as_any().is::<ProvidersPage>() {
+            return TestPageMut::Providers(self.page.downcast_mut::<ProvidersPage>().unwrap());
+        }
+        if self.page.as_any().is::<CategoryPage>() {
+            return TestPageMut::Category(self.page.downcast_mut::<CategoryPage>().unwrap());
+        }
+        if self.page.as_any().is::<InstructionsPage>() {
+            return TestPageMut::Instructions(
+                self.page.downcast_mut::<InstructionsPage>().unwrap(),
+            );
+        }
+        if self.page.as_any().is::<RedactPatternsPage>() {
+            return TestPageMut::RedactPatterns(
+                self.page.downcast_mut::<RedactPatternsPage>().unwrap(),
+            );
+        }
+        if self.page.as_any().is::<StringListPage>() {
+            return TestPageMut::StringList(self.page.downcast_mut::<StringListPage>().unwrap());
+        }
+        if self.page.as_any().is::<SkillsPage>() {
+            return TestPageMut::Skills(self.page.downcast_mut::<SkillsPage>().unwrap());
+        }
+        if self.page.as_any().is::<McpPage>() {
+            return TestPageMut::Mcp(self.page.downcast_mut::<McpPage>().unwrap());
+        }
+        if self.page.as_any().is::<LspPage>() {
+            return TestPageMut::Lsp(self.page.downcast_mut::<LspPage>().unwrap());
+        }
+        unreachable!("unknown settings page")
+    }
+}
+
+impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
         let config = ConfigDoc::load(&config_path)
             .map(|d| d.providers())
@@ -760,23 +1032,25 @@ impl SettingsDialog {
                 .collect();
         }
         Self {
-            config_path,
-            extended_path,
-            page: Page::Root { cursor: 0 },
-            scroll_states: SettingsScrollStates::default(),
-            original_config: config.clone(),
-            config,
-            extended,
-            extended_warnings,
+            page: root_page(0),
             stack: Vec::new(),
-            picker_cwd: None,
-            active_project_root: None,
-            back_to_picker: false,
-            command_installed: |cmd| crate::harness::preflight::which_on_path(cmd).is_some(),
-            env_lookup: |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
-            credential_store_path: None,
-            pending_daemon_request: None,
-            pending_oauth_action: None,
+            cx: SettingsCx {
+                config_path,
+                extended_path,
+                scroll_states: SettingsScrollStates::default(),
+                original_config: config.clone(),
+                config,
+                extended,
+                extended_warnings,
+                picker_cwd: None,
+                active_project_root: None,
+                back_to_picker: false,
+                command_installed: |cmd| crate::harness::preflight::which_on_path(cmd).is_some(),
+                env_lookup: |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
+                credential_store_path: None,
+                pending_daemon_request: None,
+                pending_oauth_action: None,
+            },
         }
     }
 
@@ -807,7 +1081,7 @@ impl SettingsDialog {
     }
 
     fn enter_providers(&mut self) {
-        self.page = Page::Providers(ProvidersPage::List {
+        self.page = providers_page(ProvidersPage::List {
             cursor: providers::initial_list_cursor(&self.config),
             status: None,
             delete_pending: false,
@@ -818,7 +1092,7 @@ impl SettingsDialog {
     /// extended-config first so the rows reflect on-disk state.
     fn enter_category(&mut self, category: Category) {
         self.reload_extended();
-        self.page = Page::Category(Box::new(CategoryPage::new(category)));
+        self.page = category_page(CategoryPage::new(category));
     }
 
     /// Navigate to the active model's model-settings sub-dialog
@@ -826,7 +1100,7 @@ impl SettingsDialog {
     /// list with an inline status when no model is active or the active
     /// (provider, model) can't be found.
     fn enter_model_settings(&mut self) {
-        self.page = Page::Providers(providers::active_model_settings_page(&self.config));
+        self.page = providers_page(providers::active_model_settings_page(&self.config));
     }
 
     fn save_config(&mut self) -> Result<(), String> {
@@ -840,63 +1114,61 @@ impl SettingsDialog {
     }
 
     fn tick(&mut self) {
-        // Drain finished fetches into config. The Headers sub-page
-        // owns its parent's EditState (via Box) — if a /models fetch
-        // was started on Edit and the user navigated into Headers
-        // while it was in flight, the handle still needs to be
-        // drained so the result lands when they come back.
-        let pending = match &mut self.page {
-            Page::Providers(ProvidersPage::Add(s)) => s.fetch.clone(),
-            Page::Providers(ProvidersPage::Edit(s)) => s.fetch.clone(),
-            Page::Providers(ProvidersPage::Headers { parent, .. }) => parent.fetch.clone(),
-            Page::Providers(ProvidersPage::Models { parent, .. }) => parent.fetch.clone(),
-            Page::Providers(ProvidersPage::ModelSettings { parent, .. }) => parent.fetch.clone(),
-            Page::Providers(ProvidersPage::ProviderSettings { parent, .. }) => parent.fetch.clone(),
-            _ => None,
-        };
+        let pending = self
+            .page
+            .downcast_mut::<ProvidersPage>()
+            .and_then(|page| match page {
+                ProvidersPage::Add(s) => s.fetch.clone(),
+                ProvidersPage::Edit(s) => s.fetch.clone(),
+                ProvidersPage::Headers { parent, .. } => parent.fetch.clone(),
+                ProvidersPage::Models { parent, .. } => parent.fetch.clone(),
+                ProvidersPage::ModelSettings { parent, .. } => parent.fetch.clone(),
+                ProvidersPage::ProviderSettings { parent, .. } => parent.fetch.clone(),
+                _ => None,
+            });
         if let Some(handle) = pending
             && let Some(result) = handle.take()
         {
             self.apply_fetch_result(&handle.provider_id, result);
         }
 
-        // Drain the all-providers refetch: move any handle that has
-        // finished out of `in_flight`, persist its models into config,
-        // and record its outcome for the per-provider summary. When the
-        // last one lands, compute the aggregated unlisted-models set so
-        // the Keep/Remove prompt can render.
         self.drain_fetch_all();
-        match &mut self.page {
-            Page::Providers(ProvidersPage::GrokOAuthSetup { state, .. })
-            | Page::Providers(ProvidersPage::Add(AddState {
-                step: AddStep::GrokOAuthAuth(state),
-                ..
-            })) if state.pending => {
-                state.spinner_tick = state.spinner_tick.wrapping_add(1);
+        if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
+            match page {
+                ProvidersPage::GrokOAuthSetup { state, .. }
+                | ProvidersPage::Add(AddState {
+                    step: AddStep::GrokOAuthAuth(state),
+                    ..
+                }) if state.pending => {
+                    state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                }
+                ProvidersPage::CodexOAuthSetup { state, .. }
+                | ProvidersPage::Add(AddState {
+                    step: AddStep::CodexOAuthAuth(state),
+                    ..
+                }) if state.polling => {
+                    state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                }
+                _ => {}
             }
-            Page::Providers(ProvidersPage::CodexOAuthSetup { state, .. })
-            | Page::Providers(ProvidersPage::Add(AddState {
-                step: AddStep::CodexOAuthAuth(state),
-                ..
-            })) if state.polling => {
-                state.spinner_tick = state.spinner_tick.wrapping_add(1);
-            }
-            _ => {}
         }
     }
 
     fn oauth_wants_mouse_off(&self) -> bool {
-        match &self.page {
-            Page::Providers(ProvidersPage::GrokOAuthSetup { state, .. })
-            | Page::Providers(ProvidersPage::Add(AddState {
+        let Some(page) = self.page.downcast_ref::<ProvidersPage>() else {
+            return false;
+        };
+        match page {
+            ProvidersPage::GrokOAuthSetup { state, .. }
+            | ProvidersPage::Add(AddState {
                 step: AddStep::GrokOAuthAuth(state),
                 ..
-            })) => state.pending && state.authorize_url.is_some(),
-            Page::Providers(ProvidersPage::CodexOAuthSetup { state, .. })
-            | Page::Providers(ProvidersPage::Add(AddState {
+            }) => state.pending && state.authorize_url.is_some(),
+            ProvidersPage::CodexOAuthSetup { state, .. }
+            | ProvidersPage::Add(AddState {
                 step: AddStep::CodexOAuthAuth(state),
                 ..
-            })) => state.polling && state.pending.is_some(),
+            }) => state.polling && state.pending.is_some(),
             _ => false,
         }
     }
@@ -981,23 +1253,25 @@ impl SettingsDialog {
     }
 
     fn grok_oauth_state_mut(&mut self) -> Option<&mut providers::GrokOAuthSetupState> {
-        match &mut self.page {
-            Page::Providers(ProvidersPage::GrokOAuthSetup { state, .. }) => Some(state),
-            Page::Providers(ProvidersPage::Add(AddState {
+        let page = self.page.downcast_mut::<ProvidersPage>()?;
+        match page {
+            ProvidersPage::GrokOAuthSetup { state, .. } => Some(state),
+            ProvidersPage::Add(AddState {
                 step: AddStep::GrokOAuthAuth(state),
                 ..
-            })) => Some(state),
+            }) => Some(state),
             _ => None,
         }
     }
 
     fn codex_oauth_state_mut(&mut self) -> Option<&mut providers::CodexOAuthSetupState> {
-        match &mut self.page {
-            Page::Providers(ProvidersPage::CodexOAuthSetup { state, .. }) => Some(state),
-            Page::Providers(ProvidersPage::Add(AddState {
+        let page = self.page.downcast_mut::<ProvidersPage>()?;
+        match page {
+            ProvidersPage::CodexOAuthSetup { state, .. } => Some(state),
+            ProvidersPage::Add(AddState {
                 step: AddStep::CodexOAuthAuth(state),
                 ..
-            })) => Some(state),
+            }) => Some(state),
             _ => None,
         }
     }
@@ -1007,10 +1281,12 @@ impl SettingsDialog {
     /// popup switches between fields; the browse list treats Tab as ↓), so
     /// the field-nav rewrite in [`Self::handle_key`] must leave them alone.
     fn in_header_editor(&self) -> bool {
-        match &self.page {
-            Page::Providers(ProvidersPage::Headers { .. }) => true,
-            Page::Providers(ProvidersPage::Models { .. }) => true,
-            Page::Providers(ProvidersPage::Add(s)) => matches!(s.step, AddStep::EditHeaders),
+        let Some(page) = self.page.downcast_ref::<ProvidersPage>() else {
+            return false;
+        };
+        match page {
+            ProvidersPage::Headers { .. } | ProvidersPage::Models { .. } => true,
+            ProvidersPage::Add(s) => matches!(s.step, AddStep::EditHeaders),
             _ => false,
         }
     }
@@ -1019,7 +1295,9 @@ impl SettingsDialog {
     /// there Tab accepts a directory suggestion, so the field-nav Tab→Down
     /// rewrite in [`Self::handle_key`] must leave Tab alone.
     fn in_pkg_dir_autosuggest(&self) -> bool {
-        matches!(&self.page, Page::Category(p) if p.is_path_editing())
+        self.page
+            .downcast_ref::<CategoryPage>()
+            .is_some_and(|p| p.is_path_editing())
     }
 
     /// Insert pasted text into the page's focused text field, mirroring the
@@ -1027,28 +1305,21 @@ impl SettingsDialog {
     /// buffer a typed char would. Pages with no open field (or no field at
     /// all) drop the paste.
     fn paste(&mut self, text: &str) {
-        // Computed up front (reads `config_path`/`picker_cwd`) so the
-        // packages-dir autosuggest refresh below doesn't conflict with the
-        // `&mut self.page` borrow held across the match.
         let cwd = self.agents_cwd();
-        match &mut self.page {
-            Page::Root { .. } => {}
-            Page::Providers(p) => {
-                if let Some(field) = p.active_text_field() {
-                    field.paste(text);
-                }
+        if let Some(p) = self.page.downcast_mut::<ProvidersPage>() {
+            if let Some(field) = p.active_text_field() {
+                field.paste(text);
             }
-            Page::Agents(p) => {
-                if let Some(editor) = p.editing.as_mut() {
-                    editor.paste(text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<AgentsPage>() {
+            if let Some(editor) = p.editing.as_mut() {
+                editor.paste(text);
             }
-            Page::Tools(p) => {
-                if p.editing.is_some() {
-                    p.buf.paste(text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<ToolsPage>() {
+            if p.editing.is_some() {
+                p.buf.paste(text);
             }
-            Page::Harnesses(p) => match p {
+        } else if let Some(p) = self.page.downcast_mut::<HarnessesPage>() {
+            match p {
                 harnesses_page::HarnessesPage::List(s) => {
                     if let Some(buf) = s.adding.as_mut() {
                         buf.paste(text);
@@ -1059,90 +1330,69 @@ impl SettingsDialog {
                         buf.paste(text);
                     }
                 }
-            },
-            Page::Category(p) => {
-                // Full-area editor and utility-model picker own input before
-                // the inline field, refreshing the packages-dir autosuggest as
-                // a typed char would.
-                if let Some(editor) = p.path_editor.as_mut() {
-                    editor.paste(text, &cwd);
-                } else if let Some(editor) = p.text_editor.as_mut() {
-                    editor.paste(text);
-                } else if let Some(picker) = p.utility_picker.as_mut() {
-                    if let Some(field) = picker.active_text_field() {
-                        field.paste(text);
-                    }
-                } else if p.editing.is_some() {
-                    p.buf.paste(text);
-                }
             }
-            Page::Instructions(p) => {
-                if let Some(g) = p.grabbed.as_mut() {
-                    g.buf.paste(text);
+        } else if let Some(p) = self.page.downcast_mut::<CategoryPage>() {
+            if let Some(editor) = p.path_editor.as_mut() {
+                editor.paste(text, &cwd);
+            } else if let Some(editor) = p.text_editor.as_mut() {
+                editor.paste(text);
+            } else if let Some(picker) = p.utility_picker.as_mut() {
+                if let Some(field) = picker.active_text_field() {
+                    field.paste(text);
                 }
+            } else if p.editing.is_some() {
+                p.buf.paste(text);
             }
-            Page::RedactPatterns(p) => {
-                if let Some(g) = p.grabbed.as_mut() {
-                    g.buf.paste(text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<InstructionsPage>() {
+            if let Some(g) = p.grabbed.as_mut() {
+                g.buf.paste(text);
             }
-            Page::StringList(p) => {
-                if let Some(g) = p.grabbed.as_mut() {
-                    g.buf.paste(text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<RedactPatternsPage>() {
+            if let Some(g) = p.grabbed.as_mut() {
+                g.buf.paste(text);
             }
-            Page::Skills(p) => {
-                if let Some(g) = p.grabbed.as_mut() {
-                    g.buf.paste(text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<StringListPage>() {
+            if let Some(g) = p.grabbed.as_mut() {
+                g.buf.paste(text);
             }
-            Page::Mcp(p) => {
-                if let mcp_page::McpPage::Add(s) = p {
-                    mcp_page::paste_into_add_state(s, text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<SkillsPage>() {
+            if let Some(g) = p.grabbed.as_mut() {
+                g.buf.paste(text);
             }
-            Page::Lsp(p) => {
-                if p.editing.is_some() {
-                    p.buf.paste(text);
-                }
+        } else if let Some(p) = self.page.downcast_mut::<McpPage>() {
+            if let mcp_page::McpPage::Add(s) = p {
+                mcp_page::paste_into_add_state(s, text);
             }
+        } else if let Some(p) = self.page.downcast_mut::<LspPage>()
+            && p.editing.is_some()
+        {
+            p.buf.paste(text);
         }
     }
 
-    fn apply_nav(&mut self, current: Page, nav: Nav) -> bool {
+    fn apply_nav(&mut self, nav: Nav) -> bool {
         match nav {
-            Nav::Stay => {
-                self.page = current;
-                false
-            }
+            Nav::Stay => false,
             Nav::Replace(new) => {
                 self.page = new;
                 false
             }
             Nav::Push(new) => {
+                let current = std::mem::replace(&mut self.page, new);
                 self.stack.push(current);
-                self.page = new;
                 false
             }
             Nav::Back => {
-                self.page = self.stack.pop().unwrap_or(Page::Root { cursor: 0 });
+                self.page = self.stack.pop().unwrap_or_else(|| root_page(0));
                 false
             }
             Nav::Close => true,
         }
     }
 
-    fn push_page(&mut self, current: Page, next: Page) {
-        self.stack.push(current);
-        self.page = next;
-    }
-
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         // Tab / Shift+Tab move between fields like ↓/↑ across settings
-        // screens. The header editor owns Tab itself (the popup switches
-        // name↔value; its browse list treats Tab as ↓), and the packages-dir
-        // autosuggest owns Tab (accept a suggestion), so skip the rewrite
-        // while either is on screen.
+        // screens. Editors that own Tab themselves opt out through page state.
         let key = if self.in_header_editor() || self.in_pkg_dir_autosuggest() {
             key
         } else {
@@ -1152,320 +1402,8 @@ impl SettingsDialog {
                 _ => key,
             }
         };
-        // Esc semantics differ per page: in deep pages it goes back one
-        // level; only at root does it close.
-        let cursor = match &self.page {
-            Page::Root { cursor } => Some(*cursor),
-            _ => None,
-        };
-        if let Some(cursor) = cursor {
-            return self.handle_root_key(key, cursor);
-        }
-        match &self.page {
-            Page::Agents(_) => self.handle_agents_key(key),
-            Page::Tools(_) => self.handle_tools_key(key),
-            Page::Harnesses(_) => self.handle_harnesses_key(key),
-            Page::Category(_) => self.handle_category_key(key),
-            Page::Instructions(_) => self.handle_instructions_key(key),
-            Page::RedactPatterns(_) => self.handle_redact_patterns_key(key),
-            Page::StringList(_) => self.handle_string_list_key(key),
-            Page::Skills(_) => self.handle_skills_key(key),
-            Page::Mcp(_) => self.handle_mcp_key(key),
-            Page::Lsp(_) => self.handle_lsp_key(key),
-            Page::Providers(_) => self.handle_providers_key(key),
-            Page::Root { .. } => unreachable!("handled above"),
-        }
-    }
-
-    fn handle_root_key(&mut self, key: KeyEvent, mut cursor: usize) -> bool {
-        let children = root_nodes();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return true,
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
-                if self.picker_cwd.is_some() =>
-            {
-                self.back_to_picker = true;
-                return true;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                cursor = crate::tui::nav::wrap_prev(cursor, children.len());
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                cursor = crate::tui::nav::wrap_next(cursor, children.len());
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                let chosen = children.get(cursor).map(|n| n.title).unwrap_or("");
-                let next = match chosen {
-                    PROVIDERS_TITLE => Some(Page::Providers(ProvidersPage::List {
-                        cursor: providers::initial_list_cursor(&self.config),
-                        status: None,
-                        delete_pending: false,
-                    })),
-                    "Agents" => Some(Page::Agents(AgentsPage::new(&self.agents_cwd()))),
-                    "Interface" => {
-                        self.reload_extended();
-                        Some(Page::Category(Box::new(CategoryPage::new(
-                            Category::Interface,
-                        ))))
-                    }
-                    "Behavior" => {
-                        self.reload_extended();
-                        Some(Page::Category(Box::new(CategoryPage::new(
-                            Category::Behavior,
-                        ))))
-                    }
-                    "Privacy & Safety" => {
-                        self.reload_extended();
-                        Some(Page::Category(Box::new(CategoryPage::new(
-                            Category::Privacy,
-                        ))))
-                    }
-                    "Translation" => {
-                        self.reload_extended();
-                        Some(Page::Category(Box::new(CategoryPage::new(
-                            Category::Translation,
-                        ))))
-                    }
-                    "Profile" => {
-                        self.reload_extended();
-                        Some(Page::Category(Box::new(CategoryPage::new(
-                            Category::Profile,
-                        ))))
-                    }
-                    "Tools" => {
-                        self.reload_extended();
-                        Some(Page::Tools(ToolsPage {
-                            cursor: 0,
-                            setup: None,
-                            editing: None,
-                            buf: TextField::default(),
-                            edit_target: None,
-                            status: None,
-                            reset: ResetButton::default(),
-                        }))
-                    }
-                    "Harnesses" => {
-                        self.reload_extended();
-                        let status = self.extended_warnings.first().cloned();
-                        Some(Page::Harnesses(harnesses_page::HarnessesPage::List(
-                            harnesses_page::ListState {
-                                cursor: 0,
-                                status,
-                                delete_pending: false,
-                                reset: ResetButton::default(),
-                                adding: None,
-                            },
-                        )))
-                    }
-                    "Skills" => {
-                        self.reload_extended();
-                        Some(Page::Skills(skills_page::SkillsPage {
-                            cursor: 0,
-                            grabbed: None,
-                            status: None,
-                            reset: ResetButton::default(),
-                        }))
-                    }
-                    "MCP" => Some(Page::Mcp(mcp_page::McpPage::List(mcp_page::ListState {
-                        cursor: 0,
-                        status: None,
-                        delete_pending: false,
-                    }))),
-                    "LSP" => {
-                        self.reload_extended();
-                        Some(Page::Lsp(LspPage {
-                            cursor: 0,
-                            editing: None,
-                            buf: TextField::default(),
-                            status: None,
-                            reset: ResetButton::default(),
-                        }))
-                    }
-                    _ => None,
-                };
-                if let Some(next) = next {
-                    self.push_page(Page::Root { cursor }, next);
-                }
-                return false;
-            }
-            _ => {}
-        }
-        self.page = Page::Root { cursor };
-        false
-    }
-
-    fn handle_lsp_key(&mut self, key: KeyEvent) -> bool {
-        let Page::Lsp(mut p) = std::mem::replace(&mut self.page, Page::Root { cursor: 0 }) else {
-            unreachable!("not on LSP page");
-        };
-        let row_count = LSP_SERVER_ROW_START
-            + self
-                .project_context()
-                .project_root()
-                .map(|cwd| crate::daemon::lsp::builtin_server_views(cwd, &self.extended).len())
-                .unwrap_or(1);
-        if let Some(edit) = p.editing {
-            match key.code {
-                KeyCode::Esc => {
-                    p.editing = None;
-                    p.buf = TextField::default();
-                }
-                KeyCode::Enter => {
-                    let raw = p.buf.text().trim();
-                    match raw.parse::<u64>() {
-                        Ok(v) => {
-                            match edit {
-                                LspEdit::OtherFilesLimit => {
-                                    self.extended.lsp.diagnostics.other_files_limit = v as usize
-                                }
-                                LspEdit::PerFileLimit => {
-                                    self.extended.lsp.diagnostics.per_file_limit = v as usize
-                                }
-                                LspEdit::DebounceMs => {
-                                    self.extended.lsp.diagnostics.debounce_ms = v
-                                }
-                                LspEdit::DocumentTimeoutMs => {
-                                    self.extended.lsp.diagnostics.document_timeout_ms = v
-                                }
-                                LspEdit::WorkspaceTimeoutMs => {
-                                    self.extended.lsp.diagnostics.workspace_timeout_ms = v
-                                }
-                            }
-                            p.status = save_status(self.save_extended());
-                            p.editing = None;
-                            p.buf = TextField::default();
-                        }
-                        Err(_) => p.status = Some("enter a non-negative integer".into()),
-                    }
-                }
-                _ => {
-                    let _ = p.buf.handle_key(key);
-                }
-            }
-            self.page = Page::Lsp(p);
-            return false;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                p.reset.disarm();
-                let nav = if self.stack.is_empty() {
-                    Nav::Close
-                } else {
-                    Nav::Back
-                };
-                return self.apply_nav(Page::Lsp(p), nav);
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                p.reset.disarm();
-                return self.apply_nav(Page::Lsp(p), Nav::Back);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                p.reset.disarm();
-                p.cursor = crate::tui::nav::wrap_prev(p.cursor, row_count);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                p.reset.disarm();
-                p.cursor = crate::tui::nav::wrap_next(p.cursor, row_count);
-            }
-            KeyCode::Char('r') => {
-                self.activate_lsp_reset(&mut p);
-            }
-            KeyCode::Char('i') if p.cursor >= LSP_SERVER_ROW_START => {
-                p.reset.disarm();
-                self.queue_lsp_action(
-                    p.cursor - LSP_SERVER_ROW_START,
-                    LspControlAction::Install,
-                    &mut p,
-                );
-            }
-            KeyCode::Char('u') if p.cursor >= LSP_SERVER_ROW_START => {
-                p.reset.disarm();
-                self.queue_lsp_action(
-                    p.cursor - LSP_SERVER_ROW_START,
-                    LspControlAction::Uninstall,
-                    &mut p,
-                );
-            }
-            KeyCode::Char('R') if p.cursor >= LSP_SERVER_ROW_START => {
-                p.reset.disarm();
-                self.queue_lsp_action(
-                    p.cursor - LSP_SERVER_ROW_START,
-                    LspControlAction::Restart,
-                    &mut p,
-                );
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                match lsp_row_for_cursor(p.cursor) {
-                    LspRow::Enabled => {
-                        p.reset.disarm();
-                        self.extended.lsp.enabled = !self.extended.lsp.enabled;
-                        p.status = save_status(self.save_extended());
-                    }
-                    LspRow::AutoInstall => {
-                        p.reset.disarm();
-                        self.extended.lsp.auto_install = self.extended.lsp.auto_install.cycled();
-                        p.status = save_status(self.save_extended());
-                    }
-                    LspRow::Diagnostics => {
-                        p.reset.disarm();
-                        self.extended.lsp.diagnostics.enabled =
-                            !self.extended.lsp.diagnostics.enabled;
-                        p.status = save_status(self.save_extended());
-                    }
-                    LspRow::OtherFilesLimit => {
-                        p.reset.disarm();
-                        start_lsp_edit(
-                            &mut p,
-                            LspEdit::OtherFilesLimit,
-                            self.extended.lsp.diagnostics.other_files_limit,
-                        );
-                    }
-                    LspRow::PerFileLimit => {
-                        p.reset.disarm();
-                        start_lsp_edit(
-                            &mut p,
-                            LspEdit::PerFileLimit,
-                            self.extended.lsp.diagnostics.per_file_limit,
-                        );
-                    }
-                    LspRow::DebounceMs => {
-                        p.reset.disarm();
-                        start_lsp_edit(
-                            &mut p,
-                            LspEdit::DebounceMs,
-                            self.extended.lsp.diagnostics.debounce_ms,
-                        );
-                    }
-                    LspRow::DocumentTimeoutMs => {
-                        p.reset.disarm();
-                        start_lsp_edit(
-                            &mut p,
-                            LspEdit::DocumentTimeoutMs,
-                            self.extended.lsp.diagnostics.document_timeout_ms,
-                        );
-                    }
-                    LspRow::WorkspaceTimeoutMs => {
-                        p.reset.disarm();
-                        start_lsp_edit(
-                            &mut p,
-                            LspEdit::WorkspaceTimeoutMs,
-                            self.extended.lsp.diagnostics.workspace_timeout_ms,
-                        );
-                    }
-                    LspRow::Reset => {
-                        self.activate_lsp_reset(&mut p);
-                    }
-                    LspRow::Server(idx) => {
-                        p.reset.disarm();
-                        self.queue_lsp_action(idx, LspControlAction::Check, &mut p);
-                    }
-                }
-            }
-            _ => {}
-        }
-        self.page = Page::Lsp(p);
-        false
+        let nav = self.page.handle_key(&mut self.cx, key);
+        self.apply_nav(nav)
     }
 
     fn activate_lsp_reset(&mut self, p: &mut LspPage) {
@@ -1508,6 +1446,32 @@ impl SettingsDialog {
             .render_lines(frame, area, "lsp", rows, Some(selected_line));
     }
 
+    fn enter_mcp(&mut self) {
+        self.page = mcp_page(mcp_page::McpPage::List(mcp_page::ListState {
+            cursor: 0,
+            status: None,
+            delete_pending: false,
+        }));
+    }
+
+    fn enter_gitignore_allow(&mut self) {
+        self.cx.reload_extended();
+        self.page = string_list_page(StringListPage::gitignore_allow());
+    }
+
+    fn take_pending_category_external_edit(&mut self) -> Option<PathBuf> {
+        self.page
+            .downcast_mut::<CategoryPage>()
+            .and_then(|p| p.pending_external_edit.as_mut()?.service_path())
+    }
+
+    fn finish_category_external_edit(&mut self, editor_error: Option<String>) {
+        let Some(p) = self.page.downcast_mut::<CategoryPage>() else {
+            return;
+        };
+        self.cx.finish_category_page_external_edit(p, editor_error);
+    }
+
     // ── Rendering ────────────────────────────────────────────────────────
 
     fn render(&self, frame: &mut Frame, area: Rect) {
@@ -1519,21 +1483,7 @@ impl SettingsDialog {
         frame.render_widget(block, area);
 
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-
-        match &self.page {
-            Page::Root { cursor } => render_root(frame, layout[0], *cursor, &self.scroll_states),
-            Page::Agents(p) => self.render_agents_page(frame, layout[0], p),
-            Page::Tools(p) => self.render_tools_page(frame, layout[0], p),
-            Page::Harnesses(p) => self.render_harnesses_page(frame, layout[0], p),
-            Page::Category(p) => self.render_category_page(frame, layout[0], p),
-            Page::Instructions(p) => self.render_instructions_page(frame, layout[0], p),
-            Page::RedactPatterns(p) => self.render_redact_patterns_page(frame, layout[0], p),
-            Page::StringList(p) => self.render_string_list_page(frame, layout[0], p),
-            Page::Skills(p) => self.render_skills_page(frame, layout[0], p),
-            Page::Mcp(p) => self.render_mcp_page(frame, layout[0], p),
-            Page::Lsp(p) => self.render_lsp_page(frame, layout[0], p),
-            Page::Providers(p) => self.render_providers_page(frame, layout[0], p),
-        }
+        self.page.render(&self.cx, frame, layout[0]);
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
             frame.set_cursor_position(cursor);
         }
@@ -1541,236 +1491,336 @@ impl SettingsDialog {
     }
 
     fn title(&self) -> String {
-        let crumbs = match &self.page {
-            Page::Root { .. } => String::new(),
-            Page::Agents(_) => " › Agents".into(),
-            Page::Tools(_) => " › Tools".into(),
-            Page::Harnesses(HarnessesPage::List(_)) => " › Harnesses".into(),
-            Page::Harnesses(HarnessesPage::Edit(s)) => format!(" › Harnesses › {}", s.name),
-            Page::Category(p) => format!(" › {}", p.category.crumb()),
-            Page::Skills(_) => " › Skills".into(),
-            Page::Mcp(McpPage::List(_)) => " › MCP".into(),
-            Page::Mcp(McpPage::Add(_)) => " › MCP › Add".into(),
-            Page::Lsp(_) => " › LSP".into(),
-            Page::Instructions(_) => " › Behavior › Instructions Files".into(),
-            Page::RedactPatterns(_) => " › Privacy & Safety › Environment File Patterns".into(),
-            Page::StringList(p) => format!(" › {}", p.crumb()),
-            Page::Providers(ProvidersPage::List { .. }) => format!(" › {PROVIDERS_TITLE}"),
-            Page::Providers(ProvidersPage::Add(_)) => format!(" › {PROVIDERS_TITLE} › Add"),
-            Page::Providers(ProvidersPage::Edit(s)) => {
-                format!(" › {PROVIDERS_TITLE} › {}", s.provider_id)
-            }
-            Page::Providers(ProvidersPage::Headers { parent, .. }) => {
-                format!(" › {PROVIDERS_TITLE} › {} › Headers", parent.provider_id)
-            }
-            Page::Providers(ProvidersPage::Models { parent, .. }) => {
-                format!(" › {PROVIDERS_TITLE} › {} › Models", parent.provider_id)
-            }
-            Page::Providers(ProvidersPage::ModelSettings { parent, .. }) => {
-                format!(
-                    " › {PROVIDERS_TITLE} › {} › Model Settings",
-                    parent.provider_id
-                )
-            }
-            Page::Providers(ProvidersPage::ProviderSettings { parent, .. }) => {
-                format!(" › {PROVIDERS_TITLE} › {} › Settings", parent.provider_id)
-            }
-            Page::Providers(ProvidersPage::FetchAll(_)) => {
-                format!(" › {PROVIDERS_TITLE} › refetch all")
-            }
-            Page::Providers(ProvidersPage::FetchOnePrompt(s)) => {
-                format!(" › {PROVIDERS_TITLE} › {} › refetch", s.provider_id)
-            }
-            Page::Providers(ProvidersPage::FetchFallbackPrompt(s)) => {
-                format!(" › {PROVIDERS_TITLE} › {} › fallback", s.provider_id)
-            }
-            Page::Providers(ProvidersPage::CopilotSetup { .. }) => {
-                format!(" › {PROVIDERS_TITLE} › Copilot setup")
-            }
-            Page::Providers(ProvidersPage::GrokOAuthSetup { .. }) => {
-                format!(" › {PROVIDERS_TITLE} › Grok OAuth")
-            }
-            Page::Providers(ProvidersPage::CodexOAuthSetup { .. }) => {
-                format!(" › {PROVIDERS_TITLE} › Codex OAuth")
-            }
-        };
-        format!(
-            "{}{}",
-            crate::welcome::display_path(&self.config_path),
-            crumbs
-        )
+        self.page.title(&self.cx)
     }
 
     fn help_text(&self) -> &'static str {
-        match &self.page {
-            Page::Root { .. } => {
-                if self.picker_cwd.is_some() {
-                    "↑/↓/Tab/Shift+Tab  enter: open  h: back to picker  esc/q: close"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: open  esc/q: close"
+        self.page.help_text(&self.cx)
+    }
+}
+
+impl SettingsPage for RootPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        let children = root_nodes();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace if cx.picker_cwd.is_some() => {
+                cx.back_to_picker = true;
+                return Nav::Close;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, children.len());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, children.len());
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let chosen = children.get(self.cursor).map(|n| n.title).unwrap_or("");
+                let next = match chosen {
+                    PROVIDERS_TITLE => Some(providers_page(ProvidersPage::List {
+                        cursor: providers::initial_list_cursor(&cx.config),
+                        status: None,
+                        delete_pending: false,
+                    })),
+                    "Agents" => Some(agents_page(AgentsPage::new(&cx.agents_cwd()))),
+                    "Interface" => {
+                        cx.reload_extended();
+                        Some(category_page(CategoryPage::new(Category::Interface)))
+                    }
+                    "Behavior" => {
+                        cx.reload_extended();
+                        Some(category_page(CategoryPage::new(Category::Behavior)))
+                    }
+                    "Privacy & Safety" => {
+                        cx.reload_extended();
+                        Some(category_page(CategoryPage::new(Category::Privacy)))
+                    }
+                    "Translation" => {
+                        cx.reload_extended();
+                        Some(category_page(CategoryPage::new(Category::Translation)))
+                    }
+                    "Profile" => {
+                        cx.reload_extended();
+                        Some(category_page(CategoryPage::new(Category::Profile)))
+                    }
+                    "Tools" => {
+                        cx.reload_extended();
+                        Some(tools_page(ToolsPage {
+                            cursor: 0,
+                            setup: None,
+                            editing: None,
+                            buf: TextField::default(),
+                            edit_target: None,
+                            status: None,
+                            reset: ResetButton::default(),
+                        }))
+                    }
+                    "Harnesses" => {
+                        cx.reload_extended();
+                        let status = cx.extended_warnings.first().cloned();
+                        Some(harnesses_page(harnesses_page::HarnessesPage::List(
+                            harnesses_page::ListState {
+                                cursor: 0,
+                                status,
+                                delete_pending: false,
+                                reset: ResetButton::default(),
+                                adding: None,
+                            },
+                        )))
+                    }
+                    "Skills" => {
+                        cx.reload_extended();
+                        Some(skills_page(skills_page::SkillsPage {
+                            cursor: 0,
+                            grabbed: None,
+                            status: None,
+                            reset: ResetButton::default(),
+                        }))
+                    }
+                    "MCP" => Some(mcp_page(mcp_page::McpPage::List(mcp_page::ListState {
+                        cursor: 0,
+                        status: None,
+                        delete_pending: false,
+                    }))),
+                    "LSP" => {
+                        cx.reload_extended();
+                        Some(lsp_page(LspPage {
+                            cursor: 0,
+                            editing: None,
+                            buf: TextField::default(),
+                            status: None,
+                            reset: ResetButton::default(),
+                        }))
+                    }
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    return Nav::Push(next);
                 }
             }
-            Page::Agents(p) => p.help_text(),
-            Page::Instructions(p) => {
-                if p.grabbed.is_some() {
-                    "type to rename  ↑/↓: reorder  enter: drop & save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  a: add  enter: grab to rename/reorder  d: delete  esc/h: back  q: close"
+            _ => {}
+        }
+        Nav::Stay
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        render_root(frame, area, self.cursor, &cx.scroll_states);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        crate::welcome::display_path(&cx.config_path)
+    }
+
+    fn help_text(&self, cx: &SettingsCx) -> &'static str {
+        if cx.picker_cwd.is_some() {
+            "↑/↓/Tab/Shift+Tab  enter: open  h: back to picker  esc/q: close"
+        } else {
+            "↑/↓/Tab/Shift+Tab  enter: open  esc/q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Root"
+    }
+}
+
+impl SettingsPage for LspPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        let row_count = LSP_SERVER_ROW_START
+            + cx.project_context()
+                .project_root()
+                .map(|cwd| crate::daemon::lsp::builtin_server_views(cwd, &cx.extended).len())
+                .unwrap_or(1);
+        if let Some(edit) = self.editing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.editing = None;
+                    self.buf = TextField::default();
                 }
-            }
-            Page::RedactPatterns(p) => {
-                if p.grabbed.is_some() {
-                    "type to edit pattern  ↑/↓: reorder  enter: drop & save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  a: add  enter: grab to edit/reorder  d: delete (x2)  esc/h: back  q: close"
-                }
-            }
-            Page::StringList(p) => {
-                if p.grabbed.is_some() {
-                    "type to edit  ↑/↓: reorder  enter: drop & save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  a: add  enter: grab to edit/reorder  d: delete  esc/h: back  q: close"
-                }
-            }
-            Page::Tools(p) => {
-                if p.editing.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit  t: toggle  r: reset  esc/h: back  q: close"
-                }
-            }
-            Page::Harnesses(HarnessesPage::List(s)) => {
-                if s.adding.is_some() {
-                    "type harness name  enter: create & edit  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit/seed  a: add  d: delete (×2)  esc/h: back  q: close"
-                }
-            }
-            Page::Harnesses(HarnessesPage::Edit(s)) => {
-                if s.editing.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit / cycle  esc/h: back to list  q: close"
-                }
-            }
-            Page::Category(p) => {
-                if p.utility_picker.is_some() {
-                    "↑/↓  enter: select  esc: back / cancel"
-                } else if p.is_editing() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit / cycle / drill  esc/h: back  q: close"
-                }
-            }
-            Page::Skills(p) => {
-                if p.grabbed.is_some() {
-                    "type to edit dir  enter: save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir  d: delete  esc/h: back  q: close"
-                }
-            }
-            Page::Mcp(McpPage::List(_)) => {
-                "↑/↓/Tab/Shift+Tab  space: toggle  m: mode  a: authenticate  d: delete (×2)  enter: add  esc/h: back  q: close"
-            }
-            Page::Mcp(McpPage::Add(_)) => {
-                "↑/↓/Tab  enter: cycle / save  type to edit name/endpoint  esc: back"
-            }
-            Page::Lsp(p) => {
-                if p.editing.is_some() {
-                    "type value  enter: save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  esc/h: back  q: close"
-                }
-            }
-            Page::Providers(ProvidersPage::List { .. }) => {
-                "↑/↓/Tab/Shift+Tab  enter: edit/refetch-all  R: refetch all  m: unlisted policy  a: add  d: delete (×2)  esc/h: back  q: close"
-            }
-            Page::Providers(ProvidersPage::Add(s)) => match &s.step {
-                AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
-                AddStep::EditId | AddStep::EditUrl => "type to edit  enter: next  esc: cancel",
-                AddStep::EditHeaders => {
-                    if s.headers.is_editing() {
-                        "type to edit  Tab: switch field  enter: save  esc: cancel"
-                    } else {
-                        "↑/↓  a: add  enter: edit  d: delete (x2)  enter on continue: save  esc: back"
+                KeyCode::Enter => {
+                    let raw = self.buf.text().trim();
+                    match raw.parse::<u64>() {
+                        Ok(v) => {
+                            match edit {
+                                LspEdit::OtherFilesLimit => {
+                                    cx.extended.lsp.diagnostics.other_files_limit = v as usize
+                                }
+                                LspEdit::PerFileLimit => {
+                                    cx.extended.lsp.diagnostics.per_file_limit = v as usize
+                                }
+                                LspEdit::DebounceMs => cx.extended.lsp.diagnostics.debounce_ms = v,
+                                LspEdit::DocumentTimeoutMs => {
+                                    cx.extended.lsp.diagnostics.document_timeout_ms = v
+                                }
+                                LspEdit::WorkspaceTimeoutMs => {
+                                    cx.extended.lsp.diagnostics.workspace_timeout_ms = v
+                                }
+                            }
+                            self.status = save_status(cx.save_extended());
+                            self.editing = None;
+                            self.buf = TextField::default();
+                        }
+                        Err(_) => self.status = Some("enter a non-negative integer".into()),
                     }
                 }
-                AddStep::CopilotAuth(_) => "enter: apply  s: skip  esc: cancel",
-                AddStep::GrokOAuthAuth(state) => {
-                    providers::oauth_setup_help_text(providers::oauth_setup_confirming_logged_in(
-                        state.logged_in,
-                        state.pending,
-                        state.manual_mode,
-                    ))
-                }
-                AddStep::CodexOAuthAuth(state) => {
-                    providers::oauth_setup_help_text(providers::oauth_setup_confirming_logged_in(
-                        state.logged_in,
-                        state.polling,
-                        false,
-                    ))
-                }
-                AddStep::Saving | AddStep::Fetching => "(in progress)  esc: cancel",
-                AddStep::Done => "enter: back to list",
-            },
-            Page::Providers(ProvidersPage::Edit(s)) => {
-                if s.editing_field.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit  s: save  r: refetch  f: favorite  d: delete (x2)  h: back  q: close"
+                _ => {
+                    let _ = self.buf.handle_key(key);
                 }
             }
-            Page::Providers(ProvidersPage::Headers { editor, .. }) => {
-                if editor.is_editing() {
-                    "type to edit  Tab: switch field  enter: save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  a: add  enter: edit  d: delete (x2)  h: back  q: close"
-                }
-            }
-            Page::Providers(ProvidersPage::Models { editor, .. }) => {
-                if editor.is_editing() {
-                    "type to edit  Tab: switch field  enter: save  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  a: add  r: rename  enter: settings  d: delete (x2)  h: back  q: close"
-                }
-            }
-            Page::Providers(ProvidersPage::ModelSettings { editor, .. }) => {
-                if editor.editing.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit/cycle  x: clear to inherit  h: back  q: close"
-                }
-            }
-            Page::Providers(ProvidersPage::ProviderSettings { editor, .. }) => {
-                if editor.editing.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: close"
-                }
-            }
-            Page::Providers(ProvidersPage::FetchAll(s)) => {
-                if s.is_fetching() {
-                    "fetching all providers…  esc: cancel"
-                } else if s.unlisted.is_empty() {
-                    "press any key to return"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  space: toggle don't-ask  enter: apply  esc: cancel"
-                }
-            }
-            Page::Providers(ProvidersPage::FetchOnePrompt(_)) => {
-                "↑/↓/Tab/Shift+Tab  space: toggle don't-ask  enter: apply  esc: cancel"
-            }
-            Page::Providers(ProvidersPage::FetchFallbackPrompt(_)) => {
-                "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel"
-            }
-            Page::Providers(ProvidersPage::CopilotSetup { .. }) => "enter: apply  esc: cancel",
-            Page::Providers(ProvidersPage::GrokOAuthSetup { .. }) => {
-                "↑/↓/Tab/Shift+Tab  enter: choose  esc: back"
-            }
-            Page::Providers(ProvidersPage::CodexOAuthSetup { .. }) => {
-                "↑/↓/Tab/Shift+Tab  enter: choose  esc: back"
-            }
+            return Nav::Stay;
         }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.reset.disarm();
+                Nav::Back
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.reset.disarm();
+                Nav::Back
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.reset.disarm();
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, row_count);
+                Nav::Stay
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.reset.disarm();
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, row_count);
+                Nav::Stay
+            }
+            KeyCode::Char('r') => {
+                cx.activate_lsp_reset(self);
+                Nav::Stay
+            }
+            KeyCode::Char('i') if self.cursor >= LSP_SERVER_ROW_START => {
+                self.reset.disarm();
+                cx.queue_lsp_action(
+                    self.cursor - LSP_SERVER_ROW_START,
+                    LspControlAction::Install,
+                    self,
+                );
+                Nav::Stay
+            }
+            KeyCode::Char('u') if self.cursor >= LSP_SERVER_ROW_START => {
+                self.reset.disarm();
+                cx.queue_lsp_action(
+                    self.cursor - LSP_SERVER_ROW_START,
+                    LspControlAction::Uninstall,
+                    self,
+                );
+                Nav::Stay
+            }
+            KeyCode::Char('R') if self.cursor >= LSP_SERVER_ROW_START => {
+                self.reset.disarm();
+                cx.queue_lsp_action(
+                    self.cursor - LSP_SERVER_ROW_START,
+                    LspControlAction::Restart,
+                    self,
+                );
+                Nav::Stay
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                match lsp_row_for_cursor(self.cursor) {
+                    LspRow::Enabled => {
+                        self.reset.disarm();
+                        cx.extended.lsp.enabled = !cx.extended.lsp.enabled;
+                        self.status = save_status(cx.save_extended());
+                    }
+                    LspRow::AutoInstall => {
+                        self.reset.disarm();
+                        cx.extended.lsp.auto_install = cx.extended.lsp.auto_install.cycled();
+                        self.status = save_status(cx.save_extended());
+                    }
+                    LspRow::Diagnostics => {
+                        self.reset.disarm();
+                        cx.extended.lsp.diagnostics.enabled = !cx.extended.lsp.diagnostics.enabled;
+                        self.status = save_status(cx.save_extended());
+                    }
+                    LspRow::OtherFilesLimit => {
+                        self.reset.disarm();
+                        start_lsp_edit(
+                            self,
+                            LspEdit::OtherFilesLimit,
+                            cx.extended.lsp.diagnostics.other_files_limit,
+                        );
+                    }
+                    LspRow::PerFileLimit => {
+                        self.reset.disarm();
+                        start_lsp_edit(
+                            self,
+                            LspEdit::PerFileLimit,
+                            cx.extended.lsp.diagnostics.per_file_limit,
+                        );
+                    }
+                    LspRow::DebounceMs => {
+                        self.reset.disarm();
+                        start_lsp_edit(
+                            self,
+                            LspEdit::DebounceMs,
+                            cx.extended.lsp.diagnostics.debounce_ms,
+                        );
+                    }
+                    LspRow::DocumentTimeoutMs => {
+                        self.reset.disarm();
+                        start_lsp_edit(
+                            self,
+                            LspEdit::DocumentTimeoutMs,
+                            cx.extended.lsp.diagnostics.document_timeout_ms,
+                        );
+                    }
+                    LspRow::WorkspaceTimeoutMs => {
+                        self.reset.disarm();
+                        start_lsp_edit(
+                            self,
+                            LspEdit::WorkspaceTimeoutMs,
+                            cx.extended.lsp.diagnostics.workspace_timeout_ms,
+                        );
+                    }
+                    LspRow::Reset => cx.activate_lsp_reset(self),
+                    LspRow::Server(idx) => {
+                        self.reset.disarm();
+                        cx.queue_lsp_action(idx, LspControlAction::Check, self);
+                    }
+                }
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_lsp_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!("{} › LSP", crate::welcome::display_path(&cx.config_path))
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.editing.is_some() {
+            "type value  enter: save  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "LSP"
     }
 }
 
@@ -1897,7 +1947,7 @@ fn start_lsp_edit<T: ToString>(p: &mut LspPage, edit: LspEdit, value: T) {
     p.buf.set(value.to_string());
 }
 
-fn lsp_rows(dialog: &SettingsDialog, p: &LspPage) -> (Vec<Line<'static>>, usize) {
+fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>, usize) {
     let d = &dialog.extended.lsp.diagnostics;
     let project_context = dialog.project_context();
     let mut rows = vec![
@@ -2090,9 +2140,73 @@ impl ProjectContext {
     }
 }
 
-impl SettingsDialog {
+impl SettingsCx {
     fn project_context(&self) -> ProjectContext {
         project_context_for_config(&self.config_path, self.active_project_root.as_deref())
+    }
+}
+
+impl SettingsCx {
+    fn reload_extended(&mut self) {
+        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
+            let (extended, warnings) = doc.config_with_warnings();
+            self.extended = extended;
+            self.extended_warnings = warnings;
+        }
+    }
+
+    pub(super) fn save_extended(&mut self) -> Result<(), String> {
+        let mut doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
+        doc.write(&self.extended).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn save_config(&mut self) -> Result<(), String> {
+        let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
+        let mut merged = doc.providers();
+        merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        doc.write(&merged).map_err(|e| e.to_string())?;
+        self.config = merged.clone();
+        self.original_config = merged;
+        Ok(())
+    }
+
+    fn activate_lsp_reset(&mut self, p: &mut LspPage) {
+        match p.reset.activate() {
+            ResetOutcome::Armed => p.status = None,
+            ResetOutcome::Apply => {
+                self.extended.lsp = crate::config::extended::LspConfig::default();
+                p.status = save_status(self.save_extended());
+            }
+        }
+    }
+
+    fn queue_lsp_action(&mut self, server_idx: usize, action: LspControlAction, p: &mut LspPage) {
+        let Some(cwd) = self.project_context().project_root().cloned() else {
+            p.status = Some(PROJECT_CONTEXT_UNAVAILABLE.to_string());
+            return;
+        };
+        let Some(server) = crate::daemon::lsp::builtin_server_views(&cwd, &self.extended)
+            .into_iter()
+            .nth(server_idx)
+        else {
+            return;
+        };
+        self.pending_daemon_request = Some(Request::LspControl {
+            project_root: cwd.display().to_string(),
+            server_id: server.id.clone(),
+            action,
+        });
+        p.status = Some(format!(
+            "requested {:?} for {}; result will appear as a daemon notice",
+            action, server.id
+        ));
+    }
+
+    fn render_lsp_page(&self, frame: &mut Frame, area: Rect, p: &LspPage) {
+        let (rows, selected_line) = lsp_rows(self, p);
+        self.scroll_states
+            .render_lines(frame, area, "lsp", rows, Some(selected_line));
     }
 }
 
@@ -2589,15 +2703,18 @@ mod tests {
     }
 
     fn on_add_page(d: &SettingsDialog) -> bool {
-        matches!(&d.page, Page::Providers(ProvidersPage::Add(_)))
+        matches!(d.test_page(), TestPageRef::Providers(ProvidersPage::Add(_)))
     }
 
     fn on_list_page(d: &SettingsDialog) -> bool {
-        matches!(&d.page, Page::Providers(ProvidersPage::List { .. }))
+        matches!(
+            d.test_page(),
+            TestPageRef::Providers(ProvidersPage::List { .. })
+        )
     }
 
     fn on_root_page(d: &SettingsDialog) -> bool {
-        matches!(&d.page, Page::Root { .. })
+        matches!(d.test_page(), TestPageRef::Root { .. })
     }
 
     #[cfg(unix)]
@@ -2667,7 +2784,7 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         let mut codex = providers::CodexOAuthSetupState::new();
         codex.logged_in = true;
-        d.page = Page::Providers(ProvidersPage::Add(providers::AddState {
+        d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
             step: AddStep::CodexOAuthAuth(Box::new(codex)),
             template: None,
             id_field: TextField::default(),
@@ -2676,12 +2793,12 @@ mod tests {
             error: None,
             fetch: None,
             saved_provider_id: None,
-        }));
+        })));
         assert_eq!(d.help_text(), "enter: continue  esc: back");
 
         let mut grok = providers::GrokOAuthSetupState::new();
         grok.logged_in = false;
-        d.page = Page::Providers(ProvidersPage::Add(providers::AddState {
+        d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
             step: AddStep::GrokOAuthAuth(Box::new(grok)),
             template: None,
             id_field: TextField::default(),
@@ -2690,7 +2807,7 @@ mod tests {
             error: None,
             fetch: None,
             saved_provider_id: None,
-        }));
+        })));
         assert_eq!(
             d.help_text(),
             "↑/↓  enter: choose  s: skip/continue  esc: back"
@@ -2703,7 +2820,7 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         let mut grok = providers::GrokOAuthSetupState::new();
         grok.manual_mode = true;
-        d.page = Page::Providers(ProvidersPage::Add(providers::AddState {
+        d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
             step: AddStep::GrokOAuthAuth(Box::new(grok)),
             template: None,
             id_field: TextField::default(),
@@ -2712,11 +2829,11 @@ mod tests {
             error: None,
             fetch: None,
             saved_provider_id: None,
-        }));
+        })));
 
         d.paste("http://127.0.0.1/callback?code=abc123&state=s\nignored");
 
-        let Page::Providers(ProvidersPage::Add(add)) = &d.page else {
+        let TestPageRef::Providers(ProvidersPage::Add(add)) = d.test_page() else {
             panic!("expected Add provider page");
         };
         let AddStep::GrokOAuthAuth(grok) = &add.step else {
@@ -2734,17 +2851,18 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         let mut grok = providers::GrokOAuthSetupState::new();
         grok.manual_mode = true;
-        d.page = Page::Providers(ProvidersPage::GrokOAuthSetup {
+        d.set_test_page(Page::Providers(ProvidersPage::GrokOAuthSetup {
             state: Box::new(grok),
             parent: Box::new(providers::EditState::new(
                 "grok-oauth".to_string(),
                 Default::default(),
             )),
-        });
+        }));
 
         d.paste("manual-code");
 
-        let Page::Providers(ProvidersPage::GrokOAuthSetup { state, .. }) = &d.page else {
+        let TestPageRef::Providers(ProvidersPage::GrokOAuthSetup { state, .. }) = d.test_page()
+        else {
             panic!("expected standalone Grok OAuth page");
         };
         assert_eq!(state.manual_input.text(), "manual-code");
@@ -2757,7 +2875,7 @@ mod tests {
     /// Open a category page on `d` with the cursor on `id`'s row.
     fn open_category_on(d: &mut SettingsDialog, category: Category, id: SettingId) {
         d.enter_category(category);
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.cursor = p
                 .cursor_of(id)
                 .unwrap_or_else(|| panic!("setting {id:?} not on {category:?}"));
@@ -2794,8 +2912,8 @@ mod tests {
     }
 
     fn category_cursor(d: &SettingsDialog) -> Option<usize> {
-        match &d.page {
-            Page::Category(p) => Some(p.cursor),
+        match d.test_page() {
+            TestPageRef::Category(p) => Some(p.cursor),
             _ => None,
         }
     }
@@ -2826,6 +2944,73 @@ mod tests {
         row.chars().nth(usize::from(x)).unwrap_or(' ')
     }
 
+    #[derive(Default)]
+    struct ProbePage {
+        handled: bool,
+    }
+
+    impl SettingsPage for ProbePage {
+        fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+            match key.code {
+                KeyCode::Esc => Nav::Back,
+                KeyCode::Char('x') => {
+                    self.handled = true;
+                    Nav::Stay
+                }
+                _ => Nav::Stay,
+            }
+        }
+
+        fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+            frame.render_widget(Paragraph::new("probe page"), area);
+        }
+
+        fn title(&self, cx: &SettingsCx) -> String {
+            format!("{} › Probe", crate::welcome::display_path(&cx.config_path))
+        }
+
+        fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+            "probe help"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn test_name(&self) -> &'static str {
+            "Probe"
+        }
+    }
+
+    #[test]
+    fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+
+        assert!(!d.apply_nav(Nav::Push(Box::new(ProbePage::default()))));
+        assert_eq!(
+            d.title(),
+            format!("{} › Probe", crate::welcome::display_path(&d.config_path))
+        );
+        assert_eq!(d.help_text(), "probe help");
+
+        d.handle_key(press(KeyCode::Char('x')));
+        assert!(
+            d.page
+                .downcast_ref::<ProbePage>()
+                .is_some_and(|page| page.handled),
+            "probe page should handle keys through SettingsPage"
+        );
+
+        let rows = render_settings_rows(&d, 40, 4).join("\n");
+        assert!(rows.contains("probe page"), "rendered rows were {rows:?}");
+
+        d.handle_key(press(KeyCode::Esc));
+        assert!(matches!(d.test_page(), TestPageRef::Root { cursor: 0 }));
+    }
+
     fn settings_body_area(width: u16, height: u16) -> Rect {
         Rect::new(1, 1, width.saturating_sub(2), height.saturating_sub(3))
     }
@@ -2847,10 +3032,10 @@ mod tests {
         editor.buf.handle_key(press(KeyCode::Home));
         editor.buf.handle_key(press(KeyCode::Right));
         editor.buf.handle_key(press(KeyCode::Right));
-        d.page = Page::Providers(ProvidersPage::ProviderSettings {
+        d.set_test_page(Page::Providers(ProvidersPage::ProviderSettings {
             editor,
             parent: Box::new(providers::EditState::new("p".to_string(), entry)),
-        });
+        }));
 
         let rows = render_settings_rows(&d, 100, 30).join("\n");
 
@@ -2862,7 +3047,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         d.enter_category(Category::Behavior);
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.cursor = p.cursor_of_reset().expect("reset row");
         }
         let rendered = render_settings_rows(&d, 92, 12).join("\n");
@@ -2881,7 +3066,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         d.enter_category(Category::Behavior);
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.cursor = p.cursor_of(SettingId::LlmMode).expect("llm mode");
         }
         let rendered = render_settings_rows(&d, 62, 18).join("\n");
@@ -2962,13 +3147,13 @@ mod tests {
         let cockpit_dir = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&cockpit_dir).unwrap();
         let mut d = SettingsDialog::open(cockpit_dir.join("config.json"));
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: LSP_SERVER_ROW_START,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         let rendered = render_settings_rows(&d, 110, 10).join("\n");
         assert!(
             rendered.contains("cockpit-installed") || rendered.contains("project actions"),
@@ -3017,7 +3202,7 @@ mod tests {
         assert!(help.contains("Tab/Shift+Tab"), "{help}");
         assert!(help.contains("esc/h: back"), "{help}");
         assert!(help.contains("q: close"), "{help}");
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.editing = Some(SettingId::Name);
         }
         assert!(
@@ -3052,7 +3237,7 @@ mod tests {
             SettingId::CommandProfileWrappers,
         );
         d.handle_key(press(KeyCode::Enter));
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.text_editor
                 .as_mut()
                 .expect("wrappers editor")
@@ -3076,7 +3261,7 @@ mod tests {
             SettingId::CommandProfileCustomProfiles,
         );
         d.handle_key(press(KeyCode::Enter));
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.text_editor
                 .as_mut()
                 .expect("profiles editor")
@@ -3214,8 +3399,8 @@ mod tests {
         open_category_on(&mut d, Category::Behavior, SettingId::CompactPrompt);
         d.handle_key(ctrl('g'));
         assert!(d.take_pending_category_external_edit().is_none());
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert_eq!(p.status.as_deref(), Some("No $EDITOR environment variable"))
             }
             _ => panic!("not on category page"),
@@ -3226,7 +3411,7 @@ mod tests {
     fn mcp_add_form_renders_cursor_at_textfield_position() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Mcp(McpPage::Add(Box::new(mcp_page::AddState {
+        d.set_test_page(Page::Mcp(McpPage::Add(Box::new(mcp_page::AddState {
             original_name: None,
             name: TextField::new("abcd"),
             endpoint: TextField::default(),
@@ -3251,7 +3436,7 @@ mod tests {
             request_timeout_secs: TextField::default(),
             cursor: 0,
             status: None,
-        })));
+        }))));
         d.handle_key(press(KeyCode::Home));
         d.handle_key(press(KeyCode::Right));
         d.handle_key(press(KeyCode::Right));
@@ -3293,7 +3478,7 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         open_category_on(&mut d, Category::Behavior, SettingId::PackagesDir);
         d.handle_key(press(KeyCode::Enter)); // open path editor
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.path_editor
                 .as_mut()
                 .expect("packages path editor")
@@ -3324,8 +3509,8 @@ mod tests {
         }
         type_chars(&mut d, "0");
         d.handle_key(press(KeyCode::Enter)); // reject
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert!(p.is_editing(), "stays open on invalid input");
                 assert!(p.status.as_deref().unwrap_or("").contains(">="));
             }
@@ -3355,7 +3540,7 @@ mod tests {
         std::fs::write(&dockerfile, "FROM scratch").unwrap();
         open_category_on(&mut d, Category::Privacy, SettingId::SandboxDockerfile);
         d.handle_key(press(KeyCode::Enter));
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             let editor = p.path_editor.as_mut().expect("dockerfile path editor");
             editor.set_text_for_test("Dock".to_string(), tmp.path());
             assert!(
@@ -3394,8 +3579,8 @@ mod tests {
         assert!(!d.extended.redact.scan_environment);
         // The env-file row is the next one down.
         d.handle_key(press(KeyCode::Down));
-        let want = match &d.page {
-            Page::Category(p) => p.cursor_of(SettingId::RedactScanDotenv),
+        let want = match d.test_page() {
+            TestPageRef::Category(p) => p.cursor_of(SettingId::RedactScanDotenv),
             _ => None,
         };
         assert_eq!(category_cursor(&d), want);
@@ -3418,8 +3603,8 @@ mod tests {
         }
         type_chars(&mut d, "abc");
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Category(p) => assert!(p.is_editing(), "stays open on bad input"),
+        match d.test_page() {
+            TestPageRef::Category(p) => assert!(p.is_editing(), "stays open on bad input"),
             _ => panic!("not on category page"),
         }
         assert_eq!(d.extended.redact.min_secret_length, before);
@@ -3482,8 +3667,8 @@ mod tests {
         type_chars(&mut d, "Ada");
         d.handle_key(press(KeyCode::Enter));
 
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert!(p.shadowed_global.is_some());
                 assert!(
                     p.status
@@ -3553,8 +3738,8 @@ mod tests {
             d.config.providers.contains_key("vendor"),
             "single `d` press must not delete"
         );
-        match &d.page {
-            Page::Providers(ProvidersPage::List {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::List {
                 delete_pending,
                 status,
                 ..
@@ -3595,8 +3780,8 @@ mod tests {
         // Arm the focused provider row, then move — the move must disarm it.
         d.handle_key(press(KeyCode::Char('d')));
         d.handle_key(press(KeyCode::Up));
-        match &d.page {
-            Page::Providers(ProvidersPage::List { delete_pending, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::List { delete_pending, .. }) => {
                 assert!(!delete_pending, "arrow key should clear pending-delete");
             }
             other => panic!("expected List, got {other:?}"),
@@ -3609,7 +3794,10 @@ mod tests {
     fn enter_edit_first_provider(d: &mut SettingsDialog) {
         d.handle_key(press(KeyCode::Enter)); // open Edit
         assert!(
-            matches!(&d.page, Page::Providers(ProvidersPage::Edit(_))),
+            matches!(
+                d.test_page(),
+                TestPageRef::Providers(ProvidersPage::Edit(_))
+            ),
             "expected to be on the Edit page"
         );
     }
@@ -3632,7 +3820,7 @@ mod tests {
         enter_edit_first_provider(&mut d);
         // Stage a URL edit, then move the cursor to the `[save changes]`
         // row (index 7) and activate it.
-        if let Page::Providers(ProvidersPage::Edit(s)) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
             s.entry.url = "https://new".to_string();
             s.cursor = 7;
         } else {
@@ -3640,8 +3828,8 @@ mod tests {
         }
         d.handle_key(press(KeyCode::Enter));
         // Still on the Edit page, with a `saved` status.
-        match &d.page {
-            Page::Providers(ProvidersPage::Edit(s)) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Edit(s)) => {
                 assert_eq!(s.status.as_deref(), Some("saved"));
             }
             other => panic!("expected to stay on Edit, got {other:?}"),
@@ -3675,7 +3863,7 @@ mod tests {
         let mut d = dialog_with_one_provider(&tmp);
         enter_edit_first_provider(&mut d);
         // Stage a URL edit directly on the EditState (no manual save).
-        if let Page::Providers(ProvidersPage::Edit(s)) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
             s.entry.url = "https://staged".to_string();
         } else {
             panic!("not on Edit page");
@@ -3694,18 +3882,18 @@ mod tests {
         let mut d = dialog_with_one_provider(&tmp);
         enter_edit_first_provider(&mut d);
         // Open the Headers sub-page (Edit cursor 1 → Enter).
-        if let Page::Providers(ProvidersPage::Edit(s)) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
             s.cursor = 1;
         } else {
             panic!("not on Edit page");
         }
         d.handle_key(press(KeyCode::Enter));
         assert!(matches!(
-            &d.page,
-            Page::Providers(ProvidersPage::Headers { .. })
+            d.test_page(),
+            TestPageRef::Providers(ProvidersPage::Headers { .. })
         ));
         // Stage a header row directly on the editor, then press `s`.
-        if let Page::Providers(ProvidersPage::Headers { editor, .. }) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Headers { editor, .. }) = d.test_page_mut() {
             editor.rows.push(crate::config::providers::HeaderSpec {
                 name: "Authorization".into(),
                 value: "Bearer x".into(),
@@ -3716,7 +3904,10 @@ mod tests {
         d.handle_key(press(KeyCode::Char('s')));
         // Stayed on the Headers page, committed to disk.
         assert!(
-            matches!(&d.page, Page::Providers(ProvidersPage::Headers { .. })),
+            matches!(
+                d.test_page(),
+                TestPageRef::Providers(ProvidersPage::Headers { .. })
+            ),
             "`s` keeps us on the Headers sub-page"
         );
         let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
@@ -3734,13 +3925,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
         enter_edit_first_provider(&mut d);
-        if let Page::Providers(ProvidersPage::Edit(s)) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
             s.cursor = 1;
         } else {
             panic!("not on Edit page");
         }
         d.handle_key(press(KeyCode::Enter));
-        if let Page::Providers(ProvidersPage::Headers { editor, .. }) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Headers { editor, .. }) = d.test_page_mut() {
             editor.rows.push(crate::config::providers::HeaderSpec {
                 name: "X-Test".into(),
                 value: "1".into(),
@@ -3750,7 +3941,10 @@ mod tests {
         }
         // Esc back to Edit must persist.
         d.handle_key(press(KeyCode::Esc));
-        assert!(matches!(&d.page, Page::Providers(ProvidersPage::Edit(_))));
+        assert!(matches!(
+            d.test_page(),
+            TestPageRef::Providers(ProvidersPage::Edit(_))
+        ));
         let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
             .unwrap()
             .providers();
@@ -3765,13 +3959,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
         enter_edit_first_provider(&mut d);
-        if let Page::Providers(ProvidersPage::Edit(s)) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
             s.cursor = 2; // Models row
         } else {
             panic!("not on Edit page");
         }
         d.handle_key(press(KeyCode::Enter));
-        if let Page::Providers(ProvidersPage::Models { editor, .. }) = &mut d.page {
+        if let TestPageMut::Providers(ProvidersPage::Models { editor, .. }) = d.test_page_mut() {
             editor.rows.push(crate::config::providers::ModelEntry {
                 id: "m-new".into(),
                 name: None,
@@ -3816,7 +4010,10 @@ mod tests {
     }
 
     fn on_fetch_all_page(d: &SettingsDialog) -> bool {
-        matches!(&d.page, Page::Providers(ProvidersPage::FetchAll(_)))
+        matches!(
+            d.test_page(),
+            TestPageRef::Providers(ProvidersPage::FetchAll(_))
+        )
     }
 
     #[tokio::test]
@@ -3827,7 +4024,10 @@ mod tests {
         let mut d = dialog_with_one_provider(&tmp);
         d.handle_key(press(KeyCode::Enter));
         assert!(
-            matches!(&d.page, Page::Providers(ProvidersPage::Edit(_))),
+            matches!(
+                d.test_page(),
+                TestPageRef::Providers(ProvidersPage::Edit(_))
+            ),
             "initial Enter should edit the first provider, got {:?}",
             d.page
         );
@@ -3846,7 +4046,7 @@ mod tests {
             "Enter on the refetch-all button should enter FetchAll, got {:?}",
             d.page
         );
-        if let Page::Providers(ProvidersPage::FetchAll(s)) = &d.page {
+        if let TestPageRef::Providers(ProvidersPage::FetchAll(s)) = d.test_page() {
             assert_eq!(
                 s.in_flight.len() + s.finished.len(),
                 1,
@@ -3877,8 +4077,8 @@ mod tests {
         d.enter_providers();
         assert!(d.config.providers.is_empty());
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Providers(ProvidersPage::List { status, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::List { status, .. }) => {
                 assert_eq!(
                     status.as_deref(),
                     Some("no providers configured"),
@@ -3900,8 +4100,8 @@ mod tests {
         // fast the spawned task completes (we never tick, so in_flight
         // stays populated).
         let state = ProvidersPage::FetchAll(FetchAllState::spawn(&d.config));
-        d.page = Page::Providers(state);
-        if let Page::Providers(ProvidersPage::FetchAll(s)) = &d.page {
+        d.set_test_page(Page::Providers(state));
+        if let TestPageRef::Providers(ProvidersPage::FetchAll(s)) = d.test_page() {
             assert!(s.is_fetching(), "expected an in-flight fetch");
         }
         // A non-Esc key is ignored — we stay on FetchAll.
@@ -3942,7 +4142,7 @@ mod tests {
             panic!("expected Settings dialog");
         };
         assert!(
-            matches!(s.page, Page::Providers(ProvidersPage::Add(_))),
+            matches!(s.test_page(), TestPageRef::Providers(ProvidersPage::Add(_))),
             "expected Add page, got {:?}",
             s.page
         );
@@ -3954,13 +4154,13 @@ mod tests {
         let cockpit_dir = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&cockpit_dir).unwrap();
         let mut d = SettingsDialog::open(cockpit_dir.join("config.json"));
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: LSP_SERVER_ROW_START,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
 
         d.handle_key(press(KeyCode::Enter));
         match d.pending_daemon_request.take() {
@@ -4007,13 +4207,13 @@ mod tests {
     fn lsp_reset_r_once_arms_without_wiping() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: 0,
             editing: None,
             buf: TextField::default(),
             status: Some("old status".into()),
             reset: ResetButton::default(),
-        });
+        }));
         d.extended.lsp.enabled = false;
         d.extended.lsp.diagnostics.other_files_limit = 17;
         let before = lsp_snapshot(&d.extended.lsp);
@@ -4025,8 +4225,8 @@ mod tests {
             before,
             "first r must not reset"
         );
-        match &d.page {
-            Page::Lsp(p) => {
+        match d.test_page() {
+            TestPageRef::Lsp(p) => {
                 assert!(p.reset.is_pending());
                 assert!(p.status.is_none(), "arming clears stale status");
             }
@@ -4038,13 +4238,13 @@ mod tests {
     fn lsp_reset_r_twice_restores_defaults() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: 0,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d.extended.lsp.enabled = false;
         d.extended.lsp.diagnostics.other_files_limit = 17;
 
@@ -4055,8 +4255,8 @@ mod tests {
             lsp_snapshot(&d.extended.lsp),
             lsp_snapshot(&crate::config::extended::LspConfig::default())
         );
-        match &d.page {
-            Page::Lsp(p) => {
+        match d.test_page() {
+            TestPageRef::Lsp(p) => {
                 assert!(!p.reset.is_pending());
                 assert!(p.status.is_some(), "applying reports save status");
             }
@@ -4068,13 +4268,13 @@ mod tests {
     fn lsp_reset_pending_cancelled_by_navigation() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: 0,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d.extended.lsp.enabled = false;
         let before = lsp_snapshot(&d.extended.lsp);
 
@@ -4087,8 +4287,8 @@ mod tests {
             before,
             "navigation disarms, so the next r arms again instead of applying"
         );
-        match &d.page {
-            Page::Lsp(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Lsp(p) => assert!(p.reset.is_pending()),
             other => panic!("expected LSP page, got {other:?}"),
         }
     }
@@ -4097,18 +4297,18 @@ mod tests {
     fn lsp_reset_row_and_accelerator_share_confirm_state() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: row_index(LspRow::Reset),
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d.extended.lsp.enabled = false;
 
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Lsp(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Lsp(p) => assert!(p.reset.is_pending()),
             other => panic!("expected LSP page, got {other:?}"),
         }
         d.handle_key(press(KeyCode::Char('r')));
@@ -4119,8 +4319,8 @@ mod tests {
 
         d.extended.lsp.enabled = false;
         d.handle_key(press(KeyCode::Char('r')));
-        match &d.page {
-            Page::Lsp(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Lsp(p) => assert!(p.reset.is_pending()),
             other => panic!("expected LSP page, got {other:?}"),
         }
         d.handle_key(press(KeyCode::Enter));
@@ -4147,20 +4347,20 @@ mod tests {
     fn lsp_edit_row_places_caret_at_textfield_cursor() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: row_index(LspRow::DebounceMs),
             editing: Some(LspEdit::DebounceMs),
             buf: TextField::new("1234"),
             status: None,
             reset: ResetButton::default(),
-        });
-        let Page::Lsp(p) = &mut d.page else {
+        }));
+        let TestPageMut::Lsp(p) = d.test_page_mut() else {
             panic!("expected LSP page")
         };
         p.buf.handle_key(press(KeyCode::Home));
         p.buf.handle_key(press(KeyCode::Right));
         p.buf.handle_key(press(KeyCode::Right));
-        let Page::Lsp(p) = &d.page else {
+        let TestPageRef::Lsp(p) = d.test_page() else {
             panic!("expected LSP page")
         };
         let (rows, selected_line) = lsp_rows(&d, p);
@@ -4173,15 +4373,15 @@ mod tests {
     fn lsp_severity_is_muted_non_selectable_info_line() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: 0,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
 
-        let Page::Lsp(p) = &d.page else {
+        let TestPageRef::Lsp(p) = d.test_page() else {
             panic!("expected LSP page");
         };
         let (rows, _) = lsp_rows(&d, p);
@@ -4199,7 +4399,7 @@ mod tests {
         );
 
         for _ in 0..(LSP_NAV_ROWS.len() * 2) {
-            let Page::Lsp(p) = &d.page else {
+            let TestPageRef::Lsp(p) = d.test_page() else {
                 panic!("expected LSP page");
             };
             let selected = lsp_rows(&d, p)
@@ -4268,13 +4468,13 @@ mod tests {
         let active = tmp.path().join("active-project");
         let global = tmp.path().join(".config/cockpit/config.json");
         let mut d = SettingsDialog::open_from_picker(global, active.clone());
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: LSP_SERVER_ROW_START,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
 
         d.handle_key(press(KeyCode::Enter));
 
@@ -4291,18 +4491,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let global = tmp.path().join(".config/cockpit/config.json");
         let mut d = SettingsDialog::open(global);
-        d.page = Page::Lsp(LspPage {
+        d.set_test_page(Page::Lsp(LspPage {
             cursor: LSP_SERVER_ROW_START,
             editing: None,
             buf: TextField::default(),
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
 
         d.handle_key(press(KeyCode::Enter));
 
         assert!(d.pending_daemon_request.is_none());
-        let Page::Lsp(p) = &d.page else {
+        let TestPageRef::Lsp(p) = d.test_page() else {
             panic!("expected LSP page");
         };
         assert_eq!(p.status.as_deref(), Some(PROJECT_CONTEXT_UNAVAILABLE));
@@ -4337,9 +4537,9 @@ mod tests {
     }
 
     fn enter_root_node(d: &mut SettingsDialog, title: &str) {
-        d.page = Page::Root {
+        d.set_test_page(Page::Root {
             cursor: root_index(title),
-        };
+        });
         d.handle_key(press(KeyCode::Enter));
     }
 
@@ -4360,7 +4560,7 @@ mod tests {
         d.command_installed = |_| true;
         enter_harnesses_from_root(&mut d);
         assert!(
-            matches!(d.page, Page::Harnesses(_)),
+            matches!(d.test_page(), TestPageRef::Harnesses(_)),
             "expected Harnesses page, got {:?}",
             d.page
         );
@@ -4440,8 +4640,8 @@ mod tests {
     }
 
     fn harness_status(d: &SettingsDialog) -> Option<String> {
-        match &d.page {
-            Page::Harnesses(HarnessesPage::List(s)) => s.status.clone(),
+        match d.test_page() {
+            TestPageRef::Harnesses(HarnessesPage::List(s)) => s.status.clone(),
             _ => None,
         }
     }
@@ -4561,7 +4761,7 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         enter_root_node(&mut d, "Interface");
         assert!(
-            matches!(d.page, Page::Category(_)),
+            matches!(d.test_page(), TestPageRef::Category(_)),
             "expected Category, got {:?}",
             d.page
         );
@@ -4592,8 +4792,8 @@ mod tests {
     }
 
     fn utility_picker(d: &SettingsDialog) -> &ui_page::UtilityModelPicker {
-        match &d.page {
-            Page::Category(p) => p.utility_picker.as_ref().expect("picker open"),
+        match d.test_page() {
+            TestPageRef::Category(p) => p.utility_picker.as_ref().expect("picker open"),
             other => panic!("expected Category page, got {other:?}"),
         }
     }
@@ -4633,8 +4833,8 @@ mod tests {
             Some("anthropic:claude-haiku")
         );
         // Picker closed, status reflects the save.
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert!(p.utility_picker.is_none(), "picker closes on accept");
                 assert_eq!(p.status.as_deref(), Some("saved"));
             }
@@ -4710,8 +4910,10 @@ mod tests {
         // Cursor starts on the first model row (anthropic:opus); Enter picks it.
         d.handle_key(press(KeyCode::Enter));
         assert_eq!(d.extended.utility_model.as_deref(), Some("anthropic:opus"));
-        match &d.page {
-            Page::Category(p) => assert!(p.utility_picker.is_none(), "picker closes on select"),
+        match d.test_page() {
+            TestPageRef::Category(p) => {
+                assert!(p.utility_picker.is_none(), "picker closes on select")
+            }
             other => panic!("expected Ui, got {other:?}"),
         }
         let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
@@ -4810,7 +5012,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_tools_from_root(&mut d);
-        assert!(matches!(d.page, Page::Tools(_)));
+        assert!(matches!(d.test_page(), TestPageRef::Tools(_)));
         d.handle_key(press(KeyCode::Char('h')));
         assert!(
             on_root_page(&d),
@@ -4828,7 +5030,7 @@ mod tests {
         open_category_on(&mut d, Category::Behavior, SettingId::Instructions);
         d.handle_key(press(KeyCode::Enter));
         assert!(
-            matches!(d.page, Page::Instructions(_)),
+            matches!(d.test_page(), TestPageRef::Instructions(_)),
             "expected Instructions page after Enter on the instructions row, got {:?}",
             d.page
         );
@@ -4839,8 +5041,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_root_node(&mut d, "Behavior");
-        let before_cursor = match &mut d.page {
-            Page::Category(p) => {
+        let before_cursor = match d.test_page_mut() {
+            TestPageMut::Category(p) => {
                 p.cursor = p.cursor_of(SettingId::Instructions).unwrap();
                 p.cursor
             }
@@ -4852,11 +5054,11 @@ mod tests {
         assert!(before_offset > 0, "test setup should scroll Behavior");
 
         d.handle_key(press(KeyCode::Enter));
-        assert!(matches!(d.page, Page::Instructions(_)));
+        assert!(matches!(d.test_page(), TestPageRef::Instructions(_)));
         d.handle_key(press(KeyCode::Esc));
 
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert_eq!(p.category, Category::Behavior);
                 assert_eq!(p.cursor, before_cursor);
             }
@@ -4874,18 +5076,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_root_node(&mut d, "Privacy & Safety");
-        let privacy_cursor = match &mut d.page {
-            Page::Category(p) => {
+        let privacy_cursor = match d.test_page_mut() {
+            TestPageMut::Category(p) => {
                 p.cursor = p.cursor_of(SettingId::RedactPatterns).unwrap();
                 p.cursor
             }
             other => panic!("expected Privacy category, got {other:?}"),
         };
         d.handle_key(press(KeyCode::Enter));
-        assert!(matches!(d.page, Page::RedactPatterns(_)));
+        assert!(matches!(d.test_page(), TestPageRef::RedactPatterns(_)));
         d.handle_key(press(KeyCode::Esc));
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert_eq!(p.category, Category::Privacy);
                 assert_eq!(p.cursor, privacy_cursor);
             }
@@ -4893,18 +5095,18 @@ mod tests {
         }
 
         enter_root_node(&mut d, "Behavior");
-        let behavior_cursor = match &mut d.page {
-            Page::Category(p) => {
+        let behavior_cursor = match d.test_page_mut() {
+            TestPageMut::Category(p) => {
                 p.cursor = p.cursor_of(SettingId::AgentDirs).unwrap();
                 p.cursor
             }
             other => panic!("expected Behavior category, got {other:?}"),
         };
         d.handle_key(press(KeyCode::Enter));
-        assert!(matches!(d.page, Page::StringList(_)));
+        assert!(matches!(d.test_page(), TestPageRef::StringList(_)));
         d.handle_key(press(KeyCode::Esc));
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert_eq!(p.category, Category::Behavior);
                 assert_eq!(p.cursor, behavior_cursor);
             }
@@ -4917,16 +5119,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_root_node(&mut d, "Behavior");
-        match &mut d.page {
-            Page::Category(p) => p.cursor = p.cursor_of(SettingId::Instructions).unwrap(),
+        match d.test_page_mut() {
+            TestPageMut::Category(p) => p.cursor = p.cursor_of(SettingId::Instructions).unwrap(),
             other => panic!("expected Behavior category, got {other:?}"),
         }
         d.handle_key(press(KeyCode::Enter));
-        assert!(matches!(d.page, Page::Instructions(_)));
+        assert!(matches!(d.test_page(), TestPageRef::Instructions(_)));
 
         assert!(!d.handle_key(press(KeyCode::Esc)));
         assert!(
-            matches!(&d.page, Page::Category(p) if p.category == Category::Behavior),
+            matches!(d.test_page(), TestPageRef::Category(p) if p.category == Category::Behavior),
             "Esc from sub-page should restore Behavior, got {:?}",
             d.page
         );
@@ -4938,8 +5140,8 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         d.extended.agent_guidance_files.clear();
         enter_root_node(&mut d, "Behavior");
-        match &mut d.page {
-            Page::Category(p) => p.cursor = p.cursor_of(SettingId::Instructions).unwrap(),
+        match d.test_page_mut() {
+            TestPageMut::Category(p) => p.cursor = p.cursor_of(SettingId::Instructions).unwrap(),
             other => panic!("expected Behavior category, got {other:?}"),
         }
         d.handle_key(press(KeyCode::Enter));
@@ -4968,10 +5170,10 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         enter_root_node(&mut d, "Behavior");
         d.handle_key(press(KeyCode::Char('h')));
-        match &d.page {
-            Page::Root { cursor } => {
+        match d.test_page() {
+            TestPageRef::Root { cursor } => {
                 assert_eq!(
-                    *cursor,
+                    cursor,
                     root_index("Behavior"),
                     "cursor should be on the Behavior row after return"
                 )
@@ -4986,10 +5188,10 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         enter_tools_from_root(&mut d);
         d.handle_key(press(KeyCode::Char('h')));
-        match &d.page {
-            Page::Root { cursor } => {
+        match d.test_page() {
+            TestPageRef::Root { cursor } => {
                 assert_eq!(
-                    *cursor,
+                    cursor,
                     root_index("Tools"),
                     "cursor should be on the Tools row after return"
                 )
@@ -5019,15 +5221,15 @@ mod tests {
             let mut d = fresh_dialog(&tmp);
             enter_root_node(&mut d, title);
             assert!(
-                !matches!(d.page, Page::Root { .. }),
+                !matches!(d.test_page(), TestPageRef::Root { .. }),
                 "`{title}` should open a child page"
             );
 
             d.handle_key(press(KeyCode::Char('h')));
 
-            match &d.page {
-                Page::Root { cursor } => assert_eq!(
-                    *cursor,
+            match d.test_page() {
+                TestPageRef::Root { cursor } => assert_eq!(
+                    cursor,
                     root_index(title),
                     "`{title}` should return to its own root row"
                 ),
@@ -5174,7 +5376,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         open_category_on(&mut d, Category::Behavior, SettingId::Instructions);
-        assert!(matches!(d.page, Page::Category(_)));
+        assert!(matches!(d.test_page(), TestPageRef::Category(_)));
         assert!(!d.handle_key(press(KeyCode::Esc)));
         assert!(on_root_page(&d), "Esc from category returns to root");
 
@@ -5186,7 +5388,7 @@ mod tests {
         let mut d = fresh_dialog(tmp);
         open_category_on(&mut d, Category::Behavior, SettingId::Instructions);
         d.handle_key(press(KeyCode::Enter));
-        assert!(matches!(d.page, Page::Instructions(_)));
+        assert!(matches!(d.test_page(), TestPageRef::Instructions(_)));
         d
     }
 
@@ -5195,8 +5397,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_instructions_dialog(&tmp);
         d.handle_key(press(KeyCode::Char('a')));
-        match &d.page {
-            Page::Instructions(p) => {
+        match d.test_page() {
+            TestPageRef::Instructions(p) => {
                 let g = p.grabbed.as_ref().expect("expected grabbed state");
                 assert!(g.buf.text().is_empty());
                 assert!(g.original_name.is_none(), "new row has no original name");
@@ -5213,8 +5415,8 @@ mod tests {
         let before = d.extended.agent_guidance_files.len();
         d.handle_key(press(KeyCode::Char('a')));
         d.handle_key(press(KeyCode::Esc));
-        match &d.page {
-            Page::Instructions(p) => {
+        match d.test_page() {
+            TestPageRef::Instructions(p) => {
                 assert!(p.grabbed.is_none(), "esc should drop the grab");
                 assert_eq!(
                     d.extended.agent_guidance_files.len(),
@@ -5233,11 +5435,11 @@ mod tests {
         // Seed two known rows.
         d.extended.agent_guidance_files = vec!["AGENTS.md".into(), "project guidance".into()];
         // Reset to row 0 and grab it.
-        d.page = Page::Instructions(InstructionsPage {
+        d.set_test_page(Page::Instructions(InstructionsPage {
             cursor: 0,
             grabbed: None,
             status: None,
-        });
+        }));
         d.handle_key(press(KeyCode::Enter));
         // Now grabbed at idx 0. Press ↓ to swap with row 1.
         d.handle_key(press(KeyCode::Down));
@@ -5247,8 +5449,8 @@ mod tests {
         );
         // Drop with Enter → save.
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Instructions(p) => assert!(p.grabbed.is_none()),
+        match d.test_page() {
+            TestPageRef::Instructions(p) => assert!(p.grabbed.is_none()),
             other => panic!("expected Instructions, got {other:?}"),
         }
     }
@@ -5258,11 +5460,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_instructions_dialog(&tmp);
         d.extended.agent_guidance_files = vec!["AGENTS.md".into(), "project guidance".into()];
-        d.page = Page::Instructions(InstructionsPage {
+        d.set_test_page(Page::Instructions(InstructionsPage {
             cursor: 0,
             grabbed: None,
             status: None,
-        });
+        }));
         d.handle_key(press(KeyCode::Enter));
         d.handle_key(press(KeyCode::Down));
         // Mid-grab the list is mutated. Esc must restore.
@@ -5280,11 +5482,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_instructions_dialog(&tmp);
         d.extended.agent_guidance_files = vec!["X".into()];
-        d.page = Page::Instructions(InstructionsPage {
+        d.set_test_page(Page::Instructions(InstructionsPage {
             cursor: 0,
             grabbed: None,
             status: None,
-        });
+        }));
         d.handle_key(press(KeyCode::Enter));
         for ch in "Y".chars() {
             d.handle_key(KeyEvent {
@@ -5305,11 +5507,13 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         d.extended.redact.denylist = vec!["secret-value".to_string(), "other-value".to_string()];
         d.save_extended().unwrap();
-        d.page = Page::StringList(Box::new(StringListPage::redact_denylist()));
+        d.set_test_page(Page::StringList(
+            Box::new(StringListPage::redact_denylist()),
+        ));
 
         d.handle_key(press(KeyCode::Char('d')));
-        match &d.page {
-            Page::StringList(p) => {
+        match d.test_page() {
+            TestPageRef::StringList(p) => {
                 assert_eq!(
                     d.extended.redact.denylist,
                     vec!["secret-value".to_string(), "other-value".to_string()],
@@ -5329,8 +5533,8 @@ mod tests {
         );
 
         d.handle_key(press(KeyCode::Down));
-        match &d.page {
-            Page::StringList(p) => {
+        match d.test_page() {
+            TestPageRef::StringList(p) => {
                 assert!(!p.delete.is_pending_for(0), "navigation disarms");
             }
             other => panic!("expected StringList, got {other:?}"),
@@ -5360,7 +5564,9 @@ mod tests {
         assert!(!rendered.contains("secret-value"), "{rendered}");
         assert!(!rendered.contains("other-value"), "{rendered}");
 
-        d.page = Page::StringList(Box::new(StringListPage::redact_denylist()));
+        d.set_test_page(Page::StringList(
+            Box::new(StringListPage::redact_denylist()),
+        ));
         let rendered = render_settings_rows(&d, 100, 22).join("\n");
         assert!(
             rendered.contains(secret_display::MASKED_VALUE),
@@ -5376,11 +5582,13 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         d.extended.redact.denylist = vec!["secret-value".to_string()];
         d.save_extended().unwrap();
-        d.page = Page::StringList(Box::new(StringListPage::redact_denylist()));
+        d.set_test_page(Page::StringList(
+            Box::new(StringListPage::redact_denylist()),
+        ));
 
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::StringList(p) => {
+        match d.test_page() {
+            TestPageRef::StringList(p) => {
                 let grabbed = p.grabbed.as_ref().expect("grabbed denylist row");
                 assert_eq!(grabbed.buf.text(), "");
                 assert_eq!(grabbed.original_name.as_deref(), Some("secret-value"));
@@ -5406,15 +5614,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
         d.handle_key(press(KeyCode::Enter)); // List → Edit(vendor)
-        match &d.page {
-            Page::Providers(ProvidersPage::Edit(_)) => {}
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Edit(_)) => {}
             other => panic!("expected Edit, got {other:?}"),
         }
         // Move to Headers row (idx 1).
         d.handle_key(press(KeyCode::Char('j')));
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Providers(ProvidersPage::Headers { parent, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Headers { parent, .. }) => {
                 assert_eq!(parent.provider_id, "vendor");
             }
             other => panic!("expected Headers sub-page, got {other:?}"),
@@ -5437,8 +5645,8 @@ mod tests {
         d.handle_key(press(KeyCode::Enter));
         // `h` from Browse mode returns to the Edit page.
         d.handle_key(press(KeyCode::Char('h')));
-        match &d.page {
-            Page::Providers(ProvidersPage::Edit(s)) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Edit(s)) => {
                 assert_eq!(s.provider_id, "vendor");
                 assert_eq!(s.cursor, 1, "cursor returns to the Headers row");
                 assert_eq!(
@@ -5460,15 +5668,15 @@ mod tests {
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('j'))); // cursor → Headers row
         d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
-        let before = match &d.page {
-            Page::Providers(ProvidersPage::Headers { editor, .. }) => editor.rows().len(),
+        let before = match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Headers { editor, .. }) => editor.rows().len(),
             other => panic!("expected Headers sub-page, got {other:?}"),
         };
         d.handle_key(press(KeyCode::Char('a'))); // open add popup
         d.handle_key(press(KeyCode::Char('x'))); // type a name
         d.handle_key(press(KeyCode::Esc)); // cancel — discards the add
-        match &d.page {
-            Page::Providers(ProvidersPage::Headers { editor, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Headers { editor, .. }) => {
                 assert_eq!(editor.rows().len(), before, "cancelled add leaves no row");
                 assert!(!editor.is_editing(), "popup is closed after cancel");
             }
@@ -5490,8 +5698,8 @@ mod tests {
         d.handle_key(press(KeyCode::Tab)); // focus → value
         d.handle_key(press(KeyCode::Char('v'))); // → value buffer
         d.handle_key(press(KeyCode::Enter)); // commit
-        match &d.page {
-            Page::Providers(ProvidersPage::Headers { editor, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Headers { editor, .. }) => {
                 let row = editor.rows().last().expect("a header row was added");
                 assert_eq!(row.name, "n");
                 assert_eq!(row.value, "v");
@@ -5510,8 +5718,8 @@ mod tests {
         d.handle_key(press(KeyCode::Char('j'))); // → row 1 (Headers)
         d.handle_key(press(KeyCode::Char('j'))); // → row 2 (Models)
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Providers(ProvidersPage::Models { parent, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Models { parent, .. }) => {
                 assert_eq!(parent.provider_id, "vendor");
             }
             other => panic!("expected Models sub-page, got {other:?}"),
@@ -5534,8 +5742,8 @@ mod tests {
         d.handle_key(press(KeyCode::Enter)); // commit
         // Back to Edit.
         d.handle_key(press(KeyCode::Char('h')));
-        match &d.page {
-            Page::Providers(ProvidersPage::Edit(s)) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Edit(s)) => {
                 assert_eq!(s.cursor, 2, "cursor returns to the Models row");
                 assert_eq!(s.entry.models.len(), 1);
                 assert_eq!(s.entry.models[0].id, "gpt-x");
@@ -5555,8 +5763,8 @@ mod tests {
         d.handle_key(press(KeyCode::Enter)); // → Models sub-page
         d.handle_key(press(KeyCode::Char('a'))); // open popup
         d.handle_key(press(KeyCode::Enter)); // commit with empty id
-        match &d.page {
-            Page::Providers(ProvidersPage::Models { editor, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Models { editor, .. }) => {
                 assert!(editor.is_editing(), "popup stays open on empty id");
                 assert!(editor.rows().is_empty(), "no row added");
                 assert!(editor.status.as_deref().unwrap_or("").contains("empty"));
@@ -5585,8 +5793,8 @@ mod tests {
             d.handle_key(press(KeyCode::Char(ch)));
         }
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Providers(ProvidersPage::Models { editor, .. }) => {
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::Models { editor, .. }) => {
                 assert!(editor.is_editing(), "popup stays open on duplicate id");
                 assert_eq!(editor.rows().len(), 1, "no duplicate row added");
                 assert!(
@@ -5609,8 +5817,8 @@ mod tests {
         let mut d = dialog_with_one_provider(&tmp);
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('h')));
-        match &d.page {
-            Page::Providers(ProvidersPage::List { .. }) => {}
+        match d.test_page() {
+            TestPageRef::Providers(ProvidersPage::List { .. }) => {}
             other => panic!("expected List after `h`, got {other:?}"),
         }
     }
@@ -5621,11 +5829,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_instructions_dialog(&tmp);
         d.extended.agent_guidance_files = vec!["AGENTS.md".into()];
-        d.page = Page::Instructions(InstructionsPage {
+        d.set_test_page(Page::Instructions(InstructionsPage {
             cursor: 0,
             grabbed: None,
             status: None,
-        });
+        }));
         d.handle_key(press(KeyCode::Enter));
         // Type some junk.
         for ch in "ZZZ".chars() {
@@ -5690,8 +5898,8 @@ mod tests {
 
         // First activation arms (no change yet).
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Tools(p) => assert!(p.reset.is_pending(), "first activation arms"),
+        match d.test_page() {
+            TestPageRef::Tools(p) => assert!(p.reset.is_pending(), "first activation arms"),
             other => panic!("expected Tools, got {other:?}"),
         }
         assert_eq!(
@@ -5703,8 +5911,8 @@ mod tests {
 
         // Second activation applies + saves.
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Tools(p) => assert!(!p.reset.is_pending(), "applying disarms"),
+        match d.test_page() {
+            TestPageRef::Tools(p) => assert!(!p.reset.is_pending(), "applying disarms"),
             other => panic!("expected Tools, got {other:?}"),
         }
         assert!(
@@ -5735,14 +5943,14 @@ mod tests {
         enter_tools_from_root(&mut d);
         cursor_down(&mut d, tools_reset_row());
         d.handle_key(press(KeyCode::Enter)); // arm
-        match &d.page {
-            Page::Tools(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Tools(p) => assert!(p.reset.is_pending()),
             other => panic!("expected Tools, got {other:?}"),
         }
         // Navigate away → disarm.
         d.handle_key(press(KeyCode::Up));
-        match &d.page {
-            Page::Tools(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
+        match d.test_page() {
+            TestPageRef::Tools(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
             other => panic!("expected Tools, got {other:?}"),
         }
     }
@@ -5752,8 +5960,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_tools_from_root(&mut d);
-        let p = match &d.page {
-            Page::Tools(p) => p,
+        let p = match d.test_page() {
+            TestPageRef::Tools(p) => p,
             other => panic!("expected Tools, got {other:?}"),
         };
         let rendered = d
@@ -5784,8 +5992,8 @@ mod tests {
             },
         );
 
-        let p = match &d.page {
-            Page::Tools(p) => p,
+        let p = match d.test_page() {
+            TestPageRef::Tools(p) => p,
             other => panic!("expected Tools, got {other:?}"),
         };
         let rendered: Vec<String> = d
@@ -5846,8 +6054,8 @@ mod tests {
             d.extended.tools.is_empty(),
             "native Firecrawl does not write CLI templates"
         );
-        match &d.page {
-            Page::Tools(p) => {
+        match d.test_page() {
+            TestPageRef::Tools(p) => {
                 assert_eq!(p.setup, Some(tools_page::WebSetupState::FirecrawlDetails));
                 assert_eq!(p.cursor, 0);
             }
@@ -5872,8 +6080,8 @@ mod tests {
             crate::config::extended::WebProvider::Firecrawl,
             "TinyFish selection is blocked without a key"
         );
-        match &d.page {
-            Page::Tools(p) => assert!(
+        match d.test_page() {
+            TestPageRef::Tools(p) => assert!(
                 p.status
                     .as_deref()
                     .unwrap_or_default()
@@ -5909,8 +6117,8 @@ mod tests {
         d.handle_key(press(KeyCode::Enter)); // key field
         d.paste("fc-secret-value");
 
-        let p = match &d.page {
-            Page::Tools(p) => p,
+        let p = match d.test_page() {
+            TestPageRef::Tools(p) => p,
             other => panic!("expected Tools, got {other:?}"),
         };
         let rendered = d
@@ -5950,9 +6158,9 @@ mod tests {
         d.handle_key(press(KeyCode::Enter));
         d.paste("not-a-url");
         d.handle_key(press(KeyCode::Enter));
-        assert!(matches!(&d.page, Page::Tools(p) if p.editing.is_some()));
+        assert!(matches!(d.test_page(), TestPageRef::Tools(p) if p.editing.is_some()));
 
-        if let Page::Tools(p) = &mut d.page {
+        if let TestPageMut::Tools(p) = d.test_page_mut() {
             p.buf = crate::tui::textfield::TextField::new("https://firecrawl.local");
         }
         d.handle_key(press(KeyCode::Enter));
@@ -5996,11 +6204,11 @@ mod tests {
     /// Move a category page's cursor onto its reset button row (the last
     /// selectable row).
     fn move_to_reset_row(d: &mut SettingsDialog) {
-        let target = match &d.page {
-            Page::Category(p) => p.cursor_of_reset().expect("category has a reset button"),
+        let target = match d.test_page() {
+            TestPageRef::Category(p) => p.cursor_of_reset().expect("category has a reset button"),
             _ => panic!("not on a category page"),
         };
-        if let Page::Category(p) = &mut d.page {
+        if let TestPageMut::Category(p) = d.test_page_mut() {
             p.cursor = target;
         }
     }
@@ -6030,16 +6238,16 @@ mod tests {
 
         move_to_reset_row(&mut d);
         d.handle_key(press(KeyCode::Enter)); // arm
-        match &d.page {
-            Page::Category(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Category(p) => assert!(p.reset.is_pending()),
             other => panic!("expected Category, got {other:?}"),
         }
         // Arming must not change anything.
         assert_eq!(d.extended.tui.vim_mode, VimModeSetting::Disabled);
 
         d.handle_key(press(KeyCode::Enter)); // apply
-        match &d.page {
-            Page::Category(p) => {
+        match d.test_page() {
+            TestPageRef::Category(p) => {
                 assert!(!p.reset.is_pending(), "applying disarms");
                 assert_eq!(
                     p.pending_mouse_capture,
@@ -6173,13 +6381,13 @@ mod tests {
         enter_root_node(&mut d, "Interface");
         move_to_reset_row(&mut d);
         d.handle_key(press(KeyCode::Enter)); // arm
-        match &d.page {
-            Page::Category(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Category(p) => assert!(p.reset.is_pending()),
             other => panic!("expected Category, got {other:?}"),
         }
         d.handle_key(press(KeyCode::Up)); // navigate away
-        match &d.page {
-            Page::Category(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
+        match d.test_page() {
+            TestPageRef::Category(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
             other => panic!("expected Category, got {other:?}"),
         }
     }

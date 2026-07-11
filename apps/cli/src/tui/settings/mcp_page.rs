@@ -28,7 +28,7 @@ use super::shell::{
     error_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
     selected_style, warning_style,
 };
-use super::{Nav, Page, SettingsDialog, save_button_line, save_status};
+use super::{Nav, SettingsCx, SettingsPage, save_button_line, save_status};
 
 /// `/settings → MCP` state: the server list or the add form.
 pub(super) enum McpPage {
@@ -209,7 +209,7 @@ pub(crate) fn row_color(name: &str, s: &ServerConfig) -> Color {
     }
 }
 
-impl SettingsDialog {
+impl SettingsCx {
     /// The path to the sibling `mcp.json` (same dir as `config.json`).
     pub(super) fn mcp_path(&self) -> std::path::PathBuf {
         self.config_path
@@ -228,32 +228,6 @@ impl SettingsDialog {
     fn save_mcp(&self, cfg: &McpConfig) -> Result<(), String> {
         let path = self.mcp_path();
         cfg.write_private(&path).map_err(|e| e.to_string())
-    }
-
-    pub(super) fn enter_mcp(&mut self) {
-        self.page = Page::Mcp(McpPage::List(ListState {
-            cursor: 0,
-            status: None,
-            delete_pending: false,
-        }));
-    }
-
-    pub(super) fn handle_mcp_key(&mut self, key: KeyEvent) -> bool {
-        // Swap the page out so we can mutate it without borrowing `self`.
-        let mut page = std::mem::replace(
-            &mut self.page,
-            Page::Mcp(McpPage::List(ListState {
-                cursor: 0,
-                status: None,
-                delete_pending: false,
-            })),
-        );
-        let nav = match &mut page {
-            Page::Mcp(McpPage::List(s)) => self.handle_mcp_list_key(key, s),
-            Page::Mcp(McpPage::Add(s)) => self.handle_mcp_add_key(key, s),
-            _ => Nav::Close,
-        };
-        self.apply_nav(page, nav)
     }
 
     fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
@@ -275,15 +249,15 @@ impl SettingsDialog {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if s.cursor == names.len() => {
                 // [+ add server]
-                return Nav::Replace(Page::Mcp(McpPage::Add(Box::new(AddState::new()))));
+                return Nav::Replace(super::mcp_page(McpPage::Add(Box::new(AddState::new()))));
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(name) = names.get(s.cursor)
                     && let Some(server) = cfg.servers.get(name)
                 {
-                    return Nav::Replace(Page::Mcp(McpPage::Add(Box::new(AddState::from_server(
-                        name, server,
-                    )))));
+                    return Nav::Replace(super::mcp_page(McpPage::Add(Box::new(
+                        AddState::from_server(name, server),
+                    ))));
                 }
             }
             KeyCode::Char(' ') => {
@@ -344,7 +318,7 @@ impl SettingsDialog {
         let editing_text = active_text_field_mut(s).is_some();
         match key.code {
             KeyCode::Esc => {
-                return Nav::Replace(Page::Mcp(McpPage::List(ListState {
+                return Nav::Replace(super::mcp_page(McpPage::List(ListState {
                     cursor: 0,
                     status: None,
                     delete_pending: false,
@@ -425,7 +399,7 @@ impl SettingsDialog {
             return Nav::Stay;
         }
         match self.save_mcp(&cfg) {
-            Ok(()) => Nav::Replace(Page::Mcp(McpPage::List(ListState {
+            Ok(()) => Nav::Replace(super::mcp_page(McpPage::List(ListState {
                 cursor: 0,
                 status: Some(if s.original_name.is_some() {
                     format!("saved `{name}`")
@@ -1352,5 +1326,52 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
         }
+    }
+}
+
+impl SettingsPage for McpPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        match self {
+            McpPage::List(s) => cx.handle_mcp_list_key(key, s),
+            McpPage::Add(s) => cx.handle_mcp_add_key(key, s),
+        }
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_mcp_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        let crumbs = match self {
+            McpPage::List(_) => " › MCP",
+            McpPage::Add(_) => " › MCP › Add",
+        };
+        format!(
+            "{}{}",
+            crate::welcome::display_path(&cx.config_path),
+            crumbs
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        match self {
+            McpPage::List(_) => {
+                "↑/↓/Tab/Shift+Tab  space: toggle  m: mode  a: authenticate  d: delete (×2)  enter: add  esc/h: back  q: close"
+            }
+            McpPage::Add(_) => {
+                "↑/↓/Tab  enter: cycle / save  type to edit name/endpoint  esc: back"
+            }
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "MCP"
     }
 }

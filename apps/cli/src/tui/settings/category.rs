@@ -55,7 +55,7 @@ use super::shell::{
     push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
-use super::{Nav, Page, SettingsDialog, save_status};
+use super::{Nav, SettingsCx, SettingsPage, save_status};
 
 // ── Enum option labels + cycles ──────────────────────────────────────────
 // One place per enum so the value-renderer and the cycle/toggle action stay
@@ -1158,7 +1158,7 @@ pub(super) struct CategoryPage {
 }
 
 pub(super) struct CategorySettingStore<'a, 'b> {
-    pub(super) dialog: &'a mut SettingsDialog,
+    pub(super) dialog: &'a mut SettingsCx,
     pub(super) page: &'b mut CategoryPage,
 }
 
@@ -1219,7 +1219,7 @@ impl CategoryExternalEdit {
         })
     }
 
-    fn service_path(&mut self) -> Option<PathBuf> {
+    pub(super) fn service_path(&mut self) -> Option<PathBuf> {
         if self.servicing {
             return None;
         }
@@ -1636,7 +1636,7 @@ fn category_rows(category: Category) -> Vec<Row> {
 
 // ── Value formatting ─────────────────────────────────────────────────────
 
-impl SettingsDialog {
+impl SettingsCx {
     /// The right-column display value for a setting, reflecting the current
     /// `self.extended` (or `self.config`) state. Enum rows show the active
     /// option spelled out; bool rows show on/off with the default noted.
@@ -2004,45 +2004,8 @@ fn toggle_command_profile(e: &mut crate::config::extended::ExtendedConfig, id: &
 
 // ── Key handling ─────────────────────────────────────────────────────────
 
-impl SettingsDialog {
-    pub(super) fn handle_category_key(&mut self, key: KeyEvent) -> bool {
-        // Detach + swap so the inner handler returns a `Nav` rather than
-        // writing `self.page` (the swap-back would discard a direct write).
-        let cat = match &self.page {
-            Page::Category(p) => p.category,
-            _ => return false,
-        };
-        let placeholder = Page::Category(Box::new(CategoryPage::new(cat)));
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::Category(p) = &mut page {
-            self.handle_category_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
-    }
-
-    pub(super) fn take_pending_category_external_edit(&mut self) -> Option<PathBuf> {
-        let Page::Category(p) = &mut self.page else {
-            return None;
-        };
-        p.pending_external_edit.as_mut()?.service_path()
-    }
-
-    pub(super) fn finish_category_external_edit(&mut self, editor_error: Option<String>) {
-        let cat = match &self.page {
-            Page::Category(p) => p.category,
-            _ => return,
-        };
-        let placeholder = Page::Category(Box::new(CategoryPage::new(cat)));
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        if let Page::Category(p) = &mut page {
-            self.finish_category_page_external_edit(p, editor_error);
-        }
-        self.page = page;
-    }
-
-    fn finish_category_page_external_edit(
+impl SettingsCx {
+    pub(super) fn finish_category_page_external_edit(
         &mut self,
         p: &mut CategoryPage,
         editor_error: Option<String>,
@@ -2764,23 +2727,23 @@ impl SettingsDialog {
                 p.status = None;
                 Nav::Stay
             }
-            S::Instructions => Nav::Push(Page::Instructions(InstructionsPage::new())),
-            S::RedactPatterns => Nav::Push(Page::RedactPatterns(RedactPatternsPage::new())),
-            S::AgentDirs => Nav::Push(Page::StringList(Box::new(
+            S::Instructions => Nav::Push(super::instructions_page(InstructionsPage::new())),
+            S::RedactPatterns => Nav::Push(super::redact_patterns_page(RedactPatternsPage::new())),
+            S::AgentDirs => Nav::Push(super::string_list_page(
                 super::string_list::StringListPage::agent_dirs(),
-            ))),
-            S::RedactExtraDotenvPaths => Nav::Push(Page::StringList(Box::new(
+            )),
+            S::RedactExtraDotenvPaths => Nav::Push(super::string_list_page(
                 super::string_list::StringListPage::extra_dotenv_paths(),
-            ))),
-            S::RedactDenylist => Nav::Push(Page::StringList(Box::new(
+            )),
+            S::RedactDenylist => Nav::Push(super::string_list_page(
                 super::string_list::StringListPage::redact_denylist(),
-            ))),
-            S::RedactAllowlist => Nav::Push(Page::StringList(Box::new(
+            )),
+            S::RedactAllowlist => Nav::Push(super::string_list_page(
                 super::string_list::StringListPage::redact_allowlist(),
-            ))),
-            S::GitignoreAllow => Nav::Push(Page::StringList(Box::new(
+            )),
+            S::GitignoreAllow => Nav::Push(super::string_list_page(
                 super::string_list::StringListPage::gitignore_allow(),
-            ))),
+            )),
             _ => Nav::Stay,
         }
     }
@@ -3096,7 +3059,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
 
 // ── Rendering ────────────────────────────────────────────────────────────
 
-impl SettingsDialog {
+impl SettingsCx {
     pub(super) fn render_category_page(&self, frame: &mut Frame, area: Rect, p: &CategoryPage) {
         if let Some(editor) = &p.path_editor {
             editor.render(frame, area);
@@ -3297,5 +3260,44 @@ mod descriptor_tests {
             SettingId::ApprovalMode.descriptor().help,
             "When a command, web fetch, or MCP call needs approval before it runs. `manual` (default) asks you every time — you are the gate; `auto` routes each call past the utility-model safety gate (safe runs, unsafe asks) and needs a utility model; `yolo` runs everything unprompted. Distinct from the `auto` *agent*."
         );
+    }
+}
+
+impl SettingsPage for CategoryPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_category_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_category_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!(
+            "{} › {}",
+            crate::welcome::display_path(&cx.config_path),
+            self.category.crumb()
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.utility_picker.is_some() {
+            "↑/↓  enter: select  esc: back / cancel"
+        } else if self.is_editing() {
+            "type to edit  enter: apply  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  enter: edit / cycle / drill  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Category"
     }
 }

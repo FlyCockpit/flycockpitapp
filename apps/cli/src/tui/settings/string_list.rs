@@ -28,7 +28,7 @@ use super::grab;
 use super::secret_display;
 use super::shell::{push_wrapped_text, selected_line_from_marker};
 use super::ui_page::GrabState;
-use super::{Nav, Page, RowDeleteConfirm, SettingsDialog, save_status};
+use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
 /// Which config list this editor is bound to. Each variant names its
 /// back-target category (so Esc/h lands on the page it was drilled from),
@@ -157,7 +157,7 @@ fn string_list_existing_grab(kind: StringListKind, value: String, origin: usize)
     }
 }
 
-impl SettingsDialog {
+impl SettingsCx {
     /// Read the current list for `kind` as owned strings (paths render via
     /// `display()`).
     fn string_list_values(&self, kind: StringListKind) -> Vec<String> {
@@ -277,14 +277,8 @@ impl SettingsDialog {
         }
     }
 
-    /// Open the dialog directly on the gitignore read-allowlist string-list
-    /// editor (`/gitignore-allow`). Reloads the cached extended-config first
-    /// so the rows reflect on-disk state, mirroring [`Self::enter_category`].
-    pub(super) fn enter_gitignore_allow(&mut self) {
-        self.reload_extended();
-        self.page = Page::StringList(Box::new(StringListPage::gitignore_allow()));
-    }
-
+    // `/gitignore-allow` opens this list after reloading extended config,
+    // mirroring category entry so rows reflect on-disk state.
     /// Quick-add `glob` to the project gitignore allowlist and persist, then
     /// open the editor (`/gitignore-allow <glob>`). A blank/duplicate glob is
     /// a no-op add; the editor still opens.
@@ -294,22 +288,6 @@ impl SettingsDialog {
             self.extended.gitignore_allow.push(glob.to_string());
             let _ = self.save_extended();
         }
-        self.enter_gitignore_allow();
-    }
-
-    pub(super) fn handle_string_list_key(&mut self, key: KeyEvent) -> bool {
-        let kind = match &self.page {
-            Page::StringList(p) => p.kind,
-            _ => return false,
-        };
-        let placeholder = Page::StringList(Box::new(StringListPage::new(kind)));
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::StringList(p) = &mut page {
-            self.handle_string_list_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
     }
 
     fn handle_string_list_page_key(&mut self, key: KeyEvent, p: &mut StringListPage) -> Nav {
@@ -541,5 +519,42 @@ impl SettingsDialog {
             lines,
             selected_line,
         );
+    }
+}
+
+impl SettingsPage for StringListPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_string_list_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_string_list_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!(
+            "{} › {}",
+            crate::welcome::display_path(&cx.config_path),
+            self.crumb()
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.grabbed.is_some() {
+            "type to edit  ↑/↓: reorder  enter: drop & save  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  a: add  enter: grab to edit/reorder  d: delete  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "StringList"
     }
 }

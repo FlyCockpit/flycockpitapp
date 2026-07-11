@@ -25,7 +25,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
 use super::shell::{SettingsScrollStates, push_wrapped_text, selected_line_from_marker};
-use super::{Nav, Page, SettingsDialog, save_status};
+use super::{Nav, SettingsCx, SettingsPage, save_status};
 
 // ── Utility-model picker ─────────────────────────────────────────────────
 
@@ -226,19 +226,8 @@ impl GrabState {
     }
 }
 
-impl SettingsDialog {
+impl SettingsCx {
     // ── Instructions sub-page ────────────────────────────────────────────
-
-    pub(super) fn handle_instructions_key(&mut self, key: KeyEvent) -> bool {
-        let placeholder = Page::Instructions(InstructionsPage::new());
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::Instructions(p) = &mut page {
-            self.handle_instructions_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
-    }
 
     fn handle_instructions_page_key(&mut self, key: KeyEvent, p: &mut InstructionsPage) -> Nav {
         if p.grabbed.is_some() {
@@ -391,17 +380,6 @@ impl SettingsDialog {
     }
 
     // ── Environment File Patterns sub-page ───────────────────────────────
-
-    pub(super) fn handle_redact_patterns_key(&mut self, key: KeyEvent) -> bool {
-        let placeholder = Page::RedactPatterns(RedactPatternsPage::new());
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::RedactPatterns(p) = &mut page {
-            self.handle_redact_patterns_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
-    }
 
     fn handle_redact_patterns_page_key(
         &mut self,
@@ -781,4 +759,76 @@ fn render_grab_list(
 
     let selected_line = selected_line_from_marker(&lines);
     scroll_states.render_lines(frame, area, key, lines, selected_line);
+}
+
+impl SettingsPage for InstructionsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_instructions_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_instructions_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!(
+            "{} › Behavior › Instructions Files",
+            crate::welcome::display_path(&cx.config_path)
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.grabbed.is_some() {
+            "type to rename  ↑/↓: reorder  enter: drop & save  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  a: add  enter: grab to rename/reorder  d: delete  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Instructions"
+    }
+}
+
+impl SettingsPage for RedactPatternsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_redact_patterns_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_redact_patterns_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!(
+            "{} › Privacy & Safety › Environment File Patterns",
+            crate::welcome::display_path(&cx.config_path)
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.grabbed.is_some() {
+            "type to edit pattern  ↑/↓: reorder  enter: drop & save  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  a: add  enter: grab to edit/reorder  d: delete (x2)  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "RedactPatterns"
+    }
 }

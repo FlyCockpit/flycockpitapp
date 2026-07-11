@@ -26,7 +26,9 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 use super::grab;
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{push_wrapped_text, selected_line_from_marker};
-use super::{Nav, Page, SettingsDialog, save_status};
+use super::{Nav, SettingsCx, SettingsPage, save_status};
+#[cfg(test)]
+use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
 
 /// Number of leading toggle rows before the scan-dir list: row 0 is the
 /// auto-`!`-command toggle, row 1 is the ancestor-walk toggle.
@@ -51,23 +53,7 @@ pub(super) struct GrabState {
     pub(super) original: Option<String>,
 }
 
-impl SettingsDialog {
-    pub(super) fn handle_skills_key(&mut self, key: KeyEvent) -> bool {
-        let placeholder = Page::Skills(SkillsPage {
-            cursor: 0,
-            grabbed: None,
-            status: None,
-            reset: ResetButton::default(),
-        });
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::Skills(p) = &mut page {
-            self.handle_skills_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
-    }
-
+impl SettingsCx {
     /// Toggles occupy cursors `0..TOGGLE_ROWS`; scan-dir rows occupy
     /// `TOGGLE_ROWS..TOGGLE_ROWS+len`; the `[+ add]` synthetic row is at
     /// `TOGGLE_ROWS + len`.
@@ -382,12 +368,12 @@ mod tests {
     fn fresh_skills_dialog(tmp: &TempDir) -> SettingsDialog {
         let path = tmp.path().join("config.json");
         let mut d = SettingsDialog::open(path);
-        d.page = Page::Skills(SkillsPage {
+        d.set_test_page(Page::Skills(SkillsPage {
             cursor: 0,
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d
     }
 
@@ -397,12 +383,12 @@ mod tests {
         let path = tmp.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
         let mut d = SettingsDialog::open(path);
-        d.page = Page::Skills(SkillsPage {
+        d.set_test_page(Page::Skills(SkillsPage {
             cursor: 0,
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d
     }
 
@@ -475,8 +461,8 @@ mod tests {
         // Start from an empty list to exercise add/remove cleanly.
         d.extended.skills.scan_dirs.clear();
         d.handle_key(press(KeyCode::Char('a')));
-        match &d.page {
-            Page::Skills(p) => assert!(p.grabbed.is_some(), "expected a grabbed new row"),
+        match d.test_page() {
+            TestPageRef::Skills(p) => assert!(p.grabbed.is_some(), "expected a grabbed new row"),
             other => panic!("expected Skills page, got {other:?}"),
         }
         for ch in "~/skills".chars() {
@@ -493,12 +479,12 @@ mod tests {
         assert_eq!(reloaded.skills.scan_dirs, vec!["~/skills".to_string()]);
 
         // Delete it: cursor is on the entry (first dir row = TOGGLE_ROWS).
-        d.page = Page::Skills(SkillsPage {
+        d.set_test_page(Page::Skills(SkillsPage {
             cursor: TOGGLE_ROWS,
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d.handle_key(press(KeyCode::Char('d')));
         assert!(d.extended.skills.scan_dirs.is_empty());
         let reloaded2 = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
@@ -512,8 +498,8 @@ mod tests {
         d.extended.skills.scan_dirs.clear();
         d.handle_key(press(KeyCode::Char('a')));
         d.handle_key(press(KeyCode::Esc));
-        match &d.page {
-            Page::Skills(p) => assert!(p.grabbed.is_none()),
+        match d.test_page() {
+            TestPageRef::Skills(p) => assert!(p.grabbed.is_none()),
             other => panic!("expected Skills page, got {other:?}"),
         }
         assert!(
@@ -527,12 +513,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_skills_dialog(&tmp);
         d.extended.skills.scan_dirs = vec!["orig".into()];
-        d.page = Page::Skills(SkillsPage {
+        d.set_test_page(Page::Skills(SkillsPage {
             cursor: TOGGLE_ROWS, // first dir row
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
-        });
+        }));
         d.handle_key(press(KeyCode::Enter)); // grab existing
         for ch in "XYZ".chars() {
             d.handle_key(KeyEvent {
@@ -566,7 +552,7 @@ mod tests {
     /// scan-dir count.
     fn put_on_reset_row(d: &mut SettingsDialog) {
         let reset_cursor = TOGGLE_ROWS + d.extended.skills.scan_dirs.len() + 1;
-        if let Page::Skills(p) = &mut d.page {
+        if let TestPageMut::Skills(p) = d.test_page_mut() {
             p.cursor = reset_cursor;
         } else {
             panic!("expected Skills page");
@@ -587,8 +573,8 @@ mod tests {
 
         // First activation arms only.
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Skills(p) => assert!(p.reset.is_pending(), "first activation arms"),
+        match d.test_page() {
+            TestPageRef::Skills(p) => assert!(p.reset.is_pending(), "first activation arms"),
             other => panic!("expected Skills, got {other:?}"),
         }
         assert_eq!(
@@ -599,8 +585,8 @@ mod tests {
 
         // Second activation applies + saves.
         d.handle_key(press(KeyCode::Enter));
-        match &d.page {
-            Page::Skills(p) => assert!(!p.reset.is_pending(), "applying disarms"),
+        match d.test_page() {
+            TestPageRef::Skills(p) => assert!(!p.reset.is_pending(), "applying disarms"),
             other => panic!("expected Skills, got {other:?}"),
         }
         let want = SkillsConfig::seeded_default();
@@ -622,14 +608,47 @@ mod tests {
         let mut d = fresh_skills_dialog(&tmp);
         put_on_reset_row(&mut d);
         d.handle_key(press(KeyCode::Enter)); // arm
-        match &d.page {
-            Page::Skills(p) => assert!(p.reset.is_pending()),
+        match d.test_page() {
+            TestPageRef::Skills(p) => assert!(p.reset.is_pending()),
             other => panic!("expected Skills, got {other:?}"),
         }
         d.handle_key(press(KeyCode::Up)); // navigate away
-        match &d.page {
-            Page::Skills(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
+        match d.test_page() {
+            TestPageRef::Skills(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
             other => panic!("expected Skills, got {other:?}"),
         }
+    }
+}
+
+impl SettingsPage for SkillsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_skills_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_skills_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!("{} › Skills", crate::welcome::display_path(&cx.config_path))
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.grabbed.is_some() {
+            "type to edit dir  enter: save  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir  d: delete  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Skills"
     }
 }

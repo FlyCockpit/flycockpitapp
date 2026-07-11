@@ -45,7 +45,9 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
 use super::shell::selected_line_from_marker;
-use super::{Nav, Page, RowDeleteConfirm, SettingsDialog, save_button_line};
+use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
+#[cfg(test)]
+use super::{Page, TestPageRef};
 
 /// One selectable action on the Edit-provider menu. The menu is built
 /// dynamically (see [`edit_menu_actions`]) so render and key handling
@@ -1563,15 +1565,16 @@ impl SettingsDialog {
             let stored = self.config.on_unlisted_models_fetch;
             if matches!(stored, None | Some(OnUnlistedModelsFetch::Ask)) && !unlisted.is_empty() {
                 self.clear_fetch_handle(provider_id);
-                self.page = Page::Providers(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
-                    provider_id: provider_id.to_string(),
-                    remote: models,
-                    catalog,
-                    pre_fetch_models,
-                    unlisted,
-                    cursor: 0,
-                    dont_ask_again: false,
-                }));
+                self.page =
+                    super::providers_page(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
+                        provider_id: provider_id.to_string(),
+                        remote: models,
+                        catalog,
+                        pre_fetch_models,
+                        unlisted,
+                        cursor: 0,
+                        dont_ask_again: false,
+                    }));
                 return;
             }
             let policy = match stored.unwrap_or(OnUnlistedModelsFetch::Keep) {
@@ -1604,7 +1607,7 @@ impl SettingsDialog {
         {
             if self.config.providers.contains_key(provider_id) {
                 self.clear_fetch_handle(provider_id);
-                self.page = Page::Providers(ProvidersPage::FetchFallbackPrompt(
+                self.page = super::providers_page(ProvidersPage::FetchFallbackPrompt(
                     FetchFallbackPromptState {
                         provider_id: provider_id.to_string(),
                         models,
@@ -1638,67 +1641,67 @@ impl SettingsDialog {
             }
         }
 
-        match &mut self.page {
-            Page::Providers(ProvidersPage::Add(s)) => {
-                s.error = Some(message);
-                s.fetch = None;
-                s.step = AddStep::Done;
-            }
-            Page::Providers(ProvidersPage::Edit(s)) => {
-                s.status = Some(message);
-                s.fetch = None;
-                // Refresh only the fetch-owned fields; keep staged edits on
-                // the live EditState intact.
-                if let Some(entry) = self.config.providers.get(provider_id) {
-                    s.entry.models = entry.models.clone();
-                    s.entry.models_fetched_at = entry.models_fetched_at;
-                    s.entry.model_catalog = entry.model_catalog;
+        let refreshed = self.config.providers.get(provider_id).map(|entry| {
+            (
+                entry.models.clone(),
+                entry.models_fetched_at,
+                entry.model_catalog,
+            )
+        });
+        if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
+            match page {
+                ProvidersPage::Add(s) => {
+                    s.error = Some(message);
+                    s.fetch = None;
+                    s.step = AddStep::Done;
                 }
-            }
-            Page::Providers(ProvidersPage::Headers { parent, .. }) => {
-                parent.status = Some(message);
-                parent.fetch = None;
-                // Don't clobber the in-flight header edits — only
-                // refresh non-header fields from the saved entry.
-                if let Some(entry) = self.config.providers.get(provider_id) {
-                    parent.entry.models = entry.models.clone();
-                    parent.entry.models_fetched_at = entry.models_fetched_at;
-                    parent.entry.model_catalog = entry.model_catalog;
+                ProvidersPage::Edit(s) => {
+                    s.status = Some(message);
+                    s.fetch = None;
+                    if let Some((models, fetched_at, catalog)) = &refreshed {
+                        s.entry.models = models.clone();
+                        s.entry.models_fetched_at = *fetched_at;
+                        s.entry.model_catalog = *catalog;
+                    }
                 }
+                ProvidersPage::Headers { parent, .. } => {
+                    parent.status = Some(message);
+                    parent.fetch = None;
+                    if let Some((models, fetched_at, catalog)) = &refreshed {
+                        parent.entry.models = models.clone();
+                        parent.entry.models_fetched_at = *fetched_at;
+                        parent.entry.model_catalog = *catalog;
+                    }
+                }
+                ProvidersPage::Models { parent, .. } => {
+                    parent.status = Some(message);
+                    parent.fetch = None;
+                }
+                ProvidersPage::ModelSettings { parent, .. }
+                | ProvidersPage::ProviderSettings { parent, .. } => {
+                    parent.status = Some(message);
+                    parent.fetch = None;
+                }
+                _ => {}
             }
-            Page::Providers(ProvidersPage::Models { parent, .. }) => {
-                // A refetch finished while the user is managing the model
-                // list. The model editor owns the live (unsaved) rows, so
-                // we don't touch them here — just record the outcome on
-                // the parent so it surfaces when they return to Edit.
-                parent.status = Some(message);
-                parent.fetch = None;
-            }
-            Page::Providers(ProvidersPage::ModelSettings { parent, .. })
-            | Page::Providers(ProvidersPage::ProviderSettings { parent, .. }) => {
-                // Same as Models: the settings editors own their live state,
-                // so just clear the in-flight handle and record the outcome.
-                parent.status = Some(message);
-                parent.fetch = None;
-            }
-            _ => {}
         }
     }
 
     fn clear_fetch_handle(&mut self, provider_id: &str) {
-        match &mut self.page {
-            Page::Providers(ProvidersPage::Add(s))
-                if s.saved_provider_id.as_deref() == Some(provider_id) =>
-            {
+        let Some(page) = self.page.downcast_mut::<ProvidersPage>() else {
+            return;
+        };
+        match page {
+            ProvidersPage::Add(s) if s.saved_provider_id.as_deref() == Some(provider_id) => {
                 s.fetch = None;
             }
-            Page::Providers(ProvidersPage::Edit(s)) if s.provider_id == provider_id => {
+            ProvidersPage::Edit(s) if s.provider_id == provider_id => {
                 s.fetch = None;
             }
-            Page::Providers(ProvidersPage::Headers { parent, .. })
-            | Page::Providers(ProvidersPage::Models { parent, .. })
-            | Page::Providers(ProvidersPage::ModelSettings { parent, .. })
-            | Page::Providers(ProvidersPage::ProviderSettings { parent, .. })
+            ProvidersPage::Headers { parent, .. }
+            | ProvidersPage::Models { parent, .. }
+            | ProvidersPage::ModelSettings { parent, .. }
+            | ProvidersPage::ProviderSettings { parent, .. }
                 if parent.provider_id == provider_id =>
             {
                 parent.fetch = None;
@@ -1716,7 +1719,7 @@ impl SettingsDialog {
     /// A per-provider failure is just an `Err` summary — it never aborts
     /// the others.
     pub(super) fn drain_fetch_all(&mut self) {
-        let Page::Providers(ProvidersPage::FetchAll(s)) = &mut self.page else {
+        let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
             return;
         };
         if s.in_flight.is_empty() {
@@ -1726,8 +1729,6 @@ impl SettingsDialog {
             return;
         }
 
-        // Collect the results of any handles that have completed, leaving
-        // the still-running ones in place.
         let mut newly_done: Vec<FetchedSummary> = Vec::new();
         s.in_flight.retain(|handle| match handle.take() {
             Some(outcome) => {
@@ -1744,56 +1745,54 @@ impl SettingsDialog {
         }
 
         let all_done = {
-            let Page::Providers(ProvidersPage::FetchAll(s)) = &mut self.page else {
+            let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
                 return;
             };
             s.finished.extend(newly_done);
             s.in_flight.is_empty()
         };
 
-        // Once every provider has reported, aggregate the set of
-        // configured-but-unlisted models for the Keep/Remove prompt.
-        // Done as a free function so it doesn't hold `self.page` and
-        // `self.config` borrowed at once.
         if all_done {
             self.finish_fetch_all_if_ready();
         }
     }
 
     fn finish_fetch_all_if_ready(&mut self) {
-        let Page::Providers(ProvidersPage::FetchAll(_)) = &self.page else {
+        if !matches!(
+            self.page.downcast_ref::<ProvidersPage>(),
+            Some(ProvidersPage::FetchAll(_))
+        ) {
             return;
+        }
+        let unlisted = compute_unlisted(self);
+        let degraded = fetch_all_degraded_statuses(self);
+        let auto_policy = match self.config.on_unlisted_models_fetch {
+            Some(OnUnlistedModelsFetch::Keep) => Some(ModelMergePolicy::KeepUnlisted),
+            Some(OnUnlistedModelsFetch::Remove) => Some(ModelMergePolicy::RemoveUnlisted),
+            Some(OnUnlistedModelsFetch::Ask) | None if unlisted.is_empty() => {
+                Some(ModelMergePolicy::KeepUnlisted)
+            }
+            Some(OnUnlistedModelsFetch::Ask) | None => None,
         };
-        {
-            let unlisted = compute_unlisted(self);
-            let degraded = fetch_all_degraded_statuses(self);
-            let auto_policy = match self.config.on_unlisted_models_fetch {
-                Some(OnUnlistedModelsFetch::Keep) => Some(ModelMergePolicy::KeepUnlisted),
-                Some(OnUnlistedModelsFetch::Remove) => Some(ModelMergePolicy::RemoveUnlisted),
-                Some(OnUnlistedModelsFetch::Ask) | None if unlisted.is_empty() => {
-                    Some(ModelMergePolicy::KeepUnlisted)
-                }
-                Some(OnUnlistedModelsFetch::Ask) | None => None,
+        if let Some(policy) = auto_policy {
+            let merges = {
+                let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_ref::<ProvidersPage>()
+                else {
+                    return;
+                };
+                fetch_all_merges(s)
             };
-            if let Some(policy) = auto_policy {
-                let merges = {
-                    let Page::Providers(ProvidersPage::FetchAll(s)) = &self.page else {
-                        return;
-                    };
-                    fetch_all_merges(s)
-                };
-                self.apply_fetch_all_policy(merges, policy);
-            }
-            self.apply_fetch_all_degraded_statuses(degraded);
-            let _ = self.save_config();
-            if let Page::Providers(ProvidersPage::FetchAll(s)) = &mut self.page {
-                s.unlisted = if auto_policy.is_some() {
-                    Vec::new()
-                } else {
-                    unlisted
-                };
-                s.policy_resolved = true;
-            }
+            self.apply_fetch_all_policy(merges, policy);
+        }
+        self.apply_fetch_all_degraded_statuses(degraded);
+        let _ = self.save_config();
+        if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
+            s.unlisted = if auto_policy.is_some() {
+                Vec::new()
+            } else {
+                unlisted
+            };
+            s.policy_resolved = true;
         }
     }
 
@@ -1835,24 +1834,32 @@ impl SettingsDialog {
             }
         }
     }
+}
 
-    pub(super) fn handle_providers_key(&mut self, key: KeyEvent) -> bool {
-        // Detach the providers page so its `&mut SubState` doesn't alias
-        // `&mut self`. Inner handlers communicate navigation via the
-        // returned [`Nav`] rather than writing `self.page`, because the
-        // swap-back below would otherwise discard those writes.
-        let placeholder = Page::Providers(ProvidersPage::List {
-            cursor: initial_list_cursor(&self.config),
-            status: None,
-            delete_pending: false,
-        });
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::Providers(p) = &mut page {
-            self.handle_providers_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
+impl SettingsCx {
+    fn apply_fetch_all_policy(
+        &mut self,
+        merges: Vec<(
+            String,
+            Vec<ModelEntry>,
+            Vec<ModelEntry>,
+            ProviderModelCatalog,
+        )>,
+        policy: ModelMergePolicy,
+    ) {
+        for (provider_id, pre_fetch_models, remote, catalog) in merges {
+            if let Some(entry) = self.config.providers.get_mut(&provider_id) {
+                entry.models = merge_fetched_models_with_policy(
+                    entry.effective_template(&provider_id),
+                    &pre_fetch_models,
+                    remote,
+                    policy,
+                );
+                entry.models_fetched_at = Some(Utc::now());
+                entry.model_catalog = catalog;
+                entry.mark_model_fetch_success(catalog);
+            }
+        }
     }
 
     fn handle_providers_page_key(&mut self, key: KeyEvent, page: &mut ProvidersPage) -> Nav {
@@ -1881,7 +1888,9 @@ impl SettingsDialog {
                         *cursor = crate::tui::nav::wrap_next(*cursor, row_count);
                     }
                     KeyCode::Char('a') => {
-                        return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
+                        return Nav::Replace(super::providers_page(ProvidersPage::Add(
+                            AddState::new(),
+                        )));
                     }
                     // `R` triggers the all-providers refetch from anywhere
                     // on the list; Enter on the button row does the same.
@@ -1911,7 +1920,7 @@ impl SettingsDialog {
                             && let Some(id) = ids.get(idx).cloned()
                             && let Some(entry) = self.config.providers.get(&id)
                         {
-                            return Nav::Replace(Page::Providers(ProvidersPage::Edit(
+                            return Nav::Replace(super::providers_page(ProvidersPage::Edit(
                                 EditState::new(id, entry.clone()),
                             )));
                         }
@@ -1935,7 +1944,7 @@ impl SettingsDialog {
                                 } else {
                                     (*cursor).min(new_len)
                                 };
-                                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                                return Nav::Replace(super::providers_page(ProvidersPage::List {
                                     cursor: new_cursor,
                                     status: Some(msg),
                                     delete_pending: false,
@@ -1988,7 +1997,7 @@ impl SettingsDialog {
                         parent,
                         Box::new(EditState::new(String::new(), ProviderEntry::default())),
                     );
-                    Nav::Replace(Page::Providers(ProvidersPage::Edit(*owned)))
+                    Nav::Replace(super::providers_page(ProvidersPage::Edit(*owned)))
                 } else {
                     Nav::Stay
                 }
@@ -2001,7 +2010,7 @@ impl SettingsDialog {
                         parent,
                         Box::new(EditState::new(String::new(), ProviderEntry::default())),
                     );
-                    Nav::Replace(Page::Providers(ProvidersPage::Edit(*owned)))
+                    Nav::Replace(super::providers_page(ProvidersPage::Edit(*owned)))
                 } else {
                     Nav::Stay
                 }
@@ -2046,7 +2055,7 @@ impl SettingsDialog {
                 AddStep::GrokOAuthAuth(_) | AddStep::CodexOAuthAuth(_)
             )
         {
-            return Nav::Replace(Page::Providers(ProvidersPage::List {
+            return Nav::Replace(super::providers_page(ProvidersPage::List {
                 cursor: initial_list_cursor(&self.config),
                 status: None,
                 delete_pending: false,
@@ -2245,7 +2254,7 @@ impl SettingsDialog {
             }
             AddStep::Done => {
                 if matches!(key.code, KeyCode::Enter) {
-                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                    return Nav::Replace(super::providers_page(ProvidersPage::List {
                         cursor: initial_list_cursor(&self.config),
                         status: s.error.clone(),
                         delete_pending: false,
@@ -2315,7 +2324,7 @@ impl SettingsDialog {
             }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                 let status = self.commit_edit_entry(s);
-                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
                     cursor: initial_list_cursor(&self.config),
                     status,
                     delete_pending: false,
@@ -2364,7 +2373,7 @@ impl SettingsDialog {
                         Ok(()) => format!("deleted `{}`", s.provider_id),
                         Err(e) => format!("delete failed: {e}"),
                     };
-                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                    return Nav::Replace(super::providers_page(ProvidersPage::List {
                         cursor: initial_list_cursor(&self.config),
                         status: Some(msg),
                         delete_pending: false,
@@ -2393,7 +2402,7 @@ impl SettingsDialog {
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
                         );
-                        return Nav::Replace(Page::Providers(ProvidersPage::Headers {
+                        return Nav::Replace(super::providers_page(ProvidersPage::Headers {
                             editor,
                             parent: Box::new(owned),
                         }));
@@ -2408,7 +2417,7 @@ impl SettingsDialog {
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
                         );
-                        return Nav::Replace(Page::Providers(ProvidersPage::CopilotSetup {
+                        return Nav::Replace(super::providers_page(ProvidersPage::CopilotSetup {
                             state,
                             parent: Box::new(owned),
                         }));
@@ -2419,10 +2428,12 @@ impl SettingsDialog {
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
                         );
-                        return Nav::Replace(Page::Providers(ProvidersPage::GrokOAuthSetup {
-                            state,
-                            parent: Box::new(owned),
-                        }));
+                        return Nav::Replace(super::providers_page(
+                            ProvidersPage::GrokOAuthSetup {
+                                state,
+                                parent: Box::new(owned),
+                            },
+                        ));
                     }
                     Some(EditAction::CodexOAuthAuth) => {
                         let state = Box::new(CodexOAuthSetupState::new());
@@ -2430,10 +2441,12 @@ impl SettingsDialog {
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
                         );
-                        return Nav::Replace(Page::Providers(ProvidersPage::CodexOAuthSetup {
-                            state,
-                            parent: Box::new(owned),
-                        }));
+                        return Nav::Replace(super::providers_page(
+                            ProvidersPage::CodexOAuthSetup {
+                                state,
+                                parent: Box::new(owned),
+                            },
+                        ));
                     }
                     Some(EditAction::Models) => {
                         // Hand off to the Models sub-page, moving the
@@ -2449,7 +2462,7 @@ impl SettingsDialog {
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
                         );
-                        return Nav::Replace(Page::Providers(ProvidersPage::Models {
+                        return Nav::Replace(super::providers_page(ProvidersPage::Models {
                             editor,
                             parent: Box::new(owned),
                         }));
@@ -2464,10 +2477,12 @@ impl SettingsDialog {
                             s,
                             EditState::new(String::new(), ProviderEntry::default()),
                         );
-                        return Nav::Replace(Page::Providers(ProvidersPage::ProviderSettings {
-                            editor: settings,
-                            parent: Box::new(owned),
-                        }));
+                        return Nav::Replace(super::providers_page(
+                            ProvidersPage::ProviderSettings {
+                                editor: settings,
+                                parent: Box::new(owned),
+                            },
+                        ));
                     }
                     Some(EditAction::Favorite) => {
                         let new = !s.entry.favorite.unwrap_or(false);
@@ -2502,7 +2517,7 @@ impl SettingsDialog {
                                 Ok(()) => format!("deleted `{}`", s.provider_id),
                                 Err(e) => format!("delete failed: {e}"),
                             };
-                            return Nav::Replace(Page::Providers(ProvidersPage::List {
+                            return Nav::Replace(super::providers_page(ProvidersPage::List {
                                 cursor: initial_list_cursor(&self.config),
                                 status: Some(msg),
                                 delete_pending: false,
@@ -2520,7 +2535,7 @@ impl SettingsDialog {
                     Some(EditAction::Back) => {
                         // Back to list — auto-commit so nothing is lost.
                         let status = self.commit_edit_entry(s);
-                        return Nav::Replace(Page::Providers(ProvidersPage::List {
+                        return Nav::Replace(super::providers_page(ProvidersPage::List {
                             cursor: initial_list_cursor(&self.config),
                             status,
                             delete_pending: false,
@@ -2573,7 +2588,7 @@ impl SettingsDialog {
                 owned.entry.headers = rows;
                 owned.cursor = 1;
                 owned.status = self.commit_edit_entry(&owned);
-                Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+                Nav::Replace(super::providers_page(ProvidersPage::Edit(owned)))
             }
         }
     }
@@ -2615,7 +2630,7 @@ impl SettingsDialog {
                 // auto-commits so the model edits are never lost.
                 owned.cursor = 2;
                 owned.status = self.commit_edit_entry(&owned);
-                Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+                Nav::Replace(super::providers_page(ProvidersPage::Edit(owned)))
             }
             ModelResult::OpenSettings(idx) => {
                 let Some(model_id) = editor.rows.get(idx).map(|m| m.id.clone()) else {
@@ -2638,7 +2653,7 @@ impl SettingsDialog {
                     parent.as_mut(),
                     EditState::new(String::new(), ProviderEntry::default()),
                 );
-                Nav::Replace(Page::Providers(ProvidersPage::ModelSettings {
+                Nav::Replace(super::providers_page(ProvidersPage::ModelSettings {
                     editor: settings,
                     models,
                     parent: Box::new(owned),
@@ -2703,7 +2718,7 @@ impl SettingsDialog {
                         .map(str::to_owned),
                     tmp.models,
                 ));
-                Nav::Replace(Page::Providers(ProvidersPage::Models {
+                Nav::Replace(super::providers_page(ProvidersPage::Models {
                     editor: new_models,
                     parent: Box::new(owned),
                 }))
@@ -2745,7 +2760,7 @@ impl SettingsDialog {
                 // Persist immediately on leaving the dialog
                 // (implementation note).
                 owned.status = self.commit_edit_entry(&owned);
-                Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+                Nav::Replace(super::providers_page(ProvidersPage::Edit(owned)))
             }
         }
     }
@@ -2757,14 +2772,14 @@ impl SettingsDialog {
     /// only entry point is the List page and entering replaces it.
     fn start_fetch_all(&mut self) -> Nav {
         if self.config.providers.is_empty() {
-            return Nav::Replace(Page::Providers(ProvidersPage::List {
+            return Nav::Replace(super::providers_page(ProvidersPage::List {
                 cursor: 0,
                 status: Some("no providers configured".into()),
                 delete_pending: false,
             }));
         }
         let state = FetchAllState::spawn(&self.config);
-        Nav::Replace(Page::Providers(ProvidersPage::FetchAll(state)))
+        Nav::Replace(super::providers_page(ProvidersPage::FetchAll(state)))
     }
 
     fn handle_fetch_all_key(&mut self, key: KeyEvent, s: &mut FetchAllState) -> Nav {
@@ -2777,7 +2792,7 @@ impl SettingsDialog {
                 return Nav::Close;
             }
             if matches!(key.code, KeyCode::Esc) {
-                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
                     cursor: initial_list_cursor(&self.config),
                     status: Some("refetch-all cancelled".into()),
                     delete_pending: false,
@@ -2790,7 +2805,7 @@ impl SettingsDialog {
         // list, there's nothing to rule on — any key returns to the list
         // with a per-provider summary.
         if s.unlisted.is_empty() {
-            return Nav::Replace(Page::Providers(ProvidersPage::List {
+            return Nav::Replace(super::providers_page(ProvidersPage::List {
                 cursor: initial_list_cursor(&self.config),
                 status: Some(fetch_all_summary(s)),
                 delete_pending: false,
@@ -2800,7 +2815,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc => {
-                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
                     cursor: initial_list_cursor(&self.config),
                     status: Some("refetch-all cancelled".into()),
                     delete_pending: false,
@@ -2837,7 +2852,7 @@ impl SettingsDialog {
                     Ok(()) => summary,
                     Err(e) => format!("save failed: {e}"),
                 };
-                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
                     cursor: initial_list_cursor(&self.config),
                     status: Some(status),
                     delete_pending: false,
@@ -2852,7 +2867,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc => {
-                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
                     cursor: initial_list_cursor(&self.config),
                     status: Some("refetch cancelled".into()),
                     delete_pending: false,
@@ -2911,7 +2926,7 @@ impl SettingsDialog {
                     .unwrap_or_default();
                 let mut edit = EditState::new(s.provider_id.clone(), entry);
                 edit.status = Some(status);
-                return Nav::Replace(Page::Providers(ProvidersPage::Edit(edit)));
+                return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
             }
             _ => {}
         }
@@ -2926,7 +2941,7 @@ impl SettingsDialog {
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc => {
-                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
                     cursor: initial_list_cursor(&self.config),
                     status: Some("refetch cancelled".into()),
                     delete_pending: false,
@@ -2941,7 +2956,7 @@ impl SettingsDialog {
             KeyCode::Enter => match s.cursor {
                 0 => {
                     let Some(entry) = self.config.providers.get(&s.provider_id).cloned() else {
-                        return Nav::Replace(Page::Providers(ProvidersPage::List {
+                        return Nav::Replace(super::providers_page(ProvidersPage::List {
                             cursor: initial_list_cursor(&self.config),
                             status: Some("provider no longer exists".into()),
                             delete_pending: false,
@@ -2950,7 +2965,7 @@ impl SettingsDialog {
                     let mut edit = EditState::new(s.provider_id.clone(), entry.clone());
                     edit.status = Some("retrying live model fetch...".into());
                     edit.fetch = Some(FetchHandle::spawn(s.provider_id.clone(), entry));
-                    return Nav::Replace(Page::Providers(ProvidersPage::Edit(edit)));
+                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
                 }
                 1 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
@@ -2968,7 +2983,7 @@ impl SettingsDialog {
                         .unwrap_or_default();
                     let mut edit = EditState::new(s.provider_id.clone(), entry);
                     edit.status = Some(status);
-                    return Nav::Replace(Page::Providers(ProvidersPage::Edit(edit)));
+                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
                 }
                 2 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
@@ -3000,10 +3015,10 @@ impl SettingsDialog {
                         .unwrap_or_default();
                     let mut edit = EditState::new(s.provider_id.clone(), entry);
                     edit.status = Some(status);
-                    return Nav::Replace(Page::Providers(ProvidersPage::Edit(edit)));
+                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
                 }
                 _ => {
-                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                    return Nav::Replace(super::providers_page(ProvidersPage::List {
                         cursor: initial_list_cursor(&self.config),
                         status: Some("refetch cancelled".into()),
                         delete_pending: false,
@@ -3038,7 +3053,7 @@ impl SettingsDialog {
             if let Some(status) = status {
                 owned.status = Some(status);
             }
-            Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+            Nav::Replace(super::providers_page(ProvidersPage::Edit(owned)))
         };
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
@@ -3079,7 +3094,7 @@ impl SettingsDialog {
 
 // ── Rendering ────────────────────────────────────────────────────────────
 
-impl SettingsDialog {
+impl SettingsCx {
     pub(super) fn render_providers_page(
         &self,
         frame: &mut Frame,
@@ -4949,7 +4964,7 @@ fn fetch_all_merges(
 }
 
 fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDegradedStatus)> {
-    let Page::Providers(ProvidersPage::FetchAll(s)) = &dialog.page else {
+    let Some(ProvidersPage::FetchAll(s)) = dialog.page.downcast_ref::<ProvidersPage>() else {
         return Vec::new();
     };
     s.finished
@@ -4976,7 +4991,7 @@ fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDeg
 /// absent from the freshly-fetched upstream list, across every provider
 /// that reported a successful `Models` outcome in the active FetchAll.
 fn compute_unlisted(dialog: &SettingsDialog) -> Vec<(String, String)> {
-    let Page::Providers(ProvidersPage::FetchAll(s)) = &dialog.page else {
+    let Some(ProvidersPage::FetchAll(s)) = dialog.page.downcast_ref::<ProvidersPage>() else {
         return Vec::new();
     };
     let mut unlisted: Vec<(String, String)> = Vec::new();
@@ -5137,6 +5152,14 @@ mod tests {
         ConfigDoc::load(path).unwrap().providers().providers[id].clone()
     }
 
+    fn replaced_provider(nav: &Nav) -> &ProvidersPage {
+        let Nav::Replace(page) = nav else {
+            panic!("expected replace nav");
+        };
+        page.downcast_ref::<ProvidersPage>()
+            .expect("expected providers page replacement")
+    }
+
     fn one_provider_config(policy: Option<OnUnlistedModelsFetch>) -> ProvidersConfig {
         let mut providers = BTreeMap::new();
         providers.insert(
@@ -5174,7 +5197,10 @@ mod tests {
         );
         let (_tmp, mut dialog) = dialog_with_config(cfg);
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
         let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
         dialog.apply_fetch_result(
@@ -5182,8 +5208,8 @@ mod tests {
             Err(format!("fetch failed with Authorization: Bearer {secret}")),
         );
 
-        let status = match &dialog.page {
-            Page::Providers(ProvidersPage::Edit(s)) => s.status.as_deref().unwrap_or(""),
+        let status = match dialog.test_page() {
+            TestPageRef::Providers(ProvidersPage::Edit(s)) => s.status.as_deref().unwrap_or(""),
             other => panic!("expected Edit page, got {other:?}"),
         };
         assert!(!status.contains(secret), "status leaked secret: {status}");
@@ -5474,7 +5500,7 @@ mod tests {
             on_unlisted_models_fetch: Some(OnUnlistedModelsFetch::Ask),
             ..Default::default()
         });
-        dialog.page = Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
             providers: vec!["p".to_string()],
             in_flight: Vec::new(),
             finished: vec![FetchedSummary {
@@ -5498,18 +5524,19 @@ mod tests {
             cursor: 1,
             dont_ask_again: false,
             unlisted: vec![("p".to_string(), "stale".to_string())],
-        }));
+        })));
 
-        let mut page = std::mem::replace(&mut dialog.page, Page::Root { cursor: 0 });
-        if let Page::Providers(ProvidersPage::FetchAll(state)) = &mut page {
-            let nav = dialog.handle_fetch_all_key(press(KeyCode::Enter), state);
-            assert!(matches!(
-                nav,
-                Nav::Replace(Page::Providers(ProvidersPage::List { .. }))
-            ));
-        } else {
-            panic!("expected fetch-all page");
-        }
+        let nav = {
+            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
+            let Some(ProvidersPage::FetchAll(state)) = page.downcast_mut::<ProvidersPage>() else {
+                panic!("expected fetch-all page");
+            };
+            cx.handle_fetch_all_key(press(KeyCode::Enter), state)
+        };
+        assert!(matches!(
+            replaced_provider(&nav),
+            ProvidersPage::List { .. }
+        ));
 
         let ids: Vec<&str> = dialog.config.providers["p"]
             .models
@@ -5523,7 +5550,7 @@ mod tests {
     fn fetch_all_stored_remove_applies_without_prompt() {
         let (_, mut dialog) =
             dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Remove)));
-        dialog.page = Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
             providers: vec!["p".to_string()],
             in_flight: Vec::new(),
             finished: vec![FetchedSummary {
@@ -5543,12 +5570,12 @@ mod tests {
             cursor: 0,
             dont_ask_again: false,
             unlisted: Vec::new(),
-        }));
+        })));
 
         dialog.drain_fetch_all();
 
-        let state = match &dialog.page {
-            Page::Providers(ProvidersPage::FetchAll(s)) => s,
+        let state = match dialog.test_page() {
+            TestPageRef::Providers(ProvidersPage::FetchAll(s)) => s,
             _ => panic!("expected fetch-all page"),
         };
         assert!(state.unlisted.is_empty());
@@ -5564,7 +5591,7 @@ mod tests {
     fn fetch_all_stored_keep_applies_without_prompt() {
         let (_, mut dialog) =
             dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        dialog.page = Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
             providers: vec!["p".to_string()],
             in_flight: Vec::new(),
             finished: vec![FetchedSummary {
@@ -5584,7 +5611,7 @@ mod tests {
             cursor: 0,
             dont_ask_again: false,
             unlisted: Vec::new(),
-        }));
+        })));
 
         dialog.drain_fetch_all();
 
@@ -5599,26 +5626,27 @@ mod tests {
     #[test]
     fn per_provider_refetch_prompt_remove_returns_to_edit_page() {
         let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        dialog.page = Page::Providers(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
-            provider_id: "p".to_string(),
-            remote: vec![model("current", false)],
-            catalog: ProviderModelCatalog::Live,
-            pre_fetch_models: vec![model("stale", false), model("current", false)],
-            unlisted: vec!["stale".to_string()],
-            cursor: 1,
-            dont_ask_again: false,
-        }));
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchOnePrompt(
+            FetchOnePromptState {
+                provider_id: "p".to_string(),
+                remote: vec![model("current", false)],
+                catalog: ProviderModelCatalog::Live,
+                pre_fetch_models: vec![model("stale", false), model("current", false)],
+                unlisted: vec!["stale".to_string()],
+                cursor: 1,
+                dont_ask_again: false,
+            },
+        )));
 
-        let mut page = std::mem::replace(&mut dialog.page, Page::Root { cursor: 0 });
-        if let Page::Providers(ProvidersPage::FetchOnePrompt(state)) = &mut page {
-            let nav = dialog.handle_fetch_one_prompt_key(press(KeyCode::Enter), state);
-            assert!(matches!(
-                nav,
-                Nav::Replace(Page::Providers(ProvidersPage::Edit(_)))
-            ));
-        } else {
-            panic!("expected per-provider prompt page");
-        }
+        let nav = {
+            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
+            let Some(ProvidersPage::FetchOnePrompt(state)) = page.downcast_mut::<ProvidersPage>()
+            else {
+                panic!("expected per-provider prompt page");
+            };
+            cx.handle_fetch_one_prompt_key(press(KeyCode::Enter), state)
+        };
+        assert!(matches!(replaced_provider(&nav), ProvidersPage::Edit(_)));
 
         let ids: Vec<&str> = dialog.config.providers["p"]
             .models
@@ -5631,26 +5659,30 @@ mod tests {
     #[test]
     fn fetch_one_prompt_save_failure_surfaces() {
         let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        dialog.page = Page::Providers(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
-            provider_id: "p".to_string(),
-            remote: vec![model("current", false)],
-            catalog: ProviderModelCatalog::Live,
-            pre_fetch_models: vec![model("stale", false), model("current", false)],
-            unlisted: vec!["stale".to_string()],
-            cursor: 0,
-            dont_ask_again: false,
-        }));
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchOnePrompt(
+            FetchOnePromptState {
+                provider_id: "p".to_string(),
+                remote: vec![model("current", false)],
+                catalog: ProviderModelCatalog::Live,
+                pre_fetch_models: vec![model("stale", false), model("current", false)],
+                unlisted: vec!["stale".to_string()],
+                cursor: 0,
+                dont_ask_again: false,
+            },
+        )));
         break_config_saving(&dialog);
 
-        let mut page = std::mem::replace(&mut dialog.page, Page::Root { cursor: 0 });
-        let nav = if let Page::Providers(ProvidersPage::FetchOnePrompt(state)) = &mut page {
-            dialog.handle_fetch_one_prompt_key(press(KeyCode::Enter), state)
-        } else {
-            panic!("expected per-provider prompt page");
+        let nav = {
+            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
+            let Some(ProvidersPage::FetchOnePrompt(state)) = page.downcast_mut::<ProvidersPage>()
+            else {
+                panic!("expected per-provider prompt page");
+            };
+            cx.handle_fetch_one_prompt_key(press(KeyCode::Enter), state)
         };
 
-        match nav {
-            Nav::Replace(Page::Providers(ProvidersPage::Edit(edit))) => {
+        match replaced_provider(&nav) {
+            ProvidersPage::Edit(edit) => {
                 assert!(
                     edit.status
                         .as_deref()
@@ -5666,7 +5698,7 @@ mod tests {
     #[test]
     fn fetch_all_save_failure_surfaces() {
         let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        dialog.page = Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
             providers: vec!["p".to_string()],
             in_flight: Vec::new(),
             finished: vec![FetchedSummary {
@@ -5686,18 +5718,19 @@ mod tests {
             cursor: 0,
             dont_ask_again: false,
             unlisted: vec![("p".to_string(), "stale".to_string())],
-        }));
+        })));
         break_config_saving(&dialog);
 
-        let mut page = std::mem::replace(&mut dialog.page, Page::Root { cursor: 0 });
-        let nav = if let Page::Providers(ProvidersPage::FetchAll(state)) = &mut page {
-            dialog.handle_fetch_all_key(press(KeyCode::Enter), state)
-        } else {
-            panic!("expected fetch-all page");
+        let nav = {
+            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
+            let Some(ProvidersPage::FetchAll(state)) = page.downcast_mut::<ProvidersPage>() else {
+                panic!("expected fetch-all page");
+            };
+            cx.handle_fetch_all_key(press(KeyCode::Enter), state)
         };
 
-        match nav {
-            Nav::Replace(Page::Providers(ProvidersPage::List { status, .. })) => {
+        match replaced_provider(&nav) {
+            ProvidersPage::List { status, .. } => {
                 assert!(
                     status
                         .as_deref()
@@ -5731,11 +5764,11 @@ mod tests {
             .iter()
             .position(|action| matches!(action, EditAction::Delete))
             .expect("delete row");
-        dialog.page = Page::Providers(ProvidersPage::Edit(state));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(state)));
 
-        dialog.handle_providers_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Enter));
         assert!(dialog.config.providers.contains_key("p"));
-        let Page::Providers(ProvidersPage::Edit(state)) = &dialog.page else {
+        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
             panic!("expected edit page");
         };
         assert!(state.delete_pending);
@@ -5744,12 +5777,12 @@ mod tests {
             Some("press Enter again to confirm delete")
         );
 
-        dialog.handle_providers_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Enter));
 
         assert!(!dialog.config.providers.contains_key("p"));
         assert!(matches!(
-            dialog.page,
-            Page::Providers(ProvidersPage::List { .. })
+            dialog.test_page(),
+            TestPageRef::Providers(ProvidersPage::List { .. })
         ));
     }
 
@@ -5757,11 +5790,14 @@ mod tests {
     fn edit_delete_d_requires_second_d_to_confirm() {
         let (_, mut dialog) = dialog_with_config(one_provider_config(None));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
-        dialog.handle_providers_key(press(KeyCode::Char('d')));
+        dialog.handle_key(press(KeyCode::Char('d')));
         assert!(dialog.config.providers.contains_key("p"));
-        let Page::Providers(ProvidersPage::Edit(state)) = &dialog.page else {
+        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
             panic!("expected edit page");
         };
         assert!(state.delete_pending);
@@ -5770,12 +5806,12 @@ mod tests {
             Some("press d again to confirm delete")
         );
 
-        dialog.handle_providers_key(press(KeyCode::Char('d')));
+        dialog.handle_key(press(KeyCode::Char('d')));
 
         assert!(!dialog.config.providers.contains_key("p"));
         assert!(matches!(
-            dialog.page,
-            Page::Providers(ProvidersPage::List { .. })
+            dialog.test_page(),
+            TestPageRef::Providers(ProvidersPage::List { .. })
         ));
     }
 
@@ -5783,10 +5819,13 @@ mod tests {
     fn favorite_toggle_status_is_unsaved() {
         let (_, mut dialog) = dialog_with_config(one_provider_config(None));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
-        dialog.handle_providers_key(press(KeyCode::Char('f')));
-        let Page::Providers(ProvidersPage::Edit(state)) = &dialog.page else {
+        dialog.handle_key(press(KeyCode::Char('f')));
+        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
             panic!("expected edit page");
         };
         assert_eq!(
@@ -5800,10 +5839,13 @@ mod tests {
     fn q_commits_favorite_from_edit_page() {
         let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
-        dialog.handle_providers_key(press(KeyCode::Char('f')));
-        assert!(dialog.handle_providers_key(press(KeyCode::Char('q'))));
+        dialog.handle_key(press(KeyCode::Char('f')));
+        assert!(dialog.handle_key(press(KeyCode::Char('q'))));
 
         assert_eq!(
             load_provider(&tmp.path().join("config.json"), "p").favorite,
@@ -5815,11 +5857,14 @@ mod tests {
     fn q_commit_failure_after_favorite_does_not_panic() {
         let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
-        dialog.handle_providers_key(press(KeyCode::Char('f')));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
+        dialog.handle_key(press(KeyCode::Char('f')));
         break_config_saving(&dialog);
 
-        assert!(dialog.handle_providers_key(press(KeyCode::Char('q'))));
+        assert!(dialog.handle_key(press(KeyCode::Char('q'))));
     }
 
     #[test]
@@ -5834,12 +5879,12 @@ mod tests {
             }],
             false,
         );
-        dialog.page = Page::Providers(ProvidersPage::Headers {
+        dialog.set_test_page(Page::Providers(ProvidersPage::Headers {
             editor,
             parent: Box::new(parent),
-        });
+        }));
 
-        assert!(dialog.handle_providers_key(press(KeyCode::Char('q'))));
+        assert!(dialog.handle_key(press(KeyCode::Char('q'))));
 
         assert_eq!(
             load_provider(&tmp.path().join("config.json"), "p").headers,
@@ -5854,10 +5899,13 @@ mod tests {
     async fn refetch_commits_staged_entry_first() {
         let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
-        dialog.handle_providers_key(press(KeyCode::Char('f')));
-        dialog.handle_providers_key(press(KeyCode::Char('r')));
+        dialog.handle_key(press(KeyCode::Char('f')));
+        dialog.handle_key(press(KeyCode::Char('r')));
 
         assert_eq!(
             load_provider(&tmp.path().join("config.json"), "p").favorite,
@@ -5872,7 +5920,7 @@ mod tests {
         let entry = dialog.config.providers["p"].clone();
         let mut edit = EditState::new("p".into(), entry);
         edit.entry.favorite = Some(true);
-        dialog.page = Page::Providers(ProvidersPage::Edit(edit));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(edit)));
 
         dialog.apply_fetch_result(
             "p",
@@ -5882,7 +5930,7 @@ mod tests {
             }),
         );
 
-        let Page::Providers(ProvidersPage::Edit(state)) = &dialog.page else {
+        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
             panic!("expected edit page");
         };
         assert_eq!(state.entry.favorite, Some(true));
@@ -5902,7 +5950,10 @@ mod tests {
         let (_tmp, mut dialog) =
             dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
         dialog.apply_fetch_result(
             "p",
@@ -5914,7 +5965,7 @@ mod tests {
 
         let provider = &dialog.config.providers["p"];
         assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
-        let Page::Providers(ProvidersPage::Edit(state)) = &dialog.page else {
+        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
             panic!("expected edit page");
         };
         assert_eq!(
@@ -5934,7 +5985,10 @@ mod tests {
         let (_tmp, mut dialog) =
             dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
 
         dialog.apply_fetch_result(
             "p",
@@ -5947,7 +6001,8 @@ mod tests {
             }),
         );
 
-        let Page::Providers(ProvidersPage::FetchFallbackPrompt(state)) = &dialog.page else {
+        let TestPageRef::Providers(ProvidersPage::FetchFallbackPrompt(state)) = dialog.test_page()
+        else {
             panic!("expected fallback prompt");
         };
         assert_eq!(state.provider_id, "p");
@@ -5970,7 +6025,7 @@ mod tests {
     fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
         let (_tmp, mut dialog) =
             dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        dialog.page = Page::Providers(ProvidersPage::FetchFallbackPrompt(
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchFallbackPrompt(
             FetchFallbackPromptState {
                 provider_id: "p".to_string(),
                 models: vec![model("fallback", false)],
@@ -5980,19 +6035,19 @@ mod tests {
                         .into(),
                 cursor: 2,
             },
-        ));
+        )));
 
-        let mut page = std::mem::replace(&mut dialog.page, Page::Root { cursor: 0 });
-        let nav = if let Page::Providers(ProvidersPage::FetchFallbackPrompt(state)) = &mut page {
-            dialog.handle_fetch_fallback_prompt_key(press(KeyCode::Enter), state)
-        } else {
-            panic!("expected fallback prompt");
+        let nav = {
+            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
+            let Some(ProvidersPage::FetchFallbackPrompt(state)) =
+                page.downcast_mut::<ProvidersPage>()
+            else {
+                panic!("expected fallback prompt");
+            };
+            cx.handle_fetch_fallback_prompt_key(press(KeyCode::Enter), state)
         };
 
-        assert!(matches!(
-            nav,
-            Nav::Replace(Page::Providers(ProvidersPage::Edit(_)))
-        ));
+        assert!(matches!(replaced_provider(&nav), ProvidersPage::Edit(_)));
         let provider = &dialog.config.providers["p"];
         assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
         assert_eq!(
@@ -6098,7 +6153,10 @@ mod tests {
         let (_tmp, mut dialog) =
             dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
         let entry = dialog.config.providers["p"].clone();
-        dialog.page = Page::Providers(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+            "p".into(),
+            entry,
+        ))));
         break_config_saving(&dialog);
 
         dialog.apply_fetch_result(
@@ -6109,7 +6167,7 @@ mod tests {
             }),
         );
 
-        let Page::Providers(ProvidersPage::Edit(state)) = &dialog.page else {
+        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
             panic!("expected edit page");
         };
         assert!(
@@ -6448,5 +6506,176 @@ mod tests {
             entry.effective_template("anthropic-work"),
             Some("anthropic")
         );
+    }
+}
+
+impl SettingsPage for ProvidersPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_providers_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_providers_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        let crumbs = match self {
+            ProvidersPage::List { .. } => format!(" › {}", super::PROVIDERS_TITLE),
+            ProvidersPage::Add(_) => format!(" › {} › Add", super::PROVIDERS_TITLE),
+            ProvidersPage::Edit(s) => format!(" › {} › {}", super::PROVIDERS_TITLE, s.provider_id),
+            ProvidersPage::Headers { parent, .. } => {
+                format!(
+                    " › {} › {} › Headers",
+                    super::PROVIDERS_TITLE,
+                    parent.provider_id
+                )
+            }
+            ProvidersPage::Models { parent, .. } => {
+                format!(
+                    " › {} › {} › Models",
+                    super::PROVIDERS_TITLE,
+                    parent.provider_id
+                )
+            }
+            ProvidersPage::ModelSettings { parent, .. } => {
+                format!(
+                    " › {} › {} › Model Settings",
+                    super::PROVIDERS_TITLE,
+                    parent.provider_id
+                )
+            }
+            ProvidersPage::ProviderSettings { parent, .. } => {
+                format!(
+                    " › {} › {} › Settings",
+                    super::PROVIDERS_TITLE,
+                    parent.provider_id
+                )
+            }
+            ProvidersPage::FetchAll(_) => format!(" › {} › refetch all", super::PROVIDERS_TITLE),
+            ProvidersPage::FetchOnePrompt(s) => {
+                format!(
+                    " › {} › {} › refetch",
+                    super::PROVIDERS_TITLE,
+                    s.provider_id
+                )
+            }
+            ProvidersPage::FetchFallbackPrompt(s) => {
+                format!(
+                    " › {} › {} › fallback",
+                    super::PROVIDERS_TITLE,
+                    s.provider_id
+                )
+            }
+            ProvidersPage::CopilotSetup { .. } => {
+                format!(" › {} › Copilot setup", super::PROVIDERS_TITLE)
+            }
+            ProvidersPage::GrokOAuthSetup { .. } => {
+                format!(" › {} › Grok OAuth", super::PROVIDERS_TITLE)
+            }
+            ProvidersPage::CodexOAuthSetup { .. } => {
+                format!(" › {} › Codex OAuth", super::PROVIDERS_TITLE)
+            }
+        };
+        format!(
+            "{}{}",
+            crate::welcome::display_path(&cx.config_path),
+            crumbs
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        match self {
+            ProvidersPage::List { .. } => {
+                "↑/↓/Tab/Shift+Tab  enter: edit/refetch-all  R: refetch all  m: unlisted policy  a: add  d: delete (×2)  esc/h: back  q: close"
+            }
+            ProvidersPage::Add(s) => match &s.step {
+                AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
+                AddStep::EditId | AddStep::EditUrl => "type to edit  enter: next  esc: cancel",
+                AddStep::EditHeaders => {
+                    if s.headers.is_editing() {
+                        "type to edit  Tab: switch field  enter: save  esc: cancel"
+                    } else {
+                        "↑/↓  a: add  enter: edit  d: delete (x2)  enter on continue: save  esc: back"
+                    }
+                }
+                AddStep::CopilotAuth(_) => "enter: apply  s: skip  esc: cancel",
+                AddStep::GrokOAuthAuth(state) => {
+                    oauth_setup_help_text(oauth_setup_confirming_logged_in(
+                        state.logged_in,
+                        state.pending,
+                        state.manual_mode,
+                    ))
+                }
+                AddStep::CodexOAuthAuth(state) => oauth_setup_help_text(
+                    oauth_setup_confirming_logged_in(state.logged_in, state.polling, false),
+                ),
+                AddStep::Saving | AddStep::Fetching => "(in progress)  esc: cancel",
+                AddStep::Done => "enter: back to list",
+            },
+            ProvidersPage::Edit(s) => {
+                if s.editing_field.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  enter: edit  s: save  r: refetch  f: favorite  d: delete (x2)  h: back  q: close"
+                }
+            }
+            ProvidersPage::Headers { editor, .. } => {
+                if editor.is_editing() {
+                    "type to edit  Tab: switch field  enter: save  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  a: add  enter: edit  d: delete (x2)  h: back  q: close"
+                }
+            }
+            ProvidersPage::Models { editor, .. } => {
+                if editor.is_editing() {
+                    "type to edit  Tab: switch field  enter: save  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  a: add  r: rename  enter: settings  d: delete (x2)  h: back  q: close"
+                }
+            }
+            ProvidersPage::ModelSettings { editor, .. } => {
+                if editor.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  enter: edit/cycle  x: clear to inherit  h: back  q: close"
+                }
+            }
+            ProvidersPage::ProviderSettings { editor, .. } => {
+                if editor.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: close"
+                }
+            }
+            ProvidersPage::FetchAll(s) => {
+                if s.is_fetching() {
+                    "fetching all providers…  esc: cancel"
+                } else if s.unlisted.is_empty() {
+                    "press any key to return"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  space: toggle don't-ask  enter: apply  esc: cancel"
+                }
+            }
+            ProvidersPage::FetchOnePrompt(_) => {
+                "↑/↓/Tab/Shift+Tab  space: toggle don't-ask  enter: apply  esc: cancel"
+            }
+            ProvidersPage::FetchFallbackPrompt(_) => {
+                "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel"
+            }
+            ProvidersPage::CopilotSetup { .. } => "enter: apply  esc: cancel",
+            ProvidersPage::GrokOAuthSetup { .. } => "↑/↓/Tab/Shift+Tab  enter: choose  esc: back",
+            ProvidersPage::CodexOAuthSetup { .. } => "↑/↓/Tab/Shift+Tab  enter: choose  esc: back",
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Providers"
     }
 }

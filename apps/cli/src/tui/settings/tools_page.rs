@@ -18,7 +18,7 @@ use super::shell::{
     WrappedValueLayout, focused_field_style, muted_style, push_text_field_at_cursor,
     push_wrapped_prefixed_value, selected_line_from_marker, selected_style, warning_style,
 };
-use super::{Nav, Page, SettingsDialog, save_status};
+use super::{Nav, SettingsCx, SettingsPage, save_status};
 
 const TOOL_ROW_MARKER_WIDTH: usize = 2;
 const TOOL_ROW_LABEL_WIDTH: usize = 14;
@@ -228,26 +228,7 @@ fn valid_http_url(raw: &str) -> bool {
         .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-impl SettingsDialog {
-    pub(super) fn handle_tools_key(&mut self, key: KeyEvent) -> bool {
-        let placeholder = Page::Tools(ToolsPage {
-            cursor: 0,
-            setup: None,
-            editing: None,
-            buf: TextField::default(),
-            edit_target: None,
-            status: None,
-            reset: ResetButton::default(),
-        });
-        let mut page = std::mem::replace(&mut self.page, placeholder);
-        let nav = if let Page::Tools(p) = &mut page {
-            self.handle_tools_page_key(key, p)
-        } else {
-            Nav::Stay
-        };
-        self.apply_nav(page, nav)
-    }
-
+impl SettingsCx {
     fn handle_tools_page_key(&mut self, key: KeyEvent, p: &mut ToolsPage) -> Nav {
         if let Some(field) = p.editing {
             match key.code {
@@ -989,4 +970,37 @@ fn push_tool_value_row(
         value,
         value_style,
     );
+}
+
+impl SettingsPage for ToolsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_tools_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_tools_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!("{} › Tools", crate::welcome::display_path(&cx.config_path))
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.editing.is_some() {
+            "type to edit  enter: apply  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  enter: edit  t: toggle  r: reset  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Tools"
+    }
 }

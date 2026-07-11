@@ -99,6 +99,17 @@ pub type OutlineData = (Vec<SymbolRow>, Vec<(String, i64)>, String);
 /// One indexed file row for tree-style tools: path, language, size, lines, symbols.
 pub type TreeRow = (String, String, i64, Option<i64>, i64);
 
+/// One indexed file metadata row for context-packet tools.
+#[derive(Debug, Clone)]
+pub struct FileMetaRow {
+    pub path: String,
+    pub language: String,
+    pub size: i64,
+    pub lines: Option<i64>,
+    pub symbols: i64,
+    pub mtime_ns: i64,
+}
+
 /// A dependency edge for `deps` / `circular`.
 #[derive(Debug, Clone)]
 pub struct DepEdge {
@@ -234,6 +245,34 @@ impl Index {
                         r.get::<_, Option<i64>>(3)?,
                         r.get::<_, i64>(4)?,
                     ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// All indexed files with metadata needed by `context_pack`, ordered by path.
+    pub fn context_file_rows(&self) -> Result<Vec<FileMetaRow>> {
+        let root_key = self.root_key.clone();
+        self.db.read_blocking(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.path, f.language, f.size, f.lines, COUNT(s.name), f.mtime_ns \
+                 FROM intel_files f \
+                 LEFT JOIN intel_symbols s ON s.root = f.root AND s.path = f.path \
+                 WHERE f.root = ?1 \
+                 GROUP BY f.root, f.path, f.language, f.size, f.lines, f.mtime_ns \
+                 ORDER BY f.path",
+            )?;
+            let rows = stmt
+                .query_map([&root_key], |r| {
+                    Ok(FileMetaRow {
+                        path: r.get(0)?,
+                        language: r.get(1)?,
+                        size: r.get(2)?,
+                        lines: r.get(3)?,
+                        symbols: r.get(4)?,
+                        mtime_ns: r.get(5)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)

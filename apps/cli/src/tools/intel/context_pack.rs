@@ -1,4 +1,5 @@
 use super::common::*;
+use crate::tools::text_search::{SearchOptions, search_records_blocking};
 
 // ---- context_pack ----------------------------------------------------------
 
@@ -79,9 +80,9 @@ impl Tool for ContextPackTool {
 
         let index = index_of(ctx);
         index.ensure_fresh().await?;
-        let tree_rows = index.tree_rows()?;
-        let fs_files = list_files(&ctx.session.project_root);
-        if tree_rows.is_empty() && fs_files.is_empty() {
+        let file_rows = index.context_file_rows()?;
+        let fs_files = list_file_metas(&ctx.session.project_root);
+        if file_rows.is_empty() && fs_files.is_empty() {
             return Ok(ToolOutput::text(format!(
                 "context_pack: no indexed files\nproject_root: {}\ncwd: {}\nhint: verify the project root/cwd; try `context_pack` again after files exist, or use `tree`/`rg --files` to diagnose discovery.",
                 ctx.session.project_root.display(),
@@ -90,7 +91,7 @@ impl Tool for ContextPackTool {
         }
 
         let centrality = index.centrality_scores()?;
-        let files = context_file_meta(&tree_rows, &fs_files, &centrality);
+        let files = context_file_meta(&file_rows, &fs_files, &centrality);
         let kind = match requested {
             ContextPackKind::Auto => match target {
                 None => ContextPackKind::Overview,
@@ -127,7 +128,7 @@ impl Tool for ContextPackTool {
                 let Some(target) = target else {
                     return Err(invalid_input("`target` is required for kind=query"));
                 };
-                context_pack_query(&index, &files, target, ctx, limit)
+                context_pack_query(&index, &files, target, ctx, limit).await
             }
         }
     }
@@ -147,14 +148,11 @@ fn parse_context_pack_kind(raw: Option<&str>) -> Result<ContextPackKind> {
 }
 
 fn context_file_meta(
-    tree_rows: &[TreeRow],
-    fs_files: &[(String, PathBuf, u64)],
+    indexed_rows: &[FileMetaRow],
+    fs_files: &[FsFileMeta],
     centrality: &HashMap<String, f64>,
 ) -> Vec<ContextFileMeta> {
-    let indexed: HashMap<&str, (&str, i64, Option<i64>, i64)> = tree_rows
-        .iter()
-        .map(|(p, lang, size, lines, syms)| (p.as_str(), (lang.as_str(), *size, *lines, *syms)))
-        .collect();
+    let indexed_paths: HashSet<&str> = indexed_rows.iter().map(|row| row.path.as_str()).collect();
     let mut ranked: Vec<(&String, &f64)> = centrality.iter().collect();
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(a.1)
@@ -168,52 +166,34 @@ fn context_file_meta(
         .collect();
 
     let mut metas = Vec::new();
-    let mut seen = HashSet::new();
-    for (rel, abs, fs_size) in fs_files {
-        seen.insert(rel.clone());
-        let (language, size, lines, symbols) = indexed
-            .get(rel.as_str())
-            .map(|(l, s, lines, syms)| {
-                (
-                    (*l).to_string(),
-                    (*s).max(0) as u64,
-                    lines.map(|n| n.max(0) as usize),
-                    *syms,
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    Language::from_path(Path::new(rel)).as_str().to_string(),
-                    *fs_size,
-                    Some(0),
-                    0,
-                )
-            });
-        let meta = std::fs::metadata(abs).ok();
+    for row in indexed_rows {
         metas.push(ContextFileMeta {
-            path: rel.clone(),
-            language,
-            size,
-            lines,
-            symbols,
-            mtime: meta.and_then(|m| m.modified().ok()),
-            centrality: centrality.get(rel).copied().unwrap_or(0.0),
-            centrality_rank: ranks.get(rel.as_str()).copied(),
+            path: row.path.clone(),
+            language: row.language.clone(),
+            size: row.size.max(0) as u64,
+            lines: row.lines.map(|n| n.max(0) as usize),
+            symbols: row.symbols,
+            mtime: system_time_from_ns(row.mtime_ns),
+            centrality: centrality.get(&row.path).copied().unwrap_or(0.0),
+            centrality_rank: ranks.get(row.path.as_str()).copied(),
         });
     }
-    for (path, language, size, lines, symbols) in tree_rows {
-        if seen.contains(path) {
+
+    for file in fs_files {
+        if indexed_paths.contains(file.rel.as_str()) {
             continue;
         }
         metas.push(ContextFileMeta {
-            path: path.clone(),
-            language: language.clone(),
-            size: (*size).max(0) as u64,
-            lines: lines.map(|n| n.max(0) as usize),
-            symbols: *symbols,
-            mtime: None,
-            centrality: centrality.get(path).copied().unwrap_or(0.0),
-            centrality_rank: ranks.get(path.as_str()).copied(),
+            path: file.rel.clone(),
+            language: Language::from_path(Path::new(&file.rel))
+                .as_str()
+                .to_string(),
+            size: file.size,
+            lines: Some(0),
+            symbols: 0,
+            mtime: file.mtime,
+            centrality: centrality.get(&file.rel).copied().unwrap_or(0.0),
+            centrality_rank: ranks.get(file.rel.as_str()).copied(),
         });
     }
     metas.sort_by(|a, b| a.path.cmp(&b.path));
@@ -357,7 +337,8 @@ fn context_pack_overview(
         }
     }
 
-    let cycles = import_cycles(index.dep_edges()?);
+    let dep_edges = index.dep_edges()?;
+    let cycles = import_cycles(&dep_edges);
     writer.writeln(&format!("import cycles: {}", cycles.len()));
     for cycle in cycles.into_iter().take(limit.min(5)) {
         if !writer.writeln(&format!("  {}", cycle.join(" -> "))) {
@@ -582,7 +563,7 @@ fn context_pack_symbol(
     ))
 }
 
-fn context_pack_query(
+async fn context_pack_query(
     index: &Index,
     files: &[ContextFileMeta],
     target: &str,
@@ -633,7 +614,7 @@ fn context_pack_query(
     }
 
     writer.writeln("text hits (content omitted):");
-    let text_hits = literal_text_hits(target, ctx, limit.saturating_mul(2))?;
+    let text_hits = in_process_text_hits(target, ctx, limit.saturating_mul(2)).await?;
     if text_hits.is_empty() {
         writer.writeln("  none");
     } else {
@@ -666,15 +647,15 @@ fn entry_candidates(index: &Index, limit: usize) -> Result<Vec<SymbolRow>> {
     Ok(out)
 }
 
-fn import_cycles(edges: Vec<DepEdge>) -> Vec<Vec<String>> {
+fn import_cycles(edges: &[DepEdge]) -> Vec<Vec<String>> {
     let mut nodes: Vec<String> = Vec::new();
     let mut idx: HashMap<String, usize> = HashMap::new();
     let mut adj: Vec<Vec<usize>> = Vec::new();
     let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
     for edge in edges {
-        if let Some(importee) = edge.importee {
+        if let Some(importee) = edge.importee.as_deref() {
             let a = intern(&edge.importer, &mut nodes, &mut idx, &mut adj);
-            let b = intern(&importee, &mut nodes, &mut idx, &mut adj);
+            let b = intern(importee, &mut nodes, &mut idx, &mut adj);
             if seen_edges.insert((a, b)) {
                 adj[a].push(b);
             }
@@ -725,6 +706,13 @@ fn system_time_secs(t: std::time::SystemTime) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+fn system_time_from_ns(ns: i64) -> Option<std::time::SystemTime> {
+    let ns = u64::try_from(ns).ok()?;
+    let secs = ns / 1_000_000_000;
+    let nanos = (ns % 1_000_000_000) as u32;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
 fn is_identifierish(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
@@ -734,31 +722,40 @@ fn is_identifierish(s: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-fn literal_text_hits(target: &str, ctx: &ToolCtx, max_hits: usize) -> Result<Vec<(String, usize)>> {
-    let escaped = regex::escape(target);
-    let re = regex::Regex::new(&escaped).map_err(|e| invalid_input(e.to_string()))?;
-    let mut out = Vec::new();
-    for (rel, abs, _) in list_files(&ctx.session.project_root) {
-        if out.len() >= max_hits {
-            break;
-        }
-        let Ok(bytes) = std::fs::read(&abs) else {
-            continue;
-        };
-        if bytes.contains(&0u8) {
-            continue;
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-        for (idx, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                out.push((rel.clone(), idx + 1));
-                if out.len() >= max_hits {
-                    break;
-                }
-            }
-        }
+async fn in_process_text_hits(
+    target: &str,
+    ctx: &ToolCtx,
+    max_hits: usize,
+) -> Result<Vec<(String, u64)>> {
+    if max_hits == 0 {
+        return Ok(Vec::new());
     }
-    Ok(out)
+    let search_root =
+        crate::tools::sandbox::check_native_access(ctx, &ctx.session.project_root).await?;
+    let display_root = search_root.clone();
+    let guard_root = search_root.clone();
+    let options = SearchOptions {
+        pattern: regex::escape(target),
+        case_insensitive: false,
+        columns: false,
+        context: None,
+        glob: None,
+        max_matches: max_hits,
+        hidden: true,
+        parents: true,
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        search_records_blocking(&search_root, &display_root, &options, |path| {
+            path == guard_root || path.starts_with(&guard_root)
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("context_pack search worker joined: {e}"))??;
+    Ok(outcome
+        .records
+        .into_iter()
+        .filter(|record| !record.is_context)
+        .take(max_hits)
+        .map(|record| (record.path, record.line_number))
+        .collect())
 }

@@ -11,7 +11,7 @@ pub(super) use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, t
 pub(super) use crate::intel::budget::BudgetedWriter;
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
-pub(super) use crate::intel::{DepEdge, Index, SymbolRow, TreeRow};
+pub(super) use crate::intel::{DepEdge, FileMetaRow, Index, SymbolRow};
 
 /// Token cap shared by the index tools. `search` uses a larger default
 /// per the spec (4000); structural tools are terser so a tighter cap
@@ -243,17 +243,36 @@ pub(super) fn forward_deps(
         .collect()
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct FsFileMeta {
+    pub rel: String,
+    pub abs: PathBuf,
+    pub size: u64,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
 /// Gitignore-aware list of `(rel, abs, size)` for every tracked file.
 pub(super) fn list_files(root: &Path) -> Vec<(String, PathBuf, u64)> {
-    list_files_from(root, root)
+    list_file_metas_from(root, root)
+        .into_iter()
+        .map(|file| (file.rel, file.abs, file.size))
+        .collect()
+}
+
+/// Gitignore-aware list of file metadata for every tracked file.
+pub(super) fn list_file_metas(root: &Path) -> Vec<FsFileMeta> {
+    list_file_metas_from(root, root)
 }
 
 /// Gitignore-aware list rooted at `root/subdir`, with paths relative to `root`.
 pub(super) fn list_files_under(root: &Path, subdir: &str) -> Vec<(String, PathBuf, u64)> {
-    list_files_from(root, &root.join(subdir))
+    list_file_metas_from(root, &root.join(subdir))
+        .into_iter()
+        .map(|file| (file.rel, file.abs, file.size))
+        .collect()
 }
 
-fn list_files_from(root: &Path, walk_root: &Path) -> Vec<(String, PathBuf, u64)> {
+fn list_file_metas_from(root: &Path, walk_root: &Path) -> Vec<FsFileMeta> {
     let mut out = Vec::new();
     let mut walker = WalkBuilder::new(walk_root);
     walker
@@ -272,8 +291,13 @@ fn list_files_from(root: &Path, walk_root: &Path) -> Vec<(String, PathBuf, u64)>
         let Ok(rel) = abs.strip_prefix(root) else {
             continue;
         };
-        let size = dent.metadata().map(|m| m.len()).unwrap_or(0);
-        out.push((rel.to_string_lossy().replace('\\', "/"), abs, size));
+        let meta = dent.metadata().ok();
+        out.push(FsFileMeta {
+            rel: rel.to_string_lossy().replace('\\', "/"),
+            abs,
+            size: meta.as_ref().map_or(0, std::fs::Metadata::len),
+            mtime: meta.and_then(|m| m.modified().ok()),
+        });
     }
     out
 }

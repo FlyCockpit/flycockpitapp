@@ -513,13 +513,13 @@ impl App {
     }
 
     pub(super) fn slash_description_for(&self, command: &super::SlashCommand) -> String {
-        if command.name == "mcp" {
-            self.refresh_slash_menu_cache();
-            if let Some(cache) = self.slash_menu_cache.borrow().as_ref() {
-                return cache.mcp_description.clone();
-            }
+        self.refresh_slash_menu_cache();
+        if let Some(cache) = self.slash_menu_cache.borrow().as_ref()
+            && let Some(description) = cache.description_for(command)
+        {
+            return description.to_string();
         }
-        command.dynamic_description(self)
+        command.description.to_string()
     }
 
     /// The frequency-ranked slash matches for the current query, or an

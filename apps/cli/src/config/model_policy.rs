@@ -120,6 +120,7 @@ pub struct EffectiveModelCapabilities {
     pub tool_calling: CapabilityStatus,
     pub images: Option<bool>,
     pub context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
     pub reasoning: CapabilityStatus,
     pub structured_outputs: CapabilityStatus,
 }
@@ -192,12 +193,14 @@ impl ProvidersConfig {
         };
         let model_entry = entry.models.iter().find(|m| m.id == model);
         let model_caps = model_entry.map(|m| &m.capabilities);
+        let overrides = model_entry.map(|m| &m.capability_overrides);
         let provider_caps = &entry.capabilities;
-        let reasoning = model_caps
+
+        let detected_reasoning = model_caps
             .map(|c| c.reasoning)
             .filter(|s| !s.is_unknown())
             .unwrap_or(provider_caps.reasoning);
-        let reasoning = if reasoning.is_unknown()
+        let detected_reasoning = if detected_reasoning.is_unknown()
             && model_entry.is_some_and(|m| {
                 !m.thinking_modes.is_empty()
                     || m.capabilities
@@ -207,26 +210,47 @@ impl ProvidersConfig {
             }) {
             CapabilityStatus::Supported
         } else {
-            reasoning
+            detected_reasoning
         };
-        EffectiveModelCapabilities {
-            tool_calling: model_caps
-                .map(|c| c.tool_calling)
+
+        let status = |model_status: Option<CapabilityStatus>, provider_status| {
+            model_status
                 .filter(|s| !s.is_unknown())
-                .unwrap_or(provider_caps.tool_calling),
-            images: model_caps
-                .and_then(|c| c.images)
+                .unwrap_or(provider_status)
+        };
+
+        EffectiveModelCapabilities {
+            tool_calling: overrides.and_then(|o| o.tool_calling).unwrap_or_else(|| {
+                status(
+                    model_caps.map(|c| c.tool_calling),
+                    provider_caps.tool_calling,
+                )
+            }),
+            images: overrides
+                .and_then(|o| o.images)
+                .or_else(|| model_caps.and_then(|c| c.images))
                 .or(provider_caps.images)
                 .or_else(|| model_entry.and_then(|m| m.inputs.as_ref()?.images)),
-            context_tokens: model_caps
-                .and_then(|c| c.context_tokens)
+            context_tokens: overrides
+                .and_then(|o| o.context_tokens)
+                .or_else(|| model_caps.and_then(|c| c.context_tokens))
                 .or(provider_caps.context_tokens)
                 .or_else(|| model_entry.and_then(|m| m.context_length)),
-            reasoning,
-            structured_outputs: model_caps
-                .map(|c| c.structured_outputs)
-                .filter(|s| !s.is_unknown())
-                .unwrap_or(provider_caps.structured_outputs),
+            max_output_tokens: overrides
+                .and_then(|o| o.max_output_tokens)
+                .or_else(|| model_caps.and_then(|c| c.max_output_tokens))
+                .or(provider_caps.max_output_tokens),
+            reasoning: overrides
+                .and_then(|o| o.reasoning)
+                .unwrap_or(detected_reasoning),
+            structured_outputs: overrides
+                .and_then(|o| o.structured_outputs)
+                .unwrap_or_else(|| {
+                    status(
+                        model_caps.map(|c| c.structured_outputs),
+                        provider_caps.structured_outputs,
+                    )
+                }),
         }
     }
 

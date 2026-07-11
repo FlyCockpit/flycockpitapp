@@ -122,6 +122,7 @@ fn round_trips_a_provider_entry() {
                 }),
                 extra: Default::default(),
                 capabilities: Default::default(),
+                capability_overrides: Default::default(),
                 provider_metadata: Default::default(),
             }],
             capabilities: Default::default(),
@@ -347,6 +348,7 @@ fn resolve_cache_prefers_model_override() {
         inputs: None,
         extra: Default::default(),
         capabilities: Default::default(),
+        capability_overrides: Default::default(),
         provider_metadata: Default::default(),
     });
     cfg.providers.insert("p".into(), entry);
@@ -929,6 +931,7 @@ fn model(id: &str, manual: bool) -> ModelEntry {
         wire_api: WireApi::default(),
         extra: Default::default(),
         capabilities: Default::default(),
+        capability_overrides: Default::default(),
         provider_metadata: Default::default(),
     }
 }

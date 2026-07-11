@@ -215,10 +215,8 @@ fn lookup_model_context(
     provider_id: &str,
     model_id: &str,
 ) -> Option<u32> {
-    cfg.providers
-        .get(provider_id)
-        .and_then(|entry| entry.models.iter().find(|m| m.id == model_id))
-        .and_then(|model| model.context_length)
+    cfg.resolve_capabilities(provider_id, model_id)
+        .context_tokens
 }
 
 fn model_supports_images(
@@ -226,12 +224,7 @@ fn model_supports_images(
     provider_id: &str,
     model_id: &str,
 ) -> bool {
-    cfg.providers
-        .get(provider_id)
-        .and_then(|entry| entry.models.iter().find(|m| m.id == model_id))
-        .and_then(|model| model.inputs.as_ref())
-        .and_then(|inputs| inputs.images)
-        .unwrap_or(false)
+    cfg.resolve_capabilities(provider_id, model_id).images == Some(true)
 }
 
 pub fn print(project: Option<&Path>) {
@@ -330,4 +323,34 @@ fn path_line_ansi(info: &LaunchInfo) -> String {
         line.push_str(BADGE_RIGHT_EDGE);
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::providers::{
+        CapabilityStatus, ModelCapabilities, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+
+    #[test]
+    fn image_support_uses_resolved_model_capabilities() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    capabilities: ModelCapabilities {
+                        images: Some(true),
+                        tool_calling: CapabilityStatus::Unsupported,
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+
+        assert!(model_supports_images(&cfg, "p", "m"));
+    }
 }

@@ -636,6 +636,7 @@ impl RowListEditor for ModelEditor {
                     wire_api: Default::default(),
                     extra: Default::default(),
                     capabilities: Default::default(),
+                    capability_overrides: Default::default(),
                     provider_metadata: Default::default(),
                 };
                 // A hand-added model gets the same template-scoped defaults a

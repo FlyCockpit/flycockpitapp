@@ -905,6 +905,13 @@ pub struct ModelEntry {
     #[serde(default, skip_serializing_if = "ModelCapabilities::is_empty")]
     pub capabilities: ModelCapabilities,
 
+    /// User-authored capability assertions. These sit above fetched/default
+    /// [`ModelCapabilities`] in the resolver and survive `/models` refreshes.
+    /// Missing fields mean "auto" — use detection/defaults, and serialize
+    /// nothing.
+    #[serde(default, skip_serializing_if = "ModelCapabilityOverrides::is_empty")]
+    pub capability_overrides: ModelCapabilityOverrides,
+
     /// Raw upstream model metadata preserved separately from Cockpit-owned
     /// typed projections. `extra` remains as legacy compatibility.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
@@ -1002,6 +1009,8 @@ pub struct ModelCapabilities {
     pub images: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub reasoning: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
@@ -1017,6 +1026,7 @@ impl ModelCapabilities {
         self.tool_calling.is_unknown()
             && self.images.is_none()
             && self.context_tokens.is_none()
+            && self.max_output_tokens.is_none()
             && self.reasoning.is_unknown()
             && self.structured_outputs.is_unknown()
             && self
@@ -1028,6 +1038,33 @@ impl ModelCapabilities {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCapabilityOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calling: Option<CapabilityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<CapabilityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_outputs: Option<CapabilityStatus>,
+}
+
+impl ModelCapabilityOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.tool_calling.is_none()
+            && self.images.is_none()
+            && self.context_tokens.is_none()
+            && self.max_output_tokens.is_none()
+            && self.reasoning.is_none()
+            && self.structured_outputs.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub tool_calling: CapabilityStatus,
@@ -1035,6 +1072,8 @@ pub struct ProviderCapabilities {
     pub images: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub reasoning: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
@@ -1048,6 +1087,7 @@ impl ProviderCapabilities {
         self.tool_calling.is_unknown()
             && self.images.is_none()
             && self.context_tokens.is_none()
+            && self.max_output_tokens.is_none()
             && self.reasoning.is_unknown()
             && self.structured_outputs.is_unknown()
             && self.client_side_tools.is_empty()
@@ -1199,8 +1239,8 @@ pub enum ModelMergePolicy {
 /// the base but the existing entry's overrides are carried over. That includes
 /// favorites, manual markers, policy fields, endpoint pins,
 /// cache/context/shrink/timeout, auto-prune, backup, mode, inline-think,
-/// repair/recovery settings, and thinking params — plus, for manual entries,
-/// the hand-set display `name` and `context_length`.
+/// repair/recovery settings, thinking params, and capability overrides — plus,
+/// for manual entries, the hand-set display `name` and `context_length`.
 /// Template-scoped model defaults ([`apply_template_model_defaults`]) are
 /// applied only to ids that are **newly discovered** by this fetch — i.e. absent
 /// from `existing`. Standard first-party providers get frontier defaults for
@@ -1248,8 +1288,9 @@ pub fn merge_fetched_models_with_policy(
 /// Carry an existing entry's user-owned fields onto a colliding fetched entry
 /// (which is used as the base). Favorites, manual markers, policy fields,
 /// endpoint pins, cache/context/shrink/timeout, auto-prune, backup, mode,
-/// inline-think, repair/recovery settings, thinking params, and preserved
-/// metadata all survive. For **manual** entries the hand-set display `name`
+/// inline-think, repair/recovery settings, thinking params, capability
+/// overrides, and preserved metadata all survive. For **manual** entries the
+/// hand-set display `name`
 /// and `context_length` are preserved too (when set) — those are the only
 /// metadata fields the UI lets you hand-edit, so a later upstream collision
 /// must not silently overwrite them. Non-manual (fetched) entries keep taking
@@ -1333,8 +1374,13 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
                 .or_insert_with(|| value.clone());
         }
     }
-    if !existing.capabilities.is_empty() {
-        fetched.capabilities = existing.capabilities.clone();
+    if !existing.capability_overrides.is_empty() {
+        fetched.capability_overrides = existing.capability_overrides.clone();
+    }
+    if !existing.capabilities.client_side_tools.is_empty()
+        && existing.capabilities.client_side_tools.source == Some(CapabilitySource::Manual)
+    {
+        fetched.capabilities.client_side_tools = existing.capabilities.client_side_tools.clone();
     }
     if !existing.provider_metadata.is_empty() {
         for (key, value) in &existing.provider_metadata {

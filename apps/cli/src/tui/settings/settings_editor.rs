@@ -77,6 +77,16 @@ pub(super) enum SettingsScope {
     Provider,
 }
 
+#[derive(Clone, Default)]
+struct DetectedCapabilityPreview {
+    tool_calling: CapabilityStatus,
+    images: Option<bool>,
+    context_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    reasoning: CapabilityStatus,
+    structured_outputs: CapabilityStatus,
+}
+
 /// The editable provider/model fields, in row order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum ProviderSettingId {
@@ -88,6 +98,12 @@ pub(super) enum ProviderSettingId {
     CostRank,
     SubagentInvokable,
     SystemPrompt,
+    CapabilityImages,
+    CapabilityTools,
+    CapabilityReasoning,
+    CapabilityStructuredOutputs,
+    CapabilityContextTokens,
+    CapabilityMaxOutputTokens,
     AutoCompactPct,
     /// Auto-prune master switch (on | off | inherit). `off` disables the
     /// automatic prune trigger entirely — both branches; manual `/prune`
@@ -130,6 +146,12 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::CostRank,
     ProviderSettingId::SubagentInvokable,
     ProviderSettingId::SystemPrompt,
+    ProviderSettingId::CapabilityImages,
+    ProviderSettingId::CapabilityTools,
+    ProviderSettingId::CapabilityReasoning,
+    ProviderSettingId::CapabilityStructuredOutputs,
+    ProviderSettingId::CapabilityContextTokens,
+    ProviderSettingId::CapabilityMaxOutputTokens,
     ProviderSettingId::AutoCompactPct,
     ProviderSettingId::AutoPruneEnabled,
     ProviderSettingId::AutoPrunePct,
@@ -175,6 +197,12 @@ impl ProviderSettingId {
             Self::CostRank => "Cost rank",
             Self::SubagentInvokable => "Subagent available",
             Self::SystemPrompt => "Model instructions",
+            Self::CapabilityImages => "Image input",
+            Self::CapabilityTools => "Tool calling",
+            Self::CapabilityReasoning => "Reasoning",
+            Self::CapabilityStructuredOutputs => "Structured outputs",
+            Self::CapabilityContextTokens => "Context tokens",
+            Self::CapabilityMaxOutputTokens => "Max output tokens",
             Self::AutoCompactPct => "Auto-compact ctx %",
             Self::AutoPruneEnabled => "Auto-prune",
             Self::AutoPrunePct => "Auto-prune ctx %",
@@ -203,6 +231,8 @@ impl ProviderSettingId {
                 | Self::CacheTtlSecs
                 | Self::TimeoutTtftSecs
                 | Self::TimeoutIdleSecs
+                | Self::CapabilityContextTokens
+                | Self::CapabilityMaxOutputTokens
                 | Self::QualityRank
                 | Self::CostRank
         )
@@ -223,6 +253,24 @@ impl ProviderSettingId {
             ),
             Self::AutoPruneEnabled => Some(
                 "Master switch for automatic context pruning (lossless dedup of stale tool results). off never auto-prunes, protecting the provider's prompt cache; manual /prune still works. inherit falls through to the provider, then on.",
+            ),
+            Self::CapabilityImages => Some(
+                "auto uses fetched/default model capability metadata; supported sends pasted images as image parts, unsupported sends text notes.",
+            ),
+            Self::CapabilityTools => Some(
+                "auto uses fetched/default model capability metadata; override only when the provider metadata is wrong.",
+            ),
+            Self::CapabilityReasoning => Some(
+                "auto uses fetched/default model capability metadata and reasoning-effort support.",
+            ),
+            Self::CapabilityStructuredOutputs => Some(
+                "auto uses fetched/default model capability metadata for JSON-schema/structured-output support.",
+            ),
+            Self::CapabilityContextTokens => Some(
+                "auto uses fetched/default context metadata. Enter an explicit request context window only when detection is wrong.",
+            ),
+            Self::CapabilityMaxOutputTokens => Some(
+                "auto uses fetched/default max-output metadata. Enter an explicit completion limit only when detection is wrong.",
             ),
             Self::AutoCompactPct => Some(
                 "At or above this % of the context window, the conversation is auto-compacted (LLM summarization, same as /compact). Unrelated to the prune thresholds below.",
@@ -327,6 +375,13 @@ pub(super) struct SettingsEditor {
     cost_rank: Option<i64>,
     subagent_invokable: Option<bool>,
     system_prompt: Option<String>,
+    capability_tool_calling: Option<CapabilityStatus>,
+    capability_images: Option<bool>,
+    capability_context_tokens: Option<u32>,
+    capability_max_output_tokens: Option<u32>,
+    capability_reasoning: Option<CapabilityStatus>,
+    capability_structured_outputs: Option<CapabilityStatus>,
+    detected_capabilities: DetectedCapabilityPreview,
     provider_trust_confirm_pending: bool,
     provider_trust_confirm_ready_at: Option<Instant>,
     provider_trust_confirm_lockout: Duration,
@@ -387,6 +442,13 @@ impl SettingsEditor {
             cost_rank: entry.cost_rank,
             subagent_invokable: entry.subagent_invokable,
             system_prompt: None,
+            capability_tool_calling: None,
+            capability_images: None,
+            capability_context_tokens: None,
+            capability_max_output_tokens: None,
+            capability_reasoning: None,
+            capability_structured_outputs: None,
+            detected_capabilities: DetectedCapabilityPreview::default(),
             provider_trust_confirm_pending: false,
             provider_trust_confirm_ready_at: None,
             provider_trust_confirm_lockout: Duration::ZERO,
@@ -438,6 +500,9 @@ impl SettingsEditor {
             .filter(|capability| !capability.is_empty())
             .unwrap_or(&entry.capabilities.client_side_tools);
         let xai_multi_agent_tools_beta = tools_entitlement_enabled(effective_client_side_tools);
+        let detected_capabilities = model
+            .map(|m| detected_model_capabilities(entry, m))
+            .unwrap_or_default();
         let show_wire_api = !is_anthropic_native_base_url(&entry.url);
         let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
@@ -471,6 +536,15 @@ impl SettingsEditor {
             cost_rank: model.and_then(|m| m.cost_rank),
             subagent_invokable: model.and_then(|m| m.subagent_invokable),
             system_prompt: model.and_then(|m| m.system_prompt.clone()),
+            capability_tool_calling: model.and_then(|m| m.capability_overrides.tool_calling),
+            capability_images: model.and_then(|m| m.capability_overrides.images),
+            capability_context_tokens: model.and_then(|m| m.capability_overrides.context_tokens),
+            capability_max_output_tokens: model
+                .and_then(|m| m.capability_overrides.max_output_tokens),
+            capability_reasoning: model.and_then(|m| m.capability_overrides.reasoning),
+            capability_structured_outputs: model
+                .and_then(|m| m.capability_overrides.structured_outputs),
+            detected_capabilities,
             provider_trust_confirm_pending: false,
             provider_trust_confirm_ready_at: None,
             provider_trust_confirm_lockout: Duration::ZERO,
@@ -529,7 +603,15 @@ impl SettingsEditor {
             SubagentInvokable,
         ]);
         if is_model_scope {
-            fields.push(SystemPrompt);
+            fields.extend([
+                SystemPrompt,
+                CapabilityImages,
+                CapabilityTools,
+                CapabilityReasoning,
+                CapabilityStructuredOutputs,
+                CapabilityContextTokens,
+                CapabilityMaxOutputTokens,
+            ]);
         }
         fields.extend([
             AutoCompactPct,
@@ -594,6 +676,16 @@ impl SettingsEditor {
             ProviderSettingId::CostRank => self.cost_rank.is_some(),
             ProviderSettingId::SubagentInvokable => self.subagent_invokable.is_some(),
             ProviderSettingId::SystemPrompt => self.system_prompt.is_some(),
+            ProviderSettingId::CapabilityImages => self.capability_images.is_some(),
+            ProviderSettingId::CapabilityTools => self.capability_tool_calling.is_some(),
+            ProviderSettingId::CapabilityReasoning => self.capability_reasoning.is_some(),
+            ProviderSettingId::CapabilityStructuredOutputs => {
+                self.capability_structured_outputs.is_some()
+            }
+            ProviderSettingId::CapabilityContextTokens => self.capability_context_tokens.is_some(),
+            ProviderSettingId::CapabilityMaxOutputTokens => {
+                self.capability_max_output_tokens.is_some()
+            }
             ProviderSettingId::AutoCompactPct
             | ProviderSettingId::AutoPrunePct
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present,
@@ -664,6 +756,29 @@ impl SettingsEditor {
                 .as_ref()
                 .map(|prompt| format!("{} characters", prompt.chars().count()))
                 .unwrap_or_else(|| "not set".to_string()),
+            ProviderSettingId::CapabilityImages => {
+                capability_bool_label(self.capability_images, self.detected_capabilities.images)
+            }
+            ProviderSettingId::CapabilityTools => capability_status_label(
+                self.capability_tool_calling,
+                self.detected_capabilities.tool_calling,
+            ),
+            ProviderSettingId::CapabilityReasoning => capability_status_label(
+                self.capability_reasoning,
+                self.detected_capabilities.reasoning,
+            ),
+            ProviderSettingId::CapabilityStructuredOutputs => capability_status_label(
+                self.capability_structured_outputs,
+                self.detected_capabilities.structured_outputs,
+            ),
+            ProviderSettingId::CapabilityContextTokens => capability_number_label(
+                self.capability_context_tokens,
+                self.detected_capabilities.context_tokens,
+            ),
+            ProviderSettingId::CapabilityMaxOutputTokens => capability_number_label(
+                self.capability_max_output_tokens,
+                self.detected_capabilities.max_output_tokens,
+            ),
             ProviderSettingId::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
             ProviderSettingId::AutoPruneEnabled => match self.auto_prune {
                 Some(true) => "on".to_string(),
@@ -742,6 +857,17 @@ impl SettingsEditor {
                 self.timeout_present = true
             }
             ProviderSettingId::WireApi => self.wire_api_present = true,
+            ProviderSettingId::CapabilityContextTokens => {
+                if self.capability_context_tokens.is_none() {
+                    self.capability_context_tokens = self.detected_capabilities.context_tokens;
+                }
+            }
+            ProviderSettingId::CapabilityMaxOutputTokens => {
+                if self.capability_max_output_tokens.is_none() {
+                    self.capability_max_output_tokens =
+                        self.detected_capabilities.max_output_tokens;
+                }
+            }
             ProviderSettingId::XaiMultiAgentToolsBeta => {
                 self.xai_multi_agent_tools_beta_present = true
             }
@@ -753,6 +879,10 @@ impl SettingsEditor {
             | ProviderSettingId::CostRank
             | ProviderSettingId::SubagentInvokable
             | ProviderSettingId::SystemPrompt
+            | ProviderSettingId::CapabilityImages
+            | ProviderSettingId::CapabilityTools
+            | ProviderSettingId::CapabilityReasoning
+            | ProviderSettingId::CapabilityStructuredOutputs
             | ProviderSettingId::Backup
             | ProviderSettingId::Mode
             | ProviderSettingId::AutoPruneEnabled
@@ -778,6 +908,16 @@ impl SettingsEditor {
             ProviderSettingId::CostRank => self.cost_rank = None,
             ProviderSettingId::SubagentInvokable => self.subagent_invokable = None,
             ProviderSettingId::SystemPrompt => self.system_prompt = None,
+            ProviderSettingId::CapabilityImages => self.capability_images = None,
+            ProviderSettingId::CapabilityTools => self.capability_tool_calling = None,
+            ProviderSettingId::CapabilityReasoning => self.capability_reasoning = None,
+            ProviderSettingId::CapabilityStructuredOutputs => {
+                self.capability_structured_outputs = None
+            }
+            ProviderSettingId::CapabilityContextTokens => self.capability_context_tokens = None,
+            ProviderSettingId::CapabilityMaxOutputTokens => {
+                self.capability_max_output_tokens = None
+            }
             ProviderSettingId::AutoCompactPct
             | ProviderSettingId::AutoPrunePct
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present = false,
@@ -900,6 +1040,24 @@ impl SettingsEditor {
                     None => Some(true),
                 };
             }
+            ProviderSettingId::CapabilityImages => {
+                self.capability_images = match self.capability_images {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                };
+            }
+            ProviderSettingId::CapabilityTools => {
+                self.capability_tool_calling =
+                    cycle_capability_status(self.capability_tool_calling);
+            }
+            ProviderSettingId::CapabilityReasoning => {
+                self.capability_reasoning = cycle_capability_status(self.capability_reasoning);
+            }
+            ProviderSettingId::CapabilityStructuredOutputs => {
+                self.capability_structured_outputs =
+                    cycle_capability_status(self.capability_structured_outputs);
+            }
             ProviderSettingId::CacheMode => {
                 self.cache.mode = match self.cache.mode {
                     CacheMode::None => CacheMode::Ephemeral,
@@ -978,6 +1136,16 @@ impl SettingsEditor {
         let current = match field {
             ProviderSettingId::QualityRank => self.quality_rank.unwrap_or(0).to_string(),
             ProviderSettingId::CostRank => self.cost_rank.unwrap_or(0).to_string(),
+            ProviderSettingId::CapabilityContextTokens => self
+                .capability_context_tokens
+                .or(self.detected_capabilities.context_tokens)
+                .unwrap_or(0)
+                .to_string(),
+            ProviderSettingId::CapabilityMaxOutputTokens => self
+                .capability_max_output_tokens
+                .or(self.detected_capabilities.max_output_tokens)
+                .unwrap_or(0)
+                .to_string(),
             ProviderSettingId::AutoCompactPct => self.context.auto_compact_pct.to_string(),
             ProviderSettingId::AutoPrunePct => self.context.auto_prune_pct.to_string(),
             ProviderSettingId::AutoPrunePrunablePct => {
@@ -1100,6 +1268,12 @@ impl SettingsEditor {
             }
         };
         match field {
+            ProviderSettingId::CapabilityContextTokens => {
+                self.capability_context_tokens = u32::try_from(parsed).ok();
+            }
+            ProviderSettingId::CapabilityMaxOutputTokens => {
+                self.capability_max_output_tokens = u32::try_from(parsed).ok();
+            }
             ProviderSettingId::AutoCompactPct => {
                 self.context.auto_compact_pct = parsed.min(100) as u8;
                 self.mark_present(field);
@@ -1320,6 +1494,12 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     m.cost_rank = e.cost_rank;
     m.subagent_invokable = e.subagent_invokable;
     m.system_prompt = e.system_prompt.clone();
+    m.capability_overrides.tool_calling = e.capability_tool_calling;
+    m.capability_overrides.images = e.capability_images;
+    m.capability_overrides.context_tokens = e.capability_context_tokens;
+    m.capability_overrides.max_output_tokens = e.capability_max_output_tokens;
+    m.capability_overrides.reasoning = e.capability_reasoning;
+    m.capability_overrides.structured_outputs = e.capability_structured_outputs;
     m.inline_think = e.inline_think;
     m.hint_tool_call_corrections = e.hint_tool_call_corrections;
     if e.show_xai_multi_agent_tools_beta {
@@ -1332,6 +1512,106 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
         } else {
             ClientSideToolsCapability::default()
         };
+    }
+}
+
+fn detected_model_capabilities(
+    entry: &ProviderEntry,
+    model: &ModelEntry,
+) -> DetectedCapabilityPreview {
+    let provider_caps = &entry.capabilities;
+    let model_caps = &model.capabilities;
+    let status = |model_status: CapabilityStatus, provider_status: CapabilityStatus| {
+        if model_status.is_unknown() {
+            provider_status
+        } else {
+            model_status
+        }
+    };
+    let reasoning = status(model_caps.reasoning, provider_caps.reasoning);
+    let reasoning = if reasoning.is_unknown()
+        && (!model.thinking_modes.is_empty()
+            || model
+                .capabilities
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(|cap| !cap.values.is_empty()))
+    {
+        CapabilityStatus::Supported
+    } else {
+        reasoning
+    };
+    DetectedCapabilityPreview {
+        tool_calling: status(model_caps.tool_calling, provider_caps.tool_calling),
+        images: model_caps
+            .images
+            .or(provider_caps.images)
+            .or_else(|| model.inputs.as_ref()?.images),
+        context_tokens: model_caps
+            .context_tokens
+            .or(provider_caps.context_tokens)
+            .or(model.context_length),
+        max_output_tokens: model_caps
+            .max_output_tokens
+            .or(provider_caps.max_output_tokens),
+        reasoning,
+        structured_outputs: status(
+            model_caps.structured_outputs,
+            provider_caps.structured_outputs,
+        ),
+    }
+}
+
+fn capability_status_label(
+    override_value: Option<CapabilityStatus>,
+    detected: CapabilityStatus,
+) -> String {
+    match override_value {
+        Some(CapabilityStatus::Supported) => "supported".to_string(),
+        Some(CapabilityStatus::Unsupported) => "unsupported".to_string(),
+        Some(CapabilityStatus::RequiresEntitlement) => "requires entitlement".to_string(),
+        Some(CapabilityStatus::Unknown) | None => {
+            format!("auto: {}", capability_status_word(detected))
+        }
+    }
+}
+
+fn capability_status_word(status: CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Supported => "supported",
+        CapabilityStatus::Unsupported => "unsupported",
+        CapabilityStatus::RequiresEntitlement => "requires entitlement",
+        CapabilityStatus::Unknown => "unknown",
+    }
+}
+
+fn capability_bool_label(override_value: Option<bool>, detected: Option<bool>) -> String {
+    match override_value {
+        Some(true) => "supported".to_string(),
+        Some(false) => "unsupported".to_string(),
+        None => match detected {
+            Some(true) => "auto: supported".to_string(),
+            Some(false) => "auto: unsupported".to_string(),
+            None => "auto: unknown".to_string(),
+        },
+    }
+}
+
+fn capability_number_label(override_value: Option<u32>, detected: Option<u32>) -> String {
+    match override_value {
+        Some(value) => value.to_string(),
+        None => detected
+            .map(|value| format!("auto: {value}"))
+            .unwrap_or_else(|| "auto: unknown".to_string()),
+    }
+}
+
+fn cycle_capability_status(value: Option<CapabilityStatus>) -> Option<CapabilityStatus> {
+    match value {
+        None => Some(CapabilityStatus::Supported),
+        Some(CapabilityStatus::Supported) => Some(CapabilityStatus::Unsupported),
+        Some(CapabilityStatus::Unsupported) => None,
+        Some(CapabilityStatus::RequiresEntitlement | CapabilityStatus::Unknown) => None,
     }
 }
 
@@ -1462,6 +1742,7 @@ mod tests {
             wire_api: Default::default(),
             extra: Default::default(),
             capabilities: Default::default(),
+            capability_overrides: Default::default(),
             provider_metadata: Default::default(),
         });
         entry
@@ -1755,7 +2036,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 20);
+        assert_eq!(e.field_count(), 26);
         assert_eq!(
             *e.fields().last().unwrap(),
             ProviderSettingId::HintToolCallCorrections
@@ -2140,6 +2421,54 @@ mod tests {
     }
 
     #[test]
+    fn model_capability_overrides_show_auto_and_reset_to_detection() {
+        let mut entry = provider_with_model();
+        entry.models[0].capabilities.images = Some(true);
+        entry.models[0].capabilities.context_tokens = Some(100_000);
+        entry.models[0].capabilities.tool_calling = CapabilityStatus::Unsupported;
+
+        let mut e = SettingsEditor::for_model("p", &entry, "m1");
+        assert_eq!(
+            e.value_str(ProviderSettingId::CapabilityImages),
+            "auto: supported"
+        );
+        assert_eq!(
+            e.value_str(ProviderSettingId::CapabilityContextTokens),
+            "auto: 100000"
+        );
+        assert!(!e.is_overridden(ProviderSettingId::CapabilityImages));
+
+        e.cursor = e
+            .fields()
+            .iter()
+            .position(|f| *f == ProviderSettingId::CapabilityImages)
+            .unwrap();
+        e.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            e.value_str(ProviderSettingId::CapabilityImages),
+            "supported"
+        );
+        assert!(e.is_overridden(ProviderSettingId::CapabilityImages));
+
+        e.handle_key(press(KeyCode::Char('x')));
+        assert_eq!(
+            e.value_str(ProviderSettingId::CapabilityImages),
+            "auto: supported"
+        );
+        assert!(!e.is_overridden(ProviderSettingId::CapabilityImages));
+
+        e.commit_text(ProviderSettingId::CapabilityContextTokens, "250000")
+            .unwrap();
+        let mut written = entry.clone();
+        e.write_into(&mut written);
+        assert_eq!(
+            written.models[0].capability_overrides.context_tokens,
+            Some(250_000)
+        );
+        assert_eq!(written.models[0].capability_overrides.images, None);
+    }
+
+    #[test]
     fn non_xai_settings_preserve_generic_client_side_tool_capabilities() {
         let mut entry = provider_with_model();
         entry.capabilities.client_side_tools = ClientSideToolsCapability {
@@ -2288,6 +2617,12 @@ mod tests {
             (CostRank, false, false, false, false),
             (SubagentInvokable, false, false, false, false),
             (SystemPrompt, false, true, false, false),
+            (CapabilityImages, false, true, false, false),
+            (CapabilityTools, false, true, false, false),
+            (CapabilityReasoning, false, true, false, false),
+            (CapabilityStructuredOutputs, false, true, false, false),
+            (CapabilityContextTokens, false, true, false, false),
+            (CapabilityMaxOutputTokens, false, true, false, false),
             (AutoCompactPct, false, false, false, false),
             (AutoPruneEnabled, false, false, false, false),
             (AutoPrunePct, false, false, false, false),

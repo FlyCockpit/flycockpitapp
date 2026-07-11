@@ -2485,6 +2485,7 @@ mod tests {
                     wire_api: Default::default(),
                     extra: Default::default(),
                     capabilities: Default::default(),
+                    capability_overrides: Default::default(),
                     provider_metadata: Default::default(),
                 })
                 .collect(),
@@ -2568,6 +2569,7 @@ mod tests {
                     wire_api: Default::default(),
                     extra: Default::default(),
                     capabilities: Default::default(),
+                    capability_overrides: Default::default(),
                     provider_metadata: Default::default(),
                 },
                 ModelEntry {
@@ -2599,6 +2601,7 @@ mod tests {
                     wire_api: Default::default(),
                     extra: Default::default(),
                     capabilities: Default::default(),
+                    capability_overrides: Default::default(),
                     provider_metadata: Default::default(),
                 },
             ],
@@ -3995,6 +3998,7 @@ mod tests {
                 wire_api: Default::default(),
                 extra: Default::default(),
                 capabilities: Default::default(),
+                capability_overrides: Default::default(),
                 provider_metadata: Default::default(),
             });
         } else {

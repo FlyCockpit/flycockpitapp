@@ -662,15 +662,10 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 extra.insert(k.clone(), v.clone());
             }
 
-            // Several OpenAI-compat providers (OpenRouter, llamafile,
-            // some self-hosted shims) include `context_length`. Pick
-            // it up here so `/fetch-models` populates the field
-            // automatically. `max_tokens` is the alt name a few use.
-            let context_length = obj
-                .get("context_length")
-                .or_else(|| obj.get("max_tokens"))
-                .and_then(Value::as_u64)
-                .and_then(|n| u32::try_from(n).ok());
+            // Several providers include a request context window under
+            // different names. Keep `context_length` in sync with the typed
+            // capability projection so legacy context consumers still work.
+            let context_length = context_tokens_from_metadata(obj);
 
             Some(ModelEntry {
                 id,
@@ -704,6 +699,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 wire_api: Default::default(),
                 extra: extra.clone(),
                 capabilities,
+                capability_overrides: Default::default(),
                 provider_metadata: extra,
             })
         })
@@ -711,45 +707,179 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
 }
 
 fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> ModelCapabilities {
-    let context_tokens = obj
-        .get("context_length")
-        .or_else(|| obj.get("max_tokens"))
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok());
-    let images = obj
-        .get("inputs")
-        .and_then(Value::as_object)
-        .and_then(|inputs| inputs.get("images"))
-        .and_then(Value::as_bool);
     ModelCapabilities {
-        tool_calling: capability_status_from_metadata(obj, "tool_calling"),
-        images,
-        context_tokens,
-        reasoning: capability_status_from_metadata(obj, "reasoning"),
-        structured_outputs: capability_status_from_metadata(obj, "structured_outputs"),
+        tool_calling: capability_status_from_metadata(
+            obj,
+            "tool_calling",
+            &["tools", "tool_choice", "functions", "function_calling"],
+        ),
+        images: images_from_metadata(obj),
+        context_tokens: context_tokens_from_metadata(obj),
+        max_output_tokens: max_output_tokens_from_metadata(obj),
+        reasoning: capability_status_from_metadata(
+            obj,
+            "reasoning",
+            &["reasoning", "reasoning_effort", "include_reasoning"],
+        ),
+        structured_outputs: capability_status_from_metadata(
+            obj,
+            "structured_outputs",
+            &[
+                "structured_outputs",
+                "response_format",
+                "json_schema",
+                "json_schema_response_format",
+            ],
+        ),
         reasoning_effort: reasoning_effort_capability_from_metadata(obj),
         client_side_tools: client_side_tools_capability_from_metadata(obj).unwrap_or_default(),
     }
 }
 
-fn capability_status_from_metadata(obj: &Map<String, Value>, key: &str) -> CapabilityStatus {
+fn context_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
+    numeric_field(obj, "max_input_tokens")
+        .or_else(|| numeric_field(obj, "context_length"))
+        .or_else(|| nested_numeric_field(obj, &["top_provider", "context_length"]))
+        .or_else(|| nested_numeric_field(obj, &["limit", "context"]))
+        .or_else(|| numeric_field(obj, "max_context_tokens"))
+        .or_else(|| numeric_field(obj, "max_tokens"))
+}
+
+fn max_output_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
+    numeric_field(obj, "max_output_tokens")
+        .or_else(|| numeric_field(obj, "output_token_limit"))
+        .or_else(|| numeric_field(obj, "max_tokens"))
+}
+
+fn numeric_field(obj: &Map<String, Value>, key: &str) -> Option<u32> {
+    u32_from_value(obj.get(key)?)
+}
+
+fn nested_numeric_field(obj: &Map<String, Value>, path: &[&str]) -> Option<u32> {
+    let mut current = obj.get(*path.first()?)?;
+    for key in &path[1..] {
+        current = current.as_object()?.get(*key)?;
+    }
+    u32_from_value(current)
+}
+
+fn u32_from_value(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+        Value::String(s) => s.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+fn images_from_metadata(obj: &Map<String, Value>) -> Option<bool> {
+    if let Some(images) = obj
+        .get("inputs")
+        .and_then(Value::as_object)
+        .and_then(|inputs| inputs.get("images"))
+        .and_then(Value::as_bool)
+    {
+        return Some(images);
+    }
+    let input_modalities = obj
+        .get("architecture")
+        .and_then(Value::as_object)
+        .and_then(|architecture| architecture.get("input_modalities"))
+        .or_else(|| obj.get("input_modalities"))
+        .or_else(|| obj.get("inputModalities"));
+    modality_list_contains(input_modalities, "image").then_some(true)
+}
+
+fn modality_list_contains(value: Option<&Value>, needle: &str) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| string_value_eq(value, needle)))
+}
+
+fn capability_status_from_metadata(
+    obj: &Map<String, Value>,
+    key: &str,
+    supported_parameters: &[&str],
+) -> CapabilityStatus {
     let camel = snake_to_camel(key);
     let raw = obj.get(key).or_else(|| obj.get(&camel)).or_else(|| {
         obj.get("capabilities")
             .and_then(Value::as_object)
             .and_then(|capabilities| capabilities.get(key).or_else(|| capabilities.get(&camel)))
     });
+    let parsed = raw
+        .map(capability_status_from_value)
+        .unwrap_or(CapabilityStatus::Unknown);
+    if !parsed.is_unknown() {
+        return parsed;
+    }
+    supported_parameters_status(obj, supported_parameters)
+}
+
+fn capability_status_from_value(raw: &Value) -> CapabilityStatus {
     match raw {
-        Some(Value::Bool(true)) => CapabilityStatus::Supported,
-        Some(Value::Bool(false)) => CapabilityStatus::Unsupported,
-        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
-            "supported" | "true" | "yes" => CapabilityStatus::Supported,
-            "unsupported" | "false" | "no" => CapabilityStatus::Unsupported,
-            "requires_entitlement" | "entitlement" => CapabilityStatus::RequiresEntitlement,
-            _ => CapabilityStatus::Unknown,
-        },
+        Value::Bool(true) => CapabilityStatus::Supported,
+        Value::Bool(false) => CapabilityStatus::Unsupported,
+        Value::String(s) => capability_status_from_str(s),
+        Value::Object(obj) => obj
+            .get("supported")
+            .and_then(Value::as_bool)
+            .map(|supported| {
+                if supported {
+                    CapabilityStatus::Supported
+                } else {
+                    CapabilityStatus::Unsupported
+                }
+            })
+            .or_else(|| {
+                obj.get("status")
+                    .or_else(|| obj.get("state"))
+                    .or_else(|| obj.get("support"))
+                    .and_then(Value::as_str)
+                    .map(capability_status_from_str)
+            })
+            .unwrap_or(CapabilityStatus::Unknown),
         _ => CapabilityStatus::Unknown,
     }
+}
+
+fn capability_status_from_str(raw: &str) -> CapabilityStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "supported" | "support" | "available" | "enabled" | "true" | "yes" => {
+            CapabilityStatus::Supported
+        }
+        "unsupported" | "not_supported" | "unavailable" | "disabled" | "false" | "no" => {
+            CapabilityStatus::Unsupported
+        }
+        "requires_entitlement"
+        | "requires entitlement"
+        | "entitlement"
+        | "entitlement_required" => CapabilityStatus::RequiresEntitlement,
+        _ => CapabilityStatus::Unknown,
+    }
+}
+
+fn supported_parameters_status(obj: &Map<String, Value>, keys: &[&str]) -> CapabilityStatus {
+    let Some(raw) = obj.get("supported_parameters") else {
+        return CapabilityStatus::Unknown;
+    };
+    let supported = match raw {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| keys.iter().any(|key| string_value_eq(value, key))),
+        Value::Object(map) => keys.iter().any(|key| map.contains_key(*key)),
+        _ => false,
+    };
+    if supported {
+        CapabilityStatus::Supported
+    } else {
+        CapabilityStatus::Unknown
+    }
+}
+
+fn string_value_eq(value: &Value, expected: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case(expected))
 }
 
 fn snake_to_camel(key: &str) -> String {
@@ -1214,6 +1344,68 @@ mod tests {
                 .get("owned_by")
                 .and_then(serde_json::Value::as_str),
             Some("provider")
+        );
+    }
+
+    #[test]
+    fn parses_openrouter_architecture_and_supported_parameters() {
+        let body = r#"{"data":[{
+            "id":"openai/gpt-4.1",
+            "architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},
+            "supported_parameters":["tools","reasoning","response_format"],
+            "top_provider":{"context_length":1048576}
+        }]}"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = &entries[0];
+        assert_eq!(model.context_length, Some(1_048_576));
+        assert_eq!(model.capabilities.context_tokens, Some(1_048_576));
+        assert_eq!(model.capabilities.images, Some(true));
+        assert_eq!(model.capabilities.tool_calling, CapabilityStatus::Supported);
+        assert_eq!(model.capabilities.reasoning, CapabilityStatus::Supported);
+        assert_eq!(
+            model.capabilities.structured_outputs,
+            CapabilityStatus::Supported
+        );
+    }
+
+    #[test]
+    fn output_only_image_modality_does_not_enable_image_input() {
+        let body = r#"{"data":[{
+            "id":"image-generator",
+            "architecture":{"input_modalities":["text"],"output_modalities":["image"]},
+            "limit":{"context":32768}
+        }]}"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = &entries[0];
+        assert_eq!(model.capabilities.images, None);
+        assert_eq!(model.capabilities.context_tokens, Some(32_768));
+    }
+
+    #[test]
+    fn parses_anthropic_token_fields_and_object_capabilities() {
+        let body = r#"{"data":[{
+            "id":"claude-sonnet-4-7-20260701",
+            "max_input_tokens":200000,
+            "max_tokens":64000,
+            "capabilities":{
+                "tool_calling":{"supported":true},
+                "reasoning":{"supported":true},
+                "structured_outputs":{"supported":false}
+            }
+        }]}"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = &entries[0];
+        assert_eq!(model.context_length, Some(200_000));
+        assert_eq!(model.capabilities.context_tokens, Some(200_000));
+        assert_eq!(model.capabilities.max_output_tokens, Some(64_000));
+        assert_eq!(model.capabilities.tool_calling, CapabilityStatus::Supported);
+        assert_eq!(model.capabilities.reasoning, CapabilityStatus::Supported);
+        assert_eq!(
+            model.capabilities.structured_outputs,
+            CapabilityStatus::Unsupported
         );
     }
 

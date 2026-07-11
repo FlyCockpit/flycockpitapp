@@ -3091,6 +3091,7 @@ fn install_test_providers(
         wire_api: Default::default(),
         extra: Default::default(),
         capabilities: Default::default(),
+        capability_overrides: Default::default(),
         provider_metadata: Default::default(),
     });
     let mut providers = std::collections::BTreeMap::new();
@@ -3449,6 +3450,7 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
         wire_api: Default::default(),
         extra: Default::default(),
         capabilities: Default::default(),
+        capability_overrides: Default::default(),
         provider_metadata: Default::default(),
     });
     let mut providers = std::collections::BTreeMap::new();

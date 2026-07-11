@@ -1881,8 +1881,8 @@ impl App {
         // otherwise. `paste_images` are the ordered PNG payloads; the
         // sentinel markers in `paste_wire` mark where each lands. Done
         // first (offsets index the untrimmed buffer) and gated on the
-        // active model's `inputs.images` at *this* send time — a `/model`
-        // switch since paste round-trips the same blocks differently.
+        // active model's resolved image capability at *this* send time — a
+        // `/model` switch since paste round-trips the same blocks differently.
         let vision = self.active_model_supports_images();
         let (paste_wire, paste_images) =
             self.paste_registry.build_wire(self.composer.text(), vision);
@@ -2576,9 +2576,9 @@ impl App {
         }
     }
 
-    /// Whether the active model accepts real image parts
-    /// (`inputs.images: true`). Recomputed by `reload_launch_info` after a
-    /// `/model` switch, so images round-trip without a re-paste.
+    /// Whether the active model accepts real image parts. Recomputed by
+    /// `reload_launch_info` after a `/model` switch, so images round-trip
+    /// without a re-paste.
     pub(super) fn active_model_supports_images(&self) -> bool {
         self.launch.active_model_supports_images
     }

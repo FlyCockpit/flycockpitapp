@@ -120,6 +120,141 @@ fn resolve_reasoning_effort_params_uses_native_mapping_and_default() {
 }
 
 #[test]
+fn resolve_capabilities_applies_model_overrides_after_detection() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "p".into(),
+        ProviderEntry {
+            capabilities: ProviderCapabilities {
+                images: Some(false),
+                context_tokens: Some(100_000),
+                max_output_tokens: Some(8_000),
+                tool_calling: CapabilityStatus::Unsupported,
+                structured_outputs: CapabilityStatus::Unsupported,
+                ..ProviderCapabilities::default()
+            },
+            models: vec![ModelEntry {
+                id: "m".into(),
+                capabilities: ModelCapabilities {
+                    images: Some(false),
+                    context_tokens: Some(200_000),
+                    max_output_tokens: Some(16_000),
+                    tool_calling: CapabilityStatus::Unsupported,
+                    structured_outputs: CapabilityStatus::Unsupported,
+                    ..ModelCapabilities::default()
+                },
+                capability_overrides: ModelCapabilityOverrides {
+                    images: Some(true),
+                    context_tokens: Some(300_000),
+                    max_output_tokens: Some(32_000),
+                    tool_calling: Some(CapabilityStatus::Supported),
+                    structured_outputs: Some(CapabilityStatus::Supported),
+                    ..ModelCapabilityOverrides::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+
+    let caps = cfg.resolve_capabilities("p", "m");
+    assert_eq!(caps.images, Some(true));
+    assert_eq!(caps.context_tokens, Some(300_000));
+    assert_eq!(caps.max_output_tokens, Some(32_000));
+    assert_eq!(caps.tool_calling, CapabilityStatus::Supported);
+    assert_eq!(caps.structured_outputs, CapabilityStatus::Supported);
+}
+
+#[test]
+fn merge_refresh_preserves_overrides_but_not_stale_detected_capabilities() {
+    let mut existing = model("mimo-v2.5", false);
+    existing.capabilities.images = Some(false);
+    existing.capability_overrides.images = Some(true);
+
+    let mut fetched = model("mimo-v2.5", false);
+    fetched.capabilities.images = Some(false);
+    fetched.capabilities.context_tokens = Some(1_000_000);
+
+    let merged = merge_fetched_models_with_policy(
+        Some("xiaomi-mimo"),
+        &[existing],
+        vec![fetched],
+        ModelMergePolicy::KeepUnlisted,
+    );
+
+    assert_eq!(merged[0].capabilities.images, Some(false));
+    assert_eq!(merged[0].capabilities.context_tokens, Some(1_000_000));
+    assert_eq!(merged[0].capability_overrides.images, Some(true));
+}
+
+#[test]
+fn first_class_defaults_apply_only_to_matching_templates() {
+    let mut deepseek = model("deepseek-reasoner", false);
+    apply_template_model_defaults(Some("deepseek"), &mut deepseek);
+    assert_eq!(deepseek.capabilities.reasoning, CapabilityStatus::Supported);
+    assert_eq!(deepseek.capabilities.context_tokens, Some(64_000));
+
+    let mut minimax_m3 = model("minimax-m3", false);
+    apply_template_model_defaults(Some("minimax"), &mut minimax_m3);
+    assert_eq!(minimax_m3.capabilities.images, Some(true));
+    assert_eq!(minimax_m3.capabilities.context_tokens, Some(1_000_000));
+
+    let mut minimax_m2 = model("MiniMax-M2", false);
+    apply_template_model_defaults(Some("minimax"), &mut minimax_m2);
+    assert_eq!(minimax_m2.capabilities.context_tokens, Some(204_800));
+    assert_eq!(
+        minimax_m2.capabilities.reasoning,
+        CapabilityStatus::Supported
+    );
+
+    let mut grok = model("grok-4.5", false);
+    apply_template_model_defaults(Some("grok"), &mut grok);
+    assert_eq!(grok.capabilities.context_tokens, Some(500_000));
+    assert_eq!(grok.capabilities.tool_calling, CapabilityStatus::Supported);
+
+    let mut grok_imagine = model("grok-4-imagine", false);
+    apply_template_model_defaults(Some("grok"), &mut grok_imagine);
+    assert!(grok_imagine.capabilities.is_empty());
+
+    let mut zai = model("glm-5.2", false);
+    apply_template_model_defaults(Some("z-ai"), &mut zai);
+    assert_eq!(zai.capabilities.context_tokens, Some(1_000_000));
+    assert_eq!(zai.capabilities.max_output_tokens, Some(128_000));
+
+    let mut mimo = model("mimo-v2.5", false);
+    apply_template_model_defaults(Some("xiaomi-mimo"), &mut mimo);
+    assert_eq!(mimo.capabilities.images, Some(true));
+    assert_eq!(mimo.capabilities.context_tokens, Some(1_000_000));
+    assert_eq!(mimo.capabilities.reasoning, CapabilityStatus::Supported);
+
+    let mut pro = model("mimo-v2.5-pro", false);
+    apply_template_model_defaults(Some("xiaomi-mimo"), &mut pro);
+    assert_eq!(pro.capabilities.images, None);
+    assert_eq!(pro.capabilities.context_tokens, Some(1_000_000));
+
+    let mut zen = model("kimi-k2.7-code", false);
+    apply_template_model_defaults(Some("opencode-zen"), &mut zen);
+    assert_eq!(zen.capabilities.context_tokens, Some(256_000));
+    assert_eq!(zen.capabilities.tool_calling, CapabilityStatus::Supported);
+
+    let mut openai = model("gpt-4o", false);
+    apply_template_model_defaults(Some("openai"), &mut openai);
+    assert_eq!(openai.capabilities.images, Some(true));
+    assert_eq!(
+        openai.capabilities.structured_outputs,
+        CapabilityStatus::Supported
+    );
+
+    let mut generic = model("mimo-v2.5", false);
+    apply_template_model_defaults(Some("openai-compatible"), &mut generic);
+    assert!(generic.capabilities.is_empty());
+
+    let mut copilot = model("gpt-4o", false);
+    apply_template_model_defaults(Some("copilot"), &mut copilot);
+    assert!(copilot.capabilities.is_empty());
+}
+
+#[test]
 fn fallback_models_without_effort_values_do_not_resolve_reasoning_params() {
     let mut cfg = ProvidersConfig::default();
     cfg.providers.insert(

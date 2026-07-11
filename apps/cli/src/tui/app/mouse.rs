@@ -1141,6 +1141,40 @@ mod affordance_hover_tests {
     }
 
     #[test]
+    fn wheel_over_at_suggestions_scrolls_window_not_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "alpha.rs",
+            "beta.rs",
+            "gamma.rs",
+            "delta.rs",
+            "epsilon.rs",
+            "zeta.rs",
+            "eta.rs",
+            "theta.rs",
+            "iota.rs",
+        ] {
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.composer.set("@".to_string());
+        app.reset_at_window();
+        assert!(app.at_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
+        app.suggestion_box_area = Some(Rect::new(0, 5, 80, 8));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 6,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.at_selected, 0);
+        assert_eq!(app.at_scroll, 1);
+    }
+
+    #[test]
     fn click_slash_suggestion_completes_without_dispatching() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);

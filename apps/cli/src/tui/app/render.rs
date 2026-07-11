@@ -2416,7 +2416,7 @@ impl App {
             self.slash_selected.min(total.saturating_sub(1)),
             self.slash_scroll,
         );
-        list.clamp_windowed(total, window);
+        list.clamp_scroll(total, window);
         let selected = list.cursor();
         let offset = list.scroll();
         let name_w = matches.iter().map(|c| c.name().len()).max().unwrap_or(0);
@@ -2482,7 +2482,7 @@ impl App {
             self.at_selected.min(suggestions.len().saturating_sub(1)),
             self.at_scroll,
         );
-        list.clamp_windowed(suggestions.len(), window);
+        list.clamp_scroll(suggestions.len(), window);
         let selected = list.cursor();
         let offset = list.scroll();
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -3818,6 +3818,97 @@ mod slash_popup_full_list_tests {
         assert_eq!(filled_rows, AUTOCOMPLETE_ROWS as usize);
         assert!(scrollbar_cells > 0, "scrollbar thumb should render");
         assert_eq!(app.suggestion_row_hits.len(), AUTOCOMPLETE_ROWS as usize);
+    }
+
+    #[test]
+    fn slash_popup_render_keeps_wheel_scrolled_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+        assert!(app.slash_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
+
+        app.scroll_slash_window_by(1);
+        assert_eq!(app.slash_selected, 0);
+        assert_eq!(app.slash_scroll, 1);
+
+        let height = AUTOCOMPLETE_ROWS + 2;
+        let backend = TestBackend::new(100, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
+            })
+            .unwrap();
+
+        assert_eq!(app.suggestion_row_hits[0].target.index, 1);
+        assert!(
+            !app.suggestion_row_hits
+                .iter()
+                .any(|hit| hit.target.index == app.slash_selected)
+        );
+    }
+
+    #[test]
+    fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "alpha.rs",
+            "beta.rs",
+            "gamma.rs",
+            "delta.rs",
+            "epsilon.rs",
+            "zeta.rs",
+            "eta.rs",
+            "theta.rs",
+            "iota.rs",
+        ] {
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("@".to_string());
+        app.reset_at_window();
+        let total = app.at_suggestions().len();
+        assert!(total > AUTOCOMPLETE_ROWS as usize);
+
+        app.scroll_at_window_by(1);
+        assert_eq!(app.at_selected, 0);
+        assert_eq!(app.at_scroll, 1);
+
+        let height = AUTOCOMPLETE_ROWS + 2;
+        let backend = TestBackend::new(100, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
+            })
+            .unwrap();
+
+        assert_eq!(app.suggestion_row_hits[0].target.index, 1);
+        assert!(
+            !app.suggestion_row_hits
+                .iter()
+                .any(|hit| hit.target.index == app.at_selected)
+        );
+
+        app.at_scroll = usize::MAX;
+        terminal
+            .draw(|frame| {
+                app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
+            })
+            .unwrap();
+        assert_eq!(
+            app.suggestion_row_hits[0].target.index,
+            total - AUTOCOMPLETE_ROWS as usize
+        );
+
+        app.composer.set("@alpha".to_string());
+        terminal
+            .draw(|frame| {
+                app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
+            })
+            .unwrap();
+        assert_eq!(app.suggestion_row_hits[0].target.index, 0);
     }
 
     #[test]

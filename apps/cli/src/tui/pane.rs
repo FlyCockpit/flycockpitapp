@@ -82,14 +82,22 @@ impl ScrollList {
         self.scroll = crate::tui::nav::windowed_scroll(self.cursor, self.scroll, len, viewport);
     }
 
+    pub(crate) fn clamp_scroll(&mut self, len: usize, viewport: usize) {
+        self.scroll_window_by(0, len, viewport);
+    }
+
     pub(crate) fn scroll_window_by(&mut self, delta: isize, len: usize, viewport: usize) {
         if len <= viewport || viewport == 0 {
             self.scroll = 0;
             return;
         }
         let max_scroll = len - viewport;
-        let next = self.scroll as isize + delta;
-        self.scroll = next.clamp(0, max_scroll as isize) as usize;
+        self.scroll = if delta < 0 {
+            self.scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll.saturating_add(delta as usize)
+        }
+        .min(max_scroll);
     }
 
     pub(crate) fn clamp_visible_span(

@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn sync_code_is_not_on_driver_hot_path() {
-        let driver = include_str!("../engine/driver.rs");
+        let driver = include_str!("../engine/driver/mod.rs");
         assert!(!driver.contains("org_sync"));
         assert!(!driver.contains("session-log sync"));
     }

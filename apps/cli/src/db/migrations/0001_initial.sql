@@ -334,6 +334,7 @@ CREATE TABLE intel_files (
     language     TEXT NOT NULL,
     mtime_ns     INTEGER NOT NULL,
     size         INTEGER NOT NULL,
+    lines        INTEGER,
     content_hash TEXT NOT NULL,
     indexed_at   INTEGER NOT NULL,
     PRIMARY KEY (root, path)

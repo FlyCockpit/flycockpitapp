@@ -77,10 +77,10 @@ impl Tool for TreeTool {
         let (filter, canonical_args) = tree_filter_path(&args, ctx);
 
         // Indexed files (with symbol counts) keyed by path.
-        let indexed: HashMap<String, (String, i64, i64)> = index
+        let indexed: HashMap<String, (String, i64, Option<i64>, i64)> = index
             .tree_rows()?
             .into_iter()
-            .map(|(p, lang, size, syms)| (p, (lang, size, syms)))
+            .map(|(p, lang, size, lines, syms)| (p, (lang, size, lines, syms)))
             .collect();
 
         // The on-disk gitignore walk is the authority for which files
@@ -89,19 +89,22 @@ impl Tool for TreeTool {
         entries.sort();
 
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
-        for (rel, abs, size) in &entries {
+        for (rel, _abs, size) in &entries {
             if let Some(f) = &filter
                 && !(rel == f || rel.starts_with(&format!("{f}/")))
             {
                 continue;
             }
             let lang = Language::from_path(Path::new(rel));
-            let (lang_str, sym_part) = match indexed.get(rel) {
-                Some((l, _s, syms)) => (l.clone(), format!("[{syms} sym]")),
-                None => (lang.as_str().to_string(), "[not indexed]".to_string()),
+            let line = match indexed.get(rel) {
+                Some((lang_str, _indexed_size, Some(lines), syms)) => {
+                    format!("{rel}  {lang_str} {size}b {lines}L [{syms} sym]")
+                }
+                Some((lang_str, _indexed_size, None, syms)) => {
+                    format!("{rel}  {lang_str} {size}b [large] [{syms} sym]")
+                }
+                None => format!("{rel}  {} {size}b [not indexed]", lang.as_str()),
             };
-            let lines = count_lines(abs);
-            let line = format!("{rel}  {lang_str} {size}b {lines}L {sym_part}");
             if !writer.writeln(&line) {
                 break;
             }

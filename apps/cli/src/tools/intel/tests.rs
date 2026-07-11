@@ -73,6 +73,35 @@ async fn tree_lists_files_including_unknown_language_files() {
 }
 
 #[tokio::test]
+async fn tree_uses_stored_lines_and_marks_large_indexed_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/lib.rs",
+        "pub fn k() {}\nmod inner;\nlast line",
+    );
+    let large_path = tmp.path().join("src/large.rs");
+    std::fs::File::create(&large_path)
+        .unwrap()
+        .set_len(5 * 1024 * 1024)
+        .unwrap();
+    let ctx = test_ctx(tmp.path());
+
+    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+    assert!(
+        tree.content.contains("src/lib.rs  rust 34b 3L"),
+        "{}",
+        tree.content
+    );
+    assert!(
+        tree.content.contains("src/large.rs  rust 5242880b [large]"),
+        "{}",
+        tree.content
+    );
+}
+
+#[tokio::test]
 async fn tree_filter_with_no_matches_reports_files_filter_and_hint() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");

@@ -74,6 +74,7 @@ struct ParsedFile {
     language: Language,
     mtime_ns: i64,
     size: i64,
+    lines: Option<i64>,
     content_hash: String,
     extraction: Extraction,
 }
@@ -94,6 +95,9 @@ pub struct SymbolRow {
 /// Result of [`Index::outline_rows`]: a file's symbols, its `(target,
 /// line)` imports, and its language label.
 pub type OutlineData = (Vec<SymbolRow>, Vec<(String, i64)>, String);
+
+/// One indexed file row for tree-style tools: path, language, size, lines, symbols.
+pub type TreeRow = (String, String, i64, Option<i64>, i64);
 
 /// A dependency edge for `deps` / `circular`.
 #[derive(Debug, Clone)]
@@ -208,17 +212,18 @@ impl Index {
 
     // ---- query methods (each assumes ensure_fresh already ran) --------
 
-    /// All known files for `tree`, ordered by path. `symbol_count` is a
-    /// correlated subquery so indexed-empty (0) differs from not-indexed
-    /// (None via the language/size heuristic at call sites — here every row
-    /// in `intel_files` has been indexed, so count is always `Some`).
-    pub fn tree_rows(&self) -> Result<Vec<(String, String, i64, i64)>> {
+    /// All known files for `tree`, ordered by path. Large files are indexed
+    /// for visibility but carry no stored line count.
+    pub fn tree_rows(&self) -> Result<Vec<TreeRow>> {
         let root_key = self.root_key.clone();
         self.db.read_blocking(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT path, language, size, \
-                 (SELECT COUNT(*) FROM intel_symbols s WHERE s.root = f.root AND s.path = f.path) \
-                 FROM intel_files f WHERE root = ?1 ORDER BY path",
+                "SELECT f.path, f.language, f.size, f.lines, COUNT(s.name) \
+                 FROM intel_files f \
+                 LEFT JOIN intel_symbols s ON s.root = f.root AND s.path = f.path \
+                 WHERE f.root = ?1 \
+                 GROUP BY f.root, f.path, f.language, f.size, f.lines \
+                 ORDER BY f.path",
             )?;
             let rows = stmt
                 .query_map([&root_key], |r| {
@@ -226,7 +231,8 @@ impl Index {
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -760,6 +766,7 @@ fn parse_one(f: &DiskFile) -> Result<Option<ParsedFile>> {
             language: f.language,
             mtime_ns: f.mtime_ns,
             size: f.size,
+            lines: None,
             content_hash: String::new(),
             extraction: Extraction::default(),
         }));
@@ -771,6 +778,7 @@ fn parse_one(f: &DiskFile) -> Result<Option<ParsedFile>> {
     if crate::tools::common::looks_binary(&bytes) {
         return Ok(None);
     }
+    let lines = Some(line_count_bytes(&bytes) as i64);
     let content_hash = hash_bytes(&bytes);
     let extraction = lang::extract(f.language, &bytes).unwrap_or_default();
     Ok(Some(ParsedFile {
@@ -778,6 +786,7 @@ fn parse_one(f: &DiskFile) -> Result<Option<ParsedFile>> {
         language: f.language,
         mtime_ns: f.mtime_ns,
         size: f.size,
+        lines,
         content_hash,
         extraction,
     }))
@@ -798,8 +807,8 @@ fn write_chunk(
     {
         let mut del = tx.prepare("DELETE FROM intel_files WHERE root = ?1 AND path = ?2")?;
         let mut ins_file = tx.prepare(
-            "INSERT INTO intel_files (root, path, language, mtime_ns, size, content_hash, indexed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO intel_files (root, path, language, mtime_ns, size, lines, content_hash, indexed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         let mut ins_sym = tx.prepare(
             "INSERT INTO intel_symbols (root, path, name, kind, line, end_line, parent, visibility, signature) \
@@ -828,6 +837,7 @@ fn write_chunk(
                 p.language.as_str(),
                 p.mtime_ns,
                 p.size,
+                p.lines,
                 p.content_hash,
                 now
             ])?;
@@ -872,6 +882,18 @@ fn write_chunk(
 }
 
 // ---- small helpers ---------------------------------------------------------
+
+fn line_count_bytes(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let nl = bytes.iter().filter(|&&c| c == b'\n').count();
+    if bytes.last() == Some(&b'\n') {
+        nl
+    } else {
+        nl + 1
+    }
+}
 
 fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -968,11 +990,33 @@ mod tests {
 
         assert_eq!(parsed.rel, "huge.rs");
         assert_eq!(parsed.size, (LARGE_FILE_BYTES + 1) as i64);
+        assert!(parsed.lines.is_none());
         assert!(parsed.content_hash.is_empty());
         assert!(parsed.extraction.symbols.is_empty());
         assert!(parsed.extraction.imports.is_empty());
         assert!(parsed.extraction.identifiers.is_empty());
         assert!(parsed.extraction.callsites.is_empty());
+    }
+
+    #[test]
+    fn parse_one_stores_count_lines_semantics_for_indexed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lines.rs");
+        let body = b"pub fn one() {}\npub fn two() {}\npartial";
+        std::fs::write(&path, body).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let file = DiskFile {
+            rel: "lines.rs".to_string(),
+            language: Language::Rust,
+            mtime_ns: mtime_ns(&meta),
+            size: meta.len() as i64,
+            abs: path,
+        };
+
+        let parsed = parse_one(&file).unwrap().unwrap();
+
+        assert_eq!(parsed.lines, Some(line_count_bytes(body) as i64));
+        assert_eq!(parsed.lines, Some(3));
     }
 
     fn count_rows(db: &Db, table: &str, root_key: &str, path: &str) -> i64 {
@@ -1004,8 +1048,8 @@ mod tests {
         assert_eq!(py.len(), 1, "expected Python class Qux");
 
         let tree = index.tree_rows().unwrap();
-        assert!(tree.iter().any(|(p, _, _, _)| p == "src/lib.rs"));
-        assert!(tree.iter().any(|(p, _, _, _)| p == "app.py"));
+        assert!(tree.iter().any(|(p, _, _, _, _)| p == "src/lib.rs"));
+        assert!(tree.iter().any(|(p, _, _, _, _)| p == "app.py"));
     }
 
     /// A gitignored source file is skipped by the default walk, but

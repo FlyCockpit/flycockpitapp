@@ -11,7 +11,7 @@ pub(super) use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, t
 pub(super) use crate::intel::budget::BudgetedWriter;
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
-pub(super) use crate::intel::{DepEdge, Index, SymbolRow};
+pub(super) use crate::intel::{DepEdge, Index, SymbolRow, TreeRow};
 
 /// Token cap shared by the index tools. `search` uses a larger default
 /// per the spec (4000); structural tools are terser so a tighter cap

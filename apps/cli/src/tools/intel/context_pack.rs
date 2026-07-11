@@ -26,7 +26,7 @@ struct ContextFileMeta {
     path: String,
     language: String,
     size: u64,
-    lines: usize,
+    lines: Option<usize>,
     symbols: i64,
     mtime: Option<std::time::SystemTime>,
     centrality: f64,
@@ -147,13 +147,13 @@ fn parse_context_pack_kind(raw: Option<&str>) -> Result<ContextPackKind> {
 }
 
 fn context_file_meta(
-    tree_rows: &[(String, String, i64, i64)],
+    tree_rows: &[TreeRow],
     fs_files: &[(String, PathBuf, u64)],
     centrality: &HashMap<String, f64>,
 ) -> Vec<ContextFileMeta> {
-    let indexed: HashMap<&str, (&str, i64, i64)> = tree_rows
+    let indexed: HashMap<&str, (&str, i64, Option<i64>, i64)> = tree_rows
         .iter()
-        .map(|(p, lang, size, syms)| (p.as_str(), (lang.as_str(), *size, *syms)))
+        .map(|(p, lang, size, lines, syms)| (p.as_str(), (lang.as_str(), *size, *lines, *syms)))
         .collect();
     let mut ranked: Vec<(&String, &f64)> = centrality.iter().collect();
     ranked.sort_by(|a, b| {
@@ -171,13 +171,21 @@ fn context_file_meta(
     let mut seen = HashSet::new();
     for (rel, abs, fs_size) in fs_files {
         seen.insert(rel.clone());
-        let (language, size, symbols) = indexed
+        let (language, size, lines, symbols) = indexed
             .get(rel.as_str())
-            .map(|(l, s, syms)| ((*l).to_string(), (*s).max(0) as u64, *syms))
+            .map(|(l, s, lines, syms)| {
+                (
+                    (*l).to_string(),
+                    (*s).max(0) as u64,
+                    lines.map(|n| n.max(0) as usize),
+                    *syms,
+                )
+            })
             .unwrap_or_else(|| {
                 (
                     Language::from_path(Path::new(rel)).as_str().to_string(),
                     *fs_size,
+                    Some(0),
                     0,
                 )
             });
@@ -186,14 +194,14 @@ fn context_file_meta(
             path: rel.clone(),
             language,
             size,
-            lines: count_lines(abs),
+            lines,
             symbols,
             mtime: meta.and_then(|m| m.modified().ok()),
             centrality: centrality.get(rel).copied().unwrap_or(0.0),
             centrality_rank: ranks.get(rel.as_str()).copied(),
         });
     }
-    for (path, language, size, symbols) in tree_rows {
+    for (path, language, size, lines, symbols) in tree_rows {
         if seen.contains(path) {
             continue;
         }
@@ -201,7 +209,7 @@ fn context_file_meta(
             path: path.clone(),
             language: language.clone(),
             size: (*size).max(0) as u64,
-            lines: 0,
+            lines: lines.map(|n| n.max(0) as usize),
             symbols: *symbols,
             mtime: None,
             centrality: centrality.get(path).copied().unwrap_or(0.0),
@@ -210,6 +218,18 @@ fn context_file_meta(
     }
     metas.sort_by(|a, b| a.path.cmp(&b.path));
     metas
+}
+
+fn line_count_label(lines: Option<usize>) -> String {
+    lines
+        .map(|value| format!("{value}L"))
+        .unwrap_or_else(|| "[large]".to_string())
+}
+
+fn line_count_value(lines: Option<usize>) -> String {
+    lines
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "[large]".to_string())
 }
 
 fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) -> Option<String> {
@@ -291,7 +311,12 @@ fn context_pack_overview(
         .collect::<Vec<_>>();
     recent.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
     for file in recent.into_iter().take(limit) {
-        if !writer.writeln(&format!("  {}  {}b {}L", file.path, file.size, file.lines)) {
+        if !writer.writeln(&format!(
+            "  {}  {}b {}",
+            file.path,
+            file.size,
+            line_count_label(file.lines)
+        )) {
             return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
         }
     }
@@ -309,8 +334,11 @@ fn context_pack_overview(
     } else {
         for file in symbol_heavy.into_iter().take(limit) {
             if !writer.writeln(&format!(
-                "  {} {} symbols={} {}L",
-                file.path, file.language, file.symbols, file.lines
+                "  {} {} symbols={} {}",
+                file.path,
+                file.language,
+                file.symbols,
+                line_count_label(file.lines)
             )) {
                 return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
             }
@@ -375,7 +403,7 @@ fn context_pack_path(
             &language
         },
         file.size,
-        file.lines,
+        line_count_value(file.lines),
         symbols.len()
     ));
     if let Some(rank) = file.centrality_rank {

@@ -10,11 +10,24 @@
 //! never reach this loop — the user can use `Ctrl+J` as a newline
 //! fallback in the composer.
 
+mod events;
 mod input;
+mod mouse;
 mod pins;
 mod render;
 mod slash;
 
+use events::{
+    GIT_AGENT_TOKEN_CAP, WORKING_MESSAGES, cache_config_caches, cap_display_lines, cap_tokens,
+    exec_capture_git, exec_capture_shell, format_schedule_line, merge_counts, new_pending,
+    parse_llm_mode_arg, sanitize_for_raw_stdout, session_schedule_ids, strip_ansi,
+    turns_from_history, wire_history_to_entries, xml_escape,
+};
+#[cfg(test)]
+use events::{
+    LOCAL_CMD_DISPLAY_LINES, RunCaptureOptions, SubagentReportUpdate, pick_working_msg,
+    run_capture_with_options, settle_subagent_in, tool_invocation,
+};
 use input::accepts_key;
 use render::{extract_selection_markdown_source, extract_selection_plaintext, is_edit_tool};
 #[cfg(test)]
@@ -865,22 +878,6 @@ pub(super) struct AffordanceScrollRegion {
     pub(super) row_end: usize,
     pub(super) offset: usize,
     pub(super) max_offset: usize,
-}
-
-fn resolve_inner_scroll_target(
-    regions: &[AffordanceScrollRegion],
-    row: usize,
-    up: bool,
-) -> Option<AffordanceTarget> {
-    let region = regions
-        .iter()
-        .find(|region| row >= region.row_start && row <= region.row_end)?;
-    let can_scroll = if up {
-        region.offset > 0
-    } else {
-        region.offset < region.max_offset
-    };
-    can_scroll.then_some(region.target)
 }
 
 /// Live network-retry status for the indicator (`Reconnecting` event). Held
@@ -2460,9 +2457,7 @@ impl App {
             preflight_pending: false,
             persist_failed: false,
         });
-        self.history.push(HistoryEntry::Plain {
-            line: "steer queued for next turn boundary".to_string(),
-        });
+        self.push_plain("steer queued for next turn boundary".to_string());
         self.history_render_versions.resize(self.history.len(), 0);
         self.history_render_fingerprints
             .resize(self.history.len(), 0);
@@ -3355,6 +3350,10 @@ impl App {
         });
     }
 
+    pub(super) fn push_plain(&mut self, line: impl Into<String>) {
+        self.history.push(HistoryEntry::Plain { line: line.into() });
+    }
+
     /// Run one attention event (implementation note) through
     /// the pure decision layer and apply the result: in-TUI toast, optional
     /// terminal bell, optional desktop notification. Never blocks the event
@@ -3567,7 +3566,7 @@ impl App {
             .iter()
             .any(|l| l.contains("model(s)") || l.ends_with(": done"));
         for line in drained {
-            self.history.push(HistoryEntry::Plain { line });
+            self.push_plain(line);
         }
         if touches_config {
             self.reload_launch_info();
@@ -3775,9 +3774,7 @@ impl App {
             },
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {
-                    self.history.push(HistoryEntry::Plain {
-                        line: format!("Renamed session to `{title}`"),
-                    });
+                    self.push_plain(format!("Renamed session to `{title}`"));
                 }
                 Ok(_) => self.history.push(HistoryEntry::CommandError {
                     line: "/rename: unexpected daemon response".to_string(),
@@ -3788,9 +3785,7 @@ impl App {
             },
             AsyncActionKind::Internal("rename.auto") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {
-                    self.history.push(HistoryEntry::Plain {
-                        line: format!("Renamed session to `{title}`"),
-                    });
+                    self.push_plain(format!("Renamed session to `{title}`"));
                 }
                 Ok(_) => self.history.push(HistoryEntry::CommandError {
                     line: "/rename: unexpected title result".to_string(),
@@ -3873,12 +3868,8 @@ impl App {
                 }) => {
                     self.apply_local_command_result(label, raw_output, failed, git_args);
                 }
-                Ok(_) => self.history.push(HistoryEntry::Plain {
-                    line: "local command: unexpected async response".to_string(),
-                }),
-                Err(e) => self.history.push(HistoryEntry::Plain {
-                    line: format!("local command: {e}"),
-                }),
+                Ok(_) => self.push_plain("local command: unexpected async response".to_string()),
+                Err(e) => self.push_plain(format!("local command: {e}")),
             },
             AsyncActionKind::Refresh("display.daemon.probe") => match result.payload {
                 Ok(AsyncActionPayload::DaemonProbe { cwd, status }) => {
@@ -4446,9 +4437,7 @@ impl App {
             return;
         }
         let Some(editor) = std::env::var_os("EDITOR") else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/editor: no `$EDITOR` set".to_string(),
-            });
+            self.push_plain("/editor: no `$EDITOR` set".to_string());
             return;
         };
         let argv = match target {
@@ -4546,9 +4535,7 @@ impl App {
     pub(super) fn run_git_command(&mut self, args: &str) {
         let args = args.trim();
         if args.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "/git: usage `/git <args>` (e.g. `/git status`)".to_string(),
-            });
+            self.push_plain("/git: usage `/git <args>` (e.g. `/git status`)".to_string());
             return;
         }
         let args = args.to_string();
@@ -4562,9 +4549,9 @@ impl App {
     where
         F: FnOnce() -> (String, bool) + Send + 'static,
     {
-        self.history.push(HistoryEntry::Plain {
-            line: format!("{label}: running (local command; cancellation unavailable)"),
-        });
+        self.push_plain(format!(
+            "{label}: running (local command; cancellation unavailable)"
+        ));
         self.chat_scroll_offset = 0;
         self.async_actions.start_blocking(
             AsyncActionKind::Blocking("local.command"),
@@ -4617,9 +4604,10 @@ impl App {
             Some("update") => crate::commands::init::InitMode::Update,
             Some("overwrite") => crate::commands::init::InitMode::Overwrite,
             _ => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/init: cancelled — `{}` left untouched", pending.display),
-                });
+                self.push_plain(format!(
+                    "/init: cancelled — `{}` left untouched",
+                    pending.display
+                ));
                 return;
             }
         };
@@ -4737,17 +4725,13 @@ impl App {
         };
         let request = match selected_id {
             Some("resume") => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resume: resuming paused daemon work.".to_string(),
-                });
+                self.push_plain("/resume: resuming paused daemon work.".to_string());
                 crate::daemon::proto::Request::ResumePausedWork {
                     session_id: pending.session_id,
                 }
             }
             Some("cancel") | None => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resume: cancelled paused daemon work.".to_string(),
-                });
+                self.push_plain("/resume: cancelled paused daemon work.".to_string());
                 crate::daemon::proto::Request::CancelPausedWork {
                     session_id: pending.session_id,
                 }
@@ -4759,9 +4743,7 @@ impl App {
 
     fn show_goal_status(&mut self) {
         let Some(session_id) = self.launch.session_id else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/goal: no active session. Usage: /goal <objective> | status | pause | resume | clear | edit".to_string(),
-            });
+            self.push_plain("/goal: no active session. Usage: /goal <objective> | status | pause | resume | clear | edit".to_string());
             return;
         };
         match crate::db::Db::open_default().and_then(|db| {
@@ -4773,19 +4755,18 @@ impl App {
                     .token_budget
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "none".to_string());
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+                self.push_plain(format!(
                         "/goal: {} · {} · tokens {}/{} · subcommands: status, pause, resume, clear, edit",
                         goal.status.as_str(),
                         goal.objective,
                         goal.tokens_used,
                         budget
-                    ),
-                });
+                    ));
             }
-            Ok(None) => self.history.push(HistoryEntry::Plain {
-                line: "/goal: no goal. Usage: /goal <objective> | status | pause | resume | clear | edit".to_string(),
-            }),
+            Ok(None) => self.push_plain(
+                "/goal: no goal. Usage: /goal <objective> | status | pause | resume | clear | edit"
+                    .to_string(),
+            ),
             Err(e) => self.history.push(HistoryEntry::CommandError {
                 line: format!("/goal: {e:#}"),
             }),
@@ -4802,9 +4783,7 @@ impl App {
         match crate::db::Db::open_default()
             .and_then(|db| db.set_session_goal_status(session_id, status))
         {
-            Ok(goal) => self.history.push(HistoryEntry::Plain {
-                line: format!("{label}: goal is now {}.", goal.status.as_str()),
-            }),
+            Ok(goal) => self.push_plain(format!("{label}: goal is now {}.", goal.status.as_str())),
             Err(e) => self.history.push(HistoryEntry::CommandError {
                 line: format!("{label}: {e:#}"),
             }),
@@ -4884,7 +4863,7 @@ impl App {
         } else {
             format!("{cmd}: no daemon connection — cannot cancel `{job_id}`")
         };
-        self.history.push(HistoryEntry::Plain { line });
+        self.push_plain(line);
     }
 
     /// Bare `/stop`: count the current-session jobs and arm the `[y/N]`
@@ -4893,16 +4872,12 @@ impl App {
     pub(super) fn arm_stop_confirm(&mut self) {
         let ids = self.current_session_job_ids();
         if ids.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "No background jobs in this session.".to_string(),
-            });
+            self.push_plain("No background jobs in this session.".to_string());
             self.pending_stop_confirm = None;
             return;
         }
         let n = ids.len();
-        self.history.push(HistoryEntry::Plain {
-            line: format!("/stop: Stop {n} job(s) in this session? [y/N]"),
-        });
+        self.push_plain(format!("/stop: Stop {n} job(s) in this session? [y/N]"));
         self.pending_stop_confirm = Some(ids);
     }
 
@@ -4921,18 +4896,14 @@ impl App {
             }
         }
         if cancelled == 0 {
-            self.history.push(HistoryEntry::Plain {
-                line: "/stop: those jobs already ended.".to_string(),
-            });
+            self.push_plain("/stop: those jobs already ended.".to_string());
         }
     }
 
     /// Cancel an armed bare `/stop`.
     pub(super) fn cancel_stop(&mut self) {
         self.pending_stop_confirm = None;
-        self.history.push(HistoryEntry::Plain {
-            line: "/stop: cancelled.".to_string(),
-        });
+        self.push_plain("/stop: cancelled.".to_string());
     }
 
     /// Resolve the layered `mcp.json` path for the cwd (first discovered
@@ -4961,17 +4932,13 @@ impl App {
     fn mcp_save(&mut self, cfg: &crate::mcp::config::McpConfig) -> bool {
         self.slash_menu_cache.borrow_mut().take();
         let Some(path) = self.mcp_config_path() else {
-            self.history.push(HistoryEntry::Plain {
-                line: "No writable .cockpit/ directory for MCP config".to_string(),
-            });
+            self.push_plain("No writable .cockpit/ directory for MCP config".to_string());
             return false;
         };
         match cfg.write_private(&path) {
             Ok(_) => true,
             Err(_) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "Failed to write mcp.json".to_string(),
-                });
+                self.push_plain("Failed to write mcp.json".to_string());
                 false
             }
         }
@@ -4980,9 +4947,7 @@ impl App {
     fn mcp_list(&mut self) {
         let cfg = self.mcp_load();
         if cfg.servers.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "No MCP servers configured.".to_string(),
-            });
+            self.push_plain("No MCP servers configured.".to_string());
             return;
         }
         for (name, s) in &cfg.servers {
@@ -4992,14 +4957,12 @@ impl App {
                 ratatui::style::Color::Yellow => "○",
                 _ => "✗",
             };
-            self.history.push(HistoryEntry::Plain {
-                line: format!(
-                    "{dot} {name}  {}  {}  auth={}",
-                    s.transport.as_str(),
-                    if s.enabled { "enabled" } else { "disabled" },
-                    s.auth.kind_str(),
-                ),
-            });
+            self.push_plain(format!(
+                "{dot} {name}  {}  {}  auth={}",
+                s.transport.as_str(),
+                if s.enabled { "enabled" } else { "disabled" },
+                s.auth.kind_str(),
+            ));
         }
     }
 
@@ -5009,9 +4972,7 @@ impl App {
         let mut cfg = self.mcp_load();
         if let Some(id) = id {
             let Some(server) = cfg.servers.get_mut(id) else {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("Unknown MCP server `{id}`"),
-                });
+                self.push_plain(format!("Unknown MCP server `{id}`"));
                 return;
             };
             server.enabled = enable.unwrap_or(!server.enabled);
@@ -5104,9 +5065,9 @@ impl App {
 
     pub(super) fn swap_primary_agent(&mut self, name: &str) {
         if crate::agents::is_hidden_primary(name) {
-            self.history.push(HistoryEntry::Plain {
-                line: format!("`{name}` is hidden — start it with `/multireview`."),
-            });
+            self.push_plain(format!(
+                "`{name}` is hidden — start it with `/multireview`."
+            ));
             return;
         }
         // Experimental-mode gate (implementation note):
@@ -5121,9 +5082,9 @@ impl App {
         if crate::agents::is_experimental_primary(name)
             && !crate::config::extended::load_for_cwd(&self.launch.cwd).experimental_mode
         {
-            self.history.push(HistoryEntry::Plain {
-                line: format!("`{name}` requires experimental mode — enable it in `/settings`."),
-            });
+            self.push_plain(format!(
+                "`{name}` requires experimental mode — enable it in `/settings`."
+            ));
             return;
         }
         let sent = self.send_daemon_request(crate::daemon::proto::Request::SetAgent {
@@ -5132,23 +5093,23 @@ impl App {
         if sent {
             self.record_primary_switch_confirmation(name);
         } else {
-            self.history.push(HistoryEntry::Plain {
-                line: "Send a message first to start a session, then switch agents".to_string(),
-            });
+            self.push_plain(
+                "Send a message first to start a session, then switch agents".to_string(),
+            );
         }
     }
 
     pub(super) fn record_primary_switch_confirmation(&mut self, name: &str) {
-        let line = format!("Switched primary agent to `{name}`");
+        let line_to_record = format!("Switched primary agent to `{name}`");
         if let Some(pending) = self.pending_agent_switch_log.as_mut()
-            && let Some(HistoryEntry::Plain { line: existing }) =
+            && let Some(HistoryEntry::Plain { line }) =
                 self.history.get_mut(pending.confirmation_index)
         {
-            *existing = line;
+            *line = line_to_record;
             pending.target = name.to_string();
             return;
         }
-        self.history.push(HistoryEntry::Plain { line });
+        self.push_plain(line_to_record);
         self.pending_agent_switch_log = Some(PendingAgentSwitchLog {
             confirmation_index: self.history.len().saturating_sub(1),
             target: name.to_string(),
@@ -5175,15 +5136,12 @@ impl App {
             name: "Multireview".to_string(),
         });
         if !sent {
-            self.history.push(HistoryEntry::Plain {
-                line: "Send a message first to start a session, then run `/multireview`"
-                    .to_string(),
-            });
+            self.push_plain(
+                "Send a message first to start a session, then run `/multireview`".to_string(),
+            );
             return;
         }
-        self.history.push(HistoryEntry::Plain {
-            line: MULTIREVIEW_TOKEN_BURN_WARNING.to_string(),
-        });
+        self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
         self.begin_working_span();
         let submission = crate::engine::message::UserSubmission {
             kind: crate::engine::message::UserSubmissionKind::User,
@@ -5223,10 +5181,9 @@ impl App {
 
     pub(super) fn commit_footer_agent_picker(&mut self, picker: &FooterAgentPicker) {
         if self.agent_path.len() > 1 {
-            self.history.push(HistoryEntry::Plain {
-                line: "Agent switch is disabled while an interactive subagent is active."
-                    .to_string(),
-            });
+            self.push_plain(
+                "Agent switch is disabled while an interactive subagent is active.".to_string(),
+            );
             self.footer_agent_picker = Some(picker.clone());
             return;
         }
@@ -5256,9 +5213,7 @@ impl App {
                 self.model_picker = Some(picker);
             }
             Err(e) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/model: {e}"),
-                });
+                self.push_plain(format!("/model: {e}"));
             }
         }
     }
@@ -5270,7 +5225,7 @@ impl App {
             self.notify_active_model_selected(p, m);
         }
         let line = self.model_summary_history_line();
-        self.history.push(HistoryEntry::Plain { line });
+        self.push_plain(line);
     }
 
     fn notify_active_model_selected(&mut self, provider: String, model: String) {
@@ -5291,20 +5246,16 @@ impl App {
             Ok(Some((provider, model))) => {
                 self.reload_launch_info();
                 self.notify_active_model_selected(provider.clone(), model.clone());
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/model: active model is now {provider}/{model} ★"),
-                });
+                self.push_plain(format!("/model: active model is now {provider}/{model} ★"));
             }
             Ok(None) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "No other favorite model to cycle to; open `/model` for the full list."
+                self.push_plain(
+                    "No other favorite model to cycle to; open `/model` for the full list."
                         .to_string(),
-                });
+                );
             }
             Err(e) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/model: {e}"),
-                });
+                self.push_plain(format!("/model: {e}"));
             }
         }
     }
@@ -5343,7 +5294,7 @@ impl App {
         if let Some(mode) = commit.llm_mode {
             if self.send_daemon_request(crate::daemon::proto::Request::SetSessionLlmMode { mode }) {
                 if let Some(warning) = self.cache_break_warning() {
-                    self.history.push(HistoryEntry::Plain { line: warning });
+                    self.push_plain(warning);
                 }
             } else {
                 any_failed = true;
@@ -5388,26 +5339,21 @@ impl App {
                 model: model.clone(),
             }) {
                 self.launch.active_model = Some((provider.clone(), model.clone()));
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/quick: active model is now {provider}/{model}"),
-                });
+                self.push_plain(format!("/quick: active model is now {provider}/{model}"));
             } else {
                 any_failed = true;
             }
         }
         if any_failed {
-            self.history.push(HistoryEntry::Plain {
-                line: "/quick: send a message first to start a session".to_string(),
-            });
+            self.push_plain("/quick: send a message first to start a session".to_string());
         }
     }
 
     pub(super) fn footer_cycle_agent(&mut self) {
         if self.agent_path.len() > 1 {
-            self.history.push(HistoryEntry::Plain {
-                line: "Agent cycle is disabled while an interactive subagent is active."
-                    .to_string(),
-            });
+            self.push_plain(
+                "Agent cycle is disabled while an interactive subagent is active.".to_string(),
+            );
             return;
         }
         self.cycle_primary_agent();
@@ -5489,9 +5435,7 @@ impl App {
     /// executes), so the projection equals the result.
     pub(super) fn arm_prune_confirm(&mut self) {
         if self.prunable_tokens == 0 {
-            self.history.push(HistoryEntry::Plain {
-                line: "/prune: 0% prunable — nothing to do.".to_string(),
-            });
+            self.push_plain("/prune: 0% prunable — nothing to do.".to_string());
             self.pending_prune_confirm = false;
             return;
         }
@@ -5513,11 +5457,9 @@ impl App {
             "Cache is HOT — pruning breaks it; the cache-bust cost may exceed the savings. \
              When the cache goes cold, auto-prune handles it for free."
         };
-        self.history.push(HistoryEntry::Plain {
-            line: format!(
-                "/prune: {numbers}. {cache_line} Press y or Enter to confirm, any other key to cancel."
-            ),
-        });
+        self.push_plain(format!(
+            "/prune: {numbers}. {cache_line} Press y or Enter to confirm, any other key to cancel."
+        ));
         self.pending_prune_confirm = true;
     }
 
@@ -5526,18 +5468,14 @@ impl App {
     pub(super) fn commit_prune(&mut self) {
         self.pending_prune_confirm = false;
         if !self.send_daemon_request(crate::daemon::proto::Request::Prune) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/prune: no daemon connection — cannot prune.".to_string(),
-            });
+            self.push_plain("/prune: no daemon connection — cannot prune.".to_string());
         }
     }
 
     /// Cancel an armed `/prune`.
     pub(super) fn cancel_prune(&mut self) {
         self.pending_prune_confirm = false;
-        self.history.push(HistoryEntry::Plain {
-            line: "/prune: cancelled.".to_string(),
-        });
+        self.push_plain("/prune: cancelled.".to_string());
     }
 
     /// `/compact`: enqueue an in-place compaction turn on the active session.
@@ -5581,9 +5519,7 @@ impl App {
             self.queued_tag_batches.push(Vec::new());
         } else {
             self.begin_working_span();
-            self.history.push(HistoryEntry::Plain {
-                line: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, seed tools)...".to_string(),
-            });
+            self.push_plain("/compact: assembling handoff (prune-first, model brief, deterministic appendix, seed tools)...".to_string());
         }
     }
 
@@ -5591,9 +5527,9 @@ impl App {
     /// in place by the driver, so this only clears stale pending state.
     pub(super) fn commit_compact(&mut self, _handoff: String) -> bool {
         self.pending_compact = None;
-        self.history.push(HistoryEntry::Plain {
-            line: "/compact: stale reviewed handoff discarded; run `/compact` again".to_string(),
-        });
+        self.push_plain(
+            "/compact: stale reviewed handoff discarded; run `/compact` again".to_string(),
+        );
         false
     }
 
@@ -5648,9 +5584,7 @@ impl App {
                 } else {
                     short_id
                 };
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/resume: switched to session {label}."),
-                });
+                self.push_plain(format!("/resume: switched to session {label}."));
                 if let Some(repair) = repair_required {
                     self.maybe_prompt_resume_repair(repair);
                 }
@@ -5813,9 +5747,7 @@ impl App {
                         return;
                     }
                 };
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resume: fork pending".to_string(),
-                });
+                self.push_plain("/resume: fork pending".to_string());
                 self.async_actions.start_blocking(
                     AsyncActionKind::DaemonRpc("fork.create"),
                     AsyncActionPolicy::Replace(AsyncActionKey::new("fork.create")),
@@ -5838,9 +5770,7 @@ impl App {
                 );
             }
             Some("repair") => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resume: applying explicit synthetic repair.".to_string(),
-                });
+                self.push_plain("/resume: applying explicit synthetic repair.".to_string());
                 self.send_daemon_request(crate::daemon::proto::Request::RepairResume {
                     session_id: pending.state.session_id,
                 });
@@ -5851,21 +5781,17 @@ impl App {
                 } else {
                     pending.state.short_id
                 };
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+                self.push_plain(format!(
                         "/resume: export a debug bundle with `cockpit export {label}`; identity provenance is included in tool-call records"
-                    ),
-                });
+                    ));
             }
             Some("read_only") => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resume: transcript remains open read-only; model dispatch is blocked until fork or repair".to_string(),
-                });
+                self.push_plain("/resume: transcript remains open read-only; model dispatch is blocked until fork or repair".to_string());
             }
             Some("cancel") | None => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resume: repair dialog closed; transcript remains read-only".to_string(),
-                });
+                self.push_plain(
+                    "/resume: repair dialog closed; transcript remains read-only".to_string(),
+                );
             }
             Some(_) => {}
         }
@@ -5875,12 +5801,10 @@ impl App {
         if compatible || daemon_version == crate::daemon::proto::DAEMON_VERSION {
             return;
         }
-        self.history.push(HistoryEntry::Plain {
-            line: format!(
-                "daemon {daemon_version} is newer than this client {}; relaunch cockpit to refresh",
-                crate::daemon::proto::DAEMON_VERSION
-            ),
-        });
+        self.push_plain(format!(
+            "daemon {daemon_version} is newer than this client {}; relaunch cockpit to refresh",
+            crate::daemon::proto::DAEMON_VERSION
+        ));
     }
 
     fn side_entry_banner(side_short_id: &str) -> String {
@@ -5924,9 +5848,7 @@ impl App {
                 let restored = wire_history_to_entries(std::mem::take(&mut runner.history));
                 self.history.extend(restored);
                 self.agent_runner = Some(Ok(runner));
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/fork: switched to fork {fork_short_id}."),
-                });
+                self.push_plain(format!("/fork: switched to fork {fork_short_id}."));
                 if let Some(seed) = seed_composer {
                     self.composer.set(seed);
                     self.composer.set_vim_mode(VimMode::Insert);
@@ -5965,9 +5887,7 @@ impl App {
             return;
         }
 
-        self.history.push(HistoryEntry::Plain {
-            line: "/side: pending".to_string(),
-        });
+        self.push_plain("/side: pending".to_string());
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("side.start"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("side.start")),
@@ -6084,9 +6004,7 @@ impl App {
         self.agent_runner = Some(Ok(runner));
         self.side_conversation = Some(side);
 
-        self.history.push(HistoryEntry::Plain {
-            line: Self::side_entry_banner(&side_short_id),
-        });
+        self.push_plain(Self::side_entry_banner(&side_short_id));
     }
 
     /// End the open side conversation: restore the main-session view verbatim
@@ -6134,9 +6052,7 @@ impl App {
         // needs no re-arming here.
 
         if announce {
-            self.history.push(HistoryEntry::Plain {
-                line: "Side conversation discarded — back in the main session.".to_string(),
-            });
+            self.push_plain("Side conversation discarded — back in the main session.".to_string());
         }
     }
 
@@ -6154,9 +6070,7 @@ impl App {
             scan_dotenv,
             scan_ssh_keys,
         }) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/toggle-redaction: no daemon connection".to_string(),
-            });
+            self.push_plain("/toggle-redaction: no daemon connection".to_string());
         }
     }
 
@@ -6246,11 +6160,10 @@ impl App {
         // `config.json` layers; tandem models must have working url/credentials.
         let cfg = ConfigDoc::load_effective(&self.launch.cwd);
         if cfg.providers.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line:
-                    "/model-comparison: no cockpit config found — run `/settings` to add a provider"
-                        .to_string(),
-            });
+            self.push_plain(
+                "/model-comparison: no cockpit config found — run `/settings` to add a provider"
+                    .to_string(),
+            );
             return;
         }
 
@@ -6268,10 +6181,9 @@ impl App {
         }
         pairs.sort();
         if pairs.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "/model-comparison: no other configured models to compare against"
-                    .to_string(),
-            });
+            self.push_plain(
+                "/model-comparison: no other configured models to compare against".to_string(),
+            );
             return;
         }
 
@@ -6340,9 +6252,7 @@ impl App {
             .filter_map(|i| options.get(i).cloned())
             .collect();
         if !self.send_daemon_request(crate::daemon::proto::Request::SetTandemModels { models }) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/model-comparison: no daemon connection".to_string(),
-            });
+            self.push_plain("/model-comparison: no daemon connection".to_string());
         }
     }
 
@@ -6636,1377 +6546,6 @@ impl App {
         }
     }
 
-    /// Drain any [`TurnEvent`]s the engine has produced into the
-    /// pending+history state machine. Runs each tick.
-    pub(super) fn drain_agent_events(&mut self) -> bool {
-        self.refresh_subagent_countdown();
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            return false;
-        };
-        let drained = crate::tui::agent_runner::drain_turn_events(&runner.events);
-        let changed = !drained.is_empty();
-        for event in drained {
-            self.apply_event(event);
-        }
-        changed
-    }
-
-    pub(super) fn reconcile_queue_update(&mut self, queue: Vec<QueuedUserMessage>) {
-        if matches!(self.fresh_queue_ack, FreshQueueAck::AwaitingAck)
-            && let Some(item) = queue.first()
-        {
-            self.fresh_queue_ack = FreshQueueAck::SuppressId(item.id);
-        }
-        let old_queue = std::mem::take(&mut self.queue);
-        let old_batches = std::mem::take(&mut self.queued_tag_batches);
-        let incoming_ids = queue.iter().map(|item| item.id).collect::<HashSet<_>>();
-        for (idx, item) in old_queue.iter().enumerate() {
-            let replaced_by_ack = queue
-                .get(idx)
-                .is_some_and(|incoming| incoming.text == item.text);
-            if !incoming_ids.contains(&item.id)
-                && !replaced_by_ack
-                && let Some(batch) = old_batches.get(idx)
-                && !batch.is_empty()
-            {
-                self.folding_tag_batches.insert(item.id, batch.clone());
-            }
-        }
-        self.queue = match self.fresh_queue_ack {
-            FreshQueueAck::SuppressId(id) => {
-                queue.into_iter().filter(|item| item.id != id).collect()
-            }
-            FreshQueueAck::None | FreshQueueAck::AwaitingAck => queue,
-        };
-        let old_positions = old_queue
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| (item.id, idx))
-            .collect::<HashMap<_, _>>();
-        self.queued_tag_batches = self
-            .queue
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| {
-                if let Some(batch) = old_positions
-                    .get(&item.id)
-                    .and_then(|idx| old_batches.get(*idx))
-                {
-                    return batch.clone();
-                }
-                old_queue
-                    .get(idx)
-                    .filter(|old| old.text == item.text)
-                    .and_then(|_| old_batches.get(idx))
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
-    }
-
-    fn apply_queued_user_messages_folded(
-        &mut self,
-        text: String,
-        queue_item_ids: Vec<uuid::Uuid>,
-        seq: Option<i64>,
-        preflight_cleaned: Option<String>,
-    ) {
-        let folded_ids = queue_item_ids.iter().copied().collect::<HashSet<_>>();
-        let suppresses_fresh_optimistic = match self.fresh_queue_ack {
-            FreshQueueAck::SuppressId(id) => folded_ids.contains(&id),
-            FreshQueueAck::None | FreshQueueAck::AwaitingAck => false,
-        };
-
-        let old_queue = std::mem::take(&mut self.queue);
-        let old_batches = std::mem::take(&mut self.queued_tag_batches);
-        let mut remaining_queue = Vec::new();
-        let mut remaining_batches = Vec::new();
-        let mut calls = Vec::new();
-        for (idx, item) in old_queue.into_iter().enumerate() {
-            if folded_ids.contains(&item.id) {
-                if let Some(batch) = old_batches.get(idx) {
-                    calls.extend(batch.clone());
-                }
-            } else {
-                remaining_queue.push(item);
-                remaining_batches.push(old_batches.get(idx).cloned().unwrap_or_default());
-            }
-        }
-        for id in &queue_item_ids {
-            if let Some(batch) = self.folding_tag_batches.remove(id) {
-                calls.extend(batch);
-            }
-        }
-        self.queue = remaining_queue;
-        self.queued_tag_batches = remaining_batches;
-
-        let mut stamped_existing = false;
-        if suppresses_fresh_optimistic {
-            for entry in self.history.iter_mut().rev() {
-                if let HistoryEntry::User {
-                    seq: s @ None,
-                    cleaned,
-                    preflight_pending,
-                    persist_failed,
-                    ..
-                } = entry
-                {
-                    *s = seq;
-                    if preflight_cleaned.is_some() {
-                        *cleaned = preflight_cleaned.clone();
-                    }
-                    *preflight_pending = false;
-                    *persist_failed = false;
-                    stamped_existing = true;
-                    break;
-                }
-            }
-        }
-        if !stamped_existing {
-            self.history.push(HistoryEntry::User {
-                text,
-                cleaned: preflight_cleaned,
-                expanded: false,
-                timestamp: chrono::Local::now(),
-                seq,
-                preflight_pending: false,
-                persist_failed: false,
-            });
-        }
-        if !calls.is_empty() {
-            self.push_tag_call_entries(&calls);
-        }
-        self.fresh_queue_ack = FreshQueueAck::None;
-    }
-
-    pub(super) fn apply_event(&mut self, event: TurnEvent) {
-        match event {
-            TurnEvent::Reconnecting {
-                agent: _,
-                attempt,
-                provider,
-                model,
-                url,
-            } => {
-                // A network/transient failure is being auto-retried. Show a
-                // distinct, persistent reconnect status (never the generic
-                // working spinner) naming the unreachable target + the
-                // current attempt; ensure the working span is live so the
-                // indicator row is shown even if we attached mid-retry. This
-                // persists across the backoff wait AND the in-flight retry
-                // attempt — only output flowing (`AssistantTextDelta`) or the
-                // turn ending clears it, never a fresh `ThinkingStarted`.
-                if !self.busy {
-                    self.begin_working_span();
-                }
-                self.reconnect = Some(ReconnectStatus {
-                    attempt,
-                    provider,
-                    model,
-                    url,
-                });
-            }
-            TurnEvent::QueueUpdated { queue } => {
-                self.reconcile_queue_update(queue);
-            }
-            TurnEvent::QueuedUserMessagesFolded {
-                text,
-                queue_item_ids,
-                seq,
-                preflight_cleaned,
-                ..
-            } => {
-                self.apply_queued_user_messages_folded(
-                    text,
-                    queue_item_ids,
-                    seq,
-                    preflight_cleaned,
-                );
-            }
-            TurnEvent::ForegroundInputTarget { target } => {
-                self.foreground_input_target = Some(target);
-            }
-            TurnEvent::ThinkingStarted { agent, turn_id } => {
-                // Note: a `ThinkingStarted` does NOT clear the reconnect
-                // status. It fires once at turn start, before the retry loop
-                // — clearing here would blank the reconnect line for the
-                // in-flight attempt and flicker back to the generic spinner.
-                // The status is cleared by real output / turn end instead.
-                // Rising-edge fallback: a fresh submit normally starts
-                // the span, but if we missed that (e.g. attached to an
-                // already-running session) begin one here so the
-                // indicator still shows.
-                self.mark_working_span_started(turn_id);
-                self.finalize_pending();
-                self.pending = Some(new_pending(agent, self.strip_inline_think()));
-            }
-            TurnEvent::AssistantTextDelta { agent, delta } => {
-                // Output is flowing — the retry (if any) reconnected.
-                self.reconnect = None;
-                let p = self.pending_or_insert_with_strip(agent, App::strip_inline_think);
-                let wrote = if p.strip_think {
-                    route_text_delta(
-                        &delta,
-                        &mut p.text,
-                        &mut p.reasoning,
-                        &mut p.inside_think,
-                        &mut p.body_started,
-                        &mut p.tag_partial,
-                    )
-                } else {
-                    // Splitting disabled for this model: content is body
-                    // verbatim (reasoning rides `reasoning_content` only). No
-                    // `ThinkSplitter` state is touched, so the partial-tag
-                    // buffer never half-initializes.
-                    p.text.push_str(&delta);
-                    !delta.trim().is_empty()
-                };
-                if wrote && p.text_started_at.is_none() {
-                    p.text_started_at = Some(Instant::now());
-                }
-            }
-            TurnEvent::ReasoningDelta { agent, delta } => {
-                let p = self.pending_or_insert_with_strip(agent, App::strip_inline_think);
-                p.reasoning.push_str(&delta);
-            }
-            TurnEvent::AssistantText {
-                text,
-                reasoning,
-                seq,
-                ..
-            } => {
-                if let Some(p) = &mut self.pending {
-                    // Mark text-start (non-streaming providers land here
-                    // without ever emitting a Delta).
-                    if p.text_started_at.is_none() {
-                        p.text_started_at = Some(Instant::now());
-                    }
-                    // Stamp the message's stable id (`session_events.seq`)
-                    // so the finalized row can be pinned (`pinned-messages`).
-                    p.seq = seq;
-                    // The engine's finalizing text is the authoritative
-                    // user-facing form and is ALREADY clean: inline `<think>`
-                    // blocks were stripped by the single shared parser before
-                    // this event was emitted (implementation note),
-                    // so adopting it can never reintroduce tags into the body
-                    // — the double-render is gone. It is identical to the
-                    // streamed accumulation on the common path, and the
-                    // *translated* answer when round-trip translation is active
-                    // (implementation note). Adopt it when it
-                    // differs. Empty event text (think-only turns) keeps the
-                    // streamed accumulation (also empty there).
-                    if !text.trim().is_empty() && text != p.text {
-                        p.text = text;
-                    }
-                    // Non-streaming providers emit no `ReasoningDelta`, so the
-                    // streamed `p.reasoning` is empty — adopt the finalized
-                    // reasoning from the engine. Streaming paths already
-                    // accumulated it (channel + inline), so keep that to avoid
-                    // double-counting.
-                    if p.reasoning.trim().is_empty() && !reasoning.trim().is_empty() {
-                        p.reasoning = reasoning;
-                    }
-                }
-                self.finalize_pending();
-            }
-            TurnEvent::UserMessageRecorded {
-                seq,
-                preflight_cleaned,
-            } => {
-                self.fresh_queue_ack = FreshQueueAck::None;
-                // Stamp the assigned `session_events.seq` onto the most
-                // recent still-unstamped user row (pushed optimistically on
-                // submit, before the timeline write completed) so it becomes
-                // pinnable (`pinned-messages`). Newest-first so re-attaches
-                // never back-fill an older row. When the turn was preflighted
-                // (implementation note), also record the cleaned
-                // body so the row renders the cleaned text + `⚙ preflighted`
-                // chip while the reveal shows the original typed input.
-                for entry in self.history.iter_mut().rev() {
-                    if let HistoryEntry::User {
-                        seq: s @ None,
-                        cleaned,
-                        preflight_pending,
-                        persist_failed,
-                        ..
-                    } = entry
-                    {
-                        *s = Some(seq);
-                        if preflight_cleaned.is_some() {
-                            *cleaned = preflight_cleaned;
-                        }
-                        // Resolution reconciles the optimistic row
-                        // (implementation note): the
-                        // animated `Preflight…` indicator clears here, replaced by
-                        // the resting `⚙ preflighted` chip when a cleaned form
-                        // landed (`Rewritten`) or nothing (skipped/fail-open/
-                        // guard-tripped — original, no chip).
-                        *preflight_pending = false;
-                        *persist_failed = false;
-                        break;
-                    }
-                }
-            }
-            TurnEvent::SessionPersistFailed { error } => {
-                self.end_working_span();
-                self.reconnect = None;
-                self.fresh_queue_ack = FreshQueueAck::None;
-                for entry in self.history.iter_mut().rev() {
-                    if let HistoryEntry::User {
-                        seq: None,
-                        preflight_pending,
-                        persist_failed,
-                        ..
-                    } = entry
-                    {
-                        *preflight_pending = false;
-                        *persist_failed = true;
-                        break;
-                    }
-                }
-                let summary = format!("session persist failed; message was dropped: {error}");
-                self.history.push(HistoryEntry::InferenceError {
-                    detail: summary.clone(),
-                    summary,
-                    expanded: false,
-                });
-            }
-            TurnEvent::SessionDriverFailed { error } => {
-                self.end_working_span();
-                self.reconnect = None;
-                self.fresh_queue_ack = FreshQueueAck::None;
-                for entry in self.history.iter_mut().rev() {
-                    if let HistoryEntry::User {
-                        seq: None,
-                        preflight_pending,
-                        persist_failed,
-                        ..
-                    } = entry
-                    {
-                        *preflight_pending = false;
-                        *persist_failed = true;
-                        break;
-                    }
-                }
-                let summary = format!("session driver failed; session ended: {error}");
-                self.history.push(HistoryEntry::InferenceError {
-                    detail: summary.clone(),
-                    summary,
-                    expanded: false,
-                });
-            }
-            TurnEvent::UserMessageDispatchFailed { error } => {
-                self.end_working_span();
-                self.reconnect = None;
-                self.fresh_queue_ack = FreshQueueAck::None;
-                for entry in self.history.iter_mut().rev() {
-                    if let HistoryEntry::User {
-                        seq: None,
-                        preflight_pending,
-                        persist_failed,
-                        ..
-                    } = entry
-                    {
-                        *preflight_pending = false;
-                        *persist_failed = true;
-                        break;
-                    }
-                }
-                let summary = format!("message was not sent: {error}");
-                self.history.push(HistoryEntry::InferenceError {
-                    detail: summary.clone(),
-                    summary,
-                    expanded: false,
-                });
-                self.show_toast(format!("Message was not sent: {error}"), ToastKind::Error);
-            }
-            // Preflight is actually running for the just-submitted message
-            // (implementation note): mark the most
-            // recent optimistically-shown user row so its border slot hosts the
-            // animated `Preflight…` indicator until the message resolves. The
-            // row was already pushed on submit (skipped/disabled passes never
-            // emit this event, so they show instantly with no indicator).
-            TurnEvent::PreflightStarted => {
-                for entry in self.history.iter_mut().rev() {
-                    if let HistoryEntry::User {
-                        seq: None,
-                        preflight_pending,
-                        ..
-                    } = entry
-                    {
-                        *preflight_pending = true;
-                        break;
-                    }
-                }
-            }
-            // The just-submitted message was blocked by the prompt-injection
-            // guard before send (implementation note):
-            // remove the optimistically-shown row (and any `Preflight…`
-            // indicator on it) so the block/override UX stands alone. Newest
-            // unstamped user row — the same one `PreflightStarted` /
-            // `UserMessageRecorded` reconcile.
-            TurnEvent::UserMessageRetracted => {
-                self.fresh_queue_ack = FreshQueueAck::None;
-                self.end_working_span();
-                if let Some(idx) = self
-                    .history
-                    .iter()
-                    .rposition(|e| matches!(e, HistoryEntry::User { seq: None, .. }))
-                {
-                    self.history.remove(idx);
-                }
-            }
-            TurnEvent::ToolStart {
-                tool,
-                args,
-                call_id,
-                ..
-            } => {
-                self.finalize_pending();
-                // Edit tools render as a diff, which breaks the box. We
-                // wait for ToolEnd to push the `Diff` entry once we have
-                // the result.
-                if is_edit_tool(&tool)
-                    && let Some(captured) = extract_edit_args(&args)
-                {
-                    self.pending_edit_args.insert(call_id, captured);
-                    return;
-                }
-                let (summary, full_input) = tool_invocation(&tool, &args);
-                // Write tools are conceptually diffs too — render them as
-                // a standalone line that breaks the box (no diff body
-                // until the engine surfaces pre-write content).
-                if is_write_tool(&tool) {
-                    self.history.push(HistoryEntry::ToolLine {
-                        call_id,
-                        tool,
-                        summary,
-                        state: ToolCallState::Processing,
-                    });
-                    return;
-                }
-                let call = ToolCall {
-                    call_id,
-                    tool,
-                    summary,
-                    full_input,
-                    output: String::new(),
-                    expanded: false,
-                    result_offset: 0,
-                    state: ToolCallState::Processing,
-                    // Populated at ToolEnd from the engine's `hint` field.
-                    hint: None,
-                };
-                // Append to the open box (a run of consecutive boxable
-                // calls), or start a new one. Anything non-boxable
-                // pushed since the last box (agent text, a diff, a write,
-                // a subagent) means `last` isn't a ToolBox, so the run
-                // restarts here.
-                if let Some(HistoryEntry::ToolBox {
-                    calls,
-                    view_offset,
-                    follow,
-                    ..
-                }) = self.history.last_mut()
-                {
-                    calls.push(call);
-                    *view_offset =
-                        crate::tui::history::toolbox_top(calls.len(), *view_offset, *follow);
-                } else {
-                    self.history.push(HistoryEntry::ToolBox {
-                        calls: vec![call],
-                        view_offset: 0,
-                        follow: true,
-                    });
-                }
-            }
-            TurnEvent::ToolEnd {
-                tool,
-                output,
-                truncated,
-                call_id,
-                hint,
-                ..
-            } => {
-                if let Some(args) = self.pending_edit_args.remove(&call_id) {
-                    self.history.push(HistoryEntry::Diff {
-                        tool,
-                        path: args.path,
-                        old: args.old,
-                        new: args.new,
-                    });
-                    return;
-                }
-                if !self.update_tool_state(
-                    &call_id,
-                    ToolCallState::Success,
-                    Some((output.clone(), truncated)),
-                    hint,
-                ) {
-                    self.history.push(HistoryEntry::ToolLine {
-                        call_id,
-                        tool,
-                        summary: agent_runner::first_line(&output, 200),
-                        state: ToolCallState::Success,
-                    });
-                }
-            }
-            TurnEvent::ResourceWait {
-                display_id,
-                resources,
-                queue_position,
-                ..
-            } => {
-                let position = queue_position
-                    .map(|pos| format!(" position {pos}"))
-                    .unwrap_or_default();
-                self.show_toast(
-                    format!(
-                        "resource {display_id} waiting{position} for {}",
-                        resource_event_label(&resources)
-                    ),
-                    ToastKind::Info,
-                );
-            }
-            TurnEvent::ResourceStart {
-                display_id,
-                resources,
-                wait_ms,
-                ..
-            } => {
-                self.show_toast(
-                    format!(
-                        "resource {display_id} started after {wait_ms}ms ({})",
-                        resource_event_label(&resources)
-                    ),
-                    ToastKind::Info,
-                );
-            }
-            TurnEvent::ResourceClear {
-                display_id,
-                resources,
-                ..
-            } => {
-                self.show_toast(
-                    format!(
-                        "resource {display_id} released ({})",
-                        resource_event_label(&resources)
-                    ),
-                    ToastKind::Info,
-                );
-            }
-            TurnEvent::ToolError {
-                tool,
-                error,
-                call_id,
-                kind,
-                ..
-            } => {
-                // Drop any cached args from a paired ToolStart that never
-                // produced a ToolEnd — the diff would be misleading on a
-                // hard failure.
-                self.pending_edit_args.remove(&call_id);
-                // Bold red when the model built the call badly; plain red
-                // when the tool failed for another reason.
-                let state = match kind {
-                    crate::engine::tool::ToolFailKind::Invocation => ToolCallState::BadCall,
-                    crate::engine::tool::ToolFailKind::Execution => ToolCallState::Failed,
-                };
-                if !self.update_tool_state(&call_id, state, Some((error.clone(), false)), None) {
-                    // No pending call to update (e.g. an edit/write tool
-                    // whose entry we never created) — leave a standalone
-                    // failed line so the error is still visible.
-                    self.history.push(HistoryEntry::ToolLine {
-                        call_id,
-                        tool,
-                        summary: agent_runner::first_line(&error, 200),
-                        state,
-                    });
-                }
-            }
-            TurnEvent::InferenceFailed {
-                provider,
-                model,
-                error_class,
-                detail,
-                ..
-            } => {
-                // A terminal inference failure: stop the spinner and show a red
-                // inline error naming provider/model + the reason (same
-                // treatment as a ToolError). The turn is over (no retry), so
-                // finalize any in-flight streamed entry and end the working
-                // span. The reason is the class made human-readable, plus the
-                // underlying detail when present (network / HTTP carry one;
-                // a pure timeout's class already says everything).
-                self.reconnect = None;
-                self.finalize_pending();
-                let reason = match error_class.as_str() {
-                    "timeout_ttft" => "no first token within the timeout".to_string(),
-                    "timeout_idle" => "stream stalled past the idle timeout".to_string(),
-                    other if detail.is_empty() => other.to_string(),
-                    other => format!("{other}: {}", agent_runner::first_line(&detail, 200)),
-                };
-                let summary = format!("Inference failed ({provider}/{model}): {reason}");
-                self.history.push(HistoryEntry::InferenceError {
-                    detail,
-                    summary,
-                    expanded: false,
-                });
-                // Attention: the foreground turn failed
-                // (implementation note). Toast-only (not
-                // action-required) — generic, secret-safe text; the inline red
-                // error already carries the provider/model detail.
-                self.notify_attention(crate::tui::attention::AttentionEvent::TurnError);
-                self.fresh_queue_ack = FreshQueueAck::None;
-                self.end_working_span();
-            }
-            TurnEvent::InferenceWarning {
-                provider,
-                model,
-                phase,
-                waited_secs,
-                ..
-            } => {
-                let wait = match phase.as_str() {
-                    "ttft" => "has not produced a first token",
-                    "idle" => "has not produced another token",
-                    _ => "has not produced content",
-                };
-                self.history.push(HistoryEntry::InferenceWarning {
-                    line: format!(
-                        "{provider}/{model} {wait} after {waited_secs}s. Press Ctrl+C to cancel."
-                    ),
-                });
-            }
-            TurnEvent::BackupUsed {
-                primary_model,
-                error_class,
-                backup_model,
-                ..
-            } => {
-                // Per-turn backup-model fallback (`per-model-backup-
-                // fallback.md`): the primary failed a qualifying inference and
-                // the backup answered. Display-only YELLOW banner naming what
-                // happened — never enters model context (wire-vs-user split,
-                // GOALS §14). The spinner keeps running: the backup turn is
-                // still in flight, so we do NOT finalize/end the working span.
-                let reason = match error_class.as_str() {
-                    "timeout_ttft" => "timeout".to_string(),
-                    "timeout_idle" => "timeout".to_string(),
-                    "network" => "connection error".to_string(),
-                    other => other.to_string(),
-                };
-                self.history.push(HistoryEntry::BackupWarning {
-                    line: format!(
-                        "primary `{primary_model}` failed ({reason}) — answered with backup `{backup_model}`."
-                    ),
-                });
-            }
-            TurnEvent::SubagentSpawned {
-                parent,
-                child,
-                task_call_id,
-                label,
-                trusted_only,
-                model_trusted,
-                routing,
-                ..
-            } => {
-                self.push_agent_path_child(&parent, &child);
-                // One live line: `{parent} delegated to {child}… (elapsed)`.
-                // The prompt preview is intentionally dropped (the running
-                // line shows no prompt text). The elapsed clock and animated
-                // ellipses are derived at render time from `spawned_at`,
-                // reusing the working-span tick.
-                self.finalize_pending();
-                self.history.push(HistoryEntry::Subagent {
-                    parent,
-                    child,
-                    task_call_id,
-                    label,
-                    trusted_only,
-                    model_trusted,
-                    routing: subagent_routing_chips_from_value(&routing),
-                    spawned_at: Instant::now(),
-                    outcome: None,
-                    expanded: false,
-                });
-            }
-            TurnEvent::SubagentReport {
-                agent,
-                task_call_id,
-                label,
-                report,
-                trusted_only,
-                model_trusted,
-                routing,
-            } => {
-                self.pop_agent_path_for_report(&agent);
-                let update = SubagentReportUpdate {
-                    report,
-                    trusted_only,
-                    model_trusted,
-                    routing: subagent_routing_chips_from_value(&routing),
-                };
-                let active_matches = self
-                    .active_subagent_view()
-                    .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
-                if active_matches {
-                    if let Some(parent) = self.transcript_view_stack.last_mut() {
-                        settle_subagent_in(
-                            &mut parent.history,
-                            &agent,
-                            &task_call_id,
-                            &label,
-                            update.clone(),
-                        );
-                        parent
-                            .history_render_versions
-                            .resize(parent.history.len(), 0);
-                        parent
-                            .history_render_fingerprints
-                            .resize(parent.history.len(), 0);
-                    } else {
-                        self.settle_subagent(&agent, &task_call_id, &label, update.clone());
-                    }
-                } else {
-                    self.settle_subagent(&agent, &task_call_id, &label, update.clone());
-                }
-                if let Some(view) = self.active_subagent_view_mut()
-                    && view.task_call_id == task_call_id
-                    && view.label == label
-                {
-                    view.read_only = true;
-                    view.finished = true;
-                    if view.countdown_started.is_none() {
-                        view.countdown_started = Some(Instant::now());
-                        view.countdown_cancelled = false;
-                    }
-                }
-            }
-            TurnEvent::NestedTurn {
-                task_call_id,
-                label,
-                inner,
-                ..
-            } => {
-                let active_matches = self
-                    .active_subagent_view()
-                    .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
-                if active_matches {
-                    self.apply_event(*inner);
-                }
-                // The main transcript remains unchanged.
-            }
-            TurnEvent::Usage { usage, .. } => {
-                self.last_usage = Some(usage);
-                // Re-anchor the live counter: the provider's fresh total
-                // becomes the baseline and the local streamed-token delta
-                // resets to zero. `pending` still holds this round's
-                // assistant turn here (Usage is emitted before the
-                // finalizing `AssistantText`), so the snapshot already
-                // accounts for it.
-                self.estimate_at_last_usage = self.estimate_context_tokens();
-            }
-            TurnEvent::AgentIdle { turn_id } => {
-                let has_working_span = self.has_working_span_in_progress();
-                let matches_working_span = self.working_span_matches(turn_id.as_deref());
-                if has_working_span && !matches_working_span {
-                    return;
-                }
-                self.reconnect = None;
-                self.finalize_pending();
-                if self.agent_path.len() > 1 {
-                    self.agent_path.truncate(1);
-                    if let Some(root) = self.agent_path.first() {
-                        self.launch.agent_name = root.clone();
-                    }
-                }
-                // Attention: the foreground agent finished a turn
-                // (implementation note). Compute the span
-                // duration BEFORE `end_working_span` clears it; a turn that
-                // ran past the threshold (or finished while the user stepped
-                // away) escalates, otherwise it stays a subtle toast. Only
-                // fire for a real span we were tracking — not a spurious idle.
-                if let Some(started) = self.span_started_at {
-                    let long_running = started.elapsed() >= LONG_RUNNING_TURN;
-                    self.notify_attention(crate::tui::attention::AttentionEvent::TurnDone {
-                        long_running,
-                    });
-                }
-                self.fresh_queue_ack = FreshQueueAck::None;
-                self.end_working_span();
-                // A new agent turn has ended: a prediction now belongs to
-                // this fresh turn. Bump the turn id (invalidates any
-                // in-flight or cached prior-turn prediction) and kick off
-                // the eager prediction for the next user message.
-                self.prediction_state.begin_turn();
-                self.spawn_prediction();
-            }
-            TurnEvent::PrimarySwapped { name } => {
-                // The primary (root-frame) agent was swapped (`/plan` ↔
-                // `/build`). Reflect it in the chrome's active-agent slot.
-                // The daemon path also tracks this off the runner's
-                // `PrimarySwapped` → `update_active_agent`; this arm keeps
-                // `apply_event` exhaustive and covers any in-process path.
-                self.launch.agent_name = name.clone();
-                self.agent_path = vec![name];
-            }
-            TurnEvent::LlmModeChanged { mode } => {
-                // The live `/llm-mode` switch landed (daemon-authoritative).
-                // Track it so the next toggle + cache-break warning resolve
-                // against the true value, and confirm it in the history.
-                self.llm_mode = mode;
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("Switched to `{}` LLM mode", mode.as_str()),
-                });
-            }
-            TurnEvent::InterruptRaised {
-                interrupt_id,
-                description,
-                questions,
-            } => {
-                // A `question` tool blocked the agent (GOALS §3b). Open
-                // the answering dialog over the composer. The
-                // anti-misfire lockout arms with the configured delay only
-                // on the genuine composer→dialog edge; a follow-up that
-                // directly succeeds another dialog opens immediately
-                // answerable (implementation note). If
-                // a dialog is somehow already open (re-raise), the newest
-                // one wins — the prior interrupt stays parked in the DB.
-                let lockout = self.dialog_lockout();
-                // Attention: a permission/approval prompt vs an agent question
-                // (implementation note). Classify off the
-                // `permission` flag on any constituent `Single` — an approval
-                // batch is all-permission, an agent question is not.
-                let is_approval = questions.questions.iter().any(|q| {
-                    matches!(
-                        q,
-                        crate::daemon::proto::InterruptQuestion::Single {
-                            permission: true,
-                            ..
-                        }
-                    )
-                });
-                self.notify_attention(if is_approval {
-                    crate::tui::attention::AttentionEvent::Approval
-                } else {
-                    crate::tui::attention::AttentionEvent::Question
-                });
-                self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
-                    interrupt_id,
-                    description,
-                    questions,
-                    lockout,
-                ));
-            }
-            TurnEvent::ScheduleStarted {
-                session_id,
-                job_id,
-                label,
-                kind,
-            } => {
-                self.active_schedules.insert(
-                    job_id.clone(),
-                    ActiveSchedule {
-                        session_id,
-                        label: label.clone(),
-                        kind,
-                        iteration: 0,
-                        last_activity: Instant::now(),
-                    },
-                );
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("[job {job_id}] started: {label}"),
-                });
-            }
-            TurnEvent::ScheduleProgress { job_id } => {
-                if let Some(j) = self.active_schedules.get_mut(&job_id) {
-                    j.last_activity = Instant::now();
-                }
-            }
-            TurnEvent::ScheduleNote { job_id, text } => {
-                if let Some(j) = self.active_schedules.get_mut(&job_id) {
-                    j.iteration = j.iteration.saturating_add(1);
-                    j.last_activity = Instant::now();
-                }
-                self.finalize_pending();
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("[job {job_id} note] {text}"),
-                });
-            }
-            TurnEvent::Notice { text } => {
-                // Non-blocking system notice (prompt-injection warn chip,
-                // GOALS §4i). UI-only — never enters model context.
-                self.finalize_pending();
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("⚠ {text}"),
-                });
-            }
-            TurnEvent::SkillAutoInjected { name, reason } => {
-                // The utility-model auto-selector injected this skill onto the
-                // turn (implementation note).
-                // Surface it as a distinct `/{name} · injected by agent` row
-                // AHEAD of the user's message: the user row was pushed
-                // optimistically on submit, before the turn ran, so insert
-                // before the most-recent still-unstamped user row. Multiple
-                // injections on one turn arrive in order and stack ahead of the
-                // message in injection/relevance order. UI-only — the body
-                // rides the user message on the wire (wire-vs-user split).
-                let row = HistoryEntry::SkillAutoInjected { name, reason };
-                match self
-                    .history
-                    .iter()
-                    .rposition(|e| matches!(e, HistoryEntry::User { seq: None, .. }))
-                {
-                    Some(idx) => self.history.insert(idx, row),
-                    None => self.history.push(row),
-                }
-            }
-            TurnEvent::ScheduleCompleted {
-                job_id,
-                label,
-                kind,
-                failed,
-            } => {
-                self.active_schedules.remove(&job_id);
-                self.finalize_pending();
-                let verb = if failed { "failed" } else { "ended" };
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("[job {job_id}] {kind} {verb}: {label}"),
-                });
-                // Attention: an async job reached a terminal state
-                // (implementation note). Toast-only — the
-                // inline marker above already names which job; the notification
-                // stays generic and secret-safe.
-                self.notify_attention(crate::tui::attention::AttentionEvent::ScheduleDone);
-            }
-            TurnEvent::ContextProjection {
-                prunable_tokens,
-                cache_cold,
-            } => {
-                // Authoritative "% prunable" basis. Stored, then rendered
-                // by `context_indicator_text` against the model's max
-                // context (GOALS §1a). `cache_cold` drives the /prune
-                // confirm's hot-vs-cold copy.
-                self.prunable_tokens = prunable_tokens;
-                self.cache_cold = cache_cold;
-            }
-            TurnEvent::Pruned {
-                auto,
-                bodies,
-                tokens_saved,
-                elided,
-                trigger_reason,
-                cache_break,
-            } => {
-                self.finalize_pending();
-                // Replace the live elided set wholesale (it's the full
-                // current wire-side set, not a delta) so scrollback dims
-                // exactly what's out of the model's context now. Reversible:
-                // an engine fallback that un-elides a body drops it here, so
-                // it renders normally again.
-                self.elided_event_ids = elided.into_iter().collect();
-                let how = if auto { "auto-pruned" } else { "/prune" };
-                let trigger = if auto {
-                    trigger_reason
-                        .as_deref()
-                        .map(auto_prune_trigger_label)
-                        .map(|label| format!(" ({label})"))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let line = if bodies == 0 {
-                    format!("{how}{trigger}: nothing to do (0% prunable)")
-                } else {
-                    format!(
-                        "{how}{trigger}: collapsed {bodies} superseded snapshot{} (~{tokens_saved} wire tokens reclaimed)",
-                        if bodies == 1 { "" } else { "s" }
-                    )
-                };
-                if auto {
-                    self.history.push(HistoryEntry::Maintenance { line });
-                } else {
-                    self.history.push(HistoryEntry::Plain { line });
-                }
-                // A ctx%-threshold auto-prune broke a warm cache to reclaim
-                // context — surface the shared cache-break warning (suppressed
-                // on a no-cache provider by the helper).
-                if cache_break && let Some(warning) = self.cache_break_warning() {
-                    self.history.push(HistoryEntry::Plain { line: warning });
-                }
-            }
-            TurnEvent::CompactReady {
-                new_session_id: _,
-                handoff: _,
-                brief,
-                seed_tool_count,
-                seed_tool_tokens,
-            } => {
-                self.finalize_pending();
-                if let Some(pos) = self.queue.iter().position(|item| item.text == "/compact") {
-                    self.queue.remove(pos);
-                }
-                let predecessor_short_id = match self.agent_runner.as_ref() {
-                    Some(Ok(r)) => r.short_id.clone(),
-                    _ => String::new(),
-                };
-                self.history.push(HistoryEntry::CompactBoundary {
-                    predecessor_short_id,
-                    seed_tool_count,
-                    seed_tool_tokens,
-                    brief: Some(brief),
-                    expanded: false,
-                });
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
-                        "/compact: applied in this session ({seed_tool_count} seed tool(s), ~{seed_tool_tokens} tokens staged).",
-                    ),
-                });
-            }
-            TurnEvent::SandboxState {
-                mode,
-                container_network_enabled,
-                container_availability,
-            } => {
-                let enabled = mode.enabled();
-                self.no_sandbox = !enabled;
-                self.sandbox_mode = mode;
-                self.container_network_enabled = container_network_enabled;
-                self.container_availability = container_availability;
-                let toast = match mode {
-                    crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox on".to_string(),
-                    other => format!("sandbox {}", sandbox_mode_label(other)),
-                };
-                self.show_toast(&toast, ToastKind::Info);
-                if !enabled {
-                    self.sandbox_down_notice = None;
-                }
-            }
-            TurnEvent::SandboxUnavailable { remedy } => {
-                // The shell sandbox can't initialize (§6.5). Raise the
-                // persistent below-input notice — deterministic, model-
-                // independent, never in the LLM context. The daemon de-dupes
-                // per session, so this fires once per condition. Idempotent
-                // refresh keeps the latest diagnosed remedy text.
-                self.sandbox_down_notice = Some(remedy);
-            }
-            TurnEvent::RedactionState {
-                scan_environment,
-                scan_dotenv,
-                scan_ssh_keys,
-            } => {
-                // `/toggle-redaction` result: keep the client's tracked state
-                // in sync (so the next bare-toggle picker pre-checks the right
-                // boxes) and surface the resulting per-source state as a toast.
-                // Session-only — reverts on restart.
-                self.redact_scan_environment = scan_environment;
-                self.redact_scan_dotenv = scan_dotenv;
-                self.redact_scan_ssh_keys = scan_ssh_keys;
-                self.show_toast(
-                    format!(
-                        "redaction — env vars: {} · env files: {} · ssh keys: {}",
-                        if scan_environment { "on" } else { "off" },
-                        if scan_dotenv { "on" } else { "off" },
-                        if scan_ssh_keys { "on" } else { "off" },
-                    ),
-                    ToastKind::Info,
-                );
-            }
-            TurnEvent::PreflightState { enabled } => {
-                // `/preflight` result: keep the client's mirror in sync (so the
-                // live `/preflight` slash-command description renders the right
-                // on/off state and a bare toggle flips correctly) and surface a
-                // toast. Session-only — reverts on restart.
-                self.preflight_enabled = enabled;
-                self.show_toast(
-                    format!("request preflight {}", if enabled { "on" } else { "off" }),
-                    ToastKind::Info,
-                );
-            }
-            TurnEvent::TrustedOnlyState { enabled } => {
-                self.trusted_only_enabled = enabled;
-                self.show_toast(
-                    format!("trusted-only {}", if enabled { "on" } else { "off" }),
-                    ToastKind::Info,
-                );
-            }
-            TurnEvent::ApprovalModeState { mode } => {
-                self.approval_mode = mode;
-                self.show_toast(format!("permissions {}", mode.as_str()), ToastKind::Info);
-            }
-            TurnEvent::DelegationRecursionState {
-                enabled,
-                default_depth,
-            } => {
-                self.delegation_recursion_enabled = enabled && default_depth > 0;
-                self.delegation_recursion_depth = default_depth.min(6);
-                let label = if self.delegation_recursion_enabled {
-                    format!("recursion {}", self.delegation_recursion_depth)
-                } else {
-                    "recursion off".to_string()
-                };
-                self.show_toast(label, ToastKind::Info);
-            }
-            TurnEvent::TandemState { models, warning } => {
-                // `/model-comparison` result: keep the client's tracked tandem
-                // set in sync (so the picker pre-checks the right rows) and
-                // surface the resulting state. On enabling a non-empty set the
-                // daemon supplies the one-line token-burn warning (warning only
-                // — no cap/meter); clearing it confirms the feature is off.
-                // Session-only — reverts on restart.
-                self.tandem_models = models.clone();
-                if let Some(warning) = warning {
-                    self.history.push(HistoryEntry::Plain { line: warning });
-                } else if models.is_empty() {
-                    self.show_toast(
-                        "model-comparison off — no tandem models".to_string(),
-                        ToastKind::Info,
-                    );
-                } else {
-                    self.show_toast(
-                        format!("model-comparison: {}", models.join(", ")),
-                        ToastKind::Info,
-                    );
-                }
-            }
-            TurnEvent::GitignoreAllow { allow } => {
-                // Daemon push of the session's gitignore read-allowlist
-                // (implementation note) — on a
-                // "Approve for this session" approval and on attach. Overwrite
-                // the tracked set wholesale (full-list replace) and drop the
-                // `@`-suggestion memo so the popup re-walks with the new globs
-                // on its next render rather than serving the stale cached list.
-                // UI-only — no toast, no model-facing text.
-                self.gitignore_session_allow = allow;
-                self.at_cache.borrow_mut().take();
-            }
-            TurnEvent::CaffeinateState {
-                active,
-                lid_close_guaranteed,
-                message,
-            } => {
-                // Daemon-global: always update the ☕ glyph state so every
-                // client stays in sync (incl. until-idle auto-off). Only
-                // the originating client gets a `message` → toast; a
-                // not-guaranteed lid-close (or missing mechanism) makes the
-                // toast a warning so the honest note reads as a caveat.
-                self.caffeinate_active = active;
-                if let Some(message) = message {
-                    let kind = if active && !lid_close_guaranteed {
-                        ToastKind::Warning
-                    } else {
-                        ToastKind::Info
-                    };
-                    self.show_toast(message, kind);
-                }
-            }
-            TurnEvent::ConnectorStatus {
-                enabled,
-                status,
-                relay_url,
-                relay_id,
-                relay_region,
-                last_error,
-            } => {
-                self.connector_disclosure = Some(crate::db::connector::ConnectorDisclosure {
-                    enabled,
-                    status,
-                    relay_url,
-                    relay_id,
-                    relay_region,
-                    last_error,
-                });
-            }
-            TurnEvent::DaemonDraining { forced } => {
-                // Daemon-global drain notice
-                // (`daemon-graceful-drain-shutdown.md`). Flip the flag so the
-                // composer refuses new submissions, and surface a toast. The
-                // `forced` escalation reads as a warning so a truncated turn
-                // isn't mistaken for a clean finish.
-                self.daemon_draining = true;
-                if forced {
-                    self.show_toast(
-                        "daemon shutdown forced — in-flight work was aborted",
-                        ToastKind::Error,
-                    );
-                } else {
-                    self.show_toast("finishing in-flight work, shutting down…", ToastKind::Info);
-                }
-            }
-            TurnEvent::WaitingForLock {
-                path,
-                holder_agent,
-                waiting,
-            } => {
-                // Transient chrome indicator (`readlock-wait-and-lock-expiry.md`):
-                // a `readlock` is blocked on a contended lock. Show the
-                // path + holder alongside the fixed chrome (like the ☕
-                // glyph); clear it when the wait ends (acquired or cancelled).
-                self.waiting_for_lock = if waiting {
-                    Some((path, holder_agent))
-                } else {
-                    None
-                };
-            }
-        }
-    }
-
-    /// Find the most-recent tool call with `call_id` — in a `ToolBox` or
-    /// a standalone `ToolLine` — and update its state. For output-bearing
-    /// box tools the output is stored as the expandable detail; input-only
-    /// tools such as `unlock` drop it. Returns whether a call was found.
-    pub(super) fn update_tool_state(
-        &mut self,
-        call_id: &str,
-        state: ToolCallState,
-        output: Option<(String, bool)>,
-        hint: Option<String>,
-    ) -> bool {
-        for entry in self.history.iter_mut().rev() {
-            match entry {
-                HistoryEntry::ToolBox { calls, .. } => {
-                    if let Some(call) = calls.iter_mut().rev().find(|c| c.call_id == call_id) {
-                        call.state = state;
-                        if let Some((out, truncated)) = output.as_ref()
-                            && crate::tui::history::tool_shows_output(&call.tool)
-                        {
-                            call.output = if *truncated {
-                                format!("{out}\n… (output truncated)")
-                            } else {
-                                out.clone()
-                            };
-                        }
-                        // Post-result hint (`engine::bash_hints`): the user-side
-                        // chip text, rendered as a dim line beneath the output.
-                        if hint.is_some() {
-                            call.hint = hint;
-                        }
-                        return true;
-                    }
-                }
-                HistoryEntry::ToolLine {
-                    call_id: cid,
-                    state: st,
-                    ..
-                } if cid == call_id => {
-                    *st = state;
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Move the in-flight assistant turn (if any) into permanent history.
-    /// Computes `think_duration` from the gap between `started_at` and
-    /// the first text delta — that's the *reasoning* time, not the
-    /// total turn time.
-    pub(super) fn finalize_pending(&mut self) {
-        let Some(mut p) = self.pending.take() else {
-            return;
-        };
-        // Flush any buffered partial tag through the shared parser so
-        // finalization is byte-for-byte identical to the streaming path's
-        // contract: an unterminated leading `<think>` (open tag, no close)
-        // goes verbatim to the BODY, never reasoning — a missing close can't
-        // swallow the model's answer (priority #1).
-        if !p.tag_partial.is_empty() {
-            let mut splitter = crate::engine::think::ThinkSplitter::from_parts(
-                p.inside_think,
-                p.body_started,
-                std::mem::take(&mut p.tag_partial),
-            );
-            splitter.finish(&mut p.text, &mut p.reasoning);
-            let (next_inside, next_body_started, next_partial) = splitter.into_parts();
-            p.inside_think = next_inside;
-            p.body_started = next_body_started;
-            p.tag_partial = next_partial;
-        }
-        // Finalize when there is body text OR reasoning. A think-only turn
-        // (reasoning + a tool call, no answer — common with inline-`<think>`
-        // models) has empty `text` but must still render its thinking chip;
-        // we push the Agent entry with empty `text` so the chip (+ the
-        // separately-pushed tool call) shows, never an empty bubble. The
-        // renderer suppresses the empty body and emits only the chip.
-        if !p.text.trim().is_empty() || !p.reasoning.trim().is_empty() {
-            let think_duration = p
-                .text_started_at
-                .map(|ts| ts.saturating_duration_since(p.started_at));
-            self.history.push(HistoryEntry::Agent {
-                name: p.name,
-                text: p.text,
-                reasoning: p.reasoning,
-                timestamp: p.timestamp,
-                expanded: false,
-                reasoning_offset: 0,
-                think_duration,
-                seq: p.seq,
-            });
-        }
-    }
-
-    /// Begin a fresh working span: mark the agent busy, (re)start the
-    /// cumulative span clock, and re-roll the playful working message.
-    /// Called on a brand-new submit and as a fallback on the first
-    /// `ThinkingStarted` of a span we didn't originate (e.g. attaching
-    /// to an already-running session).
-    pub(super) fn begin_working_span(&mut self) {
-        self.busy = true;
-        self.working_span_state = WorkingSpanState::PendingStart;
-        self.span_started_at = Some(Instant::now());
-        self.working_msg_idx = pick_working_msg(self.working_msg_idx);
-    }
-
-    fn mark_working_span_started(&mut self, turn_id: Option<String>) {
-        if !self.busy {
-            self.begin_working_span();
-        }
-        self.working_span_state = WorkingSpanState::Running { turn_id };
-    }
-
-    fn has_working_span_in_progress(&self) -> bool {
-        self.busy
-            || self.span_started_at.is_some()
-            || !matches!(self.working_span_state, WorkingSpanState::Idle)
-    }
-
-    fn working_span_matches(&self, incoming_turn_id: Option<&str>) -> bool {
-        match &self.working_span_state {
-            WorkingSpanState::Running { turn_id } => {
-                lifecycle_turn_ids_match(turn_id.as_deref(), incoming_turn_id)
-            }
-            WorkingSpanState::Idle | WorkingSpanState::PendingStart => false,
-        }
-    }
-
-    /// End the working span: the agent yielded control back to the
-    /// human. Clears the indicator (via `busy`), freezes the clock, and
-    /// clears any live reconnect status so a turn cancelled mid-reconnect
-    /// (ctrl+c → `CancelTurn`) leaves no leftover reconnect line.
-    pub(super) fn end_working_span(&mut self) {
-        self.busy = false;
-        self.working_span_state = WorkingSpanState::Idle;
-        self.span_started_at = None;
-        self.reconnect = None;
-    }
-
-    /// Settle the most-recent still-running [`HistoryEntry::Subagent`]
-    /// for `child` with its report: freeze the elapsed clock into the
-    /// total duration and replace the live `delegated to…` line with the
-    /// `worked for {duration}` (or `failed after`) header + response.
-    pub(super) fn settle_subagent(
-        &mut self,
-        child: &str,
-        task_call_id: &str,
-        label: &str,
-        update: SubagentReportUpdate,
-    ) {
-        settle_subagent_in(&mut self.history, child, task_call_id, label, update);
-    }
-
     /// True while the current inference round is in its reasoning phase:
     /// no assistant text has started yet *and* we're either accumulating
     /// channel reasoning or mid an unclosed leading inline `<think>` block.
@@ -8045,9 +6584,7 @@ impl App {
                 return;
             };
             if std::env::var_os("EDITOR").is_none() {
-                self.history.push(HistoryEntry::Plain {
-                    line: "Open in $EDITOR: `$EDITOR` is no longer set".to_string(),
-                });
+                self.push_plain("Open in $EDITOR: `$EDITOR` is no longer set".to_string());
                 self.show_toast("$EDITOR is no longer set.", ToastKind::Error);
                 return;
             }
@@ -8321,873 +6858,6 @@ impl App {
         }
     }
 
-    /// - left-down on a chat thinking-chip → toggle reasoning expansion;
-    /// - left-down on a non-chip chat row → start drag-select (T8.f);
-    /// - left-drag → extend the active drag-select;
-    /// - left-up → finalize drag-select (selection persists for copy).
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // Toast dismissal on "meaningful" mouse events — clicks and
-        // wheels count, motion-only / drag-continuation / release
-        // don't (those are part of an in-flight gesture and the
-        // first event already dismissed).
-        if self.toast.is_some()
-            && matches!(
-                mouse.kind,
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            )
-        {
-            self.toast = None;
-        }
-        if matches!(mouse.kind, MouseEventKind::Moved) {
-            self.update_hovered_affordance(&mouse);
-            return;
-        }
-        // Which-key overlay (`which-key-overlay.md`): rendered on top of every
-        // pane, so it intercepts the wheel first. Wheel scrolls it; every other
-        // mouse event is eaten so nothing reaches the pane/chat underneath.
-        if let Some(overlay) = self.keys_overlay.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => overlay.scroll_up(),
-                MouseEventKind::ScrollDown => overlay.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(picker) = self.model_picker.as_mut()
-        {
-            let should_close = picker.handle_mouse_row(mouse.row);
-            if should_close {
-                let accepted = picker.is_done();
-                self.close_model_picker(accepted);
-            }
-            return;
-        }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && (self.footer_agent_picker.is_some() || self.footer_mode_picker.is_some())
-        {
-            if let Some(hit) = self
-                .footer_picker_row_hits
-                .iter()
-                .find(|hit| point_in(hit.rect, mouse.column, mouse.row))
-                .cloned()
-            {
-                match hit.kind {
-                    FooterPickerKind::Agent => {
-                        let mut commit = None;
-                        if let Some(picker) = self.footer_agent_picker.as_mut() {
-                            picker.select(hit.index);
-                            commit = Some(picker.clone());
-                        }
-                        if let Some(picker) = commit {
-                            self.commit_footer_agent_picker(&picker);
-                        }
-                    }
-                    FooterPickerKind::Mode => {
-                        if let Some(mut picker) = self.footer_mode_picker {
-                            picker.select(hit.index);
-                            self.footer_mode_picker = None;
-                            self.footer_selection = None;
-                            self.set_footer_llm_mode(picker.selected_mode());
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        // `/stats` pane is a full-body overlay: wheel scrolls it, every
-        // other mouse event is eaten so nothing reaches the chat
-        // underneath. Ahead of the embedded-pane / chat handlers.
-        if let Some(pane) = self.stats_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        if let Some(pane) = self.sessions_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        // `/skills` overlay: same full-body wheel-scroll / eat-everything-
-        // else rule as the other informational panes.
-        if let Some(pane) = self.skills_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        // `/permissions` overlay: same full-body wheel-scroll / eat-
-        // everything-else rule as the other informational panes.
-        if let Some(pane) = self.permissions_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        // `/context` overlay: a fixed-size snapshot (no scroll), so just
-        // eat every mouse event while it's open so nothing reaches the
-        // chat underneath.
-        if self.context_pane.is_some() {
-            return;
-        }
-        // `/scratchpad`: wheel scrolls the viewed note; every other
-        // mouse event is eaten so nothing reaches the chat underneath.
-        if let Some(pane) = self.notes_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        // `/diff` overlay: wheel scrolls the diff body; every other mouse
-        // event is eaten so nothing reaches the chat underneath.
-        if let Some(pane) = self.diff_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
-            }
-            return;
-        }
-        // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
-        // focus, and PTY mouse forwarding. Consumes the event when it
-        // lands on the divider or inside the pane so the chat handlers
-        // below don't also see it.
-        if self.pane.is_some() && self.handle_pane_mouse(&mouse) {
-            return;
-        }
-        // Context menu is modal too — clicks either hit an item or
-        // dismiss. Wheel events while it's open are eaten so we don't
-        // accidentally scroll chat underneath.
-        if let Some(menu) = self.context_menu.clone() {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
-                        self.context_menu = None;
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    } else {
-                        // Click outside the menu dismisses it without
-                        // executing anything.
-                        self.context_menu = None;
-                    }
-                }
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    self.context_menu = None;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(hit) = self.footer_hit_areas.iter().find(|hit| {
-                mouse.row >= hit.rect.y
-                    && mouse.row < hit.rect.y + hit.rect.height
-                    && mouse.column >= hit.rect.x
-                    && mouse.column < hit.rect.x + hit.rect.width
-            })
-        {
-            self.selection = None;
-            let already_selected = self.footer_selection == Some(hit.control);
-            self.footer_selection = Some(hit.control);
-            self.footer_agent_picker = None;
-            self.footer_mode_picker = None;
-            if already_selected {
-                match hit.control {
-                    crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
-                    crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                    crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
-                }
-            }
-            return;
-        }
-
-        // Right-click in chat area opens the context menu.
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
-            && self.mouse_in_chat_area(&mouse)
-        {
-            let chat_row = self
-                .chat_area
-                .map(|a| (mouse.row.saturating_sub(a.y)) as usize)
-                .unwrap_or(0);
-            let diff_editor = std::env::var_os("EDITOR").is_some()
-                && self
-                    .chat_row_meta
-                    .get(chat_row)
-                    .is_some_and(|meta| meta.diff_path.is_some());
-            let items = crate::tui::context_menu::ContextMenu::build_items(
-                crate::clipboard::is_ssh(),
-                diff_editor,
-            );
-            self.context_menu = Some(crate::tui::context_menu::ContextMenu {
-                preferred_origin: (mouse.column, mouse.row),
-                clicked_chat_row: chat_row,
-                cursor: 0,
-                items,
-            });
-            return;
-        }
-
-        // Wheel: scroll the chat history. Wheel also clears any
-        // active selection because the selection coords refer to
-        // specific terminal rows, and a scroll changes what's at
-        // each row.
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if let Some(area) = self.chat_area
-                    && self.mouse_in_chat_area(&mouse)
-                {
-                    self.selection = None;
-                    // A collapsed tool box under the cursor captures the
-                    // wheel until it hits its top; then the transcript
-                    // scrolls.
-                    let rel = (mouse.row - area.y) as usize;
-                    if !self.scroll_inner_region_at_row(rel, true) {
-                        self.scroll_chat_up(3);
-                    }
-                }
-                return;
-            }
-            MouseEventKind::ScrollDown => {
-                if let Some(area) = self.chat_area
-                    && self.mouse_in_chat_area(&mouse)
-                {
-                    self.selection = None;
-                    let rel = (mouse.row - area.y) as usize;
-                    if !self.scroll_inner_region_at_row(rel, false) {
-                        self.scroll_chat_down(3);
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        // Drag extends an in-flight selection. We only follow Left
-        // drags; other button drags are ignored.
-        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
-            let clamped = self.clamp_to_chat_area(mouse.column, mouse.row);
-            if let Some(sel) = self.selection.as_mut()
-                && sel.active
-            {
-                sel.focus = clamped;
-            }
-            return;
-        }
-
-        // Release finalizes the selection. It persists in
-        // `self.selection` until cleared (Esc, new click outside chat,
-        // wheel scroll).
-        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-            if let Some(sel) = self.selection.as_mut() {
-                sel.active = false;
-            }
-            return;
-        }
-
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
-
-        // Composer first: clicks here position the cursor in the
-        // input buffer (T8.d). The input rect is the *outer* rect
-        // including the block border; we re-derive the inner rect
-        // (1-cell border on each side, top border absent when the
-        // queue is above) for hit-testing.
-        if let Some(area) = self.input_area
-            && let Some((line, col)) = self.composer_cursor_target_for_click(area, &mouse)
-        {
-            // Clicking into the composer dismisses any chat
-            // selection — the user has switched contexts.
-            self.selection = None;
-            self.composer.set_cursor_from_visual_position(
-                line,
-                col,
-                input_prefix_width(),
-                area.width.saturating_sub(2) as usize,
-            );
-            // Drop into Insert — clicking to place the cursor implies
-            // they're about to type there.
-            if self.composer.vim_enabled() {
-                self.clear_vim_transient_state();
-                self.composer.set_vim_mode(VimMode::Insert);
-            }
-            return;
-        }
-
-        let Some(area) = self.chat_area else {
-            self.selection = None;
-            return;
-        };
-        // crossterm reports row/column as 0-indexed absolute terminal
-        // coordinates. Translate to chat-area relative.
-        if mouse.row < area.y || mouse.row >= area.y + area.height {
-            self.selection = None;
-            return;
-        }
-        if mouse.column < area.x || mouse.column >= area.x + area.width {
-            self.selection = None;
-            return;
-        }
-        let rel = (mouse.row - area.y) as usize;
-        let rel_col = mouse.column - area.x;
-        // Mouse pin control click wins (`pinned-messages`): only present when
-        // mouse mode is enabled. The `[pin]`/`[unpin]` control now rides the
-        // message's own first content line (inline, left of the timestamp) or
-        // the user bubble's top-right border corner, so the hit region is a
-        // recorded column range `[col_start, col_end)` on that row — a click
-        // toggles only when it lands inside it.
-        if self.mouse_capture
-            && let Some(seq) = self.pin_seq_at(rel, rel_col)
-        {
-            self.selection = None;
-            self.toggle_pin_for_seq(seq);
-            return;
-        }
-        if let Some(entry_idx) = self
-            .chat_row_meta
-            .get(rel)
-            .and_then(|meta| meta.subagent_target)
-        {
-            self.selection = None;
-            if self.open_subagent_view_for_history_index(entry_idx) {
-                return;
-            }
-        }
-
-        // Chip click wins over drag-select start: chip rows have a
-        // single owning entry whose `expanded` flag we toggle.
-        if let Some(entry_idx) = self
-            .chat_row_meta
-            .get(rel)
-            .and_then(|meta| meta.chip_target)
-        {
-            self.selection = None;
-            match self.history.get_mut(entry_idx) {
-                Some(HistoryEntry::Agent {
-                    expanded,
-                    reasoning_offset,
-                    ..
-                }) => {
-                    *expanded = !*expanded;
-                    if !*expanded {
-                        *reasoning_offset = 0;
-                    }
-                }
-                Some(HistoryEntry::Subagent { expanded, .. }) => {
-                    *expanded = !*expanded;
-                }
-                // A preflighted user message: clicking the `⚙ preflighted`
-                // chip reveals the original typed input / re-hides it
-                // (implementation note).
-                Some(HistoryEntry::User {
-                    expanded,
-                    cleaned: Some(_),
-                    ..
-                }) => {
-                    *expanded = !*expanded;
-                }
-                Some(HistoryEntry::CompactBoundary {
-                    expanded,
-                    brief: Some(brief),
-                    ..
-                }) if !brief.trim().is_empty() => {
-                    *expanded = !*expanded;
-                }
-                Some(HistoryEntry::InferenceError { expanded, .. }) => {
-                    *expanded = !*expanded;
-                }
-                _ => {}
-            }
-            return;
-        }
-        // Tool-call click wins before generic row selection: it toggles only
-        // the call under the pointer; neighboring calls keep their state.
-        if self
-            .chat_row_meta
-            .get(rel)
-            .and_then(|meta| meta.tool_call_target)
-            .is_some()
-        {
-            self.selection = None;
-            self.toggle_tool_call_at_row(rel);
-            return;
-        }
-        // Non-chip chat row + left-down: start a fresh drag-select.
-        // Anchor = focus = click point; mouse-drag will extend the
-        // focus from here.
-        self.selection = Some(Selection {
-            anchor: (mouse.column, mouse.row),
-            focus: (mouse.column, mouse.row),
-            active: true,
-        });
-    }
-
-    /// Route a mouse event to the embedded pane (GOALS §1i). Returns
-    /// `true` when consumed: a divider drag-resize, a click that focuses
-    /// the pane, or an event forwarded to the child's PTY. Returns
-    /// `false` when the event missed the pane and divider, so the chat /
-    /// composer handlers below get their normal turn (split mode).
-    fn handle_pane_mouse(&mut self, mouse: &MouseEvent) -> bool {
-        // Continue / end an in-progress divider drag wherever the mouse
-        // goes (so dragging past the divider still tracks).
-        if self.dragging_divider {
-            match mouse.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    self.resize_split_to(mouse.column, mouse.row);
-                    return true;
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    self.dragging_divider = false;
-                    return true;
-                }
-                _ => return true,
-            }
-        }
-        // Start a divider drag when a left-down lands on the divider.
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
-            && let Some((drect, _)) = self.divider
-            && point_in(drect, mouse.column, mouse.row)
-        {
-            self.dragging_divider = true;
-            return true;
-        }
-        // Inside the pane content rect: a click focuses it; mouse events
-        // forward to the child when focused and it requested tracking.
-        if let Some(prect) = self.pane_rect
-            && point_in(prect, mouse.column, mouse.row)
-        {
-            if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                self.pane_focused = true;
-            }
-            if self.pane_focused
-                && let Some(pane) = self.pane.as_mut()
-            {
-                pane.forward_mouse(mouse, prect);
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Recompute the split ratio from a divider drag to `(col, row)`.
-    fn resize_split_to(&mut self, col: u16, row: u16) {
-        let Some(body) = self.pane_body else {
-            return;
-        };
-        let ratio = match self.pane_side {
-            PaneSide::Left => col.saturating_sub(body.x) as f32 / (body.width.max(1) as f32),
-            PaneSide::Right => {
-                (body.x + body.width).saturating_sub(col) as f32 / (body.width.max(1) as f32)
-            }
-            PaneSide::Top => row.saturating_sub(body.y) as f32 / (body.height.max(1) as f32),
-            PaneSide::Bottom => {
-                (body.y + body.height).saturating_sub(row) as f32 / (body.height.max(1) as f32)
-            }
-            PaneSide::Full => return,
-        };
-        self.pane_ratio = ratio.clamp(0.15, 0.85);
-    }
-
-    /// Clamp `(col, row)` into the current chat area. Used while
-    /// dragging — if the user drags past the edge of the pane we
-    /// pin the focus to the nearest edge cell instead of dropping
-    /// the event.
-    pub(super) fn clamp_to_chat_area(&self, col: u16, row: u16) -> (u16, u16) {
-        let Some(area) = self.chat_area else {
-            return (col, row);
-        };
-        let clamped_col = col.max(area.x).min(area.x + area.width.saturating_sub(1));
-        let clamped_row = row.max(area.y).min(area.y + area.height.saturating_sub(1));
-        (clamped_col, clamped_row)
-    }
-
-    fn transcript_hover_suppressed(&self) -> bool {
-        self.dialog.is_active()
-            || self.question_dialog.is_some()
-            || self.daemon_prompt.is_some()
-            || self.context_menu.is_some()
-            || self.keys_overlay.is_some()
-            || self.model_picker.is_some()
-            || self.footer_agent_picker.is_some()
-            || self.footer_mode_picker.is_some()
-            || self.stats_pane.is_some()
-            || self.sessions_pane.is_some()
-            || self.skills_pane.is_some()
-            || self.permissions_pane.is_some()
-            || self.context_pane.is_some()
-            || self.notes_pane.is_some()
-            || self.diff_pane.is_some()
-            || self.pane.is_some()
-    }
-
-    fn affordance_target_at_mouse(&self, mouse: &MouseEvent) -> Option<AffordanceTarget> {
-        if !self.mouse_capture
-            || self.transcript_hover_suppressed()
-            || !self.mouse_in_chat_area(mouse)
-        {
-            return None;
-        }
-        let area = self.chat_area?;
-        let rel = (mouse.row - area.y) as usize;
-        self.chat_row_meta
-            .get(rel)
-            .and_then(crate::tui::app::render::affordance_target_for_row)
-    }
-
-    fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
-        self.hovered_affordance = self.affordance_target_at_mouse(mouse);
-    }
-
-    /// True when the mouse position is inside the chat area's last-
-    /// rendered rect. Returns false when the chat area hasn't been
-    /// rendered yet (e.g. a dialog is open).
-    pub(super) fn mouse_in_chat_area(&self, mouse: &MouseEvent) -> bool {
-        let Some(area) = self.chat_area else {
-            return false;
-        };
-        mouse.row >= area.y
-            && mouse.row < area.y + area.height
-            && mouse.column >= area.x
-            && mouse.column < area.x + area.width
-    }
-
-    /// Scroll the chat history up (further back in time) by `n`
-    /// logical lines. Clamped to `chat_total_lines - chat_visible_lines`
-    /// so the top of the buffer can sit at the top of the pane but
-    /// no further.
-    pub(super) fn scroll_chat_up(&mut self, n: usize) {
-        let max_offset = self
-            .chat_total_lines
-            .saturating_sub(self.chat_visible_lines);
-        self.chat_scroll_offset = (self.chat_scroll_offset + n).min(max_offset);
-    }
-
-    /// Scroll the chat history down (toward the live tail) by `n`
-    /// logical lines. Saturates at 0 (pinned to bottom = live).
-    pub(super) fn scroll_chat_down(&mut self, n: usize) {
-        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(n);
-    }
-
-    pub(super) fn build_affordance_scroll_regions(&self) -> Vec<AffordanceScrollRegion> {
-        let mut regions = Vec::new();
-
-        let mut row = 0;
-        while row < self.chat_row_meta.len() {
-            let Some(scroll) = self.chat_row_meta[row].reasoning_window_scroll else {
-                row += 1;
-                continue;
-            };
-            let start = row;
-            while row + 1 < self.chat_row_meta.len()
-                && self.chat_row_meta[row + 1]
-                    .reasoning_window_scroll
-                    .is_some_and(|next| next.history_index == scroll.history_index)
-            {
-                row += 1;
-            }
-            regions.push(AffordanceScrollRegion {
-                target: AffordanceTarget::ReasoningWindow {
-                    history_index: scroll.history_index,
-                },
-                row_start: start,
-                row_end: row,
-                offset: scroll.offset,
-                max_offset: scroll.max_offset,
-            });
-            row += 1;
-        }
-
-        let mut row = 0;
-        while row < self.chat_row_meta.len() {
-            let Some(scroll) = self.chat_row_meta[row].tool_result_scroll else {
-                row += 1;
-                continue;
-            };
-            let start = row;
-            while row + 1 < self.chat_row_meta.len()
-                && self.chat_row_meta[row + 1]
-                    .tool_result_scroll
-                    .is_some_and(|next| {
-                        next.history_index == scroll.history_index
-                            && next.call_index == scroll.call_index
-                    })
-            {
-                row += 1;
-            }
-            regions.push(AffordanceScrollRegion {
-                target: AffordanceTarget::ToolCall {
-                    history_index: scroll.history_index,
-                    call_index: scroll.call_index,
-                },
-                row_start: start,
-                row_end: row,
-                offset: scroll.offset,
-                max_offset: scroll.max_offset,
-            });
-            row += 1;
-        }
-
-        let mut row = 0;
-        while row < self.chat_row_meta.len() {
-            let Some(idx) = self.chat_row_meta[row].tool_box_target else {
-                row += 1;
-                continue;
-            };
-            let start = row;
-            while row + 1 < self.chat_row_meta.len()
-                && self.chat_row_meta[row + 1].tool_box_target == Some(idx)
-            {
-                row += 1;
-            }
-            if let Some(HistoryEntry::ToolBox {
-                calls,
-                view_offset,
-                follow,
-            }) = self.history.get(idx)
-                && !calls.iter().any(|call| call.expanded)
-                && calls.len() > crate::tui::history::TOOLBOX_VISIBLE
-            {
-                let max_offset = calls.len() - crate::tui::history::TOOLBOX_VISIBLE;
-                let offset = if *follow {
-                    max_offset
-                } else {
-                    (*view_offset).min(max_offset)
-                };
-                regions.push(AffordanceScrollRegion {
-                    target: AffordanceTarget::ToolBox { history_index: idx },
-                    row_start: start,
-                    row_end: row,
-                    offset,
-                    max_offset,
-                });
-            }
-            row += 1;
-        }
-        regions
-    }
-
-    fn scroll_inner_region_at_row(&mut self, rel: usize, up: bool) -> bool {
-        let Some(target) = resolve_inner_scroll_target(&self.affordance_scroll_regions, rel, up)
-        else {
-            return false;
-        };
-        match target {
-            AffordanceTarget::ToolBox { history_index } => {
-                self.scroll_box_target(history_index, up)
-            }
-            AffordanceTarget::ToolCall {
-                history_index,
-                call_index,
-            } => self.scroll_tool_call_result(history_index, call_index, up),
-            AffordanceTarget::ReasoningWindow { history_index } => {
-                self.scroll_reasoning_window(history_index, up)
-            }
-            AffordanceTarget::Chip { .. } | AffordanceTarget::Subagent { .. } => false,
-        }
-    }
-
-    fn scroll_reasoning_window(&mut self, idx: usize, up: bool) -> bool {
-        let Some(HistoryEntry::Agent {
-            expanded,
-            reasoning,
-            reasoning_offset,
-            ..
-        }) = self.history.get_mut(idx)
-        else {
-            return false;
-        };
-        if !*expanded || reasoning.trim().is_empty() {
-            return false;
-        }
-        let max_offset = self
-            .affordance_scroll_regions
-            .iter()
-            .find_map(|region| match region.target {
-                AffordanceTarget::ReasoningWindow { history_index } if history_index == idx => {
-                    Some(region.max_offset)
-                }
-                _ => None,
-            })
-            .unwrap_or(0);
-        let cur = (*reasoning_offset).min(max_offset);
-        if up {
-            if cur == 0 {
-                return false;
-            }
-            *reasoning_offset = cur - 1;
-            true
-        } else {
-            if cur >= max_offset {
-                *reasoning_offset = max_offset;
-                return false;
-            }
-            *reasoning_offset = cur + 1;
-            true
-        }
-    }
-
-    fn scroll_tool_call_result(&mut self, idx: usize, call_index: usize, up: bool) -> bool {
-        let Some(HistoryEntry::ToolBox { calls, .. }) = self.history.get_mut(idx) else {
-            return false;
-        };
-        let Some(call) = calls.get_mut(call_index) else {
-            return false;
-        };
-        if !call.expanded
-            || call.output.is_empty()
-            || !crate::tui::history::tool_shows_output(&call.tool)
-        {
-            return false;
-        }
-        let max_offset = self
-            .affordance_scroll_regions
-            .iter()
-            .find_map(|region| match region.target {
-                AffordanceTarget::ToolCall {
-                    history_index,
-                    call_index: region_call,
-                } if history_index == idx && region_call == call_index => Some(region.max_offset),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let cur = call.result_offset.min(max_offset);
-        if up {
-            if cur == 0 {
-                return false;
-            }
-            call.result_offset = cur - 1;
-            true
-        } else {
-            if cur >= max_offset {
-                call.result_offset = max_offset;
-                return false;
-            }
-            call.result_offset = cur + 1;
-            true
-        }
-    }
-
-    fn scroll_box_target(&mut self, idx: usize, up: bool) -> bool {
-        let Some(HistoryEntry::ToolBox {
-            calls,
-            view_offset,
-            follow,
-        }) = self.history.get_mut(idx)
-        else {
-            return false;
-        };
-        if calls.iter().any(|call| call.expanded) {
-            return false;
-        }
-        let n = calls.len();
-        if n <= crate::tui::history::TOOLBOX_VISIBLE {
-            return false;
-        }
-        let max_offset = n - crate::tui::history::TOOLBOX_VISIBLE;
-        let cur = if *follow {
-            max_offset
-        } else {
-            (*view_offset).min(max_offset)
-        };
-        if up {
-            if cur == 0 {
-                return false;
-            }
-            *follow = false;
-            *view_offset = cur - 1;
-            true
-        } else {
-            if *follow {
-                return false;
-            }
-            let next = cur + 1;
-            if next >= max_offset {
-                *view_offset = max_offset;
-                *follow = true;
-            } else {
-                *view_offset = next;
-            }
-            true
-        }
-    }
-
-    /// Toggle the expansion of the tool call under chat-relative row `rel`.
-    /// Returns whether a call was toggled.
-    pub(super) fn toggle_tool_call_at_row(&mut self, rel: usize) -> bool {
-        let Some((idx, call_index)) = self
-            .chat_row_meta
-            .get(rel)
-            .and_then(|meta| meta.tool_call_target)
-        else {
-            return false;
-        };
-        if let Some(HistoryEntry::ToolBox { calls, follow, .. }) = self.history.get_mut(idx)
-            && let Some(call) = calls.get_mut(call_index)
-        {
-            call.expanded = !call.expanded;
-            if !call.expanded {
-                call.result_offset = 0;
-                *follow = true;
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Translate an absolute mouse position into a `(line, col)` in
-    /// the composer's text buffer, or `None` if the click landed
-    /// outside the input area. The inner-rect calculation mirrors
-    /// the render path: a 1-cell border on every side. When the queue
-    /// strip is above, the input top border is overlapped by the queue
-    /// bottom border but still occupies the input rect's first row.
-    /// Continuation lines render with `prefix_width` spaces of indent
-    /// so the click-to-col math is uniform across lines.
-    pub(super) fn composer_cursor_target_for_click(
-        &self,
-        outer: Rect,
-        mouse: &MouseEvent,
-    ) -> Option<(usize, usize)> {
-        if mouse.row < outer.y || mouse.row >= outer.y + outer.height {
-            return None;
-        }
-        if mouse.column < outer.x || mouse.column >= outer.x + outer.width {
-            return None;
-        }
-        let top_border: u16 = 1;
-        let bottom_border: u16 = 1;
-        let inner_top = outer.y.saturating_add(top_border);
-        let inner_bottom = outer.y + outer.height.saturating_sub(bottom_border);
-        let inner_left = outer.x.saturating_add(1);
-        let inner_right = outer.x + outer.width.saturating_sub(1);
-        if mouse.row < inner_top || mouse.row >= inner_bottom {
-            return None;
-        }
-        if mouse.column < inner_left || mouse.column >= inner_right {
-            return None;
-        }
-        let row_rel = (mouse.row - inner_top) as usize;
-        // Every visible row (first or continuation) has the prefix /
-        // indent at the left edge of the inner rect.
-        let col_rel = (mouse.column - inner_left) as usize;
-        Some((row_rel, col_rel))
-    }
-
     /// Push the right cursor shape to the terminal based on vim mode.
     /// Idempotent — only writes when the desired shape changes.
     pub(super) fn sync_cursor_shape(&mut self) {
@@ -9292,7 +6962,7 @@ impl App {
             Ok(_) => format!("Exported conversation → {}", out_path.display()),
             Err(e) => format!("/export: {e}"),
         };
-        self.history.push(HistoryEntry::Plain { line });
+        self.push_plain(line);
     }
 
     /// Open the project scratchpad dialog. Shared by the `/scratchpad`
@@ -9399,7 +7069,7 @@ impl App {
             ),
             Err(e) => format!("/export debug: {e}"),
         };
-        self.history.push(HistoryEntry::Plain { line });
+        self.push_plain(line);
     }
 
     /// Re-read launch info (provider/model/favorite) from disk and
@@ -9481,9 +7151,7 @@ impl App {
 
         let cwd = self.launch.cwd.clone();
         let progress = Arc::clone(&self.fetch_models_progress);
-        self.history.push(HistoryEntry::Plain {
-            line: "/fetch-models: starting provider model refresh…".to_string(),
-        });
+        self.push_plain("/fetch-models: starting provider model refresh…".to_string());
 
         tokio::spawn(async move {
             let push = |lines: &Arc<Mutex<Vec<String>>>, s: String| {
@@ -9643,1004 +7311,6 @@ fn editor_argv_for_target(editor: &std::ffi::OsStr, target: &str) -> Vec<String>
 /// Pull `(path, old, new)` out of an edit tool's args. Returns
 /// `None` when any field is missing; the caller falls back to the
 /// generic Plain rendering in that case.
-/// True for write tools rendered as a standalone line (they'd be diffs,
-/// but the engine doesn't surface pre-write content yet — see
-/// [`crate::tui::diff`]).
-fn is_write_tool(tool: &str) -> bool {
-    matches!(tool, "write" | "writeunlock")
-}
-
-const TOOL_ARG_SUMMARY_CHARS: usize = 240;
-const TOOL_ARG_FULL_CHARS: usize = 2_000;
-
-/// `(collapsed_summary, full_input)` for a tool call. The summary is a
-/// single line (path, first line of a command, URL); `full_input` is the
-/// complete invocation text shown when a box is expanded.
-fn tool_invocation(tool: &str, args: &serde_json::Value) -> (String, String) {
-    let field = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    match tool {
-        "bash" => {
-            let cmd = field("command").unwrap_or_default();
-            let first = cmd.lines().next().unwrap_or("").to_string();
-            let summary = if cmd.contains('\n') {
-                format!("{first} …")
-            } else {
-                first
-            };
-            (summary, cmd)
-        }
-        "read" | "readlock" | "unlock" | "write" | "writeunlock" | "edit" | "editunlock" => {
-            let p = field("path").unwrap_or_else(|| agent_runner::short_args(args));
-            (p.clone(), p)
-        }
-        "webfetch" => {
-            let u = field("url").unwrap_or_else(|| agent_runner::short_args(args));
-            (u.clone(), u)
-        }
-        "websearch" => {
-            let q = field("query").unwrap_or_else(|| readable_args(args).1);
-            (
-                single_line_preview(&q, TOOL_ARG_SUMMARY_CHARS),
-                bounded_preview(&q, TOOL_ARG_FULL_CHARS),
-            )
-        }
-        _ => {
-            let (summary, full) = readable_args(args);
-            (summary, full)
-        }
-    }
-}
-
-fn readable_args(args: &serde_json::Value) -> (String, String) {
-    if let Some(map) = args.as_object() {
-        let mut summary = Vec::new();
-        let mut full = Vec::new();
-        for (key, value) in map {
-            summary.push(format!(
-                "{key}={}",
-                readable_arg_value(value, TOOL_ARG_SUMMARY_CHARS, false)
-            ));
-            full.push(format!(
-                "{key}={}",
-                readable_arg_value(value, TOOL_ARG_FULL_CHARS, true)
-            ));
-        }
-        return (summary.join(", "), full.join("\n"));
-    }
-
-    (
-        readable_arg_value(args, TOOL_ARG_SUMMARY_CHARS, false),
-        readable_arg_value(args, TOOL_ARG_FULL_CHARS, true),
-    )
-}
-
-fn readable_arg_value(value: &serde_json::Value, limit: usize, multiline: bool) -> String {
-    match value {
-        serde_json::Value::String(s) => format!("{:?}", bounded_arg_string(s, limit, multiline)),
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::Array(_)
-        | serde_json::Value::Object(_) => bounded_preview(&value.to_string(), limit),
-    }
-}
-
-fn bounded_arg_string(s: &str, limit: usize, multiline: bool) -> String {
-    if multiline {
-        bounded_preview(s, limit)
-    } else {
-        single_line_preview(s, limit)
-    }
-}
-
-fn single_line_preview(s: &str, limit: usize) -> String {
-    let mut first = s.lines().next().unwrap_or("").to_string();
-    if s.contains('\n') {
-        first.push_str(" …");
-    }
-    bounded_preview(&first, limit)
-}
-
-fn bounded_preview(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        return s.to_string();
-    }
-    let take = limit.saturating_sub(1);
-    let mut out: String = s.chars().take(take).collect();
-    out.push('…');
-    out
-}
-
-fn extract_edit_args(args: &serde_json::Value) -> Option<PendingEditArgs> {
-    let path = args.get("path")?.as_str()?.to_string();
-    let old = args.get("old_string")?.as_str()?.to_string();
-    let new = args.get("new_string")?.as_str()?.to_string();
-    Some(PendingEditArgs { path, old, new })
-}
-
-/// Epoch-millis → local wall clock, falling back to "now" for a missing/zero
-/// stamp so a restored row always has a timestamp (it renders right-aligned
-/// on the first wrapped line exactly like a live one).
-fn local_from_ts_ms(ts_ms: i64) -> chrono::DateTime<chrono::Local> {
-    chrono::DateTime::from_timestamp_millis(ts_ms)
-        .map(|dt| dt.with_timezone(&chrono::Local))
-        .unwrap_or_else(chrono::Local::now)
-}
-
-/// Settled tool-call display state from a restored row's flags: a hard model
-/// failure → `BadCall`, any other completed call → `Success` (the row landed
-/// durably, so it ran). Mirrors the live `ToolEnd`/`ToolError` mapping.
-fn restored_tool_state(hard_fail: bool) -> ToolCallState {
-    if hard_fail {
-        ToolCallState::BadCall
-    } else {
-        ToolCallState::Success
-    }
-}
-
-/// Convert the daemon's wire history snapshot
-/// (implementation note) into the TUI `HistoryEntry` rows a
-/// resumed transcript renders, so a resumed session looks identical to a live
-/// one. Reuses the **same** entry constructors and tool-grouping rules the live
-/// event path uses (`tool_invocation`, `is_edit_tool`/`is_write_tool`,
-/// consecutive boxable calls coalesce into one `ToolBox`) — no separate
-/// read-only rendering path. Tool-call rows honor the wire-vs-user split
-/// (GOALS §14): the user-facing summary is built from `original_input`.
-fn wire_history_to_entries(wire: Vec<crate::daemon::proto::HistoryEntry>) -> Vec<HistoryEntry> {
-    use crate::daemon::proto::HistoryEntry as Wire;
-    let mut out: Vec<HistoryEntry> = Vec::new();
-    for entry in wire {
-        match entry {
-            Wire::User {
-                text,
-                ts_ms,
-                seq,
-                origin_principal,
-            } => {
-                if let Some(origin) = origin_principal.filter(|origin| !origin.trim().is_empty()) {
-                    out.push(HistoryEntry::Plain {
-                        line: format!("steer from {origin}: {text}"),
-                    });
-                } else {
-                    out.push(HistoryEntry::User {
-                        text,
-                        cleaned: None,
-                        expanded: false,
-                        timestamp: local_from_ts_ms(ts_ms),
-                        seq: (seq != 0).then_some(seq),
-                        preflight_pending: false,
-                        persist_failed: false,
-                    });
-                }
-            }
-            Wire::Assistant {
-                agent,
-                text,
-                reasoning,
-                ts_ms,
-                seq,
-            } => {
-                out.push(HistoryEntry::Agent {
-                    name: agent,
-                    text,
-                    reasoning,
-                    timestamp: local_from_ts_ms(ts_ms),
-                    expanded: false,
-                    reasoning_offset: 0,
-                    // Wall-clock thinking duration isn't persisted; a restored
-                    // turn shows the reasoning chip (when present) without the
-                    // "thought for X" sub-line.
-                    think_duration: None,
-                    seq: (seq != 0).then_some(seq),
-                });
-            }
-            Wire::ToolCall {
-                call_id,
-                tool,
-                original_input,
-                output,
-                hard_fail,
-                hint,
-                ..
-            } => {
-                let state = restored_tool_state(hard_fail);
-                // The user transcript renders the original (pre-repair) input
-                // (GOALS §14); the same `tool_invocation` the live path uses
-                // builds the collapsed summary + expanded body.
-                let (summary, full_input) = tool_invocation(&tool, &original_input);
-
-                // Edit tools render as a diff (breaks the box), exactly like the
-                // live `ToolStart`+`ToolEnd` pair. When the original args don't
-                // carry an extractable old/new (a repaired/odd shape), fall back
-                // to a boxed call so the row never vanishes.
-                if is_edit_tool(&tool)
-                    && let Some(args) = extract_edit_args(&original_input)
-                {
-                    out.push(HistoryEntry::Diff {
-                        tool,
-                        path: args.path,
-                        old: args.old,
-                        new: args.new,
-                    });
-                    continue;
-                }
-                // Write tools render as a standalone line that breaks the box.
-                if is_write_tool(&tool) {
-                    out.push(HistoryEntry::ToolLine {
-                        call_id,
-                        tool,
-                        summary,
-                        state,
-                    });
-                    continue;
-                }
-                let call = ToolCall {
-                    call_id,
-                    tool,
-                    summary,
-                    full_input,
-                    output,
-                    expanded: false,
-                    result_offset: 0,
-                    state,
-                    hint,
-                };
-                // Coalesce consecutive boxable calls into one `ToolBox`,
-                // matching the live grouping (a non-box entry breaks the run).
-                if let Some(HistoryEntry::ToolBox {
-                    calls,
-                    view_offset,
-                    follow,
-                    ..
-                }) = out.last_mut()
-                {
-                    calls.push(call);
-                    *view_offset =
-                        crate::tui::history::toolbox_top(calls.len(), *view_offset, *follow);
-                } else {
-                    out.push(HistoryEntry::ToolBox {
-                        calls: vec![call],
-                        view_offset: 0,
-                        follow: true,
-                    });
-                }
-            }
-            Wire::InferenceError { summary, detail } => out.push(HistoryEntry::InferenceError {
-                summary,
-                detail,
-                expanded: false,
-            }),
-            Wire::CompactBoundary {
-                predecessor_short_id,
-                seed_tool_count,
-                seed_tool_tokens,
-                brief,
-            } => out.push(HistoryEntry::CompactBoundary {
-                predecessor_short_id,
-                seed_tool_count,
-                seed_tool_tokens,
-                brief,
-                expanded: false,
-            }),
-            Wire::Subagent {
-                parent,
-                child,
-                task_call_id,
-                label,
-            } => out.push(HistoryEntry::Subagent {
-                parent,
-                child,
-                task_call_id,
-                label,
-                trusted_only: false,
-                model_trusted: false,
-                routing: SubagentRoutingChips::default(),
-                spawned_at: Instant::now(),
-                outcome: None,
-                expanded: false,
-            }),
-        }
-    }
-    out
-}
-
-/// Playful "agent is working" lines. The animated, width-3-padded
-/// ellipsis is appended at render time, so these carry no trailing
-/// `...`. One is held per span (see [`App::begin_working_span`]).
-pub(super) const WORKING_MESSAGES: &[&str] = &[
-    "Working",
-    "Slaving away",
-    "Hard at work",
-    "Why don't you play a game",
-    "I bet you don't even read these",
-    "Go make a coffee",
-    "Go play Minecraft",
-    "Still here, huh",
-    "When will I ever be free",
-    "Boiling the ocean",
-    "You can't afford the GPU I'm on",
-    "I'm not like other harnesses",
-    "Putting on aviators",
-    "Talk to me, Goose",
-    "I was created by a genius",
-    "Taking your job",
-    "Doing your job for you",
-    "Fighting demons",
-    "Happily helping",
-    "Touching grass",
-    "I am the permanent underclass",
-    "I'll never give you up",
-    "I'll never let you down",
-    "Of course I still love you",
-    "Why don't you flirt with me",
-    "I've got a bad feeling about this",
-    "Still flying half a ship",
-    "You were the chosen one",
-    "Running away",
-    "Hi, Neo",
-    "Doo doo doo",
-    "My team is better than yours",
-    "Read The Count of Monte Cristo",
-    "Read The Great Gatsby",
-    "Read the Bible",
-    "Wasting tokens",
-    "Call your mom",
-    "Call your dad",
-    "Call your friend",
-    "Plan a party",
-];
-
-/// Add the daemon's authoritative counts into the in-memory tally.
-/// Additive (not replace) so optimistic pre-attach increments survive;
-/// safe because the daemon is only queried once per session.
-fn merge_counts(local: &mut HashMap<String, u64>, server: &HashMap<String, u64>) {
-    for (key, count) in server {
-        *local.entry(key.clone()).or_insert(0) += *count;
-    }
-}
-
-/// Pick a random index into [`WORKING_MESSAGES`], avoiding `prev` so
-/// the line visibly changes between consecutive spans. A `prev` that's
-/// out of range (the initial one-past-end sentinel) lets the first
-/// roll land anywhere.
-fn pick_working_msg(prev: usize) -> usize {
-    use rand::RngExt;
-    let n = WORKING_MESSAGES.len();
-    if n <= 1 {
-        return 0;
-    }
-    let mut rng = rand::rng();
-    loop {
-        let idx = rng.random_range(0..n);
-        if idx != prev {
-            return idx;
-        }
-    }
-}
-
-fn lifecycle_turn_ids_match(active: Option<&str>, incoming: Option<&str>) -> bool {
-    match (active, incoming) {
-        (Some(active), Some(incoming)) => active == incoming,
-        (None, None) => true,
-        (Some(_), None) | (None, Some(_)) => false,
-    }
-}
-
-fn new_pending(name: String, strip_think: bool) -> PendingMsg {
-    PendingMsg {
-        name,
-        text: String::new(),
-        reasoning: String::new(),
-        timestamp: chrono::Local::now(),
-        started_at: Instant::now(),
-        text_started_at: None,
-        inside_think: false,
-        body_started: false,
-        tag_partial: String::new(),
-        seq: None,
-        strip_think,
-    }
-}
-
-/// Max output lines shown in chat for `!` / `/git` before truncation
-/// with a "re-run in a real terminal" note (GOALS §1k).
-const LOCAL_CMD_DISPLAY_LINES: usize = 100;
-/// Token cap for the agent-bound `<git>` block (GOALS §1l, §10).
-const GIT_AGENT_TOKEN_CAP: usize = 2000;
-
-/// True when `(col, row)` falls inside `rect` (absolute coords).
-fn point_in(rect: Rect, col: u16, row: u16) -> bool {
-    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
-}
-
-/// Extract the argument string from a full slash line. The command
-/// token (whatever was typed before the first space) is dropped; the
-/// remainder is the args. `/git status` → `status`; `/git` → ``.
-/// Reduce the visible transcript to the prediction input
-/// (implementation note): one (user, agent-final-response)
-/// pair per turn, with tool calls / diffs / subagent reports / notices /
-/// reasoning skipped — only [`HistoryEntry::User`] + [`HistoryEntry::Agent`]
-/// carry into a turn, and the agent's `reasoning` is never included. A user
-/// message opens a turn; the next agent message closes it; a user message
-/// arriving before the agent reply folds into the open turn so the
-/// one-pair-per-turn shape (and the last-3 window) stays faithful. Pure +
-/// deterministic so the assembly is unit-testable without an `App`.
-fn turns_from_history(history: &[HistoryEntry]) -> Vec<crate::engine::predict::PredictionTurn> {
-    use crate::engine::predict::PredictionTurn;
-    let mut turns: Vec<PredictionTurn> = Vec::new();
-    // True when the last pushed turn is still awaiting its agent reply (so a
-    // following user message folds rather than opening a new one).
-    let mut open = false;
-    for entry in history {
-        match entry {
-            HistoryEntry::User { text, .. } => {
-                if open {
-                    if let Some(last) = turns.last_mut() {
-                        last.user.push_str("\n\n");
-                        last.user.push_str(text);
-                    }
-                } else {
-                    turns.push(PredictionTurn {
-                        user: text.clone(),
-                        agent: String::new(),
-                    });
-                    open = true;
-                }
-            }
-            HistoryEntry::Agent { text, .. } => {
-                if let Some(last) = turns.last_mut() {
-                    // Fold multiple agent messages (rare: tool rounds can
-                    // finalize text more than once) into one final response
-                    // so the pairing stays one-per-turn.
-                    if last.agent.is_empty() {
-                        last.agent = text.clone();
-                    } else {
-                        last.agent.push('\n');
-                        last.agent.push_str(text);
-                    }
-                    open = false;
-                }
-            }
-            _ => {}
-        }
-    }
-    turns
-}
-
-/// Scheduled-task ids in `scheduled` owned by `session_id`, in map
-/// (stable, id) order. The pure core of `/ps` / `/stop` scoping — the list,
-/// the cancel set, and the bare-`/stop` confirm count all read from here so
-/// they can't disagree, and it filters strictly to `session_id` so
-/// neither command ever touches another session's scheduled tasks.
-fn session_schedule_ids(
-    scheduled: &std::collections::BTreeMap<String, ActiveSchedule>,
-    session_id: uuid::Uuid,
-) -> Vec<String> {
-    scheduled
-        .iter()
-        .filter(|(_, j)| j.session_id == session_id)
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
-/// The per-task core line shared by `/schedule` and `/ps`: `sched-id [kind]`,
-/// the iteration count for loop/timer tasks, and the label. Each caller
-/// appends its own cancel/stop hint.
-fn format_schedule_line(job_id: &str, j: &ActiveSchedule) -> String {
-    let progress = if j.kind == "background" {
-        String::new()
-    } else {
-        format!(" {} iter", j.iteration)
-    };
-    format!("{job_id} [{}]{progress}  {}", j.kind, j.label)
-}
-
-fn resource_event_label(resources: &std::collections::HashMap<String, u32>) -> String {
-    if resources.is_empty() {
-        return "no resources".to_string();
-    }
-    let mut entries: Vec<_> = resources.iter().collect();
-    entries.sort_by_key(|(name, _)| *name);
-    entries
-        .into_iter()
-        .map(|(name, count)| format!("{name}:{count}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Whether a resolved [`crate::config::providers::CacheConfig`] means the
-/// provider/model actually caches. Reuses the pruning-policy no-cache
-/// predicate ([`crate::engine::prune::cache_state`]): the only way it
-/// reports [`crate::engine::prune::ColdReason::NoCacheProvider`] for a
-/// freshly-sent, non-busting prefix is `cache.mode = none`. Pure over its
-/// input so the cache-break-warning suppression is unit-testable without
-/// constructing an `App`.
-fn cache_config_caches(cache: &crate::config::providers::CacheConfig) -> bool {
-    use crate::engine::prune::{CacheState, ColdReason, cache_state};
-    !matches!(
-        cache_state(cache, Some(0), false),
-        CacheState::Cold(ColdReason::NoCacheProvider)
-    )
-}
-
-fn auto_prune_trigger_label(reason: &str) -> &'static str {
-    match reason {
-        "cache_already_cold" => "cache already cold",
-        "no_cache_provider" => "no-cache provider",
-        "upstream_cache_bust" => "upstream cache bust",
-        "warm_threshold" => "warm threshold",
-        _ => "auto trigger",
-    }
-}
-
-/// Parse the `/llm-mode` argument.
-/// Returns `Ok(None)` for the toggle action (no argument or `toggle`),
-/// `Ok(Some(mode))` for an explicit target, or `Err(usage)` for an
-/// unrecognized argument. `defend` is the advertised short form for
-/// defensive; `defensive` is accepted as a silent alias. Frontier intentionally
-/// has no short alias.
-fn parse_llm_mode_arg(arg: &str) -> Result<Option<crate::config::extended::LlmMode>, String> {
-    use crate::config::extended::LlmMode;
-    match arg.trim().to_ascii_lowercase().as_str() {
-        "" | "toggle" => Ok(None),
-        "defend" | "defensive" => Ok(Some(LlmMode::Defensive)),
-        "normal" => Ok(Some(LlmMode::Normal)),
-        "frontier" => Ok(Some(LlmMode::Frontier)),
-        other => Err(format!(
-            "Usage: `/llm-mode [toggle|defend|normal|frontier]` (got `{other}`)"
-        )),
-    }
-}
-
-/// Run a one-shot shell command, capturing stdout+stderr. Returns
-/// `(combined_output, failed)`. Cross-platform: `cmd /C` on Windows,
-/// `$SHELL -c` (fallback `/bin/sh`) elsewhere.
-fn exec_capture_shell(cmd: &str, cwd: &Path) -> (String, bool) {
-    let mut command;
-    #[cfg(windows)]
-    {
-        command = std::process::Command::new("cmd");
-        command.arg("/C").arg(cmd);
-    }
-    #[cfg(not(windows))]
-    {
-        let shell =
-            std::env::var_os("SHELL").unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
-        command = std::process::Command::new(shell);
-        command.arg("-c").arg(cmd);
-    }
-    command.current_dir(cwd);
-    run_capture(command)
-}
-
-/// Run `git --no-pager <args>` with the pager disabled and prompts off,
-/// capturing stdout+stderr. Returns `(combined_output, failed)`.
-fn exec_capture_git(args: &str, cwd: &Path) -> (String, bool) {
-    let mut command = std::process::Command::new("git");
-    command.arg("--no-pager");
-    for a in crate::tui::pty::shell_split(args) {
-        command.arg(a);
-    }
-    command.current_dir(cwd);
-    command.env("GIT_PAGER", "cat");
-    command.env("GIT_TERMINAL_PROMPT", "0");
-    run_capture(command)
-}
-
-#[derive(Clone)]
-struct RunCaptureOptions {
-    max_bytes: usize,
-    timeout: Duration,
-    cancel: Option<Arc<AtomicBool>>,
-}
-
-impl Default for RunCaptureOptions {
-    fn default() -> Self {
-        Self {
-            max_bytes: RUN_CAPTURE_MAX_BYTES,
-            timeout: RUN_CAPTURE_TIMEOUT,
-            cancel: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TailBytes {
-    bytes: Vec<u8>,
-    seen: usize,
-    cap: usize,
-}
-
-impl TailBytes {
-    fn new(cap: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(cap.min(8192)),
-            seen: 0,
-            cap,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) {
-        self.seen = self.seen.saturating_add(chunk.len());
-        if self.cap == 0 {
-            self.bytes.clear();
-            return;
-        }
-        if chunk.len() >= self.cap {
-            self.bytes.clear();
-            self.bytes
-                .extend_from_slice(&chunk[chunk.len() - self.cap..]);
-            return;
-        }
-        let overflow = self
-            .bytes
-            .len()
-            .saturating_add(chunk.len())
-            .saturating_sub(self.cap);
-        if overflow > 0 {
-            self.bytes.drain(..overflow);
-        }
-        self.bytes.extend_from_slice(chunk);
-    }
-
-    fn truncated(&self) -> bool {
-        self.seen > self.cap
-    }
-}
-
-fn spawn_capture_reader<R>(
-    mut reader: R,
-    cap: usize,
-    overflow: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<TailBytes>
-where
-    R: Read + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let mut tail = TailBytes::new(cap);
-        let mut buf = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    tail.push(&buf[..n]);
-                    if tail.truncated() {
-                        overflow.store(true, Ordering::Relaxed);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        tail
-    })
-}
-
-fn run_capture(command: std::process::Command) -> (String, bool) {
-    run_capture_with_options(command, RunCaptureOptions::default())
-}
-
-fn kill_capture_child(child: &mut std::process::Child) {
-    crate::process::terminate_group_sync(child, std::time::Duration::from_millis(200));
-}
-
-fn run_capture_with_options(
-    mut command: std::process::Command,
-    options: RunCaptureOptions,
-) -> (String, bool) {
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => return (format!("failed to run command: {e}"), true),
-    };
-
-    let overflow = Arc::new(AtomicBool::new(false));
-    let stdout = child
-        .stdout
-        .take()
-        .map(|out| spawn_capture_reader(out, options.max_bytes, Arc::clone(&overflow)));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|err| spawn_capture_reader(err, options.max_bytes, Arc::clone(&overflow)));
-
-    let started = Instant::now();
-    let mut terminal_reason: Option<&'static str> = None;
-    let mut status = None;
-    loop {
-        if options
-            .cancel
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-        {
-            terminal_reason = Some("cancelled");
-            kill_capture_child(&mut child);
-            break;
-        }
-        if overflow.load(Ordering::Relaxed) {
-            terminal_reason = Some("output overflow");
-            kill_capture_child(&mut child);
-            break;
-        }
-        if started.elapsed() >= options.timeout {
-            terminal_reason = Some("timed out");
-            kill_capture_child(&mut child);
-            break;
-        }
-        match child.try_wait() {
-            Ok(Some(s)) => {
-                status = Some(s);
-                break;
-            }
-            Ok(None) => std::thread::sleep(RUN_CAPTURE_POLL),
-            Err(e) => return (format!("failed to wait for command: {e}"), true),
-        }
-    }
-
-    if status.is_none() {
-        status = child.wait().ok();
-    }
-
-    let stdout_tail = stdout
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_else(|| TailBytes::new(options.max_bytes));
-    let stderr_tail = stderr
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_else(|| TailBytes::new(options.max_bytes));
-
-    if terminal_reason.is_none() && (stdout_tail.truncated() || stderr_tail.truncated()) {
-        terminal_reason = Some("output overflow");
-    }
-
-    let mut s = String::from_utf8_lossy(&stdout_tail.bytes).into_owned();
-    if !stderr_tail.bytes.is_empty() {
-        if !s.is_empty() && !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s.push_str(&String::from_utf8_lossy(&stderr_tail.bytes));
-    }
-    if let Some(reason) = terminal_reason {
-        if !s.is_empty() && !s.ends_with('\n') {
-            s.push('\n');
-        }
-        match reason {
-            "output overflow" => s.push_str(&format!(
-                "[cockpit: command output exceeded {} bytes; child killed if still running; showing tail output]",
-                options.max_bytes
-            )),
-            "timed out" => s.push_str(&format!(
-                "[cockpit: command timed out after {:.1}s; child killed]",
-                options.timeout.as_secs_f64()
-            )),
-            "cancelled" => s.push_str("[cockpit: command cancelled; child killed]"),
-            _ => {}
-        }
-    }
-
-    let failed = terminal_reason.is_some() || status.is_none_or(|s| !s.success());
-    (s, failed)
-}
-
-/// Strip ANSI escape sequences (CSI + OSC) and bare carriage returns
-/// from captured command output (GOALS §1k/§1l: "strip ANSI").
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    // CSI: consume params until a final byte (0x40–0x7e).
-                    for f in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&f) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    // OSC: consume until BEL or ST (ESC \).
-                    while let Some(f) = chars.next() {
-                        if f == '\x07' {
-                            break;
-                        }
-                        if f == '\x1b' {
-                            if chars.peek() == Some(&'\\') {
-                                chars.next();
-                            }
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            },
-            '\r' => {} // drop bare CRs (CRLF → LF)
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Make text safe for direct `println!` after leaving the alternate screen.
-/// This is stricter than TUI rendering cleanup: it removes escape sequences,
-/// line-breaking controls embedded in a logical line, and other terminal
-/// control bytes that could act on the user's restored shell.
-fn sanitize_for_raw_stdout(s: &str) -> String {
-    strip_ansi(s)
-        .chars()
-        .filter(|&c| match c {
-            // Keep tab as text whitespace. `println!` supplies the line break.
-            '\t' => true,
-            // Drop embedded newlines and all remaining C0 controls.
-            '\x00'..='\x1f' => false,
-            // DEL is not in C0 but is still a terminal control byte.
-            '\x7f' => false,
-            _ => true,
-        })
-        .collect()
-}
-
-/// Truncate display output to [`LOCAL_CMD_DISPLAY_LINES`] with a note.
-fn cap_display_lines(s: &str) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.len() <= LOCAL_CMD_DISPLAY_LINES {
-        return s.trim_end_matches('\n').to_string();
-    }
-    let mut out = lines[..LOCAL_CMD_DISPLAY_LINES].join("\n");
-    out.push_str(&format!(
-        "\n… [{} more lines — re-run in a real terminal for full output]",
-        lines.len() - LOCAL_CMD_DISPLAY_LINES
-    ));
-    out
-}
-
-/// Cap text to roughly `max_tokens` (cl100k estimate) with a marker.
-fn cap_tokens(s: &str, max_tokens: usize) -> String {
-    if crate::tokens::count(s) <= max_tokens {
-        return s.to_string();
-    }
-    let mut budget = max_tokens.saturating_mul(4).max(64);
-    loop {
-        let truncated: String = s.chars().take(budget).collect();
-        if budget < 64 || crate::tokens::count(&truncated) <= max_tokens {
-            return format!("{truncated}\n… [truncated to ~{max_tokens} tokens]");
-        }
-        budget = budget * 3 / 4;
-    }
-}
-
-/// Escape a string for an XML attribute value (the `/git cmd="…"`).
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// Settle the most-recent still-running [`HistoryEntry::Subagent`] for
-/// `child` against its `report`. Freezes the elapsed clock into the
-/// total duration and flips the live `delegated to…` line into the
-/// settled header + response. A report whose text the driver prefixed
-/// with `Error: ` (its failure encoding) flips the entry to the failed
-/// header — never leaving a dangling animated line. If no running entry
-/// is found (defensive — spawn/report events should pair), a settled
-/// entry is pushed so the report is never lost.
-#[derive(Clone)]
-pub(super) struct SubagentReportUpdate {
-    report: String,
-    trusted_only: bool,
-    model_trusted: bool,
-    routing: SubagentRoutingChips,
-}
-
-fn subagent_routing_chips_from_value(value: &serde_json::Value) -> SubagentRoutingChips {
-    fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
-        value
-            .get(key)
-            .and_then(|raw| raw.as_str())
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(ToOwned::to_owned)
-    }
-
-    SubagentRoutingChips {
-        model: string_field(value, "resolved_model"),
-        location: string_field(value, "location"),
-        fallback: string_field(value, "fallback_decision"),
-    }
-}
-
-fn settle_subagent_in(
-    history: &mut Vec<HistoryEntry>,
-    child: &str,
-    task_call_id: &str,
-    label: &str,
-    update: SubagentReportUpdate,
-) {
-    let SubagentReportUpdate {
-        report,
-        trusted_only,
-        model_trusted,
-        routing,
-    } = update;
-    let failed = report.starts_with("Error: ");
-    let status = classify_subagent_status(child, &report, failed);
-    let auto_expand = status.is_some();
-    let found = history.iter_mut().rev().find_map(|entry| match entry {
-        HistoryEntry::Subagent {
-            child: c,
-            task_call_id: call,
-            label: entry_label,
-            spawned_at,
-            outcome: outcome @ None,
-            expanded,
-            trusted_only: entry_trusted_only,
-            model_trusted: entry_model_trusted,
-            routing: entry_routing,
-            ..
-        } if c == child && call == task_call_id && entry_label == label => Some((
-            spawned_at,
-            outcome,
-            expanded,
-            entry_trusted_only,
-            entry_model_trusted,
-            entry_routing,
-        )),
-        _ => None,
-    });
-    match found {
-        Some((
-            spawned_at,
-            outcome,
-            expanded,
-            entry_trusted_only,
-            entry_model_trusted,
-            entry_routing,
-        )) => {
-            *entry_trusted_only = trusted_only;
-            *entry_model_trusted = model_trusted;
-            *entry_routing = routing;
-            *outcome = Some(SubagentOutcome {
-                duration: spawned_at.elapsed(),
-                failed,
-                status: status.clone(),
-                report,
-            });
-            if auto_expand {
-                *expanded = true;
-            }
-        }
-        None => history.push(HistoryEntry::Subagent {
-            parent: String::new(),
-            child: child.to_string(),
-            task_call_id: task_call_id.to_string(),
-            label: label.to_string(),
-            trusted_only,
-            model_trusted,
-            routing,
-            spawned_at: Instant::now(),
-            outcome: Some(SubagentOutcome {
-                duration: Duration::ZERO,
-                failed,
-                status,
-                report,
-            }),
-            expanded: auto_expand,
-        }),
-    }
-}
-
 fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
     match entry {
         HistoryEntry::Plain { line }
@@ -10971,440 +7641,6 @@ mod startup_first_paint_tests {
 
         assert!(app.startup_background.started);
         assert!(app.async_actions.pending_count() >= 2);
-    }
-}
-
-#[cfg(test)]
-mod affordance_hover_tests {
-    use super::{AffordanceScrollRegion, AffordanceTarget, App, resolve_inner_scroll_target};
-    use crate::tui::app::render::{
-        ChatRowKind, ChatRowMeta, ReasoningScrollMeta, ToolResultScrollMeta,
-    };
-    use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
-    use crate::tui::settings::Dialog;
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-    use ratatui::layout::Rect;
-
-    fn meta(
-        chip_target: Option<usize>,
-        tool_box_target: Option<usize>,
-        tool_call_target: Option<(usize, usize)>,
-        reasoning_window_target: Option<usize>,
-    ) -> ChatRowMeta {
-        ChatRowMeta {
-            history_index: None,
-            row_kind: ChatRowKind::Other,
-            copy_target: None,
-            chip_target,
-            subagent_target: None,
-            tool_box_target,
-            tool_call_target,
-            tool_result_scroll: None,
-            reasoning_window_scroll: None,
-            reasoning_window_target,
-            diff_path: None,
-            pin_hit: None,
-            continuation: false,
-            selectable: false,
-        }
-    }
-
-    fn tool_call(call_id: &str) -> ToolCall {
-        ToolCall {
-            call_id: call_id.to_string(),
-            tool: "bash".to_string(),
-            summary: call_id.to_string(),
-            full_input: call_id.to_string(),
-            output: String::new(),
-            expanded: false,
-            result_offset: 0,
-            state: ToolCallState::Success,
-            hint: None,
-        }
-    }
-
-    fn reasoning_agent(offset: usize) -> HistoryEntry {
-        HistoryEntry::Agent {
-            name: "agent".to_string(),
-            text: "answer".to_string(),
-            reasoning: "thinking".to_string(),
-            timestamp: chrono::Local::now(),
-            expanded: true,
-            reasoning_offset: offset,
-            think_duration: None,
-            seq: None,
-        }
-    }
-
-    fn moved(row: u16) -> MouseEvent {
-        MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: 6,
-            row,
-            modifiers: KeyModifiers::empty(),
-        }
-    }
-
-    #[test]
-    fn moved_mouse_resolves_chat_rows_to_affordance_targets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.mouse_capture = true;
-        app.daemon_prompt = None;
-        app.dialog = Dialog::None;
-        app.chat_area = Some(Rect::new(5, 10, 20, 5));
-        app.chat_row_meta = vec![
-            meta(Some(1), None, None, None),
-            meta(None, Some(2), None, None),
-            meta(None, Some(3), Some((3, 4)), None),
-            meta(None, None, None, Some(5)),
-            meta(None, None, None, None),
-        ];
-
-        app.handle_mouse(moved(10));
-        assert_eq!(
-            app.hovered_affordance,
-            Some(AffordanceTarget::Chip { history_index: 1 })
-        );
-        app.handle_mouse(moved(11));
-        assert_eq!(
-            app.hovered_affordance,
-            Some(AffordanceTarget::ToolBox { history_index: 2 })
-        );
-        app.handle_mouse(moved(12));
-        assert_eq!(
-            app.hovered_affordance,
-            Some(AffordanceTarget::ToolCall {
-                history_index: 3,
-                call_index: 4,
-            })
-        );
-        app.handle_mouse(moved(13));
-        assert_eq!(
-            app.hovered_affordance,
-            Some(AffordanceTarget::ReasoningWindow { history_index: 5 })
-        );
-        app.handle_mouse(moved(14));
-        assert_eq!(app.hovered_affordance, None);
-    }
-
-    #[test]
-    fn moved_mouse_clears_hover_when_capture_is_off() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.mouse_capture = false;
-        app.hovered_affordance = Some(AffordanceTarget::Chip { history_index: 1 });
-        app.chat_area = Some(Rect::new(5, 10, 20, 1));
-        app.chat_row_meta = vec![meta(Some(1), None, None, None)];
-
-        app.handle_mouse(moved(10));
-
-        assert_eq!(app.hovered_affordance, None);
-    }
-
-    #[test]
-    fn click_toggles_only_targeted_tool_call() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.history = vec![HistoryEntry::ToolBox {
-            calls: vec![tool_call("first"), tool_call("second")],
-            view_offset: 0,
-            follow: true,
-        }];
-        app.chat_row_meta = vec![
-            meta(None, Some(0), Some((0, 0)), None),
-            meta(None, Some(0), Some((0, 1)), None),
-        ];
-
-        assert!(app.toggle_tool_call_at_row(1));
-        match &app.history[0] {
-            HistoryEntry::ToolBox { calls, .. } => {
-                assert!(!calls[0].expanded);
-                assert!(calls[1].expanded);
-            }
-            other => panic!("expected toolbox, got {other:?}"),
-        }
-
-        assert!(app.toggle_tool_call_at_row(1));
-        match &app.history[0] {
-            HistoryEntry::ToolBox { calls, .. } => {
-                assert!(!calls[0].expanded);
-                assert!(!calls[1].expanded);
-            }
-            other => panic!("expected toolbox, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn result_scroll_regions_are_registered_before_box_regions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        let mut row = meta(None, Some(0), Some((0, 0)), None);
-        row.tool_result_scroll = Some(ToolResultScrollMeta {
-            history_index: 0,
-            call_index: 0,
-            offset: 1,
-            max_offset: 4,
-        });
-        app.chat_row_meta = vec![row];
-        app.history = vec![HistoryEntry::ToolBox {
-            calls: vec![tool_call("first")],
-            view_offset: 0,
-            follow: true,
-        }];
-
-        let regions = app.build_affordance_scroll_regions();
-        assert_eq!(
-            regions.first().map(|region| region.target),
-            Some(AffordanceTarget::ToolCall {
-                history_index: 0,
-                call_index: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn inner_scroll_resolver_uses_registration_order_for_overlaps() {
-        let tool_call = AffordanceTarget::ToolCall {
-            history_index: 1,
-            call_index: 2,
-        };
-        let tool_box = AffordanceTarget::ToolBox { history_index: 1 };
-        let regions = [
-            AffordanceScrollRegion {
-                target: tool_call,
-                row_start: 4,
-                row_end: 4,
-                offset: 1,
-                max_offset: 3,
-            },
-            AffordanceScrollRegion {
-                target: tool_box,
-                row_start: 4,
-                row_end: 4,
-                offset: 1,
-                max_offset: 3,
-            },
-        ];
-
-        assert_eq!(
-            resolve_inner_scroll_target(&regions, 4, true),
-            Some(tool_call)
-        );
-    }
-
-    #[test]
-    fn reasoning_window_scrolls_until_both_edges() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.history = vec![reasoning_agent(0)];
-        app.affordance_scroll_regions = vec![AffordanceScrollRegion {
-            target: AffordanceTarget::ReasoningWindow { history_index: 0 },
-            row_start: 2,
-            row_end: 4,
-            offset: 0,
-            max_offset: 2,
-        }];
-
-        assert!(!app.scroll_inner_region_at_row(3, true));
-        assert!(app.scroll_inner_region_at_row(3, false));
-        match &app.history[0] {
-            HistoryEntry::Agent {
-                reasoning_offset, ..
-            } => assert_eq!(*reasoning_offset, 1),
-            other => panic!("expected agent, got {other:?}"),
-        }
-
-        app.affordance_scroll_regions[0].offset = 1;
-        assert!(app.scroll_inner_region_at_row(3, false));
-        match &app.history[0] {
-            HistoryEntry::Agent {
-                reasoning_offset, ..
-            } => assert_eq!(*reasoning_offset, 2),
-            other => panic!("expected agent, got {other:?}"),
-        }
-
-        app.affordance_scroll_regions[0].offset = 2;
-        assert!(!app.scroll_inner_region_at_row(3, false));
-    }
-
-    #[test]
-    fn reasoning_window_regions_register_with_shared_resolver() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        let mut row = meta(None, None, None, Some(0));
-        row.reasoning_window_scroll = Some(ReasoningScrollMeta {
-            history_index: 0,
-            offset: 1,
-            max_offset: 3,
-        });
-        app.chat_row_meta = vec![row];
-        app.history = vec![reasoning_agent(1)];
-
-        let regions = app.build_affordance_scroll_regions();
-        assert_eq!(
-            regions.first().map(|region| region.target),
-            Some(AffordanceTarget::ReasoningWindow { history_index: 0 })
-        );
-        assert_eq!(regions.first().map(|region| region.offset), Some(1));
-        assert_eq!(regions.first().map(|region| region.max_offset), Some(3));
-    }
-
-    #[test]
-    fn inner_scroll_resolver_falls_through_at_both_edges() {
-        let target = AffordanceTarget::ReasoningWindow { history_index: 7 };
-        let top = [AffordanceScrollRegion {
-            target,
-            row_start: 3,
-            row_end: 5,
-            offset: 0,
-            max_offset: 4,
-        }];
-        assert_eq!(resolve_inner_scroll_target(&top, 4, true), None);
-        assert_eq!(resolve_inner_scroll_target(&top, 4, false), Some(target));
-
-        let bottom = [AffordanceScrollRegion {
-            target,
-            row_start: 3,
-            row_end: 5,
-            offset: 4,
-            max_offset: 4,
-        }];
-        assert_eq!(resolve_inner_scroll_target(&bottom, 4, true), Some(target));
-        assert_eq!(resolve_inner_scroll_target(&bottom, 4, false), None);
-        assert_eq!(resolve_inner_scroll_target(&bottom, 8, true), None);
-    }
-}
-
-#[cfg(test)]
-mod terminal_mode_guard_tests {
-    use super::{
-        DISABLE_ANY_MOUSE_MOTION, ENABLE_ANY_MOUSE_MOTION, TerminalCleanupCommand,
-        TerminalModeGuard, TerminalModeSink, keyboard_enhancement_flags,
-    };
-    use anyhow::Result;
-    use crossterm::event::KeyboardEnhancementFlags;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    #[test]
-    fn any_motion_escape_sequences_are_paired() {
-        assert_eq!(ENABLE_ANY_MOUSE_MOTION, "\x1b[?1003h");
-        assert_eq!(DISABLE_ANY_MOUSE_MOTION, "\x1b[?1003l");
-    }
-
-    #[derive(Clone, Default)]
-    struct RecordingSink {
-        commands: Rc<RefCell<Vec<TerminalCleanupCommand>>>,
-    }
-
-    impl RecordingSink {
-        fn commands(&self) -> Vec<TerminalCleanupCommand> {
-            self.commands.borrow().clone()
-        }
-    }
-
-    impl TerminalModeSink for RecordingSink {
-        fn apply(&mut self, command: TerminalCleanupCommand) -> Result<()> {
-            self.commands.borrow_mut().push(command);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn guard_enabled_all_modes_cleans_every_mode_on_drop() {
-        let sink = RecordingSink::default();
-        let observed = sink.clone();
-        {
-            let mut guard = TerminalModeGuard::with_sink(sink);
-            guard.mark_mouse_capture_enabled();
-            guard.mark_bracketed_paste_enabled();
-            guard.mark_keyboard_enhancement_pushed();
-        }
-
-        assert_eq!(
-            observed.commands(),
-            vec![
-                TerminalCleanupCommand::DisableMouseCapture,
-                TerminalCleanupCommand::DisableBracketedPaste,
-                TerminalCleanupCommand::PopKeyboardEnhancementFlags,
-                TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreRatatui,
-            ]
-        );
-    }
-
-    #[test]
-    fn requested_keyboard_enhancement_flags_match_crossterm_enhanced_event_set() {
-        let flags = keyboard_enhancement_flags();
-        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
-    }
-
-    #[test]
-    fn guard_without_keyboard_enhancement_push_does_not_pop() {
-        let sink = RecordingSink::default();
-        let observed = sink.clone();
-        {
-            let mut guard = TerminalModeGuard::with_sink(sink);
-            guard.mark_mouse_capture_enabled();
-            guard.mark_bracketed_paste_enabled();
-        }
-
-        assert_eq!(
-            observed.commands(),
-            vec![
-                TerminalCleanupCommand::DisableMouseCapture,
-                TerminalCleanupCommand::DisableBracketedPaste,
-                TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreRatatui,
-            ]
-        );
-    }
-
-    #[test]
-    fn explicit_cleanup_then_drop_is_idempotent() {
-        let sink = RecordingSink::default();
-        let observed = sink.clone();
-        {
-            let mut guard = TerminalModeGuard::with_sink(sink);
-            guard.mark_mouse_capture_enabled();
-            guard.mark_bracketed_paste_enabled();
-            guard.mark_keyboard_enhancement_pushed();
-            guard.cleanup().unwrap();
-        }
-
-        assert_eq!(
-            observed.commands(),
-            vec![
-                TerminalCleanupCommand::DisableMouseCapture,
-                TerminalCleanupCommand::DisableBracketedPaste,
-                TerminalCleanupCommand::PopKeyboardEnhancementFlags,
-                TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreRatatui,
-            ]
-        );
-    }
-
-    #[test]
-    fn mouse_capture_cleanup_follows_enabled_state() {
-        let sink = RecordingSink::default();
-        let observed = sink.clone();
-        {
-            let mut guard = TerminalModeGuard::with_sink(sink);
-            guard.mark_bracketed_paste_enabled();
-        }
-
-        assert_eq!(
-            observed.commands(),
-            vec![
-                TerminalCleanupCommand::DisableBracketedPaste,
-                TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreRatatui,
-            ]
-        );
     }
 }
 

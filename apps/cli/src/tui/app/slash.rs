@@ -1051,10 +1051,10 @@ impl App {
                 self.start_resource_promote_action(request_id.to_string());
             }
             _ => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/resources: usage `/resources` or `/resources promote <request-id>`"
+                self.push_plain(
+                    "/resources: usage `/resources` or `/resources promote <request-id>`"
                         .to_string(),
-                });
+                );
             }
         }
     }
@@ -1069,9 +1069,7 @@ impl App {
     /// immediately. `config.json` is never touched.
     pub(super) fn handle_init_command(&mut self, args: &str) {
         if self.busy {
-            self.history.push(HistoryEntry::Plain {
-                line: "/init: a turn is already running — wait for it to finish".to_string(),
-            });
+            self.push_plain("/init: a turn is already running — wait for it to finish".to_string());
             return;
         }
         let explicit = {
@@ -1153,19 +1151,13 @@ impl App {
             }
             "clear" => {
                 let Some(session_id) = self.launch.session_id else {
-                    self.history.push(HistoryEntry::Plain {
-                        line: "/goal clear: no active session.".to_string(),
-                    });
+                    self.push_plain("/goal clear: no active session.".to_string());
                     return;
                 };
                 match crate::db::Db::open_default().and_then(|db| db.clear_session_goal(session_id))
                 {
-                    Ok(true) => self.history.push(HistoryEntry::Plain {
-                        line: "/goal clear: cleared current goal.".to_string(),
-                    }),
-                    Ok(false) => self.history.push(HistoryEntry::Plain {
-                        line: "/goal clear: no open goal.".to_string(),
-                    }),
+                    Ok(true) => self.push_plain("/goal clear: cleared current goal.".to_string()),
+                    Ok(false) => self.push_plain("/goal clear: no open goal.".to_string()),
                     Err(e) => self.history.push(HistoryEntry::CommandError {
                         line: format!("/goal clear: {e:#}"),
                     }),
@@ -1173,10 +1165,9 @@ impl App {
             }
             "edit" => {
                 self.composer.set("/goal ".to_string());
-                self.history.push(HistoryEntry::Plain {
-                    line: "/goal edit: update the objective in the composer and submit."
-                        .to_string(),
-                });
+                self.push_plain(
+                    "/goal edit: update the objective in the composer and submit.".to_string(),
+                );
             }
             _ => {
                 self.swap_primary_agent("Build");
@@ -1210,7 +1201,7 @@ impl App {
                 self.dispatch_skill_invocation(display, &name, &task);
             }
             SkillDispatch::Error(line) => {
-                self.history.push(HistoryEntry::Plain { line });
+                self.push_plain(line);
             }
         }
     }
@@ -1224,9 +1215,7 @@ impl App {
         if let Some(rest) = args.strip_prefix("cancel") {
             let job_id = rest.trim();
             if job_id.is_empty() {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/schedule: usage `/schedule cancel <id>`".to_string(),
-                });
+                self.push_plain("/schedule: usage `/schedule cancel <id>`".to_string());
                 return;
             }
             let sent = match self.agent_runner.as_ref() {
@@ -1243,26 +1232,27 @@ impl App {
             } else {
                 format!("/schedule: no daemon connection — cannot cancel `{job_id}`")
             };
-            self.history.push(HistoryEntry::Plain { line });
+            self.push_plain(line);
             return;
         }
         // Bare `/schedule`: list.
         if self.active_schedules.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "/schedule: no active scheduled tasks".to_string(),
-            });
+            self.push_plain("/schedule: no active scheduled tasks".to_string());
             return;
         }
-        self.history.push(HistoryEntry::Plain {
-            line: "/schedule: active —".to_string(),
-        });
-        for (job_id, j) in &self.active_schedules {
-            self.history.push(HistoryEntry::Plain {
-                line: format!(
+        self.push_plain("/schedule: active —".to_string());
+        let lines: Vec<String> = self
+            .active_schedules
+            .iter()
+            .map(|(job_id, j)| {
+                format!(
                     "  {}  (cancel: /schedule cancel {job_id})",
                     format_schedule_line(job_id, j)
-                ),
-            });
+                )
+            })
+            .collect();
+        for line in lines {
+            self.push_plain(line);
         }
     }
 
@@ -1273,23 +1263,23 @@ impl App {
     pub(super) fn handle_ps_command(&mut self) {
         let ids = self.current_session_job_ids();
         if ids.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "No background jobs in this session.".to_string(),
-            });
+            self.push_plain("No background jobs in this session.".to_string());
             return;
         }
-        self.history.push(HistoryEntry::Plain {
-            line: "/ps: active in this session —".to_string(),
-        });
-        for job_id in ids {
-            if let Some(j) = self.active_schedules.get(&job_id) {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+        self.push_plain("/ps: active in this session —".to_string());
+        let lines: Vec<String> = ids
+            .into_iter()
+            .filter_map(|job_id| {
+                self.active_schedules.get(&job_id).map(|j| {
+                    format!(
                         "  {}  (stop: /stop {job_id})",
                         format_schedule_line(&job_id, j)
-                    ),
-                });
-            }
+                    )
+                })
+            })
+            .collect();
+        for line in lines {
+            self.push_plain(line);
         }
     }
 
@@ -1305,11 +1295,9 @@ impl App {
         }
         let in_session = self.current_session_job_ids().iter().any(|id| id == job_id);
         if !in_session {
-            self.history.push(HistoryEntry::Plain {
-                line: format!(
+            self.push_plain(format!(
                     "/stop: no scheduled task `{job_id}` in this session (use /schedule for other sessions)"
-                ),
-            });
+                ));
             return;
         }
         self.cancel_schedule(job_id, "/stop");
@@ -1332,7 +1320,7 @@ impl App {
         let requested = match parse_llm_mode_arg(arg) {
             Ok(r) => r,
             Err(usage) => {
-                self.history.push(HistoryEntry::Plain { line: usage });
+                self.push_plain(usage);
                 return;
             }
         };
@@ -1341,22 +1329,20 @@ impl App {
         // so a stale client value can't desync the outcome.
         let target = requested.unwrap_or_else(|| self.llm_mode.cycled());
         if target == self.llm_mode {
-            self.history.push(HistoryEntry::Plain {
-                line: format!("Already in `{}` LLM mode", target.as_str()),
-            });
+            self.push_plain(format!("Already in `{}` LLM mode", target.as_str()));
             return;
         }
         let sent =
             self.send_daemon_request(crate::daemon::proto::Request::SetLlmMode { mode: requested });
         if !sent {
-            self.history.push(HistoryEntry::Plain {
-                line: "Send a message first to start a session, then switch LLM mode".to_string(),
-            });
+            self.push_plain(
+                "Send a message first to start a session, then switch LLM mode".to_string(),
+            );
             return;
         }
         // Cache-break warning via the shared helper (silent on no-cache).
         if let Some(warning) = self.cache_break_warning() {
-            self.history.push(HistoryEntry::Plain { line: warning });
+            self.push_plain(warning);
         }
         // The `LlmModeChanged` event pushes the "Switched to …" confirmation
         // once the daemon applies it.
@@ -1372,9 +1358,9 @@ impl App {
                 self.dialog = crate::tui::settings::Dialog::open_mcp(&self.launch.cwd);
             }
             McpAction::SetEnabled { id, enable } => self.mcp_set_enabled(id.as_deref(), enable),
-            McpAction::Usage => self.history.push(HistoryEntry::Plain {
-                line: "Usage: /mcp [settings | list | on|off|toggle [id]]".to_string(),
-            }),
+            McpAction::Usage => {
+                self.push_plain("Usage: /mcp [settings | list | on|off|toggle [id]]".to_string())
+            }
         }
     }
 
@@ -1398,7 +1384,7 @@ impl App {
             // Bare `/agent` list, or an error naming the bad value — both are
             // plain history lines; neither switches.
             AgentCommandOutcome::Message(line) => {
-                self.history.push(HistoryEntry::Plain { line });
+                self.push_plain(line);
             }
         }
     }
@@ -1418,23 +1404,19 @@ impl App {
             if self.side_conversation.is_some() {
                 self.end_side_conversation(true);
             } else {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/side: not in a side conversation".to_string(),
-                });
+                self.push_plain("/side: not in a side conversation".to_string());
             }
             return;
         }
         if !arg.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "Usage: `/side` to start, `/side end` to discard".to_string(),
-            });
+            self.push_plain("Usage: `/side` to start, `/side end` to discard".to_string());
             return;
         }
         if self.side_conversation.is_some() {
             // Deterministic no-op: already in a side conversation, don't nest.
-            self.history.push(HistoryEntry::Plain {
-                line: "/side: already in a side conversation (`/side end` to discard)".to_string(),
-            });
+            self.push_plain(
+                "/side: already in a side conversation (`/side end` to discard)".to_string(),
+            );
             return;
         }
         self.enter_side_conversation();
@@ -1442,9 +1424,7 @@ impl App {
 
     pub(super) fn handle_fork_command(&mut self, args: &str) {
         if !args.trim().is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "Usage: `/fork`".to_string(),
-            });
+            self.push_plain("Usage: `/fork`".to_string());
             return;
         }
         if self.side_conversation.is_some() {
@@ -1493,11 +1473,9 @@ impl App {
         let command = match parse_sandbox_arg(args) {
             Ok(command) => command,
             Err(other) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+                self.push_plain(format!(
                         "/sandbox: unknown arg `{other}` - use off, on, container, container-readonly, or network on/off"
-                    ),
-                });
+                    ));
                 return;
             }
         };
@@ -1511,21 +1489,19 @@ impl App {
             ),
             SandboxCommand::Set(mode) => {
                 if mode.is_container() && !self.container_availability.available {
-                    self.history.push(HistoryEntry::Plain {
-                        line: format!(
-                            "/sandbox: container modes unavailable: {}",
-                            container_unavailable_label(&self.container_availability)
-                        ),
-                    });
+                    self.push_plain(format!(
+                        "/sandbox: container modes unavailable: {}",
+                        container_unavailable_label(&self.container_availability)
+                    ));
                     return;
                 }
                 (Some(mode), None)
             }
             SandboxCommand::Network(enabled) => {
                 if !self.sandbox_mode.is_container() {
-                    self.history.push(HistoryEntry::Plain {
-                        line: "/sandbox: network only applies to container sandboxes".to_string(),
-                    });
+                    self.push_plain(
+                        "/sandbox: network only applies to container sandboxes".to_string(),
+                    );
                     return;
                 }
                 (None, Some(enabled))
@@ -1535,9 +1511,7 @@ impl App {
             mode,
             container_network_enabled: network,
         }) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/sandbox: no daemon connection".to_string(),
-            });
+            self.push_plain("/sandbox: no daemon connection".to_string());
         }
     }
 
@@ -1551,12 +1525,8 @@ impl App {
             sandbox_enabled: Some(!self.no_sandbox),
         };
         match crate::diagnostics::tui_snapshot(input) {
-            Ok(snapshot) => self.history.push(HistoryEntry::Plain {
-                line: crate::diagnostics::render(&snapshot),
-            }),
-            Err(error) => self.history.push(HistoryEntry::Plain {
-                line: format!("/doctor: {error}"),
-            }),
+            Ok(snapshot) => self.push_plain(crate::diagnostics::render(&snapshot)),
+            Err(error) => self.push_plain(format!("/doctor: {error}")),
         }
     }
 
@@ -1572,18 +1542,14 @@ impl App {
             "on" | "enable" | "enabled" => Some(true),
             "off" | "disable" | "disabled" => Some(false),
             other => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
-                        "/preflight: unknown arg `{other}` — use `on`, `off`, or no arg to toggle"
-                    ),
-                });
+                self.push_plain(format!(
+                    "/preflight: unknown arg `{other}` — use `on`, `off`, or no arg to toggle"
+                ));
                 return;
             }
         };
         if !self.send_daemon_request(crate::daemon::proto::Request::SetPreflight { enabled }) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/preflight: no daemon connection".to_string(),
-            });
+            self.push_plain("/preflight: no daemon connection".to_string());
         }
     }
 
@@ -1607,11 +1573,9 @@ impl App {
                 Some(false)
             }
             other => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+                self.push_plain(format!(
                         "/trusted-only: unknown arg `{other}` — use `on`, `off`, `default on`, `default off`, or no arg to toggle"
-                    ),
-                });
+                    ));
                 return;
             }
         };
@@ -1619,15 +1583,13 @@ impl App {
             && let Some(value) = enabled
             && let Err(error) = persist_trusted_only_default(&self.launch.cwd, value)
         {
-            self.history.push(HistoryEntry::Plain {
-                line: format!("/trusted-only: failed to persist default: {error:#}"),
-            });
+            self.push_plain(format!(
+                "/trusted-only: failed to persist default: {error:#}"
+            ));
             return;
         }
         if !self.send_daemon_request(crate::daemon::proto::Request::SetTrustedOnly { enabled }) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/trusted-only: no daemon connection".to_string(),
-            });
+            self.push_plain("/trusted-only: no daemon connection".to_string());
         }
     }
 
@@ -1652,11 +1614,9 @@ impl App {
                 self.send_redaction_toggle(None, None, Some(!self.redact_scan_ssh_keys));
             }
             other => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+                self.push_plain(format!(
                         "/toggle-redaction: unknown arg `{other}` — use `env`, `file`, `ssh`, or no arg for the picker"
-                    ),
-                });
+                    ));
             }
         }
     }
@@ -1670,40 +1630,34 @@ impl App {
         let mode = match crate::daemon::caffeinate::CaffeinateMode::parse(args) {
             Ok(m) => m,
             Err(other) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!(
+                self.push_plain(format!(
                         "/caffeinate: unknown arg `{other}` — use `on`, `off`, `until-idle`, or no arg to toggle"
-                    ),
-                });
+                    ));
                 return;
             }
         };
         if !self.send_daemon_request(crate::daemon::proto::Request::SetCaffeinate { mode }) {
-            self.history.push(HistoryEntry::Plain {
-                line: "/caffeinate: no daemon connection".to_string(),
-            });
+            self.push_plain("/caffeinate: no daemon connection".to_string());
         }
     }
 
     pub(super) fn handle_pin_context_command(&mut self, args: &str) {
         let text = args.trim();
         if text.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "/pin-context: usage `/pin-context <text>` — pins text verbatim for /compact"
+            self.push_plain(
+                "/pin-context: usage `/pin-context <text>` — pins text verbatim for /compact"
                     .to_string(),
-            });
+            );
             return;
         }
         if self.send_daemon_request(crate::daemon::proto::Request::Pin {
             text: text.to_string(),
         }) {
-            self.history.push(HistoryEntry::Plain {
-                line: format!("/pin-context: pinned (survives /compact verbatim): {text}"),
-            });
+            self.push_plain(format!(
+                "/pin-context: pinned (survives /compact verbatim): {text}"
+            ));
         } else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/pin-context: no daemon connection — cannot pin.".to_string(),
-            });
+            self.push_plain("/pin-context: no daemon connection — cannot pin.".to_string());
         }
     }
 
@@ -1790,15 +1744,11 @@ impl App {
             _ => self.launch.session_id,
         };
         let Some(session_id) = session_id else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/rename: no active session yet — send a message first".to_string(),
-            });
+            self.push_plain("/rename: no active session yet — send a message first".to_string());
             return;
         };
         if title.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "/rename: generating".to_string(),
-            });
+            self.push_plain("/rename: generating".to_string());
             self.async_actions.start(
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
@@ -1835,9 +1785,7 @@ impl App {
             title: title.to_string(),
         };
         let title = title.to_string();
-        self.history.push(HistoryEntry::Plain {
-            line: "/rename: pending".to_string(),
-        });
+        self.push_plain("/rename: pending".to_string());
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("rename"),
             AsyncActionPolicy::AllowConcurrent,
@@ -1860,9 +1808,7 @@ impl App {
             _ => (self.launch.session_id, self.launch.session_short_id.clone()),
         };
         let Some(session_id) = session_id else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/export: no active session yet — send a message first".to_string(),
-            });
+            self.push_plain("/export: no active session yet — send a message first".to_string());
             return;
         };
         // `<short_id>`, falling back to the full UUID (matching the CLI's
@@ -1885,12 +1831,8 @@ impl App {
     /// ([`crate::sysinfo::os_string`]); no build metadata. One `Plain` line
     /// per field, matching how other informational commands list output.
     pub(super) fn handle_version_command(&mut self) {
-        self.history.push(HistoryEntry::Plain {
-            line: format!("cockpit {}", env!("CARGO_PKG_VERSION")),
-        });
-        self.history.push(HistoryEntry::Plain {
-            line: format!("OS: {}", crate::sysinfo::os_string()),
-        });
+        self.push_plain(format!("cockpit {}", env!("CARGO_PKG_VERSION")));
+        self.push_plain(format!("OS: {}", crate::sysinfo::os_string()));
     }
 
     /// `/note <text>` — append a session-history note to self. The note is a
@@ -1903,9 +1845,7 @@ impl App {
     pub(super) fn handle_note_command(&mut self, arg: &str) {
         let text = arg.trim();
         if text.is_empty() {
-            self.history.push(HistoryEntry::Plain {
-                line: "Usage: `/note <text>`".to_string(),
-            });
+            self.push_plain("Usage: `/note <text>`".to_string());
             return;
         }
         // Authoritative current session: the live runner if attached, else the
@@ -1916,9 +1856,7 @@ impl App {
             _ => self.launch.session_id,
         };
         let Some(session_id) = session_id else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/note: no active session yet — send a message first".to_string(),
-            });
+            self.push_plain("/note: no active session yet — send a message first".to_string());
             return;
         };
         let req = crate::daemon::proto::Request::RecordSessionNote {
@@ -1926,9 +1864,7 @@ impl App {
             text: text.to_string(),
         };
         let text = text.to_string();
-        self.history.push(HistoryEntry::Plain {
-            line: "/note: pending".to_string(),
-        });
+        self.push_plain("/note: pending".to_string());
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("note"),
             AsyncActionPolicy::AllowConcurrent,

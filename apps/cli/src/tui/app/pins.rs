@@ -48,9 +48,7 @@ impl App {
         match Db::open_default() {
             Ok(db) => Some(db),
             Err(e) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("pins: database unavailable ({e})"),
-                });
+                self.push_plain(format!("pins: database unavailable ({e})"));
                 None
             }
         }
@@ -195,9 +193,7 @@ impl App {
                 self.scroll_pick_into_view();
             }
             None => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/pin: no message to pin yet".to_string(),
-                });
+                self.push_plain("/pin: no message to pin yet".to_string());
             }
         }
     }
@@ -210,18 +206,14 @@ impl App {
             return;
         }
         let Some(sid) = self.current_session_id() else {
-            self.history.push(HistoryEntry::Plain {
-                line: "/pins: no active session".to_string(),
-            });
+            self.push_plain("/pins: no active session".to_string());
             return;
         };
         let Some(db) = self.pins_db() else { return };
         let pins = match db.list_pins_with_text(sid) {
             Ok(p) => p,
             Err(e) => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("/pins: {e}"),
-                });
+                self.push_plain(format!("/pins: {e}"));
                 return;
             }
         };
@@ -234,9 +226,7 @@ impl App {
                 self.scroll_review_selection_into_view();
             }
             None => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/pins: no pinned messages".to_string(),
-                });
+                self.push_plain("/pins: no pinned messages".to_string());
             }
         }
     }
@@ -262,9 +252,7 @@ impl App {
                 self.scroll_fork_pick_into_view();
             }
             None => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/fork: no message to fork from".to_string(),
-                });
+                self.push_plain("/fork: no message to fork from".to_string());
             }
         }
     }
@@ -312,9 +300,7 @@ impl App {
             }
         };
 
-        self.history.push(HistoryEntry::Plain {
-            line: "/fork: pending".to_string(),
-        });
+        self.push_plain("/fork: pending".to_string());
         self.async_actions.start_blocking(
             super::AsyncActionKind::DaemonRpc("fork.create"),
             super::AsyncActionPolicy::Replace(super::AsyncActionKey::new("fork.create")),
@@ -445,9 +431,7 @@ impl App {
                 self.scroll_copy_pick_into_view();
             }
             None => {
-                self.history.push(HistoryEntry::Plain {
-                    line: "/copy-pick: no message to copy yet".to_string(),
-                });
+                self.push_plain("/copy-pick: no message to copy yet".to_string());
             }
         }
     }

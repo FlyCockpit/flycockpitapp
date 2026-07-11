@@ -278,11 +278,9 @@ impl App {
                         .and_then(|_| crate::daemon::spawn_detached(false))
                     {
                         Ok(pid) => {
-                            self.history.push(HistoryEntry::Plain {
-                                line: format!(
-                                    "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
-                                ),
-                            });
+                            self.push_plain(format!(
+                                "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
+                            ));
                             self.daemon_connected = true;
                             self.daemon_prompt = None;
                             self.reset_display_attach_backoff();
@@ -308,11 +306,8 @@ impl App {
                     // short id appears once the first message brings it up.
                     self.daemonless = true;
                     self.daemon_connected = true;
-                    self.history.push(HistoryEntry::Plain {
-                        line:
-                            "daemon: running a private daemon for this window only — it shuts down when you exit"
-                                .to_string(),
-                    });
+                    self.push_plain("daemon: running a private daemon for this window only — it shuts down when you exit"
+                                .to_string());
                     self.daemon_prompt = None;
                     self.maybe_open_add_provider_wizard();
                 }
@@ -380,9 +375,7 @@ impl App {
             } else if let Some(req) = self.dialog.take_daemon_request()
                 && !self.send_daemon_request(req)
             {
-                self.history.push(HistoryEntry::Plain {
-                    line: "⚠ daemon is not connected; LSP action was not sent".to_string(),
-                });
+                self.push_plain("⚠ daemon is not connected; LSP action was not sent".to_string());
             }
             self.drain_oauth_actions();
             return false;
@@ -633,9 +626,7 @@ impl App {
         // the loop services it before the next draw.
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
             if std::env::var_os("EDITOR").is_none() {
-                self.history.push(HistoryEntry::Plain {
-                    line: "No $EDITOR environment variable".to_string(),
-                });
+                self.push_plain("No $EDITOR environment variable".to_string());
             } else {
                 self.pending_external_edit = true;
             }
@@ -1399,9 +1390,7 @@ impl App {
     ) {
         for e in expansions {
             let mark = if e.ok { '✓' } else { '✗' };
-            self.history.push(HistoryEntry::Plain {
-                line: format!("  → {}({}) {mark} {}", e.tool, e.path, e.detail),
-            });
+            self.push_plain(format!("  → {}({}) {mark} {}", e.tool, e.path, e.detail));
         }
     }
 

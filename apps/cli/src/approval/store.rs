@@ -8,7 +8,7 @@
 //! - [`Once`](Scope::Once) — never stored.
 //! - [`Session`](Scope::Session) — session DB (`approval_grants`,
 //!   migration 0011); survives for the session's lifetime.
-//! - [`Project`](Scope::Project) — nearest project `.cockpit/`, in
+//! - [`Project`](Scope::Project) — machine-local hashed-cwd config dir, in
 //!   `approvals.json`; survives daemon restarts; applies to any session
 //!   whose cwd resolves into the same project root.
 //! - [`Global`](Scope::Global) — user-level cockpit config dir, in
@@ -44,8 +44,8 @@ pub enum Scope {
     Once,
     /// All invocations in the current session (session DB).
     Session,
-    /// All sessions whose cwd resolves into this project (project
-    /// `.cockpit/`).
+    /// All sessions whose cwd resolves into this project (machine-local
+    /// hashed-cwd config dir).
     Project,
     /// All sessions in all projects (user-level config dir).
     Global,
@@ -218,9 +218,12 @@ pub struct GrantStore {
     /// Session/project cwd used as the explicit base for relative path
     /// grants. This must not fall back to the daemon process cwd.
     cwd: PathBuf,
-    /// Resolved project root for the session cwd, if any. `Project`-scope
-    /// reads and writes target `<root>/.cockpit/approvals.json`.
+    /// Resolved project root for the session cwd, if any. Project-scope
+    /// usability is still gated by workspace trust against
+    /// `<root>/.cockpit`; the approvals file itself lives outside the repo.
     project_root: Option<PathBuf>,
+    /// Machine-local approvals dir for the resolved project root.
+    project_approvals_dir: Option<PathBuf>,
     /// User-level cockpit config dir for `Global`-scope grants. Resolved
     /// once; `None` only if no home/data dir can be located.
     global_dir: Option<PathBuf>,
@@ -235,6 +238,7 @@ impl GrantStore {
     pub fn new(db: Db, session_id: uuid::Uuid, cwd: PathBuf) -> Self {
         let project_root = crate::git::find_worktree_root(&cwd)
             .filter(|root| crate::config::trust::project_config_allowed(&root.join(".cockpit")));
+        let project_approvals_dir = project_root.as_deref().and_then(project_approvals_dir);
         let global_dir = global_approvals_dir();
         let approval_policy = crate::config::extended::load_for_cwd(&cwd).approval_policy;
         Self {
@@ -242,6 +246,7 @@ impl GrantStore {
             session_id,
             cwd,
             project_root,
+            project_approvals_dir,
             global_dir,
             approval_policy,
         }
@@ -490,12 +495,15 @@ impl GrantStore {
                 .session_record_loop_rule(signature, verdict)
                 .map_err(StoreError::Io),
             Scope::Project => {
-                let root = self
-                    .project_root
+                if self.project_root.is_none() {
+                    return Err(StoreError::NoProjectRoot);
+                }
+                let dir = self
+                    .project_approvals_dir
                     .as_ref()
-                    .ok_or(StoreError::NoProjectRoot)?;
-                let dir = root.join(".cockpit");
-                self.file_record_loop_rule(&dir, signature, verdict)
+                    .context("no machine-local project approvals dir available")
+                    .map_err(StoreError::Io)?;
+                self.file_record_loop_rule(dir, signature, verdict)
                     .map_err(StoreError::Io)
             }
             Scope::Global => {
@@ -601,12 +609,15 @@ impl GrantStore {
                 .session_insert(kind, key, verdict)
                 .map_err(StoreError::Io),
             Scope::Project => {
-                let root = self
-                    .project_root
+                if self.project_root.is_none() {
+                    return Err(StoreError::NoProjectRoot);
+                }
+                let dir = self
+                    .project_approvals_dir
                     .as_ref()
-                    .ok_or(StoreError::NoProjectRoot)?;
-                let dir = root.join(".cockpit");
-                self.file_insert(&dir, kind, key, verdict)
+                    .context("no machine-local project approvals dir available")
+                    .map_err(StoreError::Io)?;
+                self.file_insert(dir, kind, key, verdict)
                     .map_err(StoreError::Io)
             }
             Scope::Global => {
@@ -632,8 +643,8 @@ impl GrantStore {
         // Session (always reachable).
         self.session_remove(kind, key, verdict)?;
         // Project (only if a root resolves).
-        if let Some(root) = self.project_root.as_ref() {
-            self.file_remove(&root.join(".cockpit"), kind, key, verdict)?;
+        if let Some(dir) = self.project_approvals_dir.as_ref() {
+            self.file_remove(dir, kind, key, verdict)?;
         }
         // Global (only if a global dir resolves).
         if let Some(dir) = self.global_dir.clone() {
@@ -733,8 +744,8 @@ impl GrantStore {
     // ---- project / global scope (JSON files) ------------------------------
 
     fn project_file(&self) -> Option<ApprovalsFile> {
-        let root = self.project_root.as_ref()?;
-        load_approvals(&root.join(".cockpit"))
+        let dir = self.project_approvals_dir.as_ref()?;
+        load_approvals(dir)
     }
 
     fn global_file(&self) -> Option<ApprovalsFile> {
@@ -787,6 +798,13 @@ fn verdict_set(
 /// as the user-level config root.
 pub(crate) fn global_approvals_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config/cockpit"))
+}
+
+/// Machine-local approvals dir for a project root. This is keyed through
+/// the same hashed-cwd config directory used by the config layer, so the
+/// persisted user decision never lives inside the repository.
+pub(crate) fn project_approvals_dir(root: &Path) -> Option<PathBuf> {
+    crate::config::dirs::local_config_dir_for(root).ok()
 }
 
 /// A management-UI grant kind: the four entry buckets a project/global
@@ -852,8 +870,8 @@ impl ManagedGrants {
     }
 }
 
-/// Read every persisted grant from the `approvals.json` in `dir` (a scope's
-/// `.cockpit/` for project, the config dir for global). A missing or
+/// Read every persisted grant from the `approvals.json` in `dir` (the
+/// machine-local project approvals dir or the global config dir). A missing or
 /// unparseable file reads as no grants — the management UI shows an empty
 /// scope, never an error. Entries come out sorted (the on-disk `BTreeSet`
 /// ordering) so the listing is stable.
@@ -890,7 +908,7 @@ pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Re
     Ok(true)
 }
 
-/// File name for the per-scope approvals store inside a `.cockpit/` dir.
+/// File name for the per-scope approvals store inside an approvals dir.
 const APPROVALS_FILE: &str = "approvals.json";
 
 fn load_approvals(dir: &Path) -> Option<ApprovalsFile> {
@@ -1041,8 +1059,25 @@ mod tests {
         }
     }
 
-    /// Build a store backed by an in-memory DB, with project root + global
-    /// dir pointed at temp dirs so file scopes are exercised hermetically.
+    fn test_project_approvals_dir(project: &Path, base: &Path) -> PathBuf {
+        let name = project
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project");
+        base.join("project-approvals").join(name)
+    }
+
+    fn point_project_scope(store: &mut GrantStore, project: &Path, base: &Path) {
+        store.project_root = Some(project.to_path_buf());
+        store.project_approvals_dir = Some(test_project_approvals_dir(project, base));
+    }
+
+    fn test_project_dir(store: &GrantStore) -> &Path {
+        store.project_approvals_dir.as_deref().unwrap()
+    }
+
+    /// Build a store backed by an in-memory DB, with project root + file
+    /// approval dirs pointed at temp dirs so scopes are exercised hermetically.
     fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
         let db = Db::open_in_memory().unwrap();
         let session =
@@ -1050,8 +1085,8 @@ mod tests {
         let sid = session.id;
         let mut store = GrantStore::new(db, sid, project.to_path_buf());
         // Force deterministic scopes regardless of the test host's git
-        // state: the temp project IS the root, global is a temp dir.
-        store.project_root = Some(project.to_path_buf());
+        // state: the temp project IS the root, approvals/global are temp dirs.
+        point_project_scope(&mut store, project, &global);
         store.global_dir = Some(global);
         (store, sid)
     }
@@ -1102,9 +1137,67 @@ mod tests {
         // Survives reload: a fresh store over the same DB + dirs sees it.
         let db2 = store.db.clone();
         let mut reloaded = GrantStore::new(db2, sid, tmp.path().to_path_buf());
-        reloaded.project_root = Some(tmp.path().to_path_buf());
+        point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
         assert!(reloaded.is_command_granted(&info.key));
+    }
+
+    #[test]
+    fn project_grant_writes_machine_local_not_repo() {
+        let env = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(env.path());
+        let project = tempfile::tempdir_in(env.path()).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        crate::config::trust::clear_runtime_policy_for_tests();
+
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), project.path().to_path_buf(), "builder")
+                .unwrap();
+        let store = GrantStore::new(db, session.id, project.path().to_path_buf());
+        let project_dir = project_approvals_dir(project.path()).unwrap();
+        assert_eq!(
+            store.project_approvals_dir.as_deref(),
+            Some(project_dir.as_path())
+        );
+
+        let info = cmd_info("gh", Some("pr"), false);
+        store.record_command(&info, Scope::Project).unwrap();
+
+        assert!(project_dir.join(APPROVALS_FILE).exists());
+        assert!(!project.path().join(".cockpit/approvals.json").exists());
+        assert!(!project_dir.starts_with(project.path()));
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn repo_side_project_approvals_file_is_ignored_even_when_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let repo_dir = tmp.path().join(".cockpit");
+        let command = cmd_info("cargo", Some("test"), false);
+        let granted_dir = tmp.path().join("secrets");
+        store_approvals(
+            &repo_dir,
+            &ApprovalsFile {
+                commands: BTreeSet::from([command.key.as_storage_str()]),
+                paths: BTreeSet::from([normalize_path(&granted_dir, store.cwd())]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!crate::approval::command_grant_allowed_by_policy(
+            &store, &command
+        ));
+        assert!(!store.is_path_granted(&granted_dir.join("token.txt")));
+        assert!(!test_project_dir(&store).join(APPROVALS_FILE).exists());
     }
 
     #[test]
@@ -1121,7 +1214,7 @@ mod tests {
         let db2 = store.db.clone();
         let mut elsewhere =
             GrantStore::new(db2, store.session_id, other_project.path().to_path_buf());
-        elsewhere.project_root = Some(other_project.path().to_path_buf());
+        point_project_scope(&mut elsewhere, other_project.path(), global.path());
         elsewhere.global_dir = Some(global.path().to_path_buf());
         assert!(elsewhere.is_command_granted(&info.key));
     }
@@ -1361,7 +1454,7 @@ mod tests {
 
             // Reload (fresh store over the same DB + dirs) still sees it.
             let mut reloaded = GrantStore::new(store.db.clone(), sid, tmp.path().to_path_buf());
-            reloaded.project_root = Some(tmp.path().to_path_buf());
+            point_project_scope(&mut reloaded, tmp.path(), global.path());
             reloaded.global_dir = Some(global.path().to_path_buf());
             assert!(reloaded.is_command_rejected(&info.key), "reload {scope:?}");
         }
@@ -1587,7 +1680,7 @@ mod tests {
         // the persisted project rule back.
         let db2 = store.db.clone();
         let mut reloaded = GrantStore::new(db2, sid, tmp.path().to_path_buf());
-        reloaded.project_root = Some(tmp.path().to_path_buf());
+        point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
         assert_eq!(reloaded.loop_rule(&sig), Some(LoopVerdict::Accept));
     }
@@ -1652,7 +1745,7 @@ mod tests {
             crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
                 .unwrap();
         let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
-        store.project_root = Some(dir.path().to_path_buf());
+        point_project_scope(&mut store, dir.path(), dir.path());
         store
             .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
             .unwrap();
@@ -1667,7 +1760,7 @@ mod tests {
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
             .unwrap();
 
-        let grants = list_managed_grants(&dir.path().join(".cockpit"));
+        let grants = list_managed_grants(test_project_dir(&store));
         // Commands are sorted; both present.
         assert_eq!(
             grants.commands,
@@ -1694,18 +1787,18 @@ mod tests {
             crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
                 .unwrap();
         let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
-        store.project_root = Some(dir.path().to_path_buf());
+        point_project_scope(&mut store, dir.path(), dir.path());
         store
             .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
             .unwrap();
         store
             .record_command(&cmd_info("cargo", Some("build"), false), Scope::Project)
             .unwrap();
-        let cockpit = dir.path().join(".cockpit");
+        let project_dir = test_project_dir(&store).to_path_buf();
 
         // Deleting one command leaves the other intact.
-        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::Command, "gh pr").unwrap());
-        let grants = list_managed_grants(&cockpit);
+        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::Command, "gh pr").unwrap());
+        let grants = list_managed_grants(&project_dir);
         assert_eq!(grants.commands, vec!["cargo build".to_string()]);
 
         // The removal is durable: a fresh store no longer treats it as granted.
@@ -1722,13 +1815,12 @@ mod tests {
     #[test]
     fn delete_managed_grant_handles_each_kind() {
         let dir = tempfile::tempdir().unwrap();
-        let cockpit = dir.path().join(".cockpit");
         let db = Db::open_in_memory().unwrap();
         let session =
             crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
                 .unwrap();
         let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
-        store.project_root = Some(dir.path().to_path_buf());
+        point_project_scope(&mut store, dir.path(), dir.path());
         let path = dir.path().join("data");
         store.record_path(&path, Scope::Project).unwrap();
         let acc = GrantStore::loop_signature("read", &serde_json::json!({"p": 1}));
@@ -1740,11 +1832,12 @@ mod tests {
             .record_loop_rule(&rej, LoopVerdict::Reject, Scope::Project)
             .unwrap();
 
-        let path_key = list_managed_grants(&cockpit).paths[0].clone();
-        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::Path, &path_key).unwrap());
-        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::LoopAccept, &acc).unwrap());
-        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::LoopReject, &rej).unwrap());
-        assert!(list_managed_grants(&cockpit).is_empty());
+        let project_dir = test_project_dir(&store).to_path_buf();
+        let path_key = list_managed_grants(&project_dir).paths[0].clone();
+        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::Path, &path_key).unwrap());
+        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::LoopAccept, &acc).unwrap());
+        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::LoopReject, &rej).unwrap());
+        assert!(list_managed_grants(&project_dir).is_empty());
     }
 
     #[test]

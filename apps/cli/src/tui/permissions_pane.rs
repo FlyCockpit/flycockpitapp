@@ -1,7 +1,7 @@
 //! `/permissions` pane — view and delete persisted tool approvals.
 //!
 //! Lists the grants recorded in the two *file* approval scopes —
-//! **Project** (`<git-root>/.cockpit/approvals.json`) and **Global**
+//! **Project** (machine-local hashed-cwd `approvals.json`) and **Global**
 //! (`~/.config/cockpit/approvals.json`) — grouped by scope and, within
 //! each scope, by grant kind (commands, paths, loop always-accept, loop
 //! always-reject). Session-scope grants live in SQLite and expire with the
@@ -33,7 +33,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::approval::store::{
     ManagedGrantKind, ManagedGrants, delete_managed_grant, global_approvals_dir,
-    list_managed_grants,
+    list_managed_grants, project_approvals_dir,
 };
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
@@ -56,7 +56,7 @@ impl Scope {
     }
 }
 
-/// One scope's `.cockpit/`-style dir plus its loaded grants. The dir is the
+/// One scope's approvals dir plus its loaded grants. The dir is the
 /// directory *containing* `approvals.json`, so it feeds straight into the
 /// store's load/delete helpers.
 struct ScopeView {
@@ -97,7 +97,9 @@ impl PermissionsPane {
     /// sees an explicit state per scope. Pure file reads — no daemon
     /// round-trip.
     pub fn open(cwd: &Path) -> Self {
-        let project_dir = crate::git::find_worktree_root(cwd).map(|root| root.join(".cockpit"));
+        let project_dir = crate::git::find_worktree_root(cwd)
+            .filter(|root| crate::config::trust::project_config_allowed(&root.join(".cockpit")))
+            .and_then(|root| project_approvals_dir(&root));
         let global_dir = global_approvals_dir();
         let scopes = vec![
             load_scope(Scope::Project, project_dir),

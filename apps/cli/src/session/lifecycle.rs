@@ -174,6 +174,7 @@ impl Session {
             )),
             container_network_enabled: AtomicBool::new(false),
             sandbox_escalation_enabled: AtomicBool::new(true),
+            sandbox_escalation_notice_state: AtomicBool::new(true),
             // Default `manual` until the spawn path applies the config default.
             approval_mode: AtomicU8::new(approval_mode_to_u8(
                 crate::config::extended::ApprovalMode::Manual,

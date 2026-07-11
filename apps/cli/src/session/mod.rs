@@ -116,6 +116,7 @@ pub struct Session {
     /// `/sandbox-escalate` or the settings dialog. Approval mode still gates
     /// any allowed escalation.
     sandbox_escalation_enabled: AtomicBool,
+    sandbox_escalation_notice_state: AtomicBool,
     /// Command-approval mode for this session right now
     /// (implementation note), encoded by
     /// [`approval_mode_to_u8`] / [`approval_mode_from_u8`]. Resolved at
@@ -496,6 +497,10 @@ pub struct ToolCallRow {
     pub wire_input_json: Value,
     pub recovery: Recovery,
     pub hard_fail: bool,
+    pub exit_code: Option<i32>,
+    pub sandbox_enabled: bool,
+    pub sandboxed: bool,
+    pub sandbox_unavailable_reason: Option<String>,
     pub output: String,
     pub truncated: bool,
     pub duration_ms: u64,
@@ -1128,6 +1133,10 @@ mod tests {
             wire_input_json: json!({"path":"src/main.rs"}),
             recovery: Recovery::Clean,
             hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             output: "1: fn main()".into(),
             truncated: false,
             duration_ms: 4,
@@ -1164,6 +1173,10 @@ mod tests {
             wire_input_json: json!({"path":"src/main.rs"}),
             recovery: Recovery::Clean,
             hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             output: "body".into(),
             truncated: false,
             duration_ms: 4,

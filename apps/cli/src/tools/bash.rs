@@ -175,403 +175,437 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| crate::engine::tool::invalid_input("`command` is required"))?;
-        let cwd = args
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
-            .unwrap_or_else(|| ctx.cwd.clone());
-        let timeout_ms = args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .min(MAX_TIMEOUT_MS);
-        let queue_timeout_ms = args.get("queue_timeout_ms").and_then(Value::as_u64);
-        let declared_resources = parse_resource_requirements(args.get("resources"))?;
+        call_bash_inner(&self.prelude, args, ctx, BashRunOptions::default()).await
+    }
+}
 
-        if let Some(outside) =
-            outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
-        {
-            approve_outside_working_directory(ctx, &outside).await?;
-        }
-        if let Some(outside) =
-            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
-        {
-            approve_outside_working_directory(ctx, &outside).await?;
-        }
+#[derive(Debug, Clone, Default)]
+struct BashRunOptions {
+    force_unconfined: bool,
+    escalated: bool,
+    approval_scope_recorded: Option<String>,
+}
 
-        tracing::debug!(command, timeout_ms, "bash: spawning");
+pub(crate) async fn rerun_escalated_bash(
+    args: Value,
+    ctx: &ToolCtx,
+    approval_scope_recorded: Option<String>,
+) -> Result<ToolOutput> {
+    let tool = BashTool::new();
+    call_bash_inner(
+        &tool.prelude,
+        args,
+        ctx,
+        BashRunOptions {
+            force_unconfined: true,
+            escalated: true,
+            approval_scope_recorded,
+        },
+    )
+    .await
+}
 
-        let prefixed = if self.prelude.is_empty() {
-            command.to_string()
-        } else {
-            format!("{}{command}", self.prelude)
-        };
+async fn call_bash_inner(
+    prelude: &str,
+    args: Value,
+    ctx: &ToolCtx,
+    options: BashRunOptions,
+) -> Result<ToolOutput> {
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| crate::engine::tool::invalid_input("`command` is required"))?;
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
+        .unwrap_or_else(|| ctx.cwd.clone());
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_MS)
+        .min(MAX_TIMEOUT_MS);
+    let queue_timeout_ms = args.get("queue_timeout_ms").and_then(Value::as_u64);
+    let declared_resources = parse_resource_requirements(args.get("resources"))?;
 
-        // Resolve whether to confine this run (sandboxing part 2):
-        //
-        //   - Windows: never (no zerobox backend) — run unconfined and
-        //     show the one-time per-session notice.
-        //   - Sandboxing disabled for this session (`/sandbox off` /
-        //     `--no-sandbox`): run unconfined.
-        //   - Otherwise consult part 1: if every constituent simple
-        //     command is already granted broad access (Session/Project/
-        //     Global), skip the box and run with broadened access.
-        //   - Else consult the once-per-process environment probe: if the
-        //     sandbox can't initialize here (user namespaces blocked, WSL1,
-        //     bwrap absent), refuse with an actionable `/sandbox off` error
-        //     instead of failing into the escalation prompt.
-        //   - Else run sandboxed (cwd + session tmp rw, PATH exec, deny
-        //     outside).
-        let sandbox_on =
-            ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
+    if let Some(outside) =
+        outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    {
+        approve_outside_working_directory(ctx, &outside).await?;
+    }
+    if let Some(outside) =
+        command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    {
+        approve_outside_working_directory(ctx, &outside).await?;
+    }
 
-        // Windows has no zerobox backend: show the one-time per-session
-        // notice that the shell runs unconfined. The flag is only ever
-        // `Some` on Windows; elsewhere it stays `None`.
-        let windows_notice: Option<&'static str> = windows_shell_notice(ctx);
+    tracing::debug!(command, timeout_ms, "bash: spawning");
 
-        let granted_broad = if sandbox_on {
-            command_granted_broad(ctx, command).await
-        } else {
-            false
-        };
+    let prefixed = if prelude.is_empty() {
+        command.to_string()
+    } else {
+        format!("{prelude}{command}")
+    };
 
-        let session_env = ctx
-            .env_overlay
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let tmp_dir = ctx.session.tmp_dir();
-        let scrub = scrub_overrides(&session_env);
-        let command_classification = crate::approval::classify::classify(command);
-        let extended_config = crate::config::extended::load_for_cwd(&cwd);
-        let profile_introspector =
-            crate::tools::command_resource_profiles::ProductionProfileIntrospector::new(
-                true,
-                tmp_dir.clone(),
-            );
-        let command_resource_plan = command_resource_plan_with_user_grants(
-            crate::tools::command_resource_profiles::plan_for_command(
-                command_classification.simple_commands(),
-                &cwd,
-                &session_env,
-                &extended_config.command_resource_profiles,
-                &profile_introspector,
-            ),
-            ctx,
+    // Resolve whether to confine this run (sandboxing part 2):
+    //
+    //   - Windows: never (no zerobox backend) — run unconfined and
+    //     show the one-time per-session notice.
+    //   - Sandboxing disabled for this session (`/sandbox off` /
+    //     `--no-sandbox`): run unconfined.
+    //   - Otherwise consult part 1: if every constituent simple
+    //     command is already granted broad access (Session/Project/
+    //     Global), skip the box and run with broadened access.
+    //   - Else consult the once-per-process environment probe: if the
+    //     sandbox can't initialize here (user namespaces blocked, WSL1,
+    //     bwrap absent), refuse with an actionable `/sandbox off` error
+    //     instead of failing into the escalation prompt.
+    //   - Else run sandboxed (cwd + session tmp rw, PATH exec, deny
+    //     outside).
+    let sandbox_enabled =
+        ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
+    let sandbox_on = sandbox_enabled && !options.force_unconfined;
+
+    // Windows has no zerobox backend: show the one-time per-session
+    // notice that the shell runs unconfined. The flag is only ever
+    // `Some` on Windows; elsewhere it stays `None`.
+    let windows_notice: Option<&'static str> = windows_shell_notice(ctx);
+
+    let granted_broad = if sandbox_on {
+        command_granted_broad(ctx, command).await
+    } else {
+        false
+    };
+
+    let session_env = ctx
+        .env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let tmp_dir = ctx.session.tmp_dir();
+    let scrub = scrub_overrides(&session_env);
+    let command_classification = crate::approval::classify::classify(command);
+    let extended_config = crate::config::extended::load_for_cwd(&cwd);
+    let profile_introspector =
+        crate::tools::command_resource_profiles::ProductionProfileIntrospector::new(
+            true,
+            tmp_dir.clone(),
         );
-        let resource_plan = build_resource_plan(
-            declared_resources,
-            &extended_config.resource_scheduler,
+    let command_resource_plan = command_resource_plan_with_user_grants(
+        crate::tools::command_resource_profiles::plan_for_command(
+            command_classification.simple_commands(),
+            &cwd,
+            &session_env,
+            &extended_config.command_resource_profiles,
+            &profile_introspector,
+        ),
+        ctx,
+    );
+    let resource_plan = build_resource_plan(
+        declared_resources,
+        &extended_config.resource_scheduler,
+        command,
+        &command_classification,
+        queue_timeout_ms,
+    );
+
+    if !options.force_unconfined && ctx.session.sandbox_mode().is_container() {
+        return run_container_bash(
             command,
-            &command_classification,
-            queue_timeout_ms,
-        );
+            &prefixed,
+            &cwd,
+            timeout_ms,
+            &session_env,
+            &scrub,
+            &extended_config,
+            &command_resource_plan,
+            &resource_plan,
+            ctx,
+        )
+        .await;
+    }
 
-        if ctx.session.sandbox_mode().is_container() {
-            return run_container_bash(
-                command,
-                &prefixed,
-                &cwd,
-                timeout_ms,
-                &session_env,
-                &scrub,
-                &extended_config,
-                &command_resource_plan,
-                &resource_plan,
-                ctx,
-            )
-            .await;
-        }
+    // Resolve the gating decision. When confinement is actually on the
+    // table (sandbox on, not already broad-granted) we consult the
+    // once-per-process environment probe: if the sandbox cannot
+    // initialize here, refuse with an actionable `/sandbox off` error
+    // rather than letting every command fail into run-fail-escalate. The
+    // probe is skipped entirely for the off / broad-granted paths (no
+    // probe cost, no spawn). The probe needs a real cwd — we pass the
+    // command's resolved cwd (it falls back to a temp dir internally).
+    let availability = if sandbox_on && !granted_broad {
+        crate::tools::shell_sandbox::sandbox_available(&cwd)
+            .await
+            .clone()
+    } else {
+        // Not consulted on these paths; the gate ignores it.
+        crate::tools::shell_sandbox::SandboxAvailability::Available
+    };
+    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, granted_broad, &availability);
 
-        // Resolve the gating decision. When confinement is actually on the
-        // table (sandbox on, not already broad-granted) we consult the
-        // once-per-process environment probe: if the sandbox cannot
-        // initialize here, refuse with an actionable `/sandbox off` error
-        // rather than letting every command fail into run-fail-escalate. The
-        // probe is skipped entirely for the off / broad-granted paths (no
-        // probe cost, no spawn). The probe needs a real cwd — we pass the
-        // command's resolved cwd (it falls back to a temp dir internally).
-        let availability = if sandbox_on && !granted_broad {
-            crate::tools::shell_sandbox::sandbox_available(&cwd)
-                .await
-                .clone()
-        } else {
-            // Not consulted on these paths; the gate ignores it.
-            crate::tools::shell_sandbox::SandboxAvailability::Available
+    if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
+        // Sandbox enabled but cannot initialize: record the accurate
+        // diagnostic state (enabled, not confined, not run) out-of-band
+        // and return a model-facing error (token economy §10). The
+        // message is addressed to the *model*, not a human: the probe is
+        // cached process-lifetime so this verdict is permanent for the
+        // session, and `/sandbox off` is a composer UI command, never a
+        // shell command — saying so explicitly stops weaker models from
+        // both retrying the dead sandbox and shell-executing `/sandbox
+        // off` (the original phrasing read as a shell instruction).
+        // Never falls through to the escalation prompt.
+        let meta = crate::engine::tool::SandboxMeta {
+            enabled: sandbox_enabled,
+            confined: false,
+            escalated: options.escalated,
+            broad_grant_simple_commands: granted_broad,
+            approval_scope_recorded: options.approval_scope_recorded.clone(),
+            // The sandbox-unavailable signal: carry the diagnosed `reason`
+            // (incl. the `sudo sysctl …=0` command when diagnosed) out-of-
+            // band so the engine raises the deterministic user-facing
+            // indicator (§6.5). Never enters the model-facing body above.
+            unavailable_reason: Some(reason.clone()),
+            resource_profiles: command_resource_plan.metas.clone(),
         };
-        let gate =
-            crate::tools::shell_sandbox::gate_decision(sandbox_on, granted_broad, &availability);
-
-        if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
-            // Sandbox enabled but cannot initialize: record the accurate
-            // diagnostic state (enabled, not confined, not run) out-of-band
-            // and return a model-facing error (token economy §10). The
-            // message is addressed to the *model*, not a human: the probe is
-            // cached process-lifetime so this verdict is permanent for the
-            // session, and `/sandbox off` is a composer UI command, never a
-            // shell command — saying so explicitly stops weaker models from
-            // both retrying the dead sandbox and shell-executing `/sandbox
-            // off` (the original phrasing read as a shell instruction).
-            // Never falls through to the escalation prompt.
-            let meta = crate::engine::tool::SandboxMeta {
-                enabled: sandbox_on,
-                confined: false,
-                escalated: false,
-                broad_grant_simple_commands: granted_broad,
-                approval_scope_recorded: None,
-                // The sandbox-unavailable signal: carry the diagnosed `reason`
-                // (incl. the `sudo sysctl …=0` command when diagnosed) out-of-
-                // band so the engine raises the deterministic user-facing
-                // indicator (§6.5). Never enters the model-facing body above.
-                unavailable_reason: Some(reason.clone()),
-                resource_profiles: command_resource_plan.metas.clone(),
-            };
-            return Ok(ToolOutput::text(format!(
+        return Ok(ToolOutput::text(format!(
                 "Error: the shell sandbox cannot start here ({reason}); `bash` will fail for the rest of the session until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
             ))
             .with_sandbox(meta));
-        }
+    }
 
-        let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
+    let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
 
-        // Part B: the sandbox-state sub-object for the tool_call event. We
-        // accumulate the four-state record as the run proceeds and attach it
-        // to whichever `ToolOutput` we return (every path), so an export is
-        // diagnosable across sandbox-off / broad-grant-skip / confined-
-        // success / confined-fail→escalate. It is NEVER added to the
-        // model-facing body (token economy §10).
-        let mut meta = crate::engine::tool::SandboxMeta {
-            enabled: sandbox_on,
-            confined: confine,
-            escalated: false,
-            broad_grant_simple_commands: granted_broad,
-            approval_scope_recorded: None,
-            // Not the refuse path — the sandbox initialized (or was off /
-            // broad-granted), so there's no unavailable remedy to surface.
-            unavailable_reason: None,
-            resource_profiles: command_resource_plan.metas.clone(),
-        };
+    // Part B: the sandbox-state sub-object for the tool_call event. We
+    // accumulate the four-state record as the run proceeds and attach it
+    // to whichever `ToolOutput` we return (every path), so an export is
+    // diagnosable across sandbox-off / broad-grant-skip / confined-
+    // success / confined-fail→escalate. It is NEVER added to the
+    // model-facing body (token economy §10).
+    let mut meta = crate::engine::tool::SandboxMeta {
+        enabled: sandbox_enabled,
+        confined: confine,
+        escalated: options.escalated,
+        broad_grant_simple_commands: granted_broad,
+        approval_scope_recorded: options.approval_scope_recorded.clone(),
+        // Not the refuse path — the sandbox initialized (or was off /
+        // broad-granted), so there's no unavailable remedy to surface.
+        unavailable_reason: None,
+        resource_profiles: command_resource_plan.metas.clone(),
+    };
 
-        if confine && !command_resource_plan.invalid_roots.is_empty() {
-            let issues = command_resource_plan
-                .invalid_roots
-                .iter()
-                .map(|issue| issue.render())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Ok(ToolOutput::text(format!(
+    if confine && !command_resource_plan.invalid_roots.is_empty() {
+        let issues = command_resource_plan
+            .invalid_roots
+            .iter()
+            .map(|issue| issue.render())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Ok(ToolOutput::text(format!(
                 "Error: command resource profiles cannot expose configured toolchain roots ({issues}). Fix the root environment variables/profile config or use a broad command approval so the command runs without shell confinement."
             ))
             .with_sandbox(meta));
+    }
+
+    let (resource_meta, _resource_lease) =
+        match acquire_resource_lease(ctx, &resource_plan, &meta).await {
+            Ok(acquired) => acquired,
+            Err(output) => return Ok(output),
+        };
+
+    // First attempt: sandboxed (confined) or broadened/unconfined.
+    let attempt = run_shell(
+        &prefixed,
+        &cwd,
+        confine,
+        tmp_dir.as_deref(),
+        &scrub,
+        &session_env,
+        &command_resource_plan.allow_paths,
+        ctx,
+        timeout_ms,
+    )
+    .await;
+    let outcome = match attempt {
+        RunOutcome::Cancelled => {
+            return Ok(ToolOutput::truncated_text(
+                "Error: command cancelled by user (ctrl+c)".to_string(),
+            )
+            .with_bash_meta(meta, &resource_meta));
         }
-
-        let (resource_meta, _resource_lease) =
-            match acquire_resource_lease(ctx, &resource_plan, &meta).await {
-                Ok(acquired) => acquired,
-                Err(output) => return Ok(output),
-            };
-
-        // First attempt: sandboxed (confined) or broadened/unconfined.
-        let attempt = run_shell(
-            &prefixed,
-            &cwd,
-            confine,
-            tmp_dir.as_deref(),
-            &scrub,
-            &session_env,
-            &command_resource_plan.allow_paths,
-            ctx,
-            timeout_ms,
-        )
-        .await;
-        let outcome = match attempt {
-            RunOutcome::Cancelled => {
-                return Ok(ToolOutput::truncated_text(
-                    "Error: command cancelled by user (ctrl+c)".to_string(),
+        RunOutcome::TimedOut => {
+            return Ok(ToolOutput::truncated_text(format!(
+                "Error: timeout after {timeout_ms} ms{}",
+                crate::tools::command_resource_profiles::resource_profile_context(
+                    &command_resource_plan
                 )
-                .with_bash_meta(meta, &resource_meta));
-            }
-            RunOutcome::TimedOut => {
-                return Ok(ToolOutput::truncated_text(format!(
-                    "Error: timeout after {timeout_ms} ms{}",
-                    crate::tools::command_resource_profiles::resource_profile_context(
-                        &command_resource_plan
-                    )
-                ))
-                .with_bash_meta(meta, &resource_meta));
-            }
-            RunOutcome::SpawnError(e) => {
-                let mut message = render_spawn_error(&prefixed, &cwd, &e);
-                message.push_str(
-                    &crate::tools::command_resource_profiles::resource_profile_context(
-                        &command_resource_plan,
-                    ),
-                );
-                return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
-            }
-            RunOutcome::WaitError(e) => {
-                return Ok(ToolOutput::text(format!(
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
+        RunOutcome::SpawnError(e) => {
+            let mut message = render_spawn_error(&prefixed, &cwd, &e);
+            message.push_str(
+                &crate::tools::command_resource_profiles::resource_profile_context(
+                    &command_resource_plan,
+                ),
+            );
+            return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
+        }
+        RunOutcome::WaitError(e) => {
+            return Ok(ToolOutput::text(format!(
                     "Error: the command failed to run ({e}); check the command syntax or try a simpler invocation"
                 ))
                 .with_bash_meta(meta, &resource_meta));
-            }
-            RunOutcome::Done(o) => o,
-        };
+        }
+        RunOutcome::Done(o) => o,
+    };
 
-        // Run-fail-escalate (sandboxing part 2): automatic unconfined reruns
-        // are only allowed from trusted sandbox metadata. Child stderr is
-        // attacker-controlled, and zerobox currently exposes no structured
-        // "the sandbox denied this operation" signal here, so confined
-        // failures fall through with their original result.
-        let mut final_outcome = outcome;
-        if confine
-            && let Some((confined_exit, confined_stderr)) =
-                confined_failure_escalation_offer(&final_outcome)
-            && let Some(approver) = ctx.approver.as_ref()
-        {
-            meta.escalated = true;
-            // The distinct escalation prompt: carries the FIRST confined
-            // attempt's trusted denial detail, captured before the re-run
-            // overwrites `final_outcome`.
-            let decision = approver
-                .approve_command_escalated(command, confined_exit, confined_stderr)
-                .await?;
-            // Deny → fall through with the original sandboxed result;
-            // `approval_scope_recorded` stays `None` (per the settled spec).
-            if let crate::approval::Decision::Allow { scope } = decision {
-                meta.approval_scope_recorded = Some(scope.as_str().to_string());
-                let rerun = run_shell(
-                    &prefixed,
-                    &cwd,
-                    false, // broadened — no confinement
-                    tmp_dir.as_deref(),
-                    &scrub,
-                    &session_env,
-                    &command_resource_plan.allow_paths,
-                    ctx,
-                    timeout_ms,
-                )
-                .await;
-                match rerun {
-                    RunOutcome::Cancelled => {
-                        return Ok(ToolOutput::truncated_text(
-                            "Error: command cancelled by user (ctrl+c)".to_string(),
+    // Run-fail-escalate (sandboxing part 2): automatic unconfined reruns
+    // are only allowed from trusted sandbox metadata. Child stderr is
+    // attacker-controlled, and zerobox currently exposes no structured
+    // "the sandbox denied this operation" signal here, so confined
+    // failures fall through with their original result.
+    let mut final_outcome = outcome;
+    if confine
+        && let Some((confined_exit, confined_stderr)) =
+            confined_failure_escalation_offer(&final_outcome)
+        && let Some(approver) = ctx.approver.as_ref()
+    {
+        meta.escalated = true;
+        // The distinct escalation prompt: carries the FIRST confined
+        // attempt's trusted denial detail, captured before the re-run
+        // overwrites `final_outcome`.
+        let decision = approver
+            .approve_command_escalated(command, confined_exit, confined_stderr)
+            .await?;
+        // Deny → fall through with the original sandboxed result;
+        // `approval_scope_recorded` stays `None` (per the settled spec).
+        if let crate::approval::Decision::Allow { scope } = decision {
+            meta.approval_scope_recorded = Some(scope.as_str().to_string());
+            let rerun = run_shell(
+                &prefixed,
+                &cwd,
+                false, // broadened — no confinement
+                tmp_dir.as_deref(),
+                &scrub,
+                &session_env,
+                &command_resource_plan.allow_paths,
+                ctx,
+                timeout_ms,
+            )
+            .await;
+            match rerun {
+                RunOutcome::Cancelled => {
+                    return Ok(ToolOutput::truncated_text(
+                        "Error: command cancelled by user (ctrl+c)".to_string(),
+                    )
+                    .with_bash_meta(meta, &resource_meta));
+                }
+                RunOutcome::TimedOut => {
+                    return Ok(ToolOutput::truncated_text(format!(
+                        "Error: timeout after {timeout_ms} ms{}",
+                        crate::tools::command_resource_profiles::resource_profile_context(
+                            &command_resource_plan
                         )
-                        .with_bash_meta(meta, &resource_meta));
-                    }
-                    RunOutcome::TimedOut => {
-                        return Ok(ToolOutput::truncated_text(format!(
-                            "Error: timeout after {timeout_ms} ms{}",
-                            crate::tools::command_resource_profiles::resource_profile_context(
-                                &command_resource_plan
-                            )
-                        ))
-                        .with_bash_meta(meta, &resource_meta));
-                    }
-                    RunOutcome::SpawnError(e) => {
-                        let mut message = render_spawn_error(&prefixed, &cwd, &e);
-                        message.push_str(
-                            &crate::tools::command_resource_profiles::resource_profile_context(
-                                &command_resource_plan,
-                            ),
-                        );
-                        return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
-                    }
-                    RunOutcome::WaitError(e) => {
-                        return Ok(ToolOutput::text(format!(
+                    ))
+                    .with_bash_meta(meta, &resource_meta));
+                }
+                RunOutcome::SpawnError(e) => {
+                    let mut message = render_spawn_error(&prefixed, &cwd, &e);
+                    message.push_str(
+                        &crate::tools::command_resource_profiles::resource_profile_context(
+                            &command_resource_plan,
+                        ),
+                    );
+                    return Ok(ToolOutput::text(message).with_bash_meta(meta, &resource_meta));
+                }
+                RunOutcome::WaitError(e) => {
+                    return Ok(ToolOutput::text(format!(
                             "Error: the command failed to run ({e}); check the command syntax or try a simpler invocation"
                         ))
                         .with_bash_meta(meta, &resource_meta));
-                    }
-                    RunOutcome::Done(o) => final_outcome = o,
                 }
+                RunOutcome::Done(o) => final_outcome = o,
             }
         }
+    }
 
-        if confine
-            && !final_outcome.success
-            && let Some(hint) = command_resource_plan.unsupported_hint()
-        {
-            final_outcome.stderr.extend_from_slice(hint.as_bytes());
-            final_outcome.stderr.push(b'\n');
+    if confine
+        && !final_outcome.success
+        && let Some(hint) = command_resource_plan.unsupported_hint()
+    {
+        final_outcome.stderr.extend_from_slice(hint.as_bytes());
+        final_outcome.stderr.push(b'\n');
+    }
+
+    // Native shell-output compression (implementation note):
+    // when the session has the `shell compression` setting enabled, run
+    // each stream through cockpit's rtk-native filter (generic noise strip
+    // + per-command strategy) BEFORE the body is assembled — so the model
+    // sees compressed output, the user's setting decides verbatim vs not,
+    // and the failure-signal-preserving `exit:` line is always appended
+    // outside the filter. This sits strictly before the §7 redaction
+    // chokepoint (`redact::scrub`, applied in `engine::agent::turn`), which
+    // still scrubs whatever the filter leaves. Disabled → verbatim.
+    let compress = ctx.session.shell_compression_enabled();
+
+    // Defensive-mode routing nudge (`defensive-tool-routing-
+    // behavioral-nudge.md`): in `Defensive` mode only, classify the command
+    // off its first program and — unless the model has already adopted the
+    // dedicated tool this session (self-suppression) — append ONE terse tip
+    // line to the model-facing body, after the `exit:` line and outside
+    // compression. `Normal` mode appends nothing (token economy §10), and a
+    // command with no file/search replacement classifies to `None`.
+    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+        crate::tools::shell_compress::classify_tip(command)
+            .filter(|t| !ctx.session.tip_suppressed(*t))
+    } else {
+        None
+    };
+    let native_write_hint = durable_shell_write_hint(command);
+
+    // Model-facing body is unchanged — only `final_outcome` is rendered,
+    // never the sandbox metadata (which rides out-of-band for the event).
+    let body = render_output(
+        &final_outcome,
+        windows_notice,
+        compress,
+        command,
+        &cwd,
+        tip,
+        native_write_hint,
+    );
+    // Structured exit code for the `tool_call` event (export-audit
+    // fidelity): authoritative source, distinct from the `exit: N` text the
+    // body still carries. A signaled run has no numeric code, so the field
+    // is omitted (the body's `exit: signaled` line remains the signal).
+    let exit_field = if final_outcome.signaled {
+        None
+    } else {
+        Some(final_outcome.exit)
+    };
+    let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
+    let sidecar = bash_output_sidecar(command, &cwd, &final_outcome, &body, truncated_for_display);
+    if truncated_for_display {
+        // Head+tail so the `exit:` line and any stderr at the tail
+        // survive — the failure signal usually lives there.
+        let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
+            .with_bash_meta(meta, &resource_meta);
+        if let Some(sidecar) = sidecar {
+            out = out.with_output_sidecar(sidecar);
         }
-
-        // Native shell-output compression (implementation note):
-        // when the session has the `shell compression` setting enabled, run
-        // each stream through cockpit's rtk-native filter (generic noise strip
-        // + per-command strategy) BEFORE the body is assembled — so the model
-        // sees compressed output, the user's setting decides verbatim vs not,
-        // and the failure-signal-preserving `exit:` line is always appended
-        // outside the filter. This sits strictly before the §7 redaction
-        // chokepoint (`redact::scrub`, applied in `engine::agent::turn`), which
-        // still scrubs whatever the filter leaves. Disabled → verbatim.
-        let compress = ctx.session.shell_compression_enabled();
-
-        // Defensive-mode routing nudge (`defensive-tool-routing-
-        // behavioral-nudge.md`): in `Defensive` mode only, classify the command
-        // off its first program and — unless the model has already adopted the
-        // dedicated tool this session (self-suppression) — append ONE terse tip
-        // line to the model-facing body, after the `exit:` line and outside
-        // compression. `Normal` mode appends nothing (token economy §10), and a
-        // command with no file/search replacement classifies to `None`.
-        let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
-            crate::tools::shell_compress::classify_tip(command)
-                .filter(|t| !ctx.session.tip_suppressed(*t))
-        } else {
-            None
-        };
-        let native_write_hint = durable_shell_write_hint(command);
-
-        // Model-facing body is unchanged — only `final_outcome` is rendered,
-        // never the sandbox metadata (which rides out-of-band for the event).
-        let body = render_output(
-            &final_outcome,
-            windows_notice,
-            compress,
-            command,
-            &cwd,
-            tip,
-            native_write_hint,
-        );
-        // Structured exit code for the `tool_call` event (export-audit
-        // fidelity): authoritative source, distinct from the `exit: N` text the
-        // body still carries. A signaled run has no numeric code, so the field
-        // is omitted (the body's `exit: signaled` line remains the signal).
-        let exit_field = if final_outcome.signaled {
-            None
-        } else {
-            Some(final_outcome.exit)
-        };
-        let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
-        let sidecar =
-            bash_output_sidecar(command, &cwd, &final_outcome, &body, truncated_for_display);
-        if truncated_for_display {
-            // Head+tail so the `exit:` line and any stderr at the tail
-            // survive — the failure signal usually lives there.
-            let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
-                .with_bash_meta(meta, &resource_meta);
-            if let Some(sidecar) = sidecar {
-                out = out.with_output_sidecar(sidecar);
-            }
-            Ok(match exit_field {
-                Some(code) => out.with_exit_code(code),
-                None => out,
-            })
-        } else {
-            let mut out = ToolOutput::text(body).with_bash_meta(meta, &resource_meta);
-            if let Some(sidecar) = sidecar {
-                out = out.with_output_sidecar(sidecar);
-            }
-            Ok(match exit_field {
-                Some(code) => out.with_exit_code(code),
-                None => out,
-            })
+        Ok(match exit_field {
+            Some(code) => out.with_exit_code(code),
+            None => out,
+        })
+    } else {
+        let mut out = ToolOutput::text(body).with_bash_meta(meta, &resource_meta);
+        if let Some(sidecar) = sidecar {
+            out = out.with_output_sidecar(sidecar);
         }
+        Ok(match exit_field {
+            Some(code) => out.with_exit_code(code),
+            None => out,
+        })
     }
 }
 

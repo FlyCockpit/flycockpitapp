@@ -116,6 +116,13 @@ CREATE TABLE tool_call_events (
     recovery_stage      TEXT,
     hard_fail           INTEGER NOT NULL DEFAULT 0,
 
+    -- structured bash/sandbox outcome fields for escalation lookup. NULL
+    -- exit_code means no shell exit was produced (spawn/cancel/signaled).
+    exit_code           INTEGER DEFAULT NULL,
+    sandbox_enabled     INTEGER NOT NULL DEFAULT 0,
+    sandboxed           INTEGER NOT NULL DEFAULT 0,
+    sandbox_unavailable_reason TEXT DEFAULT NULL,
+
     -- audit: the two projections live on the same row (GOALS §14a)
     original_input_json TEXT    NOT NULL,
     wire_input_json     TEXT    NOT NULL,

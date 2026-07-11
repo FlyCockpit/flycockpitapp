@@ -607,6 +607,10 @@ pub(crate) async fn run_turn(
     let active_tools = turn_toolbox(agent, &session);
     let tools = active_tools.definitions(agent.llm_mode);
 
+    if let Some(notice) = session.sandbox_escalation_turn_notice() {
+        history.push(Message::System { content: notice });
+    }
+
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.
     let _ = tx
@@ -1947,6 +1951,12 @@ pub(crate) async fn run_turn(
             wire_input_json: args.clone(),
             recovery: recovery.clone(),
             hard_fail,
+            exit_code,
+            sandbox_enabled: sandbox_meta.as_ref().is_some_and(|m| m.enabled),
+            sandboxed: sandbox_meta.as_ref().is_some_and(|m| m.confined),
+            sandbox_unavailable_reason: sandbox_meta
+                .as_ref()
+                .and_then(|m| m.unavailable_reason.clone()),
             output: output_str.clone(),
             truncated,
             duration_ms,

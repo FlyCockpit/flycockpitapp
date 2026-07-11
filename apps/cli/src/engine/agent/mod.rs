@@ -249,6 +249,11 @@ async fn inject_live_project_guidance_change(
 }
 
 fn toolbox_with_retrieval_if_needed(mut tools: ToolBox, session: &Session) -> ToolBox {
+    if session.sandbox_escalation_enabled() {
+        tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
+    } else {
+        tools = tools.without("escalate");
+    }
     if session
         .db
         .session_has_compressed_tool_results(session.id)
@@ -883,6 +888,7 @@ mod compressed_tool_result_tests {
     fn retrieval_tool_advertisement_is_sticky_after_store() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        session.set_sandbox_escalation_enabled(false);
         let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
         assert!(
             !toolbox_with_retrieval_if_needed(tools.clone(), &session)
@@ -904,6 +910,39 @@ mod compressed_tool_result_tests {
                 .names()
                 .contains(&"tool_result_retrieve")
         );
+    }
+
+    #[test]
+    fn sandbox_escalate_tool_is_conditional_and_notice_is_debounced() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::escalate::EscalateTool));
+
+        session.set_sandbox_escalation_enabled(false);
+        assert!(
+            !toolbox_with_retrieval_if_needed(tools.clone(), &session)
+                .names()
+                .contains(&"escalate")
+        );
+        let disabled = session
+            .sandbox_escalation_turn_notice()
+            .expect("disabled notice");
+        assert!(disabled.contains("now disabled"));
+        assert!(session.sandbox_escalation_turn_notice().is_none());
+
+        session.set_sandbox_escalation_enabled(true);
+        assert!(
+            toolbox_with_retrieval_if_needed(tools, &session)
+                .names()
+                .contains(&"escalate")
+        );
+        let enabled = session
+            .sandbox_escalation_turn_notice()
+            .expect("enabled notice");
+        assert!(enabled.contains("now enabled"));
+        assert!(session.sandbox_escalation_turn_notice().is_none());
     }
 }
 

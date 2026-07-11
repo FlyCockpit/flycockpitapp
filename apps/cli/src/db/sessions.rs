@@ -622,6 +622,7 @@ fn copy_fork_tool_calls(
              model, provider, project_id, project_root,
              agent, tool, path, language,
              recovery_kind, recovery_stage, hard_fail,
+             exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
              original_input_json, wire_input_json,
              output, truncated, duration_ms,
              cockpit_version, llm_mode, shape_fingerprint, hint
@@ -632,6 +633,7 @@ fn copy_fork_tool_calls(
                 model, provider, project_id, project_root,
                 agent, tool, path, language,
                 recovery_kind, recovery_stage, hard_fail,
+                exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                 original_input_json, wire_input_json,
                 output, truncated, duration_ms,
                 cockpit_version, llm_mode, shape_fingerprint, hint
@@ -1653,6 +1655,10 @@ mod tests {
             path: Some("src/lib.rs".to_string()),
             recovery: crate::engine::repair::Recovery::Clean,
             hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             original_input_json: serde_json::json!({"path": "src/lib.rs"}),
             wire_input_json: serde_json::json!({"path": "src/lib.rs"}),
             output: "ok".to_string(),

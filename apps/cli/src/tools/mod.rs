@@ -24,6 +24,7 @@ pub mod defer;
 pub mod delegation_payload_retrieve;
 pub mod docs;
 pub mod editunlock;
+pub mod escalate;
 pub mod glob;
 pub mod goal;
 pub mod grep;

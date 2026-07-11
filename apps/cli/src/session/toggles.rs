@@ -64,6 +64,24 @@ impl Session {
         enabled
     }
 
+    /// Return the agent-facing sandbox-escalation availability notice when
+    /// the flag has changed since the last model turn saw it. Toggling back
+    /// before the next turn is a net no-op and emits nothing.
+    pub fn sandbox_escalation_turn_notice(&self) -> Option<String> {
+        let enabled = self.sandbox_escalation_enabled();
+        let previous = self
+            .sandbox_escalation_notice_state
+            .swap(enabled, Ordering::Relaxed);
+        if previous == enabled {
+            return None;
+        }
+        Some(if enabled {
+            "Sandbox escalation is now enabled; you may use the `escalate` tool to re-run a sandbox-failed command outside the sandbox (subject to approval).".to_string()
+        } else {
+            "Sandbox escalation is now disabled; the `escalate` tool is unavailable.".to_string()
+        })
+    }
+
     /// The session's current command-approval mode
     /// (implementation note). Read per gated tool call.
     pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {

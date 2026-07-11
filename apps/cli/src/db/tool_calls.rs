@@ -36,6 +36,10 @@ pub struct ToolCallEvent {
     pub path: Option<String>,
     pub recovery: Recovery,
     pub hard_fail: bool,
+    pub exit_code: Option<i32>,
+    pub sandbox_enabled: bool,
+    pub sandboxed: bool,
+    pub sandbox_unavailable_reason: Option<String>,
     pub original_input_json: Value,
     pub wire_input_json: Value,
     pub output: String,
@@ -86,6 +90,7 @@ impl Db {
                     model, provider, project_id, project_root,
                     agent, tool, path, language,
                     recovery_kind, recovery_stage, hard_fail,
+                    exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                     original_input_json, wire_input_json,
                     output, truncated, duration_ms,
                     cockpit_version, llm_mode, shape_fingerprint, hint
@@ -96,9 +101,10 @@ impl Db {
                     ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17,
                     ?18, ?19, ?20,
-                    ?21, ?22,
-                    ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29
+                    ?21, ?22, ?23, ?24,
+                    ?25, ?26,
+                    ?27, ?28, ?29,
+                    ?30, ?31, ?32, ?33
                  )",
                 params![
                     ev.event_id.to_string(),
@@ -121,6 +127,10 @@ impl Db {
                     recovery_kind,
                     recovery_stage,
                     ev.hard_fail as i64,
+                    ev.exit_code.map(i64::from),
+                    ev.sandbox_enabled as i64,
+                    ev.sandboxed as i64,
+                    ev.sandbox_unavailable_reason,
                     original_json,
                     wire_json,
                     ev.output,
@@ -178,6 +188,7 @@ impl Db {
                         model, provider, project_id, project_root,
                         agent, tool, path,
                         recovery_kind, recovery_stage, hard_fail,
+                        exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                         original_input_json, wire_input_json,
                         output, truncated, duration_ms,
                         cockpit_version, llm_mode, shape_fingerprint, hint
@@ -204,6 +215,46 @@ impl Db {
         })
     }
 
+    /// Lookup one tool call by model call id within a session. Used by `escalate`:
+    /// sandbox refusals and confined non-zero exits are ordinary tool results,
+    /// not hard failures, so this intentionally does not apply the failed-call
+    /// filter.
+    pub fn get_tool_call_by_call_id(
+        &self,
+        session_id: Uuid,
+        call_id: &str,
+    ) -> Result<Option<ToolCallEvent>> {
+        let call_id = call_id.to_string();
+        self.read_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_id, session_id, call_id, timestamp,
+                            provider_item_id, provider_call_id, provider_call_id_source,
+                            wire_api, provider_family,
+                            model, provider, project_id, project_root,
+                            agent, tool, path,
+                            recovery_kind, recovery_stage, hard_fail,
+                            exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
+                            original_input_json, wire_input_json,
+                            output, truncated, duration_ms,
+                            cockpit_version, llm_mode, shape_fingerprint, hint
+                       FROM tool_call_events
+                      WHERE session_id = ?1 AND call_id = ?2
+                      ORDER BY timestamp DESC, rowid DESC
+                      LIMIT 1",
+                )
+                .context("preparing get_tool_call_by_call_id")?;
+            let mut rows = stmt
+                .query(params![session_id.to_string(), call_id])
+                .context("querying tool_call_event by call_id")?;
+            let Some(row) = rows.next().context("reading tool_call_event by call_id")? else {
+                return Ok(None);
+            };
+            let raw = decode_row(row).context("decoding tool_call row")?;
+            Ok(Some(raw.try_into()?))
+        })
+    }
+
     /// All tool-call rows for one session, oldest-first. Used by
     /// `Attach` to rebuild the user transcript on the client.
     pub fn list_tool_calls_for_session(&self, session_id: Uuid) -> Result<Vec<ToolCallEvent>> {
@@ -222,6 +273,7 @@ impl Db {
                         model, provider, project_id, project_root,
                         agent, tool, path,
                         recovery_kind, recovery_stage, hard_fail,
+                        exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                         original_input_json, wire_input_json,
                         output, truncated, duration_ms,
                         cockpit_version, llm_mode, shape_fingerprint, hint
@@ -263,6 +315,10 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
     let recovery_kind: Option<String> = row.get("recovery_kind")?;
     let recovery_stage: Option<String> = row.get("recovery_stage")?;
     let hard_fail: i64 = row.get("hard_fail")?;
+    let exit_code: Option<i64> = row.get("exit_code")?;
+    let sandbox_enabled: i64 = row.get("sandbox_enabled")?;
+    let sandboxed: i64 = row.get("sandboxed")?;
+    let sandbox_unavailable_reason: Option<String> = row.get("sandbox_unavailable_reason")?;
     let truncated: i64 = row.get("truncated")?;
     let duration_ms: Option<i64> = row.get("duration_ms")?;
     let cockpit_version: Option<String> = row.get("cockpit_version")?;
@@ -290,6 +346,10 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
         recovery_kind,
         recovery_stage,
         hard_fail: hard_fail != 0,
+        exit_code: exit_code.map(|code| code as i32),
+        sandbox_enabled: sandbox_enabled != 0,
+        sandboxed: sandboxed != 0,
+        sandbox_unavailable_reason,
         original_input_json: original_json,
         wire_input_json: wire_json,
         output: row.get("output")?,
@@ -322,6 +382,10 @@ struct ToolCallEventRaw {
     recovery_kind: Option<String>,
     recovery_stage: Option<String>,
     hard_fail: bool,
+    exit_code: Option<i32>,
+    sandbox_enabled: bool,
+    sandboxed: bool,
+    sandbox_unavailable_reason: Option<String>,
     original_input_json: String,
     wire_input_json: String,
     output: String,
@@ -372,6 +436,10 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
             path: r.path,
             recovery,
             hard_fail: r.hard_fail,
+            exit_code: r.exit_code,
+            sandbox_enabled: r.sandbox_enabled,
+            sandboxed: r.sandboxed,
+            sandbox_unavailable_reason: r.sandbox_unavailable_reason,
             original_input_json,
             wire_input_json,
             output: r.output,
@@ -506,6 +574,10 @@ mod tests {
             path: Some("src/main.rs".into()),
             recovery: Recovery::Clean,
             hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             original_input_json: json!({"path": "src/main.rs"}),
             wire_input_json: json!({"path": "src/main.rs"}),
             output: "1: fn main()".into(),
@@ -549,6 +621,10 @@ mod tests {
             path: None,
             recovery,
             hard_fail,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             original_input_json: json!({}),
             wire_input_json: json!({}),
             output: "".into(),
@@ -656,6 +732,10 @@ mod tests {
             path: Some("a.py".into()),
             recovery: Recovery::Clean,
             hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             original_input_json: json!({}),
             wire_input_json: json!({}),
             output: "".into(),
@@ -702,6 +782,10 @@ mod tests {
             path: None,
             recovery: Recovery::Clean,
             hard_fail: true,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             original_input_json: json!({}),
             wire_input_json: json!({}),
             output: "".into(),
@@ -780,6 +864,10 @@ mod tests {
             recovery_kind: Some("unknown_future_kind".into()),
             recovery_stage: Some("stage".into()),
             hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
             original_input_json: "{}".into(),
             wire_input_json: "{}".into(),
             output: String::new(),

@@ -679,6 +679,13 @@ impl ToolBox {
         self
     }
 
+    pub fn without(mut self, name: &str) -> Self {
+        self.tools.remove(name);
+        self.overrides.remove(name);
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
     /// Register a per-agent description override for the tool named `name`.
     /// The override only takes effect once a tool with that name is present
     /// (registering for an absent name is inert — the tools array is what the

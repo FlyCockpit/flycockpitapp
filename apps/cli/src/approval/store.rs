@@ -318,6 +318,11 @@ impl GrantStore {
         None
     }
 
+    #[cfg(test)]
+    fn is_path_granted(&self, path: &Path) -> bool {
+        self.is_path_granted_for(path, SandboxPathAccess::Read)
+    }
+
     pub fn is_path_granted_for(&self, path: &Path, required: SandboxPathAccess) -> bool {
         self.effective_path_grant_access(path)
             .is_some_and(|access| access >= required)

@@ -307,6 +307,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
     &[
         "read",
         "bash",
+        "escalate",
         "context_pack",
         "tree",
         "outline",
@@ -396,6 +397,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::unlock::UnlockTool),
         Arc::new(tools::editunlock::EditunlockTool),
         Arc::new(tools::bash::BashTool::new()),
+        Arc::new(tools::escalate::EscalateTool),
         Arc::new(tools::intel::ContextPackTool),
         Arc::new(tools::intel::TreeTool),
         Arc::new(tools::intel::OutlineTool),
@@ -448,6 +450,7 @@ fn materialize_tool_by_name(
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
+        "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
         "readlock" => tb.with(Arc::new(tools::readlock::ReadlockTool)),
         "writeunlock" => tb.with(Arc::new(tools::writeunlock::WriteunlockTool)),
         "editunlock" => tb.with(Arc::new(tools::editunlock::EditunlockTool)),

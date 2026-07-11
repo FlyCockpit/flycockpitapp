@@ -938,8 +938,6 @@ pub fn render_entry(
             let (body, chip, toggleable): (&str, Option<&str>, bool) = if *preflight_pending {
                 preflight_chip = format!("Preflight{}", thinking_dots(preflight_dots_ms));
                 (text.as_str(), Some(preflight_chip.as_str()), false)
-            } else if *persist_failed {
-                (text.as_str(), Some("send failed"), false)
             } else {
                 match cleaned {
                     Some(c) if !*expanded => (c.as_str(), Some("⚙ preflighted"), true),
@@ -948,7 +946,7 @@ pub fn render_entry(
                 }
             };
             let (lines, pin_region) =
-                render_user(body, *timestamp, width, md.user, chip, emojis, pin);
+                render_user(body, *timestamp, width, md.user, chip, *persist_failed, pin);
             let mut continuations = vec![false; lines.len()];
             if !md.user && lines.len() > 3 {
                 for continuation in continuations.iter_mut().take(lines.len() - 1).skip(2) {
@@ -1448,20 +1446,19 @@ fn render_user(
     width: u16,
     markdown: bool,
     chip: Option<&str>,
-    emojis: bool,
+    failed: bool,
     pin: Option<PinControl>,
 ) -> (Vec<Line<'static>>, Option<PinRegion>) {
     if markdown {
-        return render_user_markdown(text, timestamp, width, chip, pin);
+        return render_user_markdown(text, timestamp, width, chip, failed, pin);
     }
-    let _ = emojis;
     let area = width as usize;
     let bubble_w = area.saturating_sub(USER_GUTTER * 2).max(4);
     let interior_w = bubble_w.saturating_sub(2);
     let text_w = interior_w.saturating_sub(USER_INNER_PAD * 2);
 
     let ts = format_timestamp(timestamp);
-    let border_style = Style::default().fg(USER_BORDER_FG);
+    let border_style = Style::default().fg(if failed { ERROR_TEXT } else { USER_BORDER_FG });
     let gutter = Span::raw(" ".repeat(USER_GUTTER));
     let inner_pad = || Span::raw(" ".repeat(USER_INNER_PAD));
 
@@ -1587,9 +1584,10 @@ fn render_user_markdown(
     timestamp: DateTime<Local>,
     width: u16,
     chip: Option<&str>,
+    failed: bool,
     pin: Option<PinControl>,
 ) -> (Vec<Line<'static>>, Option<PinRegion>) {
-    let bar_style = Style::default().fg(USER_BORDER_FG);
+    let bar_style = Style::default().fg(if failed { ERROR_TEXT } else { USER_BORDER_FG });
     // Content width inside the `│ ` bar (and a matching right margin), so
     // display-math blocks degrade to raw if they'd exceed the viewport.
     let md_width = (width as usize).saturating_sub(2 + 2).max(1);
@@ -3708,6 +3706,91 @@ mod tests {
         // Any concrete instant works — only the formatted "HH:MM"
         // width matters for these tests.
         Local::now()
+    }
+
+    fn assert_user_border_fg(lines: &[Line<'static>], expected: Color) {
+        let border_chars = ['╭', '─', '╮', '│', '╰', '╯'];
+        let mut styled_border_spans = 0;
+        for line in lines {
+            for span in &line.spans {
+                if span.content.chars().any(|ch| border_chars.contains(&ch)) {
+                    assert_eq!(span.style.fg, Some(expected), "border span {span:?}");
+                    styled_border_spans += 1;
+                }
+            }
+        }
+        assert!(styled_border_spans >= 4, "expected styled border spans");
+    }
+
+    #[test]
+    fn failed_user_bubble_recolors_border_without_adding_chip_or_rows() {
+        let ts = fixed_ts();
+        let (normal, _) = render_user("hello", ts, 60, false, None, false, None);
+        let (failed, _) = render_user("hello", ts, 60, false, None, true, None);
+
+        assert_eq!(failed.len(), normal.len());
+        assert_eq!(
+            failed.iter().map(line_text).collect::<Vec<_>>(),
+            normal.iter().map(line_text).collect::<Vec<_>>()
+        );
+        assert!(
+            failed
+                .iter()
+                .all(|line| !line_text(line).contains("send failed")),
+            "failed bubble should not render a failure chip"
+        );
+        assert_user_border_fg(&normal, USER_BORDER_FG);
+        assert_user_border_fg(&failed, ERROR_TEXT);
+    }
+
+    #[test]
+    fn failed_user_markdown_recolors_left_bar_without_adding_chip_or_rows() {
+        let ts = fixed_ts();
+        let (normal, _) = render_user("**hello**", ts, 60, true, None, false, None);
+        let (failed, _) = render_user("**hello**", ts, 60, true, None, true, None);
+
+        assert_eq!(failed.len(), normal.len());
+        assert_eq!(
+            failed.iter().map(line_text).collect::<Vec<_>>(),
+            normal.iter().map(line_text).collect::<Vec<_>>()
+        );
+        assert_eq!(normal[0].spans[0].content.as_ref(), "│ ");
+        assert_eq!(normal[0].spans[0].style.fg, Some(USER_BORDER_FG));
+        assert_eq!(failed[0].spans[0].content.as_ref(), "│ ");
+        assert_eq!(failed[0].spans[0].style.fg, Some(ERROR_TEXT));
+    }
+
+    #[test]
+    fn failed_user_entry_has_no_chip_target() {
+        let entry = HistoryEntry::User {
+            text: "hello".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: fixed_ts(),
+            seq: None,
+            preflight_pending: false,
+            persist_failed: true,
+        };
+        let rendered = render_entry(
+            &entry,
+            60,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            crate::config::extended::DiffStyle::default(),
+            false,
+            &HashSet::new(),
+            0,
+            None,
+        );
+
+        assert_eq!(rendered.chip_row, None);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .all(|line| !line_text(line).contains("send failed"))
+        );
+        assert_user_border_fg(&rendered.lines, ERROR_TEXT);
     }
 
     #[test]

@@ -13189,7 +13189,10 @@ mod preflight_in_progress_tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(top.contains("send failed"), "failed row chip: {top}");
+        assert!(
+            !top.contains("send failed"),
+            "failed row should use border color, not a chip: {top}"
+        );
     }
 
     #[test]

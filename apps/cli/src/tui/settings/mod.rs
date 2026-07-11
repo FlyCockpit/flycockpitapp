@@ -3571,6 +3571,31 @@ mod tests {
     }
 
     #[test]
+    fn behavior_sandbox_escalation_toggles_persists_and_updates_daemon() {
+        use crate::config::extended::ExtendedConfigDoc;
+
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        assert!(d.extended.sandbox_escalation_enabled);
+
+        open_category_on(
+            &mut d,
+            Category::Behavior,
+            SettingId::SandboxEscalationEnabled,
+        );
+        d.handle_key(press(KeyCode::Enter));
+        assert!(!d.extended.sandbox_escalation_enabled);
+
+        match d.pending_daemon_request.take() {
+            Some(Request::SetSandboxEscalation { enabled }) => assert!(!enabled),
+            other => panic!("expected sandbox escalation request, got {other:?}"),
+        }
+
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert!(!reloaded.sandbox_escalation_enabled);
+    }
+
+    #[test]
     fn privacy_redaction_rows_toggle_and_persist() {
         use crate::config::extended::ExtendedConfigDoc;
         let tmp = TempDir::new().unwrap();

@@ -914,6 +914,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Pruned { session_id, .. }
         | CompactReady { session_id, .. }
         | SandboxState { session_id, .. }
+        | SandboxEscalationState { session_id, .. }
         | SandboxUnavailable { session_id, .. }
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
@@ -1298,6 +1299,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             container_network_enabled,
             container_availability,
         },
+        SandboxEscalationState { enabled, .. } => TurnEvent::SandboxEscalationState { enabled },
         SandboxUnavailable { remedy, .. } => TurnEvent::SandboxUnavailable { remedy },
         RedactionState {
             scan_environment,

@@ -485,6 +485,7 @@ impl SessionRegistry {
         let project_root = session.project_root.clone();
 
         session.set_trusted_only(extended_cfg.trusted_only);
+        session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
 
         // Build per-session redaction table from the immutable session env.
         let redact = RedactionTable::build_with_env(

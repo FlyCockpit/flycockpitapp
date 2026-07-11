@@ -510,6 +510,14 @@ pub enum Event {
         container_availability: crate::container::ContainerAvailability,
     },
 
+    /// Sandbox-escalation availability changed for the session. Broadcast to
+    /// every attached client and re-emitted on attach so reconnecting clients
+    /// mirror the daemon-owned flag.
+    SandboxEscalationState {
+        session_id: Uuid,
+        enabled: bool,
+    },
+
     /// The shell sandbox cannot initialize for this session (`bash` hit the
     /// refuse path — Linux userns case; `implementation notes` §6.5). Broadcast
     /// **once per session** (the worker de-dupes) so attached clients raise a
@@ -1090,6 +1098,12 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 enabled: mode.enabled(),
                 container_network_enabled,
                 container_availability,
+            }]
+        }
+        TurnEvent::SandboxEscalationState { enabled } => {
+            vec![Event::SandboxEscalationState {
+                session_id,
+                enabled,
             }]
         }
         // Emitted by `engine::agent::turn` on the sandbox-unavailable refuse

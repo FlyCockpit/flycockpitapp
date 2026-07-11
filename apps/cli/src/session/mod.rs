@@ -111,6 +111,11 @@ pub struct Session {
     /// Per-session container-network toggle. Only honored by container modes;
     /// default off so container sandboxes start with `--network none`.
     container_network_enabled: AtomicBool,
+    /// Whether the session may offer explicit sandbox escalation retries.
+    /// Seeded from config at spawn/resume and flipped live by
+    /// `/sandbox-escalate` or the settings dialog. Approval mode still gates
+    /// any allowed escalation.
+    sandbox_escalation_enabled: AtomicBool,
     /// Command-approval mode for this session right now
     /// (implementation note), encoded by
     /// [`approval_mode_to_u8`] / [`approval_mode_from_u8`]. Resolved at

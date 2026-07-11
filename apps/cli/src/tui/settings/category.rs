@@ -358,6 +358,7 @@ pub(super) enum SettingId {
     DefaultPrimaryAgent,
     LlmMode,
     ApprovalMode,
+    SandboxEscalationEnabled,
     PredictNextMessage,
     ShellCompression,
     CommandProfileRust,
@@ -452,6 +453,7 @@ const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::DefaultPrimaryAgent,
     SettingId::LlmMode,
     SettingId::ApprovalMode,
+    SettingId::SandboxEscalationEnabled,
     SettingId::PredictNextMessage,
     SettingId::ShellCompression,
     SettingId::CommandProfileRust,
@@ -548,6 +550,7 @@ impl SettingId {
             SettingId::DefaultPrimaryAgent => "default agent",
             SettingId::LlmMode => "llm mode",
             SettingId::ApprovalMode => "approval mode",
+            SettingId::SandboxEscalationEnabled => "sandbox escalation",
             SettingId::PredictNextMessage => "predict next message",
             SettingId::ShellCompression => "shell compression",
             SettingId::CommandProfileRust => "Rust resource profile",
@@ -742,6 +745,12 @@ impl SettingId {
                  `auto` routes each call past the utility-model safety gate (safe \
                  runs, unsafe asks) and needs a utility model; `yolo` runs \
                  everything unprompted. Distinct from the `auto` *agent*."
+            }
+            SettingId::SandboxEscalationEnabled => {
+                "Allow the agent to offer an explicit unsandboxed retry after a \
+                 sandboxed command fails. On by default; approval mode still \
+                 decides whether an allowed escalation asks first. This setting \
+                 persists the default and updates the current session."
             }
             SettingId::PredictNextMessage => {
                 "After each agent turn, have the utility model predict your likely \
@@ -1532,6 +1541,7 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::DefaultPrimaryAgent),
             Setting(S::LlmMode),
             Setting(S::ApprovalMode),
+            Setting(S::SandboxEscalationEnabled),
             Setting(S::PredictNextMessage),
             Setting(S::ShellCompression),
             Heading(SettingHeading {
@@ -1712,6 +1722,11 @@ impl SettingsCx {
             }
             S::LlmMode => llm_mode_label(e.llm_mode).to_string(),
             S::ApprovalMode => approval_mode_label(e.default_approval_mode).to_string(),
+            S::SandboxEscalationEnabled => on_off(
+                e.sandbox_escalation_enabled,
+                "on (default — escalation can be offered)",
+                "off (no escalation offers)",
+            ),
             S::PredictNextMessage => predict_next_message_label(e.predict_next_message).to_string(),
             S::ShellCompression => shell_compression_label(e.shell_compression).to_string(),
             S::CommandProfileRust => command_profile_enabled_value(
@@ -2428,6 +2443,9 @@ impl SettingsCx {
             }
             S::LlmMode => e.llm_mode = e.llm_mode.cycled(),
             S::ApprovalMode => e.default_approval_mode = e.default_approval_mode.cycled(),
+            S::SandboxEscalationEnabled => {
+                e.sandbox_escalation_enabled = !e.sandbox_escalation_enabled
+            }
             S::PredictNextMessage => e.predict_next_message = e.predict_next_message.cycled(),
             S::ShellCompression => e.shell_compression = e.shell_compression.toggled(),
             S::CommandProfileRust => toggle_command_profile(e, RUST_TOOLCHAIN),
@@ -2673,6 +2691,12 @@ impl SettingsCx {
     fn finish_category_save(&mut self, id: SettingId, p: &mut CategoryPage) {
         match self.save_extended() {
             Ok(()) => {
+                if id == SettingId::SandboxEscalationEnabled {
+                    self.pending_daemon_request =
+                        Some(crate::daemon::proto::Request::SetSandboxEscalation {
+                            enabled: self.extended.sandbox_escalation_enabled,
+                        });
+                }
                 if let Some(prompt) = self.shadowed_global_prompt(id) {
                     p.status = Some(format!(
                         "saved; project config overrides {} here. Remove that project value? y/n",
@@ -2802,6 +2826,7 @@ impl SettingsCx {
                 e.default_primary_agent = d.default_primary_agent;
                 e.llm_mode = d.llm_mode;
                 e.default_approval_mode = d.default_approval_mode;
+                e.sandbox_escalation_enabled = d.sandbox_escalation_enabled;
                 e.predict_next_message = d.predict_next_message;
                 e.shell_compression = d.shell_compression;
                 e.inline_think = d.inline_think;
@@ -2989,6 +3014,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::AttentionDesktop => &["tui", "attention", "desktop"],
         S::LlmMode => &["llm_mode"],
         S::ApprovalMode => &["defaultApprovalMode"],
+        S::SandboxEscalationEnabled => &["sandbox_escalation_enabled"],
         S::SandboxDefaultMode => &["sandbox", "defaultMode"],
         S::SandboxDockerfile => &["sandbox", "dockerfile"],
         S::ExperimentalMode => &["experimentalMode"],

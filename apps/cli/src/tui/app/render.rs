@@ -2756,6 +2756,7 @@ impl App {
             self.llm_mode,
             &self.agent_path,
             self.footer_selection,
+            self.sandbox_escalation_enabled,
         );
         let mut left = status.spans;
         // Transient async-schedule strip (GOALS §22): only when ≥1 scheduled

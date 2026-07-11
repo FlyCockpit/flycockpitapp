@@ -740,6 +740,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Pruned { session_id, .. }
         | CompactReady { session_id, .. }
         | SandboxState { session_id, .. }
+        | SandboxEscalationState { session_id, .. }
         | SandboxUnavailable { session_id, .. }
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }

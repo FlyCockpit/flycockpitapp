@@ -136,6 +136,13 @@ fn describe_trusted_only(app: &App, _: &SlashCommand) -> String {
     )
 }
 
+fn describe_sandbox_escalate(app: &App, _: &SlashCommand) -> String {
+    format!(
+        "{} Allow explicit sandbox-escalation retries for this session (arg: allow/disallow; bare = status)",
+        on_off(app.sandbox_escalation_enabled)
+    )
+}
+
 fn describe_toggle_redaction(app: &App, _: &SlashCommand) -> String {
     format!(
         "Toggle secret redaction sources for this session (env {}, file {}, ssh {}) (arg: env/file/ssh; bare opens a picker)",
@@ -588,6 +595,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_sandbox,
     },
     SlashCommand {
+        name: "sandbox-escalate",
+        description: "Allow explicit sandbox escalation (arg: allow/disallow; bare = status)",
+        takes_args: true,
+        run: run_sandbox_escalate,
+        available: available_always,
+        describe: describe_sandbox_escalate,
+    },
+    SlashCommand {
         name: "sessions",
         description: "Browse and resume previous sessions",
         takes_args: false,
@@ -882,6 +897,11 @@ fn run_keys(app: &mut App, _: &str) -> bool {
 
 fn run_sandbox(app: &mut App, args: &str) -> bool {
     app.handle_sandbox_command(args);
+    false
+}
+
+fn run_sandbox_escalate(app: &mut App, args: &str) -> bool {
+    app.handle_sandbox_escalate_command(args);
     false
 }
 
@@ -1516,6 +1536,36 @@ impl App {
         }
     }
 
+    /// `/sandbox-escalate [allow|disallow]`: session-only switch for whether
+    /// an explicit unsandboxed retry path may be offered after sandboxed
+    /// command failures. Approval mode still gates any allowed escalation.
+    pub(super) fn handle_sandbox_escalate_command(&mut self, args: &str) {
+        match parse_sandbox_escalation_arg(args) {
+            Ok(SandboxEscalationCommand::Status) => {
+                self.push_plain(format!(
+                    "/sandbox-escalate: {}",
+                    if self.sandbox_escalation_enabled {
+                        "allowed"
+                    } else {
+                        "disallowed"
+                    }
+                ));
+            }
+            Ok(SandboxEscalationCommand::Set(enabled)) => {
+                if !self.send_daemon_request(crate::daemon::proto::Request::SetSandboxEscalation {
+                    enabled,
+                }) {
+                    self.push_plain("/sandbox-escalate: no daemon connection".to_string());
+                }
+            }
+            Err(other) => {
+                self.push_plain(format!(
+                    "/sandbox-escalate: unknown arg `{other}` - use allow, disallow, or no arg for status"
+                ));
+            }
+        }
+    }
+
     pub(super) fn handle_doctor_command(&mut self) {
         let input = crate::diagnostics::DiagnosticsInput {
             cwd: self.launch.cwd.clone(),
@@ -1917,6 +1967,23 @@ pub(super) fn parse_sandbox_arg(args: &str) -> Result<SandboxCommand, String> {
         )),
         "network on" => Ok(SandboxCommand::Network(true)),
         "network off" => Ok(SandboxCommand::Network(false)),
+        other => Err(other.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SandboxEscalationCommand {
+    Status,
+    Set(bool),
+}
+
+pub(super) fn parse_sandbox_escalation_arg(args: &str) -> Result<SandboxEscalationCommand, String> {
+    let normalized = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized.to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => Ok(SandboxEscalationCommand::Status),
+        "allow" | "allowed" => Ok(SandboxEscalationCommand::Set(true)),
+        "disallow" | "disallowed" => Ok(SandboxEscalationCommand::Set(false)),
         other => Err(other.to_string()),
     }
 }

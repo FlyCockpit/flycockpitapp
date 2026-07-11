@@ -307,6 +307,16 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub translation: TranslationConfig,
 
+    /// Whether sandbox escalation is enabled for new sessions. When true, a
+    /// sandboxed command may offer an explicit unsandboxed retry path; the
+    /// approval mode still controls whether that retry requires confirmation.
+    #[serde(
+        default = "default_true",
+        rename = "sandbox_escalation_enabled",
+        alias = "sandboxEscalationEnabled"
+    )]
+    pub sandbox_escalation_enabled: bool,
+
     /// Which command-approval mode new sessions start in
     /// (implementation note). `manual` (the default)
     /// asks the user for every gated call; `auto` runs each gated call past
@@ -1306,6 +1316,7 @@ impl Default for ExtendedConfig {
             llm_mode: LlmMode::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
             translation: TranslationConfig::default(),
+            sandbox_escalation_enabled: true,
             default_approval_mode: ApprovalMode::default(),
             approval_policy: ApprovalPolicyConfig::default(),
             predict_next_message: PredictNextMessage::default(),
@@ -1520,6 +1531,8 @@ impl ExtendedConfigDoc {
         parse_field!("llm_mode", llm_mode);
         parse_field!("defaultPrimaryAgent", default_primary_agent);
         parse_field!("translation", translation);
+        parse_field!("sandboxEscalationEnabled", sandbox_escalation_enabled);
+        parse_field!("sandbox_escalation_enabled", sandbox_escalation_enabled);
         parse_field!("defaultApprovalMode", default_approval_mode);
         parse_field!("approvalPolicy", approval_policy);
         parse_field!("predictNextMessage", predict_next_message);
@@ -1560,6 +1573,8 @@ impl ExtendedConfigDoc {
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("trustedOnly", bool);
         remove_malformed!("trusted_only", bool);
+        remove_malformed!("sandboxEscalationEnabled", bool);
+        remove_malformed!("sandbox_escalation_enabled", bool);
         remove_malformed!("prompt_injection_guard", PromptInjectionGuardConfig);
         remove_malformed!("llm_mode", LlmMode);
         remove_malformed!("approvalPolicy", ApprovalPolicyConfig);
@@ -1630,6 +1645,7 @@ impl ExtendedConfigDoc {
             }
         }
         obj.remove("trusted_only");
+        obj.remove("sandboxEscalationEnabled");
         // Optional fields are skipped on serialize, so clearing them must
         // explicitly remove stale raw keys from the target layer.
         for key in [

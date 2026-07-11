@@ -442,6 +442,13 @@ pub enum Request {
         container_network_enabled: Option<bool>,
     },
 
+    /// Enable or disable explicit sandbox-escalation retries for the attached
+    /// session. Session-only; the settings dialog persists the default
+    /// separately before sending this live update.
+    SetSandboxEscalation {
+        enabled: bool,
+    },
+
     /// Set (or toggle) request preflight for the attached session at runtime
     /// (`/preflight`, implementation note). `enabled = None`
     /// toggles the current effective state; `Some(true)`/`Some(false)` set it
@@ -650,6 +657,7 @@ macro_rules! command {
             (Request::SetApprovalMode { .. }, "set_approval_mode", session_writer, attached, true, none);
             (Request::SetDelegationRecursion { .. }, "set_delegation_recursion", session_writer, attached, true, none);
             (Request::SetSandbox { .. }, "set_sandbox", session_writer, attached, true, none);
+            (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation", session_writer, attached, true, none);
             (Request::SetPreflight { .. }, "set_preflight", session_writer, attached, true, none);
             (Request::SetTrustedOnly { .. }, "set_trusted_only", session_writer, attached, true, none);
             (Request::SetRedaction { .. }, "set_redaction", session_writer, attached, true, none);

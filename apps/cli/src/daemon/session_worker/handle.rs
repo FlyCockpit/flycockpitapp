@@ -299,6 +299,29 @@ impl SessionWorkerHandle {
         self.session.container_network_enabled()
     }
 
+    #[cfg(test)]
+    pub fn sandbox_escalation_enabled(&self) -> bool {
+        self.session.sandbox_escalation_enabled()
+    }
+
+    /// Set the session's sandbox-escalation availability and broadcast when
+    /// the value changes. Idempotent writes are intentionally silent.
+    pub fn set_sandbox_escalation(&self, enabled: bool) -> bool {
+        let previous = self.session.sandbox_escalation_enabled();
+        let enabled = self.session.set_sandbox_escalation_enabled(enabled);
+        if previous != enabled {
+            send_current_event(
+                &self.event_tx,
+                &self.redaction,
+                proto::Event::SandboxEscalationState {
+                    session_id: self.session_id,
+                    enabled,
+                },
+            );
+        }
+        enabled
+    }
+
     /// Set the session's command-approval mode and broadcast the resulting
     /// state to every attached client. Effective immediately for subsequent
     /// gated tool calls because tools read the same session atomic.
@@ -474,6 +497,19 @@ impl SessionWorkerHandle {
             },
         );
     }
+
+    /// Broadcast the current sandbox-escalation availability so late or
+    /// reconnecting clients hydrate the daemon-owned session flag.
+    pub fn broadcast_sandbox_escalation(&self) {
+        send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::SandboxEscalationState {
+                session_id: self.session_id,
+                enabled: self.session.sandbox_escalation_enabled(),
+            },
+        );
+    }
 }
 
 /// Work items a client can ask the worker to perform.
@@ -623,6 +659,7 @@ pub fn spawn(
         client_no_sandbox,
         extended_cfg.sandbox.default_mode,
     ));
+    session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
     // Command-approval mode (implementation note): new
     // sessions start in the configured default (`manual` unless overridden).
     // A later `/settings` change re-resolves on the next session.

@@ -241,6 +241,12 @@ pub enum Response {
         container_availability: crate::container::ContainerAvailability,
     },
 
+    /// The resulting sandbox-escalation availability after
+    /// [`Request::SetSandboxEscalation`]. Session-only — not persisted.
+    SandboxEscalationState {
+        enabled: bool,
+    },
+
     /// The resulting redaction-source state after a
     /// [`Request::SetRedaction`] (`/toggle-redaction`). The TUI surfaces it
     /// via a toast. Session-only — not persisted.

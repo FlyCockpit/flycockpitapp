@@ -622,6 +622,12 @@ async fn handle_request(
             })
         }
 
+        Request::SetSandboxEscalation { enabled } => {
+            let att = require_attached(state)?;
+            let enabled = att.handle.set_sandbox_escalation(enabled);
+            Ok(Response::SandboxEscalationState { enabled })
+        }
+
         Request::SetPreflight { enabled } => {
             // `/preflight`: route to the worker, which sets the session-only
             // override on the driver (precedence over config), and broadcasts
@@ -1150,6 +1156,7 @@ async fn attach(
     // idempotent for already-attached clients. Only the allow-set is sent.
     if let Some(att) = state.attached.as_ref() {
         att.handle.broadcast_gitignore_allow();
+        att.handle.broadcast_sandbox_escalation();
     }
 
     // Full chronological history snapshot (user messages + assistant turns +

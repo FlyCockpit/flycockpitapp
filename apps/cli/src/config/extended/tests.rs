@@ -1142,6 +1142,41 @@ fn llm_mode_round_trips_through_extended_doc() {
 }
 
 #[test]
+fn sandbox_escalation_defaults_enabled_and_round_trips() {
+    assert!(ExtendedConfig::default().sandbox_escalation_enabled);
+    let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert!(parsed.sandbox_escalation_enabled);
+
+    let parsed: ExtendedConfig =
+        serde_json::from_str(r#"{"sandboxEscalationEnabled":false}"#).unwrap();
+    assert!(!parsed.sandbox_escalation_enabled);
+    let parsed: ExtendedConfig =
+        serde_json::from_str(r#"{"sandbox_escalation_enabled":false}"#).unwrap();
+    assert!(!parsed.sandbox_escalation_enabled);
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"sandboxEscalationEnabled":true,"sandbox_escalation_enabled":false}"#,
+    )
+    .unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let cfg = doc.config();
+    assert!(
+        !cfg.sandbox_escalation_enabled,
+        "legacy alias is still accepted on read"
+    );
+    doc.write(&cfg).unwrap();
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false))
+    );
+    assert!(raw.get("sandboxEscalationEnabled").is_none());
+}
+
+#[test]
 fn approval_mode_defaults_to_manual_and_parses_all_values() {
     // Default + an omitted field both read `manual` (fail-safe default).
     assert_eq!(

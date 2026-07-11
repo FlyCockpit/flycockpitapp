@@ -32,9 +32,10 @@ use input::accepts_key;
 use render::{extract_selection_markdown_source, extract_selection_plaintext, is_edit_tool};
 #[cfg(test)]
 use slash::{
-    AgentCommandOutcome, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand, SkillDispatch,
-    agent_command_outcome, bare_skill_commands_from, builtin_slash_name_taken, last_agent_text,
-    next_sandbox_mode, parse_copy_format, parse_mcp_action, parse_pane_side, parse_sandbox_arg,
+    AgentCommandOutcome, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,
+    SandboxEscalationCommand, SkillDispatch, agent_command_outcome, bare_skill_commands_from,
+    builtin_slash_name_taken, last_agent_text, next_sandbox_mode, parse_copy_format,
+    parse_mcp_action, parse_pane_side, parse_sandbox_arg, parse_sandbox_escalation_arg,
     resolve_skill_dispatch, slash_matches,
 };
 use slash::{
@@ -1845,6 +1846,9 @@ pub struct App {
     /// Live trusted-only inference state (`/trusted-only`). Seeded from
     /// `trustedOnly` config at launch and kept in sync by daemon broadcasts.
     pub(super) trusted_only_enabled: bool,
+    /// Live sandbox-escalation availability for this session. Seeded from
+    /// config and kept in sync by daemon broadcasts.
+    pub(super) sandbox_escalation_enabled: bool,
     /// Live command-approval mode for this session (`/quick`). Seeded from the
     /// config default and kept in sync by daemon broadcasts.
     pub(super) approval_mode: crate::config::extended::ApprovalMode,
@@ -2634,6 +2638,7 @@ impl App {
         // `PreflightState` broadcasts (`/preflight`).
         let preflight_enabled = extended.preflight.enabled;
         let trusted_only_enabled = extended.trusted_only;
+        let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
@@ -2842,6 +2847,7 @@ impl App {
             redact_scan_ssh_keys,
             preflight_enabled,
             trusted_only_enabled,
+            sandbox_escalation_enabled,
             approval_mode,
             delegation_recursion_enabled,
             delegation_recursion_depth,
@@ -8708,10 +8714,11 @@ mod working_msg_tests {
 #[cfg(test)]
 mod local_cmd_tests {
     use super::{
-        App, GIT_AGENT_TOKEN_CAP, McpAction, PaneSide, SandboxCommand, cache_config_caches,
-        cap_tokens, editor_argv_for_cwd, new_external_editor_tempfile, parse_llm_mode_arg,
-        parse_mcp_action, parse_pane_side, parse_sandbox_arg, sanitize_for_raw_stdout, slash_args,
-        strip_ansi, tool_invocation, xml_escape,
+        App, GIT_AGENT_TOKEN_CAP, McpAction, PaneSide, SandboxCommand, SandboxEscalationCommand,
+        cache_config_caches, cap_tokens, editor_argv_for_cwd, new_external_editor_tempfile,
+        parse_llm_mode_arg, parse_mcp_action, parse_pane_side, parse_sandbox_arg,
+        parse_sandbox_escalation_arg, sanitize_for_raw_stdout, slash_args, strip_ansi,
+        tool_invocation, xml_escape,
     };
     use crate::tui::history::HistoryEntry;
     use serde_json::json;
@@ -8933,6 +8940,26 @@ mod local_cmd_tests {
             Ok(SandboxCommand::Network(false))
         );
         assert_eq!(parse_sandbox_arg("maybe"), Err("maybe".to_string()));
+    }
+
+    #[test]
+    fn parse_sandbox_escalation_arg_maps_to_actions() {
+        assert_eq!(
+            parse_sandbox_escalation_arg(""),
+            Ok(SandboxEscalationCommand::Status)
+        );
+        assert_eq!(
+            parse_sandbox_escalation_arg(" allow "),
+            Ok(SandboxEscalationCommand::Set(true))
+        );
+        assert_eq!(
+            parse_sandbox_escalation_arg("DISALLOW"),
+            Ok(SandboxEscalationCommand::Set(false))
+        );
+        assert_eq!(
+            parse_sandbox_escalation_arg("maybe"),
+            Err("maybe".to_string())
+        );
     }
 
     #[test]

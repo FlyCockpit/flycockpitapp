@@ -396,6 +396,12 @@ pub enum TurnEvent {
         container_availability: crate::container::ContainerAvailability,
     },
 
+    /// Sandbox-escalation availability changed for the live session. UI-only:
+    /// the TUI mirrors the daemon-owned flag and surfaces the result as a
+    /// toast/chrome state. Emitted by the daemon's `SetSandboxEscalation`
+    /// handler and on attach.
+    SandboxEscalationState { enabled: bool },
+
     /// The shell sandbox cannot initialize (a confined `bash` hit the
     /// `SandboxGate::Refuse` path — Linux userns case; `implementation notes`
     /// §6.5). Emitted by [`turn`] on detection, carrying the diagnosed

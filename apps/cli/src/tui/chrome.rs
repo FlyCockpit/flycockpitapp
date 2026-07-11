@@ -76,6 +76,7 @@ pub fn left_status(
     llm_mode: LlmMode,
     agent_path: &[String],
     selected: Option<FooterControl>,
+    sandbox_escalation_enabled: bool,
 ) -> LeftStatus {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -153,6 +154,28 @@ pub fn left_status(
         start,
         end: col,
     });
+
+    push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
+    let escalation_style = if sandbox_escalation_enabled {
+        muted
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    push_span(
+        &mut spans,
+        &mut col,
+        Span::styled(
+            format!(
+                "esc {}",
+                if sandbox_escalation_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            escalation_style,
+        ),
+    );
 
     LeftStatus { spans, hits }
 }
@@ -399,6 +422,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            true,
         )
         .spans;
         let agent = spans
@@ -421,6 +445,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            true,
         )
         .spans;
         let model = spans
@@ -434,14 +459,23 @@ mod tests {
     fn left_status_renders_agent_path_model_and_mode_with_hits() {
         let info = launch_info("Build");
         let path = vec!["Build".to_string(), "explore".to_string()];
-        let status = left_status(&info, LlmMode::Frontier, &path, Some(FooterControl::Mode));
+        let status = left_status(
+            &info,
+            LlmMode::Frontier,
+            &path,
+            Some(FooterControl::Mode),
+            true,
+        );
         let text = status
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(text, "Build › explore · openai/gpt-test · frontier");
+        assert_eq!(
+            text,
+            "Build › explore · openai/gpt-test · frontier · esc on"
+        );
         assert_eq!(
             status
                 .hits

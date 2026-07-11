@@ -2311,6 +2311,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_sandbox_escalation_updates_session_and_broadcasts() {
+        let ctx = test_ctx();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut state, _session_id) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::SetSandboxEscalation { enabled: false },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("sandbox escalation request succeeds");
+        match response {
+            Response::SandboxEscalationState { enabled } => assert!(!enabled),
+            other => panic!("expected SandboxEscalationState response, got {other:?}"),
+        }
+
+        let attached = state.attached.as_mut().expect("attached session");
+        assert!(!attached.handle.sandbox_escalation_enabled());
+        match attached
+            .event_rx
+            .try_recv()
+            .expect("sandbox escalation broadcast")
+            .event
+        {
+            proto::Event::SandboxEscalationState { enabled, .. } => assert!(!enabled),
+            other => panic!("expected SandboxEscalationState, got {other:?}"),
+        }
+
+        handle_request(
+            Request::SetSandboxEscalation { enabled: false },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("idempotent sandbox escalation request succeeds");
+        let attached = state.attached.as_mut().expect("attached session");
+        assert!(
+            attached.event_rx.try_recv().is_err(),
+            "idempotent set should not broadcast"
+        );
+    }
+
+    #[tokio::test]
     async fn set_agent_rejects_non_ownable_subagent_name() {
         let ctx = test_ctx();
         let tmp = tempfile::TempDir::new().unwrap();

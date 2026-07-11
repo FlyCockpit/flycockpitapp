@@ -1085,6 +1085,16 @@ impl App {
                     ToastKind::Info,
                 );
             }
+            TurnEvent::SandboxEscalationState { enabled } => {
+                self.sandbox_escalation_enabled = enabled;
+                self.show_toast(
+                    format!(
+                        "sandbox escalation {}",
+                        if enabled { "allowed" } else { "disallowed" }
+                    ),
+                    ToastKind::Info,
+                );
+            }
             TurnEvent::ApprovalModeState { mode } => {
                 self.approval_mode = mode;
                 self.show_toast(format!("permissions {}", mode.as_str()), ToastKind::Info);

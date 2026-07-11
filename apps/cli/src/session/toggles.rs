@@ -50,6 +50,20 @@ impl Session {
         enabled
     }
 
+    /// Whether explicit sandbox escalation retries are available in this
+    /// session. Approval mode still decides how an allowed escalation is gated.
+    pub fn sandbox_escalation_enabled(&self) -> bool {
+        self.sandbox_escalation_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Set the session's sandbox-escalation availability and return the new
+    /// state. Used by the spawn path, `/settings`, and `/sandbox-escalate`.
+    pub fn set_sandbox_escalation_enabled(&self, enabled: bool) -> bool {
+        self.sandbox_escalation_enabled
+            .store(enabled, Ordering::Relaxed);
+        enabled
+    }
+
     /// The session's current command-approval mode
     /// (implementation note). Read per gated tool call.
     pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {

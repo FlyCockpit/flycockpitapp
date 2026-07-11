@@ -9,15 +9,19 @@ import {
 import { Input } from "@flycockpit/ui/components/input";
 import { Label } from "@flycockpit/ui/components/label";
 import { toast } from "@flycockpit/ui/components/sileo";
+import { Skeleton } from "@flycockpit/ui/components/skeleton";
 import { Switch } from "@flycockpit/ui/components/switch";
+import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { ShieldCheck, ShieldOff, TerminalSquare } from "lucide-react";
-import { useState } from "react";
+import { KeyRound, ShieldCheck, ShieldOff, TerminalSquare } from "lucide-react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import z from "zod";
 
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { authClient } from "@/lib/auth-client";
+import { friendly, isRateLimit } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/settings/security")({
@@ -31,6 +35,7 @@ function SecuritySettings() {
 
   return (
     <div className="space-y-6">
+      <PasswordSection />
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -49,6 +54,198 @@ function SecuritySettings() {
       </Card>
       <TerminalSecuritySection has2FA={has2FA} />
     </div>
+  );
+}
+
+function PasswordSection() {
+  const capabilities = useQuery(orpc.auth.passwordCapabilities.queryOptions());
+  const { t } = useTranslation(["settings", "common"]);
+
+  if (capabilities.isPending) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <KeyRound className="size-5 text-muted-foreground" />
+            {t("settings:security.passwordTitle")}
+          </CardTitle>
+          <CardDescription>{t("settings:security.passwordDescription")}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Skeleton className="h-10 w-full max-w-sm" />
+          <Skeleton className="h-10 w-full max-w-sm" />
+          <Skeleton className="h-10 w-full max-w-sm" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (capabilities.isError) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <KeyRound className="size-5 text-muted-foreground" />
+            {t("settings:security.passwordTitle")}
+          </CardTitle>
+          <CardDescription>{t("settings:security.passwordDescription")}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-sm text-destructive">{t("settings:security.passwordLoadError")}</p>
+          <Button className="min-h-[44px]" variant="outline" onClick={() => capabilities.refetch()}>
+            {t("common:actions.retry")}
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!capabilities.data.canChangePassword) return null;
+
+  return <ChangePasswordCard />;
+}
+
+function ChangePasswordCard() {
+  const { t } = useTranslation(["settings", "common"]);
+  const [formError, setFormError] = useState<string | null>(null);
+  const passwordSchema = useMemo(
+    () =>
+      z
+        .object({
+          currentPassword: z.string().min(1),
+          newPassword: z.string().min(12).max(128),
+          confirmPassword: z.string().min(1),
+        })
+        .refine((value) => value.newPassword === value.confirmPassword, {
+          message: t("settings:security.passwordsMustMatch"),
+          path: ["confirmPassword"],
+        }),
+    [t],
+  );
+
+  const form = useForm({
+    defaultValues: { currentPassword: "", newPassword: "", confirmPassword: "" },
+    validators: { onSubmit: passwordSchema },
+    onSubmit: async ({ value, formApi }) => {
+      setFormError(null);
+      const result = await authClient.changePassword({
+        currentPassword: value.currentPassword,
+        newPassword: value.newPassword,
+        revokeOtherSessions: true,
+      });
+
+      if (result.error) {
+        const message = isRateLimit(result.error)
+          ? friendly(result.error)
+          : result.error.status === 400
+            ? t("settings:security.currentPasswordMismatch")
+            : t("settings:security.passwordChangeError");
+        setFormError(message);
+        return;
+      }
+
+      formApi.reset();
+      toast.success(t("settings:security.passwordChangedSuccess"));
+    },
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <KeyRound className="size-5 text-muted-foreground" />
+          {t("settings:security.passwordTitle")}
+        </CardTitle>
+        <CardDescription>{t("settings:security.passwordDescription")}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form
+          className="max-w-sm space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            form.handleSubmit();
+          }}
+        >
+          {formError ? <p className="text-sm text-destructive">{formError}</p> : null}
+          <form.Field name="currentPassword">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("settings:security.currentPasswordLabel")}</Label>
+                <Input
+                  id={field.name}
+                  name={field.name}
+                  type="password"
+                  autoComplete="current-password"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(e) => field.handleChange(e.target.value)}
+                />
+                {field.state.meta.errors.map((error) => (
+                  <p key={error?.message} className="text-sm text-destructive">
+                    {error?.message}
+                  </p>
+                ))}
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="newPassword">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("settings:security.newPasswordLabel")}</Label>
+                <Input
+                  id={field.name}
+                  name={field.name}
+                  type="password"
+                  autoComplete="new-password"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(e) => field.handleChange(e.target.value)}
+                />
+                {field.state.meta.errors.map((error) => (
+                  <p key={error?.message} className="text-sm text-destructive">
+                    {error?.message}
+                  </p>
+                ))}
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="confirmPassword">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("settings:security.confirmPasswordLabel")}</Label>
+                <Input
+                  id={field.name}
+                  name={field.name}
+                  type="password"
+                  autoComplete="new-password"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(e) => field.handleChange(e.target.value)}
+                />
+                {field.state.meta.errors.map((error) => (
+                  <p key={error?.message} className="text-sm text-destructive">
+                    {error?.message}
+                  </p>
+                ))}
+              </div>
+            )}
+          </form.Field>
+          <p className="text-sm text-muted-foreground">
+            {t("settings:security.passwordSessionRevocation")}
+          </p>
+          <form.Subscribe selector={(state) => state.isSubmitting}>
+            {(isSubmitting) => (
+              <Button className="min-h-[44px]" type="submit" disabled={isSubmitting}>
+                {isSubmitting
+                  ? t("settings:security.changingPassword")
+                  : t("settings:security.changePassword")}
+              </Button>
+            )}
+          </form.Subscribe>
+        </form>
+      </CardContent>
+    </Card>
   );
 }
 

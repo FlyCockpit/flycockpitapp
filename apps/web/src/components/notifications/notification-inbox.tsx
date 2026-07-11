@@ -9,12 +9,12 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bell } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useDeferredSession } from "@/stores/session";
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { orpc } from "@/utils/orpc";
 
 export function NotificationInbox() {
   const { t } = useTranslation("common");
-  const session = useDeferredSession();
+  const session = useAuthSessionSnapshot();
   const signedIn = Boolean(session.data?.user);
   const queryClient = useQueryClient();
   const list = useQuery({

@@ -1,6 +1,15 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -9,6 +18,7 @@ import prisma from "@flycockpit/db";
 import { env, VIDEO_ENABLE_4K } from "@flycockpit/env/shared";
 import type { TranscodeVideoJobData } from "@flycockpit/queue";
 import type { Job } from "bullmq";
+import { mapWithConcurrency } from "../lib/concurrency.js";
 
 /**
  * Transcode a raw uploaded video into an HLS adaptive ladder + sprite-sheet
@@ -299,24 +309,45 @@ type Probe = {
   hasAudio: boolean;
 };
 
+async function runFfprobe(args: string[]): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(env.VIDEO_FFPROBE_PATH, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const timeoutMs = 30_000;
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`ffprobe timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`ffprobe failed: ${stderr.slice(-2048)}`));
+    });
+  });
+}
+
 async function ffprobe(inputPath: string): Promise<Probe> {
-  const result = spawnSync(
-    env.VIDEO_FFPROBE_PATH,
-    [
-      "-v",
-      "error",
-      "-show_entries",
-      "stream=codec_type,width,height:format=duration",
-      "-of",
-      "json",
-      inputPath,
-    ],
-    { encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL" },
-  );
-  if (result.status !== 0) {
-    throw new Error(`ffprobe failed: ${result.stderr}`);
-  }
-  const parsed = JSON.parse(result.stdout) as {
+  const stdout = await runFfprobe([
+    "-v",
+    "error",
+    "-show_entries",
+    "stream=codec_type,width,height:format=duration",
+    "-of",
+    "json",
+    inputPath,
+  ]);
+  const parsed = JSON.parse(stdout) as {
     streams?: Array<{ codec_type?: string; width?: number; height?: number }>;
     format?: { duration?: string };
   };
@@ -340,20 +371,16 @@ async function ffprobeRendition(renditionDir: string): Promise<{ codecs: string 
     // negotiate when CODECS= is approximate.
     return { codecs: "avc1.640028,mp4a.40.2" };
   }
-  const probe = spawnSync(
-    env.VIDEO_FFPROBE_PATH,
-    [
-      "-v",
-      "error",
-      "-show_entries",
-      "stream=codec_name,profile,level",
-      "-of",
-      "json",
-      join(renditionDir, segment),
-    ],
-    { encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL" },
-  );
-  if (probe.status !== 0) return { codecs: "avc1.640028,mp4a.40.2" };
+  const probed = await runFfprobe([
+    "-v",
+    "error",
+    "-show_entries",
+    "stream=codec_name,profile,level",
+    "-of",
+    "json",
+    join(renditionDir, segment),
+  ]).catch(() => null);
+  if (probed === null) return { codecs: "avc1.640028,mp4a.40.2" };
   // We don't bother parsing the profile/level into the avc1.XXXXXX hex —
   // emitting a safe baseline ("avc1.640028" = High@4.1 + AAC LC) covers the
   // typical encode and Safari is happy with it. Tighten this if you need
@@ -457,7 +484,7 @@ async function encodeLadder(args: {
     if (numericDir === targetDir) continue;
     const files = await readdir(numericDir).catch(() => [] as string[]);
     for (const f of files) {
-      await writeFile(join(targetDir, f), await readFile(join(numericDir, f)));
+      await moveFile(join(numericDir, f), join(targetDir, f));
     }
     await rm(numericDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -598,17 +625,33 @@ async function downloadToFile(key: string, dest: string): Promise<void> {
   await pipeline(obj.body, createWriteStream(dest));
 }
 
+async function moveFile(source: string, target: string): Promise<void> {
+  try {
+    await rename(source, target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+    await copyFile(source, target);
+    await unlink(source);
+  }
+}
+
+const UPLOAD_CONCURRENCY = 8;
+
 async function uploadOutputs(videoId: string, outDir: string, sourceLocale: string): Promise<void> {
   // Walk every file under outDir and PUT it to the matching videos/<id>/...
   // path. Skip the master playlist — we render that at request time.
+  const filePaths: string[] = [];
   for await (const filePath of walk(outDir)) {
     const rel = filePath.slice(outDir.length + 1).replace(/\\/g, "/");
-    if (rel === "__ignored.m3u8") continue;
+    if (rel !== "__ignored.m3u8") filePaths.push(filePath);
+  }
+  await mapWithConcurrency(filePaths, UPLOAD_CONCURRENCY, async (filePath) => {
+    const rel = filePath.slice(outDir.length + 1).replace(/\\/g, "/");
     const key = `videos/${videoId}/${rel}`;
     const body = await readFile(filePath);
     const contentType = contentTypeFor(rel);
     await putStorageObject(key, body, contentType);
-  }
+  });
   void sourceLocale;
 }
 

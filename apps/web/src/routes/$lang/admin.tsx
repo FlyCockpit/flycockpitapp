@@ -1,4 +1,3 @@
-import { hasRole } from "@flycockpit/auth/roles";
 import { cn } from "@flycockpit/ui/lib/utils";
 import { createFileRoute, Link, notFound, Outlet } from "@tanstack/react-router";
 import {
@@ -15,22 +14,18 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { authClient } from "@/lib/auth-client";
+import { decideAdminRouteAccess } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 
 export const Route = createFileRoute("/$lang/admin")({
   beforeLoad: async () => {
-    const session = await authClient.getSession();
+    const decision = decideAdminRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Could not verify session");
     // 404-hide the entire admin tree from non-admins. Throwing notFound()
     // (instead of redirect) means an unauthorized visitor can't tell whether
     // /admin exists at all — same response as a route that doesn't exist.
-    // Narrow session.data here so children inherit a non-null `session`
-    // and can call hooks without an early-return guard.
-    const sessionData = session.data;
-    const user = sessionData?.user;
-    if (!sessionData || !user?.emailVerified || !hasRole(user.role, "admin")) {
-      throw notFound();
-    }
-    return { session: sessionData };
+    if (decision.kind === "not-found") throw notFound();
+    return { session: decision.session };
   },
   component: AdminLayout,
 });

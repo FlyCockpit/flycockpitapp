@@ -257,6 +257,32 @@ jobs:
             exit 1
           fi
 
+
+      # Forbid route loaders from reading Better Auth directly — use the server-side route session helper.
+      # AGENTS.md: routes should use getRouteSession() plus route-session-access decisions.
+      - name: Forbid authClient.getSession in web routes
+        run: |
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            'authClient\.getSession' \
+            apps/web/src/routes/ \
+            | grep -v 'node_modules'; then
+            echo "::error::Use getRouteSession() in route loaders instead of authClient.getSession()."
+            exit 1
+          fi
+
+      # Forbid direct Better Auth session hooks outside the centralized hook.
+      # AGENTS.md: web consumers should use useAuthSessionSnapshot()/route context.
+      - name: Forbid direct authClient.useSession in web app
+        run: |
+          if grep -rn --include='*.ts' --include='*.tsx' \
+            'authClient\.useSession(' \
+            apps/web/src/ \
+            | grep -v 'apps/web/src/hooks/use-auth-session.ts' \
+            | grep -v 'node_modules'; then
+            echo "::error::Use the centralized auth session hook instead of authClient.useSession()."
+            exit 1
+          fi
+
       # Forbid destructive Prisma commands in Dockerfile and package.json scripts.
       # AGENTS.md: "Dangerous Commands — Never Run These"
       # apps/cli is excluded: the Rust CLI manages its own local SQLite store,

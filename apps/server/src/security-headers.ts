@@ -51,6 +51,7 @@ export function mountSecurityHeaders<E extends Env>(
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         frameAncestors: ["'none'"],
+        formAction: ["'self'"],
       },
     }),
   );

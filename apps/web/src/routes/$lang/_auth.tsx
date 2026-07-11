@@ -18,20 +18,23 @@ import { useTranslation } from "react-i18next";
 import { InlineRetry } from "@/components/inline-retry";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { authClient } from "@/lib/auth-client";
+import { decideProtectedRouteAccess } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { orpc } from "@/utils/orpc";
 import { isForcedTwoFactorEnabledForRole } from "@/utils/two-factor-policy";
 
 export const Route = createFileRoute("/$lang/_auth")({
   beforeLoad: async ({ location, params }) => {
-    const session = await authClient.getSession();
-    if (!session.data) {
+    const decision = decideProtectedRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Could not verify session");
+    if (decision.kind === "redirect-to-login") {
       throw redirect({
         to: "/$lang/login",
         params: { lang: params.lang },
         search: { redirectTo: location.href },
       });
     }
-    return { session: session.data };
+    return { session: decision.session };
   },
   component: AuthLayout,
 });

@@ -3,8 +3,10 @@ import prisma from "@flycockpit/db";
 import {
   abortMultipartUpload,
   deleteStorageObject,
+  deleteStorageObjects,
   listIncompleteMultipartUploads,
   listStorageObjects,
+  type StorageObjectListEntry,
   storage,
 } from "./storage";
 
@@ -161,29 +163,95 @@ export async function runVideoCleanup(
   // Phase 2 — orphan S3 objects. We scan both prefixes and check whether the
   // owning Video row still exists. For live videos, audio/subtitle sub-prefixes
   // are also checked against their row-level owners so failed best-effort
-  // cleanup after track deletion does not leak forever. The check is per-key
-  // (not batched) because a single Video can have hundreds of objects, and we
-  // want each delete to re-check the DB state at delete time.
+  // cleanup after track deletion does not leak forever.
   const objectAgeCutoff = new Date(now - objectMinAgeMs);
+  const OBJECT_BATCH_SIZE = 1000;
+  let objectBatch: StorageObjectListEntry[] = [];
+
+  const processObjectBatch = async () => {
+    if (objectBatch.length === 0) return;
+    const batch = objectBatch;
+    objectBatch = [];
+
+    const parsed = batch.flatMap((obj) => {
+      const parts = obj.key.split("/");
+      const videoId = parts[1];
+      return videoId ? [{ obj, parts, videoId }] : [];
+    });
+    if (parsed.length === 0) return;
+
+    const videoIds = [...new Set(parsed.map((entry) => entry.videoId))];
+    const [videos, audioTracks, subtitleTracks] = await Promise.all([
+      prisma.video.findMany({ where: { id: { in: videoIds } }, select: { id: true } }),
+      prisma.videoAudioTrack.findMany({
+        where: { videoId: { in: videoIds } },
+        select: { videoId: true, locale: true, sourceKey: true },
+      }),
+      prisma.videoSubtitleTrack.findMany({
+        where: { videoId: { in: videoIds } },
+        select: { storageKey: true },
+      }),
+    ]);
+    const liveVideoIds = new Set(videos.map((video) => video.id));
+    const audioSourceKeys = new Set(
+      audioTracks.flatMap((track) => (track.sourceKey === null ? [] : [track.sourceKey])),
+    );
+    const audioLocales = new Set(audioTracks.map((track) => `${track.videoId}/${track.locale}`));
+    const subtitleKeys = new Set(subtitleTracks.map((track) => track.storageKey));
+
+    const candidates: typeof parsed = [];
+    for (const entry of parsed) {
+      const trackObject = parseTrackObjectKey(entry.parts, entry.obj.key, entry.videoId);
+      if (liveVideoIds.has(entry.videoId)) {
+        if (!trackObject) continue;
+        const referenced =
+          trackObject.kind === "rawAudioSource"
+            ? audioSourceKeys.has(entry.obj.key)
+            : trackObject.kind === "audioOutput"
+              ? audioLocales.has(`${entry.videoId}/${trackObject.locale}`)
+              : subtitleKeys.has(entry.obj.key);
+        if (referenced) continue;
+      }
+      candidates.push(entry);
+    }
+
+    const confirmed: StorageObjectListEntry[] = [];
+    for (const entry of candidates) {
+      const video = await prisma.video.findUnique({
+        where: { id: entry.videoId },
+        select: { id: true },
+      });
+      const trackObject = parseTrackObjectKey(entry.parts, entry.obj.key, entry.videoId);
+      if (
+        video &&
+        (!trackObject || !(await isUnreferencedTrackObject(trackObject, entry.videoId)))
+      ) {
+        continue;
+      }
+      confirmed.push(entry.obj);
+    }
+    if (confirmed.length === 0) return;
+
+    try {
+      const deletion = await deleteStorageObjects(confirmed.map((obj) => obj.key));
+      const failedKeys = new Set(deletion.errors.map((err) => err.key));
+      for (const obj of confirmed) {
+        if (failedKeys.has(obj.key)) continue;
+        summary.orphanObjectsDeleted++;
+        summary.orphanObjectsBytes += obj.size;
+      }
+    } catch {
+      // Best-effort; the next cron pass retries anything left behind.
+    }
+  };
 
   for (const prefix of [VIDEO_OUTPUT_PREFIX, VIDEO_RAW_PREFIX]) {
     for await (const obj of listStorageObjects(prefix)) {
       if (obj.lastModified && obj.lastModified >= objectAgeCutoff) continue;
-      const keyParts = obj.key.split("/");
-      const videoId = keyParts[1];
-      if (!videoId) continue;
-      const video = await prisma.video.findUnique({
-        where: { id: videoId },
-        select: { id: true },
-      });
-      const trackObject = parseTrackObjectKey(keyParts, obj.key, videoId);
-      if (video && (!trackObject || !(await isUnreferencedTrackObject(trackObject, videoId)))) {
-        continue;
-      }
-      await deleteStorageObject(obj.key).catch(() => {});
-      summary.orphanObjectsDeleted++;
-      summary.orphanObjectsBytes += obj.size;
+      objectBatch.push(obj);
+      if (objectBatch.length >= OBJECT_BATCH_SIZE) await processObjectBatch();
     }
+    await processObjectBatch();
   }
 
   // Phase 3 — incomplete multipart uploads

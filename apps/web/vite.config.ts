@@ -6,8 +6,8 @@ import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig, loadEnv } from "vite";
-import { VitePWA } from "vite-plugin-pwa";
+import { defineConfig, loadEnv, type Plugin } from "vite";
+import { type VitePluginPWAAPI, VitePWA } from "vite-plugin-pwa";
 
 function getBuildVersion(): string {
   // process.env is correct here — Vite config runs at build time outside the app runtime.
@@ -93,32 +93,47 @@ export default defineConfig(({ mode }) => {
     process.env.VITE_DEV_SERVER_URL ?? env.VITE_DEV_SERVER_URL,
   );
 
+  const pwaPlugins = VitePWA({
+    strategies: "injectManifest",
+    srcDir: "src",
+    filename: "sw.ts",
+    outDir: "dist/client",
+    registerType: "autoUpdate",
+    manifest: {
+      name: appName,
+      short_name: appName,
+      description: `${appName} - PWA Application`,
+      theme_color: "#0c0c0c",
+      background_color: "#0c0c0c",
+    },
+    pwaAssets: { disabled: false, config: true },
+    devOptions: { enabled: true, type: "module" },
+    injectManifest: {
+      globIgnores: ["**/logo.png"],
+      globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
+      maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+    },
+  });
+  const pwaApi = pwaPlugins.find((plugin) => plugin.name === "vite-plugin-pwa")?.api as
+    | VitePluginPWAAPI
+    | undefined;
+  const generateSWAfterClientBuild: Plugin = {
+    name: "generate-sw-after-client-build",
+    apply: "build",
+    enforce: "post",
+    closeBundle: {
+      sequential: true,
+      order: "post",
+      async handler() {
+        if (this.environment?.name !== "client") return;
+        await pwaApi?.generateSW();
+      },
+    },
+  };
+
   return {
     envDir,
-    plugins: [
-      tailwindcss(),
-      tanstackStart(),
-      react(),
-      VitePWA({
-        strategies: "injectManifest",
-        srcDir: "src",
-        filename: "sw.ts",
-        registerType: "autoUpdate",
-        manifest: {
-          name: appName,
-          short_name: appName,
-          description: `${appName} - PWA Application`,
-          theme_color: "#0c0c0c",
-          background_color: "#0c0c0c",
-        },
-        pwaAssets: { disabled: false, config: true },
-        devOptions: { enabled: true, type: "module" },
-        injectManifest: {
-          globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
-          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-        },
-      }),
-    ],
+    plugins: [tailwindcss(), tanstackStart(), react(), pwaPlugins, generateSWAfterClientBuild],
     define: {
       __APP_VERSION__: JSON.stringify(buildVersion),
     },

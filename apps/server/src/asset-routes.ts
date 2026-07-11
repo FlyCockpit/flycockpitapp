@@ -8,18 +8,21 @@ import {
   type AssetMeta,
   type AssetVisibility,
   assetCacheControl,
-  fetchAsset,
+  authorizeAssetRead,
   finalizeAsset,
   heartbeatAsset,
   presignAsset,
+  readAssetObject,
+  streamAssetObject,
   type Viewer,
 } from "@flycockpit/api/lib/assets";
 import {
+  imageTransformETag,
   parseTransformParams,
   type TransformParams,
   transformImage,
 } from "@flycockpit/api/lib/images";
-import { storage } from "@flycockpit/api/lib/storage";
+import { type StorageObjectRange, storage } from "@flycockpit/api/lib/storage";
 import type { Session } from "@flycockpit/auth";
 import { env } from "@flycockpit/env/server";
 import { analyzeAssetQueue } from "@flycockpit/queue";
@@ -188,8 +191,13 @@ export function mountAssetRoutes<E extends Env & SessionEnv>(app: Hono<E>): Hono
 
     const viewer = viewerFromSession(c.get("session"));
     try {
-      const { meta, body } = await fetchAsset(c.req.param("id"), viewer);
-      return assetResponse(meta, body.body, body.contentType);
+      const meta = await authorizeAssetRead(c.req.param("id"), viewer);
+      const etag = `"${meta.id}"`;
+      if (etagMatches(c.req.header("if-none-match"), etag)) {
+        return notModifiedResponse(etag, assetCacheControl(meta.visibility));
+      }
+      const body = await streamAssetObject(meta);
+      return assetResponse(meta, body);
     } catch (err) {
       return assetErrorResponse(err);
     }
@@ -211,12 +219,17 @@ export function mountAssetRoutes<E extends Env & SessionEnv>(app: Hono<E>): Hono
 
     const viewer = viewerFromSession(c.get("session"));
     try {
-      const { meta, body } = await fetchAsset(source, viewer);
+      const meta = await authorizeAssetRead(source, viewer);
       if (!meta.mimeType.startsWith("image/")) {
         return jsonResponse({ error: "That file isn't a valid image." }, 400);
       }
+      const etag = imageTransformETag(meta.id, params);
+      if (etagMatches(c.req.header("if-none-match"), etag)) {
+        return notModifiedResponse(etag, assetCacheControl(meta.visibility));
+      }
+      const body = await readAssetObject(meta);
       const transformed = await transformImage(body.body, params);
-      return imageResponse(transformed.body, transformed.contentType, meta.visibility);
+      return imageResponse(transformed.body, transformed.contentType, meta.visibility, etag);
     } catch (err) {
       return assetErrorResponse(err);
     }
@@ -452,35 +465,49 @@ function viewerFromSession(session: Session | null | undefined): Viewer {
   return { kind: "user", userId: session.user.id, role: session.user.role ?? "user" };
 }
 
-function assetResponse(meta: AssetMeta, body: Uint8Array, contentType: string): Response {
-  const normalizedContentType = normalizeMimeType(contentType);
+function assetResponse(meta: AssetMeta, body: StorageObjectRange): Response {
+  const normalizedContentType = normalizeMimeType(body.contentType);
   const disposition = inlineAssetMimeTypes.has(normalizedContentType) ? "inline" : "attachment";
-
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Content-Type": contentType,
-      "Content-Length": String(body.byteLength),
-      "Content-Disposition": disposition,
-      "Content-Security-Policy": "sandbox",
-      "Cache-Control": assetCacheControl(meta.visibility),
-      ETag: `"${meta.id}"`,
-    },
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": body.contentType,
+    "Content-Disposition": disposition,
+    "Content-Security-Policy": "sandbox",
+    "Cache-Control": assetCacheControl(meta.visibility),
+    ETag: `"${meta.id}"`,
+  };
+  if (body.contentLength !== null) {
+    headers["Content-Length"] = String(body.contentLength);
+  }
+  return new Response(body.body, { status: 200, headers });
 }
 
 function imageResponse(
   body: Buffer,
   contentType: string,
   visibility: AssetMeta["visibility"],
+  etag?: string,
 ): Response {
-  return new Response(new Uint8Array(body), {
-    status: 200,
-    headers: {
-      "Content-Type": contentType,
-      "Content-Length": String(body.byteLength),
-      "Cache-Control": assetCacheControl(visibility),
-    },
+  const headers: Record<string, string> = {
+    "Content-Type": contentType,
+    "Content-Length": String(body.byteLength),
+    "Cache-Control": assetCacheControl(visibility),
+  };
+  if (etag) headers.ETag = etag;
+  return new Response(new Uint8Array(body), { status: 200, headers });
+}
+
+function etagMatches(header: string | undefined, etag: string): boolean {
+  if (!header) return false;
+  return header
+    .split(",")
+    .map((value) => value.trim())
+    .some((value) => value === "*" || value === etag || value === `W/${etag}`);
+}
+
+function notModifiedResponse(etag: string, cacheControl: string): Response {
+  return new Response(null, {
+    status: 304,
+    headers: { ETag: etag, "Cache-Control": cacheControl },
   });
 }
 

@@ -5,11 +5,11 @@ import { Container } from "@/components/container";
 import { SignIn } from "@/components/sign-in";
 import { SignUp } from "@/components/sign-up";
 import { authClient } from "@/lib/auth-client";
-import { orpc, queryClient } from "@/utils/orpc";
+import { appConfigQueryOptions, queryClient } from "@/utils/orpc";
 
 export default function Account() {
   const { data: session } = authClient.useSession();
-  const appConfig = useQuery(orpc.appConfig.queryOptions());
+  const appConfig = useQuery(appConfigQueryOptions());
   const showSignup =
     appConfig.data?.signupEnabled === true || appConfig.data?.adminBootstrapSignupEnabled === true;
   const forceSso = appConfig.data?.ssoEnabled === true && appConfig.data.forceSso === true;

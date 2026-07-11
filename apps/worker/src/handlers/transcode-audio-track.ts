@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import prisma from "@flycockpit/db";
 import { env } from "@flycockpit/env/shared";
 import type { TranscodeAudioTrackJobData } from "@flycockpit/queue";
 import type { Job } from "bullmq";
+import { mapWithConcurrency } from "../lib/concurrency.js";
 
 /**
  * Encode an additional audio track (a dub) into HLS audio segments. The
@@ -111,12 +112,12 @@ export async function handleTranscodeAudioTrackJob(job: Job<TranscodeAudioTrackJ
     const playlistBody = await readFile(join(outDir, "playlist.m3u8"));
     await putStorageObject(playlistKey, playlistBody, "application/vnd.apple.mpegurl");
 
-    for (const file of await readdir(outDir)) {
-      if (!file.endsWith(".ts")) continue;
+    const segments = (await readdir(outDir)).filter((file) => file.endsWith(".ts"));
+    await mapWithConcurrency(segments, 8, async (file) => {
       const key = videoStorageKeys.audioTrackSegment(track.videoId, track.locale, file);
       const body = await readFile(join(outDir, file));
       await putStorageObject(key, body, "video/mp2t");
-    }
+    });
 
     await prisma.videoAudioTrack.update({
       where: { id: audioTrackId },
@@ -138,23 +139,44 @@ export async function handleTranscodeAudioTrackJob(job: Job<TranscodeAudioTrackJ
 // ---------------------------------------------------------------------------
 
 async function ffprobeDuration(path: string): Promise<number> {
-  const result = spawnSync(
-    env.VIDEO_FFPROBE_PATH,
-    [
-      "-v",
-      "error",
-      "-show_entries",
-      "format=duration",
-      "-of",
-      "default=noprint_wrappers=1:nokey=1",
-      path,
-    ],
-    { encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL" },
-  );
-  if (result.status !== 0) {
-    throw new Error(`ffprobe failed: ${result.stderr}`);
-  }
-  return Number.parseFloat(result.stdout.trim() || "0");
+  const stdout = await runFfprobe([
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    path,
+  ]);
+  return Number.parseFloat(stdout.trim() || "0");
+}
+
+async function runFfprobe(args: string[]): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(env.VIDEO_FFPROBE_PATH, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const timeoutMs = 30_000;
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`ffprobe timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`ffprobe failed: ${stderr.slice(-2048)}`));
+    });
+  });
 }
 
 async function runFfmpeg(args: string[]): Promise<void> {

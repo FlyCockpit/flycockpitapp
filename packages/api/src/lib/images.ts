@@ -128,6 +128,14 @@ export async function transformImage(
   }
 }
 
+export function imageTransformETag(assetId: string, params: TransformParams): string {
+  const width = clampDimension(params.width) ?? 0;
+  const height = clampDimension(params.height) ?? 0;
+  const quality = clampQuality(params.quality);
+  const format = params.format ?? "webp";
+  return `"img:${assetId}:w${width}:h${height}:q${quality}:${format}"`;
+}
+
 export function parseTransformParams(searchParams: URLSearchParams): TransformParams {
   const w = searchParams.get("w");
   const h = searchParams.get("h");

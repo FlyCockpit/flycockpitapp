@@ -1,9 +1,8 @@
 import { Link, useParams } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
-import { useDeferredSession } from "@/stores/session";
 
 export default function BottomNav({ hidden }: { hidden?: boolean }) {
   // `strict: false` keeps this safe to render under any matched route (the
@@ -11,7 +10,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
   // locale rather than crashing.
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { data: session, isPending } = useDeferredSession();
+  const { data: session, isPending } = useAuthSessionSnapshot();
   const { t } = useTranslation("nav");
   const items = getNavItems({
     placement: "mobile",

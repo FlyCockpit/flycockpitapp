@@ -57,6 +57,19 @@
     "terminalRelaxLabel": "Relax terminal reauthentication",
     "terminalRelaxDescription": "When enabled, owned terminals can open without a fresh password and 2FA check.",
     "terminalStepUpSaved": "Terminal security preference saved",
-    "terminalStepUpSaveFailed": "Couldn't save terminal security preference."
+    "terminalStepUpSaveFailed": "Couldn't save terminal security preference.",
+    "passwordTitle": "Password",
+    "passwordDescription": "Change the password used for email sign-in.",
+    "passwordLoadError": "Could not load password settings.",
+    "currentPasswordLabel": "Current password",
+    "newPasswordLabel": "New password",
+    "confirmPasswordLabel": "Confirm new password",
+    "passwordSessionRevocation": "Changing your password signs out your other sessions.",
+    "changePassword": "Change password",
+    "changingPassword": "Changing…",
+    "passwordChangedSuccess": "Password changed",
+    "currentPasswordMismatch": "The current password is not correct.",
+    "passwordChangeError": "Could not change password. Try again.",
+    "passwordsMustMatch": "Passwords must match."
   }
 }

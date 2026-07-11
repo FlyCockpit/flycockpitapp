@@ -2535,6 +2535,57 @@ fn push_toolbox_content_row(
     tool_call_rows.push(call_index);
 }
 
+fn wrap_line_with_hanging_indent(
+    line: Line<'static>,
+    max_width: usize,
+    continuation_indent: usize,
+    indent_style: Style,
+) -> Vec<Vec<Span<'static>>> {
+    if max_width == 0 {
+        return vec![line.spans];
+    }
+    let mut rows = Vec::new();
+    let mut remaining = line.spans;
+    let mut first = true;
+    let indent = continuation_indent.min(max_width.saturating_sub(1));
+    loop {
+        let budget = if first {
+            max_width
+        } else {
+            max_width.saturating_sub(indent).max(1)
+        };
+        let (mut head, tail) = slice_spans_at_width(remaining, budget);
+        if !first && indent > 0 {
+            let mut row = vec![Span::styled(" ".repeat(indent), indent_style)];
+            row.append(&mut head);
+            rows.push(row);
+        } else {
+            rows.push(head);
+        }
+        first = false;
+        match tail {
+            Some(t) => remaining = t,
+            None => break,
+        }
+    }
+    rows
+}
+
+fn push_wrapped_toolbox_input_row(
+    content: &mut Vec<Vec<Span<'static>>>,
+    tool_call_rows: &mut Vec<Option<usize>>,
+    line: Line<'static>,
+    call_index: usize,
+    body_width: usize,
+    continuation_indent: usize,
+    indent_style: Style,
+) {
+    for spans in wrap_line_with_hanging_indent(line, body_width, continuation_indent, indent_style)
+    {
+        push_toolbox_content_row(content, tool_call_rows, spans, Some(call_index));
+    }
+}
+
 /// Render a [`HistoryEntry::ToolBox`]: a light-grey rounded sidebar with
 /// the tool-call lines inside it. When every call is collapsed, shows up
 /// to [`TOOLBOX_VISIBLE`] calls (windowed by scroll/follow). Expanded
@@ -2599,21 +2650,27 @@ fn render_toolbox(
                     Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
                 ));
             }
-            push_toolbox_content_row(
+            let (glyph, label) = tool_glyph_label(&call.tool, emojis);
+            let label_indent = glyph.width() + label.width() + 2;
+            let input_style = tool_state_style(call.state);
+            push_wrapped_toolbox_input_row(
                 &mut content,
                 &mut tool_call_rows,
-                first_spans,
-                Some(call_index),
+                Line::from(first_spans),
+                call_index,
+                call_body_width,
+                label_indent,
+                input_style,
             );
             for cont in input_lines.iter().skip(1) {
-                push_toolbox_content_row(
+                push_wrapped_toolbox_input_row(
                     &mut content,
                     &mut tool_call_rows,
-                    vec![Span::styled(
-                        (*cont).to_string(),
-                        tool_state_style(call.state),
-                    )],
-                    Some(call_index),
+                    Line::from(vec![Span::styled((*cont).to_string(), input_style)]),
+                    call_index,
+                    call_body_width,
+                    0,
+                    input_style,
                 );
             }
 
@@ -4357,6 +4414,49 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn toolbox_wraps_long_expanded_input_with_hanging_indent() {
+        let width = 32u16;
+        let mut call = mk_call(
+            "bash",
+            "printf alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+            ToolCallState::Success,
+        );
+        call.expanded = true;
+        call.full_input = call.summary.clone();
+
+        let r = render_toolbox(&[call], 0, true, width, false, &no_elided());
+
+        assert!(r.lines.len() > 1, "long input should wrap");
+        assert!(
+            r.lines
+                .iter()
+                .all(|line| line_width(line) <= width as usize),
+            "wrapped rows must fit within width: {:?}",
+            r.lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+        assert!(r.lines[0].spans[0].content.as_ref() == "╭");
+        assert!(
+            r.lines[1..]
+                .iter()
+                .all(|line| matches!(line.spans[0].content.as_ref(), "│" | "╰")),
+            "every continuation keeps a sidebar glyph"
+        );
+        assert!(
+            r.tool_call_rows.iter().all(|row| *row == Some(0)),
+            "wrapped input rows stay mapped to the owning call"
+        );
+
+        let continuation = line_text(&r.lines[1]);
+        assert!(
+            continuation.starts_with("│       "),
+            "continuation should have sidebar, spacer, and six-column bash label indent: {continuation:?}"
+        );
+        let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("lambda"));
+        assert!(!joined.contains('…'));
     }
 
     #[test]

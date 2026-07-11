@@ -3703,7 +3703,12 @@ pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall]) -> u
             rows = rows.saturating_add(1);
             continue;
         }
-        rows = rows.saturating_add(c.full_input.matches('\n').count() as u16 + 1);
+        let input_rows = c
+            .full_input
+            .split('\n')
+            .map(|line| line.width().max(1))
+            .sum::<usize>();
+        rows = rows.saturating_add(input_rows as u16);
         if tool_shows_output(&c.tool) && !c.output.is_empty() {
             let result_lines = c.output.lines().count().max(1);
             let indicator_rows = usize::from(c.result_offset > 0)

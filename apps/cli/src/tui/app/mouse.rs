@@ -155,6 +155,10 @@ impl App {
             | Overlay::Quick(_) => return,
             Overlay::None => {}
         }
+        if self.mouse_capture && self.handle_suggestion_box_mouse(&mouse) {
+            return;
+        }
+
         // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
         // focus, and PTY mouse forwarding. Consumes the event when it
         // lands on the divider or inside the pane so the chat handlers
@@ -546,8 +550,63 @@ impl App {
             .and_then(crate::tui::app::render::affordance_target_for_row)
     }
 
+    fn suggestion_target_at_mouse(&self, mouse: &MouseEvent) -> Option<super::SuggestionBoxTarget> {
+        if !self.mouse_capture || !matches!(self.overlay, Overlay::None) {
+            return None;
+        }
+        self.suggestion_row_hits
+            .iter()
+            .find(|hit| point_in(hit.rect, mouse.column, mouse.row))
+            .map(|hit| hit.target)
+    }
+
+    fn mouse_in_suggestion_box(&self, mouse: &MouseEvent) -> bool {
+        self.suggestion_box_area
+            .is_some_and(|area| point_in(area, mouse.column, mouse.row))
+    }
+
     fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
-        self.hovered_affordance = self.affordance_target_at_mouse(mouse);
+        self.hovered_suggestion = self.suggestion_target_at_mouse(mouse);
+        if self.hovered_suggestion.is_some() {
+            self.hovered_affordance = None;
+        } else {
+            self.hovered_affordance = self.affordance_target_at_mouse(mouse);
+        }
+    }
+
+    fn handle_suggestion_box_mouse(&mut self, mouse: &MouseEvent) -> bool {
+        if !self.mouse_in_suggestion_box(mouse) {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.at_popup_active() {
+                    self.scroll_at_window_by(-1);
+                } else if self.slash_query().is_some() {
+                    self.scroll_slash_window_by(-1);
+                }
+                self.hovered_suggestion = None;
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                if self.at_popup_active() {
+                    self.scroll_at_window_by(1);
+                } else if self.slash_query().is_some() {
+                    self.scroll_slash_window_by(1);
+                }
+                self.hovered_suggestion = None;
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self.suggestion_target_at_mouse(mouse) {
+                    self.selection = None;
+                    self.accept_suggestion_target(target);
+                    self.hovered_suggestion = None;
+                }
+                true
+            }
+            _ => true,
+        }
     }
 
     /// True when the mouse position is inside the chat area's last-
@@ -887,13 +946,16 @@ impl App {
 
 #[cfg(test)]
 mod affordance_hover_tests {
-    use super::{AffordanceScrollRegion, AffordanceTarget, App, resolve_inner_scroll_target};
+    use super::{
+        AUTOCOMPLETE_ROWS, AffordanceScrollRegion, AffordanceTarget, App, SuggestionBoxKind,
+        SuggestionBoxRowHit, SuggestionBoxTarget, resolve_inner_scroll_target,
+    };
     use crate::tui::app::render::{
         ChatRowKind, ChatRowMeta, ReasoningScrollMeta, ToolResultScrollMeta,
     };
     use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
     use crate::tui::settings::Dialog;
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
     fn meta(
@@ -1011,6 +1073,133 @@ mod affordance_hover_tests {
         app.handle_mouse(moved(10));
 
         assert_eq!(app.hovered_affordance, None);
+    }
+
+    fn suggestion_target(kind: SuggestionBoxKind, index: usize) -> SuggestionBoxTarget {
+        SuggestionBoxTarget { kind, index }
+    }
+
+    fn suggestion_click(row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn suggestion_hover_tracks_rows_and_clears_on_leave() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.suggestion_box_area = Some(Rect::new(0, 5, 40, 4));
+        app.suggestion_row_hits = vec![SuggestionBoxRowHit {
+            target: suggestion_target(SuggestionBoxKind::Slash, 2),
+            rect: Rect::new(2, 6, 36, 1),
+        }];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(
+            app.hovered_suggestion,
+            Some(suggestion_target(SuggestionBoxKind::Slash, 2))
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row: 9,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.hovered_suggestion, None);
+    }
+
+    #[test]
+    fn wheel_over_slash_suggestions_scrolls_window_not_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+        assert!(app.slash_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
+        app.suggestion_box_area = Some(Rect::new(0, 5, 80, 8));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 6,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.slash_selected, 0);
+        assert_eq!(app.slash_scroll, 1);
+    }
+
+    #[test]
+    fn click_slash_suggestion_completes_without_dispatching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+        let expected = app.slash_suggestions()[1].completion_text();
+        app.suggestion_box_area = Some(Rect::new(0, 5, 80, 8));
+        app.suggestion_row_hits = vec![SuggestionBoxRowHit {
+            target: suggestion_target(SuggestionBoxKind::Slash, 1),
+            rect: Rect::new(2, 6, 76, 1),
+        }];
+
+        app.handle_mouse(suggestion_click(6));
+
+        assert_eq!(app.composer.text(), expected);
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn click_at_file_finalizes_and_click_at_dir_descends() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
+        std::fs::create_dir(tmp.path().join("beta")).unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.composer.set("@alpha".to_string());
+        app.reset_at_window();
+        let file_index = app
+            .at_suggestions()
+            .iter()
+            .position(|s| s.display == "alpha.rs")
+            .unwrap();
+        app.suggestion_box_area = Some(Rect::new(0, 5, 80, 4));
+        app.suggestion_row_hits = vec![SuggestionBoxRowHit {
+            target: suggestion_target(SuggestionBoxKind::At, file_index),
+            rect: Rect::new(2, 6, 76, 1),
+        }];
+
+        app.handle_mouse(suggestion_click(6));
+        assert_eq!(app.composer.text(), "@alpha.rs ");
+        assert!(app.at_dismissed);
+
+        app.composer.set("@beta".to_string());
+        app.at_dismissed = false;
+        app.reset_at_window();
+        let dir_index = app
+            .at_suggestions()
+            .iter()
+            .position(|s| s.display == "beta/")
+            .unwrap();
+        app.suggestion_row_hits = vec![SuggestionBoxRowHit {
+            target: suggestion_target(SuggestionBoxKind::At, dir_index),
+            rect: Rect::new(2, 6, 76, 1),
+        }];
+
+        app.handle_mouse(suggestion_click(6));
+        assert_eq!(app.composer.text(), "@beta/");
+        assert!(!app.at_dismissed);
     }
 
     #[test]

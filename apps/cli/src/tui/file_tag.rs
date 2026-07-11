@@ -16,20 +16,23 @@ use crate::tools::common::{
     OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice_with_byte_cap, truncation_marker,
 };
 
-/// Size of the visible suggestion window. Matches `AUTOCOMPLETE_ROWS` in
-/// `app.rs` — the renderer shows this many rows and scrolls within the
-/// full (possibly longer) candidate list.
-pub const MAX_SUGGESTIONS: usize = 6;
+/// Maximum number of file suggestions returned to the TUI. The renderer
+/// shows a six-row window and scrolls within this bounded candidate list.
+pub const MAX_SUGGESTIONS: usize = 100;
+
+/// Target number of rows to fill before the deepening walk stops. This
+/// matches the visible suggestion window in the app.
+const VISIBLE_SUGGESTION_ROWS: usize = 6;
 
 /// Once a query yields fewer than this many matches at the current
 /// depth, [`suggestions`] widens one directory deeper at a time until it
 /// reaches this many (or exhausts the subtree). Equal to the visible
-/// window so the popup is full whenever the tree can fill it.
-const DEEPEN_TARGET: usize = MAX_SUGGESTIONS;
+/// window so the box is full whenever the tree can fill it.
+const DEEPEN_TARGET: usize = VISIBLE_SUGGESTION_ROWS;
 
 /// Hard ceiling on suggestions returned. The user can arrow through the
 /// whole list; this just bounds memory/scan work in pathological trees.
-const MAX_RESULTS: usize = 200;
+const MAX_RESULTS: usize = MAX_SUGGESTIONS;
 
 /// Hard ceiling on filesystem entries scanned per `suggestions` call,
 /// so a deepening walk in a huge repo can't stall the UI.
@@ -164,10 +167,6 @@ pub fn suggestions(
                     is_dir,
                     gitignored,
                 });
-                if out.len() + level.len() >= MAX_RESULTS {
-                    bailed = true;
-                    break;
-                }
             }
             if bailed {
                 break;
@@ -188,7 +187,11 @@ pub fn suggestions(
             }
         });
         out.extend(level);
-        if bailed || out.len() >= DEEPEN_TARGET || out.len() >= MAX_RESULTS {
+        if out.len() >= MAX_RESULTS {
+            out.truncate(MAX_RESULTS);
+            break;
+        }
+        if bailed || out.len() >= DEEPEN_TARGET {
             break;
         }
         frontier = next;
@@ -1545,15 +1548,22 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_returns_more_than_window_when_available() {
-        // Ten matching files at the top level: all should be returned
-        // (the renderer windows them), not truncated to six.
+    fn suggestions_returns_more_than_window_up_to_internal_cap() {
+        // More than six matching files at the top level: the renderer windows
+        // them, but the walker returns a bounded scrollable list.
         let root = tmp_root();
-        for n in 0..10 {
-            fs::write(root.path().join(format!("file{n}.rs")), "").unwrap();
+        for n in 0..120 {
+            fs::write(root.path().join(format!("file{n:03}.rs")), "").unwrap();
         }
         let s = sug(root.path(), "file");
-        assert_eq!(s.len(), 10, "expected all matches, got {}", s.len());
+        assert_eq!(
+            s.len(),
+            MAX_SUGGESTIONS,
+            "expected capped matches, got {}",
+            s.len()
+        );
+        assert!(s.iter().any(|s| s.display == "file099.rs"));
+        assert!(!s.iter().any(|s| s.display == "file100.rs"));
     }
 
     #[test]

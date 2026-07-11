@@ -110,6 +110,24 @@ pub(super) enum FooterPickerKind {
     Mode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SuggestionBoxKind {
+    At,
+    Slash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SuggestionBoxTarget {
+    kind: SuggestionBoxKind,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SuggestionBoxRowHit {
+    target: SuggestionBoxTarget,
+    rect: Rect,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FooterPickerRowHit {
     kind: FooterPickerKind,
@@ -1428,6 +1446,14 @@ pub struct App {
     /// border included). Used by `handle_mouse` to route clicks into
     /// click-to-position-cursor (plan.md T8.d).
     pub(super) input_area: Option<Rect>,
+    /// Last-rendered suggestion/vim-hint box outer rect. Border rows are
+    /// intentionally recorded so mouse wheel over the chrome is captured,
+    /// while row hit records below limit click acceptance to content rows.
+    pub(super) suggestion_box_area: Option<Rect>,
+    /// Absolute row hit rectangles for rendered suggestion rows.
+    pub(super) suggestion_row_hits: Vec<SuggestionBoxRowHit>,
+    /// Suggestion row currently under the mouse, if capture is enabled.
+    pub(super) hovered_suggestion: Option<SuggestionBoxTarget>,
     /// Logical-line scroll offset for the chat history pane. `0` =
     /// pinned to the bottom (live). Higher = scrolled further back in
     /// time. Bumped by mouse wheel when capture is on; clamped by
@@ -2719,6 +2745,9 @@ impl App {
             },
             chat_area: None,
             input_area: None,
+            suggestion_box_area: None,
+            suggestion_row_hits: Vec::new(),
+            hovered_suggestion: None,
             chat_scroll_offset: 0,
             chat_total_lines: 0,
             chat_visible_lines: 0,
@@ -2969,7 +2998,7 @@ impl App {
             self.input_height(),
             self.indicator_lines(),
             self.queue_lines(),
-            self.popup_lines(),
+            self.suggestion_box_lines(),
             self.pins_indicator_lines(),
             self.sandbox_notice_lines(),
             self.total_history_lines(),
@@ -3532,6 +3561,7 @@ impl App {
             self.mouse_capture = want;
             if !want {
                 self.hovered_affordance = None;
+                self.hovered_suggestion = None;
             }
         }
     }

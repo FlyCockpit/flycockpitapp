@@ -15,7 +15,9 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::{border, merge::MergeStrategy};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::chrome;
@@ -35,8 +37,8 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, INPUT_BORDER,
-    MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide, Selection, Toast, ToastKind, TranscriptFind,
-    WORKING_MESSAGES,
+    MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide, Selection, SuggestionBoxKind,
+    SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -596,14 +598,23 @@ impl App {
         walked
     }
 
-    pub(super) fn popup_lines(&self) -> u16 {
-        if self.slash_query().is_some() || self.at_popup_active() {
-            // Always reserve `AUTOCOMPLETE_ROWS` while either popup is
-            // active; the renderer pads with blanks so the composer
-            // doesn't shift as the candidate set narrows.
-            return AUTOCOMPLETE_ROWS;
+    pub(super) fn suggestion_box_lines(&self) -> u16 {
+        if self.at_popup_active() {
+            let rows = self.at_suggestions().len().min(AUTOCOMPLETE_ROWS as usize);
+            if rows > 0 {
+                return rows as u16 + 2;
+            }
         }
-        if self.show_vim_hint() { 1 } else { 0 }
+        if self.slash_query().is_some() {
+            let rows = self
+                .slash_suggestions()
+                .len()
+                .min(AUTOCOMPLETE_ROWS as usize);
+            if rows > 0 {
+                return rows as u16 + 2;
+            }
+        }
+        if self.show_vim_hint() { 3 } else { 0 }
     }
 
     /// True when the Normal-mode hint chip should occupy the popup
@@ -1001,8 +1012,10 @@ impl App {
                     if geom.queue > 0 {
                         self.render_queue(frame, rects.queue);
                     }
-                    if geom.popup > 0 {
-                        self.render_popup(frame, rects.popup);
+                    if geom.suggestions > 0 {
+                        self.render_suggestion_box(frame, rects.suggestions);
+                    } else {
+                        self.clear_suggestion_box_hits();
                     }
                     // Below-input pin-count indicator (`pinned-messages`). Only
                     // shown when the session has ≥1 pin (geometry gives it a row).
@@ -2347,138 +2360,217 @@ impl App {
         sig
     }
 
-    pub(super) fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
-        // `@`-popup takes precedence over the vim hint when active.
-        if self.at_popup_active() {
-            self.render_at_popup(frame, area);
+    pub(super) fn render_suggestion_box(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.suggestion_box_area = None;
+        self.suggestion_row_hits.clear();
+        if area.height < 3 || area.width < 5 {
             return;
         }
-        // Vim hint preempts the popup when the composer is in Normal
-        // mode and the user hasn't opted out via the vim_mode setting.
-        if self.slash_query().is_none() {
-            if self.show_vim_hint() {
-                let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-                let line = Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("Press ", muted),
-                    Span::styled("`i`", Style::default().fg(WARNING_TEXT)),
-                    Span::styled(" to resume typing. Disable vim mode in ", muted),
-                    Span::styled("/settings", muted),
-                ]);
-                frame.render_widget(Paragraph::new(line), area);
-            }
+        let border_color = Self::input_border_color(self.busy, false);
+        let Some(content_area) = Self::render_connected_input_top_strip(frame, area, border_color)
+        else {
             return;
-        }
-        // `slash_suggestions` returns the full match set; this renderer
-        // windows it to the autocomplete-rows budget and pads blanks below
-        // so the popup keeps a stable 6-row footprint regardless of match
-        // count.
-        let matches = self.slash_suggestions();
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-
-        let mut lines: Vec<Line<'static>> = if matches.is_empty() {
-            vec![Line::from(vec![
-                Span::raw("  "),
-                Span::styled("no matching command", Style::default().fg(ERROR_TEXT)),
-            ])]
-        } else {
-            let window = AUTOCOMPLETE_ROWS as usize;
-            // Clamp defensively: the match set can shrink between a
-            // keypress and this render (the user typed another char).
-            let selected = self.slash_selected.min(matches.len().saturating_sub(1));
-            let offset = crate::tui::nav::windowed_scroll(
-                selected,
-                self.slash_scroll,
-                matches.len(),
-                window,
-            );
-            let name_w = matches.iter().map(|c| c.name().len()).max().unwrap_or(0);
-            matches
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .take(window)
-                .map(|(i, cmd)| {
-                    let is_sel = i == selected;
-                    let marker = if is_sel { "▸ " } else { "  " };
-                    let name_padded = format!("/{:<width$}", cmd.name(), width = name_w);
-                    let name_style = if is_sel {
-                        Style::default().fg(WARNING_TEXT)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled(name_padded, name_style),
-                        Span::raw("  "),
-                        Span::styled(cmd.description(self), muted),
-                    ])
-                })
-                .collect()
         };
-        while (lines.len() as u16) < AUTOCOMPLETE_ROWS {
-            lines.push(Line::default());
+        self.suggestion_box_area = Some(area);
+
+        if self.at_popup_active() {
+            self.render_at_suggestion_box(frame, area, content_area);
+        } else if self.slash_query().is_some() {
+            self.render_slash_suggestion_box(frame, area, content_area);
+        } else if self.show_vim_hint() {
+            self.render_vim_hint_box(frame, content_area);
         }
-        frame.render_widget(Paragraph::new(lines), area);
     }
 
-    pub(super) fn render_at_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let suggestions = self.at_suggestions();
+    pub(super) fn clear_suggestion_box_hits(&mut self) {
+        self.suggestion_box_area = None;
+        self.suggestion_row_hits.clear();
+        self.hovered_suggestion = None;
+    }
+
+    fn render_vim_hint_box(&self, frame: &mut ratatui::Frame, content_area: Rect) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let mut lines: Vec<Line<'static>> = if suggestions.is_empty() {
-            vec![Line::from(vec![
-                Span::raw("  "),
-                Span::styled("no matching file", Style::default().fg(ERROR_TEXT)),
-            ])]
-        } else {
-            let window = AUTOCOMPLETE_ROWS as usize;
-            let selected = self.at_selected.min(suggestions.len().saturating_sub(1));
-            // Clamp the stored scroll offset defensively (the list can
-            // shrink between a keypress and this render).
-            let offset = crate::tui::nav::windowed_scroll(
-                selected,
-                self.at_scroll,
-                suggestions.len(),
-                window,
-            );
-            suggestions
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .take(window)
-                .map(|(i, sug)| {
-                    let is_sel = i == selected;
-                    let marker = if is_sel { "▸ " } else { "  " };
-                    // Allowlisted-but-gitignored entries render in the subdued
-                    // color even when not selected, marking them as
-                    // normally-gitignored-but-allowed
-                    // (implementation note).
-                    let name_style = if is_sel {
-                        Style::default().fg(WARNING_TEXT)
-                    } else if sug.gitignored {
-                        muted
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    let kind = if sug.is_dir { "dir" } else { "file" };
-                    let mut spans = vec![
-                        Span::raw(marker),
-                        Span::styled(format!("@{}", sug.display), name_style),
-                        Span::raw("  "),
-                        Span::styled(kind.to_string(), muted),
-                    ];
-                    if sug.gitignored {
-                        spans.push(Span::raw("  "));
-                        spans.push(Span::styled("gitignored", muted));
-                    }
-                    Line::from(spans)
-                })
-                .collect()
-        };
-        while (lines.len() as u16) < AUTOCOMPLETE_ROWS {
-            lines.push(Line::default());
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("Press ", muted),
+            Span::styled("`i`", Style::default().fg(WARNING_TEXT)),
+            Span::styled(" to resume typing. Disable vim mode in ", muted),
+            Span::styled("/settings", muted),
+        ]);
+        frame.render_widget(Paragraph::new(line), content_area);
+    }
+
+    fn render_slash_suggestion_box(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        content_area: Rect,
+    ) {
+        let matches = self.slash_suggestions();
+        if matches.is_empty() {
+            return;
         }
-        frame.render_widget(Paragraph::new(lines), area);
+        let total = matches.len();
+        let window = content_area.height.min(AUTOCOMPLETE_ROWS) as usize;
+        let mut list = crate::tui::pane::ScrollList::at(
+            self.slash_selected.min(total.saturating_sub(1)),
+            self.slash_scroll,
+        );
+        list.clamp_windowed(total, window);
+        let selected = list.cursor();
+        let offset = list.scroll();
+        let name_w = matches.iter().map(|c| c.name().len()).max().unwrap_or(0);
+        let visible: Vec<(usize, String, String)> = matches
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(window)
+            .map(|(i, cmd)| (i, cmd.name().to_string(), cmd.description(self).to_string()))
+            .collect();
+        drop(matches);
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines = Vec::new();
+        for (row, (i, name, description)) in visible.into_iter().enumerate() {
+            let is_sel = i == selected;
+            let target = SuggestionBoxTarget {
+                kind: SuggestionBoxKind::Slash,
+                index: i,
+            };
+            let marker = if is_sel { "▸ " } else { "  " };
+            let name_padded = format!("/{:<width$}", name, width = name_w);
+            let name_style = if is_sel {
+                Style::default().fg(WARNING_TEXT)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut line = Line::from(vec![
+                Span::raw(marker),
+                Span::styled(name_padded, name_style),
+                Span::raw("  "),
+                Span::styled(description, muted),
+            ]);
+            if self.hovered_suggestion == Some(target) {
+                hover_highlight_line(&mut line);
+            }
+            lines.push(line);
+            self.suggestion_row_hits.push(SuggestionBoxRowHit {
+                target,
+                rect: Rect::new(
+                    content_area.x,
+                    content_area.y + row as u16,
+                    content_area.width,
+                    1,
+                ),
+            });
+        }
+        frame.render_widget(Paragraph::new(lines), content_area);
+        self.render_suggestion_scrollbar(frame, area, content_area, total, window, offset);
+    }
+
+    fn render_at_suggestion_box(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        content_area: Rect,
+    ) {
+        let suggestions = self.at_suggestions();
+        if suggestions.is_empty() {
+            return;
+        }
+        let window = content_area.height.min(AUTOCOMPLETE_ROWS) as usize;
+        let mut list = crate::tui::pane::ScrollList::at(
+            self.at_selected.min(suggestions.len().saturating_sub(1)),
+            self.at_scroll,
+        );
+        list.clamp_windowed(suggestions.len(), window);
+        let selected = list.cursor();
+        let offset = list.scroll();
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines = Vec::new();
+        for (row, (i, sug)) in suggestions
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(window)
+            .enumerate()
+        {
+            let is_sel = i == selected;
+            let target = SuggestionBoxTarget {
+                kind: SuggestionBoxKind::At,
+                index: i,
+            };
+            let marker = if is_sel { "▸ " } else { "  " };
+            let name_style = if is_sel {
+                Style::default().fg(WARNING_TEXT)
+            } else if sug.gitignored {
+                muted
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let kind = if sug.is_dir { "dir" } else { "file" };
+            let mut spans = vec![
+                Span::raw(marker),
+                Span::styled(format!("@{}", sug.display), name_style),
+                Span::raw("  "),
+                Span::styled(kind.to_string(), muted),
+            ];
+            if sug.gitignored {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("gitignored", muted));
+            }
+            let mut line = Line::from(spans);
+            if self.hovered_suggestion == Some(target) {
+                hover_highlight_line(&mut line);
+            }
+            lines.push(line);
+            self.suggestion_row_hits.push(SuggestionBoxRowHit {
+                target,
+                rect: Rect::new(
+                    content_area.x,
+                    content_area.y + row as u16,
+                    content_area.width,
+                    1,
+                ),
+            });
+        }
+        frame.render_widget(Paragraph::new(lines), content_area);
+        self.render_suggestion_scrollbar(
+            frame,
+            area,
+            content_area,
+            suggestions.len(),
+            window,
+            offset,
+        );
+    }
+
+    fn render_suggestion_scrollbar(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        content_area: Rect,
+        total: usize,
+        window: usize,
+        offset: usize,
+    ) {
+        if total <= window || window == 0 || area.width < 5 {
+            return;
+        }
+        let scrollbar_area = Rect::new(
+            area.x + area.width.saturating_sub(2),
+            content_area.y,
+            1,
+            content_area.height,
+        );
+        let mut state = ScrollbarState::new(total)
+            .position(offset)
+            .viewport_content_length(window);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_style(Style::default().fg(MUTED_TEXT))
+            .thumb_style(Style::default().fg(WARNING_TEXT));
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
 
     /// Lay out and render the embedded pane (GOALS §1i) inside `body`,
@@ -3669,7 +3761,8 @@ fn reconnect_status_text(reconnect: &super::ReconnectStatus, dots: &str, elapsed
 #[cfg(test)]
 mod slash_popup_full_list_tests {
     use super::App;
-    use crate::tui::app::AUTOCOMPLETE_ROWS;
+    use crate::tui::app::{AUTOCOMPLETE_ROWS, SuggestionBoxKind, SuggestionBoxTarget};
+    use crate::tui::theme::TRANSCRIPT_HOVER_BG;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -3698,11 +3791,12 @@ mod slash_popup_full_list_tests {
         app.reset_slash_window();
         assert!(app.slash_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
 
-        let backend = TestBackend::new(100, AUTOCOMPLETE_ROWS);
+        let height = AUTOCOMPLETE_ROWS + 2;
+        let backend = TestBackend::new(100, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                app.render_popup(frame, Rect::new(0, 0, 100, AUTOCOMPLETE_ROWS));
+                app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
             })
             .unwrap();
 
@@ -3713,8 +3807,44 @@ mod slash_popup_full_list_tests {
             .chunks(100)
             .filter(|row| row.iter().any(|cell| cell.symbol() == "/"))
             .count();
+        let scrollbar_cells = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "█")
+            .count();
 
         assert_eq!(filled_rows, AUTOCOMPLETE_ROWS as usize);
+        assert!(scrollbar_cells > 0, "scrollbar thumb should render");
+        assert_eq!(app.suggestion_row_hits.len(), AUTOCOMPLETE_ROWS as usize);
+    }
+
+    #[test]
+    fn slash_suggestion_hover_paints_hover_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+        app.hovered_suggestion = Some(SuggestionBoxTarget {
+            kind: SuggestionBoxKind::Slash,
+            index: 0,
+        });
+
+        let height = AUTOCOMPLETE_ROWS + 2;
+        let backend = TestBackend::new(100, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        assert!(
+            (0..100).any(|col| buf[(col, 1)].style().bg == Some(TRANSCRIPT_HOVER_BG)),
+            "hovered suggestion row should use shared hover background"
+        );
     }
 }
 

@@ -799,32 +799,11 @@ impl App {
                     return false;
                 }
                 KeyCode::Up => {
-                    let n = self.at_suggestions().len();
-                    if n > 0 {
-                        // Wrap at the top (first → last) + scrolloff so the
-                        // neighbor stays visible (see `windowed_scroll`).
-                        self.at_selected = crate::tui::nav::wrap_prev(self.at_selected, n);
-                        self.at_scroll = crate::tui::nav::windowed_scroll(
-                            self.at_selected,
-                            self.at_scroll,
-                            n,
-                            super::AUTOCOMPLETE_ROWS as usize,
-                        );
-                    }
+                    self.move_at_selection_by(-1);
                     return false;
                 }
                 KeyCode::Down => {
-                    let n = self.at_suggestions().len();
-                    if n > 0 {
-                        // Wrap at the bottom (last → first).
-                        self.at_selected = crate::tui::nav::wrap_next(self.at_selected, n);
-                        self.at_scroll = crate::tui::nav::windowed_scroll(
-                            self.at_selected,
-                            self.at_scroll,
-                            n,
-                            super::AUTOCOMPLETE_ROWS as usize,
-                        );
-                    }
+                    self.move_at_selection_by(1);
                     return false;
                 }
                 KeyCode::Tab => {
@@ -863,29 +842,11 @@ impl App {
         if self.slash_query().is_some() {
             match key.code {
                 KeyCode::Up => {
-                    let n = self.slash_suggestions().len();
-                    if n > 0 {
-                        self.slash_selected = crate::tui::nav::wrap_prev(self.slash_selected, n);
-                        self.slash_scroll = crate::tui::nav::windowed_scroll(
-                            self.slash_selected,
-                            self.slash_scroll,
-                            n,
-                            super::AUTOCOMPLETE_ROWS as usize,
-                        );
-                    }
+                    self.move_slash_selection_by(-1);
                     return false;
                 }
                 KeyCode::Down => {
-                    let n = self.slash_suggestions().len();
-                    if n > 0 {
-                        self.slash_selected = crate::tui::nav::wrap_next(self.slash_selected, n);
-                        self.slash_scroll = crate::tui::nav::windowed_scroll(
-                            self.slash_selected,
-                            self.slash_scroll,
-                            n,
-                            super::AUTOCOMPLETE_ROWS as usize,
-                        );
-                    }
+                    self.move_slash_selection_by(1);
                     return false;
                 }
                 // Plain Tab completes the composer to the highlighted
@@ -1216,6 +1177,83 @@ impl App {
         self.refresh_slash_menu_cache();
     }
 
+    pub(super) fn move_at_selection_by(&mut self, delta: isize) {
+        let n = self.at_suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let mut list = crate::tui::pane::ScrollList::at(self.at_selected, self.at_scroll);
+        list.move_by(delta, n);
+        list.clamp_windowed(n, super::AUTOCOMPLETE_ROWS as usize);
+        self.at_selected = list.cursor();
+        self.at_scroll = list.scroll();
+    }
+
+    pub(super) fn move_slash_selection_by(&mut self, delta: isize) {
+        let n = self.slash_suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let mut list = crate::tui::pane::ScrollList::at(self.slash_selected, self.slash_scroll);
+        list.move_by(delta, n);
+        list.clamp_windowed(n, super::AUTOCOMPLETE_ROWS as usize);
+        self.slash_selected = list.cursor();
+        self.slash_scroll = list.scroll();
+    }
+
+    pub(super) fn scroll_at_window_by(&mut self, delta: isize) -> bool {
+        let n = self.at_suggestions().len();
+        if n == 0 {
+            return false;
+        }
+        let mut list = crate::tui::pane::ScrollList::at(self.at_selected, self.at_scroll);
+        list.scroll_window_by(delta, n, super::AUTOCOMPLETE_ROWS as usize);
+        self.at_scroll = list.scroll();
+        true
+    }
+
+    pub(super) fn scroll_slash_window_by(&mut self, delta: isize) -> bool {
+        let n = self.slash_suggestions().len();
+        if n == 0 {
+            return false;
+        }
+        let mut list = crate::tui::pane::ScrollList::at(self.slash_selected, self.slash_scroll);
+        list.scroll_window_by(delta, n, super::AUTOCOMPLETE_ROWS as usize);
+        self.slash_scroll = list.scroll();
+        true
+    }
+
+    pub(super) fn accept_suggestion_target(&mut self, target: super::SuggestionBoxTarget) -> bool {
+        match target.kind {
+            super::SuggestionBoxKind::At => {
+                if target.index >= self.at_suggestions().len() {
+                    return false;
+                }
+                self.at_selected = target.index;
+                self.at_scroll = crate::tui::nav::windowed_scroll(
+                    self.at_selected,
+                    self.at_scroll,
+                    self.at_suggestions().len(),
+                    super::AUTOCOMPLETE_ROWS as usize,
+                );
+                self.accept_at_suggestion(false)
+            }
+            super::SuggestionBoxKind::Slash => {
+                if target.index >= self.slash_suggestions().len() {
+                    return false;
+                }
+                self.slash_selected = target.index;
+                self.slash_scroll = crate::tui::nav::windowed_scroll(
+                    self.slash_selected,
+                    self.slash_scroll,
+                    self.slash_suggestions().len(),
+                    super::AUTOCOMPLETE_ROWS as usize,
+                );
+                self.complete_slash_selection()
+            }
+        }
+    }
+
     /// Tab inside an open slash menu: complete the composer to the
     /// highlighted command, or — when the composer already holds that
     /// completion — advance to the next match and complete to it, cycling
@@ -1254,13 +1292,7 @@ impl App {
         // command's completion — advances to the next match before
         // completing, so successive Tabs walk the list.
         if self.composer.text() == completions[idx] {
-            self.slash_selected = crate::tui::nav::wrap_next(idx, n);
-            self.slash_scroll = crate::tui::nav::windowed_scroll(
-                self.slash_selected,
-                self.slash_scroll,
-                n,
-                super::AUTOCOMPLETE_ROWS as usize,
-            );
+            self.move_slash_selection_by(1);
         }
         let chosen = self.slash_selected.min(n - 1);
         // `set` resets the cursor to the end — exactly after the inserted
@@ -1350,17 +1382,12 @@ impl App {
         if self.slash_query().is_some() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             let n = self.slash_suggestions().len();
             if n > 0 {
-                self.slash_selected = if matches!(key.code, KeyCode::Up) {
-                    crate::tui::nav::wrap_prev(self.slash_selected, n)
+                let delta = if matches!(key.code, KeyCode::Up) {
+                    -1
                 } else {
-                    crate::tui::nav::wrap_next(self.slash_selected, n)
+                    1
                 };
-                self.slash_scroll = crate::tui::nav::windowed_scroll(
-                    self.slash_selected,
-                    self.slash_scroll,
-                    n,
-                    super::AUTOCOMPLETE_ROWS as usize,
-                );
+                self.move_slash_selection_by(delta);
             }
             self.composer.set_pending_g(false);
             return false;

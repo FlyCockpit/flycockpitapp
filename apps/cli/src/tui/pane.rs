@@ -82,6 +82,16 @@ impl ScrollList {
         self.scroll = crate::tui::nav::windowed_scroll(self.cursor, self.scroll, len, viewport);
     }
 
+    pub(crate) fn scroll_window_by(&mut self, delta: isize, len: usize, viewport: usize) {
+        if len <= viewport || viewport == 0 {
+            self.scroll = 0;
+            return;
+        }
+        let max_scroll = len - viewport;
+        let next = self.scroll as isize + delta;
+        self.scroll = next.clamp(0, max_scroll as isize) as usize;
+    }
+
     pub(crate) fn clamp_visible_span(
         &mut self,
         viewport_rows: usize,
@@ -129,5 +139,25 @@ mod tests {
         list = ScrollList::at(0, 0);
         list.clamp_visible_span(3, 10, 5, 6);
         assert_eq!(list.scroll(), 3);
+    }
+
+    #[test]
+    fn scroll_list_scrolls_window_without_moving_cursor() {
+        let mut list = ScrollList::at(4, 2);
+
+        list.scroll_window_by(1, 10, 5);
+        assert_eq!(list.cursor(), 4);
+        assert_eq!(list.scroll(), 3);
+
+        list.scroll_window_by(99, 10, 5);
+        assert_eq!(list.cursor(), 4);
+        assert_eq!(list.scroll(), 5);
+
+        list.scroll_window_by(-99, 10, 5);
+        assert_eq!(list.cursor(), 4);
+        assert_eq!(list.scroll(), 0);
+
+        list.scroll_window_by(1, 5, 5);
+        assert_eq!(list.scroll(), 0);
     }
 }

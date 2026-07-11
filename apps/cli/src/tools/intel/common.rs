@@ -245,8 +245,17 @@ pub(super) fn forward_deps(
 
 /// Gitignore-aware list of `(rel, abs, size)` for every tracked file.
 pub(super) fn list_files(root: &Path) -> Vec<(String, PathBuf, u64)> {
+    list_files_from(root, root)
+}
+
+/// Gitignore-aware list rooted at `root/subdir`, with paths relative to `root`.
+pub(super) fn list_files_under(root: &Path, subdir: &str) -> Vec<(String, PathBuf, u64)> {
+    list_files_from(root, &root.join(subdir))
+}
+
+fn list_files_from(root: &Path, walk_root: &Path) -> Vec<(String, PathBuf, u64)> {
     let mut out = Vec::new();
-    let mut walker = WalkBuilder::new(root);
+    let mut walker = WalkBuilder::new(walk_root);
     walker
         .hidden(true)
         .git_ignore(true)
@@ -263,7 +272,7 @@ pub(super) fn list_files(root: &Path) -> Vec<(String, PathBuf, u64)> {
         let Ok(rel) = abs.strip_prefix(root) else {
             continue;
         };
-        let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        let size = dent.metadata().map(|m| m.len()).unwrap_or(0);
         out.push((rel.to_string_lossy().replace('\\', "/"), abs, size));
     }
     out

@@ -85,16 +85,14 @@ impl Tool for TreeTool {
 
         // The on-disk gitignore walk is the authority for which files
         // exist (it sees unknown-language files the index doesn't store).
-        let mut entries = list_files(&ctx.session.project_root);
+        let mut entries = match filter.as_deref() {
+            Some(subdir) => list_files_under(&ctx.session.project_root, subdir),
+            None => list_files(&ctx.session.project_root),
+        };
         entries.sort();
 
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
         for (rel, _abs, size) in &entries {
-            if let Some(f) = &filter
-                && !(rel == f || rel.starts_with(&format!("{f}/")))
-            {
-                continue;
-            }
             let lang = Language::from_path(Path::new(rel));
             let line = match indexed.get(rel) {
                 Some((lang_str, _indexed_size, Some(lines), syms)) => {
@@ -158,14 +156,14 @@ fn tree_empty_diagnostic(
     }
     out.push_str(&format!("fs_files: {fs_files}\n"));
     out.push_str(&format!("indexed_files: {indexed_files}\n"));
-    if fs_files == 0 {
+    if filter.is_some() {
+        out.push_str("empty_reason: `path` filter excluded all discovered files\n");
+        out.push_str("hint: run `tree` without `path` or use a different subtree.");
+    } else if fs_files == 0 {
         out.push_str("empty_reason: zero discovered files\n");
         out.push_str(
             "hint: verify the project root/cwd; fall back to `rg --files` or `fd` if the filesystem walk is unexpectedly empty.",
         );
-    } else if filter.is_some() {
-        out.push_str("empty_reason: `path` filter excluded all discovered files\n");
-        out.push_str("hint: run `tree` without `path` or use a different subtree.");
     } else {
         out.push_str("empty_reason: no output rows after discovery\n");
         out.push_str(

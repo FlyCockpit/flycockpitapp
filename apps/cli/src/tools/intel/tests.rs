@@ -102,6 +102,41 @@ async fn tree_uses_stored_lines_and_marks_large_indexed_files() {
 }
 
 #[tokio::test]
+async fn tree_filter_rows_match_unfiltered_subtree_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn lib() {}\n");
+    write(tmp.path(), "src/nested/mod.rs", "pub fn nested() {}\n");
+    write(tmp.path(), "tests/outside.rs", "pub fn outside() {}\n");
+    write(tmp.path(), "notes.foo", "notes\n");
+    let ctx = test_ctx(tmp.path());
+
+    let unfiltered = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let filtered = TreeTool
+        .call(serde_json::json!({"path": "src"}), &ctx)
+        .await
+        .unwrap();
+
+    let expected: Vec<&str> = unfiltered
+        .content
+        .lines()
+        .filter(|line| line.starts_with("src/"))
+        .collect();
+    let actual: Vec<&str> = filtered.content.lines().collect();
+
+    assert_eq!(actual, expected, "{}", filtered.content);
+    assert!(
+        !filtered.content.contains("tests/outside.rs"),
+        "{}",
+        filtered.content
+    );
+    assert!(
+        !filtered.content.contains("notes.foo"),
+        "{}",
+        filtered.content
+    );
+}
+
+#[tokio::test]
 async fn tree_filter_with_no_matches_reports_files_filter_and_hint() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
@@ -122,7 +157,13 @@ async fn tree_filter_with_no_matches_reports_files_filter_and_hint() {
         "{}",
         tree.content
     );
-    assert!(tree.content.contains("fs_files: 1"), "{}", tree.content);
+    assert!(tree.content.contains("fs_files: 0"), "{}", tree.content);
+    assert!(
+        tree.content
+            .contains("empty_reason: `path` filter excluded all discovered files"),
+        "{}",
+        tree.content
+    );
     assert!(
         tree.content.contains("hint: run `tree` without `path`"),
         "{}",

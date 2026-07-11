@@ -12,9 +12,24 @@
 //!     (multiple `impl` blocks across this file and `mod.rs`)
 //!   - provider-only free helpers (`render_header_editor`,
 //!     `render_field_row`, `valid_url`, `valid_id`,
-//!     `apply_copilot_setup`, `render_copilot_setup_body`).
+//!     `apply_copilot_setup`, `render_copilot_body`).
+
+mod fetch;
+mod oauth_setup;
+mod row_editor;
 
 use std::path::PathBuf;
+
+#[cfg(test)]
+pub(super) use fetch::FetchedSummary;
+pub(super) use fetch::{
+    FetchAllState, FetchFallbackPromptState, FetchOnePromptState, compute_unlisted_for_models,
+    render_fetch_all_results,
+};
+use oauth_setup::{
+    OAuthSetupFlow, handle_codex_oauth_setup_key, handle_grok_oauth_setup_key, oauth_setup_lines,
+    render_oauth_body, render_oauth_setup,
+};
 
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -31,10 +46,9 @@ use crate::auth::{
 };
 use crate::config::providers::{
     AuthKind, HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy,
-    OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog, WireApi,
-    apply_template_model_defaults, format_model_fetch_age, merge_fetched_models_with_policy,
-    provider_model_fetch_display_state, provider_model_fetch_reason_display,
-    redact_model_fetch_reason,
+    OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
+    merge_fetched_models_with_policy, provider_model_fetch_display_state,
+    provider_model_fetch_reason_display, redact_model_fetch_reason,
 };
 use crate::envref;
 use crate::providers::models_fetch::FetchOutcome;
@@ -42,10 +56,14 @@ use crate::providers::{self as templates, ProviderTemplate};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
+pub(super) use row_editor::{
+    HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
+};
+
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
 use super::shell::selected_line_from_marker;
-use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
+use super::{Nav, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
 #[cfg(test)]
 use super::{Page, TestPageRef};
 
@@ -699,766 +717,6 @@ pub(super) enum EditField {
     Url,
 }
 
-/// Multi-row header list. Browsing the rows is inline; adding or
-/// editing a header opens a name/value popup (see
-/// [`render_header_edit_popup`]).
-///
-/// Layout (visible "rows" the cursor can land on):
-///   - 0..n               actual header rows
-///   - n                  `[+ add header]`
-///   - n+1                `[continue →]` (used by the Add wizard)
-///
-/// In Browse mode the cursor selects a row and `Tab`/`Shift+Tab` move
-/// like `↓`/`↑`. With the popup open, `Tab`/`Shift+Tab` switch between
-/// the name and value fields, `enter` saves, and `esc` cancels.
-pub(super) struct HeaderEditor {
-    pub(super) rows: Vec<HeaderSpec>,
-    pub(super) cursor: usize,
-    pub(super) mode: HeaderMode,
-    pub(super) name_buf: TextField,
-    pub(super) value_buf: TextField,
-    /// Row the popup is editing; `None` while adding a brand-new header.
-    /// A new header is committed to `rows` only on save, so cancelling
-    /// an add leaves no blank row behind.
-    pub(super) edit_target: Option<usize>,
-    /// If false, the synthetic `[continue →]` row is suppressed (used
-    /// from the Edit page, where there's no next step).
-    pub(super) show_continue: bool,
-    pub(super) delete: RowDeleteConfirm,
-    pub(super) status: Option<String>,
-}
-
-pub(super) enum HeaderMode {
-    Browse,
-    /// Popup open, focused on the name field.
-    EditName,
-    /// Popup open, focused on the value field.
-    EditValue,
-}
-
-pub(super) enum HeaderResult {
-    Stay,
-    Continue,
-    Back,
-    /// `[save changes]` row / `s` accelerator (Edit-page sub-page only):
-    /// commit the provider entry to disk and stay on the page.
-    Save,
-}
-
-impl HeaderEditor {
-    pub(super) fn new(rows: Vec<HeaderSpec>, show_continue: bool) -> Self {
-        Self {
-            rows,
-            cursor: 0,
-            mode: HeaderMode::Browse,
-            name_buf: TextField::default(),
-            value_buf: TextField::default(),
-            edit_target: None,
-            show_continue,
-            delete: RowDeleteConfirm::default(),
-            status: None,
-        }
-    }
-
-    fn n_rows(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn add_row_idx(&self) -> usize {
-        self.n_rows()
-    }
-
-    fn continue_idx(&self) -> Option<usize> {
-        if self.show_continue {
-            Some(self.n_rows() + 1)
-        } else {
-            None
-        }
-    }
-
-    /// The `[save changes]` row index (Edit-page sub-page only — mutually
-    /// exclusive with `[continue →]`, which only the Add wizard shows).
-    fn save_idx(&self) -> Option<usize> {
-        if self.show_continue {
-            None
-        } else {
-            Some(self.n_rows() + 1)
-        }
-    }
-
-    fn max_cursor(&self) -> usize {
-        self.continue_idx()
-            .or_else(|| self.save_idx())
-            .unwrap_or(self.add_row_idx())
-    }
-
-    /// Open the popup to add a brand-new header. The row is committed to
-    /// `rows` only on save (see [`Self::commit_edit`]).
-    fn begin_add(&mut self) {
-        self.delete.disarm();
-        self.status = None;
-        self.edit_target = None;
-        self.name_buf = TextField::default();
-        self.value_buf = TextField::default();
-        self.mode = HeaderMode::EditName;
-    }
-
-    /// Open the popup to edit an existing row.
-    fn begin_edit(&mut self, i: usize) {
-        if let Some(row) = self.rows.get(i) {
-            self.delete.disarm();
-            self.status = None;
-            self.edit_target = Some(i);
-            self.name_buf = TextField::new(row.name.clone());
-            self.value_buf = TextField::new(row.value.clone());
-            // Start on the value — the field most often changed when
-            // editing an existing header.
-            self.mode = HeaderMode::EditValue;
-        }
-    }
-
-    /// Save the popup buffers and close it. A new header with an empty
-    /// name is discarded so a stray `a` leaves no blank row; edits to an
-    /// existing row are always written so a field can be cleared.
-    fn commit_edit(&mut self) {
-        let name = self.name_buf.text().trim().to_string();
-        let value = self.value_buf.text().to_string();
-        match self.edit_target {
-            Some(i) => {
-                if let Some(row) = self.rows.get_mut(i) {
-                    row.name = name;
-                    row.value = value;
-                    self.cursor = i;
-                }
-            }
-            None => {
-                if !name.is_empty() {
-                    self.rows.push(HeaderSpec { name, value });
-                    self.cursor = self.rows.len() - 1;
-                }
-            }
-        }
-        self.edit_target = None;
-        self.mode = HeaderMode::Browse;
-        self.delete.disarm();
-        self.status = None;
-    }
-
-    /// Close the popup without saving.
-    fn cancel_edit(&mut self) {
-        self.edit_target = None;
-        self.mode = HeaderMode::Browse;
-        self.delete.disarm();
-    }
-
-    pub(super) fn handle_key(&mut self, key: KeyEvent) -> HeaderResult {
-        match self.mode {
-            HeaderMode::Browse => self.handle_browse_key(key),
-            HeaderMode::EditName | HeaderMode::EditValue => self.handle_edit_key(key),
-        }
-    }
-
-    fn handle_browse_key(&mut self, key: KeyEvent) -> HeaderResult {
-        match key.code {
-            // `Tab`/`Shift+Tab` move like `↓`/`↑` while browsing rows.
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                self.cursor = crate::tui::nav::wrap_prev(self.cursor, self.max_cursor() + 1);
-                self.delete.disarm();
-                self.status = None;
-                HeaderResult::Stay
-            }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.cursor = crate::tui::nav::wrap_next(self.cursor, self.max_cursor() + 1);
-                self.delete.disarm();
-                self.status = None;
-                HeaderResult::Stay
-            }
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                self.delete.disarm();
-                HeaderResult::Back
-            }
-            KeyCode::Char('a') => {
-                self.begin_add();
-                HeaderResult::Stay
-            }
-            // `s` accelerator: commit (Edit-page sub-page only — the Add
-            // wizard has no save row).
-            KeyCode::Char('s') if self.save_idx().is_some() => HeaderResult::Save,
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if self.cursor < self.rows.len() {
-                    let label = self.rows[self.cursor].name.clone();
-                    if self.delete.arm_or_confirm(self.cursor) {
-                        self.rows.remove(self.cursor);
-                        if self.cursor > 0 && self.cursor >= self.rows.len() {
-                            self.cursor -= 1;
-                        }
-                        self.status = None;
-                    } else {
-                        self.status = Some(format!("press d/Delete again to delete `{label}`"));
-                    }
-                } else {
-                    self.delete.disarm();
-                    self.status = None;
-                }
-                HeaderResult::Stay
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.cursor < self.rows.len() {
-                    self.delete.disarm();
-                    self.begin_edit(self.cursor);
-                    HeaderResult::Stay
-                } else if self.cursor == self.add_row_idx() {
-                    self.delete.disarm();
-                    self.begin_add();
-                    HeaderResult::Stay
-                } else if Some(self.cursor) == self.continue_idx() {
-                    self.delete.disarm();
-                    HeaderResult::Continue
-                } else if Some(self.cursor) == self.save_idx() {
-                    self.delete.disarm();
-                    HeaderResult::Save
-                } else {
-                    HeaderResult::Stay
-                }
-            }
-            _ => {
-                self.delete.disarm();
-                self.status = None;
-                HeaderResult::Stay
-            }
-        }
-    }
-
-    fn handle_edit_key(&mut self, key: KeyEvent) -> HeaderResult {
-        match key.code {
-            KeyCode::Esc => {
-                self.cancel_edit();
-                HeaderResult::Stay
-            }
-            KeyCode::Enter => {
-                self.commit_edit();
-                HeaderResult::Stay
-            }
-            // Two fields, so forward and backward both toggle focus.
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.mode = match self.mode {
-                    HeaderMode::EditName => HeaderMode::EditValue,
-                    _ => HeaderMode::EditName,
-                };
-                HeaderResult::Stay
-            }
-            _ => {
-                match self.mode {
-                    HeaderMode::EditName => {
-                        self.name_buf.handle_key(key);
-                    }
-                    HeaderMode::EditValue => {
-                        self.value_buf.handle_key(key);
-                    }
-                    HeaderMode::Browse => {}
-                }
-                HeaderResult::Stay
-            }
-        }
-    }
-
-    /// The field a paste should land in: the name/value buffer matching the
-    /// popup focus (`mode`), or `None` while browsing (no field is open).
-    pub(super) fn active_text_field(&mut self) -> Option<&mut TextField> {
-        match self.mode {
-            HeaderMode::EditName => Some(&mut self.name_buf),
-            HeaderMode::EditValue => Some(&mut self.value_buf),
-            HeaderMode::Browse => None,
-        }
-    }
-
-    pub(super) fn rows(&self) -> &[HeaderSpec] {
-        &self.rows
-    }
-
-    pub(super) fn is_editing(&self) -> bool {
-        !matches!(self.mode, HeaderMode::Browse)
-    }
-}
-
-/// Multi-row model list manager for the provider Edit page. Browsing the
-/// rows is inline; adding or editing a *manual* entry opens an
-/// id/name/context popup (see [`render_model_edit_popup`]).
-///
-/// Layout (visible "rows" the cursor can land on):
-///   - 0..n   actual model rows (fetched + manual, in list order)
-///   - n      `[+ add model]`
-///
-/// Only manual entries can be edited (id / name / context). Any entry —
-/// fetched or manual — can be deleted; a deleted fetched entry reappears
-/// on the next `/models` refetch.
-pub(super) struct ModelEditor {
-    /// Effective template identity of the provider whose models are being
-    /// edited ([`ProviderEntry::effective_template`]), resolved from the
-    /// loaded config at construction. Only scopes template-specific defaults
-    /// applied to newly added manual entries ([`apply_template_model_defaults`]);
-    /// `None` for providers with no known template.
-    pub(super) template: Option<String>,
-    pub(super) rows: Vec<ModelEntry>,
-    pub(super) cursor: usize,
-    pub(super) mode: ModelMode,
-    pub(super) id_buf: TextField,
-    pub(super) name_buf: TextField,
-    pub(super) context_buf: TextField,
-    /// Row the popup is editing; `None` while adding a brand-new entry.
-    pub(super) edit_target: Option<usize>,
-    /// Field the popup is focused on while editing.
-    pub(super) focus: ModelField,
-    /// Transient validation/status message shown under the editor.
-    pub(super) status: Option<String>,
-    pub(super) delete: RowDeleteConfirm,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub(super) enum ModelField {
-    Id,
-    Name,
-    Context,
-}
-
-pub(super) enum ModelMode {
-    Browse,
-    /// id/name/context popup open (add or edit).
-    Edit,
-}
-
-pub(super) enum ModelResult {
-    Stay,
-    Back,
-    /// `[save changes]` row / `s` accelerator: commit the provider entry
-    /// (with the live model rows) to disk and stay on the page.
-    Save,
-    /// Open the model-settings sub-dialog for the row at this index
-    /// (implementation note). Works on every model — these
-    /// are overrides, not edits to fetched data.
-    OpenSettings(usize),
-}
-
-impl ModelEditor {
-    pub(super) fn new(template: Option<String>, rows: Vec<ModelEntry>) -> Self {
-        Self {
-            template,
-            rows,
-            cursor: 0,
-            mode: ModelMode::Browse,
-            id_buf: TextField::default(),
-            name_buf: TextField::default(),
-            context_buf: TextField::default(),
-            edit_target: None,
-            focus: ModelField::Id,
-            status: None,
-            delete: RowDeleteConfirm::default(),
-        }
-    }
-
-    fn n_rows(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn add_row_idx(&self) -> usize {
-        self.n_rows()
-    }
-
-    /// The `[save changes]` row index (always present — the Models page is
-    /// only reached from the provider Edit page).
-    fn save_idx(&self) -> usize {
-        self.n_rows() + 1
-    }
-
-    fn selected_enter_hint(&self) -> &'static str {
-        if self.cursor < self.rows.len() {
-            if self.rows[self.cursor].manual {
-                "enter: settings"
-            } else {
-                "enter: read-only settings"
-            }
-        } else if self.cursor == self.add_row_idx() {
-            "enter: add model"
-        } else if self.cursor == self.save_idx() {
-            "enter: save changes"
-        } else {
-            "enter: settings"
-        }
-    }
-
-    fn max_cursor(&self) -> usize {
-        self.save_idx()
-    }
-
-    /// Open the popup to add a brand-new manual entry. The row is
-    /// committed to `rows` only on a valid save.
-    fn begin_add(&mut self) {
-        self.delete.disarm();
-        self.edit_target = None;
-        self.id_buf = TextField::default();
-        self.name_buf = TextField::default();
-        self.context_buf = TextField::default();
-        self.focus = ModelField::Id;
-        self.status = None;
-        self.mode = ModelMode::Edit;
-    }
-
-    /// Open the popup to edit an existing manual entry. Fetched entries
-    /// are not editable; the caller gates on `rows[i].manual`.
-    fn begin_edit(&mut self, i: usize) {
-        if let Some(row) = self.rows.get(i) {
-            self.delete.disarm();
-            self.edit_target = Some(i);
-            self.id_buf = TextField::new(row.id.clone());
-            self.name_buf = TextField::new(row.name.clone().unwrap_or_default());
-            self.context_buf = TextField::new(
-                row.context_length
-                    .map(|c| c.to_string())
-                    .unwrap_or_default(),
-            );
-            self.focus = ModelField::Id;
-            self.status = None;
-            self.mode = ModelMode::Edit;
-        }
-    }
-
-    /// Validate the popup buffers and, if valid, commit them to `rows`.
-    /// Returns `Err(message)` on validation failure (kept open) and
-    /// `Ok(())` on a successful commit (popup closed).
-    fn commit_edit(&mut self) -> Result<(), String> {
-        let id = self.id_buf.text().trim().to_string();
-        if id.is_empty() {
-            return Err("model id cannot be empty".to_string());
-        }
-        // Reject a duplicate id within this provider, ignoring the row
-        // being edited so a no-op id keeps validating.
-        let dup = self
-            .rows
-            .iter()
-            .enumerate()
-            .any(|(i, m)| m.id == id && Some(i) != self.edit_target);
-        if dup {
-            return Err(format!("a model with id `{id}` already exists"));
-        }
-        let name_raw = self.name_buf.text().trim();
-        let name = if name_raw.is_empty() {
-            None
-        } else {
-            Some(name_raw.to_string())
-        };
-        let context_raw = self.context_buf.text().trim();
-        let context_length = if context_raw.is_empty() {
-            None
-        } else {
-            match context_raw.parse::<u32>() {
-                Ok(n) => Some(n),
-                Err(_) => return Err("context length must be a number".to_string()),
-            }
-        };
-
-        match self.edit_target {
-            Some(i) => {
-                if let Some(row) = self.rows.get_mut(i) {
-                    row.id = id;
-                    row.name = name;
-                    row.context_length = context_length;
-                    self.cursor = i;
-                }
-            }
-            None => {
-                let mut entry = ModelEntry {
-                    id,
-                    name,
-                    thinking_modes: Vec::new(),
-                    inputs: None,
-                    context_length,
-                    favorite: false,
-                    manual: true,
-                    trust: None,
-                    location: None,
-                    quality_rank: None,
-                    cost_rank: None,
-                    subagent_invokable: None,
-                    availability: Default::default(),
-                    cache: None,
-                    shrink: None,
-                    context: None,
-                    auto_prune: None,
-                    timeout: None,
-                    backup: None,
-                    mode: None,
-                    system_prompt: None,
-                    inline_think: None,
-                    hint_tool_call_corrections: None,
-                    text_embedded_recovery: None,
-                    thinking_params: Default::default(),
-                    wire_api: Default::default(),
-                    extra: Default::default(),
-                    capabilities: Default::default(),
-                    provider_metadata: Default::default(),
-                };
-                // A hand-added model gets the same template-scoped defaults
-                // a `/models` discovery would apply (z.ai has no `/models`
-                // endpoint, so manual add IS its discovery).
-                apply_template_model_defaults(self.template.as_deref(), &mut entry);
-                self.rows.push(entry);
-                self.cursor = self.rows.len() - 1;
-            }
-        }
-        self.edit_target = None;
-        self.status = None;
-        self.mode = ModelMode::Browse;
-        self.delete.disarm();
-        Ok(())
-    }
-
-    /// Close the popup without saving.
-    fn cancel_edit(&mut self) {
-        self.edit_target = None;
-        self.status = None;
-        self.mode = ModelMode::Browse;
-        self.delete.disarm();
-    }
-
-    pub(super) fn handle_key(&mut self, key: KeyEvent) -> ModelResult {
-        match self.mode {
-            ModelMode::Browse => self.handle_browse_key(key),
-            ModelMode::Edit => self.handle_edit_key(key),
-        }
-    }
-
-    fn handle_browse_key(&mut self, key: KeyEvent) -> ModelResult {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                self.cursor = crate::tui::nav::wrap_prev(self.cursor, self.max_cursor() + 1);
-                self.status = None;
-                self.delete.disarm();
-                ModelResult::Stay
-            }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.cursor = crate::tui::nav::wrap_next(self.cursor, self.max_cursor() + 1);
-                self.status = None;
-                self.delete.disarm();
-                ModelResult::Stay
-            }
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                self.delete.disarm();
-                ModelResult::Back
-            }
-            KeyCode::Char('a') => {
-                self.begin_add();
-                ModelResult::Stay
-            }
-            // `s` accelerator: commit the provider entry to disk.
-            KeyCode::Char('s') => {
-                self.delete.disarm();
-                ModelResult::Save
-            }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if self.cursor < self.rows.len() {
-                    let label = self.rows[self.cursor].id.clone();
-                    if self.delete.arm_or_confirm(self.cursor) {
-                        self.rows.remove(self.cursor);
-                        if self.cursor > 0 && self.cursor >= self.rows.len() {
-                            self.cursor -= 1;
-                        }
-                        self.status = None;
-                    } else {
-                        self.status = Some(format!("press d/Delete again to delete `{label}`"));
-                    }
-                } else {
-                    self.delete.disarm();
-                    self.status = None;
-                }
-                ModelResult::Stay
-            }
-            // `r` renames (id/name/context) — manual entries only, as before.
-            KeyCode::Char('r') => {
-                if self.cursor < self.rows.len() {
-                    self.delete.disarm();
-                    if self.rows[self.cursor].manual {
-                        self.begin_edit(self.cursor);
-                    } else {
-                        self.status =
-                            Some("fetched models can't be renamed (settings: enter)".to_string());
-                    }
-                }
-                ModelResult::Stay
-            }
-            // Enter/l/→ opens the model-settings sub-dialog (every model) or
-            // the add affordance on the synthetic row.
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.cursor < self.rows.len() {
-                    self.delete.disarm();
-                    ModelResult::OpenSettings(self.cursor)
-                } else if self.cursor == self.add_row_idx() {
-                    self.delete.disarm();
-                    self.begin_add();
-                    ModelResult::Stay
-                } else if self.cursor == self.save_idx() {
-                    self.delete.disarm();
-                    ModelResult::Save
-                } else {
-                    ModelResult::Stay
-                }
-            }
-            _ => {
-                self.delete.disarm();
-                self.status = None;
-                ModelResult::Stay
-            }
-        }
-    }
-
-    fn handle_edit_key(&mut self, key: KeyEvent) -> ModelResult {
-        match key.code {
-            KeyCode::Esc => {
-                self.cancel_edit();
-                ModelResult::Stay
-            }
-            KeyCode::Enter => {
-                if let Err(msg) = self.commit_edit() {
-                    self.status = Some(msg);
-                }
-                ModelResult::Stay
-            }
-            // Three fields cycled by Tab / Shift+Tab.
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    ModelField::Id => ModelField::Name,
-                    ModelField::Name => ModelField::Context,
-                    ModelField::Context => ModelField::Id,
-                };
-                ModelResult::Stay
-            }
-            KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    ModelField::Id => ModelField::Context,
-                    ModelField::Name => ModelField::Id,
-                    ModelField::Context => ModelField::Name,
-                };
-                ModelResult::Stay
-            }
-            _ => {
-                match self.focus {
-                    ModelField::Id => {
-                        self.id_buf.handle_key(key);
-                    }
-                    ModelField::Name => {
-                        self.name_buf.handle_key(key);
-                    }
-                    ModelField::Context => {
-                        self.context_buf.handle_key(key);
-                    }
-                }
-                ModelResult::Stay
-            }
-        }
-    }
-
-    /// The field a paste should land in: the id/name/context buffer matching
-    /// the popup focus, or `None` while browsing (no popup open).
-    pub(super) fn active_text_field(&mut self) -> Option<&mut TextField> {
-        match self.mode {
-            ModelMode::Browse => None,
-            ModelMode::Edit => Some(match self.focus {
-                ModelField::Id => &mut self.id_buf,
-                ModelField::Name => &mut self.name_buf,
-                ModelField::Context => &mut self.context_buf,
-            }),
-        }
-    }
-
-    pub(super) fn rows(&self) -> &[ModelEntry] {
-        &self.rows
-    }
-
-    pub(super) fn is_editing(&self) -> bool {
-        matches!(self.mode, ModelMode::Edit)
-    }
-}
-
-pub(super) struct FetchAllState {
-    pub(super) providers: Vec<String>,
-    pub(super) in_flight: Vec<FetchHandle>,
-    pub(super) finished: Vec<FetchedSummary>,
-    pub(super) pre_fetch_models: std::collections::BTreeMap<String, Vec<ModelEntry>>,
-    pub(super) policy_resolved: bool,
-    /// 0 = Keep (default), 1 = Remove, 2 = Save & close
-    pub(super) cursor: usize,
-    pub(super) dont_ask_again: bool,
-    /// Aggregated set of (provider_id, missing_model_id) the user must rule on.
-    pub(super) unlisted: Vec<(String, String)>,
-}
-
-impl FetchAllState {
-    /// Kick off one background `/models` fetch per configured provider,
-    /// reusing the same [`FetchHandle`] machinery the Add/Edit pages use.
-    /// Providers whose request can't even be resolved (missing
-    /// env/credentials) land directly in `finished` as an error so one
-    /// bad provider never blocks the rest — `tick` drains the live
-    /// handles as they complete.
-    pub(super) fn spawn(providers: &crate::config::providers::ProvidersConfig) -> Self {
-        let mut ids: Vec<String> = providers.providers.keys().cloned().collect();
-        ids.sort();
-        let mut in_flight = Vec::new();
-        let finished = Vec::new();
-        let mut pre_fetch_models = std::collections::BTreeMap::new();
-        for id in &ids {
-            let Some(entry) = providers.providers.get(id) else {
-                continue;
-            };
-            pre_fetch_models.insert(id.clone(), entry.models.clone());
-            in_flight.push(FetchHandle::spawn(id.clone(), entry.clone()));
-        }
-        Self {
-            providers: ids,
-            in_flight,
-            finished,
-            pre_fetch_models,
-            policy_resolved: false,
-            cursor: 0,
-            dont_ask_again: false,
-            unlisted: Vec::new(),
-        }
-    }
-
-    /// True while at least one per-provider fetch is still running.
-    pub(super) fn is_fetching(&self) -> bool {
-        !self.in_flight.is_empty()
-    }
-}
-
-pub(super) struct FetchedSummary {
-    pub(super) provider_id: String,
-    pub(super) outcome: Result<FetchOutcome, String>,
-}
-
-enum FetchDegradedStatus {
-    Unsupported,
-    Failed(String),
-}
-
-pub(super) struct FetchOnePromptState {
-    pub(super) provider_id: String,
-    pub(super) remote: Vec<ModelEntry>,
-    pub(super) catalog: ProviderModelCatalog,
-    pub(super) pre_fetch_models: Vec<ModelEntry>,
-    pub(super) unlisted: Vec<String>,
-    /// 0 = Keep, 1 = Remove, 2 = Do not show again.
-    pub(super) cursor: usize,
-    pub(super) dont_ask_again: bool,
-}
-
-pub(super) struct FetchFallbackPromptState {
-    pub(super) provider_id: String,
-    pub(super) models: Vec<ModelEntry>,
-    pub(super) catalog: ProviderModelCatalog,
-    pub(super) reason: String,
-    /// 0 = retry live, 1 = keep existing, 2 = use fallback, 3 = cancel.
-    pub(super) cursor: usize,
-}
-
 impl AddState {
     pub(super) fn new() -> Self {
         Self {
@@ -1709,264 +967,118 @@ impl SettingsDialog {
             _ => {}
         }
     }
-
-    /// Poll the in-flight handles of an active all-providers refetch.
-    /// Each finished handle is removed from `in_flight` and recorded in
-    /// `finished`; model config is not mutated until the unlisted-model
-    /// policy is resolved. When `in_flight` empties, the aggregated
-    /// unlisted-models set is built so [`Self::render_fetch_all`] can show
-    /// the Keep/Remove prompt when needed.
-    /// A per-provider failure is just an `Err` summary — it never aborts
-    /// the others.
-    pub(super) fn drain_fetch_all(&mut self) {
-        let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
-            return;
-        };
-        if s.in_flight.is_empty() {
-            if !s.finished.is_empty() && !s.policy_resolved {
-                self.finish_fetch_all_if_ready();
-            }
-            return;
-        }
-
-        let mut newly_done: Vec<FetchedSummary> = Vec::new();
-        s.in_flight.retain(|handle| match handle.take() {
-            Some(outcome) => {
-                newly_done.push(FetchedSummary {
-                    provider_id: handle.provider_id.clone(),
-                    outcome,
-                });
-                false
-            }
-            None => true,
-        });
-        if newly_done.is_empty() {
-            return;
-        }
-
-        let all_done = {
-            let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
-                return;
-            };
-            s.finished.extend(newly_done);
-            s.in_flight.is_empty()
-        };
-
-        if all_done {
-            self.finish_fetch_all_if_ready();
-        }
-    }
-
-    fn finish_fetch_all_if_ready(&mut self) {
-        if !matches!(
-            self.page.downcast_ref::<ProvidersPage>(),
-            Some(ProvidersPage::FetchAll(_))
-        ) {
-            return;
-        }
-        let unlisted = compute_unlisted(self);
-        let degraded = fetch_all_degraded_statuses(self);
-        let auto_policy = match self.config.on_unlisted_models_fetch {
-            Some(OnUnlistedModelsFetch::Keep) => Some(ModelMergePolicy::KeepUnlisted),
-            Some(OnUnlistedModelsFetch::Remove) => Some(ModelMergePolicy::RemoveUnlisted),
-            Some(OnUnlistedModelsFetch::Ask) | None if unlisted.is_empty() => {
-                Some(ModelMergePolicy::KeepUnlisted)
-            }
-            Some(OnUnlistedModelsFetch::Ask) | None => None,
-        };
-        if let Some(policy) = auto_policy {
-            let merges = {
-                let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_ref::<ProvidersPage>()
-                else {
-                    return;
-                };
-                fetch_all_merges(s)
-            };
-            self.apply_fetch_all_policy(merges, policy);
-        }
-        self.apply_fetch_all_degraded_statuses(degraded);
-        let _ = self.save_config();
-        if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
-            s.unlisted = if auto_policy.is_some() {
-                Vec::new()
-            } else {
-                unlisted
-            };
-            s.policy_resolved = true;
-        }
-    }
-
-    fn apply_fetch_all_policy(
+}
+impl SettingsCx {
+    fn handle_provider_list_key(
         &mut self,
-        merges: Vec<(
-            String,
-            Vec<ModelEntry>,
-            Vec<ModelEntry>,
-            ProviderModelCatalog,
-        )>,
-        policy: ModelMergePolicy,
-    ) {
-        for (provider_id, pre_fetch_models, remote, catalog) in merges {
-            if let Some(entry) = self.config.providers.get_mut(&provider_id) {
-                entry.models = merge_fetched_models_with_policy(
-                    entry.effective_template(&provider_id),
-                    &pre_fetch_models,
-                    remote,
-                    policy,
-                );
-                entry.models_fetched_at = Some(Utc::now());
-                entry.model_catalog = catalog;
-                entry.mark_model_fetch_success(catalog);
+        key: KeyEvent,
+        cursor: &mut usize,
+        status: &mut Option<String>,
+        delete_pending: &mut bool,
+    ) -> Nav {
+        // Row 0 is the synthetic `[refetch provider models]` button;
+        // provider rows are offset by one (1..=ids.len()). The
+        // policy summary is rendered as non-selectable text.
+        let ids: Vec<String> = self.config.providers.keys().cloned().collect();
+        let row_count = ids.len() + 1;
+        let provider_idx = list_provider_idx(*cursor, ids.len());
+        let pressed_d = matches!(key.code, KeyCode::Char('d'));
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                return Nav::Back;
             }
-        }
-    }
-
-    fn apply_fetch_all_degraded_statuses(&mut self, degraded: Vec<(String, FetchDegradedStatus)>) {
-        for (provider_id, status) in degraded {
-            let Some(entry) = self.config.providers.get_mut(&provider_id) else {
-                continue;
-            };
-            match status {
-                FetchDegradedStatus::Unsupported => entry.mark_model_fetch_unsupported(),
-                FetchDegradedStatus::Failed(reason) => {
-                    entry.mark_model_fetch_failed_kept_existing(reason)
+            KeyCode::Char('q') => return Nav::Close,
+            KeyCode::Up | KeyCode::Char('k') => {
+                *cursor = crate::tui::nav::wrap_prev(*cursor, row_count);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *cursor = crate::tui::nav::wrap_next(*cursor, row_count);
+            }
+            KeyCode::Char('a') => {
+                return Nav::Replace(super::providers_page(ProvidersPage::Add(AddState::new())));
+            }
+            // `R` triggers the all-providers refetch from anywhere
+            // on the list; Enter on the button row does the same.
+            KeyCode::Char('R') => {
+                return self.start_fetch_all();
+            }
+            // `m` cycles the global on-unlisted-models-fetch policy
+            // (ask → keep → remove → ask): what a `/fetch-models` run
+            // does with config models that vanished from upstream.
+            KeyCode::Char('m') => {
+                self.config.on_unlisted_models_fetch =
+                    Some(cycle_on_unlisted(self.config.on_unlisted_models_fetch));
+                *status = Some(match self.save_config() {
+                    Ok(()) => format!(
+                        "on unlisted models: {}",
+                        on_unlisted_label(self.config.on_unlisted_models_fetch)
+                    ),
+                    Err(e) => format!("save failed: {e}"),
+                });
+                return Nav::Stay;
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if *cursor == 0 {
+                    return self.start_fetch_all();
+                }
+                if let Some(idx) = provider_idx
+                    && let Some(id) = ids.get(idx).cloned()
+                    && let Some(entry) = self.config.providers.get(&id)
+                {
+                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(
+                        EditState::new(id, entry.clone()),
+                    )));
                 }
             }
-        }
-    }
-}
-
-impl SettingsCx {
-    fn apply_fetch_all_policy(
-        &mut self,
-        merges: Vec<(
-            String,
-            Vec<ModelEntry>,
-            Vec<ModelEntry>,
-            ProviderModelCatalog,
-        )>,
-        policy: ModelMergePolicy,
-    ) {
-        for (provider_id, pre_fetch_models, remote, catalog) in merges {
-            if let Some(entry) = self.config.providers.get_mut(&provider_id) {
-                entry.models = merge_fetched_models_with_policy(
-                    entry.effective_template(&provider_id),
-                    &pre_fetch_models,
-                    remote,
-                    policy,
-                );
-                entry.models_fetched_at = Some(Utc::now());
-                entry.model_catalog = catalog;
-                entry.mark_model_fetch_success(catalog);
+            KeyCode::Char('d') => {
+                // Only arm/confirm when the cursor is on a
+                // provider row (not the refetch-all button).
+                if let Some(idx) = provider_idx {
+                    if *delete_pending {
+                        let id = ids[idx].clone();
+                        self.config.providers.remove(&id);
+                        let msg = match self.save_config() {
+                            Ok(()) => format!("deleted `{id}`"),
+                            Err(e) => format!("delete failed: {e}"),
+                        };
+                        let new_len = self.config.providers.len();
+                        // Keep the cursor on a valid provider row, or
+                        // the refetch button if none remain.
+                        let new_cursor = if new_len == 0 {
+                            0
+                        } else {
+                            (*cursor).min(new_len)
+                        };
+                        return Nav::Replace(super::providers_page(ProvidersPage::List {
+                            cursor: new_cursor,
+                            status: Some(msg),
+                            delete_pending: false,
+                        }));
+                    } else {
+                        *delete_pending = true;
+                        *status = Some(format!("press d again to delete `{}`", ids[idx]));
+                        return Nav::Stay;
+                    }
+                }
+                // Drop through to the post-match cleanup.
             }
+            _ => {}
         }
+        // Any non-`d` key (or `d` on a non-provider row) clears
+        // the pending-delete arm and the transient status.
+        if !pressed_d {
+            *delete_pending = false;
+            *status = None;
+        }
+        Nav::Stay
     }
-
     fn handle_providers_page_key(&mut self, key: KeyEvent, page: &mut ProvidersPage) -> Nav {
         match page {
             ProvidersPage::List {
                 cursor,
                 status,
                 delete_pending,
-            } => {
-                // Row 0 is the synthetic `[refetch provider models]` button;
-                // provider rows are offset by one (1..=ids.len()). The
-                // policy summary is rendered as non-selectable text.
-                let ids: Vec<String> = self.config.providers.keys().cloned().collect();
-                let row_count = ids.len() + 1;
-                let provider_idx = list_provider_idx(*cursor, ids.len());
-                let pressed_d = matches!(key.code, KeyCode::Char('d'));
-                match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                        return Nav::Back;
-                    }
-                    KeyCode::Char('q') => return Nav::Close,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *cursor = crate::tui::nav::wrap_prev(*cursor, row_count);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *cursor = crate::tui::nav::wrap_next(*cursor, row_count);
-                    }
-                    KeyCode::Char('a') => {
-                        return Nav::Replace(super::providers_page(ProvidersPage::Add(
-                            AddState::new(),
-                        )));
-                    }
-                    // `R` triggers the all-providers refetch from anywhere
-                    // on the list; Enter on the button row does the same.
-                    KeyCode::Char('R') => {
-                        return self.start_fetch_all();
-                    }
-                    // `m` cycles the global on-unlisted-models-fetch policy
-                    // (ask → keep → remove → ask): what a `/fetch-models` run
-                    // does with config models that vanished from upstream.
-                    KeyCode::Char('m') => {
-                        self.config.on_unlisted_models_fetch =
-                            Some(cycle_on_unlisted(self.config.on_unlisted_models_fetch));
-                        *status = Some(match self.save_config() {
-                            Ok(()) => format!(
-                                "on unlisted models: {}",
-                                on_unlisted_label(self.config.on_unlisted_models_fetch)
-                            ),
-                            Err(e) => format!("save failed: {e}"),
-                        });
-                        return Nav::Stay;
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        if *cursor == 0 {
-                            return self.start_fetch_all();
-                        }
-                        if let Some(idx) = provider_idx
-                            && let Some(id) = ids.get(idx).cloned()
-                            && let Some(entry) = self.config.providers.get(&id)
-                        {
-                            return Nav::Replace(super::providers_page(ProvidersPage::Edit(
-                                EditState::new(id, entry.clone()),
-                            )));
-                        }
-                    }
-                    KeyCode::Char('d') => {
-                        // Only arm/confirm when the cursor is on a
-                        // provider row (not the refetch-all button).
-                        if let Some(idx) = provider_idx {
-                            if *delete_pending {
-                                let id = ids[idx].clone();
-                                self.config.providers.remove(&id);
-                                let msg = match self.save_config() {
-                                    Ok(()) => format!("deleted `{id}`"),
-                                    Err(e) => format!("delete failed: {e}"),
-                                };
-                                let new_len = self.config.providers.len();
-                                // Keep the cursor on a valid provider row, or
-                                // the refetch button if none remain.
-                                let new_cursor = if new_len == 0 {
-                                    0
-                                } else {
-                                    (*cursor).min(new_len)
-                                };
-                                return Nav::Replace(super::providers_page(ProvidersPage::List {
-                                    cursor: new_cursor,
-                                    status: Some(msg),
-                                    delete_pending: false,
-                                }));
-                            } else {
-                                *delete_pending = true;
-                                *status = Some(format!("press d again to delete `{}`", ids[idx]));
-                                return Nav::Stay;
-                            }
-                        }
-                        // Drop through to the post-match cleanup.
-                    }
-                    _ => {}
-                }
-                // Any non-`d` key (or `d` on a non-provider row) clears
-                // the pending-delete arm and the transient status.
-                if !pressed_d {
-                    *delete_pending = false;
-                    *status = None;
-                }
-                Nav::Stay
-            }
+            } => self.handle_provider_list_key(key, cursor, status, delete_pending),
             ProvidersPage::Add(state) => self.handle_add_key(key, state),
             ProvidersPage::Edit(state) => self.handle_edit_key(key, state),
             ProvidersPage::Headers { editor, parent } => {
@@ -2218,7 +1330,7 @@ impl SettingsCx {
                 }
                 if matches!(key.code, KeyCode::Char('s'))
                     || (matches!(key.code, KeyCode::Enter)
-                        && grok_oauth_setup_is_confirmation(state))
+                        && OAuthSetupFlow::Grok(state).confirming())
                     || (matches!(key.code, KeyCode::Enter)
                         && state.cursor == 2
                         && !state.manual_mode)
@@ -2238,7 +1350,7 @@ impl SettingsCx {
                 }
                 if matches!(key.code, KeyCode::Char('s'))
                     || (matches!(key.code, KeyCode::Enter)
-                        && codex_oauth_setup_is_confirmation(state))
+                        && OAuthSetupFlow::Codex(state).confirming())
                     || (matches!(key.code, KeyCode::Enter)
                         && state.cursor == 1
                         && state.pending.is_none())
@@ -2385,164 +1497,7 @@ impl SettingsCx {
                 return Nav::Stay;
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                match actions.get(s.cursor).copied() {
-                    Some(EditAction::Url) => {
-                        s.field_buf = TextField::new(s.entry.url.clone());
-                        s.editing_field = Some(EditField::Url);
-                    }
-                    Some(EditAction::Headers) => {
-                        // Hand off to the Headers sub-page. We move
-                        // the EditState out via `mem::replace` so the
-                        // Headers page can return it intact on back.
-                        let editor = HeaderEditor::new(
-                            s.entry.headers.clone(),
-                            /* show_continue */ false,
-                        );
-                        let owned = std::mem::replace(
-                            s,
-                            EditState::new(String::new(), ProviderEntry::default()),
-                        );
-                        return Nav::Replace(super::providers_page(ProvidersPage::Headers {
-                            editor,
-                            parent: Box::new(owned),
-                        }));
-                    }
-                    Some(EditAction::CopilotAuth) => {
-                        // Hand off to the Copilot-auth screen, moving the
-                        // EditState out so it returns intact on back
-                        // (mirrors the Headers/Models/Settings rows). Same
-                        // screen the Add wizard's Copilot step shows.
-                        let state = CopilotSetupState::new();
-                        let owned = std::mem::replace(
-                            s,
-                            EditState::new(String::new(), ProviderEntry::default()),
-                        );
-                        return Nav::Replace(super::providers_page(ProvidersPage::CopilotSetup {
-                            state,
-                            parent: Box::new(owned),
-                        }));
-                    }
-                    Some(EditAction::GrokOAuthAuth) => {
-                        let state = Box::new(GrokOAuthSetupState::new());
-                        let owned = std::mem::replace(
-                            s,
-                            EditState::new(String::new(), ProviderEntry::default()),
-                        );
-                        return Nav::Replace(super::providers_page(
-                            ProvidersPage::GrokOAuthSetup {
-                                state,
-                                parent: Box::new(owned),
-                            },
-                        ));
-                    }
-                    Some(EditAction::CodexOAuthAuth) => {
-                        let state = Box::new(CodexOAuthSetupState::new());
-                        let owned = std::mem::replace(
-                            s,
-                            EditState::new(String::new(), ProviderEntry::default()),
-                        );
-                        return Nav::Replace(super::providers_page(
-                            ProvidersPage::CodexOAuthSetup {
-                                state,
-                                parent: Box::new(owned),
-                            },
-                        ));
-                    }
-                    Some(EditAction::Models) => {
-                        // Hand off to the Models sub-page, moving the
-                        // EditState out so the sub-page can return it
-                        // intact on back (mirrors the Headers row).
-                        let editor = Box::new(ModelEditor::new(
-                            s.entry
-                                .effective_template(&s.provider_id)
-                                .map(str::to_owned),
-                            s.entry.models.clone(),
-                        ));
-                        let owned = std::mem::replace(
-                            s,
-                            EditState::new(String::new(), ProviderEntry::default()),
-                        );
-                        return Nav::Replace(super::providers_page(ProvidersPage::Models {
-                            editor,
-                            parent: Box::new(owned),
-                        }));
-                    }
-                    Some(EditAction::Settings) => {
-                        // Hand off to the provider-settings sub-page, moving
-                        // the EditState out so it returns intact on back
-                        // (mirrors the Headers/Models rows).
-                        let settings = SettingsEditor::for_provider(&s.provider_id, &s.entry)
-                            .with_trust_confirm_lockout_ms(self.extended.dialog.lockout_ms);
-                        let owned = std::mem::replace(
-                            s,
-                            EditState::new(String::new(), ProviderEntry::default()),
-                        );
-                        return Nav::Replace(super::providers_page(
-                            ProvidersPage::ProviderSettings {
-                                editor: settings,
-                                parent: Box::new(owned),
-                            },
-                        ));
-                    }
-                    Some(EditAction::Favorite) => {
-                        let new = !s.entry.favorite.unwrap_or(false);
-                        s.entry.favorite = if new { Some(true) } else { None };
-                        s.status = Some(if new {
-                            "favorite ✓ (unsaved — s to save)".into()
-                        } else {
-                            "favorite removed (unsaved — s to save)".into()
-                        });
-                    }
-                    Some(EditAction::Refetch) => {
-                        // Same as 'r'
-                        let status = self.commit_edit_entry(s);
-                        s.fetch = Some(FetchHandle::spawn(
-                            s.provider_id.clone(),
-                            (*s.entry).clone(),
-                        ));
-                        s.status = if status
-                            .as_deref()
-                            .is_some_and(|msg| msg.starts_with("save failed:"))
-                        {
-                            status
-                        } else {
-                            Some("refetching /models…".into())
-                        };
-                    }
-                    Some(EditAction::Delete) => {
-                        if s.delete_pending {
-                            self.config.providers.remove(&s.provider_id);
-                            let saved = self.save_config();
-                            let msg = match saved {
-                                Ok(()) => format!("deleted `{}`", s.provider_id),
-                                Err(e) => format!("delete failed: {e}"),
-                            };
-                            return Nav::Replace(super::providers_page(ProvidersPage::List {
-                                cursor: initial_list_cursor(&self.config),
-                                status: Some(msg),
-                                delete_pending: false,
-                            }));
-                        } else {
-                            s.delete_pending = true;
-                            s.status = Some("press Enter again to confirm delete".into());
-                            return Nav::Stay;
-                        }
-                    }
-                    Some(EditAction::Save) => {
-                        // `[save changes]` — commit to disk and stay.
-                        s.status = self.commit_edit_entry(s);
-                    }
-                    Some(EditAction::Back) => {
-                        // Back to list — auto-commit so nothing is lost.
-                        let status = self.commit_edit_entry(s);
-                        return Nav::Replace(super::providers_page(ProvidersPage::List {
-                            cursor: initial_list_cursor(&self.config),
-                            status,
-                            delete_pending: false,
-                        }));
-                    }
-                    None => {}
-                }
+                return self.handle_edit_menu_action(s, actions.get(s.cursor).copied());
             }
             _ => {}
         }
@@ -2550,6 +1505,147 @@ impl SettingsCx {
         Nav::Stay
     }
 
+    fn handle_edit_menu_action(&mut self, s: &mut EditState, action: Option<EditAction>) -> Nav {
+        match action {
+            Some(EditAction::Url) => {
+                s.field_buf = TextField::new(s.entry.url.clone());
+                s.editing_field = Some(EditField::Url);
+            }
+            Some(EditAction::Headers) => {
+                // Hand off to the Headers sub-page. We move
+                // the EditState out via `mem::replace` so the
+                // Headers page can return it intact on back.
+                let editor =
+                    HeaderEditor::new(s.entry.headers.clone(), /* show_continue */ false);
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                return Nav::Replace(super::providers_page(ProvidersPage::Headers {
+                    editor,
+                    parent: Box::new(owned),
+                }));
+            }
+            Some(EditAction::CopilotAuth) => {
+                // Hand off to the Copilot-auth screen, moving the
+                // EditState out so it returns intact on back
+                // (mirrors the Headers/Models/Settings rows). Same
+                // screen the Add wizard's Copilot step shows.
+                let state = CopilotSetupState::new();
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                return Nav::Replace(super::providers_page(ProvidersPage::CopilotSetup {
+                    state,
+                    parent: Box::new(owned),
+                }));
+            }
+            Some(EditAction::GrokOAuthAuth) => {
+                let state = Box::new(GrokOAuthSetupState::new());
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                return Nav::Replace(super::providers_page(ProvidersPage::GrokOAuthSetup {
+                    state,
+                    parent: Box::new(owned),
+                }));
+            }
+            Some(EditAction::CodexOAuthAuth) => {
+                let state = Box::new(CodexOAuthSetupState::new());
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                return Nav::Replace(super::providers_page(ProvidersPage::CodexOAuthSetup {
+                    state,
+                    parent: Box::new(owned),
+                }));
+            }
+            Some(EditAction::Models) => {
+                // Hand off to the Models sub-page, moving the
+                // EditState out so the sub-page can return it
+                // intact on back (mirrors the Headers row).
+                let editor = Box::new(ModelEditor::new(
+                    s.entry
+                        .effective_template(&s.provider_id)
+                        .map(str::to_owned),
+                    s.entry.models.clone(),
+                ));
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                return Nav::Replace(super::providers_page(ProvidersPage::Models {
+                    editor,
+                    parent: Box::new(owned),
+                }));
+            }
+            Some(EditAction::Settings) => {
+                // Hand off to the provider-settings sub-page, moving
+                // the EditState out so it returns intact on back
+                // (mirrors the Headers/Models rows).
+                let settings = SettingsEditor::for_provider(&s.provider_id, &s.entry)
+                    .with_trust_confirm_lockout_ms(self.extended.dialog.lockout_ms);
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                return Nav::Replace(super::providers_page(ProvidersPage::ProviderSettings {
+                    editor: settings,
+                    parent: Box::new(owned),
+                }));
+            }
+            Some(EditAction::Favorite) => {
+                let new = !s.entry.favorite.unwrap_or(false);
+                s.entry.favorite = if new { Some(true) } else { None };
+                s.status = Some(if new {
+                    "favorite ✓ (unsaved — s to save)".into()
+                } else {
+                    "favorite removed (unsaved — s to save)".into()
+                });
+            }
+            Some(EditAction::Refetch) => {
+                // Same as 'r'
+                let status = self.commit_edit_entry(s);
+                s.fetch = Some(FetchHandle::spawn(
+                    s.provider_id.clone(),
+                    (*s.entry).clone(),
+                ));
+                s.status = if status
+                    .as_deref()
+                    .is_some_and(|msg| msg.starts_with("save failed:"))
+                {
+                    status
+                } else {
+                    Some("refetching /models…".into())
+                };
+            }
+            Some(EditAction::Delete) => {
+                if s.delete_pending {
+                    self.config.providers.remove(&s.provider_id);
+                    let saved = self.save_config();
+                    let msg = match saved {
+                        Ok(()) => format!("deleted `{}`", s.provider_id),
+                        Err(e) => format!("delete failed: {e}"),
+                    };
+                    return Nav::Replace(super::providers_page(ProvidersPage::List {
+                        cursor: initial_list_cursor(&self.config),
+                        status: Some(msg),
+                        delete_pending: false,
+                    }));
+                } else {
+                    s.delete_pending = true;
+                    s.status = Some("press Enter again to confirm delete".into());
+                    return Nav::Stay;
+                }
+            }
+            Some(EditAction::Save) => {
+                // `[save changes]` — commit to disk and stay.
+                s.status = self.commit_edit_entry(s);
+            }
+            Some(EditAction::Back) => {
+                // Back to list — auto-commit so nothing is lost.
+                let status = self.commit_edit_entry(s);
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
+                    cursor: initial_list_cursor(&self.config),
+                    status,
+                    delete_pending: false,
+                }));
+            }
+            None => {}
+        }
+        Nav::Stay
+    }
     /// Handle keys on the Headers sub-page. All keys go to the
     /// [`HeaderEditor`] until it signals `Back`; on back, copy the
     /// editor's rows into `parent.entry.headers` and return to the
@@ -2763,104 +1859,6 @@ impl SettingsCx {
                 Nav::Replace(super::providers_page(ProvidersPage::Edit(owned)))
             }
         }
-    }
-
-    /// Enter the all-providers refetch flow, reusing the existing
-    /// [`FetchAll`](ProvidersPage::FetchAll) page and its per-provider
-    /// [`FetchHandle`] machinery. No-op (with a status) when no providers
-    /// are configured; never stacks a second concurrent run because the
-    /// only entry point is the List page and entering replaces it.
-    fn start_fetch_all(&mut self) -> Nav {
-        if self.config.providers.is_empty() {
-            return Nav::Replace(super::providers_page(ProvidersPage::List {
-                cursor: 0,
-                status: Some("no providers configured".into()),
-                delete_pending: false,
-            }));
-        }
-        let state = FetchAllState::spawn(&self.config);
-        Nav::Replace(super::providers_page(ProvidersPage::FetchAll(state)))
-    }
-
-    fn handle_fetch_all_key(&mut self, key: KeyEvent, s: &mut FetchAllState) -> Nav {
-        // While the per-provider fetches are still running, the only
-        // accepted key is Esc (cancel + return). The prompt rows aren't
-        // live yet — `tick`/`drain_fetch_all` populates them once every
-        // handle has reported.
-        if s.is_fetching() {
-            if matches!(key.code, KeyCode::Char('q')) {
-                return Nav::Close;
-            }
-            if matches!(key.code, KeyCode::Esc) {
-                return Nav::Replace(super::providers_page(ProvidersPage::List {
-                    cursor: initial_list_cursor(&self.config),
-                    status: Some("refetch-all cancelled".into()),
-                    delete_pending: false,
-                }));
-            }
-            return Nav::Stay;
-        }
-
-        // If the fetch finished but no model drifted out of the upstream
-        // list, there's nothing to rule on — any key returns to the list
-        // with a per-provider summary.
-        if s.unlisted.is_empty() {
-            return Nav::Replace(super::providers_page(ProvidersPage::List {
-                cursor: initial_list_cursor(&self.config),
-                status: Some(fetch_all_summary(s)),
-                delete_pending: false,
-            }));
-        }
-
-        match key.code {
-            KeyCode::Char('q') => return Nav::Close,
-            KeyCode::Esc => {
-                return Nav::Replace(super::providers_page(ProvidersPage::List {
-                    cursor: initial_list_cursor(&self.config),
-                    status: Some("refetch-all cancelled".into()),
-                    delete_pending: false,
-                }));
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                // 3 rows: confirm / cancel / "don't ask again".
-                s.cursor = crate::tui::nav::wrap_prev(s.cursor, 3);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                s.cursor = crate::tui::nav::wrap_next(s.cursor, 3);
-            }
-            KeyCode::Char(' ') if s.cursor == 2 => {
-                s.dont_ask_again = !s.dont_ask_again;
-            }
-            KeyCode::Enter => {
-                let pick = match s.cursor {
-                    0 => OnUnlistedModelsFetch::Keep,
-                    1 => OnUnlistedModelsFetch::Remove,
-                    _ => OnUnlistedModelsFetch::Keep,
-                };
-                let policy = match pick {
-                    OnUnlistedModelsFetch::Remove => ModelMergePolicy::RemoveUnlisted,
-                    OnUnlistedModelsFetch::Ask | OnUnlistedModelsFetch::Keep => {
-                        ModelMergePolicy::KeepUnlisted
-                    }
-                };
-                self.apply_fetch_all_policy(fetch_all_merges(s), policy);
-                if s.dont_ask_again {
-                    self.config.on_unlisted_models_fetch = Some(pick);
-                }
-                let summary = fetch_all_summary(s);
-                let status = match self.save_config() {
-                    Ok(()) => summary,
-                    Err(e) => format!("save failed: {e}"),
-                };
-                return Nav::Replace(super::providers_page(ProvidersPage::List {
-                    cursor: initial_list_cursor(&self.config),
-                    status: Some(status),
-                    delete_pending: false,
-                }));
-            }
-            _ => {}
-        }
-        Nav::Stay
     }
 
     fn handle_fetch_one_prompt_key(&mut self, key: KeyEvent, s: &mut FetchOnePromptState) -> Nav {
@@ -3132,10 +2130,10 @@ impl SettingsCx {
                 self.render_copilot_setup(frame, area, state)
             }
             ProvidersPage::GrokOAuthSetup { state, .. } => {
-                render_grok_oauth_setup(frame, area, state)
+                render_oauth_setup(frame, area, OAuthSetupFlow::Grok(state))
             }
             ProvidersPage::CodexOAuthSetup { state, .. } => {
-                render_codex_oauth_setup(frame, area, state)
+                render_oauth_setup(frame, area, OAuthSetupFlow::Codex(state))
             }
         }
     }
@@ -3230,13 +2228,7 @@ impl SettingsCx {
     }
 
     fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(Span::styled(
-            "Set up GitHub Copilot auth".to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::default());
-        render_copilot_setup_body(&mut lines, s);
+        let lines = oauth_setup_lines(OAuthSetupFlow::Copilot(s));
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_lines(
             frame,
@@ -3333,7 +2325,7 @@ impl SettingsCx {
                     ),
                 ]));
                 lines.push(Line::default());
-                render_copilot_setup_body(&mut lines, state);
+                render_oauth_body(&mut lines, OAuthSetupFlow::Copilot(state));
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
                     "After this step we'll fetch the model list automatically. \
@@ -3356,7 +2348,7 @@ impl SettingsCx {
                     muted,
                 )));
                 lines.push(Line::default());
-                render_grok_oauth_setup_body(&mut lines, state);
+                render_oauth_body(&mut lines, OAuthSetupFlow::Grok(state));
             }
             AddStep::CodexOAuthAuth(state) => {
                 let t = s.template.expect("template chosen");
@@ -3376,7 +2368,7 @@ impl SettingsCx {
                     muted,
                 )));
                 lines.push(Line::default());
-                render_codex_oauth_setup_body(&mut lines, state);
+                render_oauth_body(&mut lines, OAuthSetupFlow::Codex(state));
             }
             AddStep::Saving | AddStep::Fetching => {
                 lines.push(Line::from(Span::styled(
@@ -4000,513 +2992,6 @@ impl SettingsCx {
 /// Render the body of the Copilot auth-setup affordance (everything
 /// after the bold title). Used both by the standalone CopilotSetup
 /// page and by the embedded panel inside the Add-Provider Copilot flow.
-fn render_copilot_setup_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
-    let red = Style::default().fg(Color::Red);
-    let green = Style::default().fg(Color::Green);
-    let cyan = Style::default().fg(Color::Cyan);
-
-    if let Some(outcome) = &s.outcome {
-        // Post-action result screen.
-        match outcome {
-            Ok(msg) => {
-                lines.push(Line::from(Span::styled(msg.clone(), green)));
-            }
-            Err(e) => {
-                lines.push(Line::from(Span::styled(format!("Failed: {e}"), red)));
-            }
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "Press Enter to continue.".to_string(),
-            muted,
-        )));
-        return;
-    }
-
-    match (s.shell, &s.rc_path, s.already_configured) {
-        (Some(shell), Some(rc_path), false) => {
-            lines.push(Line::from(Span::styled(
-                format!("Detected shell: {}", shell.name()),
-                muted,
-            )));
-            lines.push(Line::from(vec![
-                Span::styled("Will append to: ".to_string(), muted),
-                Span::styled(rc_path.display().to_string(), cyan),
-            ]));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Lines to be added:".to_string(),
-                muted,
-            )));
-            for line in copilot_setup::append_block(shell).lines() {
-                if line.is_empty() {
-                    lines.push(Line::default());
-                } else {
-                    lines.push(Line::from(Span::styled(format!("    {line}"), cyan)));
-                }
-            }
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "We'll also run `gh auth token` once and set GH_TOKEN in this \
-                     cockpit session so Copilot works without restarting."
-                    .to_string(),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter to apply, Esc to cancel.".to_string(),
-                yellow,
-            )));
-        }
-        (Some(shell), Some(rc_path), true) => {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} already contains the cockpit Copilot-auth export.",
-                    rc_path.display()
-                ),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "To re-apply: remove the marker block from your {} and try again.",
-                    shell.rc_filename()
-                ),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter or Esc to return.".to_string(),
-                yellow,
-            )));
-        }
-        _ => {
-            // Unsupported shell or unknown $HOME — show manual
-            // instructions instead of a write button.
-            lines.push(Line::from(Span::styled(
-                "Couldn't detect a supported shell ($SHELL is unset, or it's \
-                     not zsh/bash/fish). Set GH_TOKEN manually with one of:"
-                    .to_string(),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "  POSIX shell (zsh/bash/sh):".to_string(),
-                muted,
-            )));
-            lines.push(Line::from(Span::styled(
-                "    export GH_TOKEN=$(gh auth token)".to_string(),
-                cyan,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled("  fish:".to_string(), muted)));
-            lines.push(Line::from(Span::styled(
-                "    set -Ux GH_TOKEN (gh auth token)".to_string(),
-                cyan,
-            )));
-            if cfg!(windows) {
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "  Windows PowerShell ($PROFILE):".to_string(),
-                    muted,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "    $env:GH_TOKEN = (gh auth token)".to_string(),
-                    cyan,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  Windows persistent (User scope):".to_string(),
-                    muted,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "    [Environment]::SetEnvironmentVariable(\"GH_TOKEN\", \
-                         (gh auth token), \"User\")"
-                        .to_string(),
-                    cyan,
-                )));
-            }
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter or Esc to return.".to_string(),
-                yellow,
-            )));
-        }
-    }
-}
-
-fn handle_grok_oauth_setup_key(
-    key: KeyEvent,
-    s: &mut GrokOAuthSetupState,
-) -> (bool, Option<OAuthActionRequest>) {
-    if s.pending && matches!(key.code, KeyCode::Esc) {
-        s.pending = false;
-        s.status = Some(Ok("OAuth login cancelled".to_string()));
-        return (false, Some(OAuthActionRequest::GrokCancel));
-    }
-    if s.manual_mode {
-        match key.code {
-            KeyCode::Esc => {
-                s.manual_mode = false;
-                s.manual_input.set("");
-                s.pending = false;
-                return (false, Some(OAuthActionRequest::GrokCancel));
-            }
-            KeyCode::Enter => {
-                let Some(login) = s.manual_login.clone() else {
-                    s.status = Some(Err("manual OAuth session was not initialized".into()));
-                    s.manual_mode = false;
-                    return (false, None);
-                };
-                let input = s.manual_input.text().to_string();
-                if input.trim().is_empty() {
-                    s.status = Some(Err("paste callback URL or code first".to_string()));
-                    return (false, None);
-                }
-                s.pending = true;
-                s.status = Some(Ok("Completing xAI OAuth login...".to_string()));
-                return (
-                    false,
-                    Some(OAuthActionRequest::GrokComplete { login, input }),
-                );
-            }
-            _ => {
-                s.manual_input.handle_key(key);
-                return (false, None);
-            }
-        }
-    }
-
-    if matches!(key.code, KeyCode::Char('c')) {
-        copy_oauth_url_with(
-            s.authorize_url.as_deref(),
-            &mut s.status,
-            crate::clipboard::copy_plain,
-        );
-        return (false, None);
-    }
-
-    match key.code {
-        KeyCode::Esc => (true, Some(OAuthActionRequest::GrokCancel)),
-        KeyCode::Up | KeyCode::Char('k') => {
-            let len = if grok_oauth_setup_is_confirmation(s) {
-                1
-            } else {
-                3
-            };
-            s.cursor = oauth_option_cursor_prev(s.cursor, len);
-            (false, None)
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let len = if grok_oauth_setup_is_confirmation(s) {
-                1
-            } else {
-                3
-            };
-            s.cursor = oauth_option_cursor_next(s.cursor, len);
-            (false, None)
-        }
-        KeyCode::Enter => {
-            if grok_oauth_setup_is_confirmation(s) {
-                s.cursor = 0;
-                return (false, None);
-            }
-            if s.pending {
-                return (false, None);
-            }
-            if s.cursor == 0 || s.cursor == 1 {
-                let selection = if s.cursor == 1 {
-                    GrokLoginSelection::ManualOnly
-                } else {
-                    grok_login_selection(s.ssh_manual_only)
-                };
-                s.pending = true;
-                s.manual_mode = matches!(selection, GrokLoginSelection::ManualOnly);
-                s.manual_input.set("");
-                s.status = Some(Ok(if s.cursor == 0 && !s.ssh_manual_only {
-                    "Preparing xAI OAuth login...".to_string()
-                } else if s.ssh_manual_only {
-                    "SSH detected; browser auto-open is unavailable here".to_string()
-                } else {
-                    "Preparing manual xAI OAuth login...".to_string()
-                }));
-                return (
-                    false,
-                    Some(OAuthActionRequest::GrokBegin {
-                        is_ssh: matches!(selection, GrokLoginSelection::ManualOnly),
-                    }),
-                );
-            }
-            (false, None)
-        }
-        _ => (false, None),
-    }
-}
-
-fn grok_oauth_setup_is_confirmation(s: &GrokOAuthSetupState) -> bool {
-    oauth_setup_confirming_logged_in(s.logged_in, s.pending, s.manual_mode)
-}
-
-fn render_grok_oauth_setup(frame: &mut Frame, area: Rect, s: &GrokOAuthSetupState) {
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Set up Grok subscription auth".to_string(),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::default());
-    render_grok_oauth_setup_body(&mut lines, s);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-fn render_grok_oauth_setup_body(lines: &mut Vec<Line<'static>>, s: &GrokOAuthSetupState) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
-    let green = Style::default().fg(Color::Green);
-    let red = Style::default().fg(Color::Red);
-    let cyan = Style::default().fg(Color::Cyan);
-
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", muted),
-        Span::styled(
-            if s.logged_in {
-                "logged in"
-            } else {
-                "not logged in"
-            }
-            .to_string(),
-            if s.logged_in { green } else { red },
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "Uses your SuperGrok subscription quota via xAI's sanctioned OAuth flow.".to_string(),
-        muted,
-    )));
-    lines.push(Line::default());
-    if let Some(status) = &s.status {
-        match status {
-            Ok(msg) => lines.push(Line::from(Span::styled(msg.clone(), cyan))),
-            Err(msg) => lines.push(Line::from(Span::styled(format!("Failed: {msg}"), red))),
-        }
-        lines.push(Line::default());
-    }
-    if s.pending {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} Waiting for OAuth response...",
-                spinner_glyph(s.spinner_tick)
-            ),
-            yellow,
-        )));
-        lines.push(Line::default());
-    }
-    if let Some(url) = &s.authorize_url {
-        lines.push(Line::from(Span::styled(
-            "Open this URL in a browser, then paste the callback URL or code below.".to_string(),
-            muted,
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("Open: ", muted),
-            Span::styled(url.clone(), cyan),
-        ]));
-        lines.push(Line::from(Span::styled("c copy URL".to_string(), muted)));
-        lines.push(Line::default());
-    }
-    if s.manual_mode {
-        lines.push(Line::from(Span::styled(
-            "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
-            muted,
-        )));
-        lines.push(Line::from(Span::styled(
-            s.manual_input.text().to_string(),
-            cyan,
-        )));
-        return;
-    }
-    let opts: &[&str] = if grok_oauth_setup_is_confirmation(s) {
-        &["continue"]
-    } else {
-        &["log in", "manual paste", "skip / continue"]
-    };
-    for (i, label) in opts.iter().enumerate() {
-        let marker = if i == s.cursor { "▸ " } else { "  " };
-        let style = if i == s.cursor {
-            yellow.add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(format!("[{label}]"), style),
-        ]));
-    }
-}
-
-fn handle_codex_oauth_setup_key(
-    key: KeyEvent,
-    s: &mut CodexOAuthSetupState,
-) -> (bool, Option<OAuthActionRequest>) {
-    if matches!(key.code, KeyCode::Char('c')) {
-        copy_oauth_url_with(
-            s.pending
-                .as_ref()
-                .map(|login| login.verification_uri.as_str()),
-            &mut s.status,
-            crate::clipboard::copy_plain,
-        );
-        return (false, None);
-    }
-    if s.polling && matches!(key.code, KeyCode::Esc) {
-        s.polling = false;
-        s.status = Some(Ok("Codex OAuth polling cancelled".to_string()));
-        return (false, Some(OAuthActionRequest::CodexCancel));
-    }
-    match key.code {
-        KeyCode::Esc => (true, Some(OAuthActionRequest::CodexCancel)),
-        KeyCode::Up | KeyCode::Char('k') => {
-            let len = if codex_oauth_setup_is_confirmation(s) {
-                1
-            } else {
-                2
-            };
-            s.cursor = oauth_option_cursor_prev(s.cursor, len);
-            (false, None)
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let len = if codex_oauth_setup_is_confirmation(s) {
-                1
-            } else {
-                2
-            };
-            s.cursor = oauth_option_cursor_next(s.cursor, len);
-            (false, None)
-        }
-        KeyCode::Enter => {
-            if codex_oauth_setup_is_confirmation(s) {
-                s.cursor = 0;
-                return (false, None);
-            }
-            if s.cursor == 0 {
-                if s.polling {
-                    return (false, None);
-                }
-                if let Some(login) = s.pending.clone() {
-                    s.polling = true;
-                    s.status = Some(Ok("Waiting for Codex approval...".to_string()));
-                    return (false, Some(OAuthActionRequest::CodexPoll(login)));
-                } else {
-                    s.polling = true;
-                    s.status = Some(Ok("Requesting Codex device code...".to_string()));
-                    return (false, Some(OAuthActionRequest::CodexBegin));
-                }
-            }
-            (false, None)
-        }
-        _ => (false, None),
-    }
-}
-
-fn codex_oauth_setup_is_confirmation(s: &CodexOAuthSetupState) -> bool {
-    oauth_setup_confirming_logged_in(s.logged_in, s.polling, false)
-}
-
-fn render_codex_oauth_setup(frame: &mut Frame, area: Rect, s: &CodexOAuthSetupState) {
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Set up Codex subscription auth".to_string(),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::default());
-    render_codex_oauth_setup_body(&mut lines, s);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-fn render_codex_oauth_setup_body(lines: &mut Vec<Line<'static>>, s: &CodexOAuthSetupState) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
-    let green = Style::default().fg(Color::Green);
-    let red = Style::default().fg(Color::Red);
-    let cyan = Style::default().fg(Color::Cyan);
-
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", muted),
-        Span::styled(
-            if s.logged_in {
-                "logged in"
-            } else {
-                "not logged in"
-            }
-            .to_string(),
-            if s.logged_in { green } else { red },
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "Uses your ChatGPT Plus/Pro subscription quota via OpenAI's documented Codex agent login."
-            .to_string(),
-        muted,
-    )));
-    lines.push(Line::from(Span::styled(
-        "Separate from the Codex CLI credential store; re-login if CLI use causes refresh-token contention."
-            .to_string(),
-        muted,
-    )));
-    lines.push(Line::default());
-    if let Some(status) = &s.status {
-        match status {
-            Ok(msg) => lines.push(Line::from(Span::styled(msg.clone(), cyan))),
-            Err(msg) => lines.push(Line::from(Span::styled(format!("Failed: {msg}"), red))),
-        }
-        lines.push(Line::default());
-    }
-    if let Some(login) = &s.pending {
-        lines.push(Line::from(Span::styled(
-            "Open this URL in any browser, including a different machine from this terminal."
-                .to_string(),
-            muted,
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("Open: ", muted),
-            Span::styled(login.verification_uri.clone(), cyan),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Code: ", muted),
-            Span::styled(login.user_code.clone(), yellow.add_modifier(Modifier::BOLD)),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "After approving, poll here; Cockpit waits for the full 15 minute device-code window. c copies the URL."
-                .to_string(),
-            muted,
-        )));
-        lines.push(Line::default());
-    }
-    if s.polling {
-        lines.push(Line::from(Span::styled(
-            format!("{} Waiting for approval...", spinner_glyph(s.spinner_tick)),
-            yellow,
-        )));
-        lines.push(Line::default());
-    }
-    let opts: &[&str] = if codex_oauth_setup_is_confirmation(s) {
-        &["continue"]
-    } else if s.pending.is_some() {
-        &["poll for approval", "skip / continue"]
-    } else {
-        &["log in", "skip / continue"]
-    };
-    for (i, label) in opts.iter().enumerate() {
-        let marker = if i == s.cursor { "▸ " } else { "  " };
-        let style = if i == s.cursor {
-            yellow.add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(format!("[{label}]"), style),
-        ]));
-    }
-}
-
 fn spinner_glyph(tick: usize) -> &'static str {
     ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][tick % 10]
 }
@@ -4853,169 +3338,6 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
     lines.push(Line::from(spans));
 }
 
-/// Render the per-provider outcome rows of an all-providers refetch:
-/// `✓ provider — N model(s)`, `· provider — no /models endpoint`, or
-/// `✗ provider — <error>`. Shared by the in-flight and completed views.
-fn render_fetch_all_results(
-    lines: &mut Vec<Line<'static>>,
-    s: &FetchAllState,
-    muted: Style,
-    green: Style,
-    red: Style,
-) {
-    for f in &s.finished {
-        let (glyph, text, style) = match &f.outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => (
-                "✓",
-                format!(
-                    "{} — {} model(s){}",
-                    f.provider_id,
-                    models.len(),
-                    provider_catalog_suffix(*catalog)
-                ),
-                green,
-            ),
-            Ok(FetchOutcome::Unsupported) => (
-                "·",
-                format!("{} — no /models endpoint (skipped)", f.provider_id),
-                muted,
-            ),
-            Ok(FetchOutcome::FallbackAvailable { reason, .. }) => (
-                "✗",
-                format!(
-                    "{} — live fetch failed; fallback available: {reason}",
-                    f.provider_id,
-                    reason = redact_model_fetch_reason(reason.as_str())
-                ),
-                red,
-            ),
-            Err(e) => (
-                "✗",
-                format!(
-                    "{} — {}",
-                    f.provider_id,
-                    redact_model_fetch_reason(e.as_str())
-                ),
-                red,
-            ),
-        };
-        lines.push(Line::from(vec![
-            Span::raw(format!("  {glyph} ")),
-            Span::styled(text, style),
-        ]));
-    }
-}
-
-/// One-line per-provider summary of a finished all-providers refetch:
-/// how many succeeded, how many failed, and (when any did) the first
-/// failing provider so the user has a thread to pull on.
-fn fetch_all_summary(s: &FetchAllState) -> String {
-    let total = s.finished.len();
-    let failed: Vec<&FetchedSummary> = s
-        .finished
-        .iter()
-        .filter(|f| {
-            f.outcome.is_err() || matches!(f.outcome, Ok(FetchOutcome::FallbackAvailable { .. }))
-        })
-        .collect();
-    let ok = total - failed.len();
-    if failed.is_empty() {
-        format!("refetched /models for {ok}/{total} provider(s)")
-    } else {
-        let first = &failed[0];
-        let reason = match &first.outcome {
-            Err(e) => redact_model_fetch_reason(e.as_str()),
-            Ok(FetchOutcome::FallbackAvailable { reason, .. }) => {
-                redact_model_fetch_reason(reason.as_str())
-            }
-            Ok(_) => String::new(),
-        };
-        format!(
-            "refetched {ok}/{total} provider(s); {} failed (e.g. `{}`: {reason})",
-            failed.len(),
-            first.provider_id,
-        )
-    }
-}
-
-fn fetch_all_merges(
-    s: &FetchAllState,
-) -> Vec<(
-    String,
-    Vec<ModelEntry>,
-    Vec<ModelEntry>,
-    ProviderModelCatalog,
-)> {
-    s.finished
-        .iter()
-        .filter_map(|summary| match &summary.outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => Some((
-                summary.provider_id.clone(),
-                s.pre_fetch_models
-                    .get(&summary.provider_id)
-                    .cloned()
-                    .unwrap_or_default(),
-                models.clone(),
-                *catalog,
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDegradedStatus)> {
-    let Some(ProvidersPage::FetchAll(s)) = dialog.page.downcast_ref::<ProvidersPage>() else {
-        return Vec::new();
-    };
-    s.finished
-        .iter()
-        .filter_map(|summary| match &summary.outcome {
-            Ok(FetchOutcome::Unsupported) => Some((
-                summary.provider_id.clone(),
-                FetchDegradedStatus::Unsupported,
-            )),
-            Ok(FetchOutcome::FallbackAvailable { reason, .. }) => Some((
-                summary.provider_id.clone(),
-                FetchDegradedStatus::Failed(redact_model_fetch_reason(reason.as_str())),
-            )),
-            Err(error) => Some((
-                summary.provider_id.clone(),
-                FetchDegradedStatus::Failed(redact_model_fetch_reason(error.as_str())),
-            )),
-            Ok(FetchOutcome::Models { .. }) => None,
-        })
-        .collect()
-}
-
-/// Build the (provider_id, model_id) set of configured models that are
-/// absent from the freshly-fetched upstream list, across every provider
-/// that reported a successful `Models` outcome in the active FetchAll.
-fn compute_unlisted(dialog: &SettingsDialog) -> Vec<(String, String)> {
-    let Some(ProvidersPage::FetchAll(s)) = dialog.page.downcast_ref::<ProvidersPage>() else {
-        return Vec::new();
-    };
-    let mut unlisted: Vec<(String, String)> = Vec::new();
-    for summary in &s.finished {
-        if let Ok(FetchOutcome::Models { models: remote, .. }) = &summary.outcome
-            && let Some(existing) = s.pre_fetch_models.get(&summary.provider_id)
-        {
-            for model_id in compute_unlisted_for_models(existing, remote) {
-                unlisted.push((summary.provider_id.clone(), model_id));
-            }
-        }
-    }
-    unlisted
-}
-
-fn compute_unlisted_for_models(existing: &[ModelEntry], remote: &[ModelEntry]) -> Vec<String> {
-    existing
-        .iter()
-        .filter(|m| !m.manual)
-        .filter(|m| !remote.iter().any(|r| r.id == m.id))
-        .map(|m| m.id.clone())
-        .collect()
-}
-
 /// Build the `ProvidersPage` for `/model-settings`: the active model's
 /// model-settings sub-dialog (implementation note). Falls
 /// back to the providers list with an inline status when no model is active
@@ -5099,1415 +3421,7 @@ fn valid_id(s: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::providers::ProvidersConfig;
-    use crate::config::providers::{ConfigDoc, ProviderEntry};
-    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
-    use std::collections::BTreeMap;
-
-    fn provider_with_models(models: Vec<ModelEntry>) -> ProviderEntry {
-        ProviderEntry {
-            url: "https://api.example.com/v1".to_string(),
-            models,
-            ..Default::default()
-        }
-    }
-
-    fn model(id: &str, manual: bool) -> ModelEntry {
-        ModelEntry {
-            id: id.to_string(),
-            manual,
-            ..Default::default()
-        }
-    }
-
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::empty(),
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }
-    }
-
-    fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        std::fs::write(&path, "{}").unwrap();
-        let mut doc = ConfigDoc::load(&path).unwrap();
-        doc.write(&config).unwrap();
-        let dialog = SettingsDialog::open(path);
-        (tmp, dialog)
-    }
-
-    fn break_config_saving(dialog: &SettingsDialog) {
-        if let Some(parent) = dialog.config_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&dialog.config_path, "[").unwrap();
-    }
-
-    fn load_provider(path: &std::path::Path, id: &str) -> ProviderEntry {
-        ConfigDoc::load(path).unwrap().providers().providers[id].clone()
-    }
-
-    fn replaced_provider(nav: &Nav) -> &ProvidersPage {
-        let Nav::Replace(page) = nav else {
-            panic!("expected replace nav");
-        };
-        page.downcast_ref::<ProvidersPage>()
-            .expect("expected providers page replacement")
-    }
-
-    fn one_provider_config(policy: Option<OnUnlistedModelsFetch>) -> ProvidersConfig {
-        let mut providers = BTreeMap::new();
-        providers.insert(
-            "p".to_string(),
-            provider_with_models(vec![model("stale", false), model("current", false)]),
-        );
-        ProvidersConfig {
-            providers,
-            on_unlisted_models_fetch: policy,
-            ..Default::default()
-        }
-    }
-
-    fn line_text(line: &Line<'static>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    fn rendered_text(lines: &[Line<'static>]) -> String {
-        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
-    }
-
-    fn option_row_count(rendered: &str) -> usize {
-        rendered.lines().filter(|line| line.contains('[')).count()
-    }
-
-    #[test]
-    fn single_fetch_error_is_redacted_in_status_and_saved_state() {
-        let mut cfg = ProvidersConfig::default();
-        cfg.providers.insert(
-            "p".into(),
-            provider_with_models(vec![model("existing", true)]),
-        );
-        let (_tmp, mut dialog) = dialog_with_config(cfg);
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
-        dialog.apply_fetch_result(
-            "p",
-            Err(format!("fetch failed with Authorization: Bearer {secret}")),
-        );
-
-        let status = match dialog.test_page() {
-            TestPageRef::Providers(ProvidersPage::Edit(s)) => s.status.as_deref().unwrap_or(""),
-            other => panic!("expected Edit page, got {other:?}"),
-        };
-        assert!(!status.contains(secret), "status leaked secret: {status}");
-        let reason = dialog.config.providers["p"]
-            .last_model_fetch
-            .as_ref()
-            .and_then(|status| status.reason.as_deref())
-            .unwrap_or("");
-        assert!(
-            !reason.contains(secret),
-            "saved reason leaked secret: {reason}"
-        );
-    }
-
-    #[test]
-    fn grok_oauth_template_materializes_oauth_credential_ref() {
-        let template = templates::template_by_id("grok-oauth").unwrap();
-        let mut state = AddState::new();
-        state.id_field.set("grok-oauth");
-        state.url_field.set(template.url);
-
-        let entry = provider_entry_from_add(&state, template, Vec::new());
-
-        assert_eq!(entry.auth, Some(AuthKind::OAuth));
-        assert_eq!(
-            entry.credential_ref.as_deref(),
-            Some(crate::auth::xai_oauth::CREDENTIAL_KEY)
-        );
-        assert!(entry.headers.is_empty());
-        assert_eq!(entry.wire_api, WireApi::Responses);
-    }
-
-    #[test]
-    fn codex_oauth_template_materializes_oauth_credential_ref() {
-        let template = templates::template_by_id("codex-oauth").unwrap();
-        let mut state = AddState::new();
-        state.id_field.set("codex-oauth");
-        state.url_field.set(template.url);
-
-        let entry = provider_entry_from_add(&state, template, Vec::new());
-
-        assert_eq!(entry.auth, Some(AuthKind::OAuth));
-        assert_eq!(
-            entry.credential_ref.as_deref(),
-            Some(crate::auth::codex_oauth::CREDENTIAL_KEY)
-        );
-        assert!(entry.headers.is_empty());
-        assert_eq!(entry.wire_api, WireApi::Responses);
-    }
-
-    #[test]
-    fn header_display_masks_literal_authorization_secret() {
-        let shown = display_header_value("Authorization", "Bearer sk-abcdef123456");
-        assert_eq!(shown, "Bearer ...3456");
-        assert!(!shown.contains("sk-abcdef123456"));
-    }
-
-    #[test]
-    fn header_display_keeps_env_only_authorization_visible() {
-        assert_eq!(
-            display_header_value("Authorization", "Bearer $OPENAI_API_KEY"),
-            "Bearer $OPENAI_API_KEY"
-        );
-    }
-
-    #[test]
-    fn header_display_masks_mixed_env_and_literal_material() {
-        let shown = display_header_value("Authorization", "Bearer $OPENAI_API_KEY literal123456");
-        assert_eq!(shown, "Bearer ...3456");
-        assert!(!shown.contains("$OPENAI_API_KEY"));
-        assert!(!shown.contains("literal123456"));
-    }
-
-    #[test]
-    fn header_display_masks_short_sensitive_header_literals() {
-        let shown = display_header_value("X-API-Key", "short");
-        assert_eq!(shown, "...hort");
-    }
-
-    #[test]
-    fn header_display_masks_common_sensitive_header_names() {
-        let shown = display_header_value("OpenAI-Organization", "org-abcdef123456");
-        assert_eq!(shown, "...3456");
-        assert!(!shown.contains("org-abcdef123456"));
-    }
-
-    #[test]
-    fn header_editor_list_masks_values_but_keeps_env_refs_visible() {
-        let editor = HeaderEditor::new(
-            vec![
-                HeaderSpec {
-                    name: "Authorization".to_string(),
-                    value: "Bearer sk-abcdef123456".to_string(),
-                },
-                HeaderSpec {
-                    name: "Authorization".to_string(),
-                    value: "Bearer $OPENAI_API_KEY".to_string(),
-                },
-            ],
-            false,
-        );
-        let mut lines = Vec::new();
-        render_header_editor(&mut lines, &editor);
-        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-
-        assert!(rendered.contains("Bearer ...3456"), "{rendered}");
-        assert!(!rendered.contains("sk-abcdef123456"), "{rendered}");
-        assert!(rendered.contains("Bearer $OPENAI_API_KEY"), "{rendered}");
-    }
-
-    #[test]
-    fn header_delete_requires_second_press_on_same_row() {
-        let mut editor = HeaderEditor::new(
-            vec![
-                HeaderSpec {
-                    name: "X-One".to_string(),
-                    value: "1".to_string(),
-                },
-                HeaderSpec {
-                    name: "X-Two".to_string(),
-                    value: "2".to_string(),
-                },
-            ],
-            false,
-        );
-
-        assert!(matches!(
-            editor.handle_key(press(KeyCode::Char('d'))),
-            HeaderResult::Stay
-        ));
-        assert_eq!(editor.rows().len(), 2, "first press only arms");
-        assert!(editor.delete.is_pending_for(0));
-        assert!(editor.status.as_deref().unwrap_or("").contains("X-One"));
-
-        editor.handle_key(press(KeyCode::Down));
-        assert!(!editor.delete.is_pending_for(0), "navigation disarms");
-        editor.handle_key(press(KeyCode::Char('d')));
-        assert_eq!(editor.rows().len(), 2, "fresh first press on row 1 arms");
-        assert!(editor.delete.is_pending_for(1));
-
-        editor.handle_key(press(KeyCode::Char('d')));
-        assert_eq!(editor.rows().len(), 1, "second press deletes row 1");
-        assert_eq!(editor.rows()[0].name, "X-One");
-    }
-
-    /// A Copilot-shaped provider (detected by URL) gets the "Copilot auth"
-    /// row in its Edit menu; a generic provider does not. The action list
-    /// is the single source of truth render and key handling share, so
-    /// asserting on it covers both.
-    #[test]
-    fn edit_menu_copilot_auth_row_only_for_copilot_providers() {
-        let copilot = ProviderEntry {
-            url: "https://api.githubcopilot.com".to_string(),
-            ..Default::default()
-        };
-        let actions = edit_menu_actions("my-copilot", &copilot);
-        assert!(
-            actions.contains(&EditAction::CopilotAuth),
-            "Copilot-shaped provider must expose the Copilot-auth row"
-        );
-
-        let generic = ProviderEntry {
-            url: "https://api.example.com/v1".to_string(),
-            ..Default::default()
-        };
-        let generic_actions = edit_menu_actions("openai-compatible", &generic);
-        assert!(
-            !generic_actions.contains(&EditAction::CopilotAuth),
-            "generic provider must not expose the Copilot-auth row"
-        );
-        // The conditional row is the only difference in menu length.
-        assert_eq!(actions.len(), generic_actions.len() + 1);
-    }
-
-    #[test]
-    fn provider_settings_summary_surfaces_timeout_values() {
-        let provider = ProviderEntry {
-            url: "https://api.example.com/v1".to_string(),
-            timeout: crate::config::providers::TimeoutConfig {
-                ttft_secs: 240,
-                idle_secs: 180,
-            },
-            backup: Some(crate::config::providers::BackupConfig {
-                provider: "backup".to_string(),
-                model: "model".to_string(),
-            }),
-            ..Default::default()
-        };
-
-        let summary = provider_settings_summary(&provider);
-
-        assert!(summary.contains("ttft 240s"));
-        assert!(summary.contains("idle 180s"));
-        assert!(summary.contains("backup set"));
-    }
-
-    #[test]
-    fn model_editor_enter_hints_match_selected_row_actions() {
-        let mut editor =
-            ModelEditor::new(None, vec![model("fetched", false), model("manual", true)]);
-
-        editor.cursor = 0;
-        assert_eq!(editor.selected_enter_hint(), "enter: read-only settings");
-
-        editor.cursor = 1;
-        assert_eq!(editor.selected_enter_hint(), "enter: settings");
-
-        editor.cursor = editor.add_row_idx();
-        assert_eq!(editor.selected_enter_hint(), "enter: add model");
-
-        editor.cursor = editor.save_idx();
-        assert_eq!(editor.selected_enter_hint(), "enter: save changes");
-    }
-
-    #[test]
-    fn enter_on_fetched_and_manual_model_rows_opens_settings() {
-        let mut editor =
-            ModelEditor::new(None, vec![model("fetched", false), model("manual", true)]);
-
-        editor.cursor = 0;
-        assert!(matches!(
-            editor.handle_key(press(KeyCode::Enter)),
-            ModelResult::OpenSettings(0)
-        ));
-
-        editor.cursor = 1;
-        assert!(matches!(
-            editor.handle_key(press(KeyCode::Enter)),
-            ModelResult::OpenSettings(1)
-        ));
-    }
-
-    #[test]
-    fn enter_on_model_action_rows_matches_hints() {
-        let mut editor = ModelEditor::new(None, vec![model("manual", true)]);
-
-        editor.cursor = editor.add_row_idx();
-        assert_eq!(editor.selected_enter_hint(), "enter: add model");
-        assert!(matches!(
-            editor.handle_key(press(KeyCode::Enter)),
-            ModelResult::Stay
-        ));
-        assert!(editor.is_editing());
-
-        editor.cancel_edit();
-        editor.cursor = editor.save_idx();
-        assert_eq!(editor.selected_enter_hint(), "enter: save changes");
-        assert!(matches!(
-            editor.handle_key(press(KeyCode::Enter)),
-            ModelResult::Save
-        ));
-    }
-
-    #[test]
-    fn model_delete_requires_second_press_on_same_row() {
-        let mut editor =
-            ModelEditor::new(None, vec![model("fetched", false), model("manual", true)]);
-
-        editor.handle_key(press(KeyCode::Delete));
-        assert_eq!(editor.rows().len(), 2, "first press only arms");
-        assert!(editor.delete.is_pending_for(0));
-        assert!(editor.status.as_deref().unwrap_or("").contains("fetched"));
-
-        editor.handle_key(press(KeyCode::Down));
-        assert!(!editor.delete.is_pending_for(0), "navigation disarms");
-        editor.handle_key(press(KeyCode::Delete));
-        assert_eq!(editor.rows().len(), 2, "fresh first press on row 1 arms");
-        assert!(editor.delete.is_pending_for(1));
-
-        editor.handle_key(press(KeyCode::Delete));
-        assert_eq!(editor.rows().len(), 1, "second press deletes row 1");
-        assert_eq!(editor.rows()[0].id, "fetched");
-    }
-
-    #[test]
-    fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
-        let mut providers = BTreeMap::new();
-        providers.insert(
-            "p".to_string(),
-            provider_with_models(vec![
-                model("stale", false),
-                model("manual-only", true),
-                model("current", false),
-            ]),
-        );
-        let (_, mut dialog) = dialog_with_config(ProvidersConfig {
-            providers,
-            on_unlisted_models_fetch: Some(OnUnlistedModelsFetch::Ask),
-            ..Default::default()
-        });
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
-            providers: vec!["p".to_string()],
-            in_flight: Vec::new(),
-            finished: vec![FetchedSummary {
-                provider_id: "p".to_string(),
-                outcome: Ok(FetchOutcome::Models {
-                    models: vec![model("current", false)],
-                    catalog: ProviderModelCatalog::Live,
-                }),
-            }],
-            pre_fetch_models: [(
-                "p".to_string(),
-                vec![
-                    model("stale", false),
-                    model("manual-only", true),
-                    model("current", false),
-                ],
-            )]
-            .into_iter()
-            .collect(),
-            policy_resolved: false,
-            cursor: 1,
-            dont_ask_again: false,
-            unlisted: vec![("p".to_string(), "stale".to_string())],
-        })));
-
-        let nav = {
-            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
-            let Some(ProvidersPage::FetchAll(state)) = page.downcast_mut::<ProvidersPage>() else {
-                panic!("expected fetch-all page");
-            };
-            cx.handle_fetch_all_key(press(KeyCode::Enter), state)
-        };
-        assert!(matches!(
-            replaced_provider(&nav),
-            ProvidersPage::List { .. }
-        ));
-
-        let ids: Vec<&str> = dialog.config.providers["p"]
-            .models
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["current", "manual-only"]);
-    }
-
-    #[test]
-    fn fetch_all_stored_remove_applies_without_prompt() {
-        let (_, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Remove)));
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
-            providers: vec!["p".to_string()],
-            in_flight: Vec::new(),
-            finished: vec![FetchedSummary {
-                provider_id: "p".to_string(),
-                outcome: Ok(FetchOutcome::Models {
-                    models: vec![model("current", false)],
-                    catalog: ProviderModelCatalog::Live,
-                }),
-            }],
-            pre_fetch_models: [(
-                "p".to_string(),
-                vec![model("stale", false), model("current", false)],
-            )]
-            .into_iter()
-            .collect(),
-            policy_resolved: false,
-            cursor: 0,
-            dont_ask_again: false,
-            unlisted: Vec::new(),
-        })));
-
-        dialog.drain_fetch_all();
-
-        let state = match dialog.test_page() {
-            TestPageRef::Providers(ProvidersPage::FetchAll(s)) => s,
-            _ => panic!("expected fetch-all page"),
-        };
-        assert!(state.unlisted.is_empty());
-        let ids: Vec<&str> = dialog.config.providers["p"]
-            .models
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["current"]);
-    }
-
-    #[test]
-    fn fetch_all_stored_keep_applies_without_prompt() {
-        let (_, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
-            providers: vec!["p".to_string()],
-            in_flight: Vec::new(),
-            finished: vec![FetchedSummary {
-                provider_id: "p".to_string(),
-                outcome: Ok(FetchOutcome::Models {
-                    models: vec![model("current", false)],
-                    catalog: ProviderModelCatalog::Live,
-                }),
-            }],
-            pre_fetch_models: [(
-                "p".to_string(),
-                vec![model("stale", false), model("current", false)],
-            )]
-            .into_iter()
-            .collect(),
-            policy_resolved: false,
-            cursor: 0,
-            dont_ask_again: false,
-            unlisted: Vec::new(),
-        })));
-
-        dialog.drain_fetch_all();
-
-        let ids: Vec<&str> = dialog.config.providers["p"]
-            .models
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["current", "stale"]);
-    }
-
-    #[test]
-    fn per_provider_refetch_prompt_remove_returns_to_edit_page() {
-        let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchOnePrompt(
-            FetchOnePromptState {
-                provider_id: "p".to_string(),
-                remote: vec![model("current", false)],
-                catalog: ProviderModelCatalog::Live,
-                pre_fetch_models: vec![model("stale", false), model("current", false)],
-                unlisted: vec!["stale".to_string()],
-                cursor: 1,
-                dont_ask_again: false,
-            },
-        )));
-
-        let nav = {
-            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
-            let Some(ProvidersPage::FetchOnePrompt(state)) = page.downcast_mut::<ProvidersPage>()
-            else {
-                panic!("expected per-provider prompt page");
-            };
-            cx.handle_fetch_one_prompt_key(press(KeyCode::Enter), state)
-        };
-        assert!(matches!(replaced_provider(&nav), ProvidersPage::Edit(_)));
-
-        let ids: Vec<&str> = dialog.config.providers["p"]
-            .models
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["current"]);
-    }
-
-    #[test]
-    fn fetch_one_prompt_save_failure_surfaces() {
-        let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchOnePrompt(
-            FetchOnePromptState {
-                provider_id: "p".to_string(),
-                remote: vec![model("current", false)],
-                catalog: ProviderModelCatalog::Live,
-                pre_fetch_models: vec![model("stale", false), model("current", false)],
-                unlisted: vec!["stale".to_string()],
-                cursor: 0,
-                dont_ask_again: false,
-            },
-        )));
-        break_config_saving(&dialog);
-
-        let nav = {
-            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
-            let Some(ProvidersPage::FetchOnePrompt(state)) = page.downcast_mut::<ProvidersPage>()
-            else {
-                panic!("expected per-provider prompt page");
-            };
-            cx.handle_fetch_one_prompt_key(press(KeyCode::Enter), state)
-        };
-
-        match replaced_provider(&nav) {
-            ProvidersPage::Edit(edit) => {
-                assert!(
-                    edit.status
-                        .as_deref()
-                        .is_some_and(|s| s.starts_with("save failed:")),
-                    "status was {:?}",
-                    edit.status
-                );
-            }
-            _ => panic!("expected edit replacement"),
-        }
-    }
-
-    #[test]
-    fn fetch_all_save_failure_surfaces() {
-        let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
-            providers: vec!["p".to_string()],
-            in_flight: Vec::new(),
-            finished: vec![FetchedSummary {
-                provider_id: "p".to_string(),
-                outcome: Ok(FetchOutcome::Models {
-                    models: vec![model("current", false)],
-                    catalog: ProviderModelCatalog::Live,
-                }),
-            }],
-            pre_fetch_models: [(
-                "p".to_string(),
-                vec![model("stale", false), model("current", false)],
-            )]
-            .into_iter()
-            .collect(),
-            policy_resolved: false,
-            cursor: 0,
-            dont_ask_again: false,
-            unlisted: vec![("p".to_string(), "stale".to_string())],
-        })));
-        break_config_saving(&dialog);
-
-        let nav = {
-            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
-            let Some(ProvidersPage::FetchAll(state)) = page.downcast_mut::<ProvidersPage>() else {
-                panic!("expected fetch-all page");
-            };
-            cx.handle_fetch_all_key(press(KeyCode::Enter), state)
-        };
-
-        match replaced_provider(&nav) {
-            ProvidersPage::List { status, .. } => {
-                assert!(
-                    status
-                        .as_deref()
-                        .is_some_and(|s| s.starts_with("save failed:")),
-                    "status was {status:?}"
-                );
-            }
-            _ => panic!("expected list replacement"),
-        }
-    }
-
-    #[test]
-    fn render_field_row_places_caret_at_textfield_cursor() {
-        let mut field = TextField::new("alpha");
-        field.handle_key(press(KeyCode::Home));
-        field.handle_key(press(KeyCode::Right));
-        field.handle_key(press(KeyCode::Right));
-        let mut lines = Vec::new();
-
-        render_field_row(&mut lines, "Name", &field, true);
-
-        assert_eq!(line_text(&lines[0]), "▸ Name: al\u{E000}pha");
-    }
-
-    #[test]
-    fn edit_delete_enter_requires_second_enter_to_confirm() {
-        let (_, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        let mut state = EditState::new("p".into(), entry.clone());
-        state.cursor = edit_menu_actions("p", &entry)
-            .iter()
-            .position(|action| matches!(action, EditAction::Delete))
-            .expect("delete row");
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(state)));
-
-        dialog.handle_key(press(KeyCode::Enter));
-        assert!(dialog.config.providers.contains_key("p"));
-        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-            panic!("expected edit page");
-        };
-        assert!(state.delete_pending);
-        assert_eq!(
-            state.status.as_deref(),
-            Some("press Enter again to confirm delete")
-        );
-
-        dialog.handle_key(press(KeyCode::Enter));
-
-        assert!(!dialog.config.providers.contains_key("p"));
-        assert!(matches!(
-            dialog.test_page(),
-            TestPageRef::Providers(ProvidersPage::List { .. })
-        ));
-    }
-
-    #[test]
-    fn edit_delete_d_requires_second_d_to_confirm() {
-        let (_, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        dialog.handle_key(press(KeyCode::Char('d')));
-        assert!(dialog.config.providers.contains_key("p"));
-        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-            panic!("expected edit page");
-        };
-        assert!(state.delete_pending);
-        assert_eq!(
-            state.status.as_deref(),
-            Some("press d again to confirm delete")
-        );
-
-        dialog.handle_key(press(KeyCode::Char('d')));
-
-        assert!(!dialog.config.providers.contains_key("p"));
-        assert!(matches!(
-            dialog.test_page(),
-            TestPageRef::Providers(ProvidersPage::List { .. })
-        ));
-    }
-
-    #[test]
-    fn favorite_toggle_status_is_unsaved() {
-        let (_, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        dialog.handle_key(press(KeyCode::Char('f')));
-        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-            panic!("expected edit page");
-        };
-        assert_eq!(
-            state.status.as_deref(),
-            Some("favorite ✓ (unsaved — s to save)")
-        );
-        assert_eq!(state.entry.favorite, Some(true));
-    }
-
-    #[test]
-    fn q_commits_favorite_from_edit_page() {
-        let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        dialog.handle_key(press(KeyCode::Char('f')));
-        assert!(dialog.handle_key(press(KeyCode::Char('q'))));
-
-        assert_eq!(
-            load_provider(&tmp.path().join("config.json"), "p").favorite,
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn q_commit_failure_after_favorite_does_not_panic() {
-        let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-        dialog.handle_key(press(KeyCode::Char('f')));
-        break_config_saving(&dialog);
-
-        assert!(dialog.handle_key(press(KeyCode::Char('q'))));
-    }
-
-    #[test]
-    fn q_commits_headers_subpage() {
-        let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        let parent = EditState::new("p".into(), entry);
-        let editor = HeaderEditor::new(
-            vec![HeaderSpec {
-                name: "X-Test".into(),
-                value: "one".into(),
-            }],
-            false,
-        );
-        dialog.set_test_page(Page::Providers(ProvidersPage::Headers {
-            editor,
-            parent: Box::new(parent),
-        }));
-
-        assert!(dialog.handle_key(press(KeyCode::Char('q'))));
-
-        assert_eq!(
-            load_provider(&tmp.path().join("config.json"), "p").headers,
-            vec![HeaderSpec {
-                name: "X-Test".into(),
-                value: "one".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn refetch_commits_staged_entry_first() {
-        let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        dialog.handle_key(press(KeyCode::Char('f')));
-        dialog.handle_key(press(KeyCode::Char('r')));
-
-        assert_eq!(
-            load_provider(&tmp.path().join("config.json"), "p").favorite,
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn refetch_result_preserves_staged_favorite() {
-        let (_tmp, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        let entry = dialog.config.providers["p"].clone();
-        let mut edit = EditState::new("p".into(), entry);
-        edit.entry.favorite = Some(true);
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(edit)));
-
-        dialog.apply_fetch_result(
-            "p",
-            Ok(FetchOutcome::Models {
-                models: vec![model("new", false)],
-                catalog: ProviderModelCatalog::Live,
-            }),
-        );
-
-        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-            panic!("expected edit page");
-        };
-        assert_eq!(state.entry.favorite, Some(true));
-        assert_eq!(
-            state
-                .entry
-                .models
-                .iter()
-                .map(|m| m.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["new", "stale", "current"]
-        );
-    }
-
-    #[test]
-    fn refetch_result_marks_codex_fallback_catalog_active() {
-        let (_tmp, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        dialog.apply_fetch_result(
-            "p",
-            Ok(FetchOutcome::Models {
-                models: vec![model("gpt-5.5", false)],
-                catalog: ProviderModelCatalog::CodexFallback,
-            }),
-        );
-
-        let provider = &dialog.config.providers["p"];
-        assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
-        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-            panic!("expected edit page");
-        };
-        assert_eq!(
-            state.entry.model_catalog,
-            ProviderModelCatalog::CodexFallback
-        );
-        assert!(
-            state
-                .status
-                .as_deref()
-                .is_some_and(|s| s.contains("fallback Codex catalog"))
-        );
-    }
-
-    #[test]
-    fn refetch_result_with_fallback_available_opens_explicit_prompt() {
-        let (_tmp, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-
-        dialog.apply_fetch_result(
-            "p",
-            Ok(FetchOutcome::FallbackAvailable {
-                models: vec![model("fallback", false)],
-                catalog: ProviderModelCatalog::CodexFallback,
-                reason:
-                    "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
-                        .into(),
-            }),
-        );
-
-        let TestPageRef::Providers(ProvidersPage::FetchFallbackPrompt(state)) = dialog.test_page()
-        else {
-            panic!("expected fallback prompt");
-        };
-        assert_eq!(state.provider_id, "p");
-        assert!(state.reason.contains("returned 500"));
-        assert!(state.reason.contains("[redacted]"));
-        assert!(!state.reason.contains("sk-test-token"));
-        let provider = &dialog.config.providers["p"];
-        assert_eq!(provider.model_catalog, ProviderModelCatalog::Live);
-        assert_eq!(
-            provider
-                .models
-                .iter()
-                .map(|m| m.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["stale", "current"]
-        );
-    }
-
-    #[test]
-    fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
-        let (_tmp, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        dialog.set_test_page(Page::Providers(ProvidersPage::FetchFallbackPrompt(
-            FetchFallbackPromptState {
-                provider_id: "p".to_string(),
-                models: vec![model("fallback", false)],
-                catalog: ProviderModelCatalog::CodexFallback,
-                reason:
-                    "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
-                        .into(),
-                cursor: 2,
-            },
-        )));
-
-        let nav = {
-            let (cx, page) = (&mut dialog.cx, &mut dialog.page);
-            let Some(ProvidersPage::FetchFallbackPrompt(state)) =
-                page.downcast_mut::<ProvidersPage>()
-            else {
-                panic!("expected fallback prompt");
-            };
-            cx.handle_fetch_fallback_prompt_key(press(KeyCode::Enter), state)
-        };
-
-        assert!(matches!(replaced_provider(&nav), ProvidersPage::Edit(_)));
-        let provider = &dialog.config.providers["p"];
-        assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
-        assert_eq!(
-            provider
-                .models
-                .iter()
-                .map(|m| m.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["fallback", "stale", "current"]
-        );
-        let status = provider.last_model_fetch.as_ref().unwrap();
-        assert_eq!(
-            status.status,
-            crate::config::providers::ModelFetchStatusKind::Fallback
-        );
-        assert_eq!(
-            status.source,
-            crate::config::providers::ModelFetchSource::Fallback
-        );
-        let reason = status.reason.as_ref().unwrap();
-        assert!(reason.contains("returned 500"));
-        assert!(reason.contains("[redacted]"));
-        assert!(!reason.contains("sk-test-token"));
-    }
-
-    #[test]
-    fn refetch_summary_names_empty_codex_fallback_catalog() {
-        let mut entry = ProviderEntry {
-            models: vec![
-                model("gpt-5.5", false),
-                model("gpt-5.4", false),
-                model("gpt-5.4-mini", false),
-            ],
-            model_catalog: ProviderModelCatalog::CodexFallback,
-            ..ProviderEntry::default()
-        };
-        entry.mark_model_fetch_fallback(
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.0.0 returned an empty model list (status 200 OK)",
-        );
-
-        let summary = refetch_summary(&entry);
-
-        assert!(summary.contains("fallback catalog active (3 model(s))"));
-        assert!(summary.contains("live /models returned empty list"));
-        assert!(summary.contains("using hardcoded fallback"));
-    }
-
-    #[test]
-    fn model_fetch_status_block_renders_redacted_status_details() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-06-19T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let entry = ProviderEntry {
-            models: vec![model("gpt-5-mini", false)],
-            models_fetched_at: Some(
-                chrono::DateTime::parse_from_rfc3339("2026-06-19T11:00:00Z")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc),
-            ),
-            last_model_fetch: Some(crate::config::providers::ModelFetchStatus {
-                status: crate::config::providers::ModelFetchStatusKind::FailedKeptExisting,
-                at: now,
-                source: crate::config::providers::ModelFetchSource::Live,
-                reason: Some(
-                    "GET /models returned 500 Authorization Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
-                        .to_string(),
-                ),
-            }),
-            ..ProviderEntry::default()
-        };
-        let mut lines = Vec::new();
-
-        render_model_fetch_status_block(&mut lines, &entry, now);
-        let rendered = rendered_text(&lines);
-
-        assert!(rendered.contains("Catalog status:"));
-        assert!(rendered.contains("state:   Preserved"));
-        assert!(rendered.contains("count:   1"));
-        assert!(rendered.contains("fetched: 1 hour ago"));
-        assert!(rendered.contains("[redacted]"));
-        assert!(!rendered.contains("sk-test-token"));
-    }
-
-    #[test]
-    fn model_fetch_status_block_uses_never_and_dash_for_missing_fetch() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-06-19T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let entry = ProviderEntry::default();
-        let mut lines = Vec::new();
-
-        render_model_fetch_status_block(&mut lines, &entry, now);
-        let rendered = rendered_text(&lines);
-
-        assert!(rendered.contains("state:   Live"));
-        assert!(rendered.contains("count:   0"));
-        assert!(rendered.contains("fetched: never"));
-        assert!(rendered.contains("reason:  —"));
-    }
-
-    #[test]
-    fn apply_fetch_result_save_failure_surfaces() {
-        let (_tmp, mut dialog) =
-            dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
-        let entry = dialog.config.providers["p"].clone();
-        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
-            "p".into(),
-            entry,
-        ))));
-        break_config_saving(&dialog);
-
-        dialog.apply_fetch_result(
-            "p",
-            Ok(FetchOutcome::Models {
-                models: vec![model("new", false)],
-                catalog: ProviderModelCatalog::Live,
-            }),
-        );
-
-        let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-            panic!("expected edit page");
-        };
-        assert!(
-            state
-                .status
-                .as_deref()
-                .is_some_and(|s| s.starts_with("save failed:")),
-            "status was {:?}",
-            state.status
-        );
-    }
-
-    #[test]
-    fn grok_login_selection_is_ssh_aware() {
-        assert_eq!(grok_login_selection(true), GrokLoginSelection::ManualOnly);
-        assert_eq!(grok_login_selection(false), GrokLoginSelection::Auto);
-    }
-
-    #[test]
-    fn copy_oauth_url_reports_success_error_and_missing_url() {
-        let mut status = None;
-        let copied = crate::clipboard::CopyOutcome {
-            osc52_written: true,
-            local_clipboard_written: false,
-        };
-        copy_oauth_url_with(Some("https://example.test/oauth"), &mut status, |_| {
-            Ok(copied)
-        });
-        assert_eq!(status, Some(Ok("copied OAuth URL".to_string())));
-
-        copy_oauth_url_with(None, &mut status, |_| Ok(copied));
-        assert_eq!(status, Some(Ok("no OAuth URL yet".to_string())));
-
-        copy_oauth_url_with(Some("https://example.test/oauth"), &mut status, |_| {
-            Err(crate::clipboard::CopyError::Backend("denied".to_string()))
-        });
-        assert_eq!(
-            status,
-            Some(Err("clipboard backend error: denied".to_string()))
-        );
-    }
-
-    #[test]
-    fn add_grok_oauth_manual_mode_reports_active_text_field() {
-        let mut state = AddState::new();
-        state.step = AddStep::GrokOAuthAuth(Box::new(GrokOAuthSetupState::new()));
-        let mut page = ProvidersPage::Add(state);
-
-        assert!(page.active_text_field().is_none());
-
-        let ProvidersPage::Add(add) = &mut page else {
-            unreachable!();
-        };
-        let AddStep::GrokOAuthAuth(grok) = &mut add.step else {
-            unreachable!();
-        };
-        grok.manual_mode = true;
-
-        let field = page
-            .active_text_field()
-            .expect("manual Grok OAuth input should own paste focus");
-        field.paste("callback-code");
-
-        let ProvidersPage::Add(add) = &page else {
-            unreachable!();
-        };
-        let AddStep::GrokOAuthAuth(grok) = &add.step else {
-            unreachable!();
-        };
-        assert_eq!(grok.manual_input.text(), "callback-code");
-    }
-
-    #[test]
-    fn grok_manual_mode_char_c_inserts_instead_of_copying_url() {
-        let mut state = GrokOAuthSetupState::new();
-        state.manual_mode = true;
-        state.authorize_url = Some("https://example.test/oauth".to_string());
-
-        let (_close, action) = handle_grok_oauth_setup_key(press(KeyCode::Char('c')), &mut state);
-
-        assert!(action.is_none());
-        assert_eq!(state.manual_input.text(), "c");
-        assert_ne!(state.status, Some(Ok("copied OAuth URL".to_string())));
-    }
-
-    #[test]
-    fn grok_manual_mode_char_by_char_callback_keeps_shortcut_letters() {
-        let mut state = GrokOAuthSetupState::new();
-        state.manual_mode = true;
-        let callback = "http://127.0.0.1:56121/callback?code=abc123&state=s";
-
-        for ch in callback.chars() {
-            handle_grok_oauth_setup_key(press(KeyCode::Char(ch)), &mut state);
-        }
-
-        assert_eq!(state.manual_input.text(), callback);
-    }
-
-    #[test]
-    fn codex_oauth_logged_in_renders_single_continue_row() {
-        let mut state = CodexOAuthSetupState::new();
-        state.logged_in = true;
-        state.status = Some(Ok("Codex OAuth login complete".to_string()));
-        let mut lines = Vec::new();
-
-        render_codex_oauth_setup_body(&mut lines, &state);
-        let rendered = rendered_text(&lines);
-
-        assert!(rendered.contains("continue"), "{rendered}");
-        assert_eq!(option_row_count(&rendered), 1, "{rendered}");
-        assert!(!rendered.contains("log in"), "{rendered}");
-        assert!(!rendered.contains("skip / continue"), "{rendered}");
-        assert!(!rendered.contains("manual paste"), "{rendered}");
-    }
-
-    #[test]
-    fn codex_oauth_logged_out_renders_start_or_poll_menu() {
-        let mut state = CodexOAuthSetupState::new();
-        state.logged_in = false;
-        let mut lines = Vec::new();
-
-        render_codex_oauth_setup_body(&mut lines, &state);
-        let rendered = rendered_text(&lines);
-        assert!(rendered.contains("log in"), "{rendered}");
-        assert!(rendered.contains("skip / continue"), "{rendered}");
-
-        state.pending = Some(crate::auth::codex_oauth::DeviceLogin::for_test(
-            "https://example.test/device",
-            "ABCD-EFGH",
-        ));
-        lines.clear();
-        render_codex_oauth_setup_body(&mut lines, &state);
-        let rendered = rendered_text(&lines);
-        assert!(rendered.contains("poll for approval"), "{rendered}");
-        assert!(rendered.contains("skip / continue"), "{rendered}");
-        assert!(!rendered.contains("[continue]"), "{rendered}");
-    }
-
-    #[test]
-    fn grok_oauth_logged_in_renders_single_continue_row() {
-        let mut state = GrokOAuthSetupState::new();
-        state.logged_in = true;
-        state.status = Some(Ok("xAI OAuth login complete".to_string()));
-        let mut lines = Vec::new();
-
-        render_grok_oauth_setup_body(&mut lines, &state);
-        let rendered = rendered_text(&lines);
-
-        assert!(rendered.contains("continue"), "{rendered}");
-        assert_eq!(option_row_count(&rendered), 1, "{rendered}");
-        assert!(!rendered.contains("log in"), "{rendered}");
-        assert!(!rendered.contains("manual paste"), "{rendered}");
-        assert!(!rendered.contains("skip / continue"), "{rendered}");
-    }
-
-    #[test]
-    fn grok_oauth_logged_out_renders_full_menu() {
-        let mut state = GrokOAuthSetupState::new();
-        state.logged_in = false;
-        let mut lines = Vec::new();
-
-        render_grok_oauth_setup_body(&mut lines, &state);
-        let rendered = rendered_text(&lines);
-
-        assert!(rendered.contains("log in"), "{rendered}");
-        assert!(rendered.contains("manual paste"), "{rendered}");
-        assert!(rendered.contains("skip / continue"), "{rendered}");
-        assert_eq!(option_row_count(&rendered), 3, "{rendered}");
-    }
-
-    #[test]
-    fn logged_in_oauth_navigation_clamps_to_single_continue_row() {
-        let mut codex = CodexOAuthSetupState::new();
-        codex.logged_in = true;
-        codex.cursor = 99;
-        handle_codex_oauth_setup_key(press(KeyCode::Down), &mut codex);
-        assert_eq!(codex.cursor, 0);
-
-        let mut grok = GrokOAuthSetupState::new();
-        grok.logged_in = true;
-        grok.cursor = 99;
-        handle_grok_oauth_setup_key(press(KeyCode::Up), &mut grok);
-        assert_eq!(grok.cursor, 0);
-    }
-
-    #[test]
-    fn grok_oauth_logged_out_enter_still_begins_login() {
-        let mut state = GrokOAuthSetupState::new();
-        state.logged_in = false;
-        state.ssh_manual_only = false;
-        state.cursor = 0;
-        let (_close, action) = handle_grok_oauth_setup_key(press(KeyCode::Enter), &mut state);
-
-        assert!(matches!(
-            action,
-            Some(OAuthActionRequest::GrokBegin { is_ssh: false })
-        ));
-        assert!(state.pending);
-    }
-
-    #[tokio::test]
-    async fn logged_in_oauth_enter_advances_add_wizard() {
-        for template_id in ["codex-oauth", "grok-oauth"] {
-            let template = templates::template_by_id(template_id).unwrap();
-            let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
-            let mut state = AddState::new();
-            state.template = Some(template);
-            state.id_field.set(template_id);
-            state.url_field.set(template.url);
-            state.step = match template_id {
-                "codex-oauth" => {
-                    let mut oauth = CodexOAuthSetupState::new();
-                    oauth.logged_in = true;
-                    oauth.cursor = 0;
-                    AddStep::CodexOAuthAuth(Box::new(oauth))
-                }
-                "grok-oauth" => {
-                    let mut oauth = GrokOAuthSetupState::new();
-                    oauth.logged_in = true;
-                    oauth.cursor = 0;
-                    AddStep::GrokOAuthAuth(Box::new(oauth))
-                }
-                _ => unreachable!(),
-            };
-
-            dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-
-            assert!(
-                !matches!(
-                    state.step,
-                    AddStep::CodexOAuthAuth(_) | AddStep::GrokOAuthAuth(_)
-                ),
-                "{template_id} should advance past the OAuth confirmation step"
-            );
-        }
-    }
-
-    fn template_cursor(template_id: &str) -> usize {
-        templates::TEMPLATES
-            .iter()
-            .position(|t| t.id == template_id)
-            .unwrap()
-    }
-
-    /// Every template — including the frontier-defaults ones — now goes through
-    /// the editable-id step. The id is no longer locked, so a user can rename a
-    /// first-party connection (e.g. `anthropic-work`) and still add a second one.
-    #[test]
-    fn all_templates_offer_edit_id_step() {
-        for t in templates::TEMPLATES {
-            let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
-            let mut state = AddState::new();
-            state.step = AddStep::PickTemplate {
-                cursor: template_cursor(t.id),
-            };
-
-            dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-
-            assert!(
-                matches!(state.step, AddStep::EditId),
-                "{} should land on the EditId step",
-                t.id
-            );
-            // The chosen template is committed and the id is pre-filled for
-            // single-vendor templates.
-            assert_eq!(state.template.map(|c| c.id), Some(t.id));
-            let expected_id = if t.use_id_as_default { t.id } else { "" };
-            assert_eq!(state.id_field.text(), expected_id, "{}", t.id);
-            assert!(state.error.is_none(), "{}: {:?}", t.id, state.error);
-        }
-    }
-
-    /// A second connection to a first-party vendor is allowed: the EditId step
-    /// rejects the exact-duplicate default id but accepts a renamed key, so the
-    /// user can keep e.g. separate work and personal Anthropic keys.
-    #[test]
-    fn second_first_party_connection_under_custom_id_works() {
-        let mut providers = BTreeMap::new();
-        providers.insert("anthropic".to_string(), provider_with_models(Vec::new()));
-        let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig {
-            providers,
-            ..Default::default()
-        });
-        let mut state = AddState::new();
-        state.step = AddStep::PickTemplate {
-            cursor: template_cursor("anthropic"),
-        };
-
-        // Pick the template — lands on EditId with the default `anthropic` id.
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(matches!(state.step, AddStep::EditId));
-        assert_eq!(state.id_field.text(), "anthropic");
-
-        // The default id collides with the existing provider.
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(
-            matches!(state.step, AddStep::EditId),
-            "collision keeps EditId"
-        );
-        assert!(
-            state
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("already exists"),
-            "{:?}",
-            state.error
-        );
-
-        // Renaming to a unique key advances past EditId with no error.
-        state.id_field.set("anthropic-work");
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(
-            matches!(state.step, AddStep::EditUrl),
-            "unique renamed id advances the wizard"
-        );
-        assert!(state.error.is_none(), "{:?}", state.error);
-    }
-
-    /// The committed entry records the template identity (not the config-map
-    /// key), so a renamed first-party connection still resolves to its vendor
-    /// template and receives the frontier defaults.
-    #[test]
-    fn committed_entry_records_template_identity() {
-        let anthropic = templates::template_by_id("anthropic").unwrap();
-        let mut state = AddState::new();
-        state.template = Some(anthropic);
-        state.url_field.set(anthropic.url);
-
-        let entry =
-            provider_entry_from_add(&state, anthropic, templates::default_headers_for(anthropic));
-
-        assert_eq!(entry.template.as_deref(), Some("anthropic"));
-        // Even under a renamed config key the vendor identity is preserved.
-        assert_eq!(
-            entry.effective_template("anthropic-work"),
-            Some("anthropic")
-        );
-    }
-}
+mod tests;
 
 impl SettingsPage for ProvidersPage {
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {

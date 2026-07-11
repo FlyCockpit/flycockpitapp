@@ -108,7 +108,7 @@ impl UtilityModelPicker {
                 .and_then(|cur| entries.iter().position(|e| &e.value() == cur))
                 .map(|i| i + PICKER_ACTION_ROWS)
                 .unwrap_or(PICKER_ACTION_ROWS);
-            let scroll = crate::tui::app::windowed_scroll(
+            let scroll = crate::tui::nav::windowed_scroll(
                 cursor.saturating_sub(PICKER_ACTION_ROWS),
                 0,
                 entries.len(),
@@ -152,7 +152,7 @@ impl UtilityModelPicker {
 /// `mode`.
 pub(super) fn picker_window_scroll(cursor: usize, scroll: usize, entries_len: usize) -> usize {
     let selected = cursor.saturating_sub(PICKER_ACTION_ROWS);
-    crate::tui::app::windowed_scroll(selected, scroll, entries_len, UTILITY_MODEL_WINDOW)
+    crate::tui::nav::windowed_scroll(selected, scroll, entries_len, UTILITY_MODEL_WINDOW)
 }
 
 // ── Grab/reorder list sub-pages ──────────────────────────────────────────

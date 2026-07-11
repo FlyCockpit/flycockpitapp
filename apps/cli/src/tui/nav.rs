@@ -28,6 +28,28 @@ pub fn wrap_prev(i: usize, len: usize) -> usize {
     if i == 0 { len - 1 } else { i - 1 }
 }
 
+/// Recompute a scroll-window top offset so `selected` stays visible with
+/// a one-row margin (scrolloff=1) above and below, except at the true ends
+/// of the list. Hard stops, no wrap.
+pub(crate) fn windowed_scroll(
+    selected: usize,
+    mut offset: usize,
+    len: usize,
+    window: usize,
+) -> usize {
+    if len <= window {
+        return 0;
+    }
+    const SCROLLOFF: usize = 1;
+    if selected < offset + SCROLLOFF {
+        offset = selected.saturating_sub(SCROLLOFF);
+    }
+    if selected + SCROLLOFF + 1 > offset + window {
+        offset = (selected + SCROLLOFF + 1).saturating_sub(window);
+    }
+    offset.min(len - window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +91,37 @@ mod tests {
     fn out_of_range_index_wraps_safely() {
         assert_eq!(wrap_next(9, 3), 0);
         assert_eq!(wrap_prev(9, 3), 8);
+    }
+
+    #[test]
+    fn windowed_scroll_noops_when_everything_fits() {
+        const W: usize = 5;
+        assert_eq!(windowed_scroll(0, 0, 5, W), 0);
+        assert_eq!(windowed_scroll(4, 0, 5, W), 0);
+    }
+
+    #[test]
+    fn windowed_scroll_keeps_top_edge_pinned() {
+        const W: usize = 5;
+        assert_eq!(windowed_scroll(0, 0, 10, W), 0);
+        assert_eq!(windowed_scroll(1, 0, 10, W), 0);
+    }
+
+    #[test]
+    fn windowed_scroll_moves_down_with_margin() {
+        const W: usize = 5;
+        assert_eq!(windowed_scroll(5, 0, 10, W), 2);
+    }
+
+    #[test]
+    fn windowed_scroll_clamps_at_bottom() {
+        const W: usize = 5;
+        assert_eq!(windowed_scroll(9, 4, 10, W), 5);
+    }
+
+    #[test]
+    fn windowed_scroll_moves_up_with_margin() {
+        const W: usize = 5;
+        assert_eq!(windowed_scroll(4, 4, 10, W), 3);
     }
 }

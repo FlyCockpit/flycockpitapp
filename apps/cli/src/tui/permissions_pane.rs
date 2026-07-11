@@ -35,6 +35,7 @@ use crate::approval::store::{
     ManagedGrantKind, ManagedGrants, delete_managed_grant, global_approvals_dir,
     list_managed_grants,
 };
+use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
 /// The two persisted *file* scopes the pane manages. Session scope is
@@ -80,16 +81,14 @@ struct DeletableRow {
 
 pub struct PermissionsPane {
     scopes: Vec<ScopeView>,
-    /// Index into the flat list of deletable rows (built fresh each draw
-    /// from [`Self::deletable_rows`]); the highlighted grant.
-    cursor: usize,
+    /// Cursor into the flat deletable-row list plus rendered-row scroll.
+    list: ScrollList,
     /// A transient status line (e.g. "removed `gh pr`"), shown until the
     /// next key. Cleared on the next navigation.
     status: Option<String>,
     /// Rendered body height + total content rows at last draw — scroll clamp.
     last_body_height: usize,
     last_content_rows: usize,
-    scroll: usize,
 }
 
 impl PermissionsPane {
@@ -106,11 +105,10 @@ impl PermissionsPane {
         ];
         Self {
             scopes,
-            cursor: 0,
+            list: ScrollList::new(),
             status: None,
             last_body_height: 0,
             last_content_rows: 0,
-            scroll: 0,
         }
     }
 
@@ -157,12 +155,17 @@ impl PermissionsPane {
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => self.delete_focused(),
             KeyCode::PageUp => {
                 self.status = None;
-                self.scroll = self.scroll.saturating_sub(self.last_body_height.max(1));
+                self.list.set_scroll(
+                    self.list
+                        .scroll()
+                        .saturating_sub(self.last_body_height.max(1)),
+                );
             }
             KeyCode::PageDown => {
                 self.status = None;
                 let max = self.last_content_rows.saturating_sub(self.last_body_height);
-                self.scroll = (self.scroll + self.last_body_height.max(1)).min(max);
+                self.list
+                    .set_scroll((self.list.scroll() + self.last_body_height.max(1)).min(max));
             }
             _ => {}
         }
@@ -170,12 +173,12 @@ impl PermissionsPane {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
+        self.list.set_scroll(self.list.scroll().saturating_sub(1));
     }
 
     pub fn scroll_down(&mut self) {
         let max = self.last_content_rows.saturating_sub(self.last_body_height);
-        self.scroll = (self.scroll + 1).min(max);
+        self.list.set_scroll((self.list.scroll() + 1).min(max));
     }
 
     /// The flat list of deletable rows in render order (scope-major, then
@@ -200,13 +203,7 @@ impl PermissionsPane {
     }
 
     fn move_cursor(&mut self, delta: isize) {
-        let count = self.deletable_rows().len();
-        if count == 0 {
-            self.cursor = 0;
-            return;
-        }
-        let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, count as isize - 1) as usize;
+        self.list.move_clamped(delta, self.deletable_rows().len());
     }
 
     /// Remove the focused grant from its backing JSON file. Reloads the
@@ -215,7 +212,7 @@ impl PermissionsPane {
     /// selected.
     fn delete_focused(&mut self) {
         let rows = self.deletable_rows();
-        let Some(row) = rows.get(self.cursor).cloned() else {
+        let Some(row) = rows.get(self.list.cursor()).cloned() else {
             self.status = Some("Nothing to remove.".to_string());
             return;
         };
@@ -225,9 +222,9 @@ impl PermissionsPane {
                 self.reload();
                 let count = self.deletable_rows().len();
                 if count == 0 {
-                    self.cursor = 0;
-                } else if self.cursor >= count {
-                    self.cursor = count - 1;
+                    self.list.set_cursor(0);
+                } else if self.list.cursor() >= count {
+                    self.list.set_cursor(count - 1);
                 }
             }
             Err(e) => self.status = Some(format!("Remove failed: {e}")),
@@ -260,7 +257,10 @@ impl PermissionsPane {
         self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
         self.sync_scroll_to_focus();
-        frame.render_widget(Paragraph::new(lines).scroll((self.scroll as u16, 0)), body);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.list.scroll() as u16, 0)),
+            body,
+        );
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let help = match &self.status {
@@ -302,7 +302,7 @@ impl PermissionsPane {
                 }
                 lines.push(kind_heading(kind));
                 for key in entries {
-                    let selected = row_idx == self.cursor;
+                    let selected = row_idx == self.list.cursor();
                     lines.push(grant_row(key, selected));
                     row_idx += 1;
                 }
@@ -336,7 +336,7 @@ impl PermissionsPane {
                 }
                 line_idx += 1; // kind heading
                 for _ in entries {
-                    if row_idx == self.cursor {
+                    if row_idx == self.list.cursor() {
                         return Some(line_idx);
                     }
                     line_idx += 1;
@@ -355,16 +355,28 @@ impl PermissionsPane {
     fn sync_scroll_to_focus(&mut self) {
         if let Some(focus) = self.selected_line_index() {
             let vh = self.last_body_height.max(1);
-            if focus < self.scroll {
-                self.scroll = focus;
-            } else if focus >= self.scroll + vh {
-                self.scroll = focus + 1 - vh;
+            if focus < self.list.scroll() {
+                self.list.set_scroll(focus);
+            } else if focus >= self.list.scroll() + vh {
+                self.list.set_scroll(focus + 1 - vh);
             }
         }
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        if self.scroll > max_scroll {
-            self.scroll = max_scroll;
+        if self.list.scroll() > max_scroll {
+            self.list.set_scroll(max_scroll);
         }
+    }
+}
+
+impl Pane for PermissionsPane {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        PermissionsPane::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        PermissionsPane::render(self, frame, area);
     }
 }
 
@@ -474,11 +486,10 @@ mod tests {
                 load_scope(Scope::Project, project),
                 load_scope(Scope::Global, global),
             ],
-            cursor: 0,
+            list: ScrollList::new(),
             status: None,
             last_body_height: 100,
             last_content_rows: 0,
-            scroll: 0,
         }
     }
 
@@ -589,27 +600,27 @@ mod tests {
             pane.sync_scroll_to_focus();
         }
         let focus = pane.selected_line_index().expect("a focused row");
-        assert!(focus >= pane.scroll, "focus above the window");
+        assert!(focus >= pane.list.scroll(), "focus above the window");
         assert!(
-            focus < pane.scroll + pane.last_body_height,
+            focus < pane.list.scroll() + pane.last_body_height,
             "focus below the window (scroll={}, focus={focus})",
-            pane.scroll
+            pane.list.scroll()
         );
-        assert!(pane.scroll > 0, "list should have scrolled");
+        assert!(pane.list.scroll() > 0, "list should have scrolled");
         // Moving back to the top brings the focus (and scroll) back up so the
         // first grant is visible again.
         for _ in 0..30 {
             pane.handle_key(press(KeyCode::Up));
             pane.sync_scroll_to_focus();
         }
-        assert_eq!(pane.cursor, 0);
+        assert_eq!(pane.list.cursor(), 0);
         let focus = pane.selected_line_index().expect("a focused row");
         assert!(
-            focus >= pane.scroll,
+            focus >= pane.list.scroll(),
             "focus above the window after scrolling up"
         );
         assert!(
-            focus < pane.scroll + pane.last_body_height,
+            focus < pane.list.scroll() + pane.last_body_height,
             "focus visible after scrolling back up"
         );
     }
@@ -653,9 +664,13 @@ mod tests {
         let mut pane = pane_over(Some(proj.path().to_path_buf()), None);
         // Move to the last row, delete it, cursor must clamp into range.
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.cursor, 1);
+        assert_eq!(pane.list.cursor(), 1);
         pane.handle_key(press(KeyCode::Delete));
-        assert_eq!(pane.cursor, 0, "cursor clamps after deleting the last row");
+        assert_eq!(
+            pane.list.cursor(),
+            0,
+            "cursor clamps after deleting the last row"
+        );
         assert_eq!(pane.deletable_rows().len(), 1);
     }
 

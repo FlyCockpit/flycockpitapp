@@ -784,32 +784,6 @@ fn should_attempt_display_attach(
 /// set narrows. Keeps layout pinned to a 6-row reservation.
 pub(crate) const AUTOCOMPLETE_ROWS: u16 = 6;
 
-/// Recompute a scroll-window top offset so `selected` stays visible with
-/// a one-row margin (scrolloff=1) above and below — i.e. the next and
-/// previous items are always shown — except at the true ends of the
-/// list. Hard stops, no wrap. Shared by the `@`-popup and the model
-/// picker so their scrolling feels identical.
-pub(super) fn windowed_scroll(
-    selected: usize,
-    mut offset: usize,
-    len: usize,
-    window: usize,
-) -> usize {
-    if len <= window {
-        return 0;
-    }
-    const SCROLLOFF: usize = 1;
-    // Keep a margin above the selection.
-    if selected < offset + SCROLLOFF {
-        offset = selected.saturating_sub(SCROLLOFF);
-    }
-    // Keep a margin below the selection.
-    if selected + SCROLLOFF + 1 > offset + window {
-        offset = (selected + SCROLLOFF + 1).saturating_sub(window);
-    }
-    offset.min(len - window)
-}
-
 fn attach_to_session_retry_once<T, E>(mut attach: impl FnMut() -> Result<T, E>) -> Result<T, E> {
     match attach() {
         Ok(value) => Ok(value),
@@ -1524,7 +1498,7 @@ pub struct App {
     pub(super) at_selected: usize,
     /// Top visible index of the `@`-popup scroll window. Maintained with
     /// a 1-row scrolloff so the next/prev candidate is always visible
-    /// except at the true ends of the list (see [`super::windowed_scroll`]).
+    /// except at the true ends of the list (see [`crate::tui::nav::windowed_scroll`]).
     pub(super) at_scroll: usize,
     /// Per-query memo of the suggestion walk so the filesystem isn't
     /// re-walked on every render / arrow keypress. Keyed by the exact
@@ -1570,7 +1544,7 @@ pub struct App {
     pub(super) slash_selected: usize,
     /// Top visible index of the slash popup's scroll window, maintained
     /// with the same 1-row scrolloff as the `@`-popup (see
-    /// [`super::windowed_scroll`]). Reset alongside `slash_selected`.
+    /// [`crate::tui::nav::windowed_scroll`]). Reset alongside `slash_selected`.
     pub(super) slash_scroll: usize,
     /// Cached availability and expensive descriptions for the current
     /// slash-menu-open interaction. Rebuilt when the menu opens; cleared when
@@ -7677,48 +7651,6 @@ mod startup_first_paint_tests {
 
         assert!(app.startup_background.started);
         assert!(app.async_actions.pending_count() >= 2);
-    }
-}
-
-#[cfg(test)]
-mod windowed_scroll_tests {
-    use super::windowed_scroll;
-
-    const W: usize = 6;
-
-    #[test]
-    fn no_scroll_when_list_fits() {
-        assert_eq!(windowed_scroll(0, 0, 5, W), 0);
-        assert_eq!(windowed_scroll(4, 0, 5, W), 0);
-    }
-
-    #[test]
-    fn top_has_no_margin_at_index_zero() {
-        // n=10: selecting 0 keeps offset 0 (nothing above to show).
-        assert_eq!(windowed_scroll(0, 0, 10, W), 0);
-        // selecting 1 still shows index 0 above it.
-        assert_eq!(windowed_scroll(1, 0, 10, W), 0);
-    }
-
-    #[test]
-    fn scrolls_when_reaching_last_visible_row() {
-        // From offset 0 (rows 0..5 visible), moving to index 5 must
-        // scroll one so index 6 (the next item) is visible.
-        assert_eq!(windowed_scroll(5, 0, 10, W), 1);
-    }
-
-    #[test]
-    fn end_of_list_fills_last_window_without_bottom_margin() {
-        // Last index of a 10-item list with window 6 → offset 4 so the
-        // final six (4..10) show, selection on the bottom row.
-        assert_eq!(windowed_scroll(9, 4, 10, W), 4);
-    }
-
-    #[test]
-    fn moving_up_keeps_previous_item_visible() {
-        // Coming back up to index 4 from a scrolled offset keeps a row
-        // above visible.
-        assert_eq!(windowed_scroll(4, 4, 10, W), 3);
     }
 }
 

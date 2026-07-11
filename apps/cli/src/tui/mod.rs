@@ -38,6 +38,7 @@ pub mod model_picker;
 pub mod multireview_dialog;
 pub mod nav;
 pub mod notes_pane;
+pub mod pane;
 pub mod pane_shared;
 pub mod paste;
 pub mod permissions_pane;

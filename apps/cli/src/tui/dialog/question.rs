@@ -29,6 +29,7 @@ use crate::daemon::proto::{
 };
 use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page, PageKind};
 use crate::tui::geometry::{MIN_HISTORY_HEIGHT, STATUS_HEIGHT};
+use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
 /// Codex-style cap on visible option rows. Longer lists scroll, keeping
@@ -462,7 +463,7 @@ impl QuestionDialog {
         2.min(prompt_h)
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -1259,6 +1260,18 @@ fn opts(options: &[InterruptOption]) -> Vec<DialogOption> {
             description: o.description.clone(),
         })
         .collect()
+}
+
+impl Pane for QuestionDialog {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        QuestionDialog::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        QuestionDialog::render(self, frame, area);
+    }
 }
 
 /// Map a dialog [`Answer`] back to the proto [`ResolveResponse`] for its

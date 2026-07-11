@@ -32,6 +32,7 @@ use crate::db::Db;
 use crate::db::project_notes::ProjectNote;
 use crate::tui::composer::Composer;
 use crate::tui::markdown;
+use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 /// Which part of the dialog has focus / what the user is doing.
@@ -619,6 +620,18 @@ impl NotesPane {
                 );
             }
         }
+    }
+}
+
+impl Pane for NotesPane {
+    type Outcome = NotesOutcome;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        NotesPane::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        NotesPane::render(self, frame, area);
     }
 }
 

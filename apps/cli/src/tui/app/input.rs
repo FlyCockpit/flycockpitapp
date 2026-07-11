@@ -804,7 +804,7 @@ impl App {
                         // Wrap at the top (first → last) + scrolloff so the
                         // neighbor stays visible (see `windowed_scroll`).
                         self.at_selected = crate::tui::nav::wrap_prev(self.at_selected, n);
-                        self.at_scroll = super::windowed_scroll(
+                        self.at_scroll = crate::tui::nav::windowed_scroll(
                             self.at_selected,
                             self.at_scroll,
                             n,
@@ -818,7 +818,7 @@ impl App {
                     if n > 0 {
                         // Wrap at the bottom (last → first).
                         self.at_selected = crate::tui::nav::wrap_next(self.at_selected, n);
-                        self.at_scroll = super::windowed_scroll(
+                        self.at_scroll = crate::tui::nav::windowed_scroll(
                             self.at_selected,
                             self.at_scroll,
                             n,
@@ -866,7 +866,7 @@ impl App {
                     let n = self.slash_suggestions().len();
                     if n > 0 {
                         self.slash_selected = crate::tui::nav::wrap_prev(self.slash_selected, n);
-                        self.slash_scroll = super::windowed_scroll(
+                        self.slash_scroll = crate::tui::nav::windowed_scroll(
                             self.slash_selected,
                             self.slash_scroll,
                             n,
@@ -879,7 +879,7 @@ impl App {
                     let n = self.slash_suggestions().len();
                     if n > 0 {
                         self.slash_selected = crate::tui::nav::wrap_next(self.slash_selected, n);
-                        self.slash_scroll = super::windowed_scroll(
+                        self.slash_scroll = crate::tui::nav::windowed_scroll(
                             self.slash_selected,
                             self.slash_scroll,
                             n,
@@ -1255,7 +1255,7 @@ impl App {
         // completing, so successive Tabs walk the list.
         if self.composer.text() == completions[idx] {
             self.slash_selected = crate::tui::nav::wrap_next(idx, n);
-            self.slash_scroll = super::windowed_scroll(
+            self.slash_scroll = crate::tui::nav::windowed_scroll(
                 self.slash_selected,
                 self.slash_scroll,
                 n,
@@ -1355,7 +1355,7 @@ impl App {
                 } else {
                     crate::tui::nav::wrap_next(self.slash_selected, n)
                 };
-                self.slash_scroll = super::windowed_scroll(
+                self.slash_scroll = crate::tui::nav::windowed_scroll(
                     self.slash_selected,
                     self.slash_scroll,
                     n,

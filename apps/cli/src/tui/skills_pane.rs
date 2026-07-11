@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::daemon::proto::{Request, Response, SkillSummary};
 use crate::tui::agent_runner;
+use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 pub struct SkillsPane {
@@ -142,6 +143,18 @@ impl SkillsPane {
 
 /// Fetch the skill list from the daemon for `cwd`. Returns the error as a
 /// string so the pane can render it inline rather than panicking.
+impl Pane for SkillsPane {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        SkillsPane::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        SkillsPane::render(self, frame, area);
+    }
+}
+
 fn fetch_skills(cwd: &std::path::Path) -> Result<Vec<SkillSummary>, String> {
     let req = Request::ListSkills {
         project_root: cwd.to_string_lossy().into_owned(),

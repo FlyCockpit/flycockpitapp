@@ -27,6 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 /// The leader key shown in help text. `Ctrl+X` is taken (embedded-pane
@@ -612,6 +613,18 @@ impl KeysOverlay {
             .join("\n")
             .trim_end()
             .to_string()
+    }
+}
+
+impl Pane for KeysOverlay {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        KeysOverlay::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        KeysOverlay::render(self, frame, area);
     }
 }
 

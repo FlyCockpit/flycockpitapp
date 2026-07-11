@@ -31,6 +31,7 @@ use crate::config::providers::{
     ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ProvidersConfig,
     ReasoningEffortCapability, ThinkingMode,
 };
+use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use unicode_width::UnicodeWidthStr;
@@ -51,9 +52,8 @@ pub struct ModelPickerDialog {
     entries: Vec<Entry>,
     active_model: Option<(String, String)>,
     filter: TextField,
-    cursor: usize,
-    /// Top visible index of the scroll window over the filtered list.
-    scroll: usize,
+    /// Cursor and top visible index of the scroll window over the filtered list.
+    pick: ScrollList,
     step: Step,
     error: Option<String>,
     done: bool,
@@ -216,8 +216,7 @@ impl ModelPickerDialog {
             entries,
             active_model,
             filter: TextField::default(),
-            cursor,
-            scroll,
+            pick: ScrollList::at(cursor, scroll),
             step: Step::Pick,
             error: None,
             done: false,
@@ -261,7 +260,7 @@ impl ModelPickerDialog {
         };
         match hit {
             RowHit::Pick { cursor } => {
-                self.cursor = cursor;
+                self.pick.set_cursor(cursor);
                 self.handle_pick_key(KeyEvent::from(KeyCode::Enter))
             }
             RowHit::Thinking { index } => {
@@ -299,25 +298,15 @@ impl ModelPickerDialog {
         // the filter, since this step is typing-driven.
         match key.code {
             KeyCode::Up => {
-                self.cursor = crate::tui::nav::wrap_prev(self.cursor, visible.len());
-                self.scroll = crate::tui::app::windowed_scroll(
-                    self.cursor,
-                    self.scroll,
-                    visible.len(),
-                    MODEL_WINDOW,
-                );
+                self.pick.move_by(-1, visible.len());
+                self.pick.clamp_windowed(visible.len(), MODEL_WINDOW);
             }
             KeyCode::Down => {
-                self.cursor = crate::tui::nav::wrap_next(self.cursor, visible.len());
-                self.scroll = crate::tui::app::windowed_scroll(
-                    self.cursor,
-                    self.scroll,
-                    visible.len(),
-                    MODEL_WINDOW,
-                );
+                self.pick.move_by(1, visible.len());
+                self.pick.clamp_windowed(visible.len(), MODEL_WINDOW);
             }
             KeyCode::Enter => {
-                if let Some(&i) = visible.get(self.cursor) {
+                if let Some(&i) = visible.get(self.pick.cursor()) {
                     let entry = self.entries[i].clone();
                     if let Some(capability) = entry
                         .reasoning_effort
@@ -373,8 +362,7 @@ impl ModelPickerDialog {
             self.filter.text(),
             MODEL_WINDOW,
         );
-        self.cursor = cursor;
-        self.scroll = scroll;
+        self.pick = ScrollList::at(cursor, scroll);
     }
 
     fn handle_thinking_key(&mut self, key: KeyEvent) -> bool {
@@ -537,8 +525,12 @@ impl ModelPickerDialog {
                 && visible.iter().any(|&idx| !self.entries[idx].is_favorite);
             let window = pick_window(area.height, self.error.is_some(), both_sections);
             // Scroll window: same scrolloff=1 behavior as the @-popup.
-            let offset =
-                crate::tui::app::windowed_scroll(self.cursor, self.scroll, visible.len(), window);
+            let offset = crate::tui::nav::windowed_scroll(
+                self.pick.cursor(),
+                self.pick.scroll(),
+                visible.len(),
+                window,
+            );
             for (i, &idx) in visible.iter().enumerate().skip(offset).take(window) {
                 let e = &self.entries[idx];
                 if e.is_favorite && !seen_fav {
@@ -555,7 +547,7 @@ impl ModelPickerDialog {
                     )));
                     seen_other = true;
                 }
-                let highlighted = i == self.cursor;
+                let highlighted = i == self.pick.cursor();
                 let is_active_model = self.is_active_entry(e);
                 let marker = if highlighted { "▸ " } else { "  " };
                 let label_style = if highlighted {
@@ -764,6 +756,18 @@ fn pick_window(body_height: u16, has_error: bool, both_sections: bool) -> usize 
         .clamp(1, MODEL_WINDOW)
 }
 
+impl Pane for ModelPickerDialog {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        ModelPickerDialog::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        ModelPickerDialog::render(self, frame, area);
+    }
+}
+
 fn push_error_line(lines: &mut Vec<Line<'static>>, error: Option<&str>) {
     if let Some(err) = error {
         lines.push(Line::default());
@@ -794,7 +798,7 @@ fn initial_pick_position(
             })
         })
         .unwrap_or(0);
-    let scroll = crate::tui::app::windowed_scroll(cursor, 0, visible.len(), window);
+    let scroll = crate::tui::nav::windowed_scroll(cursor, 0, visible.len(), window);
     (cursor, scroll)
 }
 
@@ -963,8 +967,7 @@ mod tests {
             entries: Vec::new(),
             active_model: None,
             filter: TextField::default(),
-            cursor: 0,
-            scroll: 0,
+            pick: ScrollList::new(),
             step: Step::Pick,
             error: None,
             done: false,
@@ -1051,8 +1054,7 @@ mod tests {
             entries,
             active_model: None,
             filter: TextField::default(),
-            cursor: 0,
-            scroll: 0,
+            pick: ScrollList::new(),
             step: Step::Pick,
             error: None,
             done: false,
@@ -1067,8 +1069,7 @@ mod tests {
             entries,
             active_model: None,
             filter: TextField::default(),
-            cursor: 0,
-            scroll: 0,
+            pick: ScrollList::new(),
             step: Step::Pick,
             error: None,
             done: false,
@@ -1144,7 +1145,7 @@ mod tests {
         let mut entries = vec![favorite_entry("fav")];
         entries.extend((0..13).map(|i| entry(&format!("m{i:02}"))));
         let mut d = dialog_with(entries);
-        d.cursor = d.filtered_indices().len() - 1;
+        d.pick.set_cursor(d.filtered_indices().len() - 1);
 
         let rendered = rendered_text(&mut d, 80, 10);
 
@@ -1159,7 +1160,7 @@ mod tests {
         let mut entries = vec![favorite_entry("fav")];
         entries.extend((0..13).map(|i| entry(&format!("m{i:02}"))));
         let mut d = dialog_with(entries);
-        d.cursor = d.filtered_indices().len() - 1;
+        d.pick.set_cursor(d.filtered_indices().len() - 1);
         d.error = Some("save failed: test".to_string());
 
         let rendered = rendered_text(&mut d, 80, 10);
@@ -1175,13 +1176,13 @@ mod tests {
     #[test]
     fn pick_step_arrows_wrap() {
         let mut d = dialog_with(vec![entry("a"), entry("b"), entry("c")]);
-        assert_eq!(d.cursor, 0);
+        assert_eq!(d.pick.cursor(), 0);
         // Up from the first item wraps to the last.
         d.handle_key(press(KeyCode::Up));
-        assert_eq!(d.cursor, 2);
+        assert_eq!(d.pick.cursor(), 2);
         // Down from the last item wraps to the first.
         d.handle_key(press(KeyCode::Down));
-        assert_eq!(d.cursor, 0);
+        assert_eq!(d.pick.cursor(), 0);
     }
 
     #[test]
@@ -1403,8 +1404,7 @@ mod tests {
             entries,
             active_model,
             filter: TextField::default(),
-            cursor,
-            scroll,
+            pick: ScrollList::at(cursor, scroll),
             step: Step::Pick,
             error: None,
             done: false,
@@ -1419,8 +1419,8 @@ mod tests {
             "p",
             "active",
         );
-        assert_eq!(d.cursor, 1);
-        assert_eq!(d.scroll, 0);
+        assert_eq!(d.pick.cursor(), 1);
+        assert_eq!(d.pick.scroll(), 0);
     }
 
     #[test]
@@ -1430,8 +1430,11 @@ mod tests {
             .collect::<Vec<_>>();
         entries.push(entry("active"));
         let d = dialog_with_active(entries, "p", "active");
-        assert_eq!(d.cursor, 14);
-        assert!(d.scroll > 0, "active row should be scrolled into view");
+        assert_eq!(d.pick.cursor(), 14);
+        assert!(
+            d.pick.scroll() > 0,
+            "active row should be scrolled into view"
+        );
     }
 
     #[test]
@@ -1445,23 +1448,23 @@ mod tests {
         d.handle_key(press(KeyCode::Char('c')));
         d.handle_key(press(KeyCode::Char('t')));
         assert_eq!(d.filter.text(), "act");
-        assert_eq!(d.cursor, 0);
+        assert_eq!(d.pick.cursor(), 0);
         let visible = d.filtered_indices();
-        assert_eq!(d.entries[visible[d.cursor]].model_id, "active");
+        assert_eq!(d.entries[visible[d.pick.cursor()]].model_id, "active");
     }
 
     #[test]
     fn active_missing_falls_back_to_first_visible_row() {
         let d = dialog_with_active(vec![entry("first"), entry("second")], "p", "missing");
-        assert_eq!(d.cursor, 0);
-        assert_eq!(d.scroll, 0);
+        assert_eq!(d.pick.cursor(), 0);
+        assert_eq!(d.pick.scroll(), 0);
     }
 
     #[test]
     fn active_marker_renders_independent_of_highlight() {
         let mut d = dialog_with_active(vec![entry("first"), entry("active")], "p", "active");
         d.handle_key(press(KeyCode::Up));
-        assert_eq!(d.cursor, 0);
+        assert_eq!(d.pick.cursor(), 0);
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");

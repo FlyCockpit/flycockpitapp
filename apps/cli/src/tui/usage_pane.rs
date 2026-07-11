@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::providers::usage::{ProviderUsageSnapshot, render_usage_lines};
+use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 pub struct UsagePane {
@@ -120,6 +121,18 @@ impl UsagePane {
     fn scroll_down(&mut self) {
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
         self.scroll = (self.scroll + 1).min(max_scroll);
+    }
+}
+
+impl Pane for UsagePane {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        UsagePane::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        UsagePane::render(self, frame, area);
     }
 }
 

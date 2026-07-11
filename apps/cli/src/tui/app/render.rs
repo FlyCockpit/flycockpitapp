@@ -2386,7 +2386,12 @@ impl App {
             // Clamp defensively: the match set can shrink between a
             // keypress and this render (the user typed another char).
             let selected = self.slash_selected.min(matches.len().saturating_sub(1));
-            let offset = super::windowed_scroll(selected, self.slash_scroll, matches.len(), window);
+            let offset = crate::tui::nav::windowed_scroll(
+                selected,
+                self.slash_scroll,
+                matches.len(),
+                window,
+            );
             let name_w = matches.iter().map(|c| c.name().len()).max().unwrap_or(0);
             matches
                 .iter()
@@ -2430,7 +2435,7 @@ impl App {
             let selected = self.at_selected.min(suggestions.len().saturating_sub(1));
             // Clamp the stored scroll offset defensively (the list can
             // shrink between a keypress and this render).
-            let offset = crate::tui::app::windowed_scroll(
+            let offset = crate::tui::nav::windowed_scroll(
                 selected,
                 self.at_scroll,
                 suggestions.len(),
@@ -2540,7 +2545,8 @@ impl App {
             .map(String::as_str)
             .unwrap_or(self.launch.agent_name.as_str());
         let window = layout[0].height as usize;
-        let offset = super::windowed_scroll(picker.cursor, 0, picker.entries.len(), window.max(1));
+        let offset =
+            crate::tui::nav::windowed_scroll(picker.cursor, 0, picker.entries.len(), window.max(1));
         let mut lines = Vec::new();
         for (idx, name) in picker.entries.iter().enumerate().skip(offset).take(window) {
             let highlighted = idx == picker.cursor;

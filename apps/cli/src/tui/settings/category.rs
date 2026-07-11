@@ -2165,7 +2165,7 @@ impl SettingsCx {
                     let n = editor.suggest.entries.len();
                     editor.suggest.selected =
                         crate::tui::nav::wrap_prev(editor.suggest.selected, n);
-                    editor.suggest.scroll = crate::tui::app::windowed_scroll(
+                    editor.suggest.scroll = crate::tui::nav::windowed_scroll(
                         editor.suggest.selected,
                         editor.suggest.scroll,
                         n,
@@ -2177,7 +2177,7 @@ impl SettingsCx {
                     let n = editor.suggest.entries.len();
                     editor.suggest.selected =
                         crate::tui::nav::wrap_next(editor.suggest.selected, n);
-                    editor.suggest.scroll = crate::tui::app::windowed_scroll(
+                    editor.suggest.scroll = crate::tui::nav::windowed_scroll(
                         editor.suggest.selected,
                         editor.suggest.scroll,
                         n,

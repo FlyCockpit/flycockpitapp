@@ -26,6 +26,7 @@ use crate::db::Db;
 use crate::db::stats::{
     LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
 };
+use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
@@ -84,11 +85,8 @@ pub struct StatsPane {
     /// Indexed by position in `rollup.recovery.by_model`. Reset on a
     /// scope/range change (the model set may differ).
     expanded: Vec<bool>,
-    /// Cursor over the recovery `by_model` rows — the row Enter/`e`
-    /// expands. Only meaningful when there are recovery rows.
-    cursor: usize,
-    /// Vertical scroll offset (in rendered body rows).
-    scroll: usize,
+    /// Cursor over recovery rows plus vertical body scroll.
+    list: ScrollList,
     /// Rendered body height at the last draw — drives scroll clamping.
     last_body_height: usize,
     /// Total rendered body rows at the last draw — drives scroll clamp.
@@ -120,8 +118,7 @@ impl StatsPane {
             range,
             rollup,
             expanded,
-            cursor: 0,
-            scroll: 0,
+            list: ScrollList::new(),
             last_body_height: 0,
             last_content_rows: 0,
         }
@@ -139,8 +136,7 @@ impl StatsPane {
             &self.prices,
         );
         self.expanded = init_expanded(&self.rollup);
-        self.cursor = 0;
-        self.scroll = 0;
+        self.list.reset();
     }
 
     /// Number of recovery `by_model` rows, used to clamp the cursor.
@@ -173,41 +169,49 @@ impl StatsPane {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let n = self.recovery_rows();
-                let prev = self.cursor;
-                self.cursor = crate::tui::nav::wrap_prev(self.cursor, n);
-                if self.cursor > prev {
+                let prev = self.list.cursor();
+                self.list.move_by(-1, n);
+                if self.list.cursor() > prev {
                     // Wrapped first → last: jump the body to the bottom so
                     // the now-selected last row is visible.
-                    self.scroll = self.last_content_rows.saturating_sub(self.last_body_height);
+                    self.list
+                        .set_scroll(self.last_content_rows.saturating_sub(self.last_body_height));
                 } else {
                     self.ensure_cursor_visible();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let n = self.recovery_rows();
-                let prev = self.cursor;
-                self.cursor = crate::tui::nav::wrap_next(self.cursor, n);
-                if self.cursor < prev {
+                let prev = self.list.cursor();
+                self.list.move_by(1, n);
+                if self.list.cursor() < prev {
                     // Wrapped last → first: jump the body to the top.
-                    self.scroll = 0;
+                    self.list.set_scroll(0);
                 } else {
                     self.ensure_cursor_visible();
                 }
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(self.last_body_height.max(1));
+                self.list.set_scroll(
+                    self.list
+                        .scroll()
+                        .saturating_sub(self.last_body_height.max(1)),
+                );
             }
             KeyCode::PageDown => {
                 let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-                self.scroll = (self.scroll + self.last_body_height.max(1)).min(max_scroll);
+                self.list.set_scroll(
+                    (self.list.scroll() + self.last_body_height.max(1)).min(max_scroll),
+                );
             }
-            KeyCode::Char('g') => self.scroll = 0,
+            KeyCode::Char('g') => self.list.set_scroll(0),
             KeyCode::Char('G') => {
-                self.scroll = self.last_content_rows.saturating_sub(self.last_body_height);
+                self.list
+                    .set_scroll(self.last_content_rows.saturating_sub(self.last_body_height));
             }
             KeyCode::Enter | KeyCode::Char('e') => {
                 // Expand/collapse the recovery row under the cursor.
-                if let Some(flag) = self.expanded.get_mut(self.cursor) {
+                if let Some(flag) = self.expanded.get_mut(self.list.cursor()) {
                     *flag = !*flag;
                 }
             }
@@ -218,14 +222,15 @@ impl StatsPane {
 
     /// Scroll the body up by one row (mouse wheel).
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
+        self.list.set_scroll(self.list.scroll().saturating_sub(1));
     }
 
     /// Scroll the body down by one row (mouse wheel), clamped so the
     /// last row can't scroll above the body floor.
     pub fn scroll_down(&mut self) {
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        self.scroll = (self.scroll + 1).min(max_scroll);
+        self.list
+            .set_scroll((self.list.scroll() + 1).min(max_scroll));
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -233,22 +238,24 @@ impl StatsPane {
             return;
         };
         let height = self.last_body_height.max(1);
-        if row < self.scroll {
-            self.scroll = row;
-        } else if row >= self.scroll + height {
-            self.scroll = row + 1 - height;
+        if row < self.list.scroll() {
+            self.list.set_scroll(row);
+        } else if row >= self.list.scroll() + height {
+            self.list.set_scroll(row + 1 - height);
         }
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        self.scroll = self.scroll.min(max_scroll);
+        self.list.set_scroll(self.list.scroll().min(max_scroll));
     }
 
     fn cursor_body_line(&self) -> Option<usize> {
         let rollup = self.rollup.as_ref().ok()?;
-        if rollup.recovery.by_model.is_empty() || self.cursor >= rollup.recovery.by_model.len() {
+        if rollup.recovery.by_model.is_empty()
+            || self.list.cursor() >= rollup.recovery.by_model.len()
+        {
             return None;
         }
         let mut row = section_tokens(&rollup.tokens).len() + 1 + 2;
-        for i in 0..self.cursor {
+        for i in 0..self.list.cursor() {
             row += 1;
             if self.expanded.get(i).copied().unwrap_or(false) {
                 row +=
@@ -274,11 +281,14 @@ impl StatsPane {
         self.last_body_height = body.height as usize;
         // Clamp scroll to the valid range now that we know the heights.
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        if self.scroll > max_scroll {
-            self.scroll = max_scroll;
+        if self.list.scroll() > max_scroll {
+            self.list.set_scroll(max_scroll);
         }
 
-        frame.render_widget(Paragraph::new(lines).scroll((self.scroll as u16, 0)), body);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.list.scroll() as u16, 0)),
+            body,
+        );
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         frame.render_widget(
@@ -327,12 +337,28 @@ impl StatsPane {
             Ok(r) => {
                 lines.extend(section_tokens(&r.tokens));
                 lines.push(Line::default());
-                lines.extend(section_recovery(&r.recovery, &self.expanded, self.cursor));
+                lines.extend(section_recovery(
+                    &r.recovery,
+                    &self.expanded,
+                    self.list.cursor(),
+                ));
                 lines.push(Line::default());
                 lines.extend(section_language(&r.language, width));
             }
         }
         lines
+    }
+}
+
+impl Pane for StatsPane {
+    type Outcome = bool;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        StatsPane::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        StatsPane::render(self, frame, area);
     }
 }
 
@@ -731,8 +757,7 @@ mod tests {
             range: RangeToggle::Last7Days,
             rollup: Ok(rollup),
             expanded,
-            cursor: 0,
-            scroll: 0,
+            list: ScrollList::new(),
             last_body_height: 100,
             last_content_rows: 0,
         }
@@ -894,17 +919,17 @@ mod tests {
             },
         ];
         let mut pane = pane_with(rollup);
-        assert_eq!(pane.cursor, 0);
+        assert_eq!(pane.list.cursor(), 0);
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.cursor, 1);
+        assert_eq!(pane.list.cursor(), 1);
         // Wrap last → first.
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.cursor, 0);
+        assert_eq!(pane.list.cursor(), 0);
         // Wrap first → last.
         pane.handle_key(press(KeyCode::Up));
-        assert_eq!(pane.cursor, 1);
+        assert_eq!(pane.list.cursor(), 1);
         pane.handle_key(press(KeyCode::Up));
-        assert_eq!(pane.cursor, 0);
+        assert_eq!(pane.list.cursor(), 0);
     }
 
     #[test]
@@ -963,14 +988,14 @@ mod tests {
 
         let selected = pane.cursor_body_line().unwrap();
         assert!(
-            selected >= pane.scroll,
+            selected >= pane.list.scroll(),
             "selected={selected} scroll={}",
-            pane.scroll
+            pane.list.scroll()
         );
         assert!(
-            selected < pane.scroll + pane.last_body_height,
+            selected < pane.list.scroll() + pane.last_body_height,
             "selected={selected} scroll={}",
-            pane.scroll
+            pane.list.scroll()
         );
     }
 

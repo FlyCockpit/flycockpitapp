@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::tui::pane::ScrollList;
 use crate::tui::textfield::TextField;
 
 /// One proposed option on a select / multiselect page.
@@ -271,9 +272,8 @@ pub struct DialogState {
     page_states: Vec<PageState>,
     /// Current page index. Equals `pages.len()` on the confirm page.
     page: usize,
-    /// Cursor within the current page (option index, or the custom
-    /// affordance index). Unused on the confirm page.
-    cursor: usize,
+    /// Cursor within the current page plus answer-list scroll.
+    list: ScrollList,
     /// True while the user is editing the custom / free-text field of
     /// the current page (keystrokes go to the field, not to navigation).
     typing: bool,
@@ -281,12 +281,6 @@ pub struct DialogState {
     /// here.
     created_at: Instant,
     lockout: Duration,
-    /// First visible row index within the current page's row list (option
-    /// rows + custom + optional Next), used when the list is taller than
-    /// the viewport. Kept so the focused row stays in view. `viewport`
-    /// rows are visible at a time once [`set_viewport`](Self::set_viewport)
-    /// is fed the rendered cap.
-    scroll: usize,
     /// Max visible rows the renderer last reported (the codex-style cap).
     /// Zero means "unbounded" (no scrolling) until the renderer reports a
     /// cap.
@@ -337,11 +331,10 @@ impl DialogState {
             pages,
             page_states,
             page: 0,
-            cursor: 0,
+            list: ScrollList::new(),
             typing,
             created_at: Instant::now(),
             lockout,
-            scroll: 0,
             viewport: 0,
             prompt_scroll: 0,
             prompt_lines: 0,
@@ -393,7 +386,7 @@ impl DialogState {
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.list.cursor()
     }
 
     pub fn is_typing(&self) -> bool {
@@ -460,7 +453,7 @@ impl DialogState {
     /// renderer skips rows before this when the list is taller than the
     /// viewport.
     pub fn scroll(&self) -> usize {
-        self.scroll
+        self.list.scroll()
     }
 
     /// Visible option rows the renderer last reported (the codex-style cap).
@@ -500,12 +493,12 @@ impl DialogState {
     /// (clamping the cursor into the window wins over honoring the margin).
     fn clamp_scroll(&mut self) {
         if self.viewport == 0 || self.on_confirm_page() {
-            self.scroll = 0;
+            self.list.set_scroll(0);
             return;
         }
         let total = self.pages[self.page].cursor_count();
         if total <= self.viewport {
-            self.scroll = 0;
+            self.list.set_scroll(0);
             return;
         }
         // Desired 1-row margin, shrunk to fit the viewport: with a window of
@@ -516,19 +509,19 @@ impl DialogState {
         let margin = 1.min((self.viewport.saturating_sub(1)) / 2);
         // Top edge: keep `margin` rows above the cursor, but never scroll
         // past the first option.
-        let want_top = self.cursor.saturating_sub(margin);
-        if want_top < self.scroll {
-            self.scroll = want_top;
+        let want_top = self.list.cursor().saturating_sub(margin);
+        if want_top < self.list.scroll() {
+            self.list.set_scroll(want_top);
         }
         // Bottom edge: keep `margin` rows below the cursor, but never scroll
         // past the last option.
-        let want_bottom = (self.cursor + margin).min(total.saturating_sub(1));
-        if want_bottom >= self.scroll + self.viewport {
-            self.scroll = want_bottom + 1 - self.viewport;
+        let want_bottom = (self.list.cursor() + margin).min(total.saturating_sub(1));
+        if want_bottom >= self.list.scroll() + self.viewport {
+            self.list.set_scroll(want_bottom + 1 - self.viewport);
         }
         let max_scroll = total.saturating_sub(self.viewport);
-        if self.scroll > max_scroll {
-            self.scroll = max_scroll;
+        if self.list.scroll() > max_scroll {
+            self.list.set_scroll(max_scroll);
         }
     }
 
@@ -755,7 +748,7 @@ impl DialogState {
         let page = &self.pages[self.page];
         let id = page.options[idx].id.clone();
         if page.is_select() {
-            self.cursor = idx;
+            self.list.set_cursor(idx);
             self.clamp_scroll();
             let st = &mut self.page_states[self.page];
             // Radio + custom are mutually exclusive: choosing a radio
@@ -770,7 +763,7 @@ impl DialogState {
             } else {
                 st.selected.push(id);
             }
-            self.cursor = idx;
+            self.list.set_cursor(idx);
             self.clamp_scroll();
             DialogOutcome::Continue
         }
@@ -781,19 +774,19 @@ impl DialogState {
     /// not a toggle target — space there is a no-op (Enter advances).
     fn toggle_or_type(&mut self) {
         let page = &self.pages[self.page];
-        if Some(self.cursor) == page.next_index() {
+        if Some(self.list.cursor()) == page.next_index() {
             return;
         }
-        if Some(self.cursor) == page.custom_index() {
+        if Some(self.list.cursor()) == page.custom_index() {
             // Hovering "Type your own answer": space begins typing.
             self.begin_custom_typing();
             return;
         }
-        let Some(option) = page.options.get(self.cursor) else {
+        let Some(option) = page.options.get(self.list.cursor()) else {
             debug_assert!(
                 page.options.is_empty(),
                 "dialog cursor {} points past {} option rows",
-                self.cursor,
+                self.list.cursor(),
                 page.options.len()
             );
             return;
@@ -832,10 +825,10 @@ impl DialogState {
     fn enter_on_page(&mut self) -> DialogOutcome {
         let page = &self.pages[self.page];
         // Multiselect "Next" entry: the explicit advance.
-        if Some(self.cursor) == page.next_index() {
+        if Some(self.list.cursor()) == page.next_index() {
             return self.fast_path_submit_or_advance();
         }
-        if Some(self.cursor) == page.custom_index() {
+        if Some(self.list.cursor()) == page.custom_index() {
             // On the custom affordance: with text already typed, enter =
             // choose+submit that custom answer; with nothing typed, enter
             // = begin typing.
@@ -851,11 +844,11 @@ impl DialogState {
             return self.fast_path_submit_or_advance();
         }
         // Hovering a proposed option.
-        let Some(option) = page.options.get(self.cursor) else {
+        let Some(option) = page.options.get(self.list.cursor()) else {
             debug_assert!(
                 page.options.is_empty(),
                 "dialog cursor {} points past {} option rows",
-                self.cursor,
+                self.list.cursor(),
                 page.options.len()
             );
             return DialogOutcome::Continue;
@@ -919,7 +912,7 @@ impl DialogState {
         if n == 0 {
             return;
         }
-        self.cursor = (((self.cursor as i32 + delta) % n + n) % n) as usize;
+        self.list.move_by(delta as isize, n as usize);
         self.clamp_scroll();
     }
 
@@ -945,8 +938,7 @@ impl DialogState {
     /// Reset per-page transient state after a page change. Freetext pages
     /// open directly in typing mode (no space/enter to start).
     fn land_on_page(&mut self) {
-        self.cursor = 0;
-        self.scroll = 0;
+        self.list.reset();
         self.prompt_scroll = 0;
         self.typing = !self.on_confirm_page() && self.pages[self.page].is_text();
     }

@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::engine::resource_scheduler::{
     ResourceQueuedSnapshot, ResourceQueuedState, ResourceRunningSnapshot, ResourceSchedulerSnapshot,
 };
-use crate::tui::pane_shared::clamp_scroll_to_visible_span;
+use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
 #[derive(Debug)]
@@ -24,8 +24,7 @@ pub struct ResourcesPane {
     snapshot: Option<ResourceSchedulerSnapshot>,
     error: Option<String>,
     loading: bool,
-    cursor: usize,
-    scroll: usize,
+    list: ScrollList,
     last_body_height: usize,
     last_content_rows: usize,
 }
@@ -65,8 +64,7 @@ impl ResourcesPane {
             snapshot: None,
             error: None,
             loading: true,
-            cursor: 0,
-            scroll: 0,
+            list: ScrollList::new(),
             last_body_height: 0,
             last_content_rows: 0,
         }
@@ -77,7 +75,7 @@ impl ResourcesPane {
         match result {
             Ok(snapshot) => {
                 self.error = None;
-                self.cursor = self.cursor.min(snapshot.queued.len().saturating_sub(1));
+                self.list.clamp_cursor(snapshot.queued.len());
                 self.snapshot = Some(snapshot);
             }
             Err(e) => self.error = Some(e),
@@ -93,12 +91,12 @@ impl ResourcesPane {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let n = self.queued_len();
-                self.cursor = crate::tui::nav::wrap_prev(self.cursor, n);
+                self.list.move_by(-1, n);
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let n = self.queued_len();
-                self.cursor = crate::tui::nav::wrap_next(self.cursor, n);
+                self.list.move_by(1, n);
                 None
             }
             KeyCode::Enter | KeyCode::Char(' ') => self
@@ -120,21 +118,16 @@ impl ResourcesPane {
         let (lines, selected_span) = self.body_lines_with_selected_span();
         self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
-        let mut scroll = self
-            .scroll
-            .min(self.last_content_rows.saturating_sub(self.last_body_height));
+        let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
+        self.list.set_scroll(self.list.scroll().min(max_scroll));
         if let Some((start, end)) = selected_span {
-            scroll = clamp_scroll_to_visible_span(
-                scroll,
-                self.last_body_height,
-                self.last_content_rows,
-                start,
-                end,
-            );
+            self.list
+                .clamp_visible_span(self.last_body_height, self.last_content_rows, start, end);
         }
-        self.scroll = scroll;
-
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.list.scroll() as u16, 0)),
+            body,
+        );
         frame.render_widget(
             Paragraph::new(self.help_line())
                 .style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
@@ -149,7 +142,7 @@ impl ResourcesPane {
     fn selected_request(&self) -> Option<&ResourceQueuedSnapshot> {
         self.snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.queued.get(self.cursor))
+            .and_then(|snapshot| snapshot.queued.get(self.list.cursor()))
     }
 
     fn help_line(&self) -> Line<'static> {
@@ -216,8 +209,8 @@ impl ResourcesPane {
         } else {
             for (i, entry) in snapshot.queued.iter().enumerate() {
                 let start = lines.len();
-                lines.push(queued_line(entry, i == self.cursor));
-                if i == self.cursor {
+                lines.push(queued_line(entry, i == self.list.cursor()));
+                if i == self.list.cursor() {
                     selected_span = Some((start, start + 1));
                 }
             }
@@ -233,6 +226,18 @@ fn section(text: &str) -> Line<'static> {
             .fg(Color::Indexed(ACCENT_BLUE_INDEX))
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+impl Pane for ResourcesPane {
+    type Outcome = Option<ResourcesOutcome>;
+
+    fn handle_key(&mut self, key: KeyEvent) -> Self::Outcome {
+        ResourcesPane::handle_key(self, key)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        ResourcesPane::render(self, frame, area);
+    }
 }
 
 fn muted(text: impl Into<String>) -> Line<'static> {

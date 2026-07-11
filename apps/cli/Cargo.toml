@@ -227,6 +227,7 @@ similar = "3"
 # single core in the tree. `rayon` drives the parallel parse; the serial
 # SQLite write goes through the bundled `rusqlite` connection.
 tree-sitter = "0.26"
+tree-sitter-highlight = "0.26.10"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"

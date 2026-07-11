@@ -8965,9 +8965,8 @@ impl App {
 
     /// Find the most-recent tool call with `call_id` — in a `ToolBox` or
     /// a standalone `ToolLine` — and update its state. For output-bearing
-    /// box tools the output is stored as the expandable detail; input-
-    /// only tools (read/readlock/unlock) drop it so a big file read
-    /// doesn't sit in history. Returns whether a call was found.
+    /// box tools the output is stored as the expandable detail; input-only
+    /// tools such as `unlock` drop it. Returns whether a call was found.
     pub(super) fn update_tool_state(
         &mut self,
         call_id: &str,
@@ -17207,6 +17206,57 @@ mod keys_overlay_tests {
                     && summary == "orphan result"
                     && *state == crate::tui::history::ToolCallState::Success
         ));
+    }
+
+    #[test]
+    fn read_and_readlock_tool_end_store_captured_output_but_unlock_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        for (call_id, tool, path, output) in [
+            ("read-call", "read", "src/main.rs", "1|fn main() {}"),
+            (
+                "readlock-call",
+                "readlock",
+                "src/lib.rs",
+                "1|pub fn lib() {}",
+            ),
+            ("unlock-call", "unlock", "src/lib.rs", "SHOULD_NOT_STORE"),
+        ] {
+            app.apply_event(crate::engine::agent::TurnEvent::ToolStart {
+                agent: "Build".into(),
+                call_id: call_id.into(),
+                tool: tool.into(),
+                args: serde_json::json!({ "path": path }),
+            });
+            app.apply_event(crate::engine::agent::TurnEvent::ToolEnd {
+                agent: "Build".into(),
+                call_id: call_id.into(),
+                tool: tool.into(),
+                output: output.into(),
+                truncated: false,
+                hint: None,
+            });
+        }
+
+        let Some(HistoryEntry::ToolBox { calls, .. }) = app.history.last() else {
+            panic!("expected tool box");
+        };
+        let read = calls
+            .iter()
+            .find(|call| call.call_id == "read-call")
+            .unwrap();
+        let readlock = calls
+            .iter()
+            .find(|call| call.call_id == "readlock-call")
+            .unwrap();
+        let unlock = calls
+            .iter()
+            .find(|call| call.call_id == "unlock-call")
+            .unwrap();
+
+        assert_eq!(read.output, "1|fn main() {}");
+        assert_eq!(readlock.output, "1|pub fn lib() {}");
+        assert!(unlock.output.is_empty());
     }
 
     /// Esc and `q` close the overlay while it is open.

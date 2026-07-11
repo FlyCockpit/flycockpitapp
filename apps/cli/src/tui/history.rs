@@ -2408,12 +2408,16 @@ fn tool_state_style(state: ToolCallState) -> Style {
     }
 }
 
-/// Tools whose output is worth showing when a box is expanded. Input-
-/// only tools (read/readlock/unlock) never show output — the user can
-/// open the file themselves. Public so the event handler can avoid
-/// storing large outputs it will never display.
+/// Tools whose output is worth showing when a box is expanded. `read` and
+/// `readlock` show their captured, capped tool output so the user can inspect
+/// exactly what the model saw; `unlock` remains input-only. Public so the event
+/// handler can avoid storing outputs it will never display.
 pub fn tool_shows_output(tool: &str) -> bool {
-    !matches!(tool, "read" | "readlock" | "unlock")
+    !matches!(tool, "unlock")
+}
+
+fn tool_uses_read_output_renderer(tool: &str) -> bool {
+    matches!(tool, "read" | "readlock")
 }
 
 /// Spans for one tool-call line: `[glyph] label: summary`, the label
@@ -2619,13 +2623,21 @@ fn render_toolbox(
                 } else {
                     Style::default().fg(TOOL_OUTPUT_FG)
                 };
-                let output_lines = call
-                    .output
-                    .split('\n')
-                    .map(|out_line| {
-                        Line::from(vec![Span::styled(format!("    {out_line}"), out_style)])
-                    })
-                    .collect::<Vec<_>>();
+                let output_lines = if tool_uses_read_output_renderer(&call.tool) {
+                    crate::tui::read_highlight::render_read_output_lines(
+                        &call.output,
+                        &call.full_input,
+                        out_style,
+                        !is_elided,
+                    )
+                } else {
+                    call.output
+                        .split('\n')
+                        .map(|out_line| {
+                            Line::from(vec![Span::styled(format!("    {out_line}"), out_style)])
+                        })
+                        .collect::<Vec<_>>()
+                };
                 let (wrapped, _) = wrap_lines_to_width(output_lines, call_body_width);
                 let window =
                     inner_scroll_window(wrapped.len(), TOOLCALL_RESULT_VISIBLE, call.result_offset);
@@ -4236,17 +4248,62 @@ mod tests {
     }
 
     #[test]
-    fn toolbox_expanded_shows_output_only_for_output_bearing_tools() {
+    fn toolbox_expanded_shows_read_and_readlock_output_but_not_unlock_output() {
         let mut bash = mk_call("bash", "ls", ToolCallState::Success);
         bash.expanded = true;
         bash.output = "file_a\nfile_b".into();
-        let mut read = mk_call("read", "f.txt", ToolCallState::Success);
+        let mut read = mk_call("read", "f.rs", ToolCallState::Success);
         read.expanded = true;
-        read.output = "SHOULD_NOT_SHOW".into(); // input-only — never displayed
-        let r = render_toolbox(&[bash, read], 0, true, 80, false, &no_elided());
+        read.output = "1|fn main() {}".into();
+        let mut readlock = mk_call("readlock", "g.ts", ToolCallState::Success);
+        readlock.expanded = true;
+        readlock.output = "1|const value = 1;".into();
+        let mut unlock = mk_call("unlock", "f.rs", ToolCallState::Success);
+        unlock.expanded = true;
+        unlock.output = "SHOULD_NOT_SHOW".into();
+
+        let r = render_toolbox(
+            &[bash, read, readlock, unlock],
+            0,
+            true,
+            80,
+            false,
+            &no_elided(),
+        );
         let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
         assert!(joined.contains("file_a") && joined.contains("file_b"));
+        assert!(joined.contains("1|fn main() {}"));
+        assert!(joined.contains("1|const value = 1;"));
         assert!(!joined.contains("SHOULD_NOT_SHOW"));
+    }
+
+    #[test]
+    fn toolbox_read_output_styles_line_numbers_without_rewriting_text() {
+        let mut call = mk_call("read", "src/main.rs", ToolCallState::Success);
+        call.expanded = true;
+        call.output = "1|fn main() {\n2|}".into();
+
+        let r = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+        let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(joined.contains("1|fn main() {"));
+        assert!(joined.contains("2|}"));
+        let line = r
+            .lines
+            .iter()
+            .find(|line| line_text(line).contains("1|fn main()"))
+            .expect("rendered read output line");
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "1|" && span.style.fg == Some(METADATA_TEXT))
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "fn" && span.style.fg == Some(PLAN_YELLOW))
+        );
     }
 
     #[test]

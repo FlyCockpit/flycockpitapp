@@ -44,6 +44,7 @@ pub mod permissions_pane;
 pub mod pins_overlay;
 pub mod pty;
 pub mod quick_dialog;
+pub(crate) mod read_highlight;
 pub mod resources_pane;
 pub mod sessions_pane;
 pub mod settings;

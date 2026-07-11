@@ -2,14 +2,35 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::db::session_goals::{GoalStatus, GoalUpdateOutcome};
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 
 pub struct CreateGoalTool;
 pub struct GetGoalTool;
 pub struct UpdateGoalTool;
+
+#[derive(Debug, Deserialize)]
+struct CreateGoalArgs {
+    objective: String,
+    context: Option<String>,
+    token_budget: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetGoalArgs {
+    include_context: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGoalArgs {
+    status: String,
+    evidence: Option<String>,
+    blocker: Option<String>,
+    context_delta: Option<String>,
+}
 
 #[async_trait]
 impl Tool for CreateGoalTool {
@@ -38,15 +59,14 @@ impl Tool for CreateGoalTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let objective = required_str(&args, "objective")?;
-        let context = args.get("context").and_then(Value::as_str);
-        let token_budget = args.get("token_budget").and_then(Value::as_i64);
+        let args: CreateGoalArgs = typed_args(args)?;
+        let objective = required_nonempty(&args.objective, "objective")?;
         let goal = ctx.session.db.create_session_goal(
             ctx.session.id,
             &ctx.session.project_id,
             objective,
-            context,
-            token_budget,
+            args.context.as_deref(),
+            args.token_budget,
         )?;
         Ok(ToolOutput::text(format!(
             "Created goal `{}` [{}]: {}",
@@ -81,11 +101,9 @@ impl Tool for GetGoalTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: GetGoalArgs = typed_args(args)?;
         ctx.session.db.refresh_session_goal_usage(ctx.session.id)?;
-        let include_context = args
-            .get("include_context")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let include_context = args.include_context.unwrap_or(false);
         let Some(goal) = ctx.session.db.current_session_goal(ctx.session.id, true)? else {
             return Ok(ToolOutput::text("No goal for this session."));
         };
@@ -139,7 +157,8 @@ impl Tool for UpdateGoalTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let status = match required_str(&args, "status")? {
+        let args: UpdateGoalArgs = typed_args(args)?;
+        let status = match required_nonempty(&args.status, "status")? {
             "active" => GoalStatus::Active,
             "paused" => GoalStatus::Paused,
             "blocked" => GoalStatus::Blocked,
@@ -151,9 +170,9 @@ impl Tool for UpdateGoalTool {
         match ctx.session.db.update_session_goal(
             ctx.session.id,
             status,
-            args.get("evidence").and_then(Value::as_str),
-            args.get("blocker").and_then(Value::as_str),
-            args.get("context_delta").and_then(Value::as_str),
+            args.evidence.as_deref(),
+            args.blocker.as_deref(),
+            args.context_delta.as_deref(),
         )? {
             GoalUpdateOutcome::Updated(goal) => Ok(ToolOutput::text(format!(
                 "Goal `{}` status is now `{}`.",
@@ -169,12 +188,13 @@ impl Tool for UpdateGoalTool {
     }
 }
 
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid_input(format!("`{key}` is required")))
+fn required_nonempty<'a>(value: &'a str, key: &str) -> Result<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(invalid_input(format!("`{key}` is required")))
+    } else {
+        Ok(trimmed)
+    }
 }
 
 #[cfg(test)]

@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use async_trait::async_trait;
 use ignore::WalkBuilder;
+use serde::Deserialize;
 use serde_json::Value;
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::intel::budget::BudgetedWriter;
 use crate::intel::lang::{Language, regex_outline};
 use crate::intel::thin::{ThinLimits, thin_line_output};
@@ -108,6 +109,14 @@ fn finish(writer: BudgetedWriter, note: &str) -> ToolOutput {
 
 pub struct ContextPackTool;
 
+#[derive(Debug, Deserialize)]
+struct ContextPackArgs {
+    target: Option<String>,
+    kind: Option<String>,
+    depth: Option<u64>,
+    limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextPackKind {
     Auto,
@@ -163,22 +172,15 @@ impl Tool for ContextPackTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: ContextPackArgs = typed_args(args)?;
         let target = args
-            .get("target")
-            .and_then(Value::as_str)
+            .target
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let requested = parse_context_pack_kind(args.get("kind").and_then(Value::as_str))?;
-        let depth = args
-            .get("depth")
-            .and_then(Value::as_u64)
-            .map(|d| d.clamp(1, 3) as usize)
-            .unwrap_or(1);
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|l| l.clamp(1, 50) as usize)
-            .unwrap_or(12);
+        let requested = parse_context_pack_kind(args.kind.as_deref())?;
+        let depth = args.depth.map(|d| d.clamp(1, 3) as usize).unwrap_or(1);
+        let limit = args.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(12);
 
         let index = index_of(ctx);
         index.ensure_fresh().await?;

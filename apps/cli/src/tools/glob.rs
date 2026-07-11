@@ -14,9 +14,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
+use serde::Deserialize;
 use serde_json::Value;
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::intel::budget::BudgetedWriter;
 use crate::tools::sandbox;
 
@@ -27,6 +28,12 @@ const GLOB_TOKEN_CAP: usize = 4_000;
 const MAX_ENTRIES: usize = 5_000;
 
 pub struct GlobTool;
+
+#[derive(Debug, Deserialize)]
+struct GlobArgs {
+    pattern: String,
+    path: Option<String>,
+}
 
 #[async_trait]
 impl Tool for GlobTool {
@@ -76,15 +83,14 @@ impl Tool for GlobTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let pattern = args
-            .get("pattern")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid_input("`pattern` is required"))?
-            .to_string();
+        let args: GlobArgs = typed_args(args)?;
+        if args.pattern.trim().is_empty() {
+            return Err(invalid_input("`pattern` is required"));
+        }
+        let pattern = args.pattern;
 
         let canonical_root = sandbox::canonical_root(&ctx.cwd)?;
-        let walk_root = match args.get("path").and_then(Value::as_str) {
+        let walk_root = match args.path.as_deref() {
             Some(p) if !p.is_empty() => sandbox::confine(&ctx.cwd, p)?,
             _ => canonical_root.clone(),
         };

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::engine::message::ToolDefinition;
@@ -59,6 +59,16 @@ pub fn invalid_input(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(InvalidToolInput(msg.into()))
 }
 
+/// Deserialize already-repaired tool arguments into a tool-local args type.
+///
+/// This deliberately sits below the repair layer: [`Tool::call`] still receives
+/// raw [`serde_json::Value`], then individual tools call this helper inside
+/// `call` after validation/repair/path-normalization has mutated that value.
+pub fn typed_args<A: DeserializeOwned>(args: Value) -> Result<A> {
+    serde_json::from_value(args)
+        .map_err(|err| invalid_input(format!("invalid tool arguments: {err}")))
+}
+
 /// Classify a dispatch error: an [`InvalidToolInput`] anywhere in the
 /// chain means the model built the call badly; everything else is an
 /// execution failure.
@@ -67,6 +77,46 @@ pub fn classify_failure(err: &anyhow::Error) -> ToolFailKind {
         ToolFailKind::Invocation
     } else {
         ToolFailKind::Execution
+    }
+}
+
+#[cfg(test)]
+mod typed_args_tests {
+    use super::*;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[derive(Debug, Deserialize)]
+    struct GlobArgs {
+        pattern: String,
+    }
+
+    #[test]
+    fn typed_args_deserializes_after_repair_normalizes_aliases() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "x-cockpit-aliases": ["query"]
+                }
+            },
+            "required": ["pattern"]
+        });
+        let mut args = json!({ "query": "**/*.rs" });
+
+        let outcome = crate::engine::repair::repair(&mut args, &schema, "glob");
+        assert!(outcome.valid, "{outcome:?}");
+
+        let parsed: GlobArgs = typed_args(args).unwrap();
+        assert_eq!(parsed.pattern, "**/*.rs");
+    }
+
+    #[test]
+    fn typed_args_failures_are_invocation_errors() {
+        let err = typed_args::<GlobArgs>(json!({})).unwrap_err();
+
+        assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
     }
 }
 
@@ -863,57 +913,8 @@ mod llm_mode_tests {
     use crate::config::extended::LlmMode;
     use crate::tools;
 
-    /// Every built-in tool, in one registry. Drives the full-surface
-    /// coverage test so a future tool added to the built-in surface cannot
-    /// silently skip its defensive description — add it here and the
-    /// coverage assertion forces a defensive variant. `bash` and `task`
-    /// build their descriptions at construction, so they appear via their
-    /// real constructors. Custom-bash tools (`webfetch`/…) are
-    /// user-config-driven — their author owns the wording — so they are
-    /// deliberately excluded.
     fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
-        vec![
-            Arc::new(tools::read::ReadTool),
-            Arc::new(tools::readlock::ReadlockTool),
-            Arc::new(tools::writeunlock::WriteunlockTool),
-            Arc::new(tools::unlock::UnlockTool),
-            Arc::new(tools::editunlock::EditunlockTool),
-            Arc::new(tools::bash::BashTool::new()),
-            Arc::new(tools::skill::SkillTool),
-            Arc::new(tools::question::QuestionTool),
-            Arc::new(tools::defer::DeferTool),
-            Arc::new(tools::schedule::ScheduleTool),
-            Arc::new(tools::mcp_tool::McpTool),
-            Arc::new(tools::intel::TreeTool),
-            Arc::new(tools::intel::OutlineTool),
-            Arc::new(tools::intel::SymbolFindTool),
-            Arc::new(tools::intel::WordTool),
-            Arc::new(tools::intel::DepsTool),
-            Arc::new(tools::intel::HotTool),
-            Arc::new(tools::intel::CircularTool),
-            Arc::new(tools::intel::SearchTool),
-            Arc::new(tools::intel::ImpactTool),
-            Arc::new(tools::plan_doc::PlanReadTool),
-            Arc::new(tools::plan_doc::PlanWriteTool),
-            Arc::new(tools::plan_doc::PlanEditTool),
-            Arc::new(tools::plan_doc::StartBuildTool),
-            Arc::new(tools::session_search::SessionSearchTool),
-            Arc::new(tools::session_read::SessionReadTool),
-            Arc::new(tools::todo::TodoTool),
-            Arc::new(tools::todo_read::TodoReadTool),
-            Arc::new(tools::tool_result_retrieve::ToolResultRetrieveTool),
-            Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
-            Arc::new(tools::goal::CreateGoalTool),
-            Arc::new(tools::goal::GetGoalTool),
-            Arc::new(tools::goal::UpdateGoalTool),
-            Arc::new(tools::grep::GrepTool),
-            Arc::new(tools::glob::GlobTool),
-            Arc::new(tools::harness::HarnessListTool),
-            Arc::new(tools::harness::HarnessInvokeTool),
-            Arc::new(tools::task::TaskTool::with_subagents(&[
-                "builder", "explore",
-            ])),
-        ]
+        crate::engine::builtin::invariant_builtin_tools()
     }
 
     /// CONFLICT-AVOIDANCE INVARIANT (implementation note):

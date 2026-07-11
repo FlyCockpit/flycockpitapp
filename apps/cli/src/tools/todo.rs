@@ -2,13 +2,26 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::task_todos::{TodoNoteKind, TodoStatus};
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 
 pub struct TodoTool;
+
+#[derive(Debug, Deserialize)]
+struct TodoArgs {
+    action: String,
+    content: Option<String>,
+    todo_id: Option<String>,
+    status: Option<String>,
+    priority: Option<i64>,
+    outcome_summary: Option<String>,
+    note_kind: Option<String>,
+    note: Option<String>,
+}
 
 #[async_trait]
 impl Tool for TodoTool {
@@ -42,10 +55,11 @@ impl Tool for TodoTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        match args.get("action").and_then(Value::as_str).unwrap_or("") {
+        let args: TodoArgs = typed_args(args)?;
+        match args.action.as_str() {
             "create" => {
-                let content = required_str(&args, "content")?;
-                let priority = args.get("priority").and_then(Value::as_i64).unwrap_or(0);
+                let content = required_opt_str(args.content.as_deref(), "content")?;
+                let priority = args.priority.unwrap_or(0);
                 let todo = ctx
                     .session
                     .db
@@ -74,16 +88,16 @@ impl Tool for TodoTool {
                 Ok(ToolOutput::text(out))
             }
             "update" => {
-                let todo_id = parse_uuid(required_str(&args, "todo_id")?)?;
+                let todo_id = parse_uuid(required_opt_str(args.todo_id.as_deref(), "todo_id")?)?;
                 let status = args
-                    .get("status")
-                    .and_then(Value::as_str)
+                    .status
+                    .as_deref()
                     .map(TodoStatus::parse)
                     .transpose()
                     .map_err(|e| invalid_input(format!("{e:#}")))?;
-                let content = args.get("content").and_then(Value::as_str);
-                let priority = args.get("priority").and_then(Value::as_i64);
-                let summary = args.get("outcome_summary").and_then(Value::as_str);
+                let content = args.content.as_deref();
+                let priority = args.priority;
+                let summary = args.outcome_summary.as_deref();
                 ctx.session.db.update_task_todo(
                     ctx.session.id,
                     todo_id,
@@ -95,15 +109,15 @@ impl Tool for TodoTool {
                 Ok(ToolOutput::text(format!("Updated todo `{todo_id}`.")))
             }
             "append_note" => {
-                let todo_id = parse_uuid(required_str(&args, "todo_id")?)?;
+                let todo_id = parse_uuid(required_opt_str(args.todo_id.as_deref(), "todo_id")?)?;
                 let kind = args
-                    .get("note_kind")
-                    .and_then(Value::as_str)
+                    .note_kind
+                    .as_deref()
                     .map(TodoNoteKind::parse)
                     .transpose()
                     .map_err(|e| invalid_input(format!("{e:#}")))?
                     .unwrap_or(TodoNoteKind::Finding);
-                let note = required_str(&args, "note")?;
+                let note = required_opt_str(args.note.as_deref(), "note")?;
                 let id = ctx.session.db.append_task_todo_note(
                     ctx.session.id,
                     todo_id,
@@ -126,9 +140,8 @@ impl Tool for TodoTool {
     }
 }
 
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
+fn required_opt_str<'a>(value: Option<&'a str>, key: &str) -> Result<&'a str> {
+    value
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_input(format!("`{key}` is required")))

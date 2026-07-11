@@ -19,14 +19,35 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::daemon::proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
 };
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 
 pub struct QuestionTool;
+
+#[derive(Debug, Deserialize)]
+struct QuestionArgs {
+    questions: Vec<QuestionArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuestionArg {
+    #[serde(rename = "type")]
+    kind: String,
+    prompt: String,
+    options: Option<Vec<QuestionOptionArg>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuestionOptionArg {
+    id: String,
+    label: Option<String>,
+    description: Option<String>,
+}
 
 #[async_trait]
 impl Tool for QuestionTool {
@@ -122,17 +143,14 @@ impl Tool for QuestionTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let raw = args
-            .get("questions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_input("`questions` must be a non-empty array"))?;
-        if raw.is_empty() {
+        let args: QuestionArgs = typed_args(args)?;
+        if args.questions.is_empty() {
             return Err(invalid_input("`questions` must be a non-empty array"));
         }
 
-        let mut questions = Vec::with_capacity(raw.len());
-        for (i, q) in raw.iter().enumerate() {
-            questions.push(parse_question(q, i)?);
+        let mut questions = Vec::with_capacity(args.questions.len());
+        for (i, q) in args.questions.iter().enumerate() {
+            questions.push(parse_question_arg(q, i)?);
         }
         let set = InterruptQuestionSet { questions };
         let n = set.questions.len();
@@ -176,16 +194,15 @@ impl Tool for QuestionTool {
 
 /// Parse one question entry from the tool args. Returns `invalid_input`
 /// (a model-fault, repairable failure) on a malformed entry.
+#[cfg(test)]
 fn parse_question(q: &Value, index: usize) -> Result<InterruptQuestion> {
-    let kind = q
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_input(format!("question {index}: missing `type`")))?;
-    let prompt = q
-        .get("prompt")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_input(format!("question {index}: missing `prompt`")))?
-        .to_string();
+    let q: QuestionArg = typed_args(q.clone())?;
+    parse_question_arg(&q, index)
+}
+
+fn parse_question_arg(q: &QuestionArg, index: usize) -> Result<InterruptQuestion> {
+    let kind = q.kind.as_str();
+    let prompt = q.prompt.clone();
 
     match kind {
         "text" => Ok(InterruptQuestion::Freetext {
@@ -193,7 +210,7 @@ fn parse_question(q: &Value, index: usize) -> Result<InterruptQuestion> {
             masked: false,
         }),
         "select" | "multiselect" => {
-            let options = parse_options(q, index)?;
+            let options = parse_options_arg(q);
             if options.is_empty() {
                 return Err(invalid_input(format!(
                     "question {index}: `{kind}` needs at least one option"
@@ -224,33 +241,20 @@ fn parse_question(q: &Value, index: usize) -> Result<InterruptQuestion> {
     }
 }
 
-fn parse_options(q: &Value, index: usize) -> Result<Vec<InterruptOption>> {
-    let Some(arr) = q.get("options").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for opt in arr {
-        let id = opt
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input(format!("question {index}: option missing `id`")))?
-            .to_string();
-        let label = opt
-            .get("label")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| id.clone());
-        let description = opt
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        out.push(InterruptOption {
-            id,
-            label,
-            description,
-        });
-    }
-    Ok(out)
+fn parse_options_arg(q: &QuestionArg) -> Vec<InterruptOption> {
+    q.options
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|opt| {
+            let label = opt.label.clone().unwrap_or_else(|| opt.id.clone());
+            InterruptOption {
+                id: opt.id.clone(),
+                label,
+                description: opt.description.clone(),
+            }
+        })
+        .collect()
 }
 
 fn question_prompt(q: &InterruptQuestion) -> &str {

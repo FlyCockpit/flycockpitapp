@@ -380,6 +380,64 @@ fn validate_configured_custom_tools(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Builtin tools covered by registry invariants.
+///
+/// Keep this list next to the real builtin materializer so schema/description
+/// coverage tracks the same static tools Cockpit can grant to agents. Configured
+/// custom tools and web tool templates are intentionally excluded because their
+/// author owns their wording at runtime.
+#[cfg(test)]
+pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool>> {
+    use crate::tools;
+    vec![
+        Arc::new(tools::read::ReadTool),
+        Arc::new(tools::readlock::ReadlockTool),
+        Arc::new(tools::writeunlock::WriteunlockTool),
+        Arc::new(tools::unlock::UnlockTool),
+        Arc::new(tools::editunlock::EditunlockTool),
+        Arc::new(tools::bash::BashTool::new()),
+        Arc::new(tools::intel::ContextPackTool),
+        Arc::new(tools::intel::TreeTool),
+        Arc::new(tools::intel::OutlineTool),
+        Arc::new(tools::intel::SymbolFindTool),
+        Arc::new(tools::intel::WordTool),
+        Arc::new(tools::intel::DepsTool),
+        Arc::new(tools::intel::HotTool),
+        Arc::new(tools::intel::CircularTool),
+        Arc::new(tools::intel::SearchTool),
+        Arc::new(tools::intel::ImpactTool),
+        Arc::new(tools::intel::ChangeImpactTool),
+        Arc::new(tools::skill::SkillTool),
+        Arc::new(tools::question::QuestionTool),
+        Arc::new(tools::defer::DeferTool),
+        Arc::new(tools::schedule::ScheduleTool),
+        Arc::new(tools::mcp_tool::McpTool),
+        Arc::new(tools::lsp::LspTool),
+        Arc::new(tools::handoff::HandoffTool),
+        Arc::new(tools::return_tool::ReturnTool),
+        Arc::new(tools::plan_doc::PlanReadTool),
+        Arc::new(tools::plan_doc::PlanWriteTool),
+        Arc::new(tools::plan_doc::PlanEditTool),
+        Arc::new(tools::plan_doc::StartBuildTool),
+        Arc::new(tools::session_search::SessionSearchTool),
+        Arc::new(tools::session_read::SessionReadTool),
+        Arc::new(tools::todo::TodoTool),
+        Arc::new(tools::todo_read::TodoReadTool),
+        Arc::new(tools::tool_result_retrieve::ToolResultRetrieveTool),
+        Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
+        Arc::new(tools::goal::CreateGoalTool),
+        Arc::new(tools::goal::GetGoalTool),
+        Arc::new(tools::goal::UpdateGoalTool),
+        Arc::new(tools::grep::GrepTool),
+        Arc::new(tools::glob::GlobTool),
+        Arc::new(tools::harness::HarnessListTool),
+        Arc::new(tools::harness::HarnessInvokeTool),
+        Arc::new(tools::task::TaskTool::with_subagents(&[
+            "builder", "explore",
+        ])),
+    ]
+}
+
 fn materialize_tool_by_name(
     tb: ToolBox,
     name: &str,

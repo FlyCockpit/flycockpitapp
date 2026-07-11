@@ -19,10 +19,11 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::extended::{ExtendedConfigDoc, HarnessConfig, resolve_harnesses};
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::engine::validation_hint::ValidationCorrection;
 use crate::harness::run::{RunContext, WritePolicy, run_harness};
 
@@ -34,6 +35,11 @@ use crate::harness::run::{RunContext, WritePolicy, run_harness};
 /// model + PATH/auth status; supports a `refresh` probe of a harness's
 /// live model list.
 pub struct HarnessListTool;
+
+#[derive(Debug, Deserialize)]
+struct HarnessListArgs {
+    refresh: Option<String>,
+}
 
 #[async_trait]
 impl Tool for HarnessListTool {
@@ -82,10 +88,11 @@ impl Tool for HarnessListTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: HarnessListArgs = typed_args(args)?;
         let cwd = ctx.cwd.clone();
         let refresh = args
-            .get("refresh")
-            .and_then(Value::as_str)
+            .refresh
+            .as_deref()
             .map(|raw| normalize_harness_selector(raw, &cwd))
             .transpose()?;
         require_workspace_trust_for_harness_spawn()?;
@@ -251,6 +258,14 @@ fn persist_models(name: &str, models: Vec<String>, cwd: &std::path::Path) {
 /// returns its structured result (a leaf delegation).
 pub struct HarnessInvokeTool;
 
+#[derive(Debug, Deserialize)]
+struct HarnessInvokeArgs {
+    harness: String,
+    model: Option<String>,
+    prompt: String,
+    write: Option<String>,
+}
+
 #[async_trait]
 impl Tool for HarnessInvokeTool {
     fn name(&self) -> &str {
@@ -302,24 +317,19 @@ impl Tool for HarnessInvokeTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let harness_name = args
-            .get("harness")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input("`harness` is required (an external harness selector)"))
-            .and_then(|raw| normalize_harness_selector(raw, &ctx.cwd))?;
-        let prompt = args
-            .get("prompt")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid_input("`prompt` is required (the task brief)"))?
-            .to_string();
+        let args: HarnessInvokeArgs = typed_args(args)?;
+        let harness_name = normalize_harness_selector(&args.harness, &ctx.cwd)?;
+        if args.prompt.trim().is_empty() {
+            return Err(invalid_input("`prompt` is required (the task brief)"));
+        }
+        let prompt = args.prompt;
         let explicit_model = args
-            .get("model")
-            .and_then(Value::as_str)
+            .model
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let write_override = match args.get("write").and_then(Value::as_str) {
+        let write_override = match args.write.as_deref() {
             Some(raw) => {
                 let policy = WritePolicy::parse_override(raw).ok_or_else(|| {
                     invalid_input("`write` must be either `direct` or `isolated`")

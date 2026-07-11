@@ -47,6 +47,7 @@ use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode
 use crate::tui::textfield::TextField;
 use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 
+use super::descriptor::{FieldKind, SettingDescriptor, SettingHeading, SettingStore};
 use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
@@ -323,10 +324,7 @@ impl Category {
 pub(super) enum Row {
     /// A non-selectable section divider (e.g. the "Advanced" block) with a
     /// short blurb shown under it.
-    Heading {
-        title: &'static str,
-        blurb: &'static str,
-    },
+    Heading(SettingHeading),
     /// A selectable setting.
     Setting(SettingId),
 }
@@ -433,18 +431,100 @@ pub(super) enum SettingId {
     Name,
 }
 
-/// What activating a setting row does. Drives Enter handling generically.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum ActionKind {
-    /// Cycle/toggle an enum or bool in place (Enter); no text edit.
-    Cycle,
-    /// Open an inline text/number edit (Enter), committed on Enter.
-    EditText,
-    /// Drill into a dedicated sub-page (Enter).
-    Drill,
-}
+const ALL_SETTING_IDS: &[SettingId] = &[
+    SettingId::VimMode,
+    SettingId::Thinking,
+    SettingId::RenderAgentMarkdown,
+    SettingId::RenderUserMarkdown,
+    SettingId::Mouse,
+    SettingId::RichTextCopy,
+    SettingId::Emojis,
+    SettingId::DiffStyle,
+    SettingId::Banner,
+    SettingId::ShowCwd,
+    SettingId::ShowBranch,
+    SettingId::CaffeinateDisplay,
+    SettingId::AttentionEnabled,
+    SettingId::AttentionBell,
+    SettingId::AttentionDesktop,
+    SettingId::ExitTailLines,
+    SettingId::ExperimentalMode,
+    SettingId::DefaultPrimaryAgent,
+    SettingId::LlmMode,
+    SettingId::ApprovalMode,
+    SettingId::PredictNextMessage,
+    SettingId::ShellCompression,
+    SettingId::CommandProfileRust,
+    SettingId::CommandProfileNode,
+    SettingId::CommandProfilePython,
+    SettingId::CommandProfileGo,
+    SettingId::CommandProfileJava,
+    SettingId::CommandProfileWrappers,
+    SettingId::CommandProfileCustomProfiles,
+    SettingId::InlineThink,
+    SettingId::HintToolCallCorrections,
+    SettingId::TextEmbeddedRecovery,
+    SettingId::UtilityModel,
+    SettingId::TranslationModel,
+    SettingId::CheapCodeModel,
+    SettingId::SmartCodeModel,
+    SettingId::ReasoningModel,
+    SettingId::AgentChoosesSubagentModel,
+    SettingId::DeepthinkEnabled,
+    SettingId::AutoTitleModel,
+    SettingId::SkillInjectionModel,
+    SettingId::PredictNextMessageModel,
+    SettingId::HarnessReportSummarizationModel,
+    SettingId::CompactModel,
+    SettingId::CompactPrompt,
+    SettingId::Instructions,
+    SettingId::LoopGuardThreshold,
+    SettingId::MaxPrimaryRounds,
+    SettingId::Concurrency,
+    SettingId::ScheduleMaxConcurrent,
+    SettingId::ScheduleAllowUnboundedLoops,
+    SettingId::DelegationMaxParallel,
+    SettingId::SwarmMaxDepth,
+    SettingId::SwarmMaxConcurrency,
+    SettingId::DialogLockoutMs,
+    SettingId::TimeInjectionInterval,
+    SettingId::PackagesDir,
+    SettingId::AgentDirs,
+    SettingId::SandboxDefaultMode,
+    SettingId::SandboxDockerfile,
+    SettingId::RedactEnabled,
+    SettingId::RedactScanEnvironment,
+    SettingId::RedactScanDotenv,
+    SettingId::RedactScanSshKeys,
+    SettingId::RedactPatterns,
+    SettingId::InjectionThreshold,
+    SettingId::InjectionResultAction,
+    SettingId::InjectionCheckPrompt,
+    SettingId::InjectionModel,
+    SettingId::PreflightEnabled,
+    SettingId::PreflightModel,
+    SettingId::PreflightPrompt,
+    SettingId::RedactExtraDotenvPaths,
+    SettingId::RedactMinSecretLength,
+    SettingId::RedactPlaceholder,
+    SettingId::RedactDenylist,
+    SettingId::RedactAllowlist,
+    SettingId::GitignoreAllow,
+    SettingId::AllowRemoteConfig,
+    SettingId::TranslationUserLanguage,
+    SettingId::TranslationModelLanguage,
+    SettingId::Name,
+];
 
 impl SettingId {
+    fn descriptor(self) -> SettingDescriptor {
+        SettingDescriptor {
+            label: self.label(),
+            help: self.help_text(),
+            kind: self.kind(),
+        }
+    }
+
     /// The short row label (left column).
     fn label(self) -> &'static str {
         match self {
@@ -537,7 +617,7 @@ impl SettingId {
     /// of each value. Genuinely educational — written for someone who has
     /// never read the docs. Read the code that consumes each field to keep
     /// these accurate.
-    fn help(self) -> &'static str {
+    fn help_text(self) -> &'static str {
         match self {
             SettingId::VimMode => {
                 "Keystroke model for the message composer. `hint` (default) enables \
@@ -995,8 +1075,8 @@ impl SettingId {
     }
 
     /// The activation kind for Enter handling.
-    fn action(self) -> ActionKind {
-        match self {
+    fn kind(self) -> FieldKind {
+        let kind = match self {
             // Drill-in sub-pages.
             SettingId::UtilityModel
             | SettingId::TranslationModel
@@ -1014,7 +1094,7 @@ impl SettingId {
             | SettingId::RedactExtraDotenvPaths
             | SettingId::RedactDenylist
             | SettingId::RedactAllowlist
-            | SettingId::GitignoreAllow => ActionKind::Drill,
+            | SettingId::GitignoreAllow => FieldKind::Drill,
             // Inline text/number edits.
             SettingId::ExitTailLines
             | SettingId::CommandProfileWrappers
@@ -1038,9 +1118,14 @@ impl SettingId {
             | SettingId::RedactPlaceholder
             | SettingId::TranslationUserLanguage
             | SettingId::TranslationModelLanguage
-            | SettingId::Name => ActionKind::EditText,
+            | SettingId::Name => FieldKind::EditText,
             // Everything else cycles/toggles in place.
-            _ => ActionKind::Cycle,
+            _ => FieldKind::Cycle,
+        };
+        if matches!(kind, FieldKind::EditText) && numeric_text_setting(self) {
+            FieldKind::Numeric
+        } else {
+            kind
         }
     }
 }
@@ -1070,6 +1155,31 @@ pub(super) struct CategoryPage {
     pub(super) utility_picker: Option<Box<UtilityModelPicker>>,
     pub(super) utility_picker_target: Option<SettingId>,
     pub(super) shadowed_global: Option<ShadowedGlobalPrompt>,
+}
+
+pub(super) struct CategorySettingStore<'a, 'b> {
+    pub(super) dialog: &'a mut SettingsDialog,
+    pub(super) page: &'b mut CategoryPage,
+}
+
+impl SettingStore for CategorySettingStore<'_, '_> {
+    type Id = SettingId;
+
+    fn descriptor(&self, id: Self::Id) -> SettingDescriptor {
+        id.descriptor()
+    }
+
+    fn value(&self, id: Self::Id) -> String {
+        self.dialog.category_value(id)
+    }
+
+    fn cycle(&mut self, id: Self::Id) {
+        self.dialog.cycle_category_setting(id, self.page);
+    }
+
+    fn commit_text(&mut self, id: Self::Id, raw: &str) -> Result<(), String> {
+        self.dialog.commit_category_text(id, raw)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1170,7 +1280,7 @@ impl CategoryPathEditor {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(Span::styled(
-                format!("editing {}", self.id.label()),
+                format!("editing {}", self.id.descriptor().label),
                 heading_style(),
             )),
             Line::default(),
@@ -1178,7 +1288,7 @@ impl CategoryPathEditor {
         super::shell::push_text_field_at_cursor(
             &mut lines,
             area.width,
-            self.id.label(),
+            self.id.descriptor().label,
             self.text(),
             self.cursor(),
             true,
@@ -1277,8 +1387,8 @@ impl CategoryTextEditor {
 
     fn render(&self, frame: &mut Frame, area: Rect) {
         let title = match &self.error {
-            Some(error) => format!("editing {} - {error}", self.id.label()),
-            None => format!("editing {}", self.id.label()),
+            Some(error) => format!("editing {} - {error}", self.id.descriptor().label),
+            None => format!("editing {}", self.id.descriptor().label),
         };
         self.editor.render(
             frame,
@@ -1371,7 +1481,7 @@ impl CategoryPage {
             .iter()
             .filter_map(|r| match r {
                 Row::Setting(id) => Some(*id),
-                Row::Heading { .. } => None,
+                Row::Heading(_) => None,
             })
             .collect()
     }
@@ -1424,10 +1534,10 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ApprovalMode),
             Setting(S::PredictNextMessage),
             Setting(S::ShellCompression),
-            Heading {
+            Heading(SettingHeading {
                 title: "Command resource profiles",
                 blurb: "Scoped cache/toolchain access for sandboxed developer commands.",
-            },
+            }),
             Setting(S::CommandProfileRust),
             Setting(S::CommandProfileNode),
             Setting(S::CommandProfilePython),
@@ -1438,22 +1548,22 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::InlineThink),
             Setting(S::HintToolCallCorrections),
             Setting(S::TextEmbeddedRecovery),
-            Heading {
+            Heading(SettingHeading {
                 title: "Coding tiers",
                 blurb: "Default models for delegated subagents; explicit agent config wins.",
-            },
+            }),
             Setting(S::CheapCodeModel),
             Setting(S::SmartCodeModel),
             Setting(S::ReasoningModel),
             Setting(S::TranslationModel),
             Setting(S::AgentChoosesSubagentModel),
             Setting(S::DeepthinkEnabled),
-            Heading {
+            Heading(SettingHeading {
                 title: "Utility",
                 blurb: "Background models; extra utility rows fall back to utility if \
                         unset. The injection-guard and preflight models live under \
                         Privacy & Safety.",
-            },
+            }),
             Setting(S::UtilityModel),
             Setting(S::AutoTitleModel),
             Setting(S::SkillInjectionModel),
@@ -1462,11 +1572,11 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::CompactModel),
             Setting(S::CompactPrompt),
             Setting(S::Instructions),
-            Heading {
+            Heading(SettingHeading {
                 title: "Advanced",
                 blurb: "Tuning knobs most users never need. Defaults are sensible; \
                         change these only with a specific reason.",
-            },
+            }),
             Setting(S::LoopGuardThreshold),
             Setting(S::MaxPrimaryRounds),
             Setting(S::Concurrency),
@@ -1492,22 +1602,22 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::InjectionResultAction),
             Setting(S::InjectionCheckPrompt),
             Setting(S::InjectionModel),
-            Heading {
+            Heading(SettingHeading {
                 title: "Request preflight",
                 blurb: "Rewrite each prompt through the utility model before \
                         sending it (clearer + more concise, same intent). Off by \
                         default; per-session flippable via `/preflight`.",
-            },
+            }),
             Setting(S::PreflightEnabled),
             Setting(S::PreflightModel),
             Setting(S::PreflightPrompt),
-            Heading {
+            Heading(SettingHeading {
                 title: "Advanced",
                 blurb: "Redaction internals and the remote-config opt-in. The \
                         denylist/allowlist and remote-config are \
                         security-sensitive — read each description before changing \
                         it.",
-            },
+            }),
             Setting(S::RedactExtraDotenvPaths),
             Setting(S::RedactMinSecretLength),
             Setting(S::RedactPlaceholder),
@@ -2038,7 +2148,7 @@ impl SettingsDialog {
                         match remove_project_shadow_path(&prompt.project_config, prompt.path) {
                             Ok(true) => format!(
                                 "saved; removed project override for {}",
-                                prompt.setting.label()
+                                prompt.setting.descriptor().label
                             ),
                             Ok(false) => "saved; project override was already absent".to_string(),
                             Err(e) => format!("saved; removing project override failed: {e}"),
@@ -2266,12 +2376,12 @@ impl SettingsDialog {
                 let Some(&id) = ids.get(p.cursor) else {
                     return Nav::Stay;
                 };
-                match id.action() {
-                    ActionKind::Cycle => {
+                match id.descriptor().kind {
+                    FieldKind::Cycle => {
                         self.cycle_category_setting(id, p);
                         self.finish_category_save(id, p);
                     }
-                    ActionKind::EditText => {
+                    FieldKind::EditText | FieldKind::Numeric => {
                         let seed = self.category_edit_seed(id);
                         if let Some(mode) = path_setting_mode(id) {
                             let cwd = self.agents_cwd();
@@ -2292,7 +2402,7 @@ impl SettingsDialog {
                         }
                         p.status = None;
                     }
-                    ActionKind::Drill => {
+                    FieldKind::Drill => {
                         return self.drill_category_setting(id, p);
                     }
                 }
@@ -2603,7 +2713,7 @@ impl SettingsDialog {
                 if let Some(prompt) = self.shadowed_global_prompt(id) {
                     p.status = Some(format!(
                         "saved; project config overrides {} here. Remove that project value? y/n",
-                        id.label()
+                        id.descriptor().label
                     ));
                     p.shadowed_global = Some(prompt);
                 } else {
@@ -2856,7 +2966,7 @@ fn numeric_text_setting(id: SettingId) -> bool {
 }
 
 fn category_external_editable(id: SettingId) -> bool {
-    matches!(id.action(), ActionKind::EditText) && !numeric_text_setting(id)
+    matches!(id.descriptor().kind, FieldKind::EditText) && !numeric_text_setting(id)
 }
 
 /// Parse a `>= min` `u32`, rejecting blank/non-numeric/below-floor input.
@@ -3018,7 +3128,7 @@ impl SettingsDialog {
         let ids = p.setting_ids();
         let label_w = ids
             .iter()
-            .map(|id| id.label().chars().count())
+            .map(|id| id.descriptor().label.chars().count())
             .max()
             .unwrap_or(0);
 
@@ -3026,13 +3136,18 @@ impl SettingsDialog {
         let mut sel = 0usize;
         for row in &p.rows {
             match row {
-                Row::Heading { title, blurb } => {
+                Row::Heading(heading) => {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
-                        format!("-- {title} --"),
+                        format!("-- {} --", heading.title),
                         muted_style().add_modifier(Modifier::BOLD),
                     )));
-                    push_wrapped_text(&mut lines, settings_area.width, blurb, muted_style());
+                    push_wrapped_text(
+                        &mut lines,
+                        settings_area.width,
+                        heading.blurb,
+                        muted_style(),
+                    );
                 }
                 Row::Setting(id) => {
                     let on_cursor = sel == p.cursor;
@@ -3044,7 +3159,7 @@ impl SettingsDialog {
                             &mut lines,
                             settings_area.width,
                             on_cursor,
-                            id.label(),
+                            id.descriptor().label,
                             label_w,
                             p.buf.text(),
                             p.buf.cursor(),
@@ -3054,7 +3169,7 @@ impl SettingsDialog {
                             &mut lines,
                             settings_area.width,
                             on_cursor,
-                            id.label(),
+                            id.descriptor().label,
                             label_w,
                             &self.category_value(*id),
                             muted_style(),
@@ -3097,13 +3212,13 @@ impl SettingsDialog {
         if let Some(&id) = ids.get(p.cursor) {
             help.push(Line::default());
             help.push(Line::from(Span::styled(
-                id.label().to_string(),
+                id.descriptor().label.to_string(),
                 Style::default()
                     .fg(ratatui::style::Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )));
             help.push(Line::from(Span::styled(
-                id.help().to_string(),
+                id.descriptor().help.to_string(),
                 muted_style(),
             )));
         } else if Some(p.cursor) == p.reset_cursor()
@@ -3157,5 +3272,30 @@ impl CategoryPage {
     /// category has one.
     pub(super) fn cursor_of_reset(&self) -> Option<usize> {
         self.reset_cursor()
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn every_setting_id_has_descriptor() {
+        for id in ALL_SETTING_IDS {
+            let descriptor = id.descriptor();
+            assert!(!descriptor.label.is_empty(), "missing label for {id:?}");
+            assert!(!descriptor.help.is_empty(), "missing help for {id:?}");
+            match descriptor.kind {
+                FieldKind::Cycle | FieldKind::EditText | FieldKind::Numeric | FieldKind::Drill => {}
+            }
+        }
+    }
+
+    #[test]
+    fn approval_mode_help_is_preserved() {
+        assert_eq!(
+            SettingId::ApprovalMode.descriptor().help,
+            "When a command, web fetch, or MCP call needs approval before it runs. `manual` (default) asks you every time — you are the gate; `auto` routes each call past the utility-model safety gate (safe runs, unsafe asks) and needs a utility model; `yolo` runs everything unprompted. Distinct from the `auto` *agent*."
+        );
     }
 }

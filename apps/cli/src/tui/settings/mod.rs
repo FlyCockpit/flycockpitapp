@@ -35,6 +35,7 @@ mod agent_editor;
 mod agents_page;
 mod auth;
 mod category;
+mod descriptor;
 mod grab;
 mod harnesses_page;
 mod mcp_page;
@@ -2765,6 +2766,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn category_commit_text_contract_keeps_invalid_edit_open() {
+        use super::descriptor::SettingStore;
+        use category::CategorySettingStore;
+
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        let mut page = category::CategoryPage::new(Category::Interface);
+        let mut store = CategorySettingStore {
+            dialog: &mut d,
+            page: &mut page,
+        };
+
+        let err = store
+            .commit_text(SettingId::ExitTailLines, "bad")
+            .expect_err("invalid numeric text is rejected");
+        assert_eq!(err, "must be a whole number (-1, 0, or a line count)");
+
+        store
+            .commit_text(SettingId::ExitTailLines, "7")
+            .expect("valid numeric text commits");
+        assert_eq!(
+            store.value(SettingId::ExitTailLines),
+            "7 (lines of tail dumped to scrollback on exit; 0 none, -1 all)"
+        );
+    }
+
     fn category_cursor(d: &SettingsDialog) -> Option<usize> {
         match &d.page {
             Page::Category(p) => Some(p.cursor),
@@ -2808,7 +2836,7 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         let entry = entry(&[]);
         let mut editor = settings_editor::SettingsEditor::for_provider("p", &entry);
-        let field = settings_editor::SettingsField::AutoCompactPct;
+        let field = settings_editor::ProviderSettingId::AutoCompactPct;
         editor.cursor = editor
             .fields()
             .iter()

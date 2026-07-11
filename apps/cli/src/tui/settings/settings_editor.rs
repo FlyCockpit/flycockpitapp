@@ -55,6 +55,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
+use super::descriptor::{FieldKind, SettingDescriptor, SettingStore};
+
 use crate::config::extended::LlmMode;
 use crate::config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
@@ -77,7 +79,7 @@ pub(super) enum SettingsScope {
 
 /// The editable provider/model fields, in row order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum SettingsField {
+pub(super) enum ProviderSettingId {
     /// Provider-only opt-in for plaintext non-loopback HTTP base URLs.
     AllowInsecureHttp,
     TrustPolicy,
@@ -120,7 +122,50 @@ pub(super) enum SettingsField {
     XaiMultiAgentToolsBeta,
 }
 
-impl SettingsField {
+const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
+    ProviderSettingId::AllowInsecureHttp,
+    ProviderSettingId::TrustPolicy,
+    ProviderSettingId::Location,
+    ProviderSettingId::QualityRank,
+    ProviderSettingId::CostRank,
+    ProviderSettingId::SubagentInvokable,
+    ProviderSettingId::SystemPrompt,
+    ProviderSettingId::AutoCompactPct,
+    ProviderSettingId::AutoPruneEnabled,
+    ProviderSettingId::AutoPrunePct,
+    ProviderSettingId::AutoPrunePrunablePct,
+    ProviderSettingId::CacheTtlSecs,
+    ProviderSettingId::CacheMode,
+    ProviderSettingId::ShrinkStrategy,
+    ProviderSettingId::TimeoutTtftSecs,
+    ProviderSettingId::TimeoutIdleSecs,
+    ProviderSettingId::WireApi,
+    ProviderSettingId::Backup,
+    ProviderSettingId::Mode,
+    ProviderSettingId::InlineThink,
+    ProviderSettingId::HintToolCallCorrections,
+    ProviderSettingId::XaiMultiAgentToolsBeta,
+];
+
+impl ProviderSettingId {
+    pub(super) fn descriptor(self) -> SettingDescriptor {
+        SettingDescriptor {
+            label: self.label(),
+            help: self.help_text().unwrap_or(""),
+            kind: self.kind(),
+        }
+    }
+
+    fn kind(self) -> FieldKind {
+        if self.is_numeric() {
+            FieldKind::Numeric
+        } else if self.is_text() {
+            FieldKind::EditText
+        } else {
+            FieldKind::Cycle
+        }
+    }
+
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::AllowInsecureHttp => "Allow insecure HTTP",
@@ -163,39 +208,12 @@ impl SettingsField {
         )
     }
 
-    /// Which config group this field belongs to (for the model-scope
-    /// override-present tracking).
-    fn group(self) -> SettingsGroup {
-        match self {
-            Self::AllowInsecureHttp => SettingsGroup::TransportSecurity,
-            Self::TrustPolicy => SettingsGroup::TrustPolicy,
-            Self::Location => SettingsGroup::Location,
-            Self::QualityRank => SettingsGroup::QualityRank,
-            Self::CostRank => SettingsGroup::CostRank,
-            Self::SubagentInvokable => SettingsGroup::SubagentInvokable,
-            Self::SystemPrompt => SettingsGroup::SystemPrompt,
-            Self::AutoCompactPct | Self::AutoPrunePct | Self::AutoPrunePrunablePct => {
-                SettingsGroup::Context
-            }
-            Self::AutoPruneEnabled => SettingsGroup::AutoPrune,
-            Self::CacheTtlSecs | Self::CacheMode => SettingsGroup::Cache,
-            Self::ShrinkStrategy => SettingsGroup::Shrink,
-            Self::TimeoutTtftSecs | Self::TimeoutIdleSecs => SettingsGroup::Timeout,
-            Self::WireApi => SettingsGroup::WireApi,
-            Self::Backup => SettingsGroup::Backup,
-            Self::Mode => SettingsGroup::Mode,
-            Self::InlineThink => SettingsGroup::InlineThink,
-            Self::HintToolCallCorrections => SettingsGroup::HintToolCallCorrections,
-            Self::XaiMultiAgentToolsBeta => SettingsGroup::XaiMultiAgentToolsBeta,
-        }
-    }
-
     /// True for the free-text edit fields (currently only the backup model).
     fn is_text(self) -> bool {
         matches!(self, Self::Backup | Self::SystemPrompt)
     }
 
-    fn help(self) -> Option<&'static str> {
+    fn help_text(self) -> Option<&'static str> {
         match self {
             Self::InlineThink => Some(
                 "extract strips literal <think> blocks from assistant text, stores them as reasoning, and leaves display to Interface -> Thinking display. It does not request more reasoning from the model.",
@@ -254,28 +272,6 @@ impl SettingsField {
             _ => None,
         }
     }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum SettingsGroup {
-    TransportSecurity,
-    TrustPolicy,
-    Location,
-    QualityRank,
-    CostRank,
-    SubagentInvokable,
-    SystemPrompt,
-    Context,
-    AutoPrune,
-    Cache,
-    Shrink,
-    Timeout,
-    WireApi,
-    Backup,
-    Mode,
-    InlineThink,
-    HintToolCallCorrections,
-    XaiMultiAgentToolsBeta,
 }
 
 /// The model/provider settings sub-dialog state.
@@ -349,9 +345,9 @@ pub(super) struct SettingsEditor {
     /// of which are fixed for the editor's lifetime — so per-keystroke and
     /// per-frame accessors (`field_count`, `selected_field`, the render loop)
     /// borrow this slice instead of reallocating.
-    fields: Vec<SettingsField>,
+    fields: Vec<ProviderSettingId>,
     /// Inline numeric edit buffer; `Some` while a numeric field is open.
-    pub(super) editing: Option<SettingsField>,
+    pub(super) editing: Option<ProviderSettingId>,
     pub(super) buf: TextField,
     /// Transient validation status shown under the rows.
     pub(super) status: Option<String>,
@@ -505,7 +501,7 @@ impl SettingsEditor {
     /// provider-only transport security row (`AllowInsecureHttp`); model scope
     /// omits it. The wire-API row is hidden for native Anthropic providers, and
     /// the xAI multi-agent tools opt-in only appears for xAI/Grok providers.
-    pub(super) fn fields(&self) -> &[SettingsField] {
+    pub(super) fn fields(&self) -> &[ProviderSettingId] {
         &self.fields
     }
 
@@ -517,8 +513,8 @@ impl SettingsEditor {
         is_model_scope: bool,
         show_wire_api: bool,
         show_xai_multi_agent_tools_beta: bool,
-    ) -> Vec<SettingsField> {
-        use SettingsField::*;
+    ) -> Vec<ProviderSettingId> {
+        use ProviderSettingId::*;
         let mut fields = Vec::with_capacity(22);
         // Provider-only transport security opt-in leads the list; model scope
         // cannot override it.
@@ -579,111 +575,118 @@ impl SettingsEditor {
     }
 
     /// The field at a row index (clamped to the last on overflow).
-    fn field_at(&self, row: usize) -> SettingsField {
+    fn field_at(&self, row: usize) -> ProviderSettingId {
         let fields = self.fields();
         fields[row.min(fields.len() - 1)]
     }
 
     /// Whether a field's group is currently an active override (model scope)
     /// — drives the "inherited" dimming. Always true for provider scope.
-    pub(super) fn is_overridden(&self, field: SettingsField) -> bool {
+    pub(super) fn is_overridden(&self, field: ProviderSettingId) -> bool {
         if !self.is_model_scope() {
             return true;
         }
-        match field.group() {
-            SettingsGroup::TransportSecurity => true,
-            SettingsGroup::TrustPolicy => self.trust.is_some(),
-            SettingsGroup::Location => self.location.is_some(),
-            SettingsGroup::QualityRank => self.quality_rank.is_some(),
-            SettingsGroup::CostRank => self.cost_rank.is_some(),
-            SettingsGroup::SubagentInvokable => self.subagent_invokable.is_some(),
-            SettingsGroup::SystemPrompt => self.system_prompt.is_some(),
-            SettingsGroup::Context => self.context_present,
-            SettingsGroup::AutoPrune => self.auto_prune.is_some(),
-            SettingsGroup::Cache => self.cache_present,
-            SettingsGroup::Shrink => self.shrink_present,
-            SettingsGroup::Timeout => self.timeout_present,
-            SettingsGroup::WireApi => self.wire_api_present,
-            SettingsGroup::Backup => self.backup.is_some(),
-            SettingsGroup::Mode => self.mode.is_some(),
-            SettingsGroup::InlineThink => self.inline_think.is_some(),
-            SettingsGroup::HintToolCallCorrections => self.hint_tool_call_corrections.is_some(),
-            SettingsGroup::XaiMultiAgentToolsBeta => self.xai_multi_agent_tools_beta_present,
+        match field {
+            ProviderSettingId::AllowInsecureHttp => true,
+            ProviderSettingId::TrustPolicy => self.trust.is_some(),
+            ProviderSettingId::Location => self.location.is_some(),
+            ProviderSettingId::QualityRank => self.quality_rank.is_some(),
+            ProviderSettingId::CostRank => self.cost_rank.is_some(),
+            ProviderSettingId::SubagentInvokable => self.subagent_invokable.is_some(),
+            ProviderSettingId::SystemPrompt => self.system_prompt.is_some(),
+            ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::AutoPrunePct
+            | ProviderSettingId::AutoPrunePrunablePct => self.context_present,
+            ProviderSettingId::AutoPruneEnabled => self.auto_prune.is_some(),
+            ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => self.cache_present,
+            ProviderSettingId::ShrinkStrategy => self.shrink_present,
+            ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
+                self.timeout_present
+            }
+            ProviderSettingId::WireApi => self.wire_api_present,
+            ProviderSettingId::Backup => self.backup.is_some(),
+            ProviderSettingId::Mode => self.mode.is_some(),
+            ProviderSettingId::InlineThink => self.inline_think.is_some(),
+            ProviderSettingId::HintToolCallCorrections => self.hint_tool_call_corrections.is_some(),
+            ProviderSettingId::XaiMultiAgentToolsBeta => self.xai_multi_agent_tools_beta_present,
         }
     }
 
-    pub(super) fn selected_field(&self) -> Option<SettingsField> {
+    pub(super) fn selected_field(&self) -> Option<ProviderSettingId> {
         self.fields().get(self.cursor).copied()
     }
 
     pub(super) fn selected_help(&self) -> Option<&'static str> {
-        self.selected_field().and_then(SettingsField::help)
+        self.selected_field().and_then(|field| {
+            let help = field.descriptor().help;
+            (!help.is_empty()).then_some(help)
+        })
     }
 
     /// The display value for a row (the working value, formatted).
-    pub(super) fn value_str(&self, field: SettingsField) -> String {
+    pub(super) fn value_str(&self, field: ProviderSettingId) -> String {
         match field {
-            SettingsField::AllowInsecureHttp => {
+            ProviderSettingId::AllowInsecureHttp => {
                 if self.allow_insecure_http {
                     "on".to_string()
                 } else {
                     "off".to_string()
                 }
             }
-            SettingsField::TrustPolicy => match self.trust {
+            ProviderSettingId::TrustPolicy => match self.trust {
                 Some(ModelTrust::Trusted) => "trusted".to_string(),
                 Some(ModelTrust::Untrusted) => "untrusted".to_string(),
                 None if self.is_model_scope() => "inherit".to_string(),
                 None => "untrusted (default)".to_string(),
             },
-            SettingsField::Location => match self.location {
+            ProviderSettingId::Location => match self.location {
                 Some(ModelLocation::Local) => "local".to_string(),
                 Some(ModelLocation::Remote) => "remote".to_string(),
                 Some(ModelLocation::PrivateRemote) => "private remote".to_string(),
                 None => "unset".to_string(),
             },
-            SettingsField::QualityRank => self
+            ProviderSettingId::QualityRank => self
                 .quality_rank
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "0 (default)".to_string()),
-            SettingsField::CostRank => self
+            ProviderSettingId::CostRank => self
                 .cost_rank
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "0 (default)".to_string()),
-            SettingsField::SubagentInvokable => match self.subagent_invokable {
+            ProviderSettingId::SubagentInvokable => match self.subagent_invokable {
                 Some(true) => "on".to_string(),
                 Some(false) => "off".to_string(),
                 None if self.is_model_scope() => "inherit".to_string(),
                 None => "off (default)".to_string(),
             },
-            SettingsField::SystemPrompt => self
+            ProviderSettingId::SystemPrompt => self
                 .system_prompt
                 .as_ref()
                 .map(|prompt| format!("{} characters", prompt.chars().count()))
                 .unwrap_or_else(|| "not set".to_string()),
-            SettingsField::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
-            SettingsField::AutoPruneEnabled => match self.auto_prune {
+            ProviderSettingId::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
+            ProviderSettingId::AutoPruneEnabled => match self.auto_prune {
                 Some(true) => "on".to_string(),
                 Some(false) => "off".to_string(),
                 None if self.is_model_scope() => "inherit".to_string(),
                 None => "on (default)".to_string(),
             },
-            SettingsField::AutoPrunePct => format!("{}%", self.context.auto_prune_pct),
-            SettingsField::AutoPrunePrunablePct => {
+            ProviderSettingId::AutoPrunePct => format!("{}%", self.context.auto_prune_pct),
+            ProviderSettingId::AutoPrunePrunablePct => {
                 format!("{}%", self.context.auto_prune_prunable_pct)
             }
-            SettingsField::CacheTtlSecs => format!("{}s", self.cache.ttl_secs),
-            SettingsField::CacheMode => match self.cache.mode {
+            ProviderSettingId::CacheTtlSecs => format!("{}s", self.cache.ttl_secs),
+            ProviderSettingId::CacheMode => match self.cache.mode {
                 CacheMode::None => "none".to_string(),
                 CacheMode::Ephemeral => "ephemeral".to_string(),
             },
-            SettingsField::ShrinkStrategy => match self.shrink.strategy {
+            ProviderSettingId::ShrinkStrategy => match self.shrink.strategy {
                 ShrinkStrategy::Prune => "prune".to_string(),
                 ShrinkStrategy::Compact => "compact".to_string(),
             },
-            SettingsField::TimeoutTtftSecs => format!("{}s", self.timeout.ttft_secs),
-            SettingsField::TimeoutIdleSecs => format!("{}s", self.timeout.idle_secs),
-            SettingsField::WireApi => {
+            ProviderSettingId::TimeoutTtftSecs => format!("{}s", self.timeout.ttft_secs),
+            ProviderSettingId::TimeoutIdleSecs => format!("{}s", self.timeout.idle_secs),
+            ProviderSettingId::WireApi => {
                 if self.is_model_scope() && !self.wire_api_present {
                     if self.wire_api.is_auto() {
                         "auto (inherit)".to_string()
@@ -694,29 +697,29 @@ impl SettingsEditor {
                     wire_api_label(self.wire_api).to_string()
                 }
             }
-            SettingsField::Backup => match &self.backup {
+            ProviderSettingId::Backup => match &self.backup {
                 Some(b) => format!("{}:{}", b.provider, b.model),
                 None => "none".to_string(),
             },
-            SettingsField::Mode => match self.mode {
+            ProviderSettingId::Mode => match self.mode {
                 Some(LlmMode::Defensive) => "defensive".to_string(),
                 Some(LlmMode::Normal) => "normal".to_string(),
                 Some(LlmMode::Frontier) => "frontier".to_string(),
                 None if self.is_model_scope() => "inherit".to_string(),
                 None => "inherit (global llm mode)".to_string(),
             },
-            SettingsField::InlineThink => match self.inline_think {
+            ProviderSettingId::InlineThink => match self.inline_think {
                 Some(true) => "extract".to_string(),
                 Some(false) => "leave inline".to_string(),
                 None if self.is_model_scope() => "inherit provider/default".to_string(),
                 None => "inherit default".to_string(),
             },
-            SettingsField::HintToolCallCorrections => match self.hint_tool_call_corrections {
+            ProviderSettingId::HintToolCallCorrections => match self.hint_tool_call_corrections {
                 Some(true) => "on".to_string(),
                 Some(false) => "off".to_string(),
                 None => "inherit".to_string(),
             },
-            SettingsField::XaiMultiAgentToolsBeta => {
+            ProviderSettingId::XaiMultiAgentToolsBeta => {
                 if self.xai_multi_agent_tools_beta {
                     "on".to_string()
                 } else {
@@ -726,62 +729,75 @@ impl SettingsEditor {
         }
     }
 
-    fn mark_present(&mut self, field: SettingsField) {
-        match field.group() {
-            SettingsGroup::TransportSecurity => {}
-            SettingsGroup::TrustPolicy
-            | SettingsGroup::Location
-            | SettingsGroup::QualityRank
-            | SettingsGroup::CostRank
-            | SettingsGroup::SubagentInvokable
-            | SettingsGroup::SystemPrompt => {}
-            SettingsGroup::Context => self.context_present = true,
-            SettingsGroup::Cache => self.cache_present = true,
-            SettingsGroup::Shrink => self.shrink_present = true,
-            SettingsGroup::Timeout => self.timeout_present = true,
-            SettingsGroup::WireApi => self.wire_api_present = true,
-            // Backup / Mode / AutoPrune / InlineThink /
-            // HintToolCallCorrections track presence via their `Option`.
-            SettingsGroup::Backup
-            | SettingsGroup::Mode
-            | SettingsGroup::AutoPrune
-            | SettingsGroup::InlineThink
-            | SettingsGroup::HintToolCallCorrections => {}
-            SettingsGroup::XaiMultiAgentToolsBeta => self.xai_multi_agent_tools_beta_present = true,
+    fn mark_present(&mut self, field: ProviderSettingId) {
+        match field {
+            ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::AutoPrunePct
+            | ProviderSettingId::AutoPrunePrunablePct => self.context_present = true,
+            ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => {
+                self.cache_present = true
+            }
+            ProviderSettingId::ShrinkStrategy => self.shrink_present = true,
+            ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
+                self.timeout_present = true
+            }
+            ProviderSettingId::WireApi => self.wire_api_present = true,
+            ProviderSettingId::XaiMultiAgentToolsBeta => {
+                self.xai_multi_agent_tools_beta_present = true
+            }
+            // These fields track presence via their own `Option` or are always provider-only.
+            ProviderSettingId::AllowInsecureHttp
+            | ProviderSettingId::TrustPolicy
+            | ProviderSettingId::Location
+            | ProviderSettingId::QualityRank
+            | ProviderSettingId::CostRank
+            | ProviderSettingId::SubagentInvokable
+            | ProviderSettingId::SystemPrompt
+            | ProviderSettingId::Backup
+            | ProviderSettingId::Mode
+            | ProviderSettingId::AutoPruneEnabled
+            | ProviderSettingId::InlineThink
+            | ProviderSettingId::HintToolCallCorrections => {}
         }
     }
 
     /// Clear the field's group back to inherit (model scope only). On
     /// provider scope this is a no-op (no inherit state).
-    fn clear_override(&mut self, field: SettingsField) {
+    fn clear_override(&mut self, field: ProviderSettingId) {
         if !self.is_model_scope() {
             self.status = Some("provider settings can't inherit (model scope only)".to_string());
             return;
         }
-        match field.group() {
-            SettingsGroup::TransportSecurity => {
+        match field {
+            ProviderSettingId::AllowInsecureHttp => {
                 self.status = Some("provider transport setting cannot inherit".to_string());
             }
-            SettingsGroup::TrustPolicy => self.trust = None,
-            SettingsGroup::Location => self.location = None,
-            SettingsGroup::QualityRank => self.quality_rank = None,
-            SettingsGroup::CostRank => self.cost_rank = None,
-            SettingsGroup::SubagentInvokable => self.subagent_invokable = None,
-            SettingsGroup::SystemPrompt => self.system_prompt = None,
-            SettingsGroup::Context => self.context_present = false,
-            SettingsGroup::Cache => self.cache_present = false,
-            SettingsGroup::Shrink => self.shrink_present = false,
-            SettingsGroup::Timeout => self.timeout_present = false,
-            SettingsGroup::WireApi => {
+            ProviderSettingId::TrustPolicy => self.trust = None,
+            ProviderSettingId::Location => self.location = None,
+            ProviderSettingId::QualityRank => self.quality_rank = None,
+            ProviderSettingId::CostRank => self.cost_rank = None,
+            ProviderSettingId::SubagentInvokable => self.subagent_invokable = None,
+            ProviderSettingId::SystemPrompt => self.system_prompt = None,
+            ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::AutoPrunePct
+            | ProviderSettingId::AutoPrunePrunablePct => self.context_present = false,
+            ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => {
+                self.cache_present = false
+            }
+            ProviderSettingId::ShrinkStrategy => self.shrink_present = false,
+            ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
+                self.timeout_present = false
+            }
+            ProviderSettingId::WireApi => {
                 self.wire_api_present = false;
                 self.wire_api = WireApi::Auto;
             }
-            SettingsGroup::Backup => self.backup = None,
-            SettingsGroup::Mode => self.mode = None,
-            SettingsGroup::AutoPrune => self.auto_prune = None,
-            SettingsGroup::InlineThink => self.inline_think = None,
-            SettingsGroup::HintToolCallCorrections => self.hint_tool_call_corrections = None,
-            SettingsGroup::XaiMultiAgentToolsBeta => {
+            ProviderSettingId::Backup => self.backup = None,
+            ProviderSettingId::Mode => self.mode = None,
+            ProviderSettingId::AutoPruneEnabled => self.auto_prune = None,
+            ProviderSettingId::InlineThink => self.inline_think = None,
+            ProviderSettingId::HintToolCallCorrections => self.hint_tool_call_corrections = None,
+            ProviderSettingId::XaiMultiAgentToolsBeta => {
                 self.xai_multi_agent_tools_beta_present = false;
                 self.xai_multi_agent_tools_beta = false;
             }
@@ -790,16 +806,16 @@ impl SettingsEditor {
     }
 
     /// Cycle a non-numeric field in place.
-    fn cycle(&mut self, field: SettingsField) {
+    fn cycle(&mut self, field: ProviderSettingId) {
         match field {
-            SettingsField::AllowInsecureHttp => {
+            ProviderSettingId::AllowInsecureHttp => {
                 if self.is_model_scope() {
                     self.status = Some("provider setting only".to_string());
                 } else {
                     self.allow_insecure_http = !self.allow_insecure_http;
                 }
             }
-            SettingsField::TrustPolicy => {
+            ProviderSettingId::TrustPolicy => {
                 if self.is_model_scope() {
                     self.trust = match self.trust {
                         None => Some(ModelTrust::Trusted),
@@ -854,7 +870,7 @@ impl SettingsEditor {
                 }
                 return;
             }
-            SettingsField::Location => {
+            ProviderSettingId::Location => {
                 self.location = match self.location {
                     None => Some(ModelLocation::Local),
                     Some(ModelLocation::Local) => Some(ModelLocation::PrivateRemote),
@@ -862,7 +878,7 @@ impl SettingsEditor {
                     Some(ModelLocation::Remote) => None,
                 };
             }
-            SettingsField::SubagentInvokable => {
+            ProviderSettingId::SubagentInvokable => {
                 self.subagent_invokable = if self.is_model_scope() {
                     match self.subagent_invokable {
                         None => Some(true),
@@ -876,7 +892,7 @@ impl SettingsEditor {
                     }
                 };
             }
-            SettingsField::AutoPruneEnabled => {
+            ProviderSettingId::AutoPruneEnabled => {
                 // on → off → inherit(None) → on
                 self.auto_prune = match self.auto_prune {
                     Some(true) => Some(false),
@@ -884,21 +900,21 @@ impl SettingsEditor {
                     None => Some(true),
                 };
             }
-            SettingsField::CacheMode => {
+            ProviderSettingId::CacheMode => {
                 self.cache.mode = match self.cache.mode {
                     CacheMode::None => CacheMode::Ephemeral,
                     CacheMode::Ephemeral => CacheMode::None,
                 };
                 self.mark_present(field);
             }
-            SettingsField::ShrinkStrategy => {
+            ProviderSettingId::ShrinkStrategy => {
                 self.shrink.strategy = match self.shrink.strategy {
                     ShrinkStrategy::Prune => ShrinkStrategy::Compact,
                     ShrinkStrategy::Compact => ShrinkStrategy::Prune,
                 };
                 self.mark_present(field);
             }
-            SettingsField::WireApi => {
+            ProviderSettingId::WireApi => {
                 if self.is_model_scope() {
                     match (self.wire_api_present, self.wire_api) {
                         (true, WireApi::Completions) => {
@@ -923,7 +939,7 @@ impl SettingsEditor {
                     self.wire_api_present = true;
                 }
             }
-            SettingsField::Mode => {
+            ProviderSettingId::Mode => {
                 // inherit → defensive → normal → frontier → inherit
                 self.mode = match self.mode {
                     Some(LlmMode::Defensive) => Some(LlmMode::Normal),
@@ -932,7 +948,7 @@ impl SettingsEditor {
                     None => Some(LlmMode::Defensive),
                 };
             }
-            SettingsField::InlineThink => {
+            ProviderSettingId::InlineThink => {
                 // on → off → default(inherit) → on
                 self.inline_think = match self.inline_think {
                     Some(true) => Some(false),
@@ -940,7 +956,7 @@ impl SettingsEditor {
                     None => Some(true),
                 };
             }
-            SettingsField::HintToolCallCorrections => {
+            ProviderSettingId::HintToolCallCorrections => {
                 // on → off → default(inherit) → on
                 self.hint_tool_call_corrections = match self.hint_tool_call_corrections {
                     Some(true) => Some(false),
@@ -948,7 +964,7 @@ impl SettingsEditor {
                     None => Some(true),
                 };
             }
-            SettingsField::XaiMultiAgentToolsBeta => {
+            ProviderSettingId::XaiMultiAgentToolsBeta => {
                 self.xai_multi_agent_tools_beta = !self.xai_multi_agent_tools_beta;
                 self.xai_multi_agent_tools_beta_present =
                     self.is_model_scope() || self.xai_multi_agent_tools_beta;
@@ -958,16 +974,18 @@ impl SettingsEditor {
         self.status = None;
     }
 
-    fn begin_numeric_edit(&mut self, field: SettingsField) {
+    fn begin_numeric_edit(&mut self, field: ProviderSettingId) {
         let current = match field {
-            SettingsField::QualityRank => self.quality_rank.unwrap_or(0).to_string(),
-            SettingsField::CostRank => self.cost_rank.unwrap_or(0).to_string(),
-            SettingsField::AutoCompactPct => self.context.auto_compact_pct.to_string(),
-            SettingsField::AutoPrunePct => self.context.auto_prune_pct.to_string(),
-            SettingsField::AutoPrunePrunablePct => self.context.auto_prune_prunable_pct.to_string(),
-            SettingsField::CacheTtlSecs => self.cache.ttl_secs.to_string(),
-            SettingsField::TimeoutTtftSecs => self.timeout.ttft_secs.to_string(),
-            SettingsField::TimeoutIdleSecs => self.timeout.idle_secs.to_string(),
+            ProviderSettingId::QualityRank => self.quality_rank.unwrap_or(0).to_string(),
+            ProviderSettingId::CostRank => self.cost_rank.unwrap_or(0).to_string(),
+            ProviderSettingId::AutoCompactPct => self.context.auto_compact_pct.to_string(),
+            ProviderSettingId::AutoPrunePct => self.context.auto_prune_pct.to_string(),
+            ProviderSettingId::AutoPrunePrunablePct => {
+                self.context.auto_prune_prunable_pct.to_string()
+            }
+            ProviderSettingId::CacheTtlSecs => self.cache.ttl_secs.to_string(),
+            ProviderSettingId::TimeoutTtftSecs => self.timeout.ttft_secs.to_string(),
+            ProviderSettingId::TimeoutIdleSecs => self.timeout.idle_secs.to_string(),
             _ => String::new(),
         };
         self.buf = TextField::new(current);
@@ -977,13 +995,13 @@ impl SettingsEditor {
 
     /// Open the free-text edit for the backup-model field, seeded with the
     /// current `provider:model` (empty when unset).
-    fn begin_text_edit(&mut self, field: SettingsField) {
+    fn begin_text_edit(&mut self, field: ProviderSettingId) {
         let current = match field {
-            SettingsField::Backup => match &self.backup {
+            ProviderSettingId::Backup => match &self.backup {
                 Some(b) => format!("{}:{}", b.provider, b.model),
                 None => String::new(),
             },
-            SettingsField::SystemPrompt => self.system_prompt.clone().unwrap_or_default(),
+            ProviderSettingId::SystemPrompt => self.system_prompt.clone().unwrap_or_default(),
             _ => String::new(),
         };
         self.buf = TextField::new(current);
@@ -995,19 +1013,18 @@ impl SettingsEditor {
     /// the backup (no fallback / inherit); otherwise it must be `provider:model`
     /// with both halves non-empty (rejected inline on a bad shape — the field
     /// stays open).
-    fn commit_text_edit(&mut self) {
+    fn commit_text_edit(&mut self) -> Result<(), String> {
         let Some(field) = self.editing else {
-            return;
+            return Ok(());
         };
         match field {
-            SettingsField::SystemPrompt => {
+            ProviderSettingId::SystemPrompt => {
                 let raw = self.buf.text();
                 if model_system_prompt_too_large(raw) {
-                    self.status = Some(format!(
+                    return Err(format!(
                         "model instructions must be at most {} bytes",
                         MODEL_SYSTEM_PROMPT_MAX_BYTES
                     ));
-                    return;
                 }
                 self.system_prompt = normalize_model_system_prompt(raw).map(str::to_string);
                 self.editing = None;
@@ -1015,15 +1032,16 @@ impl SettingsEditor {
                     "saved for future root sessions; existing conversations keep their current instructions"
                         .to_string(),
                 );
+                return Ok(());
             }
-            SettingsField::Backup => {
+            ProviderSettingId::Backup => {
                 let raw = self.buf.text().trim();
                 if raw.is_empty() {
                     // Clear the backup (no fallback at this scope / inherit on model).
                     self.backup = None;
                     self.editing = None;
                     self.status = None;
-                    return;
+                    return Ok(());
                 }
                 match raw.split_once(':') {
                     Some((provider, model))
@@ -1035,72 +1053,74 @@ impl SettingsEditor {
                         });
                         self.editing = None;
                         self.status = None;
+                        return Ok(());
                     }
                     _ => {
-                        self.status =
-                            Some("must be provider:model (or empty to clear)".to_string());
+                        return Err("must be provider:model (or empty to clear)".to_string());
                     }
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Validate + commit the numeric edit buffer. Percentages clamp to
     /// 0–100; the cache time and the TTFT / idle timeouts accept any
     /// non-negative integer (seconds). Non-numeric input is rejected inline
     /// (the field stays open).
-    fn commit_numeric_edit(&mut self) {
+    fn commit_numeric_edit(&mut self) -> Result<(), String> {
         let Some(field) = self.editing else {
-            return;
+            return Ok(());
         };
         let raw = self.buf.text().trim();
-        if matches!(field, SettingsField::QualityRank | SettingsField::CostRank) {
+        if matches!(
+            field,
+            ProviderSettingId::QualityRank | ProviderSettingId::CostRank
+        ) {
             let parsed: i64 = match raw.parse() {
                 Ok(n) => n,
                 Err(_) => {
-                    self.status = Some("must be a signed number".to_string());
-                    return;
+                    return Err("must be a signed number".to_string());
                 }
             };
             match field {
-                SettingsField::QualityRank => self.quality_rank = Some(parsed),
-                SettingsField::CostRank => self.cost_rank = Some(parsed),
+                ProviderSettingId::QualityRank => self.quality_rank = Some(parsed),
+                ProviderSettingId::CostRank => self.cost_rank = Some(parsed),
                 _ => {}
             }
             self.editing = None;
             self.status = None;
-            return;
+            return Ok(());
         }
         let parsed: u64 = match raw.parse() {
             Ok(n) => n,
             Err(_) => {
-                self.status = Some("must be a number".to_string());
-                return;
+                return Err("must be a number".to_string());
             }
         };
         match field {
-            SettingsField::AutoCompactPct => {
+            ProviderSettingId::AutoCompactPct => {
                 self.context.auto_compact_pct = parsed.min(100) as u8;
                 self.mark_present(field);
             }
-            SettingsField::AutoPrunePct => {
+            ProviderSettingId::AutoPrunePct => {
                 self.context.auto_prune_pct = parsed.min(100) as u8;
                 self.mark_present(field);
             }
-            SettingsField::AutoPrunePrunablePct => {
+            ProviderSettingId::AutoPrunePrunablePct => {
                 self.context.auto_prune_prunable_pct = parsed.min(100) as u8;
                 self.mark_present(field);
             }
-            SettingsField::CacheTtlSecs => {
+            ProviderSettingId::CacheTtlSecs => {
                 self.cache.ttl_secs = parsed;
                 self.mark_present(field);
             }
-            SettingsField::TimeoutTtftSecs => {
+            ProviderSettingId::TimeoutTtftSecs => {
                 self.timeout.ttft_secs = parsed;
                 self.mark_present(field);
             }
-            SettingsField::TimeoutIdleSecs => {
+            ProviderSettingId::TimeoutIdleSecs => {
                 self.timeout.idle_secs = parsed;
                 self.mark_present(field);
             }
@@ -1114,7 +1134,7 @@ impl SettingsEditor {
         // warn rather than reject. Other numeric fields just clear the status.
         if matches!(
             field,
-            SettingsField::AutoPrunePct | SettingsField::AutoCompactPct
+            ProviderSettingId::AutoPrunePct | ProviderSettingId::AutoCompactPct
         ) && self.context.auto_prune_pct >= self.context.auto_compact_pct
         {
             self.status = Some(
@@ -1123,6 +1143,21 @@ impl SettingsEditor {
             );
         } else {
             self.status = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_text(
+        &mut self,
+        field: ProviderSettingId,
+        raw: &str,
+    ) -> Result<(), String> {
+        self.buf = TextField::new(raw.to_string());
+        self.editing = Some(field);
+        match field.descriptor().kind {
+            FieldKind::EditText => self.commit_text_edit(),
+            FieldKind::Numeric => self.commit_numeric_edit(),
+            FieldKind::Cycle | FieldKind::Drill => Ok(()),
         }
     }
 
@@ -1137,10 +1172,13 @@ impl SettingsEditor {
         if let Some(field) = self.editing {
             match key.code {
                 KeyCode::Enter => {
-                    if field.is_text() {
-                        self.commit_text_edit();
-                    } else {
-                        self.commit_numeric_edit();
+                    let result = match field.descriptor().kind {
+                        FieldKind::EditText => self.commit_text_edit(),
+                        FieldKind::Numeric => self.commit_numeric_edit(),
+                        FieldKind::Cycle | FieldKind::Drill => Ok(()),
+                    };
+                    if let Err(error) = result {
+                        self.status = Some(error);
                     }
                 }
                 KeyCode::Esc => {
@@ -1185,18 +1223,16 @@ impl SettingsEditor {
                     return SettingsResult::Save;
                 }
                 let field = self.field_at(self.cursor);
-                if field == SettingsField::TrustPolicy
+                if field == ProviderSettingId::TrustPolicy
                     && matches!(self.scope, SettingsScope::Provider)
                     && matches!(key.kind, KeyEventKind::Repeat)
                 {
                     return SettingsResult::Stay;
                 }
-                if field.is_numeric() {
-                    self.begin_numeric_edit(field);
-                } else if field.is_text() {
-                    self.begin_text_edit(field);
-                } else {
-                    self.cycle(field);
+                match field.descriptor().kind {
+                    FieldKind::Numeric => self.begin_numeric_edit(field),
+                    FieldKind::EditText => self.begin_text_edit(field),
+                    FieldKind::Cycle | FieldKind::Drill => self.cycle(field),
                 }
                 SettingsResult::Stay
             }
@@ -1335,9 +1371,57 @@ pub(super) enum SettingsResult {
     Save,
 }
 
+impl SettingStore for SettingsEditor {
+    type Id = ProviderSettingId;
+
+    fn descriptor(&self, id: Self::Id) -> SettingDescriptor {
+        id.descriptor()
+    }
+
+    fn value(&self, id: Self::Id) -> String {
+        self.value_str(id)
+    }
+
+    fn cycle(&mut self, id: Self::Id) {
+        self.cycle(id);
+    }
+
+    fn commit_text(&mut self, id: Self::Id, raw: &str) -> Result<(), String> {
+        self.commit_text(id, raw)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    #[test]
+    fn every_provider_setting_id_has_descriptor() {
+        for id in ALL_PROVIDER_SETTING_IDS {
+            let descriptor = id.descriptor();
+            assert!(!descriptor.label.is_empty(), "missing label for {id:?}");
+            match descriptor.kind {
+                FieldKind::Cycle | FieldKind::EditText | FieldKind::Numeric | FieldKind::Drill => {}
+            }
+        }
+    }
+
+    #[test]
+    fn provider_commit_text_contract_keeps_invalid_edit_open() {
+        let entry = provider_with_model();
+        let mut editor = SettingsEditor::for_provider("p", &entry);
+        let err = editor
+            .commit_text(ProviderSettingId::Backup, "bad-shape")
+            .expect_err("invalid backup shape is rejected");
+        assert_eq!(err, "must be provider:model (or empty to clear)");
+        assert_eq!(editor.editing, Some(ProviderSettingId::Backup));
+
+        editor
+            .commit_text(ProviderSettingId::Backup, "p:m")
+            .expect("valid backup shape commits");
+        assert_eq!(editor.editing, None);
+        assert_eq!(editor.value_str(ProviderSettingId::Backup), "p:m");
+    }
 
     fn provider_with_model() -> ProviderEntry {
         let mut entry = ProviderEntry {
@@ -1406,10 +1490,13 @@ mod tests {
     #[test]
     fn timeout_fields_use_threshold_labels() {
         assert_eq!(
-            SettingsField::TimeoutTtftSecs.label(),
+            ProviderSettingId::TimeoutTtftSecs.label(),
             "First-token threshold (s)"
         );
-        assert_eq!(SettingsField::TimeoutIdleSecs.label(), "Idle threshold (s)");
+        assert_eq!(
+            ProviderSettingId::TimeoutIdleSecs.label(),
+            "Idle threshold (s)"
+        );
     }
 
     #[test]
@@ -1418,17 +1505,20 @@ mod tests {
         assert!(!entry.allow_insecure_http);
 
         let mut e = SettingsEditor::for_provider("p", &entry);
-        assert_eq!(e.fields().first(), Some(&SettingsField::AllowInsecureHttp));
-        assert_eq!(e.value_str(SettingsField::AllowInsecureHttp), "off");
-        assert!(e.is_overridden(SettingsField::AllowInsecureHttp));
+        assert_eq!(
+            e.fields().first(),
+            Some(&ProviderSettingId::AllowInsecureHttp)
+        );
+        assert_eq!(e.value_str(ProviderSettingId::AllowInsecureHttp), "off");
+        assert!(e.is_overridden(ProviderSettingId::AllowInsecureHttp));
 
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AllowInsecureHttp)
+            .position(|f| *f == ProviderSettingId::AllowInsecureHttp)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::AllowInsecureHttp), "on");
+        assert_eq!(e.value_str(ProviderSettingId::AllowInsecureHttp), "on");
 
         let mut written = entry.clone();
         e.write_into(&mut written);
@@ -1441,7 +1531,7 @@ mod tests {
     fn model_scope_does_not_show_insecure_http_opt_in() {
         let entry = provider_with_model();
         let e = SettingsEditor::for_model("p", &entry, "m1");
-        assert!(!e.fields().contains(&SettingsField::AllowInsecureHttp));
+        assert!(!e.fields().contains(&ProviderSettingId::AllowInsecureHttp));
     }
 
     #[test]
@@ -1449,19 +1539,19 @@ mod tests {
         let entry = provider_with_model();
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
         // Inherited (no override yet) — shows the provider value, dimmed.
-        assert_eq!(e.value_str(SettingsField::AutoCompactPct), "85%");
-        assert!(!e.is_overridden(SettingsField::AutoCompactPct));
+        assert_eq!(e.value_str(ProviderSettingId::AutoCompactPct), "85%");
+        assert!(!e.is_overridden(ProviderSettingId::AutoCompactPct));
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AutoCompactPct)
+            .position(|f| *f == ProviderSettingId::AutoCompactPct)
             .unwrap();
         // Edit the auto-compact %: open, type, commit.
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("70".to_string());
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::AutoCompactPct), "70%");
-        assert!(e.is_overridden(SettingsField::AutoCompactPct));
+        assert_eq!(e.value_str(ProviderSettingId::AutoCompactPct), "70%");
+        assert!(e.is_overridden(ProviderSettingId::AutoCompactPct));
         // Writeback sets the model override.
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
@@ -1476,13 +1566,13 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AutoCompactPct)
+            .position(|f| *f == ProviderSettingId::AutoCompactPct)
             .unwrap();
         // Over 100 clamps.
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("250".to_string());
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::AutoCompactPct), "100%");
+        assert_eq!(e.value_str(ProviderSettingId::AutoCompactPct), "100%");
         // Non-numeric is rejected (field stays open, value unchanged).
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("abc".to_string());
@@ -1499,14 +1589,14 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AutoPrunePct)
+            .position(|f| *f == ProviderSettingId::AutoPrunePct)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("90".to_string());
         e.handle_key(press(KeyCode::Enter));
         // Commit succeeded and closed the edit.
         assert!(e.editing.is_none(), "coherence warning still commits");
-        assert_eq!(e.value_str(SettingsField::AutoPrunePct), "90%");
+        assert_eq!(e.value_str(ProviderSettingId::AutoPrunePct), "90%");
         // …but a warning is surfaced.
         assert!(
             e.status
@@ -1522,7 +1612,7 @@ mod tests {
         e.buf = TextField::new("40".to_string());
         e.handle_key(press(KeyCode::Enter));
         assert!(e.editing.is_none());
-        assert_eq!(e.value_str(SettingsField::AutoPrunePct), "40%");
+        assert_eq!(e.value_str(ProviderSettingId::AutoPrunePct), "40%");
         assert_eq!(e.status, None, "coherent value clears the warning");
     }
 
@@ -1534,21 +1624,21 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::Mode)
+            .position(|f| *f == ProviderSettingId::Mode)
             .unwrap();
         assert_eq!(
-            e.value_str(SettingsField::Mode),
+            e.value_str(ProviderSettingId::Mode),
             "inherit (global llm mode)"
         );
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::Mode), "defensive");
+        assert_eq!(e.value_str(ProviderSettingId::Mode), "defensive");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::Mode), "normal");
+        assert_eq!(e.value_str(ProviderSettingId::Mode), "normal");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::Mode), "frontier");
+        assert_eq!(e.value_str(ProviderSettingId::Mode), "frontier");
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(
-            e.value_str(SettingsField::Mode),
+            e.value_str(ProviderSettingId::Mode),
             "inherit (global llm mode)"
         );
         // Writeback: inherit → None.
@@ -1568,13 +1658,16 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AutoPruneEnabled)
+            .position(|f| *f == ProviderSettingId::AutoPruneEnabled)
             .unwrap();
-        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "on (default)");
+        assert_eq!(
+            e.value_str(ProviderSettingId::AutoPruneEnabled),
+            "on (default)"
+        );
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "on");
+        assert_eq!(e.value_str(ProviderSettingId::AutoPruneEnabled), "on");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "off");
+        assert_eq!(e.value_str(ProviderSettingId::AutoPruneEnabled), "off");
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
         assert_eq!(entry2.auto_prune, Some(false));
@@ -1583,16 +1676,16 @@ mod tests {
         // pins the override; clearing with `x` returns to inherit. The
         // context-group pct rows are untouched by the switch.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.value_str(SettingsField::AutoPruneEnabled), "inherit");
-        assert!(!e.is_overridden(SettingsField::AutoPruneEnabled));
+        assert_eq!(e.value_str(ProviderSettingId::AutoPruneEnabled), "inherit");
+        assert!(!e.is_overridden(ProviderSettingId::AutoPruneEnabled));
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AutoPruneEnabled)
+            .position(|f| *f == ProviderSettingId::AutoPruneEnabled)
             .unwrap();
         e.handle_key(press(KeyCode::Enter)); // on
         e.handle_key(press(KeyCode::Enter)); // off
-        assert!(e.is_overridden(SettingsField::AutoPruneEnabled));
+        assert!(e.is_overridden(ProviderSettingId::AutoPruneEnabled));
         let mut entry3 = entry.clone();
         e.write_into(&mut entry3);
         let m = entry3.models.iter().find(|m| m.id == "m1").unwrap();
@@ -1600,7 +1693,7 @@ mod tests {
         assert!(m.context.is_none(), "switch must not pin the ctx% group");
 
         e.handle_key(press(KeyCode::Char('x')));
-        assert!(!e.is_overridden(SettingsField::AutoPruneEnabled));
+        assert!(!e.is_overridden(ProviderSettingId::AutoPruneEnabled));
         let mut entry4 = entry.clone();
         e.write_into(&mut entry4);
         let m = entry4.models.iter().find(|m| m.id == "m1").unwrap();
@@ -1611,22 +1704,25 @@ mod tests {
     fn model_system_prompt_row_saves_clears_and_rejects_oversize() {
         let entry = provider_with_model();
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert!(e.fields().contains(&SettingsField::SystemPrompt));
-        assert_eq!(e.value_str(SettingsField::SystemPrompt), "not set");
-        assert!(!e.is_overridden(SettingsField::SystemPrompt));
+        assert!(e.fields().contains(&ProviderSettingId::SystemPrompt));
+        assert_eq!(e.value_str(ProviderSettingId::SystemPrompt), "not set");
+        assert!(!e.is_overridden(ProviderSettingId::SystemPrompt));
 
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::SystemPrompt)
+            .position(|f| *f == ProviderSettingId::SystemPrompt)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
         for ch in "model guidance".chars() {
             e.handle_key(press(KeyCode::Char(ch)));
         }
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::SystemPrompt), "14 characters");
-        assert!(e.is_overridden(SettingsField::SystemPrompt));
+        assert_eq!(
+            e.value_str(ProviderSettingId::SystemPrompt),
+            "14 characters"
+        );
+        assert!(e.is_overridden(ProviderSettingId::SystemPrompt));
         assert!(
             e.status
                 .as_deref()
@@ -1640,7 +1736,7 @@ mod tests {
         assert_eq!(m.system_prompt.as_deref(), Some("model guidance"));
 
         e.handle_key(press(KeyCode::Char('x')));
-        assert_eq!(e.value_str(SettingsField::SystemPrompt), "not set");
+        assert_eq!(e.value_str(ProviderSettingId::SystemPrompt), "not set");
         let mut cleared = entry.clone();
         e.write_into(&mut cleared);
         let m = cleared.models.iter().find(|m| m.id == "m1").unwrap();
@@ -1649,7 +1745,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("x".repeat(MODEL_SYSTEM_PROMPT_MAX_BYTES + 1));
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.editing, Some(SettingsField::SystemPrompt));
+        assert_eq!(e.editing, Some(ProviderSettingId::SystemPrompt));
         assert!(e.status.as_deref().unwrap_or_default().contains("at most"));
     }
 
@@ -1662,27 +1758,27 @@ mod tests {
         assert_eq!(e.field_count(), 20);
         assert_eq!(
             *e.fields().last().unwrap(),
-            SettingsField::HintToolCallCorrections
+            ProviderSettingId::HintToolCallCorrections
         );
-        assert!(e.fields().contains(&SettingsField::InlineThink));
+        assert!(e.fields().contains(&ProviderSettingId::InlineThink));
         // Default (unset override) shows explicit inherit wording and is dimmed.
         assert_eq!(
-            e.value_str(SettingsField::InlineThink),
+            e.value_str(ProviderSettingId::InlineThink),
             "inherit provider/default"
         );
-        assert!(!e.is_overridden(SettingsField::InlineThink));
+        assert!(!e.is_overridden(ProviderSettingId::InlineThink));
 
         // Move to the inline-`<think>` row and cycle on→off→inherit.
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::InlineThink)
+            .position(|f| *f == ProviderSettingId::InlineThink)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::InlineThink), "extract");
-        assert!(e.is_overridden(SettingsField::InlineThink));
+        assert_eq!(e.value_str(ProviderSettingId::InlineThink), "extract");
+        assert!(e.is_overridden(ProviderSettingId::InlineThink));
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::InlineThink), "leave inline");
+        assert_eq!(e.value_str(ProviderSettingId::InlineThink), "leave inline");
         // Writeback pins the explicit opt-out on the model row.
         let mut entry_off = entry.clone();
         e.write_into(&mut entry_off);
@@ -1692,10 +1788,10 @@ mod tests {
         // Cycle once more → back to inherit (None).
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(
-            e.value_str(SettingsField::InlineThink),
+            e.value_str(ProviderSettingId::InlineThink),
             "inherit provider/default"
         );
-        assert!(!e.is_overridden(SettingsField::InlineThink));
+        assert!(!e.is_overridden(ProviderSettingId::InlineThink));
         let mut entry_default = entry.clone();
         e.write_into(&mut entry_default);
         let m = entry_default.models.iter().find(|m| m.id == "m1").unwrap();
@@ -1708,11 +1804,11 @@ mod tests {
         // Provider scope now also shows the inline-`<think>` tri-state row,
         // mirroring the `mode` tri-state.
         let mut prov = SettingsEditor::for_provider("p", &entry);
-        assert!(prov.fields().contains(&SettingsField::InlineThink));
+        assert!(prov.fields().contains(&ProviderSettingId::InlineThink));
         assert_eq!(prov.field_count(), 20);
         // Seeded from the provider's (unset) override → inherit default.
         assert_eq!(
-            prov.value_str(SettingsField::InlineThink),
+            prov.value_str(ProviderSettingId::InlineThink),
             "inherit default"
         );
 
@@ -1720,12 +1816,15 @@ mod tests {
         prov.cursor = prov
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::InlineThink)
+            .position(|f| *f == ProviderSettingId::InlineThink)
             .unwrap();
         prov.handle_key(press(KeyCode::Enter)); // inherit → on
-        assert_eq!(prov.value_str(SettingsField::InlineThink), "extract");
+        assert_eq!(prov.value_str(ProviderSettingId::InlineThink), "extract");
         prov.handle_key(press(KeyCode::Enter)); // extract → leave inline
-        assert_eq!(prov.value_str(SettingsField::InlineThink), "leave inline");
+        assert_eq!(
+            prov.value_str(ProviderSettingId::InlineThink),
+            "leave inline"
+        );
         let mut entry_off = entry.clone();
         prov.write_into(&mut entry_off);
         assert_eq!(entry_off.inline_think, Some(false));
@@ -1733,7 +1832,7 @@ mod tests {
         // Cycle back to inherit → None on writeback.
         prov.handle_key(press(KeyCode::Enter)); // leave inline → inherit default
         assert_eq!(
-            prov.value_str(SettingsField::InlineThink),
+            prov.value_str(ProviderSettingId::InlineThink),
             "inherit default"
         );
         let help = prov.selected_help().expect("inline think help");
@@ -1751,15 +1850,21 @@ mod tests {
         provider.cursor = provider
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::TrustPolicy)
+            .position(|f| *f == ProviderSettingId::TrustPolicy)
             .unwrap();
 
         provider.handle_key(press(KeyCode::Enter));
         provider.handle_key(repeat(KeyCode::Enter));
-        assert_ne!(provider.value_str(SettingsField::TrustPolicy), "trusted");
+        assert_ne!(
+            provider.value_str(ProviderSettingId::TrustPolicy),
+            "trusted"
+        );
 
         provider.handle_key(press(KeyCode::Enter));
-        assert_ne!(provider.value_str(SettingsField::TrustPolicy), "trusted");
+        assert_ne!(
+            provider.value_str(ProviderSettingId::TrustPolicy),
+            "trusted"
+        );
         assert!(provider.status.as_deref().unwrap_or("").contains("wait"));
     }
 
@@ -1767,19 +1872,19 @@ mod tests {
     fn trust_policy_rows_write_provider_and_model_policy() {
         let entry = provider_with_model();
         let mut provider = SettingsEditor::for_provider("p", &entry);
-        assert!(provider.fields().contains(&SettingsField::TrustPolicy));
+        assert!(provider.fields().contains(&ProviderSettingId::TrustPolicy));
         assert_eq!(
-            provider.value_str(SettingsField::TrustPolicy),
+            provider.value_str(ProviderSettingId::TrustPolicy),
             "untrusted (default)"
         );
         provider.cursor = provider
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::TrustPolicy)
+            .position(|f| *f == ProviderSettingId::TrustPolicy)
             .unwrap();
         provider.handle_key(press(KeyCode::Enter));
         assert_eq!(
-            provider.value_str(SettingsField::TrustPolicy),
+            provider.value_str(ProviderSettingId::TrustPolicy),
             "untrusted (default)"
         );
         assert!(
@@ -1790,24 +1895,27 @@ mod tests {
                 .contains("press Enter again")
         );
         provider.handle_key(press(KeyCode::Enter));
-        assert_eq!(provider.value_str(SettingsField::TrustPolicy), "trusted");
+        assert_eq!(
+            provider.value_str(ProviderSettingId::TrustPolicy),
+            "trusted"
+        );
         let mut provider_written = entry.clone();
         provider.write_into(&mut provider_written);
         assert_eq!(provider_written.trust, Some(ModelTrust::Trusted));
 
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert!(e.fields().contains(&SettingsField::TrustPolicy));
-        assert_eq!(e.value_str(SettingsField::TrustPolicy), "inherit");
-        assert!(!e.is_overridden(SettingsField::TrustPolicy));
+        assert!(e.fields().contains(&ProviderSettingId::TrustPolicy));
+        assert_eq!(e.value_str(ProviderSettingId::TrustPolicy), "inherit");
+        assert!(!e.is_overridden(ProviderSettingId::TrustPolicy));
 
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::TrustPolicy)
+            .position(|f| *f == ProviderSettingId::TrustPolicy)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::TrustPolicy), "trusted");
-        assert!(e.is_overridden(SettingsField::TrustPolicy));
+        assert_eq!(e.value_str(ProviderSettingId::TrustPolicy), "trusted");
+        assert!(e.is_overridden(ProviderSettingId::TrustPolicy));
         assert!(e.status.as_deref().unwrap_or("").contains("unsanitized"));
         let mut entry_off = entry.clone();
         e.write_into(&mut entry_off);
@@ -1815,7 +1923,7 @@ mod tests {
         assert_eq!(m.trust, Some(ModelTrust::Trusted));
 
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::TrustPolicy), "untrusted");
+        assert_eq!(e.value_str(ProviderSettingId::TrustPolicy), "untrusted");
         let mut entry_untrusted = entry.clone();
         e.write_into(&mut entry_untrusted);
         let m = entry_untrusted
@@ -1832,22 +1940,28 @@ mod tests {
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
         // Default (unset override) shows "inherit" and is dimmed.
         assert_eq!(
-            e.value_str(SettingsField::HintToolCallCorrections),
+            e.value_str(ProviderSettingId::HintToolCallCorrections),
             "inherit"
         );
-        assert!(!e.is_overridden(SettingsField::HintToolCallCorrections));
+        assert!(!e.is_overridden(ProviderSettingId::HintToolCallCorrections));
 
         // Cycle inherit→on→off and pin the explicit opt-out.
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::HintToolCallCorrections)
+            .position(|f| *f == ProviderSettingId::HintToolCallCorrections)
             .unwrap();
         e.handle_key(press(KeyCode::Enter)); // inherit → on
-        assert_eq!(e.value_str(SettingsField::HintToolCallCorrections), "on");
-        assert!(e.is_overridden(SettingsField::HintToolCallCorrections));
+        assert_eq!(
+            e.value_str(ProviderSettingId::HintToolCallCorrections),
+            "on"
+        );
+        assert!(e.is_overridden(ProviderSettingId::HintToolCallCorrections));
         e.handle_key(press(KeyCode::Enter)); // on → off
-        assert_eq!(e.value_str(SettingsField::HintToolCallCorrections), "off");
+        assert_eq!(
+            e.value_str(ProviderSettingId::HintToolCallCorrections),
+            "off"
+        );
         let mut entry_off = entry.clone();
         e.write_into(&mut entry_off);
         let m = entry_off.models.iter().find(|m| m.id == "m1").unwrap();
@@ -1856,7 +1970,7 @@ mod tests {
         // Cycle once more → inherit (None on writeback).
         e.handle_key(press(KeyCode::Enter)); // off → inherit
         assert_eq!(
-            e.value_str(SettingsField::HintToolCallCorrections),
+            e.value_str(ProviderSettingId::HintToolCallCorrections),
             "inherit"
         );
         let mut entry_default = entry.clone();
@@ -1871,16 +1985,16 @@ mod tests {
         let mut prov = SettingsEditor::for_provider("p", &entry);
         assert!(
             prov.fields()
-                .contains(&SettingsField::HintToolCallCorrections)
+                .contains(&ProviderSettingId::HintToolCallCorrections)
         );
         assert_eq!(
-            prov.value_str(SettingsField::HintToolCallCorrections),
+            prov.value_str(ProviderSettingId::HintToolCallCorrections),
             "inherit"
         );
         prov.cursor = prov
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::HintToolCallCorrections)
+            .position(|f| *f == ProviderSettingId::HintToolCallCorrections)
             .unwrap();
         prov.handle_key(press(KeyCode::Enter)); // inherit → on
         let mut entry_on = entry.clone();
@@ -1902,20 +2016,20 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::Backup)
+            .position(|f| *f == ProviderSettingId::Backup)
             .unwrap();
         // Unset shows "none".
-        assert_eq!(e.value_str(SettingsField::Backup), "none");
+        assert_eq!(e.value_str(ProviderSettingId::Backup), "none");
 
         // Open the text edit, type a valid `provider:model`, commit.
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("reliable:claude-sonnet-4-6".to_string());
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(
-            e.value_str(SettingsField::Backup),
+            e.value_str(ProviderSettingId::Backup),
             "reliable:claude-sonnet-4-6"
         );
-        assert!(e.is_overridden(SettingsField::Backup));
+        assert!(e.is_overridden(ProviderSettingId::Backup));
         // Writeback pins it onto the provider entry.
         let mut entry_set = entry.clone();
         e.write_into(&mut entry_set);
@@ -1935,7 +2049,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new(String::new());
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::Backup), "none");
+        assert_eq!(e.value_str(ProviderSettingId::Backup), "none");
         let mut entry_clear = entry.clone();
         e.write_into(&mut entry_clear);
         assert!(entry_clear.backup.is_none());
@@ -1953,21 +2067,27 @@ mod tests {
         let e = SettingsEditor::for_model("p", &entry, "m1");
         // The model has no own backup → shows "none" and is NOT marked
         // overridden (it inherits the provider backup at resolve time).
-        assert_eq!(e.value_str(SettingsField::Backup), "none");
-        assert!(!e.is_overridden(SettingsField::Backup));
+        assert_eq!(e.value_str(ProviderSettingId::Backup), "none");
+        assert!(!e.is_overridden(ProviderSettingId::Backup));
     }
 
     #[test]
     fn xai_provider_entitlement_toggle_writes_generic_capability() {
         let entry = provider_with_model();
         let mut e = SettingsEditor::for_provider("grok-oauth", &entry);
-        assert!(e.fields().contains(&SettingsField::XaiMultiAgentToolsBeta));
-        assert_eq!(e.value_str(SettingsField::XaiMultiAgentToolsBeta), "off");
+        assert!(
+            e.fields()
+                .contains(&ProviderSettingId::XaiMultiAgentToolsBeta)
+        );
+        assert_eq!(
+            e.value_str(ProviderSettingId::XaiMultiAgentToolsBeta),
+            "off"
+        );
 
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::XaiMultiAgentToolsBeta)
+            .position(|f| *f == ProviderSettingId::XaiMultiAgentToolsBeta)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
 
@@ -1992,13 +2112,13 @@ mod tests {
         let mut entry = provider_with_model();
         entry.capabilities.client_side_tools = tools_supported_capability();
         let mut e = SettingsEditor::for_model("grok", &entry, "m1");
-        assert_eq!(e.value_str(SettingsField::XaiMultiAgentToolsBeta), "on");
-        assert!(!e.is_overridden(SettingsField::XaiMultiAgentToolsBeta));
+        assert_eq!(e.value_str(ProviderSettingId::XaiMultiAgentToolsBeta), "on");
+        assert!(!e.is_overridden(ProviderSettingId::XaiMultiAgentToolsBeta));
 
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::XaiMultiAgentToolsBeta)
+            .position(|f| *f == ProviderSettingId::XaiMultiAgentToolsBeta)
             .unwrap();
         e.handle_key(press(KeyCode::Enter));
 
@@ -2057,16 +2177,16 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::WireApi)
+            .position(|f| *f == ProviderSettingId::WireApi)
             .unwrap();
-        assert_eq!(e.value_str(SettingsField::WireApi), "auto");
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "auto");
 
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::WireApi), "completions");
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "completions");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::WireApi), "responses");
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "responses");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::WireApi), "auto");
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "auto");
 
         e.handle_key(press(KeyCode::Enter));
         let mut entry2 = entry.clone();
@@ -2082,20 +2202,23 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::WireApi)
+            .position(|f| *f == ProviderSettingId::WireApi)
             .unwrap();
 
-        assert_eq!(e.value_str(SettingsField::WireApi), "responses (inherit)");
-        assert!(!e.is_overridden(SettingsField::WireApi));
+        assert_eq!(
+            e.value_str(ProviderSettingId::WireApi),
+            "responses (inherit)"
+        );
+        assert!(!e.is_overridden(ProviderSettingId::WireApi));
 
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::WireApi), "completions");
-        assert!(e.is_overridden(SettingsField::WireApi));
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "completions");
+        assert!(e.is_overridden(ProviderSettingId::WireApi));
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::WireApi), "responses");
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "responses");
         e.handle_key(press(KeyCode::Enter));
-        assert_eq!(e.value_str(SettingsField::WireApi), "auto (inherit)");
-        assert!(!e.is_overridden(SettingsField::WireApi));
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "auto (inherit)");
+        assert!(!e.is_overridden(ProviderSettingId::WireApi));
 
         e.handle_key(press(KeyCode::Enter));
         let mut pinned = entry.clone();
@@ -2116,10 +2239,10 @@ mod tests {
         entry.url = "https://api.anthropic.com/v1".into();
 
         let provider = SettingsEditor::for_provider("p", &entry);
-        assert!(!provider.fields().contains(&SettingsField::WireApi));
+        assert!(!provider.fields().contains(&ProviderSettingId::WireApi));
 
         let model = SettingsEditor::for_model("p", &entry, "m1");
-        assert!(!model.fields().contains(&SettingsField::WireApi));
+        assert!(!model.fields().contains(&ProviderSettingId::WireApi));
     }
 
     #[test]
@@ -2129,16 +2252,16 @@ mod tests {
         e.cursor = e
             .fields()
             .iter()
-            .position(|f| *f == SettingsField::AutoCompactPct)
+            .position(|f| *f == ProviderSettingId::AutoCompactPct)
             .unwrap();
         // Override the auto-compact %.
         e.handle_key(press(KeyCode::Enter));
         e.buf = TextField::new("70".to_string());
         e.handle_key(press(KeyCode::Enter));
-        assert!(e.is_overridden(SettingsField::AutoCompactPct));
+        assert!(e.is_overridden(ProviderSettingId::AutoCompactPct));
         // Clear it back to inherit with `x`.
         e.handle_key(press(KeyCode::Char('x')));
-        assert!(!e.is_overridden(SettingsField::AutoCompactPct));
+        assert!(!e.is_overridden(ProviderSettingId::AutoCompactPct));
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
         let m = entry2.models.iter().find(|m| m.id == "m1").unwrap();
@@ -2147,7 +2270,7 @@ mod tests {
 
     #[test]
     fn field_lists_match_expected_for_every_scope_and_flag_variant() {
-        use SettingsField::*;
+        use ProviderSettingId::*;
         // Independent oracle: the single canonical maximal ordering, each row
         // tagged with the condition under which it appears. `derive_fields`
         // (the single source of truth, cached per editor and returned by
@@ -2157,7 +2280,7 @@ mod tests {
         // one variant.
         //
         // (field, provider_only, model_only, wire_api_only, xai_only)
-        let canonical: &[(SettingsField, bool, bool, bool, bool)] = &[
+        let canonical: &[(ProviderSettingId, bool, bool, bool, bool)] = &[
             (AllowInsecureHttp, true, false, false, false),
             (TrustPolicy, false, false, false, false),
             (Location, false, false, false, false),
@@ -2187,7 +2310,7 @@ mod tests {
         for is_model in [false, true] {
             for wire in [false, true] {
                 for xai in [false, true] {
-                    let expected: Vec<SettingsField> = canonical
+                    let expected: Vec<ProviderSettingId> = canonical
                         .iter()
                         .filter(|(_, provider_only, model_only, wire_only, xai_only)| {
                             (!provider_only || !is_model)

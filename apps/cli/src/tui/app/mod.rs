@@ -4321,7 +4321,9 @@ impl App {
                 return Ok(());
             }
         };
-        if let Err(e) = temp.write_all(self.composer.text().as_bytes()) {
+        let editor_text = self.paste_registry.expand_editor(self.composer.text());
+        let retained_images = self.paste_registry.image_payloads_by_number();
+        if let Err(e) = temp.write_all(editor_text.as_bytes()) {
             self.history.push(HistoryEntry::CommandError {
                 line: format!("editor: failed to write temp file: {e}"),
             });
@@ -4343,11 +4345,13 @@ impl App {
                     // Drop a single trailing newline — most editors
                     // write one even when the user didn't add one.
                     let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
-                    self.composer.set(text);
-                    // The editor returns plain text; any prior paste
-                    // blocks were flattened to their placeholder text when
-                    // we wrote the temp file, so drop the registry.
-                    self.paste_registry.clear();
+                    let rebuilt = crate::tui::paste::PasteRegistry::rebuild_from_editor(
+                        &text,
+                        &retained_images,
+                        crate::tokens::count,
+                    );
+                    self.composer.set(rebuilt.buffer);
+                    self.paste_registry = rebuilt.registry;
                 }
                 Err(e) => {
                     self.history.push(HistoryEntry::CommandError {

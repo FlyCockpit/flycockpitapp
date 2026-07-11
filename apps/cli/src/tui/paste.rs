@@ -18,11 +18,14 @@
 //! offset + delta through [`PasteRegistry::shift_for_edit`] so the two
 //! stay in lockstep.
 
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 const USER_PASTE_TAG: &str = "user_paste";
 const DISPLAY_PASTE_RULE: &str = "---";
+const USER_PASTE_OPEN_PREFIX: &str = "<user_paste id=\"";
+const PASTED_IMAGE_PREFIX: &str = "[Pasted image #";
 
 /// Text paste collapses into a condensed block only when it exceeds this
 /// many lines **or** [`CONDENSE_CHAR_THRESHOLD`] characters. Smaller
@@ -95,6 +98,12 @@ pub struct PasteBlock {
 pub struct PasteRegistry {
     blocks: Vec<PasteBlock>,
     next_block_id: u64,
+}
+
+#[derive(Debug)]
+pub struct EditorPasteRebuild {
+    pub buffer: String,
+    pub registry: PasteRegistry,
 }
 
 impl Default for PasteRegistry {
@@ -214,9 +223,19 @@ impl PasteRegistry {
         full: String,
         tokens: Option<usize>,
     ) -> (u64, String) {
+        let nonce = Self::text_nonce(&full);
+        self.register_text_with_state_and_nonce(at, full, tokens, nonce)
+    }
+
+    fn register_text_with_state_and_nonce(
+        &mut self,
+        at: usize,
+        full: String,
+        tokens: Option<usize>,
+        nonce: String,
+    ) -> (u64, String) {
         let id = self.next_block_id();
         let number = self.next_text_number();
-        let nonce = Self::text_nonce(&full);
         let placeholder = match tokens {
             Some(tokens) => Self::text_placeholder(number, tokens),
             None => Self::pending_text_placeholder(number),
@@ -323,6 +342,42 @@ impl PasteRegistry {
         out.push_str(&Self::user_paste_open_tag(nonce));
         out.push_str(full);
         out.push_str(&Self::user_paste_close_tag(nonce));
+    }
+
+    fn parse_user_paste_open(text: &str) -> Option<(&str, usize)> {
+        let rest = text.strip_prefix(USER_PASTE_OPEN_PREFIX)?;
+        let end_quote = rest.find("\">")?;
+        let nonce = &rest[..end_quote];
+        if nonce.is_empty() {
+            return None;
+        }
+        Some((nonce, USER_PASTE_OPEN_PREFIX.len() + end_quote + 2))
+    }
+
+    fn parse_image_placeholder_at(text: &str) -> Option<(u32, usize)> {
+        let rest = text.strip_prefix(PASTED_IMAGE_PREFIX)?;
+        let digit_len = rest
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digit_len == 0 || rest.as_bytes().get(digit_len) != Some(&b']') {
+            return None;
+        }
+        let number = rest[..digit_len].parse::<u32>().ok()?;
+        Some((number, PASTED_IMAGE_PREFIX.len() + digit_len + 1))
+    }
+
+    fn next_image_placeholder(text: &str) -> Option<(usize, u32, usize)> {
+        let mut search_start = 0usize;
+        while search_start < text.len() {
+            let rel = text[search_start..].find(PASTED_IMAGE_PREFIX)?;
+            let start = search_start + rel;
+            if let Some((number, len)) = Self::parse_image_placeholder_at(&text[start..]) {
+                return Some((start, number, len));
+            }
+            search_start = start + 1;
+        }
+        None
     }
 
     fn display_paste_boundary(number: u32, edge: &str) -> String {
@@ -555,6 +610,104 @@ impl PasteRegistry {
             }
             PasteKind::Image { .. } => out.push_str(&buffer[block.start..block.end]),
         })
+    }
+
+    /// Build the text handed to `$EDITOR`. Text paste blocks are expanded
+    /// with stable nonce tags so they can be rebuilt on return; images stay
+    /// as visible placeholders because their bytes cannot live in the file.
+    pub fn expand_editor(&self, buffer: &str) -> String {
+        self.expand_blocks(buffer, |out, block| match &block.kind {
+            PasteKind::Text { full, nonce, .. } => {
+                Self::append_user_paste_wire(out, full, nonce);
+            }
+            PasteKind::Image { .. } => out.push_str(&buffer[block.start..block.end]),
+        })
+    }
+
+    /// Retain one payload for each visible image number before an external
+    /// editor round-trip. Returned text maps `[Pasted image #N]` back through
+    /// this table; missing placeholders are dropped.
+    pub fn image_payloads_by_number(&self) -> BTreeMap<u32, Vec<u8>> {
+        let mut images = BTreeMap::new();
+        for block in &self.blocks {
+            if let PasteKind::Image { png, .. } = &block.kind {
+                images.entry(block.number).or_insert_with(|| png.clone());
+            }
+        }
+        images
+    }
+
+    /// Parse editor-returned text into a normal composer buffer plus a fresh
+    /// registry. Well-formed `<user_paste id="...">...</user_paste id="...">`
+    /// regions become condensed text blocks. Surviving image placeholders
+    /// are rebuilt from `retained_images`; unknown image numbers remain text.
+    pub fn rebuild_from_editor(
+        editor_text: &str,
+        retained_images: &BTreeMap<u32, Vec<u8>>,
+        mut count_text: impl FnMut(&str) -> usize,
+    ) -> EditorPasteRebuild {
+        let mut buffer = String::with_capacity(editor_text.len());
+        let mut registry = PasteRegistry::new();
+        let mut pos = 0usize;
+
+        while pos < editor_text.len() {
+            let rest = &editor_text[pos..];
+            let next_text = rest.find(USER_PASTE_OPEN_PREFIX);
+            let next_image = Self::next_image_placeholder(rest);
+
+            let use_text = match (next_text, next_image) {
+                (Some(text_start), Some((image_start, _, _))) => text_start <= image_start,
+                (Some(_), None) => true,
+                _ => false,
+            };
+
+            if use_text {
+                let start = next_text.expect("text event exists");
+                buffer.push_str(&rest[..start]);
+                let absolute_start = pos + start;
+                let tag_text = &editor_text[absolute_start..];
+                let Some((nonce, open_len)) = Self::parse_user_paste_open(tag_text) else {
+                    buffer.push_str(tag_text);
+                    break;
+                };
+                let close_tag = Self::user_paste_close_tag(nonce);
+                let content_start = absolute_start + open_len;
+                let Some(close_rel) = editor_text[content_start..].find(&close_tag) else {
+                    buffer.push_str(tag_text);
+                    break;
+                };
+                let close_start = content_start + close_rel;
+                let full = editor_text[content_start..close_start].to_string();
+                let at = buffer.len();
+                let tokens = count_text(&full);
+                let (_id, placeholder) = registry.register_text_with_state_and_nonce(
+                    at,
+                    full,
+                    Some(tokens),
+                    nonce.into(),
+                );
+                buffer.push_str(&placeholder);
+                pos = close_start + close_tag.len();
+                continue;
+            }
+
+            let Some((image_start, image_number, image_len)) = next_image else {
+                buffer.push_str(rest);
+                break;
+            };
+            buffer.push_str(&rest[..image_start]);
+            let image_text_start = pos + image_start;
+            let image_text = &editor_text[image_text_start..image_text_start + image_len];
+            if let Some(png) = retained_images.get(&image_number) {
+                let placeholder = registry.register_image(buffer.len(), png.clone());
+                buffer.push_str(&placeholder);
+            } else {
+                buffer.push_str(image_text);
+            }
+            pos = image_text_start + image_len;
+        }
+
+        EditorPasteRebuild { buffer, registry }
     }
 }
 
@@ -880,6 +1033,182 @@ VERY LONG TEXT
                 b.end += placeholder.len();
             }
         }
+    }
+
+    /// Mirror a raw insertion through the app's registry shift path.
+    fn insert_raw(c: &mut Composer, r: &mut PasteRegistry, text: &str) {
+        let at = r.resolve_insertion(c.cursor());
+        c.set_cursor(at);
+        c.insert_str(text);
+        r.shift_for_edit(at, text.len() as isize);
+    }
+
+    /// Mirror the app's image insertion: register, insert placeholder, shift
+    /// later blocks while preserving the newly inserted range.
+    fn insert_image_block(c: &mut Composer, r: &mut PasteRegistry, png: Vec<u8>) -> String {
+        let at = r.resolve_insertion(c.cursor());
+        c.set_cursor(at);
+        let placeholder = r.register_image(at, png);
+        c.insert_str(&placeholder);
+        for b in r.blocks_mut() {
+            if b.start > at {
+                b.start += placeholder.len();
+                b.end += placeholder.len();
+            }
+        }
+        placeholder
+    }
+
+    #[test]
+    fn editor_round_trip_expands_text_tags_and_keeps_images() {
+        let mut c = Composer::new(false);
+        let mut r = PasteRegistry::new();
+        let full = "alpha
+beta
+gamma";
+        let png = vec![9u8, 8, 7];
+
+        insert_raw(&mut c, &mut r, "before ");
+        insert_text_block(&mut c, &mut r, full, 3);
+        let nonce = match &r.blocks()[0].kind {
+            PasteKind::Text { nonce, .. } => nonce.clone(),
+            _ => panic!("expected text block"),
+        };
+        insert_raw(&mut c, &mut r, " after ");
+        insert_image_block(&mut c, &mut r, png.clone());
+        insert_raw(&mut c, &mut r, " done");
+
+        let editor = r.expand_editor(c.text());
+        assert_eq!(
+            editor,
+            format!(
+                "before <user_paste id=\"{nonce}\">{full}</user_paste id=\"{nonce}\"> after [Pasted image #1] done"
+            )
+        );
+        assert!(!editor.contains("[Pasted text #"));
+
+        let retained = r.image_payloads_by_number();
+        let rebuilt = PasteRegistry::rebuild_from_editor(&editor, &retained, |_| 11);
+
+        assert_eq!(
+            rebuilt.buffer,
+            format!(
+                "before {} after {} done",
+                PasteRegistry::text_placeholder(1, 11),
+                PasteRegistry::image_placeholder(1)
+            )
+        );
+        assert_eq!(rebuilt.registry.blocks().len(), 2);
+        match &rebuilt.registry.blocks()[0].kind {
+            PasteKind::Text {
+                full: stored,
+                nonce: rebuilt_nonce,
+                ..
+            } => {
+                assert_eq!(stored, full);
+                assert_eq!(rebuilt_nonce, &nonce);
+            }
+            _ => panic!("expected rebuilt text block"),
+        }
+        let (wire, images) = rebuilt.registry.build_wire(&rebuilt.buffer, true);
+        assert_eq!(images, vec![png]);
+        assert!(wire.contains(&format!(
+            "<user_paste id=\"{nonce}\">{full}</user_paste id=\"{nonce}\">"
+        )));
+    }
+
+    #[test]
+    fn editor_round_trip_uses_edited_user_paste_body() {
+        let mut c = Composer::new(false);
+        let mut r = PasteRegistry::new();
+        insert_text_block(
+            &mut c,
+            &mut r,
+            "original
+body
+text",
+            3,
+        );
+        let nonce = match &r.blocks()[0].kind {
+            PasteKind::Text { nonce, .. } => nonce.clone(),
+            _ => panic!("expected text block"),
+        };
+        let edited = r.expand_editor(c.text()).replace(
+            "original
+body
+text",
+            "edited
+body
+text",
+        );
+
+        let rebuilt =
+            PasteRegistry::rebuild_from_editor(&edited, &r.image_payloads_by_number(), |_| 7);
+
+        assert_eq!(rebuilt.buffer, PasteRegistry::text_placeholder(1, 7));
+        match &rebuilt.registry.blocks()[0].kind {
+            PasteKind::Text {
+                full,
+                nonce: rebuilt_nonce,
+                ..
+            } => {
+                assert_eq!(
+                    full,
+                    "edited
+body
+text"
+                );
+                assert_eq!(rebuilt_nonce, &nonce);
+            }
+            _ => panic!("expected rebuilt text block"),
+        }
+    }
+
+    #[test]
+    fn editor_round_trip_malformed_user_paste_stays_raw() {
+        let mut c = Composer::new(false);
+        let mut r = PasteRegistry::new();
+        insert_text_block(
+            &mut c,
+            &mut r,
+            "alpha
+beta
+gamma",
+            3,
+        );
+        let nonce = match &r.blocks()[0].kind {
+            PasteKind::Text { nonce, .. } => nonce.clone(),
+            _ => panic!("expected text block"),
+        };
+        let malformed = r
+            .expand_editor(c.text())
+            .replace(&format!("</user_paste id=\"{nonce}\">"), "");
+
+        let rebuilt =
+            PasteRegistry::rebuild_from_editor(&malformed, &r.image_payloads_by_number(), |_| 1);
+
+        assert_eq!(rebuilt.buffer, malformed);
+        assert!(rebuilt.registry.is_empty());
+    }
+
+    #[test]
+    fn editor_round_trip_deleted_image_placeholder_drops_image() {
+        let mut c = Composer::new(false);
+        let mut r = PasteRegistry::new();
+        let first = vec![1u8, 1, 1];
+        let second = vec![2u8, 2, 2];
+        insert_image_block(&mut c, &mut r, first);
+        insert_raw(&mut c, &mut r, " ");
+        insert_image_block(&mut c, &mut r, second.clone());
+        let retained = r.image_payloads_by_number();
+
+        let rebuilt =
+            PasteRegistry::rebuild_from_editor("keep [Pasted image #2]", &retained, |_| 1);
+
+        assert_eq!(rebuilt.buffer, "keep [Pasted image #1]");
+        let (wire, images) = rebuilt.registry.build_wire(&rebuilt.buffer, true);
+        assert_eq!(images, vec![second]);
+        assert!(wire.contains(IMAGE_PART_SENTINEL));
     }
 
     #[test]

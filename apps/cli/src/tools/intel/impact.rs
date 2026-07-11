@@ -82,6 +82,7 @@ impl Tool for ImpactTool {
         });
 
         let multi = targets.len() > 1;
+        let calls = index.impact_calls(name)?;
         for (tpath, tline, tkind) in &targets {
             if multi {
                 writer.writeln(&format!("=== {name} ({tkind}) at {tpath}:{tline} ==="));
@@ -108,7 +109,6 @@ impl Tool for ImpactTool {
                 }
             }
 
-            let calls = index.impact_calls(name)?;
             if calls.is_empty() {
                 writer.writeln("Calls: none");
             } else {

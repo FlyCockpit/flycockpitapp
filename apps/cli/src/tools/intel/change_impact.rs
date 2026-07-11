@@ -5,6 +5,9 @@ use super::common::*;
 pub struct ChangeImpactTool;
 
 type HunkMap = HashMap<String, (Vec<(i64, i64)>, bool)>;
+type DepAdjacency<'a> = HashMap<&'a str, Vec<&'a str>>;
+type CallerRows = Vec<(String, i64, Option<String>)>;
+type CallRows = Vec<(String, String, i64)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChangedFile {
@@ -123,6 +126,8 @@ impl Tool for ChangeImpactTool {
         let index = index_of(ctx);
         index.ensure_fresh().await?;
         let dep_edges = index.dep_edges()?;
+        // Build import adjacency maps once; each changed file only runs BFS over these maps.
+        let (forward_deps, reverse_deps) = dependency_adjacencies(&dep_edges);
         let centrality = index.centrality_scores()?;
         let changed_paths: HashSet<String> = changed.iter().map(|f| f.path.clone()).collect();
         let mut file_symbols: HashMap<String, Vec<SymbolRow>> = HashMap::new();
@@ -143,24 +148,22 @@ impl Tool for ChangeImpactTool {
         writer.writeln(&format!("depth: {depth}"));
         writer.writeln("files:");
         let mut changed_symbols: Vec<(SymbolRow, RiskTier, usize, usize)> = Vec::new();
+        // Share expensive callgraph lookups across count, detail, and context passes.
+        let mut callers_cache: HashMap<(String, i64), CallerRows> = HashMap::new();
+        let mut calls_cache: HashMap<String, CallRows> = HashMap::new();
         for file in changed.iter().take(50) {
             let symbols = file_symbols.get(&file.path).cloned().unwrap_or_default();
             let overlapping = overlapping_symbols(&symbols, &file.ranges);
-            let reverse = reverse_deps(&dep_edges, &file.path, depth, path_filter.as_deref());
-            let forward = forward_deps(&dep_edges, &file.path, depth, path_filter.as_deref());
+            let reverse = filtered_bfs(&reverse_deps, &file.path, depth, path_filter.as_deref());
+            let forward = filtered_bfs(&forward_deps, &file.path, depth, path_filter.as_deref());
             let file_score = centrality.get(&file.path).copied().unwrap_or(0.0);
             let callers = overlapping
                 .iter()
-                .map(|s| {
-                    index
-                        .impact_callers(&s.path, s.line)
-                        .unwrap_or_default()
-                        .len()
-                })
+                .map(|s| memoized_impact_callers(&index, &mut callers_cache, &s.path, s.line).len())
                 .sum::<usize>();
             let calls = overlapping
                 .iter()
-                .map(|s| index.impact_calls(&s.name).unwrap_or_default().len())
+                .map(|s| memoized_impact_calls(&index, &mut calls_cache, &s.name).len())
                 .sum::<usize>();
             let risk = risk_for_file(
                 file,
@@ -212,10 +215,9 @@ impl Tool for ChangeImpactTool {
             }
             for symbol in overlapping {
                 let sc = centrality.get(&symbol.path).copied().unwrap_or(0.0);
-                let sym_callers = index
-                    .impact_callers(&symbol.path, symbol.line)
-                    .unwrap_or_default();
-                let sym_calls = index.impact_calls(&symbol.name).unwrap_or_default();
+                let sym_callers =
+                    memoized_impact_callers(&index, &mut callers_cache, &symbol.path, symbol.line);
+                let sym_calls = memoized_impact_calls(&index, &mut calls_cache, &symbol.name);
                 let sym_risk = risk_for_symbol(
                     &symbol,
                     sc,
@@ -270,9 +272,10 @@ impl Tool for ChangeImpactTool {
         writer.writeln("reverse dependencies:");
         let mut any_reverse = false;
         for file in &changed {
-            for (_dist, dep) in reverse_deps(&dep_edges, &file.path, depth, path_filter.as_deref())
-                .into_iter()
-                .take(40)
+            for (_dist, dep) in
+                filtered_bfs(&reverse_deps, &file.path, depth, path_filter.as_deref())
+                    .into_iter()
+                    .take(40)
             {
                 any_reverse = true;
                 if !writer.writeln(&format!("  {} <- {}", file.path, dep)) {
@@ -287,11 +290,10 @@ impl Tool for ChangeImpactTool {
         writer.writeln("call context:");
         let mut any_call = false;
         for (sym, _risk, _callers, _calls) in changed_symbols.iter().take(20) {
-            for (caller_file, caller_line, caller_symbol) in index
-                .impact_callers(&sym.path, sym.line)
-                .unwrap_or_default()
-                .into_iter()
-                .take(20)
+            for (caller_file, caller_line, caller_symbol) in
+                memoized_impact_callers(&index, &mut callers_cache, &sym.path, sym.line)
+                    .into_iter()
+                    .take(20)
             {
                 if path_filter.as_deref().is_some_and(|p| {
                     !path_matches_filter(&caller_file, p) && !changed_paths.contains(&sym.path)
@@ -309,11 +311,10 @@ impl Tool for ChangeImpactTool {
                     return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
                 }
             }
-            for (callee, def_file, def_line) in index
-                .impact_calls(&sym.name)
-                .unwrap_or_default()
-                .into_iter()
-                .take(20)
+            for (callee, def_file, def_line) in
+                memoized_impact_calls(&index, &mut calls_cache, &sym.name)
+                    .into_iter()
+                    .take(20)
             {
                 if path_filter.as_deref().is_some_and(|p| {
                     !path_matches_filter(&def_file, p) && !changed_paths.contains(&sym.path)
@@ -335,6 +336,58 @@ impl Tool for ChangeImpactTool {
         writer.writeln(&format!("next: read narrow changed ranges; run `impact` for high-risk symbols; run `deps` reverse on high-risk files{}", path_filter.as_ref().map(|p| format!(" under `{p}`")).unwrap_or_default()));
         Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"))
     }
+}
+
+fn dependency_adjacencies(edges: &[DepEdge]) -> (DepAdjacency<'_>, DepAdjacency<'_>) {
+    let mut forward: DepAdjacency<'_> = HashMap::new();
+    let mut reverse: DepAdjacency<'_> = HashMap::new();
+    for edge in edges {
+        if let Some(importee) = &edge.importee {
+            forward.entry(&edge.importer).or_default().push(importee);
+            reverse.entry(importee).or_default().push(&edge.importer);
+        }
+    }
+    (forward, reverse)
+}
+
+fn filtered_bfs(
+    adj: &DepAdjacency<'_>,
+    path: &str,
+    depth: usize,
+    filter: Option<&str>,
+) -> Vec<(usize, String)> {
+    bfs(adj, path, depth)
+        .into_iter()
+        .filter(|(_, p)| filter.is_none_or(|f| path_matches_filter(p, f)))
+        .collect()
+}
+
+fn memoized_impact_callers(
+    index: &Index,
+    cache: &mut HashMap<(String, i64), CallerRows>,
+    path: &str,
+    line: i64,
+) -> CallerRows {
+    let key = (path.to_string(), line);
+    if let Some(rows) = cache.get(&key) {
+        return rows.clone();
+    }
+    let rows = index.impact_callers(path, line).unwrap_or_default();
+    cache.insert(key, rows.clone());
+    rows
+}
+
+fn memoized_impact_calls(
+    index: &Index,
+    cache: &mut HashMap<String, CallRows>,
+    name: &str,
+) -> CallRows {
+    if let Some(rows) = cache.get(name) {
+        return rows.clone();
+    }
+    let rows = index.impact_calls(name).unwrap_or_default();
+    cache.insert(name.to_string(), rows.clone());
+    rows
 }
 
 fn reject_git_ref(label: &str, value: &str) -> Result<()> {

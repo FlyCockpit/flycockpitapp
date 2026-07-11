@@ -765,7 +765,7 @@ fn run_multireview(app: &mut App, _: &str) -> bool {
         &app.launch.cwd,
         &app.usage_models,
     ) {
-        Ok(dialog) => app.multireview_dialog = Some(dialog),
+        Ok(dialog) => app.overlay = Overlay::Multireview(dialog),
         Err(e) => app.history.push(HistoryEntry::Plain {
             line: format!("/multireview: {e}"),
         }),
@@ -911,7 +911,7 @@ fn run_trusted_only(app: &mut App, args: &str) -> bool {
 }
 
 fn run_stats(app: &mut App, _: &str) -> bool {
-    app.stats_pane = Some(crate::tui::stats_pane::StatsPane::open(&app.launch.cwd));
+    app.overlay = Overlay::Stats(crate::tui::stats_pane::StatsPane::open(&app.launch.cwd));
     false
 }
 
@@ -922,13 +922,13 @@ fn run_usage(app: &mut App, args: &str) -> bool {
 
 fn run_context(app: &mut App, _: &str) -> bool {
     let snapshot = app.context_snapshot();
-    app.context_pane = Some(crate::tui::context_pane::ContextPane::open(snapshot));
+    app.overlay = Overlay::Context(crate::tui::context_pane::ContextPane::open(snapshot));
     false
 }
 
 fn run_diff(app: &mut App, args: &str) -> bool {
     let source = crate::tui::diff_pane::parse_source_arg(args);
-    app.diff_pane = Some(crate::tui::diff_pane::DiffPane::open(
+    app.overlay = Overlay::Diff(crate::tui::diff_pane::DiffPane::open(
         source,
         &app.launch.cwd,
         &app.history,
@@ -938,7 +938,7 @@ fn run_diff(app: &mut App, args: &str) -> bool {
 }
 
 fn run_sessions(app: &mut App, _: &str) -> bool {
-    app.sessions_pane = Some(crate::tui::sessions_pane::SessionsPane::open(
+    app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
         &app.launch.cwd,
         app.daemon_connected,
     ));
@@ -954,7 +954,7 @@ fn run_skill(app: &mut App, args: &str) -> bool {
 }
 
 fn run_skills(app: &mut App, _: &str) -> bool {
-    app.skills_pane = Some(crate::tui::skills_pane::SkillsPane::open(&app.launch.cwd));
+    app.overlay = Overlay::Skills(crate::tui::skills_pane::SkillsPane::open(&app.launch.cwd));
     false
 }
 
@@ -989,7 +989,7 @@ fn run_swarm(app: &mut App, _: &str) -> bool {
 }
 
 fn run_permissions(app: &mut App, _: &str) -> bool {
-    app.permissions_pane = Some(crate::tui::permissions_pane::PermissionsPane::open(
+    app.overlay = Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(
         &app.launch.cwd,
     ));
     false
@@ -1044,7 +1044,8 @@ impl App {
         let mut parts = args.split_whitespace();
         match (parts.next(), parts.next(), parts.next()) {
             (None, _, _) => {
-                self.resources_pane = Some(crate::tui::resources_pane::ResourcesPane::open());
+                self.overlay =
+                    Overlay::Resources(crate::tui::resources_pane::ResourcesPane::open());
                 self.start_resources_snapshot_action();
             }
             (Some("promote"), Some(request_id), None) => {
@@ -1115,10 +1116,10 @@ impl App {
                 }],
             };
             let lockout = self.dialog_lockout();
-            self.pending_init = Some(PendingInit {
+            self.pending_local_choice = Some(LocalChoice::Init(PendingInit {
                 interrupt_id,
                 display,
-            });
+            }));
             self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
                 interrupt_id,
                 String::new(),

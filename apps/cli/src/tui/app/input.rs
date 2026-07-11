@@ -10,7 +10,7 @@ use crate::tui::composer::{FindSpec, Operator, Register, VimMode};
 use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
-use super::{App, TranscriptFind};
+use super::{App, LocalChoiceSelection, Overlay, TranscriptFind};
 use crate::daemon::proto::{self, Request, Response};
 use crate::engine::message::{QueueItemStatus, QueuedUserMessage};
 use crate::tui::settings::Dialog;
@@ -328,30 +328,14 @@ impl App {
                 let result = dialog.take_result();
                 self.question_dialog = None;
                 if let Some(result) = result {
-                    // A local `/init` existing-file prompt resolves here
-                    // (update/overwrite/cancel), not back to the daemon —
-                    // matched by the synthetic interrupt id. Every other
-                    // dialog is a real `question`-tool interrupt.
-                    if self.init_choice_for(&result) {
-                        let selected = init_selected_id(&result);
-                        self.resolve_init_choice(selected.as_deref());
-                    } else if self.paused_work_choice_for(&result) {
-                        let selected = init_selected_id(&result);
-                        self.resolve_paused_work_choice(selected.as_deref());
-                    } else if self.resume_repair_choice_for(&result) {
-                        let selected = init_selected_id(&result);
-                        self.resolve_resume_repair_choice(selected.as_deref());
-                    } else if self.redaction_toggle_choice_for(&result) {
-                        // Bare `/toggle-redaction` multiselect — resolved
-                        // locally, not back to the daemon as an interrupt.
-                        let selected = redaction_selected_ids(&result);
-                        self.resolve_redaction_toggle(selected.as_deref());
-                    } else if self.tandem_select_choice_for(&result) {
-                        // `/model-comparison` multiselect — resolved locally
-                        // (the checked rows become the session's tandem set),
-                        // not back to the daemon as an interrupt.
-                        let selected = redaction_selected_ids(&result);
-                        self.resolve_model_comparison_select(selected.as_deref());
+                    let interrupt_id = question_result_interrupt_id(&result);
+                    if self.pending_local_choice_matches(interrupt_id) {
+                        let selection = if self.pending_local_choice_is_multi() {
+                            LocalChoiceSelection::Multi(redaction_selected_ids(&result))
+                        } else {
+                            LocalChoiceSelection::Single(init_selected_id(&result))
+                        };
+                        self.resolve_local_choice(selection);
                     } else {
                         self.resolve_question_dialog(result);
                     }
@@ -381,144 +365,113 @@ impl App {
             return false;
         }
 
-        if let Some(picker) = self.model_picker.as_mut() {
-            let should_close = picker.handle_key(key);
-            if should_close {
-                // `is_done()` distinguishes an accepted pick from an Esc
-                // cancel — only the former counts toward the tally.
-                let accepted = picker.is_done();
-                self.close_model_picker(accepted);
-            }
-            // See the "modal dialog rule" comment above — always
-            // consume the key while the picker is open.
-            return false;
-        }
-
-        if let Some(dialog) = self.multireview_dialog.as_mut() {
-            let should_close = dialog.handle_key(key);
-            let kickoff = dialog.take_done();
-            if should_close || kickoff.is_some() {
-                self.multireview_dialog = None;
-            }
-            if let Some(kickoff) = kickoff {
-                self.start_multireview(kickoff.prompt);
-            }
-            return false;
-        }
-
-        // `/stats` pane (GOALS §15). Same modal rule: route the key to
-        // the pane, close on its request, and always consume so nothing
-        // leaks into the composer underneath.
-        if let Some(pane) = self.stats_pane.as_mut() {
-            if pane.handle_key(key) {
-                self.stats_pane = None;
-            }
-            return false;
-        }
-
-        // `/usage` pane. Same modal rule as `/stats`: route the key to
-        // the pane, close on request, and consume input.
-        if let Some(pane) = self.usage_pane.as_mut() {
-            if pane.handle_key(key) {
-                self.usage_pane = None;
-            }
-            return false;
-        }
-
-        // `/sessions` + `/resume` browser (GOALS §17f). Same modal rule.
-        // The pane returns an outcome: Close drops it; Resume drops it and
-        // switches the runner onto the chosen session via the existing
-        // resume path. Always consume the key.
-        if let Some(pane) = self.sessions_pane.as_mut() {
-            match pane.handle_key(key) {
-                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {
-                    self.sessions_pane = None;
+        match std::mem::take(&mut self.overlay) {
+            Overlay::None => {}
+            Overlay::ModelPicker(mut picker) => {
+                let should_close = picker.handle_key(key);
+                if should_close {
+                    let accepted = picker.is_done();
+                    self.overlay = Overlay::ModelPicker(picker);
+                    self.close_model_picker(accepted);
+                } else {
+                    self.overlay = Overlay::ModelPicker(picker);
                 }
-                Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
-                    self.sessions_pane = None;
-                    self.resume_session(session_id);
+                return false;
+            }
+            Overlay::Multireview(mut dialog) => {
+                let should_close = dialog.handle_key(key);
+                let kickoff = dialog.take_done();
+                if !should_close && kickoff.is_none() {
+                    self.overlay = Overlay::Multireview(dialog);
                 }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadList) => {
-                    self.start_sessions_list_action();
+                if let Some(kickoff) = kickoff {
+                    self.start_multireview(kickoff.prompt);
                 }
-                None => {}
+                return false;
             }
-            return false;
-        }
-
-        // `/skills` overlay (read-only). Same modal rule: route the key to
-        // the pane, close on its request, and always consume so nothing
-        // leaks into the composer underneath.
-        if let Some(pane) = self.skills_pane.as_mut() {
-            if pane.handle_key(key) {
-                self.skills_pane = None;
+            Overlay::Stats(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Stats(pane);
+                }
+                return false;
             }
-            return false;
-        }
-
-        // `/permissions` overlay. Modal: route the key to the pane (it owns
-        // navigation + the delete action), close on its request, and always
-        // consume so nothing leaks into the composer underneath.
-        if let Some(pane) = self.permissions_pane.as_mut() {
-            if pane.handle_key(key) {
-                self.permissions_pane = None;
+            Overlay::Usage(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Usage(pane);
+                }
+                return false;
             }
-            return false;
-        }
-
-        if let Some(pane) = self.resources_pane.as_mut() {
-            if let Some(outcome) = pane.handle_key(key) {
-                self.start_resources_outcome(outcome);
-            }
-            return false;
-        }
-
-        if let Some(dialog) = self.quick_dialog.as_mut() {
-            if let Some(outcome) = dialog.handle_key(key) {
-                self.quick_dialog = None;
-                match outcome {
-                    crate::tui::quick_dialog::QuickOutcome::Close => {}
-                    crate::tui::quick_dialog::QuickOutcome::Commit(commit) => {
-                        self.apply_quick_commit(commit);
+            Overlay::Sessions(mut pane) => {
+                match pane.handle_key(key) {
+                    Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {}
+                    Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
+                        self.resume_session(session_id);
+                    }
+                    Some(crate::tui::sessions_pane::SessionsOutcome::LoadList) => {
+                        self.overlay = Overlay::Sessions(pane);
+                        self.start_sessions_list_action();
+                    }
+                    None => {
+                        self.overlay = Overlay::Sessions(pane);
                     }
                 }
+                return false;
             }
-            return false;
-        }
-
-        // `/context` overlay (read-only snapshot). Same modal rule: route
-        // the key to the pane, close on its request (Esc / q), and always
-        // consume so nothing leaks into the composer underneath.
-        if let Some(pane) = self.context_pane.as_mut() {
-            if pane.handle_key(key) {
-                self.context_pane = None;
-            }
-            return false;
-        }
-
-        // `/scratchpad` dialog (prompt `notes-scratchpad.md`). Same
-        // modal rule: route the key to the pane, close on its request, and
-        // always consume so nothing leaks into the composer underneath.
-        if let Some(pane) = self.notes_pane.as_mut() {
-            match pane.handle_key(key) {
-                crate::tui::notes_pane::NotesOutcome::Close => {
-                    // Closing returns focus to the composer/transcript — the
-                    // pane is simply dropped and the composer resumes input.
-                    self.notes_pane = None;
+            Overlay::Skills(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Skills(pane);
                 }
-                crate::tui::notes_pane::NotesOutcome::Stay => {}
+                return false;
             }
-            return false;
-        }
-
-        // `/diff` pane (read-only diff browser). Same modal rule: route the
-        // key to the pane, close on its request, and always consume so
-        // nothing leaks into the composer underneath.
-        if let Some(pane) = self.diff_pane.as_mut() {
-            if pane.handle_key(key) {
-                self.diff_pane = None;
+            Overlay::Permissions(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Permissions(pane);
+                }
+                return false;
             }
-            return false;
+            Overlay::Resources(mut pane) => {
+                if let Some(outcome) = pane.handle_key(key) {
+                    self.overlay = Overlay::Resources(pane);
+                    self.start_resources_outcome(outcome);
+                } else {
+                    self.overlay = Overlay::Resources(pane);
+                }
+                return false;
+            }
+            Overlay::Quick(mut dialog) => {
+                if let Some(outcome) = dialog.handle_key(key) {
+                    match outcome {
+                        crate::tui::quick_dialog::QuickOutcome::Close => {}
+                        crate::tui::quick_dialog::QuickOutcome::Commit(commit) => {
+                            self.apply_quick_commit(commit);
+                        }
+                    }
+                } else {
+                    self.overlay = Overlay::Quick(dialog);
+                }
+                return false;
+            }
+            Overlay::Context(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Context(pane);
+                }
+                return false;
+            }
+            Overlay::Notes(mut pane) => {
+                match pane.handle_key(key) {
+                    crate::tui::notes_pane::NotesOutcome::Close => {}
+                    crate::tui::notes_pane::NotesOutcome::Stay => {
+                        self.overlay = Overlay::Notes(pane);
+                    }
+                }
+                return false;
+            }
+            Overlay::Diff(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Diff(pane);
+                }
+                return false;
+            }
         }
 
         if self.transcript_find.is_some() {
@@ -530,8 +483,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('f'))
             && !self.dialog.is_active()
-            && self.model_picker.is_none()
-            && self.multireview_dialog.is_none()
+            && !self.overlay.is_open()
             && self.question_dialog.is_none()
             && self.daemon_prompt.is_none()
             && self.pane.is_none()
@@ -549,8 +501,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('n'))
             && !self.dialog.is_active()
-            && self.model_picker.is_none()
-            && self.multireview_dialog.is_none()
+            && !self.overlay.is_open()
             && self.question_dialog.is_none()
             && self.daemon_prompt.is_none()
             && self.pane.is_none()
@@ -823,27 +774,12 @@ impl App {
             && self.pending.is_none()
             && self.active_schedules.is_empty()
             && matches!(self.dialog, Dialog::None)
-            && self.model_picker.is_none()
-            && self.multireview_dialog.is_none()
-            && self.stats_pane.is_none()
-            && self.usage_pane.is_none()
-            && self.sessions_pane.is_none()
-            && self.skills_pane.is_none()
-            && self.permissions_pane.is_none()
-            && self.resources_pane.is_none()
-            && self.quick_dialog.is_none()
-            && self.context_pane.is_none()
-            && self.notes_pane.is_none()
-            && self.diff_pane.is_none()
+            && !self.overlay.is_open()
             && self.daemon_prompt.is_none()
             && self.question_dialog.is_none()
-            && self.pending_init.is_none()
-            && self.pending_paused_work.is_none()
-            && self.pending_resume_repair.is_none()
+            && self.pending_local_choice.is_none()
             && !self.pending_prune_confirm
             && self.pending_stop_confirm.is_none()
-            && self.pending_redaction_toggle.is_none()
-            && self.pending_tandem_select.is_none()
             && self.pending_compact.is_none()
             && !self.pending_external_edit
             && self.context_menu.is_none()
@@ -2099,77 +2035,16 @@ impl App {
         }
         false
     }
+}
 
-    /// Whether a just-closed question dialog `result` is the local
-    /// `/init` existing-file prompt (matched by the pending init's
-    /// synthetic interrupt id) rather than a real daemon interrupt.
-    fn init_choice_for(&self, result: &crate::tui::dialog::question::QuestionResult) -> bool {
-        use crate::tui::dialog::question::QuestionResult;
-        let id = match result {
-            QuestionResult::Submit { interrupt_id, .. }
-            | QuestionResult::Cancel { interrupt_id } => *interrupt_id,
-        };
-        self.pending_init
-            .as_ref()
-            .is_some_and(|p| p.interrupt_id == id)
-    }
-
-    fn paused_work_choice_for(
-        &self,
-        result: &crate::tui::dialog::question::QuestionResult,
-    ) -> bool {
-        use crate::tui::dialog::question::QuestionResult;
-        let id = match result {
-            QuestionResult::Submit { interrupt_id, .. }
-            | QuestionResult::Cancel { interrupt_id } => *interrupt_id,
-        };
-        self.pending_paused_work
-            .as_ref()
-            .is_some_and(|p| p.interrupt_id == id)
-    }
-
-    fn resume_repair_choice_for(
-        &self,
-        result: &crate::tui::dialog::question::QuestionResult,
-    ) -> bool {
-        use crate::tui::dialog::question::QuestionResult;
-        let id = match result {
-            QuestionResult::Submit { interrupt_id, .. }
-            | QuestionResult::Cancel { interrupt_id } => *interrupt_id,
-        };
-        self.pending_resume_repair
-            .as_ref()
-            .is_some_and(|p| p.interrupt_id == id)
-    }
-
-    /// Whether a just-closed question dialog `result` is the local bare
-    /// `/toggle-redaction` multiselect (matched by the pending toggle's
-    /// synthetic interrupt id) rather than a real daemon interrupt.
-    fn redaction_toggle_choice_for(
-        &self,
-        result: &crate::tui::dialog::question::QuestionResult,
-    ) -> bool {
-        use crate::tui::dialog::question::QuestionResult;
-        let id = match result {
-            QuestionResult::Submit { interrupt_id, .. }
-            | QuestionResult::Cancel { interrupt_id } => *interrupt_id,
-        };
-        self.pending_redaction_toggle == Some(id)
-    }
-
-    /// Whether a just-closed question dialog `result` is the local
-    /// `/model-comparison` multiselect (matched by the pending select's
-    /// synthetic interrupt id) rather than a real daemon interrupt.
-    fn tandem_select_choice_for(
-        &self,
-        result: &crate::tui::dialog::question::QuestionResult,
-    ) -> bool {
-        use crate::tui::dialog::question::QuestionResult;
-        let id = match result {
-            QuestionResult::Submit { interrupt_id, .. }
-            | QuestionResult::Cancel { interrupt_id } => *interrupt_id,
-        };
-        self.pending_tandem_select == Some(id)
+fn question_result_interrupt_id(
+    result: &crate::tui::dialog::question::QuestionResult,
+) -> uuid::Uuid {
+    use crate::tui::dialog::question::QuestionResult;
+    match result {
+        QuestionResult::Submit { interrupt_id, .. } | QuestionResult::Cancel { interrupt_id } => {
+            *interrupt_id
+        }
     }
 }
 
@@ -2497,15 +2372,18 @@ impl App {
             return;
         }
         if self.daemon_prompt.is_some()
-            || self.stats_pane.is_some()
-            || self.usage_pane.is_some()
-            || self.sessions_pane.is_some()
-            || self.skills_pane.is_some()
-            || self.permissions_pane.is_some()
-            || self.resources_pane.is_some()
-            || self.quick_dialog.is_some()
-            || self.context_pane.is_some()
-            || self.diff_pane.is_some()
+            || matches!(
+                self.overlay,
+                Overlay::Stats(_)
+                    | Overlay::Usage(_)
+                    | Overlay::Sessions(_)
+                    | Overlay::Skills(_)
+                    | Overlay::Permissions(_)
+                    | Overlay::Resources(_)
+                    | Overlay::Quick(_)
+                    | Overlay::Context(_)
+                    | Overlay::Diff(_)
+            )
             || self.context_menu.is_some()
             || self.pin_pick.is_some()
             || self.fork_pick.is_some()
@@ -2528,17 +2406,20 @@ impl App {
             self.dialog.paste(&data);
             return;
         }
-        if let Some(picker) = self.model_picker.as_mut() {
-            picker.paste(&data);
-            return;
-        }
-        if let Some(dialog) = self.multireview_dialog.as_mut() {
-            dialog.paste(&data);
-            return;
-        }
-        if let Some(pane) = self.notes_pane.as_mut() {
-            pane.paste(&data);
-            return;
+        match &mut self.overlay {
+            Overlay::ModelPicker(picker) => {
+                picker.paste(&data);
+                return;
+            }
+            Overlay::Multireview(dialog) => {
+                dialog.paste(&data);
+                return;
+            }
+            Overlay::Notes(pane) => {
+                pane.paste(&data);
+                return;
+            }
+            _ => {}
         }
 
         // Image first: a clipboard image on the paste gesture becomes an
@@ -4030,7 +3911,7 @@ mod queued_message_edit_tests {
 #[cfg(test)]
 mod paste_routing_tests {
     use crate::db::pins::PinnedMessage;
-    use crate::tui::app::App;
+    use crate::tui::app::{App, Overlay};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
@@ -4249,13 +4130,15 @@ mod paste_routing_tests {
     fn paste_routes_to_open_notes_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        app.notes_pane = Some(crate::tui::notes_pane::NotesPane::editing_for_test(
+        app.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::editing_for_test(
             "", false,
         ));
 
         app.handle_paste("hi".to_string());
 
-        let pane = app.notes_pane.as_ref().expect("notes pane stays open");
+        let Overlay::Notes(pane) = &app.overlay else {
+            panic!("notes pane stays open");
+        };
         assert_eq!(pane.editor_text_for_test(), "hi");
         assert!(app.composer.is_empty());
         assert!(app.paste_registry.is_empty());

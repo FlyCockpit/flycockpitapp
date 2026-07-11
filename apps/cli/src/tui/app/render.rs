@@ -9,6 +9,8 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 
+use super::Overlay;
+
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::{border, merge::MergeStrategy};
@@ -923,137 +925,108 @@ impl App {
             }
         } else if self.dialog.is_active() {
             self.dialog.render(frame, rects.body);
-        } else if let Some(picker) = self.model_picker.as_mut() {
-            picker.render(frame, rects.body);
-        } else if let Some(dialog) = self.multireview_dialog.as_ref() {
-            dialog.render(frame, rects.body);
-        } else if self.footer_agent_picker.is_some() {
-            self.render_footer_agent_picker(frame, rects.body);
-        } else if self.footer_mode_picker.is_some() {
-            self.render_footer_mode_picker(frame, rects.body);
-        } else if self.stats_pane.is_some() {
-            // Take the pane out to satisfy the borrow checker (render is
-            // `&mut self` and the pane's render is `&mut self`), then put
-            // it back. The pane has no side effects beyond updating its
-            // own scroll-clamp state.
-            let mut pane = self.stats_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.stats_pane = pane;
-        } else if self.usage_pane.is_some() {
-            let mut pane = self.usage_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.usage_pane = pane;
-        } else if self.sessions_pane.is_some() {
-            // Same take/render/restore as `stats_pane` (both renders are
-            // `&mut self`). Renders into `rects.body` so the fixed chrome
-            // (cwd + git branch + context + active agent) stays visible.
-            let mut pane = self.sessions_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.sessions_pane = pane;
-        } else if self.skills_pane.is_some() {
-            // Same take/render/restore as the other panes. Renders into
-            // `rects.body` so the fixed chrome (cwd + git branch + context
-            // + active agent) stays visible — the overlay is a view, not a
-            // chrome change.
-            let mut pane = self.skills_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.skills_pane = pane;
-        } else if self.permissions_pane.is_some() {
-            // Same take/render/restore as the other panes. Renders into
-            // `rects.body` so the fixed chrome (cwd + git branch + context
-            // + active agent) stays visible — the overlay is a view, not a
-            // chrome change.
-            let mut pane = self.permissions_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.permissions_pane = pane;
-        } else if self.resources_pane.is_some() {
-            let mut pane = self.resources_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.resources_pane = pane;
-        } else if let Some(dialog) = self.quick_dialog.as_ref() {
-            dialog.render(frame, rects.body);
-        } else if self.context_pane.is_some() {
-            // Same take/render/restore as the other panes. Renders into
-            // `rects.body` so the fixed chrome (cwd + git branch + context
-            // + active agent) stays visible — the overlay is a view, not a
-            // chrome change.
-            let mut pane = self.context_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.context_pane = pane;
-        } else if self.notes_pane.is_some() {
-            // `/scratchpad`. Same take/render/restore as the other
-            // panes. Renders into `rects.body` so the fixed chrome stays
-            // visible — the overlay is a view, not a chrome change.
-            let mut pane = self.notes_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.notes_pane = pane;
-        } else if self.diff_pane.is_some() {
-            // `/diff`. Same take/render/restore as the other panes. Renders
-            // into `rects.body` so the fixed chrome (cwd + git branch +
-            // context + active agent) stays visible — the overlay is a view,
-            // not a chrome change.
-            let mut pane = self.diff_pane.take();
-            if let Some(p) = pane.as_mut() {
-                p.render(frame, rects.body);
-            }
-            self.diff_pane = pane;
         } else {
-            // Carve the body for an embedded pane (GOALS §1i) when one
-            // is open: fullscreen fills the body, splits divide it. The
-            // chat history renders into whatever's left (or nowhere when
-            // fullscreen). Returns the chat rect, or `None` if hidden.
-            let chat_rect = self.render_pane(frame, rects.body);
-            match chat_rect {
-                Some(chat) => self.render_history(frame, chat),
-                None => self.chat_area = None,
-            }
-            if geom.indicator > 0 {
-                self.render_status_indicator(frame, rects.indicator);
-            }
-            let cursor_pos = self.render_input(frame, rects.input);
-            if geom.queue > 0 {
-                self.render_queue(frame, rects.queue);
-            }
-            if geom.popup > 0 {
-                self.render_popup(frame, rects.popup);
-            }
-            // Below-input pin-count indicator (`pinned-messages`). Only
-            // shown when the session has ≥1 pin (geometry gives it a row).
-            if geom.pins > 0 {
-                self.render_pins_indicator(frame, rects.pins);
-            }
-            // Persistent below-input sandbox-down notice (§6.5). Shown while
-            // the shell sandbox can't initialize; geometry gives it rows.
-            // Persistent — it does not time out like a toast.
-            if geom.sandbox_notice > 0 {
-                self.render_sandbox_notice(frame, rects.sandbox_notice);
-            }
-            // Park the real cursor: in the focused pane (when the child
-            // shows one), otherwise in the composer.
-            if self.pane.is_some() && self.pane_focused {
-                if let (Some(rect), Some(pane)) = (self.pane_rect, self.pane.as_ref())
-                    && let Some((x, y)) = pane.cursor_in(rect)
-                {
-                    frame.set_cursor_position(Position::new(x, y));
+            let overlay = std::mem::take(&mut self.overlay);
+            match overlay {
+                Overlay::ModelPicker(mut picker) => {
+                    picker.render(frame, rects.body);
+                    self.overlay = Overlay::ModelPicker(picker);
                 }
-            } else {
-                frame.set_cursor_position(cursor_pos);
+                Overlay::Multireview(dialog) => {
+                    dialog.render(frame, rects.body);
+                    self.overlay = Overlay::Multireview(dialog);
+                }
+                other if self.footer_agent_picker.is_some() => {
+                    self.overlay = other;
+                    self.render_footer_agent_picker(frame, rects.body);
+                }
+                other if self.footer_mode_picker.is_some() => {
+                    self.overlay = other;
+                    self.render_footer_mode_picker(frame, rects.body);
+                }
+                Overlay::Stats(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Stats(pane);
+                }
+                Overlay::Usage(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Usage(pane);
+                }
+                Overlay::Sessions(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Sessions(pane);
+                }
+                Overlay::Skills(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Skills(pane);
+                }
+                Overlay::Permissions(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Permissions(pane);
+                }
+                Overlay::Resources(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Resources(pane);
+                }
+                Overlay::Quick(dialog) => {
+                    dialog.render(frame, rects.body);
+                    self.overlay = Overlay::Quick(dialog);
+                }
+                Overlay::Context(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Context(pane);
+                }
+                Overlay::Notes(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Notes(pane);
+                }
+                Overlay::Diff(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Diff(pane);
+                }
+                Overlay::None => {
+                    // Carve the body for an embedded pane (GOALS §1i) when one
+                    // is open: fullscreen fills the body, splits divide it. The
+                    // chat history renders into whatever's left (or nowhere when
+                    // fullscreen). Returns the chat rect, or `None` if hidden.
+                    let chat_rect = self.render_pane(frame, rects.body);
+                    match chat_rect {
+                        Some(chat) => self.render_history(frame, chat),
+                        None => self.chat_area = None,
+                    }
+                    if geom.indicator > 0 {
+                        self.render_status_indicator(frame, rects.indicator);
+                    }
+                    let cursor_pos = self.render_input(frame, rects.input);
+                    if geom.queue > 0 {
+                        self.render_queue(frame, rects.queue);
+                    }
+                    if geom.popup > 0 {
+                        self.render_popup(frame, rects.popup);
+                    }
+                    // Below-input pin-count indicator (`pinned-messages`). Only
+                    // shown when the session has ≥1 pin (geometry gives it a row).
+                    if geom.pins > 0 {
+                        self.render_pins_indicator(frame, rects.pins);
+                    }
+                    // Persistent below-input sandbox-down notice (§6.5). Shown while
+                    // the shell sandbox can't initialize; geometry gives it rows.
+                    // Persistent — it does not time out like a toast.
+                    if geom.sandbox_notice > 0 {
+                        self.render_sandbox_notice(frame, rects.sandbox_notice);
+                    }
+                    // Park the real cursor: in the focused pane (when the child
+                    // shows one), otherwise in the composer.
+                    if self.pane.is_some() && self.pane_focused {
+                        if let (Some(rect), Some(pane)) = (self.pane_rect, self.pane.as_ref())
+                            && let Some((x, y)) = pane.cursor_in(rect)
+                        {
+                            frame.set_cursor_position(Position::new(x, y));
+                        }
+                    } else {
+                        frame.set_cursor_position(cursor_pos);
+                    }
+                }
             }
         }
         self.render_status(frame, rects.status);

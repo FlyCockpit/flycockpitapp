@@ -938,6 +938,85 @@ pub(super) struct PendingResumeRepair {
     pub(super) state: crate::daemon::proto::ResumeRepairState,
 }
 
+#[derive(Default)]
+pub(super) enum Overlay {
+    #[default]
+    None,
+    ModelPicker(crate::tui::model_picker::ModelPickerDialog),
+    Multireview(crate::tui::multireview_dialog::MultireviewDialog),
+    Stats(crate::tui::stats_pane::StatsPane),
+    Usage(crate::tui::usage_pane::UsagePane),
+    Sessions(crate::tui::sessions_pane::SessionsPane),
+    Skills(crate::tui::skills_pane::SkillsPane),
+    Permissions(crate::tui::permissions_pane::PermissionsPane),
+    Resources(crate::tui::resources_pane::ResourcesPane),
+    Quick(crate::tui::quick_dialog::QuickDialog),
+    Context(crate::tui::context_pane::ContextPane),
+    Notes(crate::tui::notes_pane::NotesPane),
+    Diff(crate::tui::diff_pane::DiffPane),
+}
+
+impl Overlay {
+    pub(super) fn is_open(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(super) fn dialog_height(&self) -> u16 {
+        match self {
+            Self::ModelPicker(_) => crate::tui::model_picker::DIALOG_HEIGHT,
+            Self::Quick(_) => 14,
+            Self::Multireview(_) => crate::tui::multireview_dialog::DIALOG_HEIGHT,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn key_context(&self) -> Option<crate::tui::keys_overlay::KeyContext> {
+        use crate::tui::keys_overlay::KeyContext;
+        match self {
+            Self::None => None,
+            Self::ModelPicker(_) => Some(KeyContext::ModelPicker),
+            Self::Multireview(_) => Some(KeyContext::Settings),
+            Self::Sessions(_) => Some(KeyContext::Sessions),
+            Self::Permissions(_) => Some(KeyContext::Permissions),
+            Self::Resources(_) => Some(KeyContext::Resources),
+            Self::Quick(_) => Some(KeyContext::QuickSettings),
+            Self::Notes(_) => Some(KeyContext::Scratchpad),
+            Self::Diff(_) => Some(KeyContext::Diff),
+            Self::Stats(_) | Self::Usage(_) | Self::Skills(_) | Self::Context(_) => None,
+        }
+    }
+}
+
+pub(super) enum LocalChoice {
+    Init(PendingInit),
+    PausedWork(PendingPausedWork),
+    ResumeRepair(PendingResumeRepair),
+    RedactionToggle(uuid::Uuid),
+    ModelComparison(uuid::Uuid),
+}
+
+impl LocalChoice {
+    fn interrupt_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Init(pending) => pending.interrupt_id,
+            Self::PausedWork(pending) => pending.interrupt_id,
+            Self::ResumeRepair(pending) => pending.interrupt_id,
+            Self::RedactionToggle(interrupt_id) | Self::ModelComparison(interrupt_id) => {
+                *interrupt_id
+            }
+        }
+    }
+
+    fn is_multi(&self) -> bool {
+        matches!(self, Self::RedactionToggle(_) | Self::ModelComparison(_))
+    }
+}
+
+pub(super) enum LocalChoiceSelection {
+    Single(Option<String>),
+    Multi(Option<Vec<String>>),
+}
+
 /// An open `/side` side conversation. Created when `/side` forks the main
 /// session into an ephemeral throwaway and switches the TUI onto it; the
 /// snapshot is everything needed to restore the **main** session exactly
@@ -1301,54 +1380,10 @@ pub struct App {
     /// per tick.
     pub(super) repo_status: Arc<Mutex<Option<RepoStatus>>>,
     pub(super) dialog: Dialog,
-    /// `/model` picker. Mutually exclusive with `dialog` (we never show
-    /// both); kept separate so the picker doesn't clutter the settings
-    /// state machine.
-    pub(super) model_picker: Option<crate::tui::model_picker::ModelPickerDialog>,
-    pub(super) multireview_dialog: Option<crate::tui::multireview_dialog::MultireviewDialog>,
-    /// `/stats` pane (GOALS §15). A full-body interactive overlay over
-    /// the part-1 roll-up layer; `None` when closed. Routed input/render
-    /// alongside `dialog` / `model_picker`.
-    pub(super) stats_pane: Option<crate::tui::stats_pane::StatsPane>,
-    /// `/usage` pane — vendor subscription limits/quota snapshots. Fetches
-    /// asynchronously and never enters outbound model context.
-    pub(super) usage_pane: Option<crate::tui::usage_pane::UsagePane>,
-    /// `/sessions` + `/resume` browser pane (GOALS §17f). A full-body
-    /// overlay; `None` when closed. Routed input/render alongside
-    /// `stats_pane`. Enter resumes the highlighted session via the
-    /// existing `attach_to_session` path.
-    pub(super) sessions_pane: Option<crate::tui::sessions_pane::SessionsPane>,
-    /// `/skills` pane — a read-only overlay listing every discovered
-    /// skill (name + description + source). `None` when closed. Routed
-    /// input/render alongside `stats_pane` / `sessions_pane`.
-    pub(super) skills_pane: Option<crate::tui::skills_pane::SkillsPane>,
-    /// `/permissions` pane — view + delete persisted command/path/loop
-    /// approvals across the project and global file scopes. `None` when
-    /// closed. Routed input/render alongside the other panes; the one
-    /// mutating action (delete) rewrites the backing `approvals.json` via
-    /// the approval store's load→mutate→atomic-store path.
-    pub(super) permissions_pane: Option<crate::tui::permissions_pane::PermissionsPane>,
-    /// `/resources` pane — read the daemon-wide resource scheduler and
-    /// promote queued requests through the daemon authority.
-    pub(super) resources_pane: Option<crate::tui::resources_pane::ResourcesPane>,
-    /// `/quick` session settings dialog. Stages session-only settings locally
-    /// and applies them only on Enter.
-    pub(super) quick_dialog: Option<crate::tui::quick_dialog::QuickDialog>,
-    /// `/context` overlay — a read-only, dismissable snapshot of the live
-    /// context-window composition (colored per-category bar + legend).
-    /// `None` when closed. Routed input/render alongside the other panes;
-    /// the snapshot is captured once at open (not live-updating).
-    pub(super) context_pane: Option<crate::tui::context_pane::ContextPane>,
-    /// `/scratchpad` pane (prompt `notes-scratchpad.md`) — a floating, project-
-    /// scoped markdown scratchpad. `None` when closed. Routed input/render
-    /// alongside the other panes. Scratchpad notes are TUI/DB state only and
-    /// never enter any outbound model prompt.
-    pub(super) notes_pane: Option<crate::tui::notes_pane::NotesPane>,
-    /// `/diff` pane — a read-only, full-body multi-file diff browser
-    /// (worktree / staged / last-edit sources). `None` when closed. Routed
-    /// input/render alongside the other panes. Diff content is user-facing
-    /// TUI state only and never enters any outbound model prompt.
-    pub(super) diff_pane: Option<crate::tui::diff_pane::DiffPane>,
+    /// User-opened modal/pane overlays. Required prompts (`daemon_prompt` and
+    /// `question_dialog`) stay separate so they can shadow and resume this
+    /// state without destroying the user's underlying overlay.
+    pub(super) overlay: Overlay,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
@@ -1377,11 +1412,7 @@ pub struct App {
     /// dialog open at that moment is this local prompt (not a daemon
     /// interrupt), so its close resolves here instead of going back to the
     /// daemon. `None` whenever no `/init` choice is pending.
-    pub(super) pending_init: Option<PendingInit>,
-    /// Reattach resume/cancel choice for daemon-paused work.
-    pub(super) pending_paused_work: Option<PendingPausedWork>,
-    /// Reattach read-only/fork/export/cancel choice for Responses repair.
-    pub(super) pending_resume_repair: Option<PendingResumeRepair>,
+    pub(super) pending_local_choice: Option<LocalChoice>,
     /// True after we've successfully connected to (or started) the daemon.
     pub(super) daemon_connected: bool,
     /// Daemonless mode (`DaemonChoice::ContinueWithout`): this TUI owns its
@@ -1829,9 +1860,6 @@ pub struct App {
     /// session-approved gitignored entries. In-memory — resets on TUI restart;
     /// never persisted.
     pub(super) gitignore_session_allow: Vec<String>,
-    /// The bare-`/toggle-redaction` multiselect dialog's synthetic interrupt
-    /// id, while open. Resolved locally (no daemon round-trip) like `/init`.
-    pub(super) pending_redaction_toggle: Option<uuid::Uuid>,
     /// Session-only model-comparison tandem (shadow) set
     /// (`/model-comparison`, implementation note) —
     /// the `provider/model` labels currently selected. Pushed by the daemon
@@ -1839,10 +1867,6 @@ pub struct App {
     /// Pre-checks the `/model-comparison` multiselect. In-memory; resets on TUI
     /// restart (empty = feature off).
     pub(super) tandem_models: Vec<String>,
-    /// The `/model-comparison` multiselect dialog's synthetic interrupt id,
-    /// while open. Resolved locally (no daemon round-trip) like the bare
-    /// `/toggle-redaction` picker.
-    pub(super) pending_tandem_select: Option<uuid::Uuid>,
     /// Row-index → `(provider, model)` mapping for the open `/model-comparison`
     /// multiselect, so the close handler resolves checked row ids back to pairs
     /// (model ids can contain `/`, so the label isn't a safe key). Taken on
@@ -2700,24 +2724,11 @@ impl App {
             reconnect: None,
             repo_status,
             dialog: Dialog::None,
-            model_picker: None,
-            multireview_dialog: None,
-            stats_pane: None,
-            usage_pane: None,
-            notes_pane: None,
-            sessions_pane: None,
-            skills_pane: None,
-            permissions_pane: None,
-            resources_pane: None,
-            quick_dialog: None,
-            context_pane: None,
-            diff_pane: None,
+            overlay: Overlay::None,
             daemon_prompt,
             question_dialog: None,
             composer_active_since_dialog: true,
-            pending_init: None,
-            pending_paused_work: None,
-            pending_resume_repair: None,
+            pending_local_choice: None,
             daemon_connected,
             daemonless: false,
             daemon_guard: None,
@@ -2832,9 +2843,7 @@ impl App {
             delegation_recursion_enabled,
             delegation_recursion_depth,
             gitignore_session_allow: Vec::new(),
-            pending_redaction_toggle: None,
             tandem_models: Vec::new(),
-            pending_tandem_select: None,
             pending_tandem_options: Vec::new(),
             org_sync_disclosure,
             connector_disclosure,
@@ -2966,12 +2975,8 @@ impl App {
             crate::tui::daemon_prompt::DIALOG_HEIGHT
         } else if self.dialog.is_active() {
             settings::DIALOG_HEIGHT
-        } else if self.model_picker.is_some() {
-            crate::tui::model_picker::DIALOG_HEIGHT
-        } else if self.quick_dialog.is_some() {
-            14
-        } else if self.multireview_dialog.is_some() {
-            crate::tui::multireview_dialog::DIALOG_HEIGHT
+        } else if self.overlay.dialog_height() > 0 {
+            self.overlay.dialog_height()
         } else if self.footer_agent_picker.is_some() {
             footer_agent_picker_height(self.footer_agent_picker.as_ref())
         } else if self.footer_mode_picker.is_some() {
@@ -3669,7 +3674,7 @@ impl App {
     fn apply_async_action_result(&mut self, result: AsyncActionResult) {
         match result.kind {
             AsyncActionKind::DaemonRpc("sessions.list") => {
-                if let Some(pane) = self.sessions_pane.as_mut() {
+                if let Overlay::Sessions(pane) = &mut self.overlay {
                     let payload = match result.payload {
                         Ok(AsyncActionPayload::Sessions(sessions)) => Ok(sessions),
                         Ok(_) => Err("unexpected daemon response".to_string()),
@@ -3682,7 +3687,7 @@ impl App {
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.live") => {
-                if let Some(pane) = self.sessions_pane.as_mut()
+                if let Overlay::Sessions(pane) = &mut self.overlay
                     && let Ok(AsyncActionPayload::SessionLiveStatus(live)) = result.payload
                 {
                     pane.apply_live_status(live);
@@ -3718,15 +3723,15 @@ impl App {
             }
             AsyncActionKind::Refresh("provider.usage") => match result.payload {
                 Ok(AsyncActionPayload::ProviderUsage(rows)) => {
-                    self.usage_pane = Some(crate::tui::usage_pane::UsagePane::open(rows));
+                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::open(rows));
                 }
                 Ok(_) => {
-                    self.usage_pane = Some(crate::tui::usage_pane::UsagePane::error(
+                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::error(
                         "unexpected usage response".to_string(),
                     ));
                 }
                 Err(e) => {
-                    self.usage_pane = Some(crate::tui::usage_pane::UsagePane::error(e));
+                    self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::error(e));
                 }
             },
             AsyncActionKind::Internal("paste.token_count") => match result.payload {
@@ -3741,7 +3746,7 @@ impl App {
                 }
             },
             AsyncActionKind::DaemonRpc("resources.snapshot") => {
-                if let Some(pane) = self.resources_pane.as_mut() {
+                if let Overlay::Resources(pane) = &mut self.overlay {
                     let payload = match result.payload {
                         Ok(AsyncActionPayload::ResourceSnapshot(snapshot)) => Ok(snapshot),
                         Ok(_) => Err("unexpected daemon response".to_string()),
@@ -3756,7 +3761,7 @@ impl App {
                     message,
                     snapshot,
                 }) => {
-                    if let Some(pane) = self.resources_pane.as_mut() {
+                    if let Overlay::Resources(pane) = &mut self.overlay {
                         pane.apply_snapshot_result(Ok(snapshot));
                     }
                     let kind = match status {
@@ -4059,7 +4064,7 @@ impl App {
         outcome: crate::tui::resources_pane::ResourcesOutcome,
     ) {
         match outcome {
-            crate::tui::resources_pane::ResourcesOutcome::Close => self.resources_pane = None,
+            crate::tui::resources_pane::ResourcesOutcome::Close => self.overlay = Overlay::None,
             crate::tui::resources_pane::ResourcesOutcome::Refresh => {
                 self.start_resources_snapshot_action();
             }
@@ -4070,7 +4075,7 @@ impl App {
     }
 
     pub(super) fn start_sessions_list_action(&mut self) {
-        let Some(pane) = self.sessions_pane.as_ref() else {
+        let Overlay::Sessions(pane) = &self.overlay else {
             return;
         };
         let (project_id, parent) = pane.root_request();
@@ -4099,7 +4104,7 @@ impl App {
     fn start_provider_usage_action(&mut self, args: String) {
         let filter = args.split_whitespace().next().map(str::to_string);
         let cwd = self.launch.cwd.clone();
-        self.usage_pane = Some(crate::tui::usage_pane::UsagePane::loading());
+        self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::loading());
         self.async_actions.start(
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
@@ -4596,10 +4601,7 @@ impl App {
     /// chosen option id (or `None` on Esc/cancel). Update/overwrite
     /// dispatch the corresponding agent turn; cancel leaves the file
     /// untouched.
-    pub(super) fn resolve_init_choice(&mut self, selected_id: Option<&str>) {
-        let Some(pending) = self.pending_init.take() else {
-            return;
-        };
+    fn resolve_init_choice(&mut self, pending: PendingInit, selected_id: Option<&str>) {
         let mode = match selected_id {
             Some("update") => crate::commands::init::InitMode::Update,
             Some("overwrite") => crate::commands::init::InitMode::Overwrite,
@@ -4613,6 +4615,54 @@ impl App {
         };
         let prompt = crate::commands::init::build_init_prompt(&pending.display, mode);
         self.dispatch_init_turn(&pending.display, prompt);
+    }
+
+    pub(super) fn pending_local_choice_matches(&self, interrupt_id: uuid::Uuid) -> bool {
+        self.pending_local_choice
+            .as_ref()
+            .is_some_and(|choice| choice.interrupt_id() == interrupt_id)
+    }
+
+    pub(super) fn pending_local_choice_is_multi(&self) -> bool {
+        self.pending_local_choice
+            .as_ref()
+            .is_some_and(LocalChoice::is_multi)
+    }
+
+    pub(super) fn resolve_local_choice(&mut self, selection: LocalChoiceSelection) {
+        match self.pending_local_choice.take() {
+            Some(LocalChoice::Init(pending)) => {
+                let LocalChoiceSelection::Single(selected) = selection else {
+                    return;
+                };
+                self.resolve_init_choice(pending, selected.as_deref());
+            }
+            Some(LocalChoice::PausedWork(pending)) => {
+                let LocalChoiceSelection::Single(selected) = selection else {
+                    return;
+                };
+                self.resolve_paused_work_choice(pending, selected.as_deref());
+            }
+            Some(LocalChoice::ResumeRepair(pending)) => {
+                let LocalChoiceSelection::Single(selected) = selection else {
+                    return;
+                };
+                self.resolve_resume_repair_choice(pending, selected.as_deref());
+            }
+            Some(LocalChoice::RedactionToggle(_)) => {
+                let LocalChoiceSelection::Multi(selected) = selection else {
+                    return;
+                };
+                self.resolve_redaction_toggle(selected.as_deref());
+            }
+            Some(LocalChoice::ModelComparison(_)) => {
+                let LocalChoiceSelection::Multi(selected) = selection else {
+                    return;
+                };
+                self.resolve_model_comparison_select(selected.as_deref());
+            }
+            None => {}
+        }
     }
 
     /// Send an `/init` turn to the agent: render `/init <target>` as the
@@ -4719,10 +4769,11 @@ impl App {
         });
     }
 
-    pub(super) fn resolve_paused_work_choice(&mut self, selected_id: Option<&str>) {
-        let Some(pending) = self.pending_paused_work.take() else {
-            return;
-        };
+    fn resolve_paused_work_choice(
+        &mut self,
+        pending: PendingPausedWork,
+        selected_id: Option<&str>,
+    ) {
         let request = match selected_id {
             Some("resume") => {
                 self.push_plain("/resume: resuming paused daemon work.".to_string());
@@ -5210,7 +5261,7 @@ impl App {
             &self.usage_models,
         ) {
             Ok(picker) => {
-                self.model_picker = Some(picker);
+                self.overlay = Overlay::ModelPicker(picker);
             }
             Err(e) => {
                 self.push_plain(format!("/model: {e}"));
@@ -5219,7 +5270,7 @@ impl App {
     }
 
     pub(super) fn close_model_picker(&mut self, accepted: bool) {
-        self.model_picker = None;
+        self.overlay = Overlay::None;
         self.reload_launch_info();
         if accepted && let Some((p, m)) = self.launch.active_model.clone() {
             self.notify_active_model_selected(p, m);
@@ -5286,7 +5337,7 @@ impl App {
         self.footer_selection = None;
         self.footer_agent_picker = None;
         self.footer_mode_picker = None;
-        self.quick_dialog = Some(crate::tui::quick_dialog::QuickDialog::open(current, models));
+        self.overlay = Overlay::Quick(crate::tui::quick_dialog::QuickDialog::open(current, models));
     }
 
     pub(super) fn apply_quick_commit(&mut self, commit: crate::tui::quick_dialog::QuickCommit) {
@@ -5645,10 +5696,10 @@ impl App {
                 sandbox_escalation: None,
             }],
         };
-        self.pending_paused_work = Some(PendingPausedWork {
+        self.pending_local_choice = Some(LocalChoice::PausedWork(PendingPausedWork {
             interrupt_id,
             session_id,
-        });
+        }));
         self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
             interrupt_id,
             String::new(),
@@ -5714,10 +5765,10 @@ impl App {
                 sandbox_escalation: None,
             }],
         };
-        self.pending_resume_repair = Some(PendingResumeRepair {
+        self.pending_local_choice = Some(LocalChoice::ResumeRepair(PendingResumeRepair {
             interrupt_id,
             state,
-        });
+        }));
         self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
             interrupt_id,
             String::new(),
@@ -5726,10 +5777,11 @@ impl App {
         ));
     }
 
-    pub(super) fn resolve_resume_repair_choice(&mut self, selected_id: Option<&str>) {
-        let Some(pending) = self.pending_resume_repair.take() else {
-            return;
-        };
+    fn resolve_resume_repair_choice(
+        &mut self,
+        pending: PendingResumeRepair,
+        selected_id: Option<&str>,
+    ) {
         match selected_id {
             Some("fork") => {
                 let Some(seq) = pending.state.safe_last_turn_seq else {
@@ -6117,7 +6169,7 @@ impl App {
             preselected.push(REDACT_OPT_SSH.into());
         }
         let lockout = self.dialog_lockout();
-        self.pending_redaction_toggle = Some(interrupt_id);
+        self.pending_local_choice = Some(LocalChoice::RedactionToggle(interrupt_id));
         self.question_dialog = Some(
             crate::tui::dialog::question::QuestionDialog::with_preselected(
                 interrupt_id,
@@ -6134,7 +6186,6 @@ impl App {
     /// leaves the state untouched. Applies the selection by sending the
     /// resulting per-source booleans to the daemon.
     pub(super) fn resolve_redaction_toggle(&mut self, selected_ids: Option<&[String]>) {
-        self.pending_redaction_toggle = None;
         let Some(ids) = selected_ids else {
             return;
         };
@@ -6221,7 +6272,7 @@ impl App {
             }],
         };
         let lockout = self.dialog_lockout();
-        self.pending_tandem_select = Some(interrupt_id);
+        self.pending_local_choice = Some(LocalChoice::ModelComparison(interrupt_id));
         self.pending_tandem_options = pairs;
         self.question_dialog = Some(
             crate::tui::dialog::question::QuestionDialog::with_preselected(
@@ -6241,7 +6292,6 @@ impl App {
     /// tandem models + routes them to the driver and broadcasts the resulting
     /// state (+ token-burn warning). Empty = feature off.
     pub(super) fn resolve_model_comparison_select(&mut self, selected_ids: Option<&[String]>) {
-        self.pending_tandem_select = None;
         let options = std::mem::take(&mut self.pending_tandem_options);
         let Some(ids) = selected_ids else {
             return;
@@ -6969,7 +7019,7 @@ impl App {
     /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
     /// composer's vim setting so vim users get vim editing in their scratchpad.
     pub(super) fn open_scratchpad_pane(&mut self) {
-        self.notes_pane = Some(crate::tui::notes_pane::NotesPane::open(
+        self.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::open(
             &self.launch.cwd,
             self.composer.vim_enabled(),
         ));
@@ -7001,22 +7051,8 @@ impl App {
             }
         } else if self.dialog.is_active() {
             KeyContext::Settings
-        } else if self.model_picker.is_some() {
-            KeyContext::ModelPicker
-        } else if self.multireview_dialog.is_some() {
-            KeyContext::Settings
-        } else if self.sessions_pane.is_some() {
-            KeyContext::Sessions
-        } else if self.permissions_pane.is_some() {
-            KeyContext::Permissions
-        } else if self.resources_pane.is_some() {
-            KeyContext::Resources
-        } else if self.quick_dialog.is_some() {
-            KeyContext::QuickSettings
-        } else if self.notes_pane.is_some() {
-            KeyContext::Scratchpad
-        } else if self.diff_pane.is_some() {
-            KeyContext::Diff
+        } else if let Some(context) = self.overlay.key_context() {
+            context
         } else if self.pins_review.is_some()
             || self.pin_pick.is_some()
             || self.fork_pick.is_some()
@@ -10065,7 +10101,7 @@ mod ctrl_c_tests {
 
     #[test]
     fn bare_note_shows_usage_only() {
-        use super::{App, HistoryEntry};
+        use super::{App, HistoryEntry, Overlay};
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
 
@@ -10073,7 +10109,7 @@ mod ctrl_c_tests {
         app.handle_note_command("   ");
 
         assert!(
-            app.notes_pane.is_none(),
+            !matches!(app.overlay, Overlay::Notes(_)),
             "bare /note never opens scratchpad"
         );
         let usage: Vec<&String> = app
@@ -11219,7 +11255,7 @@ mod reasoning_toggle_key_tests {
 
 #[cfg(test)]
 mod keys_overlay_tests {
-    use super::{App, HistoryEntry, SLASH_COMMANDS, SideConversation, input};
+    use super::{App, HistoryEntry, Overlay, SLASH_COMMANDS, SideConversation, input};
     use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crate::tui::keys_overlay::KeyContext;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -11316,6 +11352,24 @@ mod keys_overlay_tests {
         )
     }
 
+    #[test]
+    fn question_dialog_shadows_and_resumes_an_open_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+            &app.launch.cwd,
+            false,
+        ));
+
+        assert_eq!(app.key_context(), KeyContext::Sessions);
+        app.question_dialog = Some(single_question_dialog());
+        assert_eq!(app.key_context(), KeyContext::QuestionDialog);
+
+        app.question_dialog = None;
+        assert_eq!(app.key_context(), KeyContext::Sessions);
+        assert!(matches!(app.overlay, Overlay::Sessions(_)));
+    }
+
     /// The leader (`Ctrl+K`) in the main chat opens the overlay in the
     /// composer context; pressing it again closes it (toggle), focus unchanged.
     #[test]
@@ -11348,7 +11402,7 @@ mod keys_overlay_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = configured_app(&tmp);
 
-        app.sessions_pane = Some(crate::tui::sessions_pane::SessionsPane::open(
+        app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
             &app.launch.cwd,
             false,
         ));
@@ -11356,14 +11410,14 @@ mod keys_overlay_tests {
         let overlay = app.keys_overlay.as_ref().expect("leader opens over a pane");
         assert_eq!(overlay.context(), KeyContext::Sessions);
         // The pane stays open underneath (the overlay is on top, not a swap).
-        assert!(app.sessions_pane.is_some());
+        assert!(matches!(app.overlay, Overlay::Sessions(_)));
     }
 
     #[test]
     fn leader_with_diff_pane_open_shows_diff_context() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = configured_app(&tmp);
-        app.diff_pane = Some(crate::tui::diff_pane::DiffPane::open(
+        app.overlay = Overlay::Diff(crate::tui::diff_pane::DiffPane::open(
             crate::tui::diff_pane::DiffSource::Last,
             tmp.path(),
             &[],
@@ -11374,7 +11428,7 @@ mod keys_overlay_tests {
 
         let overlay = app.keys_overlay.as_ref().expect("leader opens over diff");
         assert_eq!(overlay.context(), KeyContext::Diff);
-        assert!(app.diff_pane.is_some());
+        assert!(matches!(app.overlay, Overlay::Diff(_)));
     }
 
     /// While a slash query is typed, the leader shows the slash-menu context.
@@ -11606,7 +11660,7 @@ mod keys_overlay_tests {
 
 #[cfg(test)]
 mod model_picker_input_tests {
-    use super::{App, HistoryEntry};
+    use super::{App, HistoryEntry, Overlay};
     use crate::config::providers::ConfigDoc;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::fs;
@@ -11643,7 +11697,7 @@ mod model_picker_input_tests {
 
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
-        app.model_picker = Some(
+        app.overlay = Overlay::ModelPicker(
             crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
                 .expect("model picker opens from valid config"),
         );
@@ -11654,7 +11708,9 @@ mod model_picker_input_tests {
         let exit = app.handle_key(press(KeyCode::Enter));
 
         assert!(!exit);
-        let picker = app.model_picker.as_ref().expect("picker remains open");
+        let Overlay::ModelPicker(picker) = &app.overlay else {
+            panic!("picker remains open");
+        };
         assert!(!picker.is_done());
         assert_eq!(app.history.len(), history_len);
         assert_eq!(app.pending_usage.len(), usage_len);
@@ -11672,7 +11728,7 @@ mod model_picker_input_tests {
 
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
-        app.model_picker = Some(
+        app.overlay = Overlay::ModelPicker(
             crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
                 .expect("model picker opens from valid config"),
         );
@@ -11681,9 +11737,12 @@ mod model_picker_input_tests {
 
         assert!(!exit);
         assert!(
-            app.model_picker.is_none(),
+            !matches!(app.overlay, Overlay::ModelPicker(_)),
             "picker stayed open with error {:?}",
-            app.model_picker.as_ref().and_then(|p| p.error_text())
+            match &app.overlay {
+                Overlay::ModelPicker(picker) => picker.error_text(),
+                _ => None,
+            }
         );
         assert_eq!(app.usage_models.get("p/a"), Some(&1));
         assert!(
@@ -11705,7 +11764,7 @@ mod model_picker_input_tests {
 mod footer_selector_tests {
     use super::{
         App, FooterAgentPicker, FooterHitArea, FooterModePicker, FooterPickerKind,
-        FooterPickerRowHit, HistoryEntry,
+        FooterPickerRowHit, HistoryEntry, Overlay,
     };
     use crate::config::extended::LlmMode;
     use crate::daemon::proto::Request;
@@ -11835,14 +11894,14 @@ mod footer_selector_tests {
         app.footer_selection = Some(crate::tui::chrome::FooterControl::Agent);
         app.handle_key(press(KeyCode::Enter));
         assert!(app.footer_agent_picker.is_some());
-        assert!(app.model_picker.is_none());
+        assert!(!matches!(app.overlay, Overlay::ModelPicker(_)));
 
         app.footer_agent_picker = None;
         app.footer_selection = Some(crate::tui::chrome::FooterControl::Model);
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.model_picker.is_some());
+        assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
 
-        app.model_picker = None;
+        app.overlay = Overlay::None;
         app.footer_selection = Some(crate::tui::chrome::FooterControl::Mode);
         app.handle_key(press(KeyCode::Enter));
         assert!(app.footer_mode_picker.is_some());
@@ -11858,7 +11917,7 @@ mod footer_selector_tests {
         let before = fs::read_to_string(&config_path).unwrap();
 
         app.open_quick_dialog();
-        assert!(app.quick_dialog.is_some());
+        assert!(matches!(app.overlay, Overlay::Quick(_)));
 
         // Mode tab opens on the current defensive row. Move to normal and
         // stage it locally; no request should be sent until Enter.
@@ -11868,10 +11927,16 @@ mod footer_selector_tests {
             rx.try_recv().is_err(),
             "Space must not send daemon requests"
         );
-        assert!(app.quick_dialog.is_some(), "Space keeps the dialog open");
+        assert!(
+            matches!(app.overlay, Overlay::Quick(_)),
+            "Space keeps the dialog open"
+        );
 
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.quick_dialog.is_none(), "Enter closes after commit");
+        assert!(
+            !matches!(app.overlay, Overlay::Quick(_)),
+            "Enter closes after commit"
+        );
         match rx.try_recv().expect("quick commit sends a request") {
             Request::SetSessionLlmMode { mode } => {
                 assert_eq!(mode, crate::config::extended::LlmMode::Normal);

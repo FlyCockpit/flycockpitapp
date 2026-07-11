@@ -56,7 +56,7 @@ impl App {
         }
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(picker) = self.model_picker.as_mut()
+            && let Overlay::ModelPicker(picker) = &mut self.overlay
         {
             let should_close = picker.handle_mouse_row(mouse.row);
             if should_close {
@@ -98,70 +98,62 @@ impl App {
             }
             return;
         }
-        // `/stats` pane is a full-body overlay: wheel scrolls it, every
-        // other mouse event is eaten so nothing reaches the chat
-        // underneath. Ahead of the embedded-pane / chat handlers.
-        if let Some(pane) = self.stats_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
+        match &mut self.overlay {
+            Overlay::Stats(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
             }
-            return;
-        }
-        if let Some(pane) = self.sessions_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
+            Overlay::Sessions(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
             }
-            return;
-        }
-        // `/skills` overlay: same full-body wheel-scroll / eat-everything-
-        // else rule as the other informational panes.
-        if let Some(pane) = self.skills_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
+            Overlay::Skills(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
             }
-            return;
-        }
-        // `/permissions` overlay: same full-body wheel-scroll / eat-
-        // everything-else rule as the other informational panes.
-        if let Some(pane) = self.permissions_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
+            Overlay::Permissions(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
             }
-            return;
-        }
-        // `/context` overlay: a fixed-size snapshot (no scroll), so just
-        // eat every mouse event while it's open so nothing reaches the
-        // chat underneath.
-        if self.context_pane.is_some() {
-            return;
-        }
-        // `/scratchpad`: wheel scrolls the viewed note; every other
-        // mouse event is eaten so nothing reaches the chat underneath.
-        if let Some(pane) = self.notes_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
+            Overlay::Context(_) => return,
+            Overlay::Notes(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
             }
-            return;
-        }
-        // `/diff` overlay: wheel scrolls the diff body; every other mouse
-        // event is eaten so nothing reaches the chat underneath.
-        if let Some(pane) = self.diff_pane.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(),
-                MouseEventKind::ScrollDown => pane.scroll_down(),
-                _ => {}
+            Overlay::Diff(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
             }
-            return;
+            Overlay::ModelPicker(_)
+            | Overlay::Multireview(_)
+            | Overlay::Usage(_)
+            | Overlay::Resources(_)
+            | Overlay::Quick(_) => return,
+            Overlay::None => {}
         }
         // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
         // focus, and PTY mouse forwarding. Consumes the event when it
@@ -524,16 +516,19 @@ impl App {
             || self.daemon_prompt.is_some()
             || self.context_menu.is_some()
             || self.keys_overlay.is_some()
-            || self.model_picker.is_some()
+            || matches!(self.overlay, Overlay::ModelPicker(_))
             || self.footer_agent_picker.is_some()
             || self.footer_mode_picker.is_some()
-            || self.stats_pane.is_some()
-            || self.sessions_pane.is_some()
-            || self.skills_pane.is_some()
-            || self.permissions_pane.is_some()
-            || self.context_pane.is_some()
-            || self.notes_pane.is_some()
-            || self.diff_pane.is_some()
+            || matches!(
+                self.overlay,
+                Overlay::Stats(_)
+                    | Overlay::Sessions(_)
+                    | Overlay::Skills(_)
+                    | Overlay::Permissions(_)
+                    | Overlay::Context(_)
+                    | Overlay::Notes(_)
+                    | Overlay::Diff(_)
+            )
             || self.pane.is_some()
     }
 

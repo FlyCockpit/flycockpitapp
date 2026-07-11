@@ -3117,3 +3117,454 @@ pub(in crate::engine::driver) fn format_async_delegation_result(
         "children": children,
     }))
 }
+
+pub(in crate::engine::driver) fn stale_handle_error(child_agent: &str) -> String {
+    format!(
+        "Error: no resumable subagent for that `resume_handle` (unknown, expired, \
+         or not re-queryable). Spawn a fresh `{child_agent}` subagent instead (omit \
+         `resume_handle`)."
+    )
+}
+
+/// The footer appended to a re-queryable subagent's report carrying its
+/// follow-up handle (GOALS §3c). Terse + machine-stable so the caller's model
+/// can extract and re-use it.
+pub(in crate::engine::driver) fn handle_footer(handle: &str) -> String {
+    format!("\n\n[follow-up handle: {handle} — pass as `resume_handle` to re-query this subagent]")
+}
+
+/// Run a child agent's loop to completion synchronously. Used for
+/// noninteractive subagents — explore primarily. Drops the child's
+/// per-turn events on the floor (the parent's history already has a
+/// ToolStart/End representing this call); only the final text comes
+/// back. The loop is bounded by the `max_turns` parameter (each role
+/// passes its own named constant — explore/docs-answerer 64, docs
+/// resolver 24) to bound runaway loops; the over-limit error reports
+/// that limit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_noninteractive(
+    child: Agent,
+    brief: String,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
+    cwd: std::path::PathBuf,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
+    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    loop_guard_threshold: u32,
+    max_turns: usize,
+    // Model-comparison tandem (shadow) set, forwarded so the `docs` pipeline's
+    // resolver/answerer turns are shadowed when the feature is on.
+    tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    steer_target: Option<NoninteractiveSteerTarget>,
+) -> Result<String> {
+    // The docs pipeline (the only other caller) neither rehydrates nor
+    // seeds: a fresh transcript, no prior history, and a throwaway seed
+    // collector. It only needs the report text.
+    let out = run_noninteractive_resumable(
+        child,
+        brief,
+        Vec::new(),
+        crate::engine::seed_collector::SeedCollector::new(),
+        session,
+        locks,
+        redact,
+        cwd,
+        interrupts,
+        cancel,
+        approver,
+        resource_scheduler,
+        loop_guard_threshold,
+        max_turns,
+        tandem,
+        event_tx,
+        steer_target,
+    )
+    .await?;
+    Ok(out.report)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NoninteractiveSteerTarget {
+    task_call_id: String,
+    label: String,
+}
+
+impl NoninteractiveSteerTarget {
+    pub(crate) fn new(task_call_id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            task_call_id: task_call_id.into(),
+            label: label.into(),
+        }
+    }
+}
+
+impl NoninteractiveSteerTarget {
+    fn lineage(&self) -> crate::session::SessionEventLineage {
+        crate::session::SessionEventLineage {
+            task_call_id: self.task_call_id.clone(),
+            label: self.label.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingNestedDeltas {
+    assistant: Option<(String, String)>,
+    reasoning: Option<(String, String)>,
+}
+
+impl PendingNestedDeltas {
+    fn push_assistant(&mut self, agent: String, delta: String) {
+        match self.assistant.as_mut() {
+            Some((current_agent, current_delta)) if current_agent == &agent => {
+                current_delta.push_str(&delta);
+            }
+            _ => {
+                self.assistant = Some((agent, delta));
+            }
+        }
+    }
+
+    fn push_reasoning(&mut self, agent: String, delta: String) {
+        match self.reasoning.as_mut() {
+            Some((current_agent, current_delta)) if current_agent == &agent => {
+                current_delta.push_str(&delta);
+            }
+            _ => {
+                self.reasoning = Some((agent, delta));
+            }
+        }
+    }
+
+    fn drain(&mut self) -> Vec<TurnEvent> {
+        let mut out = Vec::new();
+        if let Some((agent, delta)) = self.reasoning.take()
+            && !delta.is_empty()
+        {
+            out.push(TurnEvent::ReasoningDelta { agent, delta });
+        }
+        if let Some((agent, delta)) = self.assistant.take()
+            && !delta.is_empty()
+        {
+            out.push(TurnEvent::AssistantTextDelta { agent, delta });
+        }
+        out
+    }
+}
+
+fn wrap_noninteractive_child_event(
+    target: &NoninteractiveSteerTarget,
+    inner: TurnEvent,
+) -> TurnEvent {
+    TurnEvent::NestedTurn {
+        task_call_id: target.task_call_id.clone(),
+        label: target.label.clone(),
+        parent_task_call_id: None,
+        inner: Box::new(inner),
+    }
+}
+
+async fn send_wrapped_noninteractive_event(
+    tx: &mpsc::Sender<TurnEvent>,
+    target: &NoninteractiveSteerTarget,
+    event: TurnEvent,
+) -> bool {
+    tx.send(wrap_noninteractive_child_event(target, event))
+        .await
+        .is_ok()
+}
+
+async fn flush_nested_deltas(
+    tx: &mpsc::Sender<TurnEvent>,
+    target: &NoninteractiveSteerTarget,
+    pending: &mut PendingNestedDeltas,
+) -> bool {
+    for event in pending.drain() {
+        if !send_wrapped_noninteractive_event(tx, target, event).await {
+            return false;
+        }
+    }
+    true
+}
+
+pub(in crate::engine::driver) fn spawn_noninteractive_event_forwarder(
+    mut rx: mpsc::Receiver<TurnEvent>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    target: Option<NoninteractiveSteerTarget>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (Some(event_tx), Some(target)) = (event_tx, target) else {
+            while rx.recv().await.is_some() {}
+            return;
+        };
+
+        let mut pending = PendingNestedDeltas::default();
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                maybe_event = rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        let _ = flush_nested_deltas(&event_tx, &target, &mut pending).await;
+                        break;
+                    };
+                    match event {
+                        TurnEvent::AssistantTextDelta { agent, delta } => {
+                            pending.push_assistant(agent, delta);
+                        }
+                        TurnEvent::ReasoningDelta { agent, delta } => {
+                            pending.push_reasoning(agent, delta);
+                        }
+                        other => {
+                            if !flush_nested_deltas(&event_tx, &target, &mut pending).await {
+                                break;
+                            }
+                            if !send_wrapped_noninteractive_event(&event_tx, &target, other).await {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    if !flush_nested_deltas(&event_tx, &target, &mut pending).await {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn render_noninteractive_steers(
+    steers: &[crate::db::task_delegations::TaskDelegationSteerRow],
+) -> String {
+    let mut out = String::from("[queued delegation steer]\n");
+    for (idx, steer) in steers.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. from {}: {}\n",
+            idx + 1,
+            steer.origin_principal,
+            steer.body.trim()
+        ));
+    }
+    out.push_str("\nContinue the delegated task, incorporating the queued steer above.");
+    out
+}
+
+/// A finished noninteractive run: the report text plus the full transcript
+/// (so the driver can persist a re-query handle, GOALS §3c).
+pub(crate) struct NoninteractiveOutcome {
+    /// The subagent's final text + any deferred-log section.
+    pub report: String,
+    /// The complete `Vec<Message>` transcript (prior history + this run),
+    /// persisted as a handle for read-only noninteractive subagents in
+    /// normal mode.
+    pub history: Vec<Message>,
+}
+
+#[derive(Debug)]
+pub(crate) struct NoninteractiveRunError {
+    source: anyhow::Error,
+    history: Vec<Message>,
+}
+
+impl NoninteractiveRunError {
+    fn new(source: anyhow::Error, history: Vec<Message>) -> Self {
+        Self { source, history }
+    }
+
+    fn into_parts(self) -> (String, Vec<Message>) {
+        (format!("{:#}", self.source), self.history)
+    }
+}
+
+impl std::fmt::Display for NoninteractiveRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for NoninteractiveRunError {}
+
+/// Run a child agent's loop to completion, optionally **rehydrated** from a
+/// prior transcript (`prior_history`) and collecting any `seed` calls into
+/// `seeds`. Returns the report + the full transcript. [`run_noninteractive`]
+/// is the no-rehydrate, no-seed wrapper used by the `docs` pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_noninteractive_resumable(
+    child: Agent,
+    brief: String,
+    prior_history: Vec<Message>,
+    seeds: crate::engine::seed_collector::SeedCollector,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
+    cwd: std::path::PathBuf,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
+    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    loop_guard_threshold: u32,
+    max_turns: usize,
+    // Model-comparison tandem (shadow) set (`model-comparison-tandem-
+    // inference.md`). `Some(set)` when the session has model-comparison on, so
+    // this leaf subagent's (`builder`/`explore`/`docs`) substantive turns are
+    // shadowed too; `None`/empty disables it. Cheap clone per call.
+    tandem: Option<crate::engine::schedule::TandemSet>,
+    event_tx: Option<mpsc::Sender<TurnEvent>>,
+    steer_target: Option<NoninteractiveSteerTarget>,
+) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
+    use crate::engine::agent::turn_with_backup;
+
+    let (child_tx, child_rx) = mpsc::channel::<TurnEvent>(64);
+    let forwarder = spawn_noninteractive_event_forwarder(child_rx, event_tx, steer_target.clone());
+
+    let agent = Arc::new(child);
+    // Per-turn backup-model fallback for the subagent (`per-model-
+    // backup-fallback.md`): subagents inherit the *mechanism*, resolved by the
+    // same model→provider→none order against the model the subagent runs on
+    // (here, its own `agent.model`). Resolved once for the run — the model is
+    // fixed for the subagent's lifetime, and resolution is per-turn-equivalent
+    // (the subagent always tries its primary model first each turn).
+    let backup_model = resolve_backup_model_for(&cwd, &agent.model);
+    // Rehydration: a follow-up starts from the subagent's prior transcript,
+    // so it answers with full knowledge of what it already did (GOALS §3c).
+    let mut history: Vec<Message> = prior_history;
+    let mut next_prompt = Message::user(brief);
+    // A noninteractive subagent's own deferred-log (`plan.md §3d`). The
+    // bundled leaves (explore/docs) lack `defer_to_orchestrator`, so this
+    // stays empty for them; a custom subagent that holds the tool gets its
+    // deferred items folded into the leaf report it returns up.
+    let deferred_log = crate::engine::deferred::DeferredLog::new();
+
+    for _ in 0..max_turns {
+        if let Some(target) = &steer_target {
+            match session
+                .db
+                .drain_task_delegation_steers(&target.task_call_id, &target.label)
+            {
+                Ok(steers) if !steers.is_empty() => {
+                    history.push(next_prompt);
+                    next_prompt = Message::user(render_noninteractive_steers(&steers));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        task_call_id = %target.task_call_id,
+                        label = %target.label,
+                        "drain delegation steer failed"
+                    );
+                }
+            }
+        }
+        // Per-round id, shared with this turn's tandem shadows.
+        let call_id = uuid::Uuid::new_v4();
+        // Model-comparison tandem (shadow) set for this leaf subagent turn
+        // (`builder`/`explore`/`docs`, `model-comparison-tandem-
+        // inference.md`). Passed into `turn`, which dispatches the shadows from
+        // the exact post-redaction body; a pure DB-only observer that never
+        // enters the child's history or affects its loop. `None`/empty = off.
+        let turn_future = turn_with_backup(
+            &agent,
+            backup_model.as_ref(),
+            &mut history,
+            next_prompt,
+            session.clone(),
+            locks.clone(),
+            redact.clone(),
+            cwd.clone(),
+            interrupts.clone(),
+            cancel.clone(),
+            approver.clone(),
+            None,
+            resource_scheduler.clone(),
+            loop_guard_threshold,
+            // A noninteractive child delegation recomposes its own fresh
+            // system prompt on spawn, so it never needs the live
+            // instructions-file diff injection.
+            false,
+            deferred_log.clone(),
+            seeds.clone(),
+            call_id,
+            tandem.as_ref(),
+            None,
+            &child_tx,
+        );
+        let outcome_future = async {
+            if let Some(target) = &steer_target {
+                crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
+                    .await
+            } else {
+                turn_future.await
+            }
+        };
+        let outcome = match outcome_future.await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                drop(child_tx);
+                let _ = forwarder.await;
+                return Err(NoninteractiveRunError::new(error, history));
+            }
+        };
+        match outcome {
+            TurnOutcome::Continue => {
+                next_prompt = history
+                    .pop()
+                    .expect("Continue with empty history is unreachable");
+            }
+            TurnOutcome::Done => {
+                drop(child_tx);
+                let _ = forwarder.await;
+                // No `return` tool call: fall back to wrapping the final text
+                // (envelope-holding agents only — the `docs` pipeline keeps its
+                // plain answer). `None` selects the fallback path.
+                let report = assemble_subagent_report(&agent, &history, &deferred_log, None);
+                return Ok(NoninteractiveOutcome { report, history });
+            }
+            TurnOutcome::Return { fields } => {
+                drop(child_tx);
+                let _ = forwarder.await;
+                let report =
+                    assemble_subagent_report(&agent, &history, &deferred_log, Some(&fields));
+                return Ok(NoninteractiveOutcome { report, history });
+            }
+            TurnOutcome::SpawnSubagent { .. }
+            | TurnOutcome::SpawnNoninteractive { .. }
+            | TurnOutcome::SpawnNoninteractiveBatch { .. }
+            | TurnOutcome::TaskControl { .. }
+            | TurnOutcome::ToolResult { .. }
+            | TurnOutcome::ScheduleAction { .. }
+            | TurnOutcome::Spawn { .. }
+            | TurnOutcome::Handoff { .. } => {
+                // explore is a leaf without `task`/`schedule`/`handoff`; this
+                // shouldn't happen, but if it does we bail rather than spin
+                // (the single async-job + primary-swap authority is the main
+                // driver, never a noninteractive subagent — §22 anti-runaway).
+                drop(child_tx);
+                let _ = forwarder.await;
+                return Err(NoninteractiveRunError::new(
+                    anyhow::anyhow!(
+                        "noninteractive agent `{}` attempted to delegate or schedule a job",
+                        agent.name
+                    ),
+                    history,
+                ));
+            }
+        }
+    }
+    drop(child_tx);
+    let _ = forwarder.await;
+    Err(NoninteractiveRunError::new(
+        anyhow::anyhow!(
+            "noninteractive agent `{}` exceeded {max_turns} turns",
+            agent.name
+        ),
+        history,
+    ))
+}

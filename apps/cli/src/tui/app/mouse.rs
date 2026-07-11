@@ -43,6 +43,15 @@ impl App {
             self.update_hovered_affordance(&mouse);
             return;
         }
+        if self.mouse_capture
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .sandbox_notice_copy_rect
+                .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
+        {
+            self.copy_sandbox_fix_command();
+            return;
+        }
         // Which-key overlay (`which-key-overlay.md`): rendered on top of every
         // pane, so it intercepts the wheel first. Wheel scrolls it; every other
         // mouse event is eaten so nothing reaches the pane/chat underneath.

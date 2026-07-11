@@ -1107,18 +1107,37 @@ impl App {
     /// until the sandbox is usable / dismissed — it does NOT time out like a
     /// toast. Hidden by the geometry when the sandbox is fine. Pure chrome:
     /// nothing here ever enters the model's context.
-    fn render_sandbox_notice(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn render_sandbox_notice(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.sandbox_notice_copy_rect = None;
         if area.height == 0 {
             return;
         }
         let Some(text) = self.sandbox_down_notice_text() else {
             return;
         };
-        let para = Paragraph::new(Line::from(vec![Span::styled(
-            super::sandbox_notice_render_text(&text),
-            Style::default().fg(ERROR_TEXT),
-        )]))
-        .wrap(ratatui::widgets::Wrap { trim: true });
+        let has_copy_chip = self
+            .sandbox_down_notice
+            .as_ref()
+            .and_then(|notice| notice.fix_command.as_ref())
+            .is_some()
+            && self.mouse_capture
+            && text.starts_with("[copy] ")
+            && area.width >= 7;
+        let line = if has_copy_chip {
+            self.sandbox_notice_copy_rect = Some(Rect::new(area.x.saturating_add(1), area.y, 6, 1));
+            let rest = text.strip_prefix("[copy]").unwrap_or(&text);
+            Line::from(vec![
+                Span::styled(" ", Style::default().fg(ERROR_TEXT)),
+                Span::styled("[copy]", Style::default().fg(Color::Black).bg(ERROR_TEXT)),
+                Span::styled(rest.to_string(), Style::default().fg(ERROR_TEXT)),
+            ])
+        } else {
+            Line::from(vec![Span::styled(
+                super::sandbox_notice_render_text(&text),
+                Style::default().fg(ERROR_TEXT),
+            )])
+        };
+        let para = Paragraph::new(line).wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(para, area);
     }
 

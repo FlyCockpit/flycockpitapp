@@ -229,8 +229,12 @@ pub enum SandboxAvailability {
     Available,
     /// Sandbox setup fails in this environment (user namespaces blocked,
     /// WSL1, bwrap absent, …). `reason` is a terse explanation for the
-    /// `/sandbox off` error.
-    Unavailable { reason: String },
+    /// `/sandbox off` error. `fix_command`, when present, is the exact
+    /// user-copyable host command that may resolve the condition.
+    Unavailable {
+        reason: String,
+        fix_command: Option<String>,
+    },
 }
 
 /// The gating decision for a single `bash` run, derived purely from the
@@ -269,7 +273,7 @@ pub fn gate_decision(
     }
     match availability {
         SandboxAvailability::Available => SandboxGate::Confine,
-        SandboxAvailability::Unavailable { reason } => SandboxGate::Refuse {
+        SandboxAvailability::Unavailable { reason, .. } => SandboxGate::Refuse {
             reason: reason.clone(),
         },
     }
@@ -311,6 +315,7 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
         Some(Err(e)) => {
             return SandboxAvailability::Unavailable {
                 reason: format!("no usable working directory for the sandbox probe: {e}"),
+                fix_command: None,
             };
         }
     };
@@ -319,9 +324,7 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
     let mut cmd = match build_sandboxed_command("true", cwd, None, &[], &probe_env, &[]).await {
         Ok(c) => c,
         Err(e) => {
-            return SandboxAvailability::Unavailable {
-                reason: reason_from(&e.to_string()),
-            };
+            return unavailable_from_raw(&e.to_string());
         }
     };
     cmd.stdin(std::process::Stdio::null())
@@ -331,9 +334,7 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
     let output = match cmd.output().await {
         Ok(o) => o,
         Err(e) => {
-            return SandboxAvailability::Unavailable {
-                reason: reason_from(&e.to_string()),
-            };
+            return unavailable_from_raw(&e.to_string());
         }
     };
 
@@ -341,20 +342,42 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
         SandboxAvailability::Available
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let reason = if stderr.trim().is_empty() {
-            "the sandbox helper exited non-zero".to_string()
+        if stderr.trim().is_empty() {
+            SandboxAvailability::Unavailable {
+                reason: "the sandbox helper exited non-zero".to_string(),
+                fix_command: None,
+            }
         } else {
-            reason_from(&stderr)
-        };
-        SandboxAvailability::Unavailable { reason }
+            unavailable_from_raw(&stderr)
+        }
     }
 }
 
-/// Build the model-facing reason for a probe failure: prefer the targeted
-/// AppArmor-userns diagnosis (Linux only — see [`diagnose_userns_restriction`]),
-/// falling back to the terse bwrap tail line.
-fn reason_from(raw: &str) -> String {
-    diagnose_userns_restriction(raw).unwrap_or_else(|| clean_reason(raw))
+/// Build structured unavailability metadata from a probe failure: prefer the
+/// targeted AppArmor-userns diagnosis (Linux only — see
+/// [`diagnose_userns_restriction`]), falling back to the terse bwrap tail line.
+fn unavailable_from_raw(raw: &str) -> SandboxAvailability {
+    match diagnose_userns_restriction(raw) {
+        Some(diagnosis) => SandboxAvailability::Unavailable {
+            reason: diagnosis.reason,
+            fix_command: diagnosis.fix_command,
+        },
+        None => SandboxAvailability::Unavailable {
+            reason: clean_reason(raw),
+            fix_command: None,
+        },
+    }
+}
+
+/// Derive the exact user-copyable host fix command from an already-diagnosed
+/// sandbox-unavailable reason. This keeps older in-memory reasons usable while
+/// the wire event carries the command as structured data for new clients.
+pub fn fix_command_for_reason(reason: &str) -> Option<String> {
+    if reason.contains(APPARMOR_USERNS_FIX_COMMAND) {
+        Some(APPARMOR_USERNS_FIX_COMMAND.to_string())
+    } else {
+        None
+    }
 }
 
 /// `/proc` knob (Ubuntu 23.10+/24.04 default) that, when `1`, lets a process
@@ -363,6 +386,15 @@ fn reason_from(raw: &str) -> String {
 /// `userns` — which the distro `bwrap` does not, so map setup EPERMs.
 #[cfg(target_os = "linux")]
 const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+pub const APPARMOR_USERNS_FIX_COMMAND: &str =
+    "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxDiagnosis {
+    reason: String,
+    fix_command: Option<String>,
+}
 
 /// Linux only: when a probe failure is the kernel refusing to write the
 /// user-namespace uid/gid map *and* AppArmor's unprivileged-userns
@@ -373,7 +405,7 @@ const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivi
 /// *diagnoses* here — it never runs the sysctl or touches AppArmor itself
 /// (host-security mutation is the user's call, not the harness's).
 #[cfg(target_os = "linux")]
-fn diagnose_userns_restriction(raw: &str) -> Option<String> {
+fn diagnose_userns_restriction(raw: &str) -> Option<SandboxDiagnosis> {
     let restricted = std::fs::read_to_string(APPARMOR_USERNS_SYSCTL)
         .map(|s| s.trim() == "1")
         .unwrap_or(false);
@@ -383,7 +415,7 @@ fn diagnose_userns_restriction(raw: &str) -> Option<String> {
 /// No AppArmor / `/proc` on macOS or Windows — the probe keeps its generic
 /// reason there, byte-for-byte unchanged.
 #[cfg(not(target_os = "linux"))]
-fn diagnose_userns_restriction(_raw: &str) -> Option<String> {
+fn diagnose_userns_restriction(_raw: &str) -> Option<SandboxDiagnosis> {
     None
 }
 
@@ -393,7 +425,7 @@ fn diagnose_userns_restriction(_raw: &str) -> Option<String> {
 /// reason when the failure is the uid/gid-map permission denial under that
 /// policy.
 #[cfg(target_os = "linux")]
-fn userns_restriction_reason(raw: &str, apparmor_restricted: bool) -> Option<String> {
+fn userns_restriction_reason(raw: &str, apparmor_restricted: bool) -> Option<SandboxDiagnosis> {
     if !apparmor_restricted {
         return None;
     }
@@ -403,11 +435,13 @@ fn userns_restriction_reason(raw: &str, apparmor_restricted: bool) -> Option<Str
     if !uid_map_denied {
         return None;
     }
-    Some(
-        "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
-         `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement"
-            .to_string(),
-    )
+    Some(SandboxDiagnosis {
+        reason: format!(
+            "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); `{}` re-enables confinement",
+            APPARMOR_USERNS_FIX_COMMAND
+        ),
+        fix_command: Some(APPARMOR_USERNS_FIX_COMMAND.to_string()),
+    })
 }
 
 /// Condense a multi-line probe failure into a single terse reason fragment
@@ -465,6 +499,7 @@ mod tests {
     fn gate_unavailable_and_enabled_refuses_with_reason() {
         let avail = SandboxAvailability::Unavailable {
             reason: "bwrap: No permission to create new namespace".to_string(),
+            fix_command: None,
         };
         match gate_decision(true, false, &avail) {
             SandboxGate::Refuse { reason } => {
@@ -481,6 +516,7 @@ mod tests {
     fn gate_unavailable_but_disabled_runs_unconfined() {
         let avail = SandboxAvailability::Unavailable {
             reason: "bwrap absent".to_string(),
+            fix_command: None,
         };
         // `/sandbox off` → no probe consulted for the decision, run as today.
         assert_eq!(
@@ -504,7 +540,8 @@ mod tests {
                 true,
                 true,
                 &SandboxAvailability::Unavailable {
-                    reason: "x".to_string()
+                    reason: "x".to_string(),
+                    fix_command: None,
                 }
             ),
             SandboxGate::Unconfined,
@@ -521,10 +558,16 @@ mod tests {
     fn userns_diagnosis_fires_on_uid_map_denial_under_apparmor() {
         let raw = "bwrap: setting up uid map: Permission denied";
         let r = userns_restriction_reason(raw, true).expect("diagnosis fires");
-        assert!(r.contains("AppArmor"), "names the policy: {r}");
+        assert!(r.reason.contains("AppArmor"), "names the policy: {:?}", r);
+        assert_eq!(
+            r.fix_command.as_deref(),
+            Some(APPARMOR_USERNS_FIX_COMMAND),
+            "gives the exact sysctl command"
+        );
         assert!(
-            r.contains("apparmor_restrict_unprivileged_userns=0"),
-            "gives the sysctl: {r}"
+            r.reason.contains(APPARMOR_USERNS_FIX_COMMAND),
+            "keeps the command visible in the reason: {:?}",
+            r
         );
     }
 

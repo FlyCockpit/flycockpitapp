@@ -655,9 +655,11 @@ mod tests {
         let remedy = "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
              `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement"
             .to_string();
+        let fix_command = "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0";
         let out = proto::turn_event_to_proto(
             TurnEvent::SandboxUnavailable {
                 remedy: remedy.clone(),
+                fix_command: Some(fix_command.to_string()),
             },
             sid,
         );
@@ -666,14 +668,59 @@ mod tests {
                 proto::Event::SandboxUnavailable {
                     session_id,
                     remedy: r,
+                    fix_command: got_fix_command,
                 },
             ] => {
                 assert_eq!(*session_id, sid);
                 assert_eq!(r, &remedy);
+                assert_eq!(got_fix_command.as_deref(), Some(fix_command));
                 // The user-facing remedy names the exact host command.
                 assert!(r.contains("sudo sysctl"));
             }
             other => panic!("expected one SandboxUnavailable, got {other:?}"),
+        }
+    }
+
+    /// Reattach hydration: once the daemon has diagnosed sandbox startup as
+    /// unavailable, a later client attach re-broadcasts the remembered notice
+    /// with the structured fix command without waiting for another `bash` call.
+    #[tokio::test]
+    async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        session.set_sandbox_mode(crate::tools::sandbox_mode::SandboxMode::Sandbox);
+        let locks = Arc::new(LockManager::in_memory(db));
+        let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
+        let remedy = "sandbox unavailable because AppArmor blocks user namespaces".to_string();
+        let fix_command =
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_string();
+        *handle
+            .sandbox_unavailable_notice
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SandboxUnavailableNotice {
+            remedy: remedy.clone(),
+            fix_command: Some(fix_command.clone()),
+        });
+
+        let mut rx = handle.subscribe();
+        handle.broadcast_sandbox_unavailable_or_probe();
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("sandbox notice broadcast")
+            .expect("event envelope");
+        match envelope.event {
+            proto::Event::SandboxUnavailable {
+                session_id,
+                remedy: got_remedy,
+                fix_command: got_fix_command,
+            } => {
+                assert_eq!(session_id, handle.session_id);
+                assert_eq!(got_remedy, remedy);
+                assert_eq!(got_fix_command.as_deref(), Some(fix_command.as_str()));
+            }
+            other => panic!("expected SandboxUnavailable, got {other:?}"),
         }
     }
 

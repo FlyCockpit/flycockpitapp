@@ -1732,7 +1732,13 @@ pub(crate) async fn run_turn(
             .as_ref()
             .and_then(|m| m.unavailable_reason.clone())
         {
-            let _ = tx.send(TurnEvent::SandboxUnavailable { remedy }).await;
+            let fix_command = crate::tools::shell_sandbox::fix_command_for_reason(&remedy);
+            let _ = tx
+                .send(TurnEvent::SandboxUnavailable {
+                    remedy,
+                    fix_command,
+                })
+                .await;
         }
         // §13c tool recovery additionally rebinds `args` so the audit row's
         // `wire_input_json` is the tool's canonical form; the shape-repair

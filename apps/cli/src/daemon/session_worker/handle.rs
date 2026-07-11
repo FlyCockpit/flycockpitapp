@@ -29,6 +29,7 @@ pub struct SessionWorkerHandle {
     /// condition and the TUI notice), so a renewed unavailable condition can
     /// surface again. Shared with the worker's event-forward task.
     sandbox_notice_armed: Arc<AtomicBool>,
+    sandbox_unavailable_notice: Arc<RwLock<Option<SandboxUnavailableNotice>>>,
     /// The daemon-wide lock authority, so the last-detach-while-idle edge can
     /// release this session's locks (implementation note).
     /// The `InteractiveClientGuard`'s `Drop` consults it; the `AgentIdle` edge
@@ -37,6 +38,12 @@ pub struct SessionWorkerHandle {
     env_overlay: Arc<RwLock<HashMap<String, String>>>,
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxUnavailableNotice {
+    remedy: String,
+    fix_command: Option<String>,
 }
 
 struct WorkerCleanupGuard(Option<Box<dyn FnOnce() + Send + 'static>>);
@@ -107,6 +114,40 @@ fn driver_join_outcome(
             tracing::error!(error = %message, "driver task panicked");
             DriverOutcome::Panicked(message)
         }
+    }
+}
+
+fn send_sandbox_unavailable_notice(
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    notice: &SandboxUnavailableNotice,
+) {
+    send_current_event(
+        event_tx,
+        redaction,
+        proto::Event::SandboxUnavailable {
+            session_id,
+            remedy: notice.remedy.clone(),
+            fix_command: notice.fix_command.clone(),
+        },
+    );
+}
+
+fn sandbox_unavailable_notice_from_availability(
+    availability: &crate::tools::shell_sandbox::SandboxAvailability,
+) -> Option<SandboxUnavailableNotice> {
+    match availability {
+        crate::tools::shell_sandbox::SandboxAvailability::Available => None,
+        crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+            reason,
+            fix_command,
+        } => Some(SandboxUnavailableNotice {
+            remedy: reason.clone(),
+            fix_command: fix_command
+                .clone()
+                .or_else(|| crate::tools::shell_sandbox::fix_command_for_reason(reason)),
+        }),
     }
 }
 
@@ -235,6 +276,7 @@ impl SessionWorkerHandle {
             interactive_clients: Arc::new(AtomicUsize::new(0)),
             session,
             sandbox_notice_armed: Arc::new(AtomicBool::new(false)),
+            sandbox_unavailable_notice: Arc::new(RwLock::new(None)),
             locks,
             env_overlay: Arc::new(RwLock::new(HashMap::new())),
             repair_required: Arc::new(RwLock::new(None)),
@@ -281,6 +323,12 @@ impl SessionWorkerHandle {
         }
         let new = self.session.set_sandbox_mode(requested);
         self.sandbox_notice_armed.store(false, Ordering::SeqCst);
+        if !new.enabled() {
+            *self
+                .sandbox_unavailable_notice
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
         send_current_event(
             &self.event_tx,
             &self.redaction,
@@ -292,6 +340,9 @@ impl SessionWorkerHandle {
                 container_availability: crate::container::availability_snapshot(),
             },
         );
+        if new.enabled() {
+            self.probe_sandbox_unavailable();
+        }
         Ok(new)
     }
 
@@ -510,6 +561,82 @@ impl SessionWorkerHandle {
             },
         );
     }
+
+    /// Hydrate a reconnecting client with the remembered sandbox-unavailable
+    /// state, or start the eager probe if no state is known yet. This broadcasts
+    /// over the shared session event stream like other attach hydration.
+    pub fn broadcast_sandbox_unavailable_or_probe(&self) {
+        self.schedule_sandbox_unavailable_probe(true);
+    }
+
+    /// Start the eager shell-sandbox availability probe for this session. The
+    /// probe is non-blocking and process-cached by `shell_sandbox`.
+    pub fn probe_sandbox_unavailable(&self) {
+        self.schedule_sandbox_unavailable_probe(false);
+    }
+
+    fn schedule_sandbox_unavailable_probe(&self, hydrate_known: bool) {
+        if !self.session.sandbox_mode().enabled() {
+            *self
+                .sandbox_unavailable_notice
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return;
+        }
+
+        if hydrate_known
+            && let Some(notice) = self
+                .sandbox_unavailable_notice
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        {
+            send_sandbox_unavailable_notice(
+                &self.event_tx,
+                &self.redaction,
+                self.session_id,
+                &notice,
+            );
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let session = self.session.clone();
+        let project_root = self.project_root.clone();
+        let event_tx = self.event_tx.clone();
+        let redaction = self.redaction.clone();
+        let session_id = self.session_id;
+        let notice_store = self.sandbox_unavailable_notice.clone();
+        let armed = self.sandbox_notice_armed.clone();
+        handle.spawn(async move {
+            if !session.sandbox_mode().enabled() {
+                *notice_store
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                return;
+            }
+            let availability = crate::tools::shell_sandbox::sandbox_available(&project_root)
+                .await
+                .clone();
+            match sandbox_unavailable_notice_from_availability(&availability) {
+                Some(notice) => {
+                    *notice_store
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notice.clone());
+                    if session.sandbox_mode().enabled() && forward_sandbox_unavailable(&armed) {
+                        send_sandbox_unavailable_notice(&event_tx, &redaction, session_id, &notice);
+                    }
+                }
+                None => {
+                    *notice_store
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                }
+            }
+        });
+    }
 }
 
 /// Work items a client can ask the worker to perform.
@@ -714,11 +841,14 @@ pub fn spawn(
         interactive_clients: interactive_clients.clone(),
         session: session.clone(),
         sandbox_notice_armed: sandbox_notice_armed.clone(),
+        sandbox_unavailable_notice: Arc::new(RwLock::new(None)),
         locks: locks.clone(),
         env_overlay: env_overlay.clone(),
         repair_required: repair_required.clone(),
         foreground: foreground.clone(),
     };
+
+    handle.probe_sandbox_unavailable();
 
     // Return the worker's `JoinHandle` so the registry can *await* it on a
     // graceful drain (`daemon-graceful-drain-shutdown.md`) — today's

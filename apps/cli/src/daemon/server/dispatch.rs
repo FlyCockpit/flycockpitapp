@@ -1157,6 +1157,7 @@ async fn attach(
     if let Some(att) = state.attached.as_ref() {
         att.handle.broadcast_gitignore_allow();
         att.handle.broadcast_sandbox_escalation();
+        att.handle.broadcast_sandbox_unavailable_or_probe();
     }
 
     // Full chronological history snapshot (user messages + assistant turns +

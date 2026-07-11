@@ -1240,6 +1240,9 @@ mod tests {
         let evt = Envelope::event(Event::SandboxUnavailable {
             session_id: sid,
             remedy: remedy.into(),
+            fix_command: Some(
+                "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_string(),
+            ),
         });
         let back: Envelope = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
         match back.body {
@@ -1248,10 +1251,15 @@ mod tests {
                     Event::SandboxUnavailable {
                         session_id,
                         remedy: r,
+                        fix_command,
                     },
             } => {
                 assert_eq!(session_id, sid);
                 assert_eq!(r, remedy);
+                assert_eq!(
+                    fix_command.as_deref(),
+                    Some("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+                );
             }
             other => panic!("expected SandboxUnavailable event, got {other:?}"),
         }

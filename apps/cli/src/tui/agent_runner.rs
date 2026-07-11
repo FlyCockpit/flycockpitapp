@@ -1300,7 +1300,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             container_availability,
         },
         SandboxEscalationState { enabled, .. } => TurnEvent::SandboxEscalationState { enabled },
-        SandboxUnavailable { remedy, .. } => TurnEvent::SandboxUnavailable { remedy },
+        SandboxUnavailable {
+            remedy,
+            fix_command,
+            ..
+        } => TurnEvent::SandboxUnavailable {
+            remedy,
+            fix_command,
+        },
         RedactionState {
             scan_environment,
             scan_dotenv,

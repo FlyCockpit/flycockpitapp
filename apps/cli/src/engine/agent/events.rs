@@ -405,12 +405,14 @@ pub enum TurnEvent {
     /// The shell sandbox cannot initialize (a confined `bash` hit the
     /// `SandboxGate::Refuse` path — Linux userns case; `implementation notes`
     /// §6.5). Emitted by [`turn`] on detection, carrying the diagnosed
-    /// `remedy` (the `reason`, incl. the `sudo sysctl …=0` command when
-    /// diagnosed). The worker fires the broadcast once per session (de-dupe);
-    /// the TUI raises a persistent below-input notice. **Never** enters the
-    /// model's context — purely client-side chrome state, deterministic and
-    /// model-independent.
-    SandboxUnavailable { remedy: String },
+    /// `remedy` plus an optional exact host fix command. The worker fires the
+    /// broadcast once per session (de-dupe); the TUI raises a persistent
+    /// below-input notice. **Never** enters the model's context — purely
+    /// client-side chrome state, deterministic and model-independent.
+    SandboxUnavailable {
+        remedy: String,
+        fix_command: Option<String>,
+    },
 
     /// Redaction sources were toggled for the session (`/toggle-redaction`).
     /// UI-only: the TUI surfaces the resulting state as a toast. Emitted by

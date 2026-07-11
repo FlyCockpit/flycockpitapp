@@ -522,13 +522,15 @@ pub enum Event {
     /// refuse path — Linux userns case; `implementation notes` §6.5). Broadcast
     /// **once per session** (the worker de-dupes) so attached clients raise a
     /// deterministic, persistent, user-facing indicator. `remedy` is the
-    /// diagnosed reason (incl. the `sudo sysctl …=0` command when diagnosed);
-    /// the TUI renders it as a persistent below-input notice, cleared when a
-    /// later `SandboxState { enabled: false }` arrives. Model-independent and
-    /// never part of any inference request.
+    /// diagnosed reason; `fix_command` is the exact user-copyable host command
+    /// when the diagnosis has one. The TUI renders it as a persistent
+    /// below-input notice, cleared when a later `SandboxState { enabled: false }`
+    /// arrives. Model-independent and never part of any inference request.
     SandboxUnavailable {
         session_id: Uuid,
         remedy: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fix_command: Option<String>,
     },
 
     /// Redaction sources were toggled for the session
@@ -1111,9 +1113,14 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         // the per-session de-dupe (fire once per condition, not per failed
         // bash call) lives in the forward seam below, so a repeated failure
         // produces no second broadcast.
-        TurnEvent::SandboxUnavailable { remedy } => {
-            vec![Event::SandboxUnavailable { session_id, remedy }]
-        }
+        TurnEvent::SandboxUnavailable {
+            remedy,
+            fix_command,
+        } => vec![Event::SandboxUnavailable {
+            session_id,
+            remedy,
+            fix_command,
+        }],
         // The engine never emits `RedactionState` — the daemon's
         // `SetRedaction` handler broadcasts the wire event directly. This
         // arm exists only for exhaustiveness.

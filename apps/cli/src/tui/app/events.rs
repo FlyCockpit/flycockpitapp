@@ -1037,13 +1037,20 @@ impl App {
                     self.sandbox_down_notice = None;
                 }
             }
-            TurnEvent::SandboxUnavailable { remedy } => {
+            TurnEvent::SandboxUnavailable {
+                remedy,
+                fix_command,
+            } => {
                 // The shell sandbox can't initialize (§6.5). Raise the
                 // persistent below-input notice — deterministic, model-
                 // independent, never in the LLM context. The daemon de-dupes
                 // per session, so this fires once per condition. Idempotent
-                // refresh keeps the latest diagnosed remedy text.
-                self.sandbox_down_notice = Some(remedy);
+                // refresh keeps the latest diagnosed remedy text and exact
+                // copyable fix command when one is diagnosed.
+                self.sandbox_down_notice = Some(SandboxDownNotice {
+                    remedy,
+                    fix_command,
+                });
             }
             TurnEvent::RedactionState {
                 scan_environment,

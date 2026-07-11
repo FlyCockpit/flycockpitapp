@@ -1121,8 +1121,28 @@ fn primary_swap_warning(name: &str) -> Option<&'static str> {
 /// text — it never enters history or any inference request.
 const MAX_SANDBOX_NOTICE_ROWS: u16 = 4;
 
-fn sandbox_down_notice_text(remedy: &str) -> String {
-    format!("⚠ shell sandbox can't start: {remedy}. Run /sandbox off in the composer to continue.")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SandboxDownNotice {
+    pub remedy: String,
+    pub fix_command: Option<String>,
+}
+
+fn sandbox_down_notice_text(remedy: &str, fix_command: Option<&str>, copy_chip: bool) -> String {
+    let mut text = if copy_chip && fix_command.is_some() {
+        format!("[copy] ⚠ shell sandbox can't start: {remedy}.")
+    } else {
+        format!("⚠ shell sandbox can't start: {remedy}.")
+    };
+    if let Some(command) = fix_command
+        && !copy_chip
+        && !remedy.contains(command)
+    {
+        text.push_str(" Fix: ");
+        text.push_str(command);
+        text.push('.');
+    }
+    text.push_str(" Run /sandbox off in the composer to continue.");
+    text
 }
 
 pub(super) fn sandbox_notice_render_text(text: &str) -> String {
@@ -1825,7 +1845,8 @@ pub struct App {
     /// Set from the daemon's `SandboxUnavailable` broadcast; cleared on the
     /// `SandboxState { enabled: false }` a `/sandbox off` triggers. Never
     /// enters history or any inference request — purely client-side chrome.
-    pub(super) sandbox_down_notice: Option<String>,
+    pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
+    pub(super) sandbox_notice_copy_rect: Option<Rect>,
     /// Session-only redaction-source state (`/toggle-redaction`). Seeded
     /// from the layered `redact` config at launch and kept in sync by the
     /// daemon's `RedactionState` broadcast. Tracked client-side so a bare
@@ -2842,6 +2863,7 @@ impl App {
             last_user_interaction: Instant::now(),
             waiting_for_lock: None,
             sandbox_down_notice: None,
+            sandbox_notice_copy_rect: None,
             redact_scan_environment,
             redact_scan_dotenv,
             redact_scan_ssh_keys,
@@ -3025,9 +3047,13 @@ impl App {
     /// instruction the user must act on. Pure UI chrome — never enters history
     /// or any inference request.
     pub(super) fn sandbox_down_notice_text(&self) -> Option<String> {
-        self.sandbox_down_notice
-            .as_deref()
-            .map(sandbox_down_notice_text)
+        self.sandbox_down_notice.as_ref().map(|notice| {
+            sandbox_down_notice_text(
+                &notice.remedy,
+                notice.fix_command.as_deref(),
+                self.mouse_capture && notice.fix_command.is_some(),
+            )
+        })
     }
 
     /// Height of the persistent below-input sandbox-down notice (§6.5): its
@@ -6625,6 +6651,21 @@ impl App {
         })
     }
 
+    pub(super) fn copy_sandbox_fix_command(&mut self) {
+        let Some(command) = self
+            .sandbox_down_notice
+            .as_ref()
+            .and_then(|notice| notice.fix_command.as_deref())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        match crate::clipboard::copy_plain(&command) {
+            Ok(_) => self.show_copy_ok_or_tmux_hint("Copied sandbox fix command.".to_string()),
+            Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
+        }
+    }
+
     /// Execute one of the context-menu actions. Called both when the
     /// user clicks an item and when they hit Enter on a focused item.
     /// `clicked_chat_row` is the chat-relative row that was
@@ -10164,6 +10205,7 @@ mod sandbox_notice_tests {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Paragraph, Wrap};
 
+    const FIX_COMMAND: &str = "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0";
     const REMEDY: &str = "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
          `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement";
 
@@ -10186,8 +10228,20 @@ mod sandbox_notice_tests {
         // Sandbox-unavailable → persistent notice raised.
         app.apply_event(TurnEvent::SandboxUnavailable {
             remedy: REMEDY.to_string(),
+            fix_command: Some(FIX_COMMAND.to_string()),
         });
-        assert_eq!(app.sandbox_down_notice.as_deref(), Some(REMEDY));
+        assert_eq!(
+            app.sandbox_down_notice
+                .as_ref()
+                .map(|notice| notice.remedy.as_str()),
+            Some(REMEDY)
+        );
+        assert_eq!(
+            app.sandbox_down_notice
+                .as_ref()
+                .and_then(|notice| notice.fix_command.as_deref()),
+            Some(FIX_COMMAND)
+        );
         assert!(app.sandbox_notice_lines() > 0, "persistent row reserved");
         let text = app.sandbox_down_notice_text().unwrap();
         assert!(text.contains("/sandbox off"));
@@ -10199,8 +10253,20 @@ mod sandbox_notice_tests {
         // daemon de-dupes the broadcast; the client stays idempotent).
         app.apply_event(TurnEvent::SandboxUnavailable {
             remedy: REMEDY.to_string(),
+            fix_command: Some(FIX_COMMAND.to_string()),
         });
-        assert_eq!(app.sandbox_down_notice.as_deref(), Some(REMEDY));
+        assert_eq!(
+            app.sandbox_down_notice
+                .as_ref()
+                .map(|notice| notice.remedy.as_str()),
+            Some(REMEDY)
+        );
+        assert_eq!(
+            app.sandbox_down_notice
+                .as_ref()
+                .and_then(|notice| notice.fix_command.as_deref()),
+            Some(FIX_COMMAND)
+        );
         assert_eq!(app.history.len(), history_len_before);
 
         // `/sandbox off` -> `SandboxState { mode: Off }` clears it.
@@ -10275,7 +10341,7 @@ mod sandbox_notice_tests {
     fn notice_text_names_sandbox_off_and_diagnosed_sysctl() {
         let remedy = "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
              `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement";
-        let text = sandbox_down_notice_text(remedy);
+        let text = sandbox_down_notice_text(remedy, Some(FIX_COMMAND), false);
         assert!(text.contains("/sandbox off"));
         assert!(text.contains("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"));
         // The original diagnosed reason is preserved verbatim inside it.
@@ -10286,7 +10352,8 @@ mod sandbox_notice_tests {
     /// `/sandbox off` action — the actionable instruction is always present.
     #[test]
     fn notice_text_always_has_sandbox_off_even_without_sysctl() {
-        let text = sandbox_down_notice_text("bwrap: setting up uid map: Permission denied");
+        let text =
+            sandbox_down_notice_text("bwrap: setting up uid map: Permission denied", None, false);
         assert!(text.contains("/sandbox off"));
         assert!(!text.contains("sudo sysctl"));
     }
@@ -10323,7 +10390,7 @@ mod sandbox_notice_tests {
 
     #[test]
     fn notice_height_matches_ratatui_wrap_for_representative_widths() {
-        let text = sandbox_down_notice_text(REMEDY);
+        let text = sandbox_down_notice_text(REMEDY, Some(FIX_COMMAND), false);
         for width in [20, 32, 48, 80] {
             assert_eq!(
                 sandbox_notice_wrapped_rows(&text, width),
@@ -10335,7 +10402,7 @@ mod sandbox_notice_tests {
 
     #[test]
     fn notice_height_keeps_long_sysctl_remedy_within_existing_cap() {
-        let text = sandbox_down_notice_text(REMEDY);
+        let text = sandbox_down_notice_text(REMEDY, Some(FIX_COMMAND), false);
         let rows = sandbox_notice_wrapped_rows(&text, 48);
         assert_eq!(rows, ratatui_notice_rows(&text, 48));
         assert_eq!(rows, MAX_SANDBOX_NOTICE_ROWS);
@@ -10345,6 +10412,8 @@ mod sandbox_notice_tests {
     fn notice_height_matches_ratatui_wrap_for_unicode_display_width() {
         let text = sandbox_down_notice_text(
             "原因: 名前空間を作成できません。`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`",
+            Some(FIX_COMMAND),
+            false,
         );
         for width in [16, 24, 40] {
             assert_eq!(

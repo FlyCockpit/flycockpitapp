@@ -10,20 +10,15 @@
 //! records dropped atomically under a token cap) via
 //! [`crate::intel::budget::BudgetedWriter`].
 
-use std::path::Path;
-
 use anyhow::Result;
 use async_trait::async_trait;
-use grep_regex::RegexMatcher;
-use grep_searcher::sinks::UTF8;
-use grep_searcher::{BinaryDetection, SearcherBuilder};
-use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 use crate::intel::budget::BudgetedWriter;
 use crate::intel::thin::{ThinLimits, thin_line_output};
 use crate::tools::sandbox;
+use crate::tools::text_search::{SearchOptions, SearchOutcome, search_records_blocking};
 
 /// cl100k token cap for one `grep` result (subagent-report economy,
 /// GOALS §10). Generous enough for a focused dependency query, tight
@@ -104,23 +99,24 @@ impl Tool for GrepTool {
             _ => canonical_root.clone(),
         };
 
-        // Case folding rides as an inline `(?i)` flag so the parameter
-        // surface stays terse (one bool, no builder knobs exposed).
-        let effective = if case_insensitive {
-            format!("(?i){pattern}")
-        } else {
-            pattern.clone()
-        };
-        let matcher = RegexMatcher::new_line_matcher(&effective).map_err(|e| {
-            invalid_input(format!(
-                "invalid regex `{pattern}` ({e}); check for unescaped backslashes or unbalanced brackets"
-            ))
-        })?;
-
-        let root = canonical_root.clone();
+        let display_root = canonical_root.clone();
+        let guard_root = canonical_root.clone();
         let query = pattern.clone();
+        let options = SearchOptions {
+            pattern,
+            case_insensitive,
+            columns: false,
+            context: None,
+            glob: None,
+            max_matches: MAX_MATCHES,
+            hidden: false,
+            parents: false,
+        };
         let out = tokio::task::spawn_blocking(move || {
-            search_blocking(&matcher, &search_root, &root, &query)
+            search_records_blocking(&search_root, &display_root, &options, |path| {
+                sandbox::within_root(&guard_root, path)
+            })
+            .map(|outcome| render_search_outcome(outcome, &query))
         })
         .await
         .map_err(|e| anyhow::anyhow!("grep worker joined: {e}"))??;
@@ -129,78 +125,25 @@ impl Tool for GrepTool {
     }
 }
 
-/// Run the search on a blocking thread (the ripgrep API is sync I/O).
-fn search_blocking(
-    matcher: &RegexMatcher,
-    search_root: &Path,
-    canonical_root: &Path,
-    query: &str,
-) -> Result<ToolOutput> {
-    let mut match_count = 0usize;
-    let mut hit_match_cap = false;
-    let mut records = Vec::new();
-
-    // Gitignore-aware walk confined to the search root. `require_git
-    // (false)` so a dependency clone without a checked-in `.gitignore`
-    // still walks; symlinks are NOT followed (escape guard).
-    let walk = WalkBuilder::new(search_root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(false)
-        .require_git(false)
-        .follow_links(false)
-        .build();
-
-    'walk: for entry in walk.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        // Defense in depth: re-verify each entry stays within the root
-        // (symlinked dir entries, races).
-        if !sandbox::within_root(canonical_root, path) {
-            continue;
-        }
-        // Relative display path for citations.
-        let rel = path
-            .strip_prefix(canonical_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let mut searcher = SearcherBuilder::new()
-            .binary_detection(BinaryDetection::quit(0))
-            .line_number(true)
-            .build();
-
-        let mut file_matches: Vec<(u64, String)> = Vec::new();
-        let sink = UTF8(|line_number, line| {
-            file_matches.push((line_number, line.trim_end().to_string()));
-            Ok(true)
-        });
-        // A search error on one file (binary, permission) is skipped, not
-        // fatal — the sandbox must answer best-effort.
-        if searcher.search_path(matcher, path, sink).is_err() {
-            continue;
-        }
-
-        for (line_number, line) in file_matches {
-            let record = format!("{rel}:{line_number}: {}", line.trim());
-            records.push(record);
-            match_count += 1;
-            if match_count >= MAX_MATCHES {
-                hit_match_cap = true;
-                break 'walk;
-            }
-        }
+fn render_search_outcome(outcome: SearchOutcome, query: &str) -> ToolOutput {
+    if outcome.records.is_empty() {
+        return ToolOutput::text("No matches.".to_string());
     }
 
-    if records.is_empty() {
-        return Ok(ToolOutput::text("No matches.".to_string()));
-    }
-
-    let raw = records.join("\n") + "\n";
+    let raw = outcome
+        .records
+        .iter()
+        .map(|record| {
+            format!(
+                "{}:{}: {}",
+                record.path,
+                record.line_number,
+                record.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     let (body, thinned) = thin_line_output(&raw, query, ThinLimits::default());
     let mut writer = BudgetedWriter::new(GREP_TOKEN_CAP);
     for line in body.lines() {
@@ -209,15 +152,15 @@ fn search_blocking(
         }
     }
     let writer_truncated = writer.is_truncated();
-    let truncated = writer_truncated || hit_match_cap || thinned;
+    let truncated = writer_truncated || outcome.hit_match_cap || thinned;
     let mut body = writer.into_string();
     if truncated {
-        if writer_truncated || hit_match_cap {
+        if writer_truncated || outcome.hit_match_cap {
             body.push_str("... [truncated; narrow the pattern or pass a `path`]\n");
         }
-        Ok(ToolOutput::truncated_text(body))
+        ToolOutput::truncated_text(body)
     } else {
-        Ok(ToolOutput::text(body))
+        ToolOutput::text(body)
     }
 }
 
@@ -225,6 +168,7 @@ fn search_blocking(
 mod tests {
     use super::*;
     use crate::tools::common::test_ctx;
+    use std::path::Path;
 
     fn write(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);

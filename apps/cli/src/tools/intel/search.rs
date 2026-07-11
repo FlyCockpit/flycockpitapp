@@ -1,8 +1,13 @@
 use super::common::*;
+use crate::tools::text_search::{
+    SearchOptions, SearchOutcome, normalize_display_root, search_records_blocking,
+};
 
 // ---- search ----------------------------------------------------------------
 
 pub struct SearchTool;
+
+const MAX_SEARCH_MATCHES: usize = 2_000;
 
 #[async_trait]
 impl Tool for SearchTool {
@@ -93,14 +98,30 @@ impl Tool for SearchTool {
             None => SearchTarget::Dir(search_path),
         };
         let single_file = matches!(target, SearchTarget::File(_));
-        let have_rg = which::which("rg").is_ok();
-        let raw = run_search(have_rg, pattern, &target, ignore_case, context, glob).await?;
-
-        let body = if have_rg {
-            format_rg_json(&raw, &root)
-        } else {
-            format_grep(&raw, &root)
+        let (search_root, display_root) = match &target {
+            SearchTarget::Dir(dir) => (dir.clone(), dir.clone()),
+            SearchTarget::File(file) => normalize_display_root(file),
         };
+        let guard_root = search_root.clone();
+        let options = SearchOptions {
+            pattern: pattern.to_string(),
+            case_insensitive: ignore_case,
+            columns: true,
+            context: context.map(|n| n as usize),
+            glob: glob.map(ToString::to_string),
+            max_matches: MAX_SEARCH_MATCHES,
+            hidden: true,
+            parents: true,
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            search_records_blocking(&search_root, &display_root, &options, |path| {
+                path == guard_root || path.starts_with(&guard_root)
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("search worker joined: {e}"))??;
+        let hit_match_cap = outcome.hit_match_cap;
+        let body = format_search_records(&outcome);
         // Hint, attached as a clearly separated note (never interleaved with
         // match data), nudging callers toward a directory scope or
         // `read`/`grep` for single-file lookups.
@@ -124,7 +145,6 @@ impl Tool for SearchTool {
         // the body is emitted verbatim in rg/grep file order.
         let ranked_body = if crate::config::extended::resolve_centrality_ranking(&ctx.cwd) {
             let index = index_of(ctx);
-            index.ensure_fresh().await?;
             let scores = index.centrality_scores()?;
             rank_search_body(&body, &scores, path)
         } else {
@@ -153,6 +173,11 @@ impl Tool for SearchTool {
                 "\n... [truncated; narrow the query or add a `path`/`glob` filter]\n",
             )
         };
+        if hit_match_cap {
+            out.truncated = true;
+            out.content
+                .push_str("... [truncated; narrow the query or add a `path`/`glob` filter]\n");
+        }
         if single_file {
             out.content.push_str(SINGLE_FILE_NOTE);
         }
@@ -178,34 +203,33 @@ fn rank_search_body(
     path_filter: Option<&str>,
 ) -> String {
     // Group lines by file in first-seen order.
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-    let mut current: Option<String> = None;
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut current: Option<&str> = None;
     for line in body.lines() {
-        let file = line.split_once(':').map(|(p, _)| p.to_string());
+        let file = line.split_once(':').map(|(p, _)| p);
         let key = match file {
             Some(f) => {
-                if !groups.contains_key(&f) {
-                    order.push(f.clone());
+                if !groups.contains_key(f) {
+                    order.push(f);
                 }
-                current = Some(f.clone());
+                current = Some(f);
                 f
             }
             // A line with no `:` (rare) attaches to the current group, or
             // starts a degenerate group keyed by itself.
-            None => match &current {
-                Some(c) => c.clone(),
+            None => match current {
+                Some(c) => c,
                 None => {
-                    let k = line.to_string();
-                    if !groups.contains_key(&k) {
-                        order.push(k.clone());
+                    if !groups.contains_key(line) {
+                        order.push(line);
                     }
-                    current = Some(k.clone());
-                    k
+                    current = Some(line);
+                    line
                 }
             },
         };
-        groups.entry(key).or_default().push(line.to_string());
+        groups.entry(key).or_default().push(line);
     }
 
     // Centrality lookup: try the body path, then `{filter}/{path}`.
@@ -252,149 +276,22 @@ enum SearchTarget {
     File(PathBuf),
 }
 
-/// Spawn `rg --json` (preferred) or `grep -rn` and return stdout.
-async fn run_search(
-    have_rg: bool,
-    pattern: &str,
-    target: &SearchTarget,
-    ignore_case: bool,
-    context: Option<u64>,
-    glob: Option<&str>,
-) -> Result<String> {
-    // Run from a directory (cwd) and point the tool at one target so output
-    // paths stay relative to cwd. For a file, cwd = parent and target =
-    // file name; for a dir, cwd = dir and target = `.`.
-    let (cwd, arg): (PathBuf, std::ffi::OsString) = match target {
-        SearchTarget::Dir(dir) => (dir.clone(), std::ffi::OsString::from(".")),
-        SearchTarget::File(file) => {
-            let parent = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-            let name = file
-                .file_name()
-                .map(std::ffi::OsString::from)
-                .unwrap_or_else(|| std::ffi::OsString::from("."));
-            (parent, name)
-        }
-    };
-    let mut cmd = if have_rg {
-        let mut c = tokio::process::Command::new("rg");
-        c.arg("--json")
-            .arg("--line-number")
-            .arg("--column")
-            .arg("--no-heading")
-            .arg("--color")
-            .arg("never");
-        if ignore_case {
-            c.arg("--ignore-case");
-        }
-        if let Some(n) = context {
-            c.arg("--context").arg(n.to_string());
-        }
-        if let Some(g) = glob {
-            c.arg("--glob").arg(g);
-        }
-        c.arg("--").arg(pattern).arg(&arg);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("grep");
-        c.arg("-rn");
-        if ignore_case {
-            c.arg("-i");
-        }
-        if let Some(n) = context {
-            c.arg(format!("-C{n}"));
-        }
-        if let Some(g) = glob {
-            c.arg(format!("--include={g}"));
-        }
-        c.arg("-e").arg(pattern).arg(&arg);
-        c
-    };
-    cmd.current_dir(&cwd);
-    let output = cmd
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("spawning search: {e}"))?;
-    // rg/grep exit 1 means "no matches" — not an error.
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Parse rg's NDJSON stream into terse `path:line:col: text` records.
-fn format_rg_json(stdout: &str, root: &Path) -> String {
+fn format_search_records(outcome: &SearchOutcome) -> String {
     let mut out = String::new();
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        match ty {
-            "match" | "context" => {
-                let data = match v.get("data") {
-                    Some(d) => d,
-                    None => continue,
-                };
-                let path = data
-                    .get("path")
-                    .and_then(|p| p.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let line_no = data.get("line_number").and_then(Value::as_u64).unwrap_or(0);
-                let text = data
-                    .get("lines")
-                    .and_then(|l| l.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim_end_matches('\n');
-                let col = data
-                    .get("submatches")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("start"))
-                    .and_then(Value::as_u64)
-                    .map(|c| c + 1);
-                let disp = display_path(path, root);
-                let sep = if ty == "context" { "-" } else { ":" };
-                match col {
-                    Some(c) => out.push_str(&format!("{disp}:{line_no}:{c}{sep} {text}\n")),
-                    None => out.push_str(&format!("{disp}:{line_no}{sep} {text}\n")),
-                }
-            }
-            _ => {}
+    for record in &outcome.records {
+        let sep = if record.is_context { '-' } else { ':' };
+        match record.column {
+            Some(column) => out.push_str(&format!(
+                "{}:{}:{}{} {}\n",
+                record.path, record.line_number, column, sep, record.text
+            )),
+            None => out.push_str(&format!(
+                "{}:{}{} {}\n",
+                record.path, record.line_number, sep, record.text
+            )),
         }
     }
     out
-}
-
-/// `grep -rn` output is already `path:line:text`; just normalize paths.
-/// Known fallback limitation: when context is requested the grep fallback
-/// uses `-C{n}`, whose context lines are `path-line-text` (dash separators)
-/// — the `split_once(':')` below doesn't carry those separators cleanly.
-fn format_grep(stdout: &str, root: &Path) -> String {
-    let mut out = String::new();
-    for line in stdout.lines() {
-        if let Some((path, rest)) = line.split_once(':') {
-            let disp = display_path(path, root);
-            out.push_str(&format!("{disp}:{rest}\n"));
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Make a path from search output relative + forward-slashed for display.
-fn display_path(p: &str, root: &Path) -> String {
-    let stripped = p.trim_start_matches("./");
-    // rg/grep run with cwd=search_dir, so paths are already relative to
-    // it; if `path` filter pointed below root, prepend nothing — the
-    // model still gets a usable relative path. Absolute paths get
-    // root-stripped.
-    if let Ok(abs) = Path::new(p).strip_prefix(root) {
-        abs.to_string_lossy().replace('\\', "/")
-    } else {
-        stripped.replace('\\', "/")
-    }
 }
 
 // ---- shared FS helpers -----------------------------------------------------

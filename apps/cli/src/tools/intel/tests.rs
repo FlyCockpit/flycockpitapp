@@ -358,6 +358,69 @@ async fn search_directory_unchanged() {
 }
 
 #[tokio::test]
+async fn search_in_process_preserves_columns_context_glob_and_ignore_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/a.rs", "first\n  Alpha target\nthird\n");
+    write(
+        tmp.path(),
+        "src/b.txt",
+        "alpha should be excluded by glob\n",
+    );
+    let ctx = test_ctx(tmp.path());
+
+    let out = SearchTool
+        .call(
+            serde_json::json!({
+                "path": "src",
+                "pattern": "alpha",
+                "ignore_case": true,
+                "context": 1,
+                "glob": "*.rs"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("a.rs:1- first"), "{}", out.content);
+    assert!(
+        out.content.contains("a.rs:2:3:   Alpha target"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("a.rs:3- third"), "{}", out.content);
+    assert!(!out.content.contains("b.txt"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn search_ranking_is_noop_without_existing_index_scores() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "zcore.rs", "// gadget\n");
+    write(tmp.path(), "acold.rs", "// gadget\n");
+
+    set_centrality(tmp.path(), true);
+    let ctx = test_ctx(tmp.path());
+    let ranked = SearchTool
+        .call(serde_json::json!({ "pattern": "gadget" }), &ctx)
+        .await
+        .unwrap();
+
+    set_centrality(tmp.path(), false);
+    let ctx2 = test_ctx(tmp.path());
+    let unranked = SearchTool
+        .call(serde_json::json!({ "pattern": "gadget" }), &ctx2)
+        .await
+        .unwrap();
+
+    assert_eq!(ranked.content, unranked.content);
+    let index = crate::intel::Index::new(ctx.session.db.clone(), tmp.path().to_path_buf());
+    assert!(
+        index.tree_rows().unwrap().is_empty(),
+        "search ranking must not build the index just to rank results"
+    );
+}
+
+#[tokio::test]
 async fn search_thins_large_line_results_before_budgeting() {
     let tmp = tempfile::tempdir().unwrap();
     let mut body = String::new();

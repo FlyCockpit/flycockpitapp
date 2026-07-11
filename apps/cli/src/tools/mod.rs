@@ -49,6 +49,7 @@ pub mod skill;
 pub mod spawn;
 pub mod task;
 pub mod task_repair;
+pub mod text_search;
 pub mod todo;
 pub mod todo_read;
 pub mod tool_result_retrieve;

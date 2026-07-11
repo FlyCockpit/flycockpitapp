@@ -1894,10 +1894,14 @@ impl App {
             return false;
         }
 
-        // The *displayed* message keeps the composer's exact text,
-        // including paste-block placeholders (wire/user split — the user
-        // sees `[Pasted text #1, …]`, the model gets the expansion).
-        let submitted = self.composer.text().trim().to_string();
+        // The *displayed* message expands text paste placeholders for the
+        // transcript, but keeps that marker-free display separate from the
+        // paste-marked model wire built below.
+        let submitted = self
+            .paste_registry
+            .expand_display(self.composer.text())
+            .trim()
+            .to_string();
         if submitted.is_empty() && self.paste_registry.is_empty() {
             return false;
         }
@@ -3938,18 +3942,50 @@ mod queued_message_edit_tests {
 #[cfg(test)]
 mod paste_routing_tests {
     use crate::db::pins::PinnedMessage;
+    use crate::engine::message::UserSubmission;
+    use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
     use crate::tui::app::{App, Overlay};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
 
     fn input_ready_app(tmp: &tempfile::TempDir) -> App {
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app
+    }
+
+    fn runner_with_input_tx(input_tx: mpsc::Sender<UserSubmission>) -> AgentRunner {
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
+        AgentRunner {
+            input_tx,
+            record_tx,
+            attached_request_tx,
+            events: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
+            active_agent: Arc::new(Mutex::new("Build".to_string())),
+            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            session_id: uuid::Uuid::new_v4(),
+            short_id: "abc123".to_string(),
+            project_id: "project".to_string(),
+            usage: UsageCounts::default(),
+            owns_daemon: false,
+            socket: PathBuf::from("/tmp/cockpit-test.sock"),
+            history: Vec::new(),
+            paused_work: Vec::new(),
+            repair_required: None,
+            daemon_version: "test".to_string(),
+            daemon_compatible: true,
+            client_tasks: ClientTasks::default(),
+        }
     }
 
     fn ctrl(ch: char) -> KeyEvent {
@@ -4006,7 +4042,7 @@ mod paste_routing_tests {
         let block = &app.paste_registry.blocks()[0];
         assert!(matches!(
             &block.kind,
-            PasteKind::Text { full, tokens: None } if full == &pasted
+            PasteKind::Text { full, tokens: None, .. } if full == &pasted
         ));
 
         drain_async_actions_until_idle(&mut app).await;
@@ -4026,8 +4062,64 @@ mod paste_routing_tests {
         app.handle_paste(pasted.clone());
 
         let (wire, images) = app.paste_registry.build_wire(app.composer.text(), true);
-        assert_eq!(wire, pasted);
+        assert!(wire.contains("<user_paste id=\""), "{wire}");
+        assert!(wire.contains(&pasted), "{wire}");
+        assert!(wire.contains("</user_paste id=\""), "{wire}");
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn submit_text_paste_expands_transcript_display_and_marks_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        app.agent_runner = Some(Ok(runner_with_input_tx(input_tx)));
+        let pasted = long_paste("wire display");
+        let placeholder =
+            app.paste_registry
+                .register_text(0, pasted.clone(), crate::tokens::count(&pasted));
+        app.composer.insert_str(&placeholder);
+
+        let keep_running = app.submit_input();
+
+        assert!(!keep_running);
+        let display = app
+            .history
+            .iter()
+            .find_map(|entry| match entry {
+                crate::tui::history::HistoryEntry::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("optimistic user row");
+        assert!(display.contains(&pasted), "display: {display}");
+        assert!(
+            display.contains("--- paste #1 start ---"),
+            "display: {display}"
+        );
+        assert!(
+            display.contains("--- paste #1 end ---"),
+            "display: {display}"
+        );
+        assert!(!display.contains("[Pasted text #"), "display: {display}");
+        assert!(!display.contains("<user_paste"), "display: {display}");
+
+        let submission = input_rx.try_recv().expect("submission sent");
+        assert!(
+            submission.text.contains("<user_paste id=\""),
+            "{}",
+            submission.text
+        );
+        assert!(submission.text.contains(&pasted), "{}", submission.text);
+        assert!(
+            submission.text.contains("</user_paste id=\""),
+            "{}",
+            submission.text
+        );
+        assert!(
+            !submission.text.contains("--- paste #1"),
+            "{}",
+            submission.text
+        );
     }
 
     #[tokio::test]

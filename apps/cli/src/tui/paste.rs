@@ -21,6 +21,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+const USER_PASTE_TAG: &str = "user_paste";
+const DISPLAY_PASTE_RULE: &str = "---";
+
 /// Text paste collapses into a condensed block only when it exceeds this
 /// many lines **or** [`CONDENSE_CHAR_THRESHOLD`] characters. Smaller
 /// pastes insert as raw text (settled UX decision).
@@ -54,7 +57,11 @@ pub enum PasteKind {
     /// condensation — the placeholder is never sent for text).
     /// `tokens` is display metadata only; `None` means the exact count is
     /// still being computed off the input path.
-    Text { full: String, tokens: Option<usize> },
+    Text {
+        full: String,
+        tokens: Option<usize>,
+        nonce: String,
+    },
     /// Pasted image. `png` is the PNG-encoded bytes; `hash` dedups
     /// repeats; `reference` is true when this is a duplicate paste of an
     /// image already in the buffer (sent as `[reference image #N]`, bytes
@@ -209,6 +216,7 @@ impl PasteRegistry {
     ) -> (u64, String) {
         let id = self.next_block_id();
         let number = self.next_text_number();
+        let nonce = Self::text_nonce(&full);
         let placeholder = match tokens {
             Some(tokens) => Self::text_placeholder(number, tokens),
             None => Self::pending_text_placeholder(number),
@@ -219,7 +227,11 @@ impl PasteRegistry {
             start: at,
             end,
             number,
-            kind: PasteKind::Text { full, tokens },
+            kind: PasteKind::Text {
+                full,
+                tokens,
+                nonce,
+            },
         });
         (id, placeholder)
     }
@@ -288,6 +300,43 @@ impl PasteRegistry {
             end: old_end,
             replacement,
         })
+    }
+
+    fn text_nonce(full: &str) -> String {
+        loop {
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            if !full.contains(&Self::user_paste_close_tag(&nonce)) {
+                return nonce;
+            }
+        }
+    }
+
+    fn user_paste_open_tag(nonce: &str) -> String {
+        format!("<{USER_PASTE_TAG} id=\"{nonce}\">")
+    }
+
+    fn user_paste_close_tag(nonce: &str) -> String {
+        format!("</{USER_PASTE_TAG} id=\"{nonce}\">")
+    }
+
+    fn append_user_paste_wire(out: &mut String, full: &str, nonce: &str) {
+        out.push_str(&Self::user_paste_open_tag(nonce));
+        out.push_str(full);
+        out.push_str(&Self::user_paste_close_tag(nonce));
+    }
+
+    fn display_paste_boundary(number: u32, edge: &str) -> String {
+        format!("{DISPLAY_PASTE_RULE} paste #{number} {edge} {DISPLAY_PASTE_RULE}")
+    }
+
+    fn append_display_paste(out: &mut String, full: &str, number: u32) {
+        out.push_str(&Self::display_paste_boundary(number, "start"));
+        out.push('\n');
+        out.push_str(full);
+        if !full.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&Self::display_paste_boundary(number, "end"));
     }
 
     fn insert_sorted(&mut self, block: PasteBlock) {
@@ -438,6 +487,22 @@ impl PasteRegistry {
         self.shift_for_edit(start, -((end - start) as isize));
     }
 
+    fn expand_blocks(
+        &self,
+        buffer: &str,
+        mut render_block: impl FnMut(&mut String, &PasteBlock),
+    ) -> String {
+        let mut out = String::with_capacity(buffer.len());
+        let mut prev = 0usize;
+        for block in &self.blocks {
+            out.push_str(&buffer[prev..block.start]);
+            render_block(&mut out, block);
+            prev = block.end;
+        }
+        out.push_str(&buffer[prev..]);
+        out
+    }
+
     /// Build the per-occurrence wire pieces for send time. Walks the
     /// buffer text left→right, replacing each block placeholder with the
     /// appropriate wire form and emitting image parts in order:
@@ -458,32 +523,38 @@ impl PasteRegistry {
     /// text and image content parts. (For non-vision and reference cases
     /// no sentinel is emitted — those are pure text.)
     pub fn build_wire(&self, buffer: &str, vision: bool) -> (String, Vec<Vec<u8>>) {
-        let mut out = String::with_capacity(buffer.len());
         let mut images = Vec::new();
-        let mut prev = 0usize;
-        // Blocks are sorted by start.
-        for b in &self.blocks {
-            out.push_str(&buffer[prev..b.start]);
-            match &b.kind {
-                PasteKind::Text { full, .. } => out.push_str(full),
-                PasteKind::Image { png, reference, .. } => {
-                    if !vision {
-                        out.push_str(&format!(
-                            "[Pasted image #{}: not sent — current model has no image support]",
-                            b.number
-                        ));
-                    } else if *reference {
-                        out.push_str(&format!("[reference image #{}]", b.number));
-                    } else {
-                        out.push_str(IMAGE_PART_SENTINEL);
-                        images.push(png.clone());
-                    }
+        let out = self.expand_blocks(buffer, |out, block| match &block.kind {
+            PasteKind::Text { full, nonce, .. } => {
+                Self::append_user_paste_wire(out, full, nonce);
+            }
+            PasteKind::Image { png, reference, .. } => {
+                if !vision {
+                    out.push_str(&format!(
+                        "[Pasted image #{}: not sent — current model has no image support]",
+                        block.number
+                    ));
+                } else if *reference {
+                    out.push_str(&format!("[reference image #{}]", block.number));
+                } else {
+                    out.push_str(IMAGE_PART_SENTINEL);
+                    images.push(png.clone());
                 }
             }
-            prev = b.end;
-        }
-        out.push_str(&buffer[prev..]);
+        });
         (out, images)
+    }
+
+    /// Build the marker-free transcript display for send time. Text
+    /// blocks expand to their full pasted content inside display-only
+    /// boundaries; image placeholders remain literal.
+    pub fn expand_display(&self, buffer: &str) -> String {
+        self.expand_blocks(buffer, |out, block| match &block.kind {
+            PasteKind::Text { full, .. } => {
+                Self::append_display_paste(out, full, block.number);
+            }
+            PasteKind::Image { .. } => out.push_str(&buffer[block.start..block.end]),
+        })
     }
 }
 
@@ -698,15 +769,63 @@ mod tests {
     }
 
     #[test]
-    fn build_wire_text_block_inlines_full_text() {
+    fn build_wire_text_block_wraps_full_text_with_nonce_tags() {
         let mut r = PasteRegistry::new();
         let buffer = String::from("see ");
         let full = "VERY LONG TEXT".to_string();
         let p = r.register_text(buffer.len(), full.clone(), 4);
+        let nonce = match &r.blocks()[0].kind {
+            PasteKind::Text { nonce, .. } => nonce.clone(),
+            _ => panic!("expected text block"),
+        };
         let buffer = format!("{buffer}{p}");
         let (wire, images) = r.build_wire(&buffer, true);
-        assert_eq!(wire, "see VERY LONG TEXT");
+        assert_eq!(
+            wire,
+            format!("see <user_paste id=\"{nonce}\">VERY LONG TEXT</user_paste id=\"{nonce}\">")
+        );
+        assert!(!wire.contains(DISPLAY_PASTE_RULE));
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn text_blocks_get_distinct_stable_nonces() {
+        let mut r = PasteRegistry::new();
+        let first = r.register_text(0, "first".into(), 1);
+        r.register_text(first.len(), "second".into(), 2);
+
+        let nonces = r
+            .blocks()
+            .iter()
+            .map(|b| match &b.kind {
+                PasteKind::Text { nonce, .. } => nonce.as_str(),
+                _ => panic!("expected text block"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nonces.len(), 2);
+        assert_ne!(nonces[0], nonces[1]);
+    }
+
+    #[test]
+    fn expand_display_inlines_text_without_wire_markers_and_keeps_image_placeholder() {
+        let mut r = PasteRegistry::new();
+        let mut buffer = String::from("see ");
+        let text = r.register_text(buffer.len(), "VERY LONG TEXT".into(), 4);
+        buffer.push_str(&text);
+        buffer.push(' ');
+        let image = r.register_image(buffer.len(), vec![1, 2, 3]);
+        buffer.push_str(&image);
+
+        let display = r.expand_display(&buffer);
+
+        assert_eq!(
+            display,
+            "see --- paste #1 start ---
+VERY LONG TEXT
+--- paste #1 end --- [Pasted image #1]"
+        );
+        assert!(!display.contains("<user_paste"));
+        assert!(!display.contains("[Pasted text #"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Context } from "../context";
-import { authRouter } from "./auth";
+import { authRouter, passwordCapabilities } from "./auth";
 
 vi.mock("@flycockpit/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -16,6 +16,7 @@ vi.mock("@flycockpit/db", async () => {
 vi.mock("@flycockpit/env/server", () => ({
   env: {},
   ADMIN_EMAILS: new Set<string>(),
+  FORCE_SSO: false,
 }));
 
 // authRouter imports verifyTransport for the email-OTP delivery preflight.
@@ -27,6 +28,7 @@ vi.mock("@flycockpit/mailer", () => ({
 const { default: prisma } = await import("@flycockpit/db");
 
 const db = prisma as unknown as {
+  account: { findFirst: MockInstance };
   user: { update: MockInstance };
 };
 
@@ -69,9 +71,66 @@ function buildContext(
   };
 }
 
+describe("passwordCapabilities helper", () => {
+  it("hides password changes when forced SSO is enabled", () => {
+    expect(passwordCapabilities({ forceSso: true, hasPasswordCredential: true })).toEqual({
+      canChangePassword: false,
+      reason: "force-sso",
+    });
+  });
+
+  it("hides password changes without a password credential", () => {
+    expect(passwordCapabilities({ forceSso: false, hasPasswordCredential: false })).toEqual({
+      canChangePassword: false,
+      reason: "no-password",
+    });
+  });
+});
+
 describe("authRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.account.findFirst.mockResolvedValue(null);
+  });
+
+  describe("passwordCapabilities", () => {
+    it("requires authentication", async () => {
+      const client = createRouterClient(authRouter, { context: buildContext(null) });
+
+      await expect(client.passwordCapabilities()).rejects.toSatisfy((err: ORPCError) => {
+        expect(err).toBeInstanceOf(ORPCError);
+        expect(err.code).toBe("UNAUTHORIZED");
+        return true;
+      });
+      expect(db.account.findFirst).not.toHaveBeenCalled();
+    });
+
+    it("allows password changes when the user has a password credential", async () => {
+      db.account.findFirst.mockResolvedValue({ id: "account-id" });
+      const client = createRouterClient(authRouter, { context: buildContext() });
+
+      await expect(client.passwordCapabilities()).resolves.toEqual({
+        canChangePassword: true,
+        reason: null,
+      });
+      expect(db.account.findFirst).toHaveBeenCalledWith({
+        where: {
+          userId: "test-user-id",
+          providerId: "credential",
+          password: { not: null },
+        },
+        select: { id: true },
+      });
+    });
+
+    it("reports no-password when the account has no password credential", async () => {
+      const client = createRouterClient(authRouter, { context: buildContext() });
+
+      await expect(client.passwordCapabilities()).resolves.toEqual({
+        canChangePassword: false,
+        reason: "no-password",
+      });
+    });
   });
 
   describe("updateLocale", () => {

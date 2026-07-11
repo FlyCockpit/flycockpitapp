@@ -9,11 +9,10 @@ import { useMutation } from "@tanstack/react-query";
 import { useParams, useRouter } from "@tanstack/react-router";
 import { Languages } from "lucide-react";
 import { useTranslation } from "react-i18next";
-
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { useHaptics } from "@/hooks/use-haptics";
 import { isSupportedLocale, type Locale, SUPPORTED_LOCALES } from "@/i18n/config";
 import { LOCALE_LABELS } from "@/i18n/labels";
-import { useDeferredSession } from "@/stores/session";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -29,7 +28,7 @@ export default function LanguageSwitcherSelect() {
   // `strict: false` so the switcher renders under any matched route — the
   // top-level `/` redirect briefly mounts without `lang` in scope.
   const params = useParams({ strict: false });
-  const { data: session } = useDeferredSession();
+  const { data: session } = useAuthSessionSnapshot();
 
   // Silent server-side sync of the signed-in user's preference. The router's
   // global error toast handles failures — the URL switch already succeeded by

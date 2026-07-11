@@ -57,6 +57,7 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: !forceSso,
     requireEmailVerification: true,
+    minPasswordLength: 12,
   },
   emailVerification: {
     sendVerificationEmail: async ({ user, url }) => {
@@ -87,6 +88,10 @@ export const auth = betterAuth({
     // session:30d, refresh every 1d
     expiresIn: 60 * 60 * 24 * 30,
     updateAge: 60 * 60 * 24,
+    cookieCache: {
+      enabled: true,
+      maxAge: 60,
+    },
   },
   advanced: {
     defaultCookieAttributes: isCrossOrigin

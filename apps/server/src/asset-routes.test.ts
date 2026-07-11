@@ -5,7 +5,9 @@ import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  fetchAsset: vi.fn(),
+  authorizeAssetRead: vi.fn(),
+  readAssetObject: vi.fn(),
+  streamAssetObject: vi.fn(),
   presignAsset: vi.fn(),
   finalizeAsset: vi.fn(),
   heartbeatAsset: vi.fn(),
@@ -48,6 +50,15 @@ function mockUpstream(opts: Parameters<typeof fakeUpstream>[0]) {
   );
 }
 
+function streamBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
 vi.mock("@flycockpit/api/lib/assets", () => ({
   AssetError: class AssetError extends Error {
     constructor(
@@ -59,14 +70,17 @@ vi.mock("@flycockpit/api/lib/assets", () => ({
     }
   },
   assetCacheControl: (visibility: string) =>
-    visibility === "PUBLIC" ? "public, max-age=86400, immutable" : "private, max-age=86400",
-  fetchAsset: mocks.fetchAsset,
+    visibility === "PUBLIC" ? "public, max-age=86400, immutable" : "private, no-cache",
+  authorizeAssetRead: mocks.authorizeAssetRead,
+  readAssetObject: mocks.readAssetObject,
+  streamAssetObject: mocks.streamAssetObject,
   finalizeAsset: mocks.finalizeAsset,
   heartbeatAsset: mocks.heartbeatAsset,
   presignAsset: mocks.presignAsset,
 }));
 
 vi.mock("@flycockpit/api/lib/images", () => ({
+  imageTransformETag: (assetId: string) => `"img:${assetId}:w0:h0:q80:webp"`,
   parseTransformParams: () => ({}),
   transformImage: mocks.transformImage,
 }));
@@ -111,12 +125,16 @@ describe("asset routes", () => {
     const app = new Hono<TestEnv>();
     mountAssetRoutes(app);
 
-    mocks.fetchAsset.mockResolvedValue({
-      meta: makeAssetMeta({ mimeType: "text/html", visibility: "PUBLIC" }),
-      body: {
-        body: new TextEncoder().encode("<script>alert(1)</script>"),
-        contentType: "text/html",
-      },
+    mocks.authorizeAssetRead.mockResolvedValue(
+      makeAssetMeta({ mimeType: "text/html", visibility: "PUBLIC" }),
+    );
+    mocks.streamAssetObject.mockResolvedValue({
+      body: streamBytes(new TextEncoder().encode("<script>alert(1)</script>")),
+      contentType: "text/html",
+      contentLength: 25,
+      contentRange: null,
+      totalSize: 25,
+      etag: null,
     });
 
     const res = await app.request("/api/assets/asset-1");
@@ -131,12 +149,16 @@ describe("asset routes", () => {
     const app = new Hono<TestEnv>();
     mountAssetRoutes(app);
 
-    mocks.fetchAsset.mockResolvedValue({
-      meta: makeAssetMeta({ mimeType: "image/png", visibility: "PUBLIC" }),
-      body: {
-        body: new Uint8Array([1, 2, 3]),
-        contentType: "image/png",
-      },
+    mocks.authorizeAssetRead.mockResolvedValue(
+      makeAssetMeta({ mimeType: "image/png", visibility: "PUBLIC" }),
+    );
+    mocks.streamAssetObject.mockResolvedValue({
+      body: streamBytes(new Uint8Array([1, 2, 3])),
+      contentType: "image/png",
+      contentLength: 3,
+      contentRange: null,
+      totalSize: 3,
+      etag: null,
     });
 
     const res = await app.request("/api/assets/asset-1");
@@ -144,6 +166,36 @@ describe("asset routes", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Disposition")).toBe("inline");
     expect(res.headers.get("Content-Security-Policy")).toBe("sandbox");
+  });
+
+  it("authorizes before returning a raw asset 304", async () => {
+    const app = new Hono<TestEnv>();
+    mountAssetRoutes(app);
+    mocks.authorizeAssetRead.mockResolvedValue(makeAssetMeta({ id: "asset-1" }));
+
+    const res = await app.request("/api/assets/asset-1", {
+      headers: { "If-None-Match": '"asset-1"' },
+    });
+
+    expect(res.status).toBe(304);
+    expect(mocks.authorizeAssetRead).toHaveBeenCalled();
+    expect(mocks.streamAssetObject).not.toHaveBeenCalled();
+  });
+
+  it("authorizes before returning an image transform 304", async () => {
+    const app = new Hono<TestEnv>();
+    mountAssetRoutes(app);
+    mocks.authorizeAssetRead.mockResolvedValue(
+      makeAssetMeta({ id: "asset-1", mimeType: "image/png" }),
+    );
+
+    const res = await app.request("/api/images/asset-1", {
+      headers: { "If-None-Match": '"img:asset-1:w0:h0:q80:webp"' },
+    });
+
+    expect(res.status).toBe(304);
+    expect(mocks.authorizeAssetRead).toHaveBeenCalled();
+    expect(mocks.readAssetObject).not.toHaveBeenCalled();
   });
 
   it("rejects active document MIME types during presign", async () => {
@@ -248,13 +300,16 @@ describe("asset routes", () => {
   });
 });
 
-function makeAssetMeta(overrides: { mimeType: string; visibility: "PUBLIC" | "RESTRICTED" }) {
+function makeAssetMeta(
+  overrides: { id?: string; mimeType?: string; visibility?: "PUBLIC" | "RESTRICTED" } = {},
+) {
+  const id = overrides.id ?? "asset-1";
   return {
-    id: "asset-1",
-    storageKey: "assets/asset-1",
-    mimeType: overrides.mimeType,
+    id,
+    storageKey: `assets/${id}`,
+    mimeType: overrides.mimeType ?? "image/png",
     size: 3,
-    visibility: overrides.visibility,
+    visibility: overrides.visibility ?? "PUBLIC",
     ownerId: null,
     width: null,
     height: null,

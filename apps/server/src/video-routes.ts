@@ -259,15 +259,16 @@ async function streamArtifact(
       : videoCacheControl(meta.visibility);
   const headers: Record<string, string> = {
     "Content-Type": contentType,
-    "Content-Length": String(result.contentLength),
     "Cache-Control": cache,
+    "Accept-Ranges": "bytes",
   };
+  if (result.contentLength !== null) {
+    headers["Content-Length"] = String(result.contentLength);
+  }
   if (result.contentRange) {
     headers["Content-Range"] = result.contentRange;
-    headers["Accept-Ranges"] = "bytes";
     return new Response(result.body, { status: 206, headers });
   }
-  headers["Accept-Ranges"] = "bytes";
   return new Response(result.body, { status: 200, headers });
 }
 

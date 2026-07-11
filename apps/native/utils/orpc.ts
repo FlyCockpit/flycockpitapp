@@ -9,7 +9,26 @@ import { Platform } from "react-native";
 
 import { authClient } from "@/lib/auth-client";
 
+let cachedCookie: string | null | undefined;
+
+authClient.$store.listen("$sessionSignal", () => {
+  cachedCookie = undefined;
+});
+
+function getSessionCookie(): string | null {
+  if (cachedCookie !== undefined) return cachedCookie;
+  cachedCookie = authClient.getCookie() || null;
+  return cachedCookie;
+}
+
 export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      gcTime: 5 * 60_000,
+      retry: 1,
+      staleTime: 30_000,
+    },
+  },
   queryCache: new QueryCache({
     onError: (error) => {
       console.log(error);
@@ -31,7 +50,7 @@ const link = new RPCLink({
       return {};
     }
     const headers = new Map<string, string>();
-    const cookies = authClient.getCookie();
+    const cookies = getSessionCookie();
     if (cookies) {
       headers.set("Cookie", cookies);
     }
@@ -42,3 +61,10 @@ const link = new RPCLink({
 const client: AppRouterClient = createORPCClient(link);
 
 export const orpc = createTanstackQueryUtils(client);
+
+export function appConfigQueryOptions() {
+  return {
+    ...orpc.appConfig.queryOptions(),
+    staleTime: 5 * 60_000,
+  };
+}

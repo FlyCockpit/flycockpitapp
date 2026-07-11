@@ -17,7 +17,10 @@ import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-ro
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
+import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 import { safeRedirectTo } from "@/utils/safe-redirect";
@@ -27,8 +30,9 @@ export const Route = createFileRoute("/$lang/signup")({
     redirectTo: typeof search.redirectTo === "string" ? search.redirectTo : undefined,
   }),
   beforeLoad: async ({ context, params, search }) => {
-    const session = await authClient.getSession();
-    if (session.data) {
+    const decision = decideAnonymousOnlyRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Could not verify session");
+    if (decision.kind === "redirect-authenticated") {
       throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
     }
     const cfg = await context.queryClient.ensureQueryData(orpc.appConfig.queryOptions());
@@ -42,7 +46,7 @@ export const Route = createFileRoute("/$lang/signup")({
 function SignupPage() {
   const { lang } = Route.useParams();
   const { redirectTo } = Route.useSearch();
-  const { isPending } = authClient.useSession();
+  const { isPending } = useAuthSessionSnapshot();
   const config = useQuery(orpc.appConfig.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
 
@@ -168,7 +172,7 @@ function SignUpForm({ lang, redirectTo }: { lang: string; redirectTo: string }) 
       onSubmit: z.object({
         name: z.string().min(2),
         email: z.email(),
-        password: z.string().min(8),
+        password: z.string().min(12),
       }),
     },
   });

@@ -15,7 +15,6 @@
     "@flycockpit/auth": "workspace:*",
     "@flycockpit/db": "workspace:*",
     "@flycockpit/env": "workspace:*",
-    "@flycockpit/i18n-translate": "workspace:*",
     "@flycockpit/mailer": "workspace:*",
     "@flycockpit/queue": "workspace:*",
     "bullmq": "catalog:",

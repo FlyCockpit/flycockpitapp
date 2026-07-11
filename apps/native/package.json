@@ -24,7 +24,6 @@
     "@flycockpit/auth": "workspace:*",
     "@flycockpit/cockpit-protocol": "workspace:*",
     "@flycockpit/env": "workspace:*",
-    "@flycockpit/relay-protocol": "workspace:*",
     "@tanstack/react-form": "catalog:",
     "@tanstack/react-query": "catalog:",
     "better-auth": "catalog:",

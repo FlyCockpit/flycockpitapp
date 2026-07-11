@@ -4,9 +4,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
-
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
-import { useDeferredSession } from "@/stores/session";
 import { orpc } from "@/utils/orpc";
 
 // Lazy so the shared Base UI overlay chunk (Menu/Dialog/focus-guards) leaves the
@@ -26,7 +25,7 @@ export default function UserMenu() {
   // top-level `/` redirect route without throwing.
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { data: session, isPending } = useDeferredSession();
+  const { data: session, isPending } = useAuthSessionSnapshot();
   const config = useQuery(orpc.appConfig.queryOptions());
   const { t } = useTranslation("nav");
   const [mounted, setMounted] = useState(false);

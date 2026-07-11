@@ -9,10 +9,18 @@ import type { Context, Next } from "hono";
 // Failure mode: a Better-Auth blip becomes "no session" rather than a 500
 // for the entire request. The downstream `requireAuth` gates will still
 // return 401 if a real session was needed.
+//
+// SECURITY: `Authorization` is stripped before resolving, so routes guarded by
+// this middleware authenticate by cookie only. API keys are MCP credentials;
+// forwarding a Bearer key here would let Better Auth's api-key plugin mock a
+// full admin session for /rpc procedures that do not enforce MCP read/write
+// scope.
 export async function sessionMiddleware(c: Context, next: Next) {
   let session: Session | null = null;
   try {
-    session = (await auth.api.getSession({ headers: c.req.raw.headers })) as Session | null;
+    const cookieOnly = new Headers(c.req.raw.headers);
+    cookieOnly.delete("authorization");
+    session = (await auth.api.getSession({ headers: cookieOnly })) as Session | null;
   } catch (err) {
     console.warn("[session-middleware] getSession failed, treating as anonymous:", err);
     session = null;

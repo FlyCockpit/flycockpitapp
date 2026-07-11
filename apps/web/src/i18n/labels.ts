@@ -13,7 +13,3 @@ export const LOCALE_LABELS: Record<Locale, string> = {
   "en-US": "English (US)",
   "es-MX": "Español (México)",
 };
-
-export function localeLabel(locale: string): string {
-  return locale in LOCALE_LABELS ? LOCALE_LABELS[locale as Locale] : locale;
-}

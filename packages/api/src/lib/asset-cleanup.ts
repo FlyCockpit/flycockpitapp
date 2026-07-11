@@ -3,8 +3,10 @@ import prisma from "@flycockpit/db";
 import {
   abortMultipartUpload,
   deleteStorageObject,
+  deleteStorageObjects,
   listIncompleteMultipartUploads,
   listStorageObjects,
+  type StorageObjectListEntry,
   storage,
 } from "./storage";
 
@@ -242,27 +244,65 @@ export async function runCleanup(opts?: CleanupOptions): Promise<CleanupResult> 
   }
 
   const objectCutoff = new Date(now - o.objectMinAgeMs);
-  for await (const obj of listStorageObjects(ASSET_KEY_PREFIX)) {
-    if (obj.lastModified && obj.lastModified > objectCutoff) continue;
-    // Re-check at delete time: a row may have been created after we kicked
-    // off the LIST, especially on big buckets where the iteration takes long.
-    const existing = await prisma.asset.findUnique({
-      where: { storageKey: obj.key },
-      select: { id: true },
+  const OBJECT_BATCH_SIZE = 1000;
+  let objectBatch: StorageObjectListEntry[] = [];
+
+  const processObjectBatch = async () => {
+    if (objectBatch.length === 0) return;
+    const batch = objectBatch;
+    objectBatch = [];
+
+    const knownRows = await prisma.asset.findMany({
+      where: { storageKey: { in: batch.map((obj) => obj.key) } },
+      select: { storageKey: true },
     });
-    if (existing) continue;
+    const knownKeys = new Set(knownRows.map((row) => row.storageKey));
+
+    const confirmed: StorageObjectListEntry[] = [];
+    for (const obj of batch) {
+      if (knownKeys.has(obj.key)) continue;
+      const existing = await prisma.asset.findUnique({
+        where: { storageKey: obj.key },
+        select: { id: true },
+      });
+      if (existing) continue;
+      confirmed.push(obj);
+    }
+    if (confirmed.length === 0) return;
+
     try {
-      await deleteStorageObject(obj.key);
-      result.orphanObjectsDeleted++;
-      result.bytesFreed += obj.size;
+      const deletion = await deleteStorageObjects(confirmed.map((obj) => obj.key));
+      const failedKeys = new Set(deletion.errors.map((err) => err.key));
+      for (const obj of confirmed) {
+        if (failedKeys.has(obj.key)) {
+          result.orphanObjectsFailed++;
+        } else {
+          result.orphanObjectsDeleted++;
+          result.bytesFreed += obj.size;
+        }
+      }
+      for (const err of deletion.errors) {
+        console.warn("[asset-cleanup] storage delete failed for orphan object", {
+          key: err.key,
+          code: err.code,
+          message: err.message,
+        });
+      }
     } catch (err) {
-      result.orphanObjectsFailed++;
-      console.warn("[asset-cleanup] storage delete failed for orphan object", {
-        key: obj.key,
+      result.orphanObjectsFailed += confirmed.length;
+      console.warn("[asset-cleanup] batched storage delete failed for orphan objects", {
+        keys: confirmed.map((obj) => obj.key),
         err,
       });
     }
+  };
+
+  for await (const obj of listStorageObjects(ASSET_KEY_PREFIX)) {
+    if (obj.lastModified && obj.lastModified > objectCutoff) continue;
+    objectBatch.push(obj);
+    if (objectBatch.length >= OBJECT_BATCH_SIZE) await processObjectBatch();
   }
+  await processObjectBatch();
 
   const multipartCutoff = new Date(now - o.multipartMaxAgeMs);
   for await (const upload of listIncompleteMultipartUploads(ASSET_KEY_PREFIX)) {

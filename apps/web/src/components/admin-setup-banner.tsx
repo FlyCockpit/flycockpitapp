@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 
-import { useDeferredSession } from "@/stores/session";
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -22,7 +22,7 @@ export function AdminSetupBanner() {
   // returns 401, which would render the error banner to every anonymous
   // visitor (it mounts in __root). Gate the query on an authenticated session
   // so the banner only ever shows to logged-in users (its intended audience).
-  const { data: session, isPending: sessionPending } = useDeferredSession();
+  const { data: session, isPending: sessionPending } = useAuthSessionSnapshot();
   // ADMIN_EMAILS is a server-restart-time constant, so refetching on every
   // route transition is wasteful. 5-minute staleTime avoids hammering the API.
   const { data, isPending, isError, refetch } = useQuery({

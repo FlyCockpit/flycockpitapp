@@ -262,6 +262,7 @@ function InviteGrantDialog({
   const canSubmit =
     normalizedEmail.length > 0 && selectedScopes.length > 0 && terminalConfirmed && !isPending;
 
+  // effect:audited — clears terminal-confirm email when the terminal scope is deselected
   useEffect(() => {
     if (!terminalSelected) setTerminalConfirmEmail("");
   }, [terminalSelected]);

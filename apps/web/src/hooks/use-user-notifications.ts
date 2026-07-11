@@ -5,7 +5,7 @@ import {
 import { toast } from "@flycockpit/ui/components/sileo";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useDeferredSession } from "@/stores/session";
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { client, orpc } from "@/utils/orpc";
 
 const HEARTBEAT_MS = 25_000;
@@ -29,7 +29,7 @@ function userRelayUrl(relayUrl: string, token: string) {
 }
 
 export function useUserNotifications() {
-  const session = useDeferredSession();
+  const session = useAuthSessionSnapshot();
   const queryClient = useQueryClient();
   const signedIn = Boolean(session.data?.user);
   const clientId = useMemo(() => (typeof window === "undefined" ? "server" : getClientId()), []);

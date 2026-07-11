@@ -106,8 +106,6 @@ catalog:
   blurhash: ^2.0.5
   "@aws-sdk/client-s3": ^3.1069.0
   "@aws-sdk/s3-request-presigner": ^3.1069.0
-  "@unpic/react": ^1.0.2
-  "@unpic/placeholder": ^0.1.2
   react-markdown: ^10.1.0
   "@hono/mcp": ^0.3.0
   "@modelcontextprotocol/sdk": ^1.29.0

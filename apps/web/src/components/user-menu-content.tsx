@@ -10,10 +10,9 @@ import {
 } from "@flycockpit/ui/components/dropdown-menu";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-
+import { useAuthSessionSnapshot } from "@/hooks/use-auth-session";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
-import { useDeferredSession } from "@/stores/session";
 
 /**
  * The real Base UI account menu. Lazy-loaded by `user-menu.tsx` on first
@@ -28,7 +27,7 @@ export default function UserMenuContent() {
   // top-level `/` redirect route without throwing.
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { data: session } = useDeferredSession();
+  const { data: session } = useAuthSessionSnapshot();
   const { t } = useTranslation("nav");
 
   // The shell only renders this once a session exists; guard defensively so a
@@ -66,8 +65,8 @@ export default function UserMenuContent() {
             onClick={async () => {
               // Dynamic import so the better-auth client chunk stays off the
               // eager bundle (UserMenu renders in the root on every page). By
-              // the time a signed-in user opens this menu, SessionSync has
-              // already loaded the chunk, so this resolves from cache.
+              // the time a signed-in user opens this menu, the session hook has
+              // already loaded the chunk, so this usually resolves from cache.
               const { authClient } = await import("@/lib/auth-client");
               authClient.signOut({
                 fetchOptions: {

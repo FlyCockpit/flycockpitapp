@@ -1,4 +1,6 @@
-# Remote sessions web UI
+---
+title: Remote Sessions Web UI
+---
 
 Use this script to verify the browser remote-session surface against a real relay and cockpit-cli daemon.
 

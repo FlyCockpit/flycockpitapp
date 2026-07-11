@@ -31,8 +31,6 @@
     "@tanstack/react-router": "catalog:",
     "@tanstack/react-router-ssr-query": "catalog:",
     "@tanstack/react-start": "catalog:",
-    "@unpic/placeholder": "catalog:",
-    "@unpic/react": "catalog:",
     "@vidstack/react": "catalog:",
     "better-auth": "catalog:",
     "crossws": "^0.4.6",

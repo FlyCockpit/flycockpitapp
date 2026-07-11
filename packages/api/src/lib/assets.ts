@@ -6,11 +6,13 @@ import prisma from "@flycockpit/db";
 import {
   deleteStorageObject,
   getStorageObject,
+  getStorageObjectRange,
   headStorageObject,
   type PresignedPut,
   presignPut,
   putStorageObject,
   type StorageObject,
+  type StorageObjectRange,
   storage,
 } from "./storage";
 
@@ -107,6 +109,12 @@ export function canViewAsset(asset: AssetMeta, viewer: Viewer): boolean {
  * inherits the new policy.
  */
 export async function fetchAsset(id: string, viewer: Viewer): Promise<AssetFetchResult> {
+  const meta = await authorizeAssetRead(id, viewer);
+  const body = await readAssetObject(meta);
+  return { meta, body };
+}
+
+export async function authorizeAssetRead(id: string, viewer: Viewer): Promise<AssetMeta> {
   if (!storage) throw new AssetError("STORAGE_DISABLED", "Object storage is not configured");
 
   const meta = await prisma.asset.findUnique({ where: { id } });
@@ -118,27 +126,41 @@ export async function fetchAsset(id: string, viewer: Viewer): Promise<AssetFetch
     // existence; the HTTP layer translates AssetError("FORBIDDEN") to 404.
     throw new AssetError("FORBIDDEN", "Not allowed to view this asset");
   }
+  return assetMeta;
+}
 
-  const body = await getStorageObject(assetMeta.storageKey);
+export async function readAssetObject(meta: AssetMeta): Promise<StorageObject> {
+  const body = await getStorageObject(meta.storageKey);
   if (!body) {
     throw new AssetError(
       "GONE",
-      `Asset ${id} has a database row but storage object ${assetMeta.storageKey} is missing`,
+      `Asset ${meta.id} has a database row but storage object ${meta.storageKey} is missing`,
     );
   }
-  return { meta: assetMeta, body };
+  return body;
+}
+
+export async function streamAssetObject(meta: AssetMeta): Promise<StorageObjectRange> {
+  const body = await getStorageObjectRange(meta.storageKey, null);
+  if (!body) {
+    throw new AssetError(
+      "GONE",
+      `Asset ${meta.id} has a database row but storage object ${meta.storageKey} is missing`,
+    );
+  }
+  return body;
 }
 
 /**
- * Build the cache-control header for an asset response. PUBLIC → 24h shared
- * cache. RESTRICTED → 24h browser cache only (no CDN). Image endpoint reuses
- * this for its own responses so the derivative inherits the source's policy.
+ * Build the cache-control header for an asset response. PUBLIC assets can be
+ * shared for 24h. RESTRICTED assets may be stored by the browser, but every use
+ * must revalidate so the origin can re-run authorization before returning 304.
  */
 export function assetCacheControl(visibility: AssetVisibility): string {
   if (visibility === "PUBLIC") {
     return "public, max-age=86400, immutable";
   }
-  return "private, max-age=86400";
+  return "private, no-cache";
 }
 
 export type CreateAssetInput = {

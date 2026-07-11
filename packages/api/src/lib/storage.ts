@@ -5,6 +5,7 @@ import {
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
   ListMultipartUploadsCommand,
@@ -192,6 +193,41 @@ export async function deleteStorageObject(key: string): Promise<void> {
   await storage.client.send(
     new DeleteObjectCommand({ Bucket: storage.bucket, Key: physicalKey(storage, key) }),
   );
+}
+
+const DELETE_OBJECTS_MAX_KEYS = 1000;
+
+export type DeleteStorageObjectsResult = {
+  deleted: string[];
+  errors: { key: string; code: string | null; message: string | null }[];
+};
+
+export async function deleteStorageObjects(keys: string[]): Promise<DeleteStorageObjectsResult> {
+  if (!storage) throw new Error("Storage is not configured");
+  const result: DeleteStorageObjectsResult = { deleted: [], errors: [] };
+  for (let i = 0; i < keys.length; i += DELETE_OBJECTS_MAX_KEYS) {
+    const batch = keys.slice(i, i + DELETE_OBJECTS_MAX_KEYS);
+    const response = await storage.client.send(
+      new DeleteObjectsCommand({
+        Bucket: storage.bucket,
+        Delete: {
+          Objects: batch.map((key) => ({ Key: physicalKey(storage, key) })),
+          Quiet: true,
+        },
+      }),
+    );
+    const failed = new Set<string>();
+    for (const err of response.Errors ?? []) {
+      if (!err.Key) continue;
+      const key = logicalKey(storage, err.Key);
+      failed.add(key);
+      result.errors.push({ key, code: err.Code ?? null, message: err.Message ?? null });
+    }
+    for (const key of batch) {
+      if (!failed.has(key)) result.deleted.push(key);
+    }
+  }
+  return result;
 }
 
 const PRESIGN_EXPIRES_SECONDS = 300;
@@ -473,18 +509,18 @@ export async function completeMultipartUpload(
 // ---------------------------------------------------------------------------
 
 export type StorageObjectRange = {
-  body: Uint8Array;
+  body: ReadableStream<Uint8Array>;
   contentType: string;
-  contentLength: number;
+  contentLength: number | null;
   contentRange: string | null;
   totalSize: number | null;
+  etag: string | null;
 };
 
 /**
- * Fetch an object with an HTTP-style Range header. Used by the HLS segment
- * route so a player that requests `bytes=0-65535` on a large segment doesn't
- * force the server to buffer the whole file. Range is optional — pass null
- * to read the whole object. Returns null when the object doesn't exist.
+ * Fetch an object with an HTTP-style Range header. Used by the HLS segment and
+ * asset routes. The body is streamed, not buffered, so large objects do not sit
+ * in server memory before the response starts.
  */
 export async function getStorageObjectRange(
   key: string,
@@ -500,16 +536,16 @@ export async function getStorageObjectRange(
       }),
     );
     if (!result.Body) return null;
-    const body = await result.Body.transformToByteArray();
     return {
-      body,
+      body: toWebReadable(result.Body),
       contentType: result.ContentType ?? "application/octet-stream",
-      contentLength: result.ContentLength ?? body.byteLength,
+      contentLength: result.ContentLength ?? null,
       contentRange: result.ContentRange ?? null,
       totalSize:
         typeof result.ContentRange === "string"
           ? Number.parseInt(result.ContentRange.split("/")[1] ?? "", 10) || null
           : (result.ContentLength ?? null),
+      etag: result.ETag ?? null,
     };
   } catch (err: unknown) {
     if (isNotFoundError(err)) return null;
@@ -531,6 +567,19 @@ function toNodeReadable(body: unknown): NodeJS.ReadableStream {
       body as { transformToWebStream: () => NodeReadableStream<Uint8Array> }
     ).transformToWebStream();
     return Readable.fromWeb(stream);
+  }
+  throw new Error("Storage object body is not a readable stream");
+}
+
+function toWebReadable(body: unknown): ReadableStream<Uint8Array> {
+  if (body instanceof ReadableStream) return body as ReadableStream<Uint8Array>;
+  if (typeof body === "object" && body !== null && "transformToWebStream" in body) {
+    return (
+      body as { transformToWebStream: () => ReadableStream<Uint8Array> }
+    ).transformToWebStream();
+  }
+  if (body instanceof Readable) {
+    return Readable.toWeb(body) as ReadableStream<Uint8Array>;
   }
   throw new Error("Storage object body is not a readable stream");
 }

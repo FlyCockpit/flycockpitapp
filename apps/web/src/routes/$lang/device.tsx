@@ -14,6 +14,8 @@ import { ShieldCheck, ShieldX } from "lucide-react";
 import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { authClient } from "@/lib/auth-client";
+import { decideDeviceRouteAccess } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -27,18 +29,19 @@ export const Route = createFileRoute("/$lang/device")({
     return { user_code: userCode };
   },
   beforeLoad: async ({ location, params }) => {
-    const session = await authClient.getSession();
-    if (!session.data) {
+    const decision = decideDeviceRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Could not verify session");
+    if (decision.kind === "redirect-to-login") {
       throw redirect({
         to: "/$lang/login",
         params: { lang: params.lang },
         search: { redirectTo: location.href },
       });
     }
-    if (!session.data.user.emailVerified) {
+    if (decision.kind === "redirect-to-dashboard") {
       throw redirect({ to: "/$lang/dashboard", params: { lang: params.lang } });
     }
-    return { session: session.data };
+    return { session: decision.session };
   },
   component: DevicePage,
 });

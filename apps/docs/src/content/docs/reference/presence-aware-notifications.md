@@ -1,4 +1,6 @@
-# Presence-aware notifications
+---
+title: Presence-Aware Notifications
+---
 
 Use this script to verify daemon attention events through the relay, control plane, browser toast, web push, and inbox ledger.
 

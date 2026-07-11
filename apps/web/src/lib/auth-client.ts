@@ -12,6 +12,11 @@ import { createAuthClient } from "better-auth/react";
 
 export const authClient = createAuthClient({
   baseURL: env.VITE_SERVER_URL,
+  sessionOptions: {
+    refetchOnWindowFocus: true,
+    refetchWhenOffline: false,
+    refetchInterval: 0,
+  },
   plugins: [
     // Surface server-side `user.additionalFields` (e.g. `locale`) on the
     // typed session. Without this, `session.user.locale` is unknown to the

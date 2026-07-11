@@ -7,6 +7,7 @@ vi.mock("@flycockpit/db", async () => {
 });
 
 const deleteStorageObject = vi.fn().mockResolvedValue(undefined);
+const deleteStorageObjects = vi.fn().mockResolvedValue({ deleted: [], errors: [] });
 const listStorageObjects = vi.fn(async function* () {});
 const listIncompleteMultipartUploads = vi.fn(async function* () {});
 const abortMultipartUpload = vi.fn();
@@ -14,6 +15,7 @@ const abortMultipartUpload = vi.fn();
 vi.mock("./storage", () => ({
   abortMultipartUpload,
   deleteStorageObject,
+  deleteStorageObjects,
   listIncompleteMultipartUploads,
   listStorageObjects,
   storage: { bucket: "test", client: {}, keyPrefix: "" },
@@ -38,6 +40,7 @@ const db = prisma as unknown as {
   };
   videoSubtitleTrack: {
     findFirst: MockInstance;
+    findMany: MockInstance;
   };
 };
 
@@ -45,6 +48,10 @@ describe("runVideoCleanup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listStorageObjects.mockImplementation(async function* () {});
+    deleteStorageObjects.mockImplementation(async (keys: string[]) => ({
+      deleted: keys,
+      errors: [],
+    }));
     db.video.findUnique.mockResolvedValue(null);
     db.video.findMany.mockResolvedValue([]);
     db.video.deleteMany.mockResolvedValue({ count: 0 });
@@ -55,6 +62,7 @@ describe("runVideoCleanup", () => {
     db.videoAudioTrack.deleteMany.mockResolvedValue({ count: 0 });
     db.videoAudioTrack.updateMany.mockResolvedValue({ count: 0 });
     db.videoSubtitleTrack.findFirst.mockResolvedValue(null);
+    db.videoSubtitleTrack.findMany.mockResolvedValue([]);
   });
 
   it("re-checks pending videos at delete time before deleting storage", async () => {
@@ -134,7 +142,7 @@ describe("runVideoCleanup", () => {
       where: { videoId_locale: { videoId: "video-1", locale: "es-MX" } },
       select: { id: true },
     });
-    expect(deleteStorageObject).toHaveBeenCalledWith("videos/video-1/a/es-MX/playlist.m3u8");
+    expect(deleteStorageObjects).toHaveBeenCalledWith(["videos/video-1/a/es-MX/playlist.m3u8"]);
   });
 
   it("keeps output audio objects when the live video still has that audio track", async () => {
@@ -153,7 +161,7 @@ describe("runVideoCleanup", () => {
     const result = await runVideoCleanup({ objectMinAgeMs: 1 });
 
     expect(result.orphanObjectsDeleted).toBe(0);
-    expect(deleteStorageObject).not.toHaveBeenCalled();
+    expect(deleteStorageObjects).not.toHaveBeenCalled();
   });
 
   it("keeps non-track objects for live videos without track lookups", async () => {
@@ -174,7 +182,7 @@ describe("runVideoCleanup", () => {
     expect(db.videoAudioTrack.findUnique).not.toHaveBeenCalled();
     expect(db.videoAudioTrack.findFirst).not.toHaveBeenCalled();
     expect(db.videoSubtitleTrack.findFirst).not.toHaveBeenCalled();
-    expect(deleteStorageObject).not.toHaveBeenCalled();
+    expect(deleteStorageObjects).not.toHaveBeenCalled();
   });
 
   it("deletes raw audio source objects for live videos when no track references the key", async () => {
@@ -197,7 +205,7 @@ describe("runVideoCleanup", () => {
       where: { videoId: "video-1", sourceKey: "rawVideos/video-1/a/track-1/source" },
       select: { id: true },
     });
-    expect(deleteStorageObject).toHaveBeenCalledWith("rawVideos/video-1/a/track-1/source");
+    expect(deleteStorageObjects).toHaveBeenCalledWith(["rawVideos/video-1/a/track-1/source"]);
   });
 
   it("deletes subtitle objects for live videos when no subtitle row references the key", async () => {
@@ -212,6 +220,7 @@ describe("runVideoCleanup", () => {
     });
     db.video.findUnique.mockResolvedValue({ id: "video-1" });
     db.videoSubtitleTrack.findFirst.mockResolvedValue(null);
+    db.videoSubtitleTrack.findMany.mockResolvedValue([]);
 
     const result = await runVideoCleanup({ objectMinAgeMs: 1 });
 
@@ -220,7 +229,7 @@ describe("runVideoCleanup", () => {
       where: { videoId: "video-1", storageKey: "videos/video-1/t/en-US.subtitles.vtt" },
       select: { id: true },
     });
-    expect(deleteStorageObject).toHaveBeenCalledWith("videos/video-1/t/en-US.subtitles.vtt");
+    expect(deleteStorageObjects).toHaveBeenCalledWith(["videos/video-1/t/en-US.subtitles.vtt"]);
   });
 });
 

@@ -1,4 +1,5 @@
 import { appRouter } from "@flycockpit/api/routers/index";
+import { env } from "@flycockpit/env/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createRouterClient, ORPCError } from "@orpc/server";
 import * as z from "zod/v4";
@@ -92,6 +93,15 @@ export function registerTools(server: McpServer): void {
           const bytes = new Uint8Array(Buffer.from(bodyBase64, "base64"));
           if (bytes.byteLength === 0) {
             throw new ORPCError("BAD_REQUEST", { message: "bodyBase64 is empty" });
+          }
+          if (bytes.byteLength > env.ASSET_UPLOAD_MAX_BYTES) {
+            const limitMb = Math.round(env.ASSET_UPLOAD_MAX_BYTES / (1024 * 1024));
+            throw new ORPCError("BAD_REQUEST", {
+              message:
+                limitMb > 0
+                  ? `File is too large. Max size is ${limitMb} MB.`
+                  : "File is too large.",
+            });
           }
           if (!isAllowedUploadMimeType(mimeType)) {
             throw new ORPCError("BAD_REQUEST", { message: "File type is not allowed." });

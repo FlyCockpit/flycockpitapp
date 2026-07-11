@@ -11,8 +11,8 @@ apps/web/dev-dist
 *.tsbuildinfo
 
 # Environment variables
-.env
-.env*.local
+.env*
+!.env.example
 !.env.docker.defaults
 
 # Agent dev-docker port state (written by scripts/dev-docker.sh)

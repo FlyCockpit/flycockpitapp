@@ -1,11 +1,40 @@
 import { SUPPORTED_LOCALES } from "@flycockpit/config/locales";
 import prisma from "@flycockpit/db";
+import { FORCE_SSO } from "@flycockpit/env/server";
 import { verifyTransport } from "@flycockpit/mailer";
 import { z } from "zod";
 
 import { protectedProcedure, publicProcedure } from "../index";
 
+export function passwordCapabilities({
+  forceSso,
+  hasPasswordCredential,
+}: {
+  forceSso: boolean;
+  hasPasswordCredential: boolean;
+}) {
+  return {
+    canChangePassword: hasPasswordCredential && !forceSso,
+    reason: forceSso ? "force-sso" : hasPasswordCredential ? null : "no-password",
+  } as const;
+}
+
 export const authRouter = {
+  passwordCapabilities: protectedProcedure.handler(async ({ context }) => {
+    const passwordCredential = await prisma.account.findFirst({
+      where: {
+        userId: context.session.user.id,
+        providerId: "credential",
+        password: { not: null },
+      },
+      select: { id: true },
+    });
+
+    return passwordCapabilities({
+      forceSso: FORCE_SSO,
+      hasPasswordCredential: passwordCredential !== null,
+    });
+  }),
   /**
    * Delivery-aware preflight for the email-OTP second factor. The login
    * challenge calls this BEFORE `authClient.twoFactor.sendOtp()` because

@@ -122,12 +122,15 @@ const MAX_FORCED_SECRET_VARIANTS: usize = 3;
 /// (or `BEGIN ENCRYPTED PRIVATE KEY`) header and are therefore still
 /// registered.
 const PEM_PRIVATE_KEY_HEADERS: &[&str] = &[
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
-    "-----BEGIN RSA PRIVATE KEY-----",
-    "-----BEGIN EC PRIVATE KEY-----",
-    "-----BEGIN DSA PRIVATE KEY-----",
-    "-----BEGIN PRIVATE KEY-----",
-    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    // These are literal PEM header strings (never real key material), matched
+    // as prefixes to detect keys for redaction. The `allowlist secret` marker
+    // tells the CI secret scanner to skip these lines.
+    "-----BEGIN OPENSSH PRIVATE KEY-----", // pragma: allowlist secret
+    "-----BEGIN RSA PRIVATE KEY-----",     // pragma: allowlist secret
+    "-----BEGIN EC PRIVATE KEY-----",      // pragma: allowlist secret
+    "-----BEGIN DSA PRIVATE KEY-----",     // pragma: allowlist secret
+    "-----BEGIN PRIVATE KEY-----",         // pragma: allowlist secret
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----", // pragma: allowlist secret
 ];
 
 /// Shared env-key heuristic for variables that should be treated as

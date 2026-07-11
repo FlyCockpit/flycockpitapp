@@ -1,5 +1,16 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema-jsonc.json",
+  // Exports that are consumed within their own file (but not imported
+  // elsewhere) are intentional module-internal API / pending integration —
+  // don't flag them as unused. Truly orphaned exports (used nowhere at all)
+  // are still reported.
+  "ignoreExportsUsedInFile": true,
+  "rules": {
+    // `userRelayFrameSchema` is a deliberate alias of
+    // `userPresenceRelayFrameSchema` in @flycockpit/relay-protocol (the
+    // generic "user frame" seam; both names are consumed). Allow the alias.
+    "duplicates": "off"
+  },
   "workspaces": {
     ".": {
       "entry": [

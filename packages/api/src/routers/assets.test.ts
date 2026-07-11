@@ -3,7 +3,7 @@ import { createRouterClient, ORPCError } from "@orpc/server";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Context } from "../../context";
+import type { Context } from "../context";
 import { assetsRouter } from "./assets";
 
 vi.mock("@flycockpit/db", async () => {

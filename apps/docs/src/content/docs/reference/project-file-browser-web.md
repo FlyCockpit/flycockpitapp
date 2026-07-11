@@ -1,4 +1,6 @@
-# Project file browser web UI
+---
+title: Project File Browser Web UI
+---
 
 Use this script to verify the browser project-file surface against a real relay and cockpit-cli daemon.
 

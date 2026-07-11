@@ -9,10 +9,10 @@ import { appConfigQueryOptions, queryClient } from "@/utils/orpc";
 
 export default function Account() {
   const { data: session } = authClient.useSession();
-  const appConfig = useQuery(appConfigQueryOptions());
+  const { data: appConfig } = useQuery(appConfigQueryOptions());
   const showSignup =
-    appConfig.data?.signupEnabled === true || appConfig.data?.adminBootstrapSignupEnabled === true;
-  const forceSso = appConfig.data?.ssoEnabled === true && appConfig.data.forceSso === true;
+    appConfig?.signupEnabled === true || appConfig?.adminBootstrapSignupEnabled === true;
+  const forceSso = appConfig?.ssoEnabled === true && appConfig.forceSso === true;
 
   return (
     <Container className="p-6">

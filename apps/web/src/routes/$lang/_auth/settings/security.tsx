@@ -58,10 +58,15 @@ function SecuritySettings() {
 }
 
 function PasswordSection() {
-  const capabilities = useQuery(orpc.auth.passwordCapabilities.queryOptions());
+  const {
+    data: capabilities,
+    isPending,
+    isError,
+    refetch,
+  } = useQuery(orpc.auth.passwordCapabilities.queryOptions());
   const { t } = useTranslation(["settings", "common"]);
 
-  if (capabilities.isPending) {
+  if (isPending) {
     return (
       <Card>
         <CardHeader>
@@ -80,7 +85,7 @@ function PasswordSection() {
     );
   }
 
-  if (capabilities.isError) {
+  if (isError) {
     return (
       <Card>
         <CardHeader>
@@ -92,7 +97,7 @@ function PasswordSection() {
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-destructive">{t("settings:security.passwordLoadError")}</p>
-          <Button className="min-h-[44px]" variant="outline" onClick={() => capabilities.refetch()}>
+          <Button className="min-h-[44px]" variant="outline" onClick={() => refetch()}>
             {t("common:actions.retry")}
           </Button>
         </CardContent>
@@ -100,7 +105,7 @@ function PasswordSection() {
     );
   }
 
-  if (!capabilities.data.canChangePassword) return null;
+  if (!capabilities?.canChangePassword) return null;
 
   return <ChangePasswordCard />;
 }

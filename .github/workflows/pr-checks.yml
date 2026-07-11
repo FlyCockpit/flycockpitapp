@@ -470,7 +470,7 @@ jobs:
                 ':!*.example' ':!.env.docker.defaults' ':!docker-compose.agent.yml' ':!*.md' || true
               git grep -nE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' -- \
                 ':!*.example' ':!.env.docker.defaults' || true
-            } | grep -v 'generateValue: true' || true
+            } | grep -v 'generateValue: true' | grep -v 'allowlist secret' || true
           )"
           if [ -n "$matches" ]; then
             echo "$matches"

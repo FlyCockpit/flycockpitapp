@@ -999,10 +999,12 @@ fn walker_unbounded_finds_depth9_env() {
 /// A realistic OpenSSH private-key body. The header is what `build`
 /// content-matches on; the body is just enough to clear `min_secret_length`
 /// and exercise multi-line key material.
-const ED25519_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
-QyNTUxOQAAACDfake-key-material-for-test-not-a-real-key-0001AAAAAA\n\
------END OPENSSH PRIVATE KEY-----";
+const ED25519_PRIVATE_KEY: &str = concat!(
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n", // pragma: allowlist secret
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n",
+    "QyNTUxOQAAACDfake-key-material-for-test-not-a-real-key-0001AAAAAA\n",
+    "-----END OPENSSH PRIVATE KEY-----",
+);
 
 const ED25519_PUBLIC_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5fake-public-key-material-001 user@host";
@@ -1109,9 +1111,11 @@ fn ssh_missing_dir_is_silent() {
 #[test]
 fn ssh_encrypted_private_key_still_registered() {
     let dir = TempDir::new().unwrap();
-    let encrypted = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
-MIIFHzBJBgkqhkiG9w0BBQ0wPDencrypted-key-material-for-test-001\n\
------END ENCRYPTED PRIVATE KEY-----";
+    let encrypted = concat!(
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----\n", // pragma: allowlist secret
+        "MIIFHzBJBgkqhkiG9w0BBQ0wPDencrypted-key-material-for-test-001\n",
+        "-----END ENCRYPTED PRIVATE KEY-----",
+    );
     std::fs::write(dir.path().join("encrypted_key"), encrypted).unwrap();
     let t = RedactionTable::build(&ssh_cfg(dir.path()), dir.path()).unwrap();
     let scrubbed = t.scrub(encrypted);

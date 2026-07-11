@@ -730,8 +730,12 @@ async fn in_process_text_hits(
     if max_hits == 0 {
         return Ok(Vec::new());
     }
-    let search_root =
-        crate::tools::sandbox::check_native_access(ctx, &ctx.session.project_root).await?;
+    let search_root = crate::tools::sandbox::check_native_access(
+        ctx,
+        &ctx.session.project_root,
+        crate::tools::shell_sandbox::SandboxPathAccess::Read,
+    )
+    .await?;
     let display_root = search_root.clone();
     let guard_root = search_root.clone();
     let options = SearchOptions {

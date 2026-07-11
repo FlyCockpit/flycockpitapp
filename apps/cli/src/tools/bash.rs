@@ -254,12 +254,15 @@ impl Tool for BashTool {
                 true,
                 tmp_dir.clone(),
             );
-        let command_resource_plan = crate::tools::command_resource_profiles::plan_for_command(
-            command_classification.simple_commands(),
-            &cwd,
-            &session_env,
-            &extended_config.command_resource_profiles,
-            &profile_introspector,
+        let command_resource_plan = command_resource_plan_with_user_grants(
+            crate::tools::command_resource_profiles::plan_for_command(
+                command_classification.simple_commands(),
+                &cwd,
+                &session_env,
+                &extended_config.command_resource_profiles,
+                &profile_introspector,
+            ),
+            ctx,
         );
         let resource_plan = build_resource_plan(
             declared_resources,
@@ -580,7 +583,12 @@ async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result
             &ctx.cwd,
         )));
     };
-    let decision = approver.approve_path(path).await?;
+    let decision = approver
+        .approve_path(
+            path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
     if decision.is_allowed() {
         Ok(())
     } else {
@@ -1046,6 +1054,27 @@ fn confined_failure_escalation_offer(_outcome: &ShellOutcome) -> Option<(i32, St
 /// case the sandboxed run is skipped and the command runs broadened with
 /// no prompt. A wrapper, an ungranted command, or no approver all return
 /// `false` (run sandboxed). Pure store reads — never prompts here.
+fn command_resource_plan_with_user_grants(
+    mut plan: crate::tools::command_resource_profiles::CommandResourcePlan,
+    ctx: &ToolCtx,
+) -> crate::tools::command_resource_profiles::CommandResourcePlan {
+    let Some(approver) = ctx.approver.as_ref() else {
+        return plan;
+    };
+    plan.allow_paths.extend(
+        approver
+            .store()
+            .effective_path_grants()
+            .into_iter()
+            .map(|grant| crate::tools::shell_sandbox::ExtraSandboxPath {
+                kind: "user_grant".to_string(),
+                path: grant.path,
+                access: grant.access,
+            }),
+    );
+    plan
+}
+
 async fn command_granted_broad(ctx: &ToolCtx, command: &str) -> bool {
     let Some(approver) = ctx.approver.as_ref() else {
         return false;
@@ -2533,6 +2562,61 @@ mod tests {
         Arc::new(crate::engine::resource_scheduler::ResourceScheduler::new(
             cfg,
         ))
+    }
+
+    #[test]
+    fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        let read_dir = tmp.path().join("read-dir");
+        let write_dir = tmp.path().join("write-dir");
+        for dir in [&project, &read_dir, &write_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let ctx = ctx_with_store(&project);
+        let store = GrantStore::new(ctx.session.db.clone(), ctx.session.id, ctx.cwd.clone());
+        store
+            .record_path(
+                &read_dir,
+                Scope::Session,
+                crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            )
+            .unwrap();
+        store
+            .record_path(
+                &write_dir,
+                Scope::Session,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            )
+            .unwrap();
+
+        let plan = command_resource_plan_with_user_grants(
+            crate::tools::command_resource_profiles::CommandResourcePlan::default(),
+            &ctx,
+        );
+        assert!(plan.allow_paths.iter().any(|path| {
+            path.kind == "user_grant"
+                && path.path == read_dir
+                && path.access == crate::tools::shell_sandbox::SandboxPathAccess::Read
+        }));
+        assert!(plan.allow_paths.iter().any(|path| {
+            path.kind == "user_grant"
+                && path.path == write_dir
+                && path.access == crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+        }));
+
+        let map = crate::container::MountMap::unix(project);
+        let mounts = crate::container::resource_profile_mounts(&plan, &map, false);
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.host == read_dir && mount.read_only)
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.host == write_dir && !mount.read_only)
+        );
     }
 
     fn ctx_with_scheduler(

@@ -81,7 +81,12 @@ impl Tool for SearchTool {
         // Native-tool boundary check (sandboxing part 2): a `path` filter
         // pointing outside cwd + session tmp must escalate before the
         // search reads any file contents there.
-        crate::tools::sandbox::check_native_access(ctx, &search_path).await?;
+        crate::tools::sandbox::check_native_access(
+            ctx,
+            &search_path,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         // Distinguish dir / single-file / missing up front so a file path
         // searches just that file (no silent widening to the parent) and a
         // missing path returns a legible error instead of a raw OS one.

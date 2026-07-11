@@ -1077,7 +1077,13 @@ mod tests {
             .store
             .record_path_reject(&outside, Scope::Session)
             .unwrap();
-        let decision = approver.approve_path(&outside).await.unwrap();
+        let decision = approver
+            .approve_path(
+                &outside,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            )
+            .await
+            .unwrap();
         assert_eq!(decision, Decision::Deny);
         let events = permission_events(&approver);
         assert_eq!(events.len(), 1);

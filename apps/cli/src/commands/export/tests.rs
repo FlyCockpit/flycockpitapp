@@ -1107,8 +1107,8 @@ fn export_includes_persisted_approval_grants_snapshot() {
         .unwrap();
         conn.execute(
             "INSERT INTO approval_grants \
-                 (session_id, grant_kind, grant_key, granted_at) \
-                 VALUES (?1, 'path', '/tmp/example', ?2)",
+                 (session_id, grant_kind, grant_key, granted_at, access) \
+                 VALUES (?1, 'path', '/tmp/example', ?2, 'read-write')",
             rusqlite::params![sid.to_string(), 1_700_000_001_i64],
         )
         .unwrap();
@@ -1133,7 +1133,10 @@ fn export_includes_persisted_approval_grants_snapshot() {
     let session = &approvals["session"][0];
     assert_eq!(session["session_id"], sid.to_string());
     assert_eq!(session["grants"]["commands"], json!(["grep"]));
-    assert_eq!(session["grants"]["paths"], json!(["/tmp/example"]));
+    assert_eq!(
+        session["grants"]["paths"],
+        json!([{ "key": "/tmp/example", "access": "read-write" }])
+    );
     assert_eq!(session["grants"]["loop_accept"], json!(["loop-hash"]));
 }
 

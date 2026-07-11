@@ -26,7 +26,7 @@
 //! one at a non-`Once` scope with [`StoreError::WrapperNotPersistable`].
 //! Wrappers re-prompt every run.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::approval::classify::ApprovalKey;
 use crate::config::extended::{ApprovalPolicyConfig, ApprovalPolicyScope};
 use crate::db::Db;
+use crate::tools::shell_sandbox::SandboxPathAccess;
 
 /// The four approval scopes the user chose. Ordered narrowest→widest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,20 +183,20 @@ struct ApprovalsFile {
     /// Command-key allow grants, as storage strings (`"gh pr"`, `"ls"`).
     #[serde(default)]
     commands: BTreeSet<String>,
-    /// Path allow grants, as absolute path / prefix strings.
-    #[serde(default)]
-    paths: BTreeSet<String>,
+    /// Path allow grants, as absolute path / prefix strings mapped to access mode.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    paths: BTreeMap<String, SandboxPathAccess>,
     /// Command-key **reject** grants — the allow set's mirror. A key here
     /// auto-denies a future attempt without re-prompting. Mutually exclusive
     /// with `commands` for the same key (the recorder clears the other
     /// polarity first), so a key is never in both.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     commands_reject: BTreeSet<String>,
-    /// Path **reject** grants — the `paths` set's mirror. A path here
-    /// auto-denies out-of-cwd access without re-prompting. Mutually exclusive
-    /// with `paths` for the same key.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    paths_reject: BTreeSet<String>,
+    /// Path **reject** grants — the `paths` map's mirror. A path here
+    /// auto-denies out-of-cwd access without re-prompting. The access value
+    /// is retained for the unified persisted shape; reject matching ignores it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    paths_reject: BTreeMap<String, SandboxPathAccess>,
     /// Loop-guard always-accept rules, keyed by call signature (a hash of
     /// tool name + canonical `wire_input`; see [`GrantStore::loop_signature`]).
     /// A signature here auto-accepts a back-to-back repeat of that exact
@@ -206,6 +207,12 @@ struct ApprovalsFile {
     /// A signature here auto-rejects the repeat with the guidance error.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     loop_reject: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectivePathGrant {
+    pub path: PathBuf,
+    pub access: SandboxPathAccess,
 }
 
 /// The grant store. Holds the session DB handle (for Session scope) and
@@ -311,20 +318,59 @@ impl GrantStore {
         None
     }
 
-    /// Whether a path is already **allowed**. A grant covers the path
-    /// itself and anything under it (prefix match) — a directory grant
-    /// covers its descendants, the natural confinement semantics part 2
-    /// wants.
-    pub fn is_path_granted(&self, path: &Path) -> bool {
+    pub fn is_path_granted_for(&self, path: &Path, required: SandboxPathAccess) -> bool {
+        self.effective_path_grant_access(path)
+            .is_some_and(|access| access >= required)
+    }
+
+    pub fn effective_path_grant_access(&self, path: &Path) -> Option<SandboxPathAccess> {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        self.session_path_has(Verdict::Allow, matches)
-            || self
-                .project_file()
-                .is_some_and(|f| f.paths.iter().any(|p| matches(p)))
-            || self
-                .global_file()
-                .is_some_and(|f| f.paths.iter().any(|p| matches(p)))
+        if self.path_reject_matches(matches) {
+            return None;
+        }
+        let mut access: Option<SandboxPathAccess> = None;
+        for (key, grant_access) in self.path_allow_entries() {
+            if path_covers(&key, &candidate) {
+                access = Some(access.map_or(grant_access, |current| current.max(grant_access)));
+            }
+        }
+        access
+    }
+
+    pub fn effective_path_grants(&self) -> Vec<EffectivePathGrant> {
+        let rejects = self.path_reject_entries();
+        let mut by_path: BTreeMap<String, SandboxPathAccess> = BTreeMap::new();
+        for (key, access) in self.path_allow_entries() {
+            if rejects
+                .iter()
+                .any(|(reject, _)| paths_overlap(reject, &key))
+            {
+                continue;
+            }
+            by_path
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(access))
+                .or_insert(access);
+        }
+
+        let entries = by_path.into_iter().collect::<Vec<_>>();
+        let mut grants = Vec::new();
+        'outer: for (key, access) in &entries {
+            for (other_key, other_access) in &entries {
+                if other_key == key {
+                    continue;
+                }
+                if *other_access >= *access && path_covers(other_key, key) {
+                    continue 'outer;
+                }
+            }
+            grants.push(EffectivePathGrant {
+                path: PathBuf::from(key),
+                access: *access,
+            });
+        }
+        grants
     }
 
     /// Whether a path is **rejected** at any applicable scope — the allow
@@ -333,13 +379,7 @@ impl GrantStore {
     pub fn is_path_rejected(&self, path: &Path) -> bool {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        self.session_path_has(Verdict::Reject, matches)
-            || self
-                .project_file()
-                .is_some_and(|f| f.paths_reject.iter().any(|p| matches(p)))
-            || self
-                .global_file()
-                .is_some_and(|f| f.paths_reject.iter().any(|p| matches(p)))
+        self.path_reject_matches(matches)
     }
 
     /// Record a command-key **allow** grant at `scope`. Rejects wrappers at
@@ -363,6 +403,7 @@ impl GrantStore {
             &info.key.as_storage_str(),
             scope,
             Verdict::Allow,
+            None,
         )
     }
 
@@ -386,6 +427,7 @@ impl GrantStore {
             &info.key.as_storage_str(),
             scope,
             Verdict::Reject,
+            None,
         )
     }
 
@@ -395,7 +437,12 @@ impl GrantStore {
     /// checks are stable.
     /// Clears any standing **reject** for this key across reachable scopes
     /// first.
-    pub fn record_path(&self, path: &Path, scope: Scope) -> Result<(), StoreError> {
+    pub fn record_path(
+        &self,
+        path: &Path,
+        scope: Scope,
+        access: SandboxPathAccess,
+    ) -> Result<(), StoreError> {
         if scope == Scope::Once {
             return Err(StoreError::OnceNotPersistable);
         }
@@ -404,6 +451,7 @@ impl GrantStore {
             &normalize_path(path, &self.cwd),
             scope,
             Verdict::Allow,
+            Some(access),
         )
     }
 
@@ -419,6 +467,7 @@ impl GrantStore {
             &normalize_path(path, &self.cwd),
             scope,
             Verdict::Reject,
+            Some(SandboxPathAccess::ReadWrite),
         )
     }
 
@@ -589,6 +638,7 @@ impl GrantStore {
         key: &str,
         scope: Scope,
         verdict: Verdict,
+        access: Option<SandboxPathAccess>,
     ) -> Result<(), StoreError> {
         if scope == Scope::Once {
             return Err(StoreError::OnceNotPersistable);
@@ -606,7 +656,7 @@ impl GrantStore {
         match scope {
             Scope::Once => Err(StoreError::OnceNotPersistable),
             Scope::Session => self
-                .session_insert(kind, key, verdict)
+                .session_insert(kind, key, verdict, access)
                 .map_err(StoreError::Io),
             Scope::Project => {
                 if self.project_root.is_none() {
@@ -617,7 +667,7 @@ impl GrantStore {
                     .as_ref()
                     .context("no machine-local project approvals dir available")
                     .map_err(StoreError::Io)?;
-                self.file_insert(dir, kind, key, verdict)
+                self.file_insert(dir, kind, key, verdict, access)
                     .map_err(StoreError::Io)
             }
             Scope::Global => {
@@ -626,7 +676,7 @@ impl GrantStore {
                     .clone()
                     .context("no global config dir available")
                     .map_err(StoreError::Io)?;
-                self.file_insert(&dir, kind, key, verdict)
+                self.file_insert(&dir, kind, key, verdict, access)
                     .map_err(StoreError::Io)
             }
         }
@@ -675,48 +725,87 @@ impl GrantStore {
             .unwrap_or(false)
     }
 
-    /// Path grants need prefix matching, so we read all session path
-    /// grants of the requested polarity and test each. (The set is tiny —
-    /// one session's manual approvals — so a full scan is cheaper than
-    /// clever SQL.)
-    fn session_path_has(&self, verdict: Verdict, matches: impl Fn(&str) -> bool) -> bool {
+    fn session_path_entries(&self, verdict: Verdict) -> Vec<(String, SandboxPathAccess)> {
         self.db
             .read_blocking(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT grant_key FROM approval_grants \
-                     WHERE session_id = ?1 AND grant_kind = 'path' AND verdict = ?2",
+                    "SELECT grant_key, access FROM approval_grants \
+                     WHERE session_id = ?1 AND grant_kind = 'path' AND verdict = ?2 \
+                     ORDER BY grant_key",
                 )?;
                 let rows = stmt.query_map(
                     rusqlite::params![self.session_id.to_string(), verdict.as_str()],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        let key: String = row.get(0)?;
+                        let access: Option<String> = row.get(1)?;
+                        Ok((key, path_access_from_storage(access.as_deref())))
+                    },
                 )?;
-                for key in rows {
-                    if matches(&key?) {
-                        return Ok(true);
-                    }
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
                 }
-                Ok(false)
+                Ok(out)
             })
-            .unwrap_or(false)
+            .unwrap_or_default()
     }
 
-    fn session_insert(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
+    fn path_allow_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+        let mut entries = self.session_path_entries(Verdict::Allow);
+        if let Some(file) = self.project_file() {
+            entries.extend(file.paths);
+        }
+        if let Some(file) = self.global_file() {
+            entries.extend(file.paths);
+        }
+        entries
+    }
+
+    fn path_reject_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+        let mut entries = self.session_path_entries(Verdict::Reject);
+        if let Some(file) = self.project_file() {
+            entries.extend(file.paths_reject);
+        }
+        if let Some(file) = self.global_file() {
+            entries.extend(file.paths_reject);
+        }
+        entries
+    }
+
+    fn path_reject_matches<F>(&self, matches: F) -> bool
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.path_reject_entries()
+            .iter()
+            .any(|(key, _)| matches(key))
+    }
+
+    fn session_insert(
+        &self,
+        kind: GrantKind,
+        key: &str,
+        verdict: Verdict,
+        access: Option<SandboxPathAccess>,
+    ) -> Result<()> {
         let session_id = self.session_id;
         let key = key.to_owned();
+        let access = access.map(SandboxPathAccess::storage_str);
         self.db.write_blocking(move |conn| {
             // `INSERT OR REPLACE` on the (session_id, grant_kind, grant_key)
             // primary key flips an existing opposite verdict in place — a key
             // can never carry both polarities at session scope.
             conn.execute(
                 "INSERT OR REPLACE INTO approval_grants \
-                 (session_id, grant_kind, grant_key, granted_at, verdict) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (session_id, grant_kind, grant_key, granted_at, verdict, access) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     session_id.to_string(),
                     kind.as_str(),
                     key,
                     now_epoch_seconds(),
-                    verdict.as_str()
+                    verdict.as_str(),
+                    access
                 ],
             )
             .context("inserting session approval grant")?;
@@ -753,14 +842,21 @@ impl GrantStore {
         load_approvals(dir)
     }
 
-    fn file_insert(&self, dir: &Path, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
+    fn file_insert(
+        &self,
+        dir: &Path,
+        kind: GrantKind,
+        key: &str,
+        verdict: Verdict,
+        access: Option<SandboxPathAccess>,
+    ) -> Result<()> {
         let mut file = load_approvals(dir).unwrap_or_default();
         // Clear the opposite polarity within this same file too, so one
         // `approvals.json` never lists a key in both an allow and a reject
         // set (belt-and-braces with `clear_key_everywhere`, which already
         // visited this scope — but this keeps `file_insert` self-consistent).
-        verdict_set(&mut file, kind, verdict.opposite()).remove(key);
-        verdict_set(&mut file, kind, verdict).insert(key.to_string());
+        verdict_remove(&mut file, kind, verdict.opposite(), key);
+        verdict_insert(&mut file, kind, verdict, key, access);
         store_approvals(dir, &file)
     }
 
@@ -771,26 +867,61 @@ impl GrantStore {
         let Some(mut file) = load_approvals(dir) else {
             return Ok(());
         };
-        if verdict_set(&mut file, kind, verdict).remove(key) {
+        if verdict_remove(&mut file, kind, verdict, key) {
             store_approvals(dir, &file)?;
         }
         Ok(())
     }
 }
 
-/// The `(kind, verdict)` set within an `ApprovalsFile` — the one BTreeSet a
-/// command/path grant of that polarity lives in.
-fn verdict_set(
+fn verdict_insert(
     file: &mut ApprovalsFile,
     kind: GrantKind,
     verdict: Verdict,
-) -> &mut BTreeSet<String> {
+    key: &str,
+    access: Option<SandboxPathAccess>,
+) {
     match (kind, verdict) {
-        (GrantKind::Command, Verdict::Allow) => &mut file.commands,
-        (GrantKind::Command, Verdict::Reject) => &mut file.commands_reject,
-        (GrantKind::Path, Verdict::Allow) => &mut file.paths,
-        (GrantKind::Path, Verdict::Reject) => &mut file.paths_reject,
+        (GrantKind::Command, Verdict::Allow) => {
+            file.commands.insert(key.to_string());
+        }
+        (GrantKind::Command, Verdict::Reject) => {
+            file.commands_reject.insert(key.to_string());
+        }
+        (GrantKind::Path, Verdict::Allow) => {
+            file.paths.insert(
+                key.to_string(),
+                access.unwrap_or(SandboxPathAccess::ReadWrite),
+            );
+        }
+        (GrantKind::Path, Verdict::Reject) => {
+            file.paths_reject.insert(
+                key.to_string(),
+                access.unwrap_or(SandboxPathAccess::ReadWrite),
+            );
+        }
     }
+}
+
+fn verdict_remove(file: &mut ApprovalsFile, kind: GrantKind, verdict: Verdict, key: &str) -> bool {
+    match (kind, verdict) {
+        (GrantKind::Command, Verdict::Allow) => file.commands.remove(key),
+        (GrantKind::Command, Verdict::Reject) => file.commands_reject.remove(key),
+        (GrantKind::Path, Verdict::Allow) => file.paths.remove(key).is_some(),
+        (GrantKind::Path, Verdict::Reject) => file.paths_reject.remove(key).is_some(),
+    }
+}
+
+fn path_access_from_storage(value: Option<&str>) -> SandboxPathAccess {
+    match value {
+        Some("read") => SandboxPathAccess::Read,
+        Some("read-write") => SandboxPathAccess::ReadWrite,
+        _ => SandboxPathAccess::ReadWrite,
+    }
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    path_covers(a, b) || path_covers(b, a)
 }
 
 /// `<global config dir>` for approvals. We prefer `~/.config/cockpit`
@@ -837,14 +968,26 @@ impl ManagedGrantKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedPathGrant {
+    pub key: String,
+    pub access: SandboxPathAccess,
+}
+
+impl ManagedPathGrant {
+    pub fn access_label(&self) -> &'static str {
+        self.access.storage_str()
+    }
+}
+
 /// The four ordered grant buckets of one scope's `approvals.json`, each a
-/// sorted list of its entry keys. Produced by [`list_managed_grants`] for
-/// the `/permissions` management UI; the order (commands, paths, accept,
+/// sorted list of entries. Produced by [`list_managed_grants`] for the
+/// `/permissions` management UI; the order (commands, paths, accept,
 /// reject) is the order the UI renders sections in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManagedGrants {
     pub commands: Vec<String>,
-    pub paths: Vec<String>,
+    pub paths: Vec<ManagedPathGrant>,
     pub loop_accept: Vec<String>,
     pub loop_reject: Vec<String>,
 }
@@ -859,13 +1002,12 @@ impl ManagedGrants {
             && self.loop_reject.is_empty()
     }
 
-    /// The entries for one kind, in sorted order.
-    pub fn entries(&self, kind: ManagedGrantKind) -> &[String] {
+    pub fn entry_count(&self, kind: ManagedGrantKind) -> usize {
         match kind {
-            ManagedGrantKind::Command => &self.commands,
-            ManagedGrantKind::Path => &self.paths,
-            ManagedGrantKind::LoopAccept => &self.loop_accept,
-            ManagedGrantKind::LoopReject => &self.loop_reject,
+            ManagedGrantKind::Command => self.commands.len(),
+            ManagedGrantKind::Path => self.paths.len(),
+            ManagedGrantKind::LoopAccept => self.loop_accept.len(),
+            ManagedGrantKind::LoopReject => self.loop_reject.len(),
         }
     }
 }
@@ -879,7 +1021,11 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
     let file = load_approvals(dir).unwrap_or_default();
     ManagedGrants {
         commands: file.commands.into_iter().collect(),
-        paths: file.paths.into_iter().collect(),
+        paths: file
+            .paths
+            .into_iter()
+            .map(|(key, access)| ManagedPathGrant { key, access })
+            .collect(),
         loop_accept: file.loop_accept.into_iter().collect(),
         loop_reject: file.loop_reject.into_iter().collect(),
     }
@@ -895,13 +1041,13 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
 /// takes effect on the next approval check, which re-reads the file.
 pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Result<bool> {
     let mut file = load_approvals(dir).unwrap_or_default();
-    let set = match kind {
-        ManagedGrantKind::Command => &mut file.commands,
-        ManagedGrantKind::Path => &mut file.paths,
-        ManagedGrantKind::LoopAccept => &mut file.loop_accept,
-        ManagedGrantKind::LoopReject => &mut file.loop_reject,
+    let removed = match kind {
+        ManagedGrantKind::Command => file.commands.remove(key),
+        ManagedGrantKind::Path => file.paths.remove(key).is_some(),
+        ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
+        ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
     };
-    if !set.remove(key) {
+    if !removed {
         return Ok(false);
     }
     store_approvals(dir, &file)?;
@@ -1187,7 +1333,10 @@ mod tests {
             &repo_dir,
             &ApprovalsFile {
                 commands: BTreeSet::from([command.key.as_storage_str()]),
-                paths: BTreeSet::from([normalize_path(&granted_dir, store.cwd())]),
+                paths: BTreeMap::from([(
+                    normalize_path(&granted_dir, store.cwd()),
+                    SandboxPathAccess::ReadWrite,
+                )]),
                 ..ApprovalsFile::default()
             },
         )
@@ -1300,7 +1449,9 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let dir = tmp.path().join("src");
-        store.record_path(&dir, Scope::Project).unwrap();
+        store
+            .record_path(&dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .unwrap();
         // A file under the granted dir is covered.
         assert!(store.is_path_granted(&dir.join("main.rs")));
         // A sibling that shares a string prefix but not a path prefix is
@@ -1316,8 +1467,99 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let file = tmp.path().join("a/b/c.txt");
         assert!(!store.is_path_granted(&file));
-        store.record_path(&file, Scope::Session).unwrap();
+        store
+            .record_path(&file, Scope::Session, SandboxPathAccess::ReadWrite)
+            .unwrap();
         assert!(store.is_path_granted(&file));
+    }
+
+    #[test]
+    fn path_grant_modes_round_trip_at_each_scope() {
+        for scope in [Scope::Session, Scope::Project, Scope::Global] {
+            let tmp = tempfile::tempdir().unwrap();
+            let global = tempfile::tempdir().unwrap();
+            let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+            let dir = tmp.path().join(format!("mode-{scope:?}"));
+            store
+                .record_path(&dir, scope, SandboxPathAccess::Read)
+                .unwrap();
+            assert!(store.is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::Read));
+            assert!(
+                !store.is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::ReadWrite),
+                "read grant must not satisfy read-write at {scope:?}"
+            );
+
+            match scope {
+                Scope::Session => {
+                    let access: String = store
+                        .db
+                        .read_blocking(|conn| {
+                            Ok(conn.query_row(
+                                "SELECT access FROM approval_grants \
+                                 WHERE session_id = ?1 AND grant_kind = 'path' AND grant_key = ?2",
+                                rusqlite::params![
+                                    store.session_id.to_string(),
+                                    normalize_path(&dir, store.cwd())
+                                ],
+                                |row| row.get(0),
+                            )?)
+                        })
+                        .unwrap();
+                    assert_eq!(access, "read");
+                }
+                Scope::Project => {
+                    let grants = list_managed_grants(test_project_dir(&store));
+                    assert_eq!(grants.paths[0].key, normalize_path(&dir, store.cwd()));
+                    assert_eq!(grants.paths[0].access, SandboxPathAccess::Read);
+                }
+                Scope::Global => {
+                    let grants = list_managed_grants(global.path());
+                    assert_eq!(grants.paths[0].key, normalize_path(&dir, store.cwd()));
+                    assert_eq!(grants.paths[0].access, SandboxPathAccess::Read);
+                }
+                Scope::Once => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_path_grants_use_strongest_access_and_filter_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let read_dir = tmp.path().join("read-only");
+        let rw_dir = tmp.path().join("read-write");
+        let rejected_dir = tmp.path().join("rejected");
+
+        store
+            .record_path(&read_dir, Scope::Session, SandboxPathAccess::Read)
+            .unwrap();
+        store
+            .record_path(&read_dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .unwrap();
+        store
+            .record_path(&rw_dir, Scope::Global, SandboxPathAccess::ReadWrite)
+            .unwrap();
+        store
+            .record_path(&rejected_dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .unwrap();
+        store
+            .record_path_reject(&rejected_dir, Scope::Session)
+            .unwrap();
+
+        let grants = store.effective_path_grants();
+        assert!(grants.iter().any(|grant| {
+            grant.path == read_dir && grant.access == SandboxPathAccess::ReadWrite
+        }));
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant.path == rw_dir && grant.access == SandboxPathAccess::ReadWrite)
+        );
+        assert!(
+            !grants.iter().any(|grant| grant.path == rejected_dir),
+            "standing rejects must not become sandbox allow paths"
+        );
     }
 
     #[test]
@@ -1403,7 +1645,13 @@ mod tests {
         let unrelated_daemon_cwd = tempfile::tempdir().unwrap();
         let (store, _) = test_store(session.path(), global.path().to_path_buf());
 
-        store.record_path(Path::new("src"), Scope::Session).unwrap();
+        store
+            .record_path(
+                Path::new("src"),
+                Scope::Session,
+                SandboxPathAccess::ReadWrite,
+            )
+            .unwrap();
 
         assert!(store.is_path_granted(Path::new("src/main.rs")));
         assert!(!store.is_path_granted(&unrelated_daemon_cwd.path().join("src/main.rs")));
@@ -1522,7 +1770,9 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let dir = tmp.path().join("data");
 
-        store.record_path(&dir, Scope::Project).unwrap();
+        store
+            .record_path(&dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .unwrap();
         assert!(store.is_path_granted(&dir.join("x")));
         store.record_path_reject(&dir, Scope::Session).unwrap();
         assert!(store.is_path_rejected(&dir.join("x")));
@@ -1531,7 +1781,9 @@ mod tests {
             "reject cleared allow"
         );
 
-        store.record_path(&dir, Scope::Global).unwrap();
+        store
+            .record_path(&dir, Scope::Global, SandboxPathAccess::ReadWrite)
+            .unwrap();
         assert!(store.is_path_granted(&dir.join("x")));
         assert!(
             !store.is_path_rejected(&dir.join("x")),
@@ -1753,7 +2005,11 @@ mod tests {
             .record_command(&cmd_info("cargo", Some("build"), false), Scope::Project)
             .unwrap();
         store
-            .record_path(&dir.path().join("src"), Scope::Project)
+            .record_path(
+                &dir.path().join("src"),
+                Scope::Project,
+                SandboxPathAccess::ReadWrite,
+            )
             .unwrap();
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
         store
@@ -1822,7 +2078,9 @@ mod tests {
         let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
         point_project_scope(&mut store, dir.path(), dir.path());
         let path = dir.path().join("data");
-        store.record_path(&path, Scope::Project).unwrap();
+        store
+            .record_path(&path, Scope::Project, SandboxPathAccess::ReadWrite)
+            .unwrap();
         let acc = GrantStore::loop_signature("read", &serde_json::json!({"p": 1}));
         let rej = GrantStore::loop_signature("bash", &serde_json::json!({"c": "x"}));
         store
@@ -1833,7 +2091,7 @@ mod tests {
             .unwrap();
 
         let project_dir = test_project_dir(&store).to_path_buf();
-        let path_key = list_managed_grants(&project_dir).paths[0].clone();
+        let path_key = list_managed_grants(&project_dir).paths[0].key.clone();
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::Path, &path_key).unwrap());
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::LoopAccept, &acc).unwrap());
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::LoopReject, &rej).unwrap());

@@ -192,12 +192,43 @@ impl PermissionsPane {
         for sv in &self.scopes {
             let Some(dir) = &sv.dir else { continue };
             for kind in KIND_ORDER {
-                for key in sv.grants.entries(kind) {
-                    rows.push(DeletableRow {
-                        dir: dir.clone(),
-                        kind,
-                        key: key.clone(),
-                    });
+                match kind {
+                    ManagedGrantKind::Path => {
+                        for grant in &sv.grants.paths {
+                            rows.push(DeletableRow {
+                                dir: dir.clone(),
+                                kind,
+                                key: grant.key.clone(),
+                            });
+                        }
+                    }
+                    ManagedGrantKind::Command => {
+                        for key in &sv.grants.commands {
+                            rows.push(DeletableRow {
+                                dir: dir.clone(),
+                                kind,
+                                key: key.clone(),
+                            });
+                        }
+                    }
+                    ManagedGrantKind::LoopAccept => {
+                        for key in &sv.grants.loop_accept {
+                            rows.push(DeletableRow {
+                                dir: dir.clone(),
+                                kind,
+                                key: key.clone(),
+                            });
+                        }
+                    }
+                    ManagedGrantKind::LoopReject => {
+                        for key in &sv.grants.loop_reject {
+                            rows.push(DeletableRow {
+                                dir: dir.clone(),
+                                kind,
+                                key: key.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -298,15 +329,39 @@ impl PermissionsPane {
                 continue;
             }
             for kind in KIND_ORDER {
-                let entries = sv.grants.entries(kind);
-                if entries.is_empty() {
+                if sv.grants.entry_count(kind) == 0 {
                     continue;
                 }
                 lines.push(kind_heading(kind));
-                for key in entries {
-                    let selected = row_idx == self.list.cursor();
-                    lines.push(grant_row(key, selected));
-                    row_idx += 1;
+                match kind {
+                    ManagedGrantKind::Path => {
+                        for grant in &sv.grants.paths {
+                            let selected = row_idx == self.list.cursor();
+                            lines.push(path_grant_row(grant, selected));
+                            row_idx += 1;
+                        }
+                    }
+                    ManagedGrantKind::Command => {
+                        for key in &sv.grants.commands {
+                            let selected = row_idx == self.list.cursor();
+                            lines.push(grant_row(key, selected));
+                            row_idx += 1;
+                        }
+                    }
+                    ManagedGrantKind::LoopAccept => {
+                        for key in &sv.grants.loop_accept {
+                            let selected = row_idx == self.list.cursor();
+                            lines.push(grant_row(key, selected));
+                            row_idx += 1;
+                        }
+                    }
+                    ManagedGrantKind::LoopReject => {
+                        for key in &sv.grants.loop_reject {
+                            let selected = row_idx == self.list.cursor();
+                            lines.push(grant_row(key, selected));
+                            row_idx += 1;
+                        }
+                    }
                 }
             }
         }
@@ -332,12 +387,12 @@ impl PermissionsPane {
                 continue;
             }
             for kind in KIND_ORDER {
-                let entries = sv.grants.entries(kind);
-                if entries.is_empty() {
+                let count = sv.grants.entry_count(kind);
+                if count == 0 {
                     continue;
                 }
                 line_idx += 1; // kind heading
-                for _ in entries {
+                for _ in 0..count {
                     if row_idx == self.list.cursor() {
                         return Some(line_idx);
                     }
@@ -445,25 +500,42 @@ fn kind_heading(kind: ManagedGrantKind) -> Line<'static> {
 }
 
 fn grant_row(key: &str, selected: bool) -> Line<'static> {
-    if selected {
-        Line::from(vec![
-            Span::styled(
-                "  › ".to_string(),
-                Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX)),
-            ),
-            Span::styled(
-                key.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
+    grant_row_spans(key, None, selected)
+}
+
+fn path_grant_row(
+    grant: &crate::approval::store::ManagedPathGrant,
+    selected: bool,
+) -> Line<'static> {
+    grant_row_spans(&grant.key, Some(grant.access_label()), selected)
+}
+
+fn grant_row_spans(key: &str, mode: Option<&str>, selected: bool) -> Line<'static> {
+    let prefix = if selected { "  › " } else { "    " };
+    let mut spans = vec![Span::styled(
+        prefix.to_string(),
+        if selected {
+            Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
+        } else {
+            Style::default()
+        },
+    )];
+    let key_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Line::from(vec![
-            Span::raw("    "),
-            Span::styled(key.to_string(), Style::default().fg(Color::White)),
-        ])
+        Style::default().fg(Color::White)
+    };
+    spans.push(Span::styled(key.to_string(), key_style));
+    if let Some(mode) = mode {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            mode.to_string(),
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        ));
     }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -499,9 +571,14 @@ mod tests {
         // Round-trip through the store's record path so the file shape is
         // production-accurate: use a real store pointed at this dir.
         std::fs::create_dir_all(dir).unwrap();
+        let paths = grants
+            .paths
+            .iter()
+            .map(|grant| (grant.key.clone(), grant.access))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let file = serde_json::json!({
             "commands": grants.commands,
-            "paths": grants.paths,
+            "paths": paths,
             "loop_accept": grants.loop_accept,
             "loop_reject": grants.loop_reject,
         });
@@ -511,7 +588,13 @@ mod tests {
     fn grants(commands: &[&str], paths: &[&str]) -> ManagedGrants {
         ManagedGrants {
             commands: commands.iter().map(|s| s.to_string()).collect(),
-            paths: paths.iter().map(|s| s.to_string()).collect(),
+            paths: paths
+                .iter()
+                .map(|s| crate::approval::store::ManagedPathGrant {
+                    key: s.to_string(),
+                    access: crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                })
+                .collect(),
             loop_accept: Vec::new(),
             loop_reject: Vec::new(),
         }
@@ -550,6 +633,7 @@ mod tests {
         assert!(text.contains("gh pr"));
         assert!(text.contains("Paths"));
         assert!(text.contains("/tmp/work"));
+        assert!(text.contains("read-write"));
         assert!(text.contains("cargo build"));
     }
 

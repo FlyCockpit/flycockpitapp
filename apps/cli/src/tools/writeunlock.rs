@@ -76,7 +76,12 @@ impl Tool for WriteunlockTool {
 
         // Native-tool boundary check (sandboxing part 2): an out-of-cwd
         // write target escalates (naming the path) before we touch disk.
-        let path = crate::tools::sandbox::check_native_access(ctx, &path).await?;
+        let path = crate::tools::sandbox::check_native_access(
+            ctx,
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
 
         let exists = path.exists();
         let write_guard = if exists {

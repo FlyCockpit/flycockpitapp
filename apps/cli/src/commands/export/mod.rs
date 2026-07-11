@@ -1026,13 +1026,30 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
         let session_id = session.session_id.to_string();
         let (commands, paths, loop_accept, loop_reject): (
             Vec<String>,
-            Vec<String>,
+            Vec<Value>,
             Vec<String>,
             Vec<String>,
         ) = db.read_blocking(|conn| {
             let read_keys = |sql: &str| -> Result<Vec<String>> {
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([session_id.as_str()], |row| row.get::<_, String>(0))?;
+                let mut values = Vec::new();
+                for row in rows {
+                    values.push(row?);
+                }
+                Ok(values)
+            };
+            let read_paths = || -> Result<Vec<Value>> {
+                let mut stmt = conn.prepare(
+                    "SELECT grant_key, access FROM approval_grants \
+                     WHERE session_id = ?1 AND grant_kind = 'path' \
+                     ORDER BY grant_key",
+                )?;
+                let rows = stmt.query_map([session_id.as_str()], |row| {
+                    let key: String = row.get(0)?;
+                    let access: String = row.get(1)?;
+                    Ok(json!({ "key": key, "access": access }))
+                })?;
                 let mut values = Vec::new();
                 for row in rows {
                     values.push(row?);
@@ -1046,11 +1063,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
                      WHERE session_id = ?1 AND grant_kind = 'command' \
                      ORDER BY grant_key",
                 )?,
-                read_keys(
-                    "SELECT grant_key FROM approval_grants \
-                     WHERE session_id = ?1 AND grant_kind = 'path' \
-                     ORDER BY grant_key",
-                )?,
+                read_paths()?,
                 read_keys(
                     "SELECT signature FROM loop_guard_rules \
                      WHERE session_id = ?1 AND rule_verdict = 'accept' \

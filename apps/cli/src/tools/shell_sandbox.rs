@@ -50,8 +50,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SandboxPathAccess {
     Read,
     ReadWrite,
@@ -62,6 +64,13 @@ impl SandboxPathAccess {
         match self {
             Self::Read => "read",
             Self::ReadWrite => "read_write",
+        }
+    }
+
+    pub fn storage_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadWrite => "read-write",
         }
     }
 }

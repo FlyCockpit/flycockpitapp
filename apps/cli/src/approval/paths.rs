@@ -1,10 +1,15 @@
 use super::*;
+use crate::tools::shell_sandbox::SandboxPathAccess;
 
 impl Approver {
     /// Decide a path access (part 2's native confinement). Granted →
     /// allow; else prompt showing the exact path. Paths are never
     /// wrappers, so all four scopes are offered.
-    pub async fn approve_path(&self, path: &std::path::Path) -> Result<Decision> {
+    pub async fn approve_path(
+        &self,
+        path: &std::path::Path,
+        required: SandboxPathAccess,
+    ) -> Result<Decision> {
         let target = path.display().to_string();
         // Standing reject short-circuit (checked before allow). A rejected
         // path auto-denies the out-of-cwd access with no prompt; recorded with
@@ -19,7 +24,7 @@ impl Approver {
             );
             return Ok(Decision::Deny);
         }
-        if self.store.is_path_granted(path) {
+        if self.store.is_path_granted_for(path, required) {
             let decision = Decision::Allow {
                 scope: Scope::Session,
             };
@@ -47,7 +52,7 @@ impl Approver {
             ApprovalChoice::Deny => Decision::Deny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::Approve(scope) => {
-                self.store.record_path(path, scope)?;
+                self.store.record_path(path, scope, required)?;
                 Decision::Allow { scope }
             }
             // A persistable path reject: record the standing reject, then deny

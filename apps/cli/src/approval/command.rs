@@ -189,7 +189,13 @@ impl Approver {
 
         let mut widest = Scope::Global;
         for target in targets {
-            match self.approve_path(&target).await? {
+            match self
+                .approve_path(
+                    &target,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await?
+            {
                 Decision::Deny => return Ok(Some(Decision::Deny)),
                 Decision::Allow { scope } => {
                     widest = narrowest(widest, scope);

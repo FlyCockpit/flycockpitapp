@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::engine::tool::{ToolCtx, ToolOutput, invalid_input};
+use crate::tools::shell_sandbox::SandboxPathAccess;
 
 /// Confine `arg` to `root`. `arg` may be relative (joined onto `root`)
 /// or absolute. Returns the canonicalized path **iff** it resolves to a
@@ -91,7 +92,11 @@ pub fn within_root(canonical_root: &Path, candidate: &Path) -> bool {
 ///
 /// Returns the syscall-effective path that was checked. Callers that
 /// touch disk should use this path rather than the original spelling.
-pub async fn check_native_access(ctx: &ToolCtx, path: &Path) -> Result<PathBuf> {
+pub async fn check_native_access(
+    ctx: &ToolCtx,
+    path: &Path,
+    required: SandboxPathAccess,
+) -> Result<PathBuf> {
     let effective = match effective_native_path(path) {
         Ok(path) => path,
         Err(err) if !ctx.session.sandbox_enabled() => {
@@ -105,7 +110,7 @@ pub async fn check_native_access(ctx: &ToolCtx, path: &Path) -> Result<PathBuf> 
                     path.display()
                 )));
             };
-            let decision = approver.approve_path(path).await?;
+            let decision = approver.approve_path(path, required).await?;
             if decision.is_allowed() {
                 return Ok(path.to_path_buf());
             }
@@ -126,7 +131,7 @@ pub async fn check_native_access(ctx: &ToolCtx, path: &Path) -> Result<PathBuf> 
             effective.display()
         )));
     };
-    let decision = approver.approve_path(&effective).await?;
+    let decision = approver.approve_path(&effective, required).await?;
     if decision.is_allowed() {
         Ok(effective)
     } else {
@@ -514,7 +519,9 @@ mod tests {
         // A path under cwd is allowed silently — no client attached, so a
         // prompt would block forever; this returns immediately.
         let inside = tmp.path().join("src/main.rs");
-        check_native_access(&ctx, &inside).await.unwrap();
+        check_native_access(&ctx, &inside, SandboxPathAccess::Read)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -524,7 +531,9 @@ mod tests {
         // The per-session tmp dir counts as inside the boundary.
         let tmp_dir = ctx.session.tmp_dir().expect("session tmp dir");
         let scratch = tmp_dir.join("scratch.txt");
-        check_native_access(&ctx, &scratch).await.unwrap();
+        check_native_access(&ctx, &scratch, SandboxPathAccess::Read)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -535,7 +544,9 @@ mod tests {
         // parent exists — no prompt.
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         let traversed = tmp.path().join("sub/../keep.txt");
-        check_native_access(&ctx, &traversed).await.unwrap();
+        check_native_access(&ctx, &traversed, SandboxPathAccess::Read)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -543,7 +554,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = sandboxed_ctx(tmp.path());
         let target = tmp.path().join("new/nested/file.txt");
-        check_native_access(&ctx, &target).await.unwrap();
+        check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -557,7 +570,9 @@ mod tests {
         let ctx = sandboxed_ctx(tmp.path());
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
-        let err = check_native_access(&ctx, &link).await.unwrap_err();
+        let err = check_native_access(&ctx, &link, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
         resolver.await.unwrap();
         assert!(
             err.to_string().contains("outside the session boundary"),
@@ -578,7 +593,9 @@ mod tests {
         let ctx = sandboxed_ctx(tmp.path());
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
-        let err = check_native_access(&ctx, &target).await.unwrap_err();
+        let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
         resolver.await.unwrap();
         assert!(
             err.to_string().contains("outside the session boundary"),
@@ -603,7 +620,9 @@ mod tests {
         for surface in ["read", "write", "edit"] {
             let ctx = sandboxed_ctx(tmp.path());
             let resolver = spawn_cancel_next_path_prompt(&ctx);
-            let err = check_native_access(&ctx, &target).await.unwrap_err();
+            let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+                .await
+                .unwrap_err();
             resolver.await.unwrap();
             assert!(
                 err.to_string().contains("outside the session boundary"),
@@ -618,9 +637,13 @@ mod tests {
         let ctx = sandboxed_ctx(tmp.path());
         ctx.session.set_sandbox_enabled(false);
         // Sandbox off → every path allowed, even far outside, no prompt.
-        check_native_access(&ctx, std::path::Path::new("/etc/shadow"))
-            .await
-            .unwrap();
+        check_native_access(
+            &ctx,
+            std::path::Path::new("/etc/shadow"),
+            SandboxPathAccess::Read,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -649,12 +672,47 @@ mod tests {
             ));
         });
         // First access prompts → granted → allowed.
-        check_native_access(&ctx, &target).await.unwrap();
+        check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap();
         resolver.await.unwrap();
 
         // A second access to the same path is now granted with no prompt
         // (would block forever otherwise — no client attached).
-        check_native_access(&ctx, &target).await.unwrap();
+        check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_read_grant_does_not_authorize_write_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "notes").unwrap();
+        let store = GrantStore::new(ctx.session.db.clone(), ctx.session.id, ctx.cwd.clone());
+        store
+            .record_path(
+                outside.path(),
+                crate::approval::store::Scope::Session,
+                SandboxPathAccess::Read,
+            )
+            .unwrap();
+
+        check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap();
+
+        let resolver = spawn_cancel_next_path_prompt(&ctx);
+        let err = check_native_access(&ctx, &target, SandboxPathAccess::ReadWrite)
+            .await
+            .unwrap_err();
+        resolver.await.unwrap();
+        assert!(
+            err.to_string().contains("outside the session boundary"),
+            "read-only grant must not authorize write access: {err}"
+        );
     }
 
     #[tokio::test]
@@ -676,7 +734,9 @@ mod tests {
             };
             assert!(hub.resolve(iid, ResolveResponse::Cancel));
         });
-        let err = check_native_access(&ctx, &target).await.unwrap_err();
+        let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
         resolver.await.unwrap();
         assert!(
             err.to_string().contains("outside the session boundary"),
@@ -692,12 +752,16 @@ mod tests {
         let mut ctx = sandboxed_ctx(tmp.path());
         ctx.approver = None;
 
-        check_native_access(&ctx, &tmp.path().join("inside.txt"))
-            .await
-            .unwrap();
+        check_native_access(
+            &ctx,
+            &tmp.path().join("inside.txt"),
+            SandboxPathAccess::Read,
+        )
+        .await
+        .unwrap();
 
         let outside = tempfile::tempdir().unwrap();
-        let err = check_native_access(&ctx, &outside.path().join("x.txt"))
+        let err = check_native_access(&ctx, &outside.path().join("x.txt"), SandboxPathAccess::Read)
             .await
             .unwrap_err();
         assert!(

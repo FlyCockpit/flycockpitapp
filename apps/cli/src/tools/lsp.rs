@@ -62,7 +62,12 @@ impl Tool for LspTool {
         let line = optional_u32(&args, "line")?;
         let character = optional_u32(&args, "character")?;
         let file = resolve(file, &ctx.cwd);
-        crate::tools::sandbox::check_native_access(ctx, &file).await?;
+        crate::tools::sandbox::check_native_access(
+            ctx,
+            &file,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         let Some(lsp) = &ctx.lsp else {
             return Ok(ToolOutput::text("LSP is unavailable in this context."));
         };

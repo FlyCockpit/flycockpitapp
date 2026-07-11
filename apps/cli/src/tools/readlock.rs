@@ -73,7 +73,12 @@ impl Tool for ReadlockTool {
         let path = resolve(path_arg, &ctx.cwd);
         // Native-tool boundary check (sandboxing part 2) before taking
         // the lock — a denied path never acquires.
-        let path = crate::tools::sandbox::check_native_access(ctx, &path).await?;
+        let path = crate::tools::sandbox::check_native_access(
+            ctx,
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         // Gitignore read-allowlist gate (read/readlock only), before acquiring
         // the lock — a refused read never locks the file.
         if let Some(refusal) = crate::tools::sandbox::check_gitignore_read(ctx, &path).await? {

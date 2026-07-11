@@ -528,6 +528,11 @@ CREATE TABLE approval_grants (
     granted_at  INTEGER NOT NULL,
     verdict     TEXT    NOT NULL DEFAULT 'allow'
         CHECK (verdict IN ('allow', 'reject')),
+    access      TEXT
+        CHECK (
+            (grant_kind = 'path' AND access IN ('read', 'read-write'))
+            OR (grant_kind <> 'path' AND access IS NULL)
+        ),
     PRIMARY KEY (session_id, grant_kind, grant_key),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );

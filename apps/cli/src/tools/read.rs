@@ -78,7 +78,12 @@ impl Tool for ReadTool {
         // exact path) before any read happens.
         if let Some(p) = args.get("path").and_then(Value::as_str) {
             let resolved = resolve(p, &ctx.cwd);
-            let checked = crate::tools::sandbox::check_native_access(ctx, &resolved).await?;
+            let checked = crate::tools::sandbox::check_native_access(
+                ctx,
+                &resolved,
+                crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            )
+            .await?;
             // Gitignore read-allowlist gate (read/readlock only): a gitignored,
             // un-allowlisted path raises the two-stage approval; a refusal is a
             // non-fatal tool result the model sees, never a crash.

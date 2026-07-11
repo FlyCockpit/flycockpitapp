@@ -52,6 +52,7 @@ impl Tool for OutlineTool {
         crate::tools::sandbox::check_native_access(
             ctx,
             &crate::tools::common::resolve(path_arg, &ctx.cwd),
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
         .await?;
         let rel = rel_path(path_arg, ctx);

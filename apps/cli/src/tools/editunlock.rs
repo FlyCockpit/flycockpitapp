@@ -112,7 +112,12 @@ impl Tool for EditunlockTool {
         let path = resolve(path_arg, &ctx.cwd);
         // Native-tool boundary check (sandboxing part 2) before the
         // write-permitted check — a denied out-of-cwd path never edits.
-        let path = crate::tools::sandbox::check_native_access(ctx, &path).await?;
+        let path = crate::tools::sandbox::check_native_access(
+            ctx,
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
         let write_guard = ctx
             .locks
             .begin_write(&path, &ctx.agent_id, ctx.session.id)?;

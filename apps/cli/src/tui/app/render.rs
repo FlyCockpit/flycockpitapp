@@ -92,16 +92,14 @@ fn push_hover_char(out: &mut Vec<Span<'static>>, ch: char, style: Style) {
     out.push(Span::styled(ch.to_string(), style));
 }
 
-fn hover_highlight_line(line: &mut Line<'static>, width: u16) {
-    let width = width as usize;
-    if width == 0 {
-        return;
-    }
-    let mut hover_start = AGENT_INDENT.min(width);
-    let mut hover_end = width.saturating_sub(AGENT_INDENT);
+fn hover_highlight_range(
+    line: &mut Line<'static>,
+    hover_start: usize,
+    hover_end: usize,
+    pad_to: Option<usize>,
+) {
     if hover_start >= hover_end {
-        hover_start = 0;
-        hover_end = width;
+        return;
     }
 
     let hover = Style::default().bg(TRANSCRIPT_HOVER_BG);
@@ -123,30 +121,67 @@ fn hover_highlight_line(line: &mut Line<'static>, width: u16) {
         }
     }
 
-    while col < width {
-        let style = if (hover_start..hover_end).contains(&col) {
-            Style::default().patch(hover)
-        } else {
-            Style::default()
-        };
-        push_hover_char(&mut patched, ' ', style);
-        col += 1;
+    if let Some(pad_to) = pad_to {
+        while col < pad_to {
+            let style = if (hover_start..hover_end).contains(&col) {
+                Style::default().patch(hover)
+            } else {
+                Style::default()
+            };
+            push_hover_char(&mut patched, ' ', style);
+            col += 1;
+        }
     }
 
     line.spans = patched;
+}
+
+fn hover_highlight_line(line: &mut Line<'static>, width: u16) {
+    let width = width as usize;
+    if width == 0 {
+        return;
+    }
+    let mut hover_start = AGENT_INDENT.min(width);
+    let mut hover_end = width.saturating_sub(AGENT_INDENT);
+    if hover_start >= hover_end {
+        hover_start = 0;
+        hover_end = width;
+    }
+    hover_highlight_range(line, hover_start, hover_end, Some(width));
+}
+
+fn hover_highlight_control_chip(line: &mut Line<'static>, hit: PinHit) {
+    hover_highlight_range(
+        line,
+        hit.col_start as usize,
+        hit.col_end as usize,
+        Some(hit.col_end as usize),
+    );
+}
+
+fn control_chip_hit_for_row(meta: &ChatRowMeta, hovered: ControlChip) -> Option<PinHit> {
+    match hovered {
+        ControlChip::Fork { seq } => meta.fork_hit.filter(|hit| hit.seq == seq),
+        ControlChip::Pin { seq } => meta.pin_hit.filter(|hit| hit.seq == seq),
+    }
 }
 
 fn apply_hover_highlight(
     lines: &mut [Line<'static>],
     meta: &[ChatRowMeta],
     hovered: Option<AffordanceTarget>,
+    hovered_control_chip: Option<ControlChip>,
     width: u16,
 ) {
-    let Some(hovered) = hovered else {
+    if hovered.is_none() && hovered_control_chip.is_none() {
         return;
-    };
+    }
     for (line, meta) in lines.iter_mut().zip(meta) {
-        if affordance_target_for_row(meta) == Some(hovered) {
+        if let Some(hit) =
+            hovered_control_chip.and_then(|chip| control_chip_hit_for_row(meta, chip))
+        {
+            hover_highlight_control_chip(line, hit);
+        } else if hovered.is_some_and(|target| affordance_target_for_row(meta) == Some(target)) {
             hover_highlight_line(line, width);
         }
     }
@@ -1783,6 +1818,7 @@ impl App {
             &mut visible,
             &self.chat_row_meta,
             self.hovered_affordance,
+            self.hovered_control_chip,
             area.width,
         );
         frame.render_widget(Paragraph::new(visible), area);
@@ -4051,8 +4087,8 @@ mod slash_popup_full_list_tests {
 #[cfg(test)]
 mod render_history_spacing_tests {
     use super::{
-        App, ChatCopyTarget, ChatRowKind, Selection, TranscriptFind, affordance_target_for_row,
-        extract_selection_plaintext,
+        App, ChatCopyTarget, ChatRowKind, ControlChip, Selection, TranscriptFind,
+        affordance_target_for_row, extract_selection_plaintext,
     };
     use crate::config::extended::{DiffStyle, ThinkingDisplay};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
@@ -5014,6 +5050,62 @@ mod render_history_spacing_tests {
                 buffer[(col, row as u16)].style().bg,
                 Some(TRANSCRIPT_HOVER_BG),
                 "column {col} should carry the inset hover background"
+            );
+        }
+    }
+
+    #[test]
+    fn hovered_control_chip_highlights_only_selected_chip_glyphs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.mouse_capture = true;
+        app.history = vec![pinned_user("pin me", 42)];
+
+        render_history(&mut app, 80, 8);
+        let row = app
+            .chat_row_meta
+            .iter()
+            .position(|meta| meta.fork_hit.is_some() && meta.pin_hit.is_some())
+            .expect("fork and pin controls rendered");
+        let fork = app.chat_row_meta[row].fork_hit.expect("fork hit");
+        let pin = app.chat_row_meta[row].pin_hit.expect("pin hit");
+
+        app.hovered_control_chip = Some(ControlChip::Fork { seq: 42 });
+        let fork_buffer = render_history_buffer(&mut app, 80, 8);
+        for col in fork.col_start..fork.col_end {
+            assert_eq!(
+                fork_buffer[(col, row as u16)].style().bg,
+                Some(TRANSCRIPT_HOVER_BG),
+                "fork column {col} should be highlighted"
+            );
+        }
+        for col in pin.col_start..pin.col_end {
+            assert_ne!(
+                fork_buffer[(col, row as u16)].style().bg,
+                Some(TRANSCRIPT_HOVER_BG),
+                "pin column {col} should not be highlighted by fork hover"
+            );
+        }
+        assert_ne!(
+            fork_buffer[(fork.col_start - 1, row as u16)].style().bg,
+            Some(TRANSCRIPT_HOVER_BG)
+        );
+
+        app.hovered_control_chip = Some(ControlChip::Pin { seq: 42 });
+        let pin_buffer = render_history_buffer(&mut app, 80, 8);
+        for col in pin.col_start..pin.col_end {
+            assert_eq!(
+                pin_buffer[(col, row as u16)].style().bg,
+                Some(TRANSCRIPT_HOVER_BG),
+                "pin column {col} should be highlighted"
+            );
+        }
+        for col in fork.col_start..fork.col_end {
+            assert_ne!(
+                pin_buffer[(col, row as u16)].style().bg,
+                Some(TRANSCRIPT_HOVER_BG),
+                "fork column {col} should not be highlighted by pin hover"
             );
         }
     }

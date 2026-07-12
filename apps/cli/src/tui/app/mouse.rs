@@ -547,6 +547,19 @@ impl App {
             || self.pane.is_some()
     }
 
+    fn control_chip_at_mouse(&self, mouse: &MouseEvent) -> Option<super::render::ControlChip> {
+        if !self.mouse_capture
+            || self.transcript_hover_suppressed()
+            || !self.mouse_in_chat_area(mouse)
+        {
+            return None;
+        }
+        let area = self.chat_area?;
+        let rel = (mouse.row - area.y) as usize;
+        let rel_col = mouse.column - area.x;
+        self.control_chip_at(rel, rel_col)
+    }
+
     fn affordance_target_at_mouse(&self, mouse: &MouseEvent) -> Option<AffordanceTarget> {
         if !self.mouse_capture
             || self.transcript_hover_suppressed()
@@ -579,6 +592,13 @@ impl App {
     fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
         self.hovered_suggestion = self.suggestion_target_at_mouse(mouse);
         if self.hovered_suggestion.is_some() {
+            self.hovered_control_chip = None;
+            self.hovered_affordance = None;
+            return;
+        }
+
+        self.hovered_control_chip = self.control_chip_at_mouse(mouse);
+        if self.hovered_control_chip.is_some() {
             self.hovered_affordance = None;
         } else {
             self.hovered_affordance = self.affordance_target_at_mouse(mouse);
@@ -962,7 +982,7 @@ mod affordance_hover_tests {
         SuggestionBoxRowHit, SuggestionBoxTarget, resolve_inner_scroll_target,
     };
     use crate::tui::app::render::{
-        ChatRowKind, ChatRowMeta, ReasoningScrollMeta, ToolResultScrollMeta,
+        ChatRowKind, ChatRowMeta, ControlChip, PinHit, ReasoningScrollMeta, ToolResultScrollMeta,
     };
     use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
     use crate::tui::settings::Dialog;
@@ -1079,12 +1099,60 @@ mod affordance_hover_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.mouse_capture = false;
         app.hovered_affordance = Some(AffordanceTarget::Chip { history_index: 1 });
+        app.hovered_control_chip = Some(ControlChip::Fork { seq: 42 });
         app.chat_area = Some(Rect::new(5, 10, 20, 1));
         app.chat_row_meta = vec![meta(Some(1), None, None, None)];
 
         app.handle_mouse(moved(10));
 
         assert_eq!(app.hovered_affordance, None);
+        assert_eq!(app.hovered_control_chip, None);
+    }
+
+    #[test]
+    fn moved_mouse_resolves_control_chip_by_column_before_row_hover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        app.chat_area = Some(Rect::new(5, 10, 40, 1));
+        let mut row = meta(Some(7), None, None, None);
+        row.fork_hit = Some(PinHit {
+            seq: 42,
+            col_start: 8,
+            col_end: 14,
+        });
+        row.pin_hit = Some(PinHit {
+            seq: 42,
+            col_start: 15,
+            col_end: 20,
+        });
+        app.chat_row_meta = vec![row];
+        let mouse_at = |column| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        app.handle_mouse(mouse_at(5 + 9));
+        assert_eq!(
+            app.hovered_control_chip,
+            Some(ControlChip::Fork { seq: 42 })
+        );
+        assert_eq!(app.hovered_affordance, None);
+
+        app.handle_mouse(mouse_at(5 + 16));
+        assert_eq!(app.hovered_control_chip, Some(ControlChip::Pin { seq: 42 }));
+        assert_eq!(app.hovered_affordance, None);
+
+        app.handle_mouse(mouse_at(5 + 14));
+        assert_eq!(app.hovered_control_chip, None);
+        assert_eq!(
+            app.hovered_affordance,
+            Some(AffordanceTarget::Chip { history_index: 7 })
+        );
     }
 
     fn suggestion_target(kind: SuggestionBoxKind, index: usize) -> SuggestionBoxTarget {

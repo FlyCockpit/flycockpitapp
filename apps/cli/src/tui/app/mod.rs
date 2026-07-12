@@ -1532,6 +1532,7 @@ pub struct App {
     /// any box row toggles its expansion. Refreshed every render.
     pub(super) box_rows: Vec<Option<usize>>,
     pub(super) hovered_affordance: Option<AffordanceTarget>,
+    pub(super) hovered_control_chip: Option<render::ControlChip>,
     pub(super) affordance_scroll_regions: Vec<AffordanceScrollRegion>,
     /// Hit map for rendered diff rows. Header/body rows for a diff entry
     /// carry the edited path so right-click can offer editor actions only
@@ -2347,6 +2348,7 @@ impl App {
         self.box_rows.clear();
         self.diff_rows.clear();
         self.hovered_affordance = None;
+        self.hovered_control_chip = None;
     }
 
     pub(super) fn active_subagent_view(&self) -> Option<&SubagentViewMeta> {
@@ -2406,6 +2408,7 @@ impl App {
         self.pending_render_cache = None;
         self.chat_scroll_offset = 0;
         self.hovered_affordance = None;
+        self.hovered_control_chip = None;
         true
     }
 
@@ -2789,6 +2792,7 @@ impl App {
             clickable_rows: Vec::new(),
             box_rows: Vec::new(),
             hovered_affordance: None,
+            hovered_control_chip: None,
             affordance_scroll_regions: Vec::new(),
             diff_rows: Vec::new(),
             last_cursor_shape: None,
@@ -4250,6 +4254,7 @@ impl App {
         self.clickable_rows.clear();
         self.box_rows.clear();
         self.hovered_affordance = None;
+        self.hovered_control_chip = None;
         self.affordance_scroll_regions.clear();
         self.chat_row_meta.clear();
         self.chat_area = None;

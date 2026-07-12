@@ -146,6 +146,20 @@ impl App {
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
         match event {
+            TurnEvent::InterruptDecision { decision, .. } => {
+                let prefix = if decision.permission {
+                    "approval"
+                } else {
+                    "decision"
+                };
+                let lines = decision
+                    .lines
+                    .into_iter()
+                    .map(|line| format!("{prefix}: {} → {}", line.prompt, line.answer))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.history.push(HistoryEntry::Maintenance { line: lines });
+            }
             TurnEvent::Reconnecting {
                 agent: _,
                 attempt,
@@ -1531,6 +1545,21 @@ pub(super) fn wire_history_to_entries(
     let mut out: Vec<HistoryEntry> = Vec::new();
     for entry in wire {
         match entry {
+            Wire::InterruptDecision { decision, .. } => {
+                let prefix = if decision.permission {
+                    "approval"
+                } else {
+                    "decision"
+                };
+                out.push(HistoryEntry::Maintenance {
+                    line: decision
+                        .lines
+                        .into_iter()
+                        .map(|line| format!("{prefix}: {} → {}", line.prompt, line.answer))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                });
+            }
             Wire::User {
                 text,
                 ts_ms,

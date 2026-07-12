@@ -71,6 +71,8 @@ pub enum SessionEventKind {
     /// resolution source (`already_granted` / `user_prompt` /
     /// `headless_auto_reject` / `loop_guard_rule`). Data/export only.
     PermissionDecision,
+    /// A user interactively resolved or dismissed a question/approval interrupt.
+    InterruptDecision,
     /// The dispatcher's validate-then-repair path (GOALS §12) rejected a tool
     /// call **before** it became a `tool_call` row. Carries the attempted tool
     /// `name` and a `reason` (`not_in_advertised_set` /
@@ -130,6 +132,7 @@ impl SessionEventKind {
             SessionEventKind::ContextPruned => "context_pruned",
             SessionEventKind::SessionCompacted => "session_compacted",
             SessionEventKind::PermissionDecision => "permission_decision",
+            SessionEventKind::InterruptDecision => "interrupt_decision",
             SessionEventKind::ToolRejected => "tool_rejected",
             SessionEventKind::PrimarySwap => "primary_swap",
             SessionEventKind::InferenceFailure => "inference_failure",

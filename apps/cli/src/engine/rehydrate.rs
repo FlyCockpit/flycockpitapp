@@ -314,6 +314,16 @@ pub fn history_snapshot_with_active_subagent_conn(
     let mut snapshot: Vec<proto::HistoryEntry> = Vec::new();
     for ev in &events {
         match ev.kind.as_str() {
+            "interrupt_decision" if visible_lineage(ev) => {
+                if let Some(value) = ev.data.get("decision")
+                    && let Ok(decision) = serde_json::from_value(value.clone())
+                {
+                    snapshot.push(proto::HistoryEntry::InterruptDecision {
+                        decision,
+                        seq: ev.seq,
+                    });
+                }
+            }
             "user_message" if visible_lineage(ev) => {
                 let text = ev
                     .data
@@ -3970,6 +3980,7 @@ mod tests {
                 *seq
             }
             proto::HistoryEntry::ToolCall { .. }
+            | proto::HistoryEntry::InterruptDecision { .. }
             | proto::HistoryEntry::CompactBoundary { .. }
             | proto::HistoryEntry::Subagent { .. }
             | proto::HistoryEntry::InferenceError { .. } => panic!("not a message entry"),

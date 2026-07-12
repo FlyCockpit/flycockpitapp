@@ -775,15 +775,47 @@ async fn run_worker(
                 interrupt_id,
                 response,
             } => {
+                let decision = session
+                    .db
+                    .get_interrupt(interrupt_id)
+                    .ok()
+                    .flatten()
+                    .map(|row| {
+                        crate::db::needs_attention::summarize_interrupt_decision(&row, &response)
+                    });
                 if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response) {
                     tracing::warn!(error = %e, %interrupt_id, "resolve_interrupt failed");
                 }
+                let seq = decision.as_ref().and_then(|decision| {
+                    let data = serde_json::json!({
+                        "interrupt_id": interrupt_id,
+                        "decision": decision,
+                    });
+                    let redacted_data = serde_json::from_str(
+                        &crate::daemon::current_redaction(&redaction).scrub(&data.to_string()),
+                    )
+                    .unwrap_or(data);
+                    session
+                        .record_event(
+                            crate::db::session_log::SessionEventKind::InterruptDecision,
+                            None,
+                            None,
+                            &redacted_data,
+                        )
+                        .map_err(|error| {
+                            tracing::warn!(%error, %interrupt_id, "recording interrupt decision failed");
+                            error
+                        })
+                        .ok()
+                });
                 send_current_event(
                     &event_tx,
                     &redaction,
                     proto::Event::InterruptResolved {
                         session_id,
                         interrupt_id,
+                        decision,
+                        seq,
                     },
                 );
                 // Engine-side wakeup (GOALS §3b): hand the resolution to

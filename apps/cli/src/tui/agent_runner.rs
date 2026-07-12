@@ -1374,6 +1374,16 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         QueueUpdated { queue, .. } => TurnEvent::QueueUpdated {
             queue: queue.into_iter().map(queue_item_from_proto).collect(),
         },
+        InterruptResolved {
+            interrupt_id,
+            decision: Some(decision),
+            seq,
+            ..
+        } => TurnEvent::InterruptDecision {
+            interrupt_id,
+            decision,
+            seq,
+        },
         InterruptRaised { .. }
         | InterruptResolved { .. }
         | SessionEnded { .. }

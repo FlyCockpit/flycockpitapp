@@ -5,6 +5,11 @@ use super::*;
 /// same channel.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
+    InterruptDecision {
+        interrupt_id: uuid::Uuid,
+        decision: crate::daemon::proto::InterruptDecision,
+        seq: Option<i64>,
+    },
     /// Authoritative daemon-owned queue snapshot for pending user messages.
     /// The TUI renders this mirror and never locally removes queue entries
     /// unless the daemon confirms removal.

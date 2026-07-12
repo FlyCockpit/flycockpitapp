@@ -381,6 +381,10 @@ pub enum Event {
     InterruptResolved {
         session_id: Uuid,
         interrupt_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<super::InterruptDecision>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
     },
 
     /// The agent yielded control back to the human: the driver loop
@@ -696,6 +700,16 @@ pub enum Event {
 /// `ToolEnd` in the future.
 pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Event> {
     match event {
+        TurnEvent::InterruptDecision {
+            interrupt_id,
+            decision,
+            seq,
+        } => vec![Event::InterruptResolved {
+            session_id,
+            interrupt_id,
+            decision: Some(decision),
+            seq,
+        }],
         TurnEvent::ThinkingStarted { agent, turn_id } => {
             vec![Event::ThinkingStarted {
                 session_id,

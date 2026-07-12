@@ -13,7 +13,10 @@ use chrono::Utc;
 use rusqlite::params;
 use uuid::Uuid;
 
-use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet, ResolveResponse};
+use crate::daemon::proto::{
+    InterruptDecision, InterruptDecisionLine, InterruptQuestion, InterruptQuestionSet,
+    ResolveResponse,
+};
 use crate::db::Db;
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
@@ -171,6 +174,93 @@ impl Db {
     }
 }
 
+pub fn summarize_interrupt_decision(
+    row: &NeedsAttentionRow,
+    response: &ResolveResponse,
+) -> InterruptDecision {
+    let questions: Vec<&InterruptQuestion> = row
+        .questions
+        .as_ref()
+        .map(|set| set.questions.iter().collect())
+        .or_else(|| row.question.as_ref().map(|question| vec![question]))
+        .unwrap_or_default();
+    let responses: Vec<&ResolveResponse> = match response {
+        ResolveResponse::Batch { responses } => responses.iter().collect(),
+        other => vec![other],
+    };
+    let cancelled = matches!(response, ResolveResponse::Cancel);
+    let permission = questions.iter().any(|question| {
+        matches!(
+            question,
+            InterruptQuestion::Single {
+                permission: true,
+                ..
+            }
+        )
+    });
+    let lines = questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| InterruptDecisionLine {
+            prompt: interrupt_prompt(question).to_string(),
+            answer: if cancelled {
+                "dismissed".to_string()
+            } else {
+                responses
+                    .get(index)
+                    .map(|response| answer_label(question, response))
+                    .unwrap_or_else(|| "dismissed".to_string())
+            },
+        })
+        .collect();
+    InterruptDecision {
+        permission,
+        cancelled,
+        lines,
+    }
+}
+
+fn interrupt_prompt(question: &InterruptQuestion) -> &str {
+    match question {
+        InterruptQuestion::Single { prompt, .. }
+        | InterruptQuestion::Multi { prompt, .. }
+        | InterruptQuestion::Freetext { prompt, .. } => prompt,
+    }
+}
+
+fn answer_label(question: &InterruptQuestion, response: &ResolveResponse) -> String {
+    match (question, response) {
+        (InterruptQuestion::Single { options, .. }, ResolveResponse::Single { selected_id }) => {
+            options
+                .iter()
+                .find(|option| option.id == *selected_id)
+                .map(|option| option.label.clone())
+                .unwrap_or_else(|| selected_id.clone())
+        }
+        (InterruptQuestion::Multi { options, .. }, ResolveResponse::Multi { selected_ids }) => {
+            selected_ids
+                .iter()
+                .map(|id| {
+                    options
+                        .iter()
+                        .find(|option| option.id == *id)
+                        .map(|option| option.label.clone())
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        (InterruptQuestion::Freetext { masked: true, .. }, ResolveResponse::Freetext { .. }) => {
+            "••••••••".to_string()
+        }
+        (InterruptQuestion::Freetext { masked: false, .. }, ResolveResponse::Freetext { text }) => {
+            text.clone()
+        }
+        (_, ResolveResponse::Cancel) => "dismissed".to_string(),
+        _ => "dismissed".to_string(),
+    }
+}
+
 fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
     let interrupt_id: String = row.get("interrupt_id")?;
     let interrupt_id = Uuid::parse_str(&interrupt_id).map_err(|e| {
@@ -263,6 +353,59 @@ mod tests {
         .unwrap();
         let open = db.list_open_interrupts(s.session_id).unwrap();
         assert_eq!(open.len(), 0);
+    }
+
+    #[test]
+    fn decision_summary_uses_labels_and_never_exposes_masked_text() {
+        let row = NeedsAttentionRow {
+            interrupt_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            agent_id: "builder".into(),
+            description: String::new(),
+            question: None,
+            questions: Some(InterruptQuestionSet {
+                questions: vec![
+                    InterruptQuestion::Single {
+                        prompt: "Continue?".into(),
+                        options: vec![InterruptOption {
+                            id: "yes".into(),
+                            label: "Approve for this project".into(),
+                            description: None,
+                            secondary: false,
+                        }],
+                        allow_freetext: false,
+                        command_detail: None,
+                        permission: true,
+                        sandbox_escalation: None,
+                    },
+                    InterruptQuestion::Freetext {
+                        prompt: "Token".into(),
+                        masked: true,
+                    },
+                ],
+            }),
+            raised_at: 0,
+            resolved_at: None,
+            response: None,
+        };
+        let decision = summarize_interrupt_decision(
+            &row,
+            &ResolveResponse::Batch {
+                responses: vec![
+                    ResolveResponse::Single {
+                        selected_id: "yes".into(),
+                    },
+                    ResolveResponse::Freetext {
+                        text: "super-secret".into(),
+                    },
+                ],
+            },
+        );
+        assert!(decision.permission);
+        assert_eq!(decision.lines[0].answer, "Approve for this project");
+        let json = serde_json::to_string(&decision).unwrap();
+        assert!(!json.contains("super-secret"));
+        assert!(json.contains("••••••••"));
     }
 
     #[test]

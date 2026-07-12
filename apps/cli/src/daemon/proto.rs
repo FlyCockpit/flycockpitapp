@@ -438,6 +438,11 @@ impl std::fmt::Display for ErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum HistoryEntry {
+    InterruptDecision {
+        decision: InterruptDecision,
+        #[serde(default)]
+        seq: i64,
+    },
     User {
         text: String,
         /// `session_events.ts_ms` of this message (epoch millis) — the wall
@@ -846,6 +851,19 @@ pub struct SandboxEscalation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterruptQuestionSet {
     pub questions: Vec<InterruptQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptDecisionLine {
+    pub prompt: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptDecision {
+    pub permission: bool,
+    pub cancelled: bool,
+    pub lines: Vec<InterruptDecisionLine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -74,7 +74,7 @@ pub(super) fn affordance_target_for_row(meta: &ChatRowMeta) -> Option<Affordance
         .map(|history_index| AffordanceTarget::ToolBox { history_index })
 }
 
-fn hover_highlight_line(line: &mut Line<'static>) {
+fn hover_highlight_full_line(line: &mut Line<'static>) {
     let hover = Style::default().bg(TRANSCRIPT_HOVER_BG);
     line.style = line.style.patch(hover);
     for span in &mut line.spans {
@@ -82,17 +82,72 @@ fn hover_highlight_line(line: &mut Line<'static>) {
     }
 }
 
+fn push_hover_char(out: &mut Vec<Span<'static>>, ch: char, style: Style) {
+    if let Some(last) = out.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push(ch);
+        return;
+    }
+    out.push(Span::styled(ch.to_string(), style));
+}
+
+fn hover_highlight_line(line: &mut Line<'static>, width: u16) {
+    let width = width as usize;
+    if width == 0 {
+        return;
+    }
+    let mut hover_start = AGENT_INDENT.min(width);
+    let mut hover_end = width.saturating_sub(AGENT_INDENT);
+    if hover_start >= hover_end {
+        hover_start = 0;
+        hover_end = width;
+    }
+
+    let hover = Style::default().bg(TRANSCRIPT_HOVER_BG);
+    let spans = std::mem::take(&mut line.spans);
+    let mut patched = Vec::with_capacity(spans.len() + 3);
+    let mut col = 0usize;
+
+    for span in spans {
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            let in_hover = col < hover_end && col.saturating_add(ch_width) > hover_start;
+            let style = if in_hover {
+                span.style.patch(hover)
+            } else {
+                span.style
+            };
+            push_hover_char(&mut patched, ch, style);
+            col = col.saturating_add(ch_width);
+        }
+    }
+
+    while col < width {
+        let style = if (hover_start..hover_end).contains(&col) {
+            Style::default().patch(hover)
+        } else {
+            Style::default()
+        };
+        push_hover_char(&mut patched, ' ', style);
+        col += 1;
+    }
+
+    line.spans = patched;
+}
+
 fn apply_hover_highlight(
     lines: &mut [Line<'static>],
     meta: &[ChatRowMeta],
     hovered: Option<AffordanceTarget>,
+    width: u16,
 ) {
     let Some(hovered) = hovered else {
         return;
     };
     for (line, meta) in lines.iter_mut().zip(meta) {
         if affordance_target_for_row(meta) == Some(hovered) {
-            hover_highlight_line(line);
+            hover_highlight_line(line, width);
         }
     }
 }
@@ -1724,7 +1779,12 @@ impl App {
         self.affordance_scroll_regions = self.build_affordance_scroll_regions();
 
         let mut visible = visible;
-        apply_hover_highlight(&mut visible, &self.chat_row_meta, self.hovered_affordance);
+        apply_hover_highlight(
+            &mut visible,
+            &self.chat_row_meta,
+            self.hovered_affordance,
+            area.width,
+        );
         frame.render_widget(Paragraph::new(visible), area);
         if self.selection.is_some() || self.transcript_find.is_some() {
             // Snapshot the content layer before overlay chrome is rendered.
@@ -2490,7 +2550,7 @@ impl App {
                 Span::styled(description, muted),
             ]);
             if self.hovered_suggestion == Some(target) {
-                hover_highlight_line(&mut line);
+                hover_highlight_full_line(&mut line);
             }
             lines.push(line);
             self.suggestion_row_hits.push(SuggestionBoxRowHit {
@@ -2560,7 +2620,7 @@ impl App {
             }
             let mut line = Line::from(spans);
             if self.hovered_suggestion == Some(target) {
-                hover_highlight_line(&mut line);
+                hover_highlight_full_line(&mut line);
             }
             lines.push(line);
             self.suggestion_row_hits.push(SuggestionBoxRowHit {
@@ -4828,9 +4888,9 @@ mod render_history_spacing_tests {
         assert_eq!(app.chat_total_lines, 3);
         assert_eq!(app.chat_visible_lines, 6);
         assert_eq!(rows.len(), 3);
-        assert!(rows[0].1.contains("abcdefghij"));
-        assert!(rows[1].1.contains("klmnopqrst"));
-        assert!(rows[2].1.contains("uvwxyz"));
+        assert!(rows[0].1.contains("  abcdefgh"));
+        assert!(rows[1].1.contains("ijklmnopqr"));
+        assert!(rows[2].1.contains("stuvwxyz"));
     }
 
     #[test]
@@ -4846,9 +4906,9 @@ mod render_history_spacing_tests {
 
         assert_eq!(row_text(&app, 0).trim(), "");
         assert_eq!(row_text(&app, 1).trim(), "");
-        assert!(row_text(&app, 2).contains("abcdefghij"));
-        assert!(row_text(&app, 3).contains("klmnopqrst"));
-        assert!(row_text(&app, 4).contains("uvwxyz"));
+        assert!(row_text(&app, 2).contains("  abcdefgh"));
+        assert!(row_text(&app, 3).contains("ijklmnopqr"));
+        assert!(row_text(&app, 4).contains("stuvwxyz"));
     }
 
     #[test]
@@ -4936,6 +4996,28 @@ mod render_history_spacing_tests {
         (0..width).any(|col| buffer[(col, row as u16)].style().bg == Some(TRANSCRIPT_HOVER_BG))
     }
 
+    fn assert_row_has_inset_hover(buffer: &ratatui::buffer::Buffer, row: usize, width: u16) {
+        assert_ne!(
+            buffer[(0, row as u16)].style().bg,
+            Some(TRANSCRIPT_HOVER_BG),
+            "left transcript margin should stay unhighlighted"
+        );
+        assert_ne!(
+            buffer[(width - 1, row as u16)].style().bg,
+            Some(TRANSCRIPT_HOVER_BG),
+            "right transcript margin should stay unhighlighted"
+        );
+        for col in crate::tui::history::AGENT_INDENT as u16
+            ..width - crate::tui::history::AGENT_INDENT as u16
+        {
+            assert_eq!(
+                buffer[(col, row as u16)].style().bg,
+                Some(TRANSCRIPT_HOVER_BG),
+                "column {col} should carry the inset hover background"
+            );
+        }
+    }
+
     #[test]
     fn hovered_tool_call_rows_get_background_highlight_only_while_hovered() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4954,7 +5036,7 @@ mod render_history_spacing_tests {
         });
 
         let buffer = render_history_buffer(&mut app, 80, 8);
-        assert!(row_has_hover_bg(&buffer, tool_row, 80));
+        assert_row_has_inset_hover(&buffer, tool_row, 80);
         assert!(!row_has_hover_bg(&buffer, agent_row, 80));
 
         app.hovered_affordance = None;
@@ -5165,7 +5247,7 @@ mod render_history_spacing_tests {
 
         render_history(&mut app, 10, 4);
 
-        let first = find_row(&app, "abcdefghij");
+        let first = find_row(&app, "  abcdefgh");
         let second = first + 1;
         assert!(!app.chat_cont_rows[first]);
         assert!(app.chat_cont_rows[second]);
@@ -5180,7 +5262,7 @@ mod render_history_spacing_tests {
                 active: false,
             },
         );
-        assert_eq!(text, "abcdefghij klmnopqrst");
+        assert_eq!(text, "abcdefgh ijklmnopqr");
     }
 
     #[test]
@@ -5199,7 +5281,7 @@ mod render_history_spacing_tests {
         render_history(&mut app, 26, 3);
 
         assert!(narrow_total > app.chat_total_lines);
-        assert_eq!(app.chat_total_lines, 1);
+        assert_eq!(app.chat_total_lines, 2);
         assert_eq!(app.chat_scroll_offset, 0);
     }
 

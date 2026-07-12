@@ -9967,8 +9967,9 @@ mod ctrl_c_tests {
             None,
         );
         assert_eq!(
-            rendered.lines[0].spans[0].style.fg, None,
-            "manual /prune confirmation should keep plain styling"
+            rendered.lines[0].spans[0].style.fg,
+            Some(Color::Indexed(MUTED_COLOR_INDEX)),
+            "manual /prune confirmation should use the shared plain-line muted styling"
         );
     }
 

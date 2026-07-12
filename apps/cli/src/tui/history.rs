@@ -20,8 +20,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::extended::ThinkingDisplay;
 use crate::tui::markdown;
 use crate::tui::theme::{
-    ERROR_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE, SUCCESS_TEXT,
-    TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
+    ERROR_TEXT, INFO_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE,
+    SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
 };
 
 /// Markdown render preferences, threaded from `App` to each
@@ -613,6 +613,9 @@ const AGENT_BULLET: &str = "";
 /// Public so the copy path can strip exactly this much from each
 /// row of an agent-message selection.
 pub const AGENT_INDENT: usize = 2;
+/// Right-side margin that transcript timestamps keep clear, matching the
+/// transcript hover inset.
+const TIMESTAMP_RIGHT_MARGIN: usize = AGENT_INDENT;
 
 /// One rendered history entry. The chrome assembles a flat list of
 /// `Rendered` for the chat pane, then uses each entry's `chip_row` to
@@ -988,7 +991,10 @@ pub fn render_entry(
             }
         }
         HistoryEntry::Plain { line } => Rendered {
-            lines: vec![Line::from(line.clone())],
+            lines: vec![Line::from(vec![
+                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(INFO_TEXT)),
+                Span::styled(line.clone(), Style::default().fg(INFO_TEXT)),
+            ])],
             chip_row: None,
             continuations: vec![false],
             tool_call_rows: Vec::new(),
@@ -1009,10 +1015,10 @@ pub fn render_entry(
             pin_region: None,
         },
         HistoryEntry::Maintenance { line } => Rendered {
-            lines: vec![Line::from(Span::styled(
-                line.clone(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ))],
+            lines: vec![Line::from(vec![
+                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(INFO_TEXT)),
+                Span::styled(line.clone(), Style::default().fg(INFO_TEXT)),
+            ])],
             chip_row: None,
             continuations: vec![false],
             tool_call_rows: Vec::new(),
@@ -1401,8 +1407,11 @@ fn render_pending_markdown_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-    let (wrapped_md, md_conts) =
-        wrap_lines_to_width_reserving_first(markdown_lines, body_content_w, TIMESTAMP_WIDTH + 1);
+    let (wrapped_md, md_conts) = wrap_lines_to_width_reserving_first(
+        markdown_lines,
+        body_content_w,
+        TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN,
+    );
     let body = indent_lines(wrapped_md, AGENT_INDENT);
     if body.is_empty() {
         return vec![render_first_line_with_pin_and_timestamp(vec![], timestamp, width, None).0];
@@ -1707,11 +1716,13 @@ fn render_user_note(text: &str, timestamp: DateTime<Local>, width: u16) -> Vec<L
     // Header: a "note to self" label, timestamp right-aligned.
     let label = "note to self";
     let used = label.width();
-    let pad = area.saturating_sub(used + TIMESTAMP_WIDTH + 1);
+    let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
+    let pad = area.saturating_sub(used + TIMESTAMP_WIDTH + 1 + right_margin);
     out.push(Line::from(vec![
         Span::styled(label.to_string(), muted_italic),
         Span::raw(" ".repeat(pad + 1)),
         Span::styled(ts, Style::default().fg(TIMESTAMP_FG)),
+        Span::raw(" ".repeat(right_margin)),
     ]));
 
     // Body: each wrapped line prefixed with a muted `┊ ` bar.
@@ -1821,7 +1832,7 @@ fn render_agent(
     // first line's right-edge reservation grows by the control block's columns
     // (`pinned-messages`).
     let pin_reserve = agent_pin_reserve(pin);
-    let reserve_first = TIMESTAMP_WIDTH + 1 + pin_reserve;
+    let reserve_first = TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve;
     // Filled in when the first content line actually draws a clickable
     // control (mouse mode on and it fit). The `▶` pick-arrow alone is not
     // clickable, so it leaves this `None`.
@@ -2000,7 +2011,8 @@ fn render_agent(
             // The first chunk shares row 1 with `chip + " "` and the
             // right-edge timestamp, so re-wrap with both reserved —
             // otherwise the chunk pushes the timestamp onto row 2.
-            let collapsed_first_reserve = label_width + 1 + TIMESTAMP_WIDTH + 1 + pin_reserve;
+            let collapsed_first_reserve =
+                label_width + 1 + TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve;
             let collapsed_wrapped: Vec<String> =
                 wrap_with_reserved_first_line(text, text_width, collapsed_first_reserve);
             let mut first_line_spans = chip_spans;
@@ -2037,7 +2049,7 @@ fn render_agent(
         let (wrapped_md, md_conts) = wrap_lines_to_width_reserving_first(
             markdown::render_with_width(text, body_content_w),
             body_content_w,
-            TIMESTAMP_WIDTH + 1 + pin_reserve,
+            TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve,
         );
         let body = indent_lines(wrapped_md, AGENT_INDENT);
         if body.is_empty() {
@@ -2929,9 +2941,9 @@ fn render_compact_boundary(
     out
 }
 
-/// Build a one-line span vec with an HH:MM timestamp right-aligned at
-/// the area edge. The leading spans fill from the left; padding spaces
-/// take up the slack.
+/// Build a one-line span vec with an HH:MM timestamp right-aligned inside
+/// the transcript right margin. The leading spans fill from the left;
+/// padding spaces take up the slack.
 fn render_first_line_timestamped(
     mut spans: Vec<Span<'static>>,
     timestamp: DateTime<Local>,
@@ -2944,10 +2956,12 @@ fn render_first_line_timestamped(
     let area = width as usize;
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
     let ts = format_timestamp(timestamp);
-    let needed = used + TIMESTAMP_WIDTH + 1;
+    let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
+    let needed = used + TIMESTAMP_WIDTH + 1 + right_margin;
     let pad = area.saturating_sub(needed);
     spans.push(Span::raw(" ".repeat(pad + 1)));
     spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+    spans.push(Span::raw(" ".repeat(right_margin)));
     Line::from(spans)
 }
 
@@ -2973,7 +2987,7 @@ fn agent_pin_reserve(pin: Option<PinControl>) -> usize {
 }
 
 /// Build an agent first line with the inline control block sitting immediately
-/// left of the right-aligned timestamp: `…content…  ▶ [fork] [pin] 12:00`
+/// left of the right-margin-aligned timestamp: `…content…  ▶ [fork] [pin] 12:00`
 /// (`pinned-messages`). The caller has already wrapped `spans`' text
 /// leaving the control block plus `TIMESTAMP_WIDTH + 1` columns clear on the
 /// right. Degrades gracefully on narrow widths: the timestamp always wins;
@@ -3002,12 +3016,14 @@ fn render_first_line_with_pin_and_timestamp(
     let pin_w = p.pin_control_width();
     let full_ctrl = p.control_width(true);
     let pin_only_ctrl = p.control_width(false);
+    let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
+    let timestamp_reserve = TIMESTAMP_WIDTH + 1 + right_margin;
     let (control_w, include_fork) =
-        if full_ctrl > 0 && used + arrow_w + full_ctrl + 1 + TIMESTAMP_WIDTH < area {
+        if full_ctrl > 0 && used + arrow_w + full_ctrl + timestamp_reserve < area {
             (full_ctrl, true)
-        } else if pin_only_ctrl > 0 && used + arrow_w + pin_only_ctrl + 1 + TIMESTAMP_WIDTH < area {
+        } else if pin_only_ctrl > 0 && used + arrow_w + pin_only_ctrl + timestamp_reserve < area {
             (pin_only_ctrl, false)
-        } else if arrow_w > 0 && used + arrow_w + TIMESTAMP_WIDTH < area {
+        } else if arrow_w > 0 && used + arrow_w + TIMESTAMP_WIDTH + right_margin < area {
             (0, false)
         } else {
             return (
@@ -3017,7 +3033,7 @@ fn render_first_line_with_pin_and_timestamp(
         };
     let pin_block = arrow_w + control_w + usize::from(control_w > 0);
     // Slack pushes the controls + timestamp to the right edge.
-    let pad = area.saturating_sub(used + pin_block + TIMESTAMP_WIDTH + 1);
+    let pad = area.saturating_sub(used + pin_block + TIMESTAMP_WIDTH + 1 + right_margin);
     spans.push(Span::raw(" ".repeat(pad + 1)));
     // `▶ ` first (immediately left of the controls), then optional `[fork]`,
     // then the `[pin]`/`[unpin]` control.
@@ -3031,7 +3047,7 @@ fn render_first_line_with_pin_and_timestamp(
     }
     let mut region = None;
     if control_w > 0 {
-        let pin_end = area - TIMESTAMP_WIDTH - 1;
+        let pin_end = area - right_margin - TIMESTAMP_WIDTH - 1;
         let pin_start = pin_end - pin_w;
         let fork_range = if include_fork {
             let fork_end = pin_start - 1;
@@ -3055,6 +3071,7 @@ fn render_first_line_with_pin_and_timestamp(
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+    spans.push(Span::raw(" ".repeat(right_margin)));
     (Line::from(spans), region)
 }
 
@@ -3703,6 +3720,121 @@ mod tests {
     }
 
     #[test]
+    fn plain_and_maintenance_lines_are_indented_and_muted() {
+        for entry in [
+            HistoryEntry::Plain {
+                line: "daemon: spawned".to_string(),
+            },
+            HistoryEntry::Maintenance {
+                line: "maintenance note".to_string(),
+            },
+        ] {
+            let r = render_entry(
+                &entry,
+                80,
+                ThinkingDisplay::Condensed,
+                MarkdownOpts::default(),
+                crate::config::extended::DiffStyle::default(),
+                false,
+                &HashSet::new(),
+                0,
+                None,
+            );
+            assert_eq!(r.lines.len(), 1);
+            let text = line_text(&r.lines[0]);
+            assert!(
+                text.starts_with(&" ".repeat(AGENT_INDENT)),
+                "system line should share the transcript indent: {text:?}"
+            );
+            assert!(
+                r.lines[0]
+                    .spans
+                    .iter()
+                    .any(|span| !span.content.trim().is_empty() && span.style.fg == Some(INFO_TEXT)),
+                "system text should use muted foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_warning_and_error_colors_are_not_muted() {
+        let entries = [
+            (
+                HistoryEntry::CommandError {
+                    line: "bad command".to_string(),
+                },
+                ERROR_TEXT,
+            ),
+            (
+                HistoryEntry::BackupWarning {
+                    line: "backup warning".to_string(),
+                },
+                WARNING_TEXT,
+            ),
+            (
+                HistoryEntry::InferenceWarning {
+                    line: "slow model".to_string(),
+                },
+                WARNING_TEXT,
+            ),
+            (
+                HistoryEntry::InferenceError {
+                    summary: "Inference failed".to_string(),
+                    detail: String::new(),
+                    expanded: false,
+                },
+                ERROR_TEXT,
+            ),
+        ];
+
+        for (entry, expected) in entries {
+            let r = render_entry(
+                &entry,
+                80,
+                ThinkingDisplay::Condensed,
+                MarkdownOpts::default(),
+                crate::config::extended::DiffStyle::default(),
+                false,
+                &HashSet::new(),
+                0,
+                None,
+            );
+            assert!(
+                r.lines[0]
+                    .spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(expected)),
+                "semantic entry should retain {expected:?}: {:?}",
+                line_text(&r.lines[0])
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_helpers_keep_right_margin() {
+        let width: u16 = 40;
+        let line =
+            render_first_line_timestamped(vec![Span::raw("  body")], fixed_ts(), width, true);
+        let text = line_text(&line);
+        assert_eq!(line_width(&line), width as usize);
+        let ts_start = text
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == ':').then_some(idx.saturating_sub(2)))
+            .expect("timestamp present");
+        assert_eq!(
+            ts_start + TIMESTAMP_WIDTH,
+            width as usize - TIMESTAMP_RIGHT_MARGIN
+        );
+        assert_eq!(
+            text.chars()
+                .rev()
+                .take(TIMESTAMP_RIGHT_MARGIN)
+                .collect::<String>(),
+            " ".repeat(TIMESTAMP_RIGHT_MARGIN)
+        );
+    }
+
+    #[test]
     fn dots_cycle_four_phases() {
         assert_eq!(thinking_dots(0), "");
         assert_eq!(thinking_dots(333), ".");
@@ -4315,7 +4447,7 @@ mod tests {
             let pin_end = pin_at + label.chars().count();
             assert_eq!(
                 pin_end,
-                width as usize - TIMESTAMP_WIDTH - 1,
+                width as usize - TIMESTAMP_RIGHT_MARGIN - TIMESTAMP_WIDTH - 1,
                 "pin control ends just left of the ts gap: {first:?}"
             );
 
@@ -4327,7 +4459,7 @@ mod tests {
             assert_eq!(region.col_end - region.col_start, pin_w, "{label} width");
             assert_eq!(
                 region.col_end,
-                width - TIMESTAMP_WIDTH as u16 - 1,
+                width - TIMESTAMP_RIGHT_MARGIN as u16 - TIMESTAMP_WIDTH as u16 - 1,
                 "pin region ends just left of the ts gap"
             );
             assert_eq!(

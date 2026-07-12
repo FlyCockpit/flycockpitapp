@@ -914,6 +914,78 @@ pub(crate) fn shell_write_targets(command: &str, cwd: &Path) -> ShellWriteTarget
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShellWriteContentPreview {
+    Literal(String),
+    Dynamic(String),
+}
+
+pub(crate) fn shell_write_content_preview(
+    command: &str,
+) -> crate::daemon::proto::WriteContentPreview {
+    match shell_write_content_preview_inner(command) {
+        ShellWriteContentPreview::Literal(content) => crate::daemon::proto::WriteContentPreview {
+            content,
+            dynamic: false,
+        },
+        ShellWriteContentPreview::Dynamic(source) => crate::daemon::proto::WriteContentPreview {
+            content: format!("(output of `{source}`)"),
+            dynamic: true,
+        },
+    }
+}
+
+fn shell_write_content_preview_inner(command: &str) -> ShellWriteContentPreview {
+    let tokens = shell_write_tokens(command);
+    let Some((op_index, _)) = tokens
+        .iter()
+        .enumerate()
+        .find(|(_, token)| matches!(token, WriteToken::Op(">" | ">>" | ">|")))
+    else {
+        return ShellWriteContentPreview::Dynamic(command.trim().to_string());
+    };
+    let source = command_source_before_redirect(&tokens[..op_index]);
+    if let Some(literal) = literal_shell_write_source(&source) {
+        ShellWriteContentPreview::Literal(literal)
+    } else {
+        ShellWriteContentPreview::Dynamic(source)
+    }
+}
+
+fn command_source_before_redirect(tokens: &[WriteToken]) -> String {
+    tokens
+        .iter()
+        .filter_map(|token| match token {
+            WriteToken::Word(word) => Some(word.as_str()),
+            WriteToken::Op(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn literal_shell_write_source(source: &str) -> Option<String> {
+    let tokens = shell_write_tokens(source);
+    let mut words = tokens.iter().filter_map(|token| match token {
+        WriteToken::Word(word) => Some(word.as_str()),
+        WriteToken::Op(_) => None,
+    });
+    let program = words.next()?;
+    let args: Vec<&str> = words.collect();
+    match program {
+        "echo" => Some(format!("{}\n", args.join(" "))),
+        "printf" => printf_literal_preview(&args),
+        _ => None,
+    }
+}
+
+fn printf_literal_preview(args: &[&str]) -> Option<String> {
+    let format = args.first()?;
+    if format.contains('%') || format.contains('\\') {
+        return None;
+    }
+    Some(format.to_string())
+}
+
 fn durable_shell_write_hint(command: &str) -> Option<&'static str> {
     let tokens = shell_write_tokens(command);
     let mut command_start = true;

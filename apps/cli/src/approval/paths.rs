@@ -10,6 +10,15 @@ impl Approver {
         path: &std::path::Path,
         required: SandboxPathAccess,
     ) -> Result<Decision> {
+        self.approve_path_with_detail(path, required, None).await
+    }
+
+    pub(super) async fn approve_path_with_detail(
+        &self,
+        path: &std::path::Path,
+        required: SandboxPathAccess,
+        detail: Option<CommandDetail>,
+    ) -> Result<Decision> {
         let target = path.display().to_string();
         // Standing reject short-circuit (checked before allow). A rejected
         // path auto-denies the out-of-cwd access with no prompt; recorded with
@@ -39,15 +48,11 @@ impl Approver {
         }
         // Paths are never wrappers → all four scopes are offered.
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        let choice = self
-            .prompt(
-                &target,
-                false,
-                None,
-                None,
-                &[Scope::Once, Scope::Session, Scope::Project, Scope::Global],
-            )
-            .await?;
+        let label = path_prompt_label(&target, required);
+        let description = path_prompt_description(&target, required);
+        let question = approval_question(&label, false, detail, None, &offered);
+        let response = self.raise_and_wait(&description, question).await?;
+        let choice = response_to_approval_choice(&response, false);
         let decision = match choice {
             ApprovalChoice::Deny => Decision::Deny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },

@@ -187,12 +187,20 @@ impl Approver {
             return Ok(None);
         }
 
+        let preview = crate::tools::bash::shell_write_content_preview(command);
         let mut widest = Scope::Global;
         for target in targets {
+            let detail = shell_write_command_detail(
+                command,
+                self.store.cwd(),
+                std::slice::from_ref(&target),
+                preview.clone(),
+            );
             match self
-                .approve_path(
+                .approve_path_with_detail(
                     &target,
                     crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                    Some(detail),
                 )
                 .await?
             {
@@ -256,7 +264,15 @@ impl Approver {
         // records the key, not the arg-laden command line. The full command
         // rides alongside as presentational detail (`CommandDetail`).
         let label = info.key.as_storage_str();
-        let detail = command_detail(info, policy, full_command, step, step_count);
+        let detail = command_detail(
+            info,
+            policy,
+            full_command,
+            self.store.cwd(),
+            None,
+            step,
+            step_count,
+        );
         let choice = self
             .prompt(
                 &label,

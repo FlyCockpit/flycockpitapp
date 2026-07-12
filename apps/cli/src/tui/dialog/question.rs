@@ -168,7 +168,7 @@ impl QuestionDialog {
     }
 
     /// Whether this dialog is a command/permission **approval** prompt (any
-    /// page carries a `command_detail` block) rather than a plain `question`
+    /// page carries the permission flag) rather than a plain `question`
     /// interrupt. Used by the which-key overlay (`which-key-overlay.md`) to
     /// show the approval-specific `y/n` decision keys.
     pub fn is_approval(&self) -> bool {
@@ -176,7 +176,7 @@ impl QuestionDialog {
             matches!(
                 q,
                 InterruptQuestion::Single {
-                    command_detail: Some(_),
+                    permission: true,
                     ..
                 }
             )
@@ -467,24 +467,31 @@ impl QuestionDialog {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        // Anti-misfire lockout: grey border while locked, white once
-        // interactive.
+        // Anti-misfire lockout: grey border while locked; once interactive,
+        // destructive/privileged approvals tint red and mutating approvals
+        // tint yellow.
         let locked = self.state.locked();
+        let risk_color = self.current_risk_color();
         let border_color = if locked {
             Color::Indexed(MUTED_COLOR_INDEX)
         } else {
-            Color::White
+            risk_color.unwrap_or(Color::White)
+        };
+        let title_base = if self.is_approval() {
+            "approval"
+        } else {
+            "question"
         };
         let title = if self.state.page_count() > 1 {
             let n = self.state.page_count();
             let cur = (self.state.current_page() + 1).min(n + 1);
             if self.state.on_confirm_page() {
-                " question · review ".to_string()
+                format!(" {title_base} · review ")
             } else {
-                format!(" question · {cur}/{n} ")
+                format!(" {title_base} · {cur}/{n} ")
             }
         } else {
-            " question ".to_string()
+            format!(" {title_base} ")
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -914,6 +921,15 @@ impl QuestionDialog {
                 muted.add_modifier(Modifier::ITALIC),
             )));
         }
+        if let Some(cwd) = cd.cwd.as_deref() {
+            out.push(Line::from(Span::styled(format!("cwd: {cwd}"), muted)));
+        }
+        if let Some(key) = cd.remembered_key.as_deref() {
+            out.push(Line::from(vec![
+                Span::styled("remembers: ", muted),
+                Span::styled(format!("`{key}`"), Style::default().fg(Color::White)),
+            ]));
+        }
 
         // Render each source line, mapping the global char-span highlight
         // onto per-line segments. `char_base` is the running char offset of
@@ -925,8 +941,30 @@ impl QuestionDialog {
             out.push(self.command_source_line(line, char_base, line_len, highlight));
             char_base += line_len + 1; // account for the '\n' separator
         }
+        if let Some(preview) = cd.write_content.as_ref() {
+            out.push(Line::from(Span::styled("content:", muted)));
+            if preview.dynamic {
+                out.push(Line::from(Span::styled(
+                    format!("  {}", preview.content),
+                    muted,
+                )));
+            } else {
+                for line in truncated_preview_lines(&preview.content) {
+                    out.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
+        }
         out.extend(self.command_risk_lines(cd));
         out
+    }
+
+    fn current_risk_color(&self) -> Option<Color> {
+        self.command_detail()
+            .and_then(|cd| cd.risk_tier.as_deref())
+            .and_then(risk_tier_color)
     }
 
     fn command_risk_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
@@ -936,7 +974,14 @@ impl QuestionDialog {
             return out;
         };
         out.push(Line::default());
-        out.push(Line::from(Span::styled(format!("risk: {tier}"), muted)));
+        out.push(Line::from(vec![
+            Span::styled("risk: ", muted),
+            Span::styled(
+                tier.to_string(),
+                Style::default()
+                    .fg(risk_tier_color(tier).unwrap_or(Color::Indexed(MUTED_COLOR_INDEX))),
+            ),
+        ]));
         if !cd.risk_reasons.is_empty() {
             out.push(Line::from(Span::styled(
                 format!("reasons: {}", cd.risk_reasons.join(", ")),
@@ -1126,6 +1171,37 @@ fn split_regions(body_h: usize, prompt_want: usize, answer_want: usize) -> (usiz
         return (prompt_h + slack, answer_h);
     }
     (prompt_h, answer_h)
+}
+
+fn risk_tier_color(tier: &str) -> Option<Color> {
+    match tier {
+        "destructive" | "privileged" => Some(Color::Red),
+        "mutating" => Some(Color::Yellow),
+        "ordinary" => Some(Color::Indexed(MUTED_COLOR_INDEX)),
+        _ => None,
+    }
+}
+
+const WRITE_PREVIEW_MAX_LINES: usize = 12;
+
+fn truncated_preview_lines(content: &str) -> Vec<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= WRITE_PREVIEW_MAX_LINES {
+        if lines.is_empty() {
+            return vec![String::new()];
+        }
+        return lines.into_iter().map(str::to_string).collect();
+    }
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(WRITE_PREVIEW_MAX_LINES)
+        .map(|line| (*line).to_string())
+        .collect();
+    out.push(format!(
+        "… (+{} more lines)",
+        lines.len() - WRITE_PREVIEW_MAX_LINES
+    ));
+    out
 }
 
 /// Total wrapped-row count for `lines` at terminal width `width`, matching
@@ -2116,6 +2192,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2129,6 +2208,62 @@ mod tests {
         render_lines(d, area).join("\n")
     }
 
+    fn rendered_dialog_text(mut d: QuestionDialog, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height)))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn approval_title_and_plain_question_title_diverge() {
+        let d = approval_dialog(CommandDetail {
+            full_command: "rm foo".into(),
+            highlight: None,
+            step: 1,
+            step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
+            risk_tier: Some("destructive".to_string()),
+            risk_reasons: Vec::new(),
+            affected_targets: Vec::new(),
+            native_tool_hints: Vec::new(),
+            offered_scopes: Vec::new(),
+            policy_cap: None,
+        });
+        let text = rendered_dialog_text(d, 80, 14);
+        assert!(text.contains(" approval "), "{text}");
+        let q = QuestionDialog::new(
+            Uuid::new_v4(),
+            String::new(),
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Pick?".into(),
+                    options: vec![opt("a", "A")],
+                    allow_freetext: true,
+                    command_detail: None,
+                    permission: false,
+                    sandbox_escalation: None,
+                }],
+            },
+            Duration::ZERO,
+        );
+        let text = rendered_dialog_text(q, 80, 10);
+        assert!(text.contains(" question "), "{text}");
+        assert!(!text.contains(" approval "), "{text}");
+    }
+
     #[test]
     fn shows_heading_and_full_command_verbatim() {
         let d = approval_dialog(CommandDetail {
@@ -2136,6 +2271,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2164,6 +2302,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: Some("destructive".to_string()),
             risk_reasons: vec!["removes files".to_string()],
             affected_targets: vec!["foo".to_string()],
@@ -2189,6 +2330,9 @@ mod tests {
             highlight: Some(CharSpan { start: 24, end: 35 }),
             step: 2,
             step_count: 2,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2238,6 +2382,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2278,6 +2425,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2385,6 +2535,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2433,6 +2586,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2482,6 +2638,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2520,6 +2679,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2554,6 +2716,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2602,6 +2767,9 @@ mod tests {
             highlight: Some(CharSpan { start: 14, end: 18 }),
             step: 2,
             step_count: 2,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -2644,6 +2812,9 @@ mod tests {
                     highlight: None,
                     step: 1,
                     step_count: 1,
+                    cwd: None,
+                    remembered_key: None,
+                    write_content: None,
                     risk_tier: None,
                     risk_reasons: Vec::new(),
                     affected_targets: Vec::new(),
@@ -2717,6 +2888,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),

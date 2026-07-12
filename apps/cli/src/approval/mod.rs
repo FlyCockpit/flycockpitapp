@@ -53,7 +53,7 @@ use crate::approval::classify::{Classification, RiskTier, SimpleCommandInfo};
 use crate::approval::store::{GrantStore, LoopVerdict, Scope};
 use crate::daemon::proto::{
     CharSpan, CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet,
-    ResolveResponse, SandboxEscalation,
+    ResolveResponse, SandboxEscalation, WriteContentPreview,
 };
 use crate::engine::interrupt::InterruptHub;
 use crate::tui::dialog::approval::{
@@ -333,6 +333,8 @@ fn command_detail(
     info: &SimpleCommandInfo,
     policy: &ApprovalPromptPolicy,
     full_command: &str,
+    cwd: &std::path::Path,
+    write_content: Option<WriteContentPreview>,
     step: u32,
     step_count: u32,
 ) -> Option<CommandDetail> {
@@ -353,22 +355,97 @@ fn command_detail(
     } else {
         None
     };
+    let offered_scope_keys: Vec<String> = policy
+        .offered_scopes
+        .iter()
+        .map(|scope| scope.as_str().to_string())
+        .collect();
+    let remembered_key = (!info.wrapper
+        && policy
+            .offered_scopes
+            .iter()
+            .any(|scope| !matches!(scope, Scope::Once)))
+    .then(|| info.key.as_storage_str());
     Some(CommandDetail {
         full_command: full_command.to_string(),
         highlight,
         step,
         step_count,
+        cwd: Some(cwd.display().to_string()),
+        remembered_key,
+        write_content,
         risk_tier: Some(info.risk.tier.as_str().to_string()),
         risk_reasons: info.risk.reasons.clone(),
         affected_targets: info.risk.affected_paths.clone(),
         native_tool_hints: info.risk.native_tool_hints.clone(),
-        offered_scopes: policy
-            .offered_scopes
-            .iter()
-            .map(|scope| scope.as_str().to_string())
-            .collect(),
+        offered_scopes: offered_scope_keys,
         policy_cap: Some(policy.max_scope.as_str().to_string()),
     })
+}
+
+fn command_description_suffix(cd: &CommandDetail) -> String {
+    let cwd = cd
+        .cwd
+        .as_deref()
+        .map(|cwd| format!(" (in {cwd})"))
+        .unwrap_or_default();
+    if cd.step_count > 1 {
+        format!(
+            " — `{}` (step {} of {}){cwd}",
+            cd.full_command, cd.step, cd.step_count
+        )
+    } else {
+        format!(" — `{}`{cwd}", cd.full_command)
+    }
+}
+
+fn path_access_label(required: crate::tools::shell_sandbox::SandboxPathAccess) -> &'static str {
+    match required {
+        crate::tools::shell_sandbox::SandboxPathAccess::Read => "read",
+        crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite => "read-write",
+    }
+}
+
+fn path_prompt_label(
+    path: &str,
+    required: crate::tools::shell_sandbox::SandboxPathAccess,
+) -> String {
+    format!("{} access to {path}", path_access_label(required))
+}
+
+fn path_prompt_description(
+    path: &str,
+    required: crate::tools::shell_sandbox::SandboxPathAccess,
+) -> String {
+    format!("Allow {} access to {path}?", path_access_label(required))
+}
+
+fn shell_write_command_detail(
+    full_command: &str,
+    cwd: &std::path::Path,
+    targets: &[std::path::PathBuf],
+    preview: WriteContentPreview,
+) -> CommandDetail {
+    CommandDetail {
+        full_command: full_command.to_string(),
+        highlight: None,
+        step: 1,
+        step_count: 1,
+        cwd: Some(cwd.display().to_string()),
+        remembered_key: None,
+        write_content: Some(preview),
+        risk_tier: Some("mutating".to_string()),
+        risk_reasons: vec!["writes shell redirect target".to_string()],
+        affected_targets: targets.iter().map(|p| p.display().to_string()).collect(),
+        native_tool_hints: Vec::new(),
+        offered_scopes: vec![
+            Scope::Once.as_str().to_string(),
+            Scope::Session.as_str().to_string(),
+            Scope::Project.as_str().to_string(),
+            Scope::Global.as_str().to_string(),
+        ],
+        policy_cap: Some(Scope::Global.as_str().to_string()),
+    }
 }
 
 fn prompt_description(
@@ -379,16 +456,7 @@ fn prompt_description(
 ) -> String {
     // Include the full command (and step indicator) so headless / log
     // surfaces aren't worse off than the TUI.
-    let suffix = match detail {
-        Some(cd) if cd.step_count > 1 => {
-            format!(
-                " — `{}` (step {} of {})",
-                cd.full_command, cd.step, cd.step_count
-            )
-        }
-        Some(cd) => format!(" — `{}`", cd.full_command),
-        None => String::new(),
-    };
+    let suffix = detail.map(command_description_suffix).unwrap_or_default();
     // The escalation variant: state honestly that it failed WHILE sandboxed
     // (not that the sandbox blocked it — zerobox is a silent deny) and carry
     // the confined exit + stderr so a non-TUI surface isn't worse off.
@@ -1551,6 +1619,9 @@ mod tests {
             highlight: None,
             step: 2,
             step_count: 2,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -1570,6 +1641,9 @@ mod tests {
             highlight: None,
             step: 1,
             step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
             risk_tier: None,
             risk_reasons: Vec::new(),
             affected_targets: Vec::new(),
@@ -1628,7 +1702,16 @@ mod tests {
             span: Some(crate::approval::classify::CharSpan { start: 2, end: 999 }),
         };
         let policy = ApprovalPromptPolicy::new(Scope::Global);
-        let cd = command_detail(&info, &policy, "x && y", 2, 2).unwrap();
+        let cd = command_detail(
+            &info,
+            &policy,
+            "x && y",
+            std::path::Path::new("."),
+            None,
+            2,
+            2,
+        )
+        .unwrap();
         assert!(cd.highlight.is_none(), "out-of-range span dropped");
         assert_eq!((cd.step, cd.step_count), (2, 2));
     }

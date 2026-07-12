@@ -773,6 +773,16 @@ pub struct CommandDetail {
     /// indicator.
     pub step: u32,
     pub step_count: u32,
+    /// Working directory where the command approval applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Approval key that a scoped remember choice records (for example
+    /// `gh pr`, not necessarily the entire command line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remembered_key: Option<String>,
+    /// Preview of content written by shell write-redirection approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_content: Option<WriteContentPreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -785,6 +795,13 @@ pub struct CommandDetail {
     pub offered_scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_cap: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteContentPreview {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic: bool,
 }
 
 /// A 0-based, end-exclusive char range into a source string. Char-indexed
@@ -1352,6 +1369,9 @@ mod tests {
                 highlight: Some(CharSpan { start: 11, end: 22 }),
                 step: 2,
                 step_count: 2,
+                cwd: None,
+                remembered_key: None,
+                write_content: None,
                 risk_tier: None,
                 risk_reasons: Vec::new(),
                 affected_targets: Vec::new(),

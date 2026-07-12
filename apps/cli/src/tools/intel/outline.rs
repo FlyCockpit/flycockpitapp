@@ -62,8 +62,8 @@ impl Tool for OutlineTool {
         let (symbols, imports, language) = index.outline_rows(&rel)?;
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
 
-        // Unknown / not-indexed language → regex fallback (never errors).
-        if language.is_empty() || language == "unknown" {
+        // Grammarless / not-indexed language → regex fallback (never errors).
+        if language.is_empty() || Language::from_stored(&language).grammar().is_none() {
             let abs = crate::tools::common::resolve(path_arg, &ctx.cwd);
             let body = match std::fs::read_to_string(&abs) {
                 Ok(b) => b,

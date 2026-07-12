@@ -32,7 +32,20 @@ pub fn resolve(
         Language::Python => resolve_python(importer, raw, existing),
         Language::Go => resolve_go(raw, existing, module_prefix),
         Language::C | Language::Cpp => resolve_c(importer, raw, existing),
-        Language::Unknown => None,
+        Language::Markdown
+        | Language::Toml
+        | Language::Yaml
+        | Language::Json
+        | Language::Html
+        | Language::Css
+        | Language::Sql
+        | Language::Xml
+        | Language::Shell
+        | Language::Dockerfile
+        | Language::Makefile
+        | Language::Dotenv
+        | Language::Text
+        | Language::Unknown => None,
     }
 }
 

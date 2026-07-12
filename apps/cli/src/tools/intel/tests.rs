@@ -34,6 +34,29 @@ async fn outline_unknown_language_uses_regex_fallback_without_erroring() {
 }
 
 #[tokio::test]
+async fn outline_grammarless_classified_language_uses_regex_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "README.md", "# Notes\n\nplain text\n");
+    let ctx = test_ctx(tmp.path());
+
+    let out = OutlineTool
+        .call(serde_json::json!({ "path": "README.md" }), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("unknown language — regex outline"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("(no definitions matched)"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
 async fn tree_and_hot_list_unknown_language_files() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
@@ -43,8 +66,8 @@ async fn tree_and_hot_list_unknown_language_files() {
     let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
     assert!(tree.content.contains("src/lib.rs"));
     assert!(tree.content.contains("notes.foo"));
-    // The unknown file is visible but flagged not-indexed.
-    assert!(tree.content.contains("notes.foo  unknown"));
+    // The unknown file is visible but flagged as grammarless data.
+    assert!(tree.content.contains("notes.foo  unknown 9b 1L [data]"));
 
     let hot = HotTool.call(serde_json::json!({}), &ctx).await.unwrap();
     assert!(hot.content.contains("notes.foo"));
@@ -66,7 +89,41 @@ async fn tree_lists_files_including_unknown_language_files() {
         tree.content
     );
     assert!(
-        tree.content.contains("scratch.unknownext  unknown"),
+        tree.content
+            .contains("scratch.unknownext  unknown 6b 1L [data]"),
+        "{}",
+        tree.content
+    );
+}
+
+#[tokio::test]
+async fn tree_marks_grammarless_data_and_parsed_symbol_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
+    write(tmp.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+    write(tmp.path(), "Dockerfile", "FROM scratch\n");
+    let ctx = test_ctx(tmp.path());
+
+    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+    assert!(
+        tree.content.contains("Cargo.toml  toml"),
+        "{}",
+        tree.content
+    );
+    assert!(
+        tree.content.contains("Cargo.toml  toml 24b 2L [data]"),
+        "{}",
+        tree.content
+    );
+    assert!(
+        tree.content
+            .contains("Dockerfile  dockerfile 13b 1L [data]"),
+        "{}",
+        tree.content
+    );
+    assert!(
+        tree.content.contains("src/lib.rs  rust 14b 1L [1 sym]"),
         "{}",
         tree.content
     );
@@ -85,6 +142,11 @@ async fn tree_uses_stored_lines_and_marks_large_indexed_files() {
         .unwrap()
         .set_len(5 * 1024 * 1024)
         .unwrap();
+    let large_data_path = tmp.path().join("large.toml");
+    std::fs::File::create(&large_data_path)
+        .unwrap()
+        .set_len(5 * 1024 * 1024)
+        .unwrap();
     let ctx = test_ctx(tmp.path());
 
     let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
@@ -95,7 +157,14 @@ async fn tree_uses_stored_lines_and_marks_large_indexed_files() {
         tree.content
     );
     assert!(
-        tree.content.contains("src/large.rs  rust 5242880b [large]"),
+        tree.content
+            .contains("src/large.rs  rust 5242880b [large] [0 sym]"),
+        "{}",
+        tree.content
+    );
+    assert!(
+        tree.content
+            .contains("large.toml  toml 5242880b [large] [data]"),
         "{}",
         tree.content
     );
@@ -468,6 +537,8 @@ async fn context_pack_overview_on_multifile_fixture() {
     );
     write(tmp.path(), "src/util.rs", "pub fn helper() {}\n");
     write(tmp.path(), "script.py", "def runner():\n    pass\n");
+    write(tmp.path(), "README.md", "# Project\n");
+    write(tmp.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
     let ctx = test_ctx(tmp.path());
 
     let out = ContextPackTool
@@ -483,6 +554,8 @@ async fn context_pack_overview_on_multifile_fixture() {
     assert!(out.content.contains("languages:"), "{}", out.content);
     assert!(out.content.contains("rust"), "{}", out.content);
     assert!(out.content.contains("python"), "{}", out.content);
+    assert!(out.content.contains("markdown"), "{}", out.content);
+    assert!(out.content.contains("toml"), "{}", out.content);
     assert!(out.content.contains("entry candidates:"), "{}", out.content);
     assert!(out.content.contains("src/lib.rs"), "{}", out.content);
     assert!(out.content.contains("next:"), "{}", out.content);

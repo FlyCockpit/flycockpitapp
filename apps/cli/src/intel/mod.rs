@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::db::Db;
@@ -43,6 +43,9 @@ const CHUNK: usize = 200;
 /// log so the first call doesn't look hung (the TUI shows a spinner on
 /// ToolStart; this is the Phase-1 progress signal).
 const COLD_THRESHOLD: usize = 100;
+
+/// Version for indexer logic that changes indexed output without file content changes.
+pub(crate) const INTEL_INDEX_LOGIC_VERSION: i64 = 1;
 
 /// Project-scoped intelligence index over `root`.
 pub struct Index {
@@ -154,13 +157,19 @@ impl Index {
         let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
 
         let read_root_key = root_key.clone();
-        let indexed = self
+        let (indexed, logic_version_current) = self
             .db
-            .read(move |conn| load_indexed(conn, &read_root_key))
+            .read(move |conn| {
+                let indexed = load_indexed(conn, &read_root_key)?;
+                let version = load_index_logic_version(conn)?;
+                Ok((indexed, version == Some(INTEL_INDEX_LOGIC_VERSION)))
+            })
             .await?;
-        let work = tokio::task::spawn_blocking(move || plan_fresh_work(disk, indexed))
-            .await
-            .context("intel planning worker joined")??;
+        let work = tokio::task::spawn_blocking(move || {
+            plan_fresh_work(disk, indexed, logic_version_current)
+        })
+        .await
+        .context("intel planning worker joined")??;
         let removed_any = !work.removed.is_empty();
 
         if removed_any || !work.stat_updates.is_empty() {
@@ -175,10 +184,19 @@ impl Index {
         }
 
         if work.to_index.is_empty() {
-            if removed_any {
+            let write_version = !logic_version_current;
+            if removed_any || write_version {
                 let write_root_key = root_key.clone();
                 self.db
-                    .write(move |conn| Ok(callgraph::recompute_centrality(conn, &write_root_key)?))
+                    .write(move |conn| {
+                        if removed_any {
+                            callgraph::recompute_centrality(conn, &write_root_key)?;
+                        }
+                        if write_version {
+                            store_index_logic_version(conn)?;
+                        }
+                        Ok(())
+                    })
                     .await?;
             }
             return Ok(());
@@ -215,8 +233,15 @@ impl Index {
         }
 
         let write_root_key = root_key.clone();
+        let write_version = !logic_version_current;
         self.db
-            .write(move |conn| Ok(callgraph::recompute_centrality(conn, &write_root_key)?))
+            .write(move |conn| {
+                callgraph::recompute_centrality(conn, &write_root_key)?;
+                if write_version {
+                    store_index_logic_version(conn)?;
+                }
+                Ok(())
+            })
             .await?;
         Ok(())
     }
@@ -613,7 +638,11 @@ struct FreshWork {
     to_index: Vec<DiskFile>,
 }
 
-fn plan_fresh_work(disk: Vec<DiskFile>, indexed: IndexedMap) -> Result<FreshWork> {
+fn plan_fresh_work(
+    disk: Vec<DiskFile>,
+    indexed: IndexedMap,
+    logic_version_current: bool,
+) -> Result<FreshWork> {
     let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
     let removed = indexed
         .keys()
@@ -626,6 +655,10 @@ fn plan_fresh_work(disk: Vec<DiskFile>, indexed: IndexedMap) -> Result<FreshWork
         match indexed.get(&f.rel) {
             None => to_index.push(f),
             Some((mtime, size, hash)) => {
+                if !logic_version_current {
+                    to_index.push(f);
+                    continue;
+                }
                 if *mtime == f.mtime_ns && *size == f.size {
                     continue;
                 }
@@ -776,6 +809,26 @@ fn disk_file_for(abs: &Path, root: &Path) -> Option<DiskFile> {
 }
 
 type IndexedMap = HashMap<String, (i64, i64, String)>;
+
+fn load_index_logic_version(conn: &Connection) -> Result<Option<i64>> {
+    let version = conn
+        .query_row(
+            "SELECT value FROM intel_meta WHERE key = 'index_logic_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(version)
+}
+
+fn store_index_logic_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO intel_meta (key, value) VALUES ('index_logic_version', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [INTEL_INDEX_LOGIC_VERSION],
+    )?;
+    Ok(())
+}
 
 fn load_indexed(conn: &Connection, root_key: &str) -> Result<IndexedMap> {
     let mut stmt =
@@ -1089,6 +1142,80 @@ mod tests {
         let tree = index.tree_rows().unwrap();
         assert!(tree.iter().any(|(p, _, _, _, _)| p == "src/lib.rs"));
         assert!(tree.iter().any(|(p, _, _, _, _)| p == "app.py"));
+    }
+
+    #[tokio::test]
+    async fn index_logic_version_controls_unchanged_file_reindex() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let root_key = root.to_string_lossy().into_owned();
+        write_file(&root, "Dockerfile.dev", "FROM scratch\n");
+
+        let index = Index::new(db.clone(), root.clone());
+        index.ensure_fresh().await.unwrap();
+
+        let stored_version: i64 = db
+            .read_blocking(|conn| {
+                Ok(conn.query_row(
+                    "SELECT value FROM intel_meta WHERE key = 'index_logic_version'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stored_version, INTEL_INDEX_LOGIC_VERSION);
+        let query_root_key = root_key.clone();
+        let language = || {
+            db.read_blocking(|conn| {
+                Ok(conn.query_row(
+                    "SELECT language FROM intel_files WHERE root = ?1 AND path = 'Dockerfile.dev'",
+                    [&query_root_key],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .unwrap()
+        };
+        assert_eq!(language(), "dockerfile");
+
+        let write_root_key = root_key.clone();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE intel_files SET language = 'unknown' WHERE root = ?1 AND path = 'Dockerfile.dev'",
+                [&write_root_key],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        index.ensure_fresh().await.unwrap();
+        assert_eq!(
+            language(),
+            "unknown",
+            "matching logic version should preserve unchanged rows"
+        );
+
+        db.write(|conn| {
+            conn.execute(
+                "UPDATE intel_meta SET value = ?1 WHERE key = 'index_logic_version'",
+                [INTEL_INDEX_LOGIC_VERSION + 1],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        index.ensure_fresh().await.unwrap();
+        assert_eq!(language(), "dockerfile");
+        let stored_version: i64 = db
+            .read_blocking(|conn| {
+                Ok(conn.query_row(
+                    "SELECT value FROM intel_meta WHERE key = 'index_logic_version'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stored_version, INTEL_INDEX_LOGIC_VERSION);
     }
 
     /// A gitignored source file is skipped by the default walk, but

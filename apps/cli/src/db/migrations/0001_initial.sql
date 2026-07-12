@@ -335,6 +335,11 @@ CREATE TABLE tokenizer_calibration (
 -- stale file's row purges its symbols/imports/identifiers/deps/callsites
 -- in one statement.
 
+CREATE TABLE intel_meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+
 CREATE TABLE intel_files (
     root         TEXT NOT NULL,
     path         TEXT NOT NULL,

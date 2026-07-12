@@ -96,10 +96,20 @@ impl Tool for TreeTool {
             let lang = Language::from_path(Path::new(rel));
             let line = match indexed.get(rel) {
                 Some((lang_str, _indexed_size, Some(lines), syms)) => {
-                    format!("{rel}  {lang_str} {size}b {lines}L [{syms} sym]")
+                    let marker = if Language::from_stored(lang_str).grammar().is_none() {
+                        "[data]".to_string()
+                    } else {
+                        format!("[{syms} sym]")
+                    };
+                    format!("{rel}  {lang_str} {size}b {lines}L {marker}")
                 }
                 Some((lang_str, _indexed_size, None, syms)) => {
-                    format!("{rel}  {lang_str} {size}b [large] [{syms} sym]")
+                    let marker = if Language::from_stored(lang_str).grammar().is_none() {
+                        "[data]".to_string()
+                    } else {
+                        format!("[{syms} sym]")
+                    };
+                    format!("{rel}  {lang_str} {size}b [large] {marker}")
                 }
                 None => format!("{rel}  {} {size}b [not indexed]", lang.as_str()),
             };

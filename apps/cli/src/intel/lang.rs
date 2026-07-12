@@ -74,13 +74,41 @@ pub enum Language {
     Go,
     C,
     Cpp,
+    Markdown,
+    Toml,
+    Yaml,
+    Json,
+    Html,
+    Css,
+    Sql,
+    Xml,
+    Shell,
+    Dockerfile,
+    Makefile,
+    Dotenv,
+    Text,
     Unknown,
 }
 
 impl Language {
-    /// Map a file extension (no leading dot, lowercased by the caller is
-    /// fine but we lowercase defensively) to a language.
+    /// Map a path to a language. Filename-based special cases win over
+    /// extension matching so conventional extensionless files classify.
     pub fn from_path(path: &Path) -> Language {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        match filename {
+            "Cargo.lock" => return Language::Toml,
+            "Dockerfile" => return Language::Dockerfile,
+            name if name.starts_with("Dockerfile.") => return Language::Dockerfile,
+            "Makefile" | "GNUmakefile" => return Language::Makefile,
+            ".env" => return Language::Dotenv,
+            name if name.starts_with(".env.") => return Language::Dotenv,
+            "LICENSE" | "NOTICE" | "AUTHORS" | "COPYING" => return Language::Text,
+            _ => {}
+        }
+
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -95,6 +123,18 @@ impl Language {
             "go" => Language::Go,
             "c" | "h" => Language::C,
             "cc" | "cpp" | "cxx" | "hpp" | "hxx" | "hh" => Language::Cpp,
+            "md" | "markdown" => Language::Markdown,
+            "toml" => Language::Toml,
+            "yaml" | "yml" => Language::Yaml,
+            "json" | "jsonc" => Language::Json,
+            "html" | "htm" => Language::Html,
+            "css" | "scss" | "sass" | "less" => Language::Css,
+            "sql" => Language::Sql,
+            "xml" => Language::Xml,
+            "sh" | "bash" | "zsh" => Language::Shell,
+            "dockerfile" => Language::Dockerfile,
+            "mk" => Language::Makefile,
+            "txt" => Language::Text,
             _ => Language::Unknown,
         }
     }
@@ -110,12 +150,54 @@ impl Language {
             Language::Go => "go",
             Language::C => "c",
             Language::Cpp => "cpp",
+            Language::Markdown => "markdown",
+            Language::Toml => "toml",
+            Language::Yaml => "yaml",
+            Language::Json => "json",
+            Language::Html => "html",
+            Language::Css => "css",
+            Language::Sql => "sql",
+            Language::Xml => "xml",
+            Language::Shell => "shell",
+            Language::Dockerfile => "dockerfile",
+            Language::Makefile => "makefile",
+            Language::Dotenv => "dotenv",
+            Language::Text => "text",
             Language::Unknown => "unknown",
         }
     }
 
-    /// The tree-sitter grammar, or `None` for `Unknown`.
-    fn grammar(self) -> Option<TsLanguage> {
+    /// Map the stable stored/display string back to a language.
+    pub fn from_stored(language: &str) -> Language {
+        match language {
+            "rust" => Language::Rust,
+            "typescript" => Language::TypeScript,
+            "tsx" => Language::Tsx,
+            "javascript" => Language::JavaScript,
+            "python" => Language::Python,
+            "go" => Language::Go,
+            "c" => Language::C,
+            "cpp" => Language::Cpp,
+            "markdown" => Language::Markdown,
+            "toml" => Language::Toml,
+            "yaml" => Language::Yaml,
+            "json" => Language::Json,
+            "html" => Language::Html,
+            "css" => Language::Css,
+            "sql" => Language::Sql,
+            "xml" => Language::Xml,
+            "shell" => Language::Shell,
+            "dockerfile" => Language::Dockerfile,
+            "makefile" => Language::Makefile,
+            "dotenv" => Language::Dotenv,
+            "text" => Language::Text,
+            "unknown" => Language::Unknown,
+            _ => Language::Unknown,
+        }
+    }
+
+    /// The tree-sitter grammar, or `None` for grammarless files.
+    pub(crate) fn grammar(self) -> Option<TsLanguage> {
         let lang: TsLanguage = match self {
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -125,7 +207,20 @@ impl Language {
             Language::Go => tree_sitter_go::LANGUAGE.into(),
             Language::C => tree_sitter_c::LANGUAGE.into(),
             Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-            Language::Unknown => return None,
+            Language::Markdown
+            | Language::Toml
+            | Language::Yaml
+            | Language::Json
+            | Language::Html
+            | Language::Css
+            | Language::Sql
+            | Language::Xml
+            | Language::Shell
+            | Language::Dockerfile
+            | Language::Makefile
+            | Language::Dotenv
+            | Language::Text
+            | Language::Unknown => return None,
         };
         Some(lang)
     }
@@ -246,7 +341,20 @@ fn symbol_query(lang: Language) -> &'static str {
             (namespace_definition name: (namespace_identifier) @name) @def
             "#
         }
-        Language::Unknown => "",
+        Language::Markdown
+        | Language::Toml
+        | Language::Yaml
+        | Language::Json
+        | Language::Html
+        | Language::Css
+        | Language::Sql
+        | Language::Xml
+        | Language::Shell
+        | Language::Dockerfile
+        | Language::Makefile
+        | Language::Dotenv
+        | Language::Text
+        | Language::Unknown => "",
     }
 }
 
@@ -426,7 +534,20 @@ fn import_node_kinds(lang: Language) -> &'static [&'static str] {
         Language::Python => &["import_statement", "import_from_statement"],
         Language::Go => &["import_declaration"],
         Language::C | Language::Cpp => &["preproc_include"],
-        Language::Unknown => &[],
+        Language::Markdown
+        | Language::Toml
+        | Language::Yaml
+        | Language::Json
+        | Language::Html
+        | Language::Css
+        | Language::Sql
+        | Language::Xml
+        | Language::Shell
+        | Language::Dockerfile
+        | Language::Makefile
+        | Language::Dotenv
+        | Language::Text
+        | Language::Unknown => &[],
     }
 }
 
@@ -562,7 +683,20 @@ fn collect_import_targets(
                 }
             }
         }
-        Language::Unknown => {}
+        Language::Markdown
+        | Language::Toml
+        | Language::Yaml
+        | Language::Json
+        | Language::Html
+        | Language::Css
+        | Language::Sql
+        | Language::Xml
+        | Language::Shell
+        | Language::Dockerfile
+        | Language::Makefile
+        | Language::Dotenv
+        | Language::Text
+        | Language::Unknown => {}
     }
 }
 
@@ -789,7 +923,132 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("a.py")), Language::Python);
         assert_eq!(Language::from_path(Path::new("a.go")), Language::Go);
         assert_eq!(Language::from_path(Path::new("a.cpp")), Language::Cpp);
-        assert_eq!(Language::from_path(Path::new("a.txt")), Language::Unknown);
+        assert_eq!(Language::from_path(Path::new("a.txt")), Language::Text);
+        assert_eq!(
+            Language::from_path(Path::new("README.md")),
+            Language::Markdown
+        );
+        assert_eq!(
+            Language::from_path(Path::new("config.toml")),
+            Language::Toml
+        );
+        assert_eq!(
+            Language::from_path(Path::new("compose.yaml")),
+            Language::Yaml
+        );
+        assert_eq!(
+            Language::from_path(Path::new("package.json")),
+            Language::Json
+        );
+        assert_eq!(Language::from_path(Path::new("index.html")), Language::Html);
+        assert_eq!(Language::from_path(Path::new("style.scss")), Language::Css);
+        assert_eq!(Language::from_path(Path::new("schema.sql")), Language::Sql);
+        assert_eq!(Language::from_path(Path::new("doc.xml")), Language::Xml);
+        assert_eq!(Language::from_path(Path::new("script.sh")), Language::Shell);
+        assert_eq!(
+            Language::from_path(Path::new("build.mk")),
+            Language::Makefile
+        );
+        assert_eq!(
+            Language::from_path(Path::new("scratch.unknownext")),
+            Language::Unknown
+        );
+    }
+
+    #[test]
+    fn detects_languages_by_filename_before_extension() {
+        assert_eq!(
+            Language::from_path(Path::new("Dockerfile")),
+            Language::Dockerfile
+        );
+        assert_eq!(
+            Language::from_path(Path::new("Dockerfile.dev")),
+            Language::Dockerfile
+        );
+        assert_eq!(
+            Language::from_path(Path::new("Dockerfile.relay")),
+            Language::Dockerfile
+        );
+        assert_eq!(
+            Language::from_path(Path::new("Dockerfile.worker")),
+            Language::Dockerfile
+        );
+        assert_eq!(Language::from_path(Path::new(".env")), Language::Dotenv);
+        assert_eq!(
+            Language::from_path(Path::new(".env.example")),
+            Language::Dotenv
+        );
+        assert_eq!(
+            Language::from_path(Path::new(".env.docker.defaults")),
+            Language::Dotenv
+        );
+        assert_eq!(Language::from_path(Path::new("Cargo.lock")), Language::Toml);
+        assert_eq!(Language::from_path(Path::new("LICENSE")), Language::Text);
+        assert_eq!(
+            Language::from_path(Path::new("Makefile")),
+            Language::Makefile
+        );
+        assert_eq!(
+            Language::from_path(Path::new("GNUmakefile")),
+            Language::Makefile
+        );
+    }
+
+    #[test]
+    fn language_from_stored_round_trips_all_variants() {
+        let variants = [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Python,
+            Language::Go,
+            Language::C,
+            Language::Cpp,
+            Language::Markdown,
+            Language::Toml,
+            Language::Yaml,
+            Language::Json,
+            Language::Html,
+            Language::Css,
+            Language::Sql,
+            Language::Xml,
+            Language::Shell,
+            Language::Dockerfile,
+            Language::Makefile,
+            Language::Dotenv,
+            Language::Text,
+            Language::Unknown,
+        ];
+        for variant in variants {
+            assert_eq!(Language::from_stored(variant.as_str()), variant);
+        }
+        assert_eq!(Language::from_stored("legacy"), Language::Unknown);
+    }
+
+    #[test]
+    fn grammarless_languages_have_no_tree_sitter_surface() {
+        let variants = [
+            Language::Markdown,
+            Language::Toml,
+            Language::Yaml,
+            Language::Json,
+            Language::Html,
+            Language::Css,
+            Language::Sql,
+            Language::Xml,
+            Language::Shell,
+            Language::Dockerfile,
+            Language::Makefile,
+            Language::Dotenv,
+            Language::Text,
+            Language::Unknown,
+        ];
+        for variant in variants {
+            assert!(variant.grammar().is_none(), "{variant:?}");
+            assert_eq!(symbol_query(variant), "", "{variant:?}");
+            assert!(import_node_kinds(variant).is_empty(), "{variant:?}");
+        }
     }
 
     #[test]
@@ -837,9 +1096,13 @@ class Thing:
 
     #[test]
     fn unknown_language_extracts_nothing() {
-        let ex = extract(Language::Unknown, b"anything at all").unwrap();
-        assert!(ex.symbols.is_empty());
-        assert!(ex.imports.is_empty());
+        for lang in [Language::Unknown, Language::Markdown, Language::Toml] {
+            let ex = extract(lang, b"anything at all").unwrap();
+            assert!(ex.symbols.is_empty(), "{lang:?}");
+            assert!(ex.imports.is_empty(), "{lang:?}");
+            assert!(ex.identifiers.is_empty(), "{lang:?}");
+            assert!(ex.callsites.is_empty(), "{lang:?}");
+        }
     }
 
     #[test]

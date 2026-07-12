@@ -139,7 +139,7 @@ impl Db {
                             question_json, questions_json, raised_at, resolved_at, response_json
                        FROM needs_attention
                       WHERE session_id = ?1 AND resolved_at IS NULL
-                      ORDER BY raised_at ASC",
+                      ORDER BY raised_at ASC, rowid ASC",
                 )
                 .context("preparing list_open_interrupts")?;
             let rows = stmt

@@ -1156,6 +1156,7 @@ async fn attach(
     // idempotent for already-attached clients. Only the allow-set is sent.
     if let Some(att) = state.attached.as_ref() {
         att.handle.broadcast_gitignore_allow();
+        att.handle.broadcast_active_interrupt();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
     }
@@ -1315,4 +1316,3 @@ fn paused_work_to_proto(row: crate::db::paused_work::PausedWorkRow) -> proto::Pa
         updated_at: row.updated_at,
     }
 }
-

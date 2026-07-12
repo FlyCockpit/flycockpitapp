@@ -1535,6 +1535,7 @@ mod tests {
                 sandbox_escalation: None,
             }),
             questions: None,
+            pending_count: 0,
         };
         let payload = attention_payload_for_event(&event, &ctx, "instance-1").unwrap();
         assert_eq!(payload["kind"], "approval");

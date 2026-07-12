@@ -292,6 +292,8 @@ async fn run_worker(
         event_tx.clone(),
         redaction.clone(),
         interactive_clients,
+        session.db.clone(),
+        session_id,
     ));
     driver.set_interrupt_hub(interrupts.clone());
 
@@ -775,6 +777,12 @@ async fn run_worker(
                 interrupt_id,
                 response,
             } => {
+                let was_active = session
+                    .db
+                    .list_open_interrupts(session_id)
+                    .ok()
+                    .and_then(|open| open.first().map(|row| row.interrupt_id))
+                    == Some(interrupt_id);
                 let decision = session
                     .db
                     .get_interrupt(interrupt_id)
@@ -824,6 +832,11 @@ async fn run_worker(
                 // locally — e.g. a `schedule` needs-attention nudge — and the
                 // DB row update above is the only effect.
                 interrupts.resolve(interrupt_id, response);
+                if was_active {
+                    interrupts.emit_active_from_db();
+                } else {
+                    interrupts.emit_queue_state();
+                }
             }
             SessionWork::RepairResume { respond_to } => {
                 let Some(state) = repair_required

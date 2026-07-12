@@ -373,6 +373,14 @@ pub enum Event {
         /// dialog. Mutually exclusive with `question` in practice.
         #[serde(default)]
         questions: Option<InterruptQuestionSet>,
+        #[serde(default)]
+        pending_count: usize,
+    },
+
+    InterruptQueueChanged {
+        session_id: Uuid,
+        active_interrupt_id: Option<Uuid>,
+        pending_count: usize,
     },
 
     /// An outstanding interrupt was resolved — emitted to every client
@@ -709,6 +717,14 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             interrupt_id,
             decision: Some(decision),
             seq,
+        }],
+        TurnEvent::InterruptQueueChanged {
+            active_interrupt_id,
+            pending_count,
+        } => vec![Event::InterruptQueueChanged {
+            session_id,
+            active_interrupt_id,
+            pending_count,
         }],
         TurnEvent::ThinkingStarted { agent, turn_id } => {
             vec![Event::ThinkingStarted {

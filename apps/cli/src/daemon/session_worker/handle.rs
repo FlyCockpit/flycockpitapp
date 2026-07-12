@@ -549,6 +549,36 @@ impl SessionWorkerHandle {
         );
     }
 
+    pub fn broadcast_active_interrupt(&self) {
+        let Ok(open) = self.session.db.list_open_interrupts(self.session_id) else {
+            return;
+        };
+        let Some(active) = open.first() else {
+            return;
+        };
+        let questions = active.questions.clone().or_else(|| {
+            active.question.clone().map(|question| proto::InterruptQuestionSet {
+                questions: vec![question],
+            })
+        });
+        let Some(questions) = questions else {
+            return;
+        };
+        send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::InterruptRaised {
+                session_id: self.session_id,
+                interrupt_id: active.interrupt_id,
+                agent: active.agent_id.clone(),
+                description: active.description.clone(),
+                question: None,
+                questions: Some(questions),
+                pending_count: open.len().saturating_sub(1),
+            },
+        );
+    }
+
     /// Broadcast the current sandbox-escalation availability so late or
     /// reconnecting clients hydrate the daemon-owned session flag.
     pub fn broadcast_sandbox_escalation(&self) {
@@ -886,4 +916,3 @@ pub fn spawn(
 
     (handle, join)
 }
-

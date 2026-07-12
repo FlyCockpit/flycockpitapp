@@ -58,6 +58,8 @@ pub struct InterruptHub {
     /// not broadcast. Cloned from the session worker's fan-out sender.
     events: Option<EventSender>,
     redaction: Option<SharedRedactionTable>,
+    db: Option<crate::db::Db>,
+    session_id: Option<Uuid>,
     /// Count of attached *interactive* clients — ones that can answer an
     /// interrupt (the TUI; later the remote dashboard). A `cockpit run`
     /// event pump attaches but cannot answer, so it does not count. The
@@ -79,11 +81,15 @@ impl InterruptHub {
         events: EventSender,
         redaction: SharedRedactionTable,
         interactive_clients: Arc<AtomicUsize>,
+        db: crate::db::Db,
+        session_id: Uuid,
     ) -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
             events: Some(events),
             redaction: Some(redaction),
+            db: Some(db),
+            session_id: Some(session_id),
             interactive_clients,
         }
     }
@@ -96,6 +102,8 @@ impl InterruptHub {
             waiters: Mutex::new(HashMap::new()),
             events: None,
             redaction: None,
+            db: None,
+            session_id: None,
             interactive_clients: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -134,7 +142,22 @@ impl InterruptHub {
         description: &str,
         questions: InterruptQuestionSet,
     ) {
+        if let (Some(db), Some(owned_session_id)) = (&self.db, self.session_id)
+            && let Ok(open) = db.list_open_interrupts(owned_session_id)
+        {
+            let active = open.first().map(|row| row.interrupt_id);
+            if active != Some(interrupt_id) {
+                self.emit_queue_changed(active, open.len().saturating_sub(1));
+                return;
+            }
+        }
         if let (Some(events), Some(redaction)) = (&self.events, &self.redaction) {
+            let pending_count = self
+                .db
+                .as_ref()
+                .and_then(|db| db.list_open_interrupts(session_id).ok())
+                .map(|open| open.len().saturating_sub(1))
+                .unwrap_or(0);
             // `send` errors only when there are no subscribers — fine,
             // the interrupt still parks in the DB for the next client.
             send_current_event(
@@ -147,6 +170,75 @@ impl InterruptHub {
                     description: description.to_string(),
                     question: None,
                     questions: Some(questions),
+                    pending_count,
+                },
+            );
+        }
+    }
+
+    pub fn emit_active_from_db(&self) {
+        let (Some(db), Some(session_id)) = (&self.db, self.session_id) else {
+            return;
+        };
+        let Ok(open) = db.list_open_interrupts(session_id) else {
+            return;
+        };
+        let Some(active) = open.first() else {
+            self.emit_queue_changed(None, 0);
+            return;
+        };
+        let pending_count = open.len().saturating_sub(1);
+        self.emit_queue_changed(Some(active.interrupt_id), pending_count);
+        let questions = active.questions.clone().or_else(|| {
+            active
+                .question
+                .clone()
+                .map(|question| InterruptQuestionSet {
+                    questions: vec![question],
+                })
+        });
+        if let (Some(events), Some(redaction), Some(questions)) =
+            (&self.events, &self.redaction, questions)
+        {
+            send_current_event(
+                events,
+                redaction,
+                proto::Event::InterruptRaised {
+                    session_id,
+                    interrupt_id: active.interrupt_id,
+                    agent: active.agent_id.clone(),
+                    description: active.description.clone(),
+                    question: None,
+                    questions: Some(questions),
+                    pending_count,
+                },
+            );
+        }
+    }
+
+    pub fn emit_queue_state(&self) {
+        let (Some(db), Some(session_id)) = (&self.db, self.session_id) else {
+            return;
+        };
+        if let Ok(open) = db.list_open_interrupts(session_id) {
+            self.emit_queue_changed(
+                open.first().map(|row| row.interrupt_id),
+                open.len().saturating_sub(1),
+            );
+        }
+    }
+
+    fn emit_queue_changed(&self, active_interrupt_id: Option<Uuid>, pending_count: usize) {
+        if let (Some(events), Some(redaction), Some(session_id)) =
+            (&self.events, &self.redaction, self.session_id)
+        {
+            send_current_event(
+                events,
+                redaction,
+                proto::Event::InterruptQueueChanged {
+                    session_id,
+                    active_interrupt_id,
+                    pending_count,
                 },
             );
         }
@@ -215,7 +307,22 @@ impl PendingInterrupt<'_> {
 impl Drop for PendingInterrupt<'_> {
     fn drop(&mut self) {
         // Idempotent: `resolve` already removed it on the happy path.
-        lock_or_recover(&self.hub.waiters).remove(&self.interrupt_id);
+        let removed = lock_or_recover(&self.hub.waiters)
+            .remove(&self.interrupt_id)
+            .is_some();
+        if removed && let (Some(db), Some(session_id)) = (&self.hub.db, self.hub.session_id) {
+            let was_active = db
+                .list_open_interrupts(session_id)
+                .ok()
+                .and_then(|open| open.first().map(|row| row.interrupt_id))
+                == Some(self.interrupt_id);
+            let _ = db.resolve_interrupt(self.interrupt_id, &ResolveResponse::Cancel);
+            if was_active {
+                self.hub.emit_active_from_db();
+            } else {
+                self.hub.emit_queue_state();
+            }
+        }
     }
 }
 
@@ -274,6 +381,46 @@ pub async fn raise_and_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
+
+    use crate::daemon::proto::{InterruptOption, InterruptQuestion};
+    use crate::redact::RedactionTable;
+
+    fn question_set() -> InterruptQuestionSet {
+        InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Continue?".into(),
+                options: vec![InterruptOption {
+                    id: "yes".into(),
+                    label: "Yes".into(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                sandbox_escalation: None,
+            }],
+        }
+    }
+
+    fn attached_hub(
+        db: crate::db::Db,
+        session_id: Uuid,
+    ) -> (InterruptHub, crate::daemon::EventReceiver) {
+        let (events, receiver) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+        (
+            InterruptHub::new(
+                events,
+                redaction,
+                Arc::new(AtomicUsize::new(1)),
+                db,
+                session_id,
+            ),
+            receiver,
+        )
+    }
 
     #[tokio::test]
     async fn resolve_wakes_a_registered_waiter() {
@@ -329,5 +476,88 @@ mod tests {
         let pending = hub.register(id);
         lock_or_recover(&hub.waiters).clear();
         assert!(matches!(pending.wait().await, ResolveResponse::Cancel));
+    }
+
+    #[tokio::test]
+    async fn concurrent_raises_keep_fifo_active_and_rehydrate_with_counter() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, mut events) = attached_hub(db.clone(), session.session_id);
+        let set = question_set();
+        let first = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .unwrap();
+        hub.emit_raised(session.session_id, first, "a", "first", set.clone());
+        let second = db
+            .raise_interrupt_questions(session.session_id, "b", "second", &set)
+            .unwrap();
+        hub.emit_raised(session.session_id, second, "b", "second", set);
+
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptRaised { interrupt_id, pending_count: 0, .. }
+                if interrupt_id == first
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptQueueChanged {
+                active_interrupt_id: Some(interrupt_id), pending_count: 1, ..
+            } if interrupt_id == first
+        ));
+
+        hub.emit_active_from_db();
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptQueueChanged {
+                active_interrupt_id: Some(interrupt_id), pending_count: 1, ..
+            } if interrupt_id == first
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptRaised { interrupt_id, pending_count: 1, .. }
+                if interrupt_id == first
+        ));
+
+        db.resolve_interrupt(first, &ResolveResponse::Cancel)
+            .unwrap();
+        hub.emit_active_from_db();
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptQueueChanged {
+                active_interrupt_id: Some(interrupt_id), pending_count: 0, ..
+            } if interrupt_id == second
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptRaised { interrupt_id, pending_count: 0, .. }
+                if interrupt_id == second
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_queued_waiter_withdraws_only_that_interrupt() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, mut events) = attached_hub(db.clone(), session.session_id);
+        let set = question_set();
+        let first = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .unwrap();
+        let second = db
+            .raise_interrupt_questions(session.session_id, "b", "second", &set)
+            .unwrap();
+        let pending = hub.register(second);
+        drop(pending);
+
+        assert_eq!(
+            db.list_open_interrupts(session.session_id).unwrap()[0].interrupt_id,
+            first
+        );
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptQueueChanged {
+                active_interrupt_id: Some(interrupt_id), pending_count: 0, ..
+            } if interrupt_id == first
+        ));
     }
 }

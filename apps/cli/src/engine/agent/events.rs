@@ -309,6 +309,11 @@ pub enum TurnEvent {
         /// Empty when the agent supplied none.
         description: String,
         questions: crate::daemon::proto::InterruptQuestionSet,
+        pending_count: usize,
+    },
+    InterruptQueueChanged {
+        active_interrupt_id: Option<uuid::Uuid>,
+        pending_count: usize,
     },
 
     /// An async job (loop / timer / background, GOALS §22) started. UI

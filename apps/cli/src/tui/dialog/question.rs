@@ -103,6 +103,7 @@ pub struct QuestionDialog {
     /// prompt region's wrapped height for the region split + scroll clamp.
     /// `0` until the first render.
     last_inner_width: u16,
+    pending_count: usize,
 }
 
 impl QuestionDialog {
@@ -125,6 +126,7 @@ impl QuestionDialog {
             result: None,
             last_term_height: 0,
             last_inner_width: 0,
+            pending_count: 0,
         }
     }
 
@@ -149,7 +151,21 @@ impl QuestionDialog {
             result: None,
             last_term_height: 0,
             last_inner_width: 0,
+            pending_count: 0,
         }
+    }
+
+    pub fn with_pending_count(mut self, pending_count: usize) -> Self {
+        self.pending_count = pending_count;
+        self
+    }
+
+    pub fn set_pending_count(&mut self, pending_count: usize) {
+        self.pending_count = pending_count;
+    }
+
+    pub fn interrupt_id(&self) -> Uuid {
+        self.interrupt_id
     }
 
     /// Drain the close result once `handle_key` returned `true`.
@@ -501,7 +517,7 @@ impl QuestionDialog {
         } else {
             "question"
         };
-        let title = if self.state.page_count() > 1 {
+        let mut title = if self.state.page_count() > 1 {
             let n = self.state.page_count();
             let cur = (self.state.current_page() + 1).min(n + 1);
             if self.state.on_confirm_page() {
@@ -512,6 +528,10 @@ impl QuestionDialog {
         } else {
             format!(" {title_base} ")
         };
+        if self.pending_count > 0 {
+            let waiting = format!("· {} waiting ", self.pending_count);
+            title = format!("{}{}", title.trim_end(), waiting);
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))

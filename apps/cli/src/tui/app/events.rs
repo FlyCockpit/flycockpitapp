@@ -146,7 +146,19 @@ impl App {
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
         match event {
-            TurnEvent::InterruptDecision { decision, .. } => {
+            TurnEvent::InterruptDecision {
+                interrupt_id,
+                decision,
+                ..
+            } => {
+                if self
+                    .question_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.interrupt_id() == interrupt_id)
+                {
+                    self.question_dialog = None;
+                    self.resolve_attention_interrupt();
+                }
                 let prefix = if decision.permission {
                     "approval"
                 } else {
@@ -842,6 +854,7 @@ impl App {
                 interrupt_id,
                 description,
                 questions,
+                pending_count,
             } => {
                 // A `question` tool blocked the agent (GOALS §3b). Open
                 // the answering dialog over the composer. The
@@ -865,12 +878,21 @@ impl App {
                         }
                     )
                 });
-                self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
-                    interrupt_id,
-                    description,
-                    questions,
-                    lockout,
-                ));
+                if let Some(dialog) = self.question_dialog.as_mut() {
+                    if dialog.interrupt_id() == interrupt_id {
+                        dialog.set_pending_count(pending_count);
+                    }
+                    return;
+                }
+                self.question_dialog = Some(
+                    crate::tui::dialog::question::QuestionDialog::new(
+                        interrupt_id,
+                        description,
+                        questions,
+                        lockout,
+                    )
+                    .with_pending_count(pending_count),
+                );
                 self.raise_attention_interrupt(
                     if is_approval {
                         AttentionInterruptKind::Approval
@@ -880,6 +902,23 @@ impl App {
                     true,
                 );
             }
+            TurnEvent::InterruptQueueChanged {
+                active_interrupt_id,
+                pending_count,
+            } => match (self.question_dialog.as_mut(), active_interrupt_id) {
+                (Some(dialog), Some(active)) if dialog.interrupt_id() == active => {
+                    dialog.set_pending_count(pending_count);
+                }
+                (Some(_), None) => {
+                    self.question_dialog = None;
+                    self.resolve_attention_interrupt();
+                }
+                (Some(_), Some(_)) => {
+                    self.question_dialog = None;
+                    self.resolve_attention_interrupt();
+                }
+                _ => {}
+            },
             TurnEvent::ScheduleStarted {
                 session_id,
                 job_id,

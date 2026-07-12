@@ -902,6 +902,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
         | PrimarySwapped { session_id, .. }
         | LlmModeChanged { session_id, .. }
@@ -1283,11 +1284,21 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             interrupt_id,
             description,
             questions: Some(questions),
+            pending_count,
             ..
         } => TurnEvent::InterruptRaised {
             interrupt_id,
             description,
             questions,
+            pending_count,
+        },
+        InterruptQueueChanged {
+            active_interrupt_id,
+            pending_count,
+            ..
+        } => TurnEvent::InterruptQueueChanged {
+            active_interrupt_id,
+            pending_count,
         },
         SandboxState {
             mode,

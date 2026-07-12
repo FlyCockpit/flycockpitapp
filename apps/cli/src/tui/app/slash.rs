@@ -1448,42 +1448,9 @@ impl App {
             self.push_plain("Usage: `/fork`".to_string());
             return;
         }
-        if self.side_conversation.is_some() {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/fork: end the side conversation first (`/side end`)".to_string(),
-            });
-            return;
+        if self.fork_preconditions_ok() {
+            self.enter_fork_pick_mode();
         }
-        if self.busy || self.pending.is_some() || self.question_dialog.is_some() {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/fork: wait until the current turn or approval finishes".to_string(),
-            });
-            return;
-        }
-        if !self.active_schedules.is_empty() {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/fork: cancel or wait for active scheduled tasks first".to_string(),
-            });
-            return;
-        }
-
-        match self.agent_runner.as_ref() {
-            Some(Ok(_runner)) => {}
-            _ => {
-                self.history.push(HistoryEntry::CommandError {
-                    line: "/fork: no active session to fork from".to_string(),
-                });
-                return;
-            }
-        };
-        if !self.current_session_persisted {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/fork: send a message first — there's nothing to fork yet".to_string(),
-            });
-            return;
-        }
-
-        self.enter_fork_pick_mode();
     }
 
     /// `/sandbox` (sandboxing part 2): no arg toggles, `on`/`off` set

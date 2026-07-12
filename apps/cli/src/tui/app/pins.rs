@@ -1,6 +1,6 @@
 //! Pinned-messages TUI integration (`pinned-messages`): the `/pin`
-//! pick-a-message mode, the `/pins` review mode, the mouse `[pin]|[unpin]`
-//! control's toggle, and the below-input count indicator's data source.
+//! pick-a-message mode, the `/pins` review mode, the mouse `[fork]` and
+//! `[pin]`/`[unpin]` controls, and the below-input count indicator's data source.
 //!
 //! Pins are pure DB state the TUI owns directly via [`crate::db::Db`]
 //! (`open_default`, same pattern as `/sessions` + `/export`). Nothing here
@@ -12,7 +12,7 @@ use crate::tui::history::HistoryEntry;
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 use std::collections::HashSet;
 
-use super::{App, ToastKind};
+use super::{App, ToastKind, render};
 
 #[cfg(test)]
 thread_local! {
@@ -120,17 +120,24 @@ impl App {
             && self.pinned_seqs_cache.contains(&seq)
     }
 
-    /// The pinnable message `seq` whose mouse `[pin]`/`[unpin]` control
-    /// covers chat-area-relative row `row` + column `col`, or `None`
-    /// (`pinned-messages`). The control rides the message's own first line
-    /// (inline, left of the timestamp) / user-bubble top-right corner, so a
-    /// click registers only inside the recorded `[col_start, col_end)`
-    /// range — a click on the same row but just outside the glyphs is a
-    /// no-op. Pure over `chat_row_meta`; the mouse handler routes the
-    /// returned seq into `toggle_pin_for_seq`.
-    pub(super) fn pin_seq_at(&self, row: usize, col: u16) -> Option<i64> {
-        let hit = self.chat_row_meta.get(row).and_then(|meta| meta.pin_hit)?;
-        (col >= hit.col_start && col < hit.col_end).then_some(hit.seq)
+    /// The control chip whose mouse region covers chat-area-relative row
+    /// `row` + column `col`, or `None`. Pure over `chat_row_meta`; the mouse
+    /// handler routes pin and fork chips to distinct actions.
+    pub(super) fn control_chip_at(&self, row: usize, col: u16) -> Option<render::ControlChip> {
+        let meta = self.chat_row_meta.get(row)?;
+        if let Some(hit) = meta.fork_hit
+            && col >= hit.col_start
+            && col < hit.col_end
+        {
+            return Some(render::ControlChip::Fork { seq: hit.seq });
+        }
+        if let Some(hit) = meta.pin_hit
+            && col >= hit.col_start
+            && col < hit.col_end
+        {
+            return Some(render::ControlChip::Pin { seq: hit.seq });
+        }
+        None
     }
 
     /// History indices of pinnable messages (User/Agent with a resolved
@@ -275,17 +282,78 @@ impl App {
         self.scroll_fork_pick_into_view();
     }
 
+    pub(super) fn fork_preconditions_ok(&mut self) -> bool {
+        if self.side_conversation.is_some() {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/fork: end the side conversation first (`/side end`)".to_string(),
+            });
+            return false;
+        }
+        if self.busy || self.pending.is_some() || self.question_dialog.is_some() {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/fork: wait until the current turn or approval finishes".to_string(),
+            });
+            return false;
+        }
+        if !self.active_schedules.is_empty() {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/fork: cancel or wait for active scheduled tasks first".to_string(),
+            });
+            return false;
+        }
+        match self.agent_runner.as_ref() {
+            Some(Ok(_runner)) => {}
+            _ => {
+                self.history.push(HistoryEntry::CommandError {
+                    line: "/fork: no active session to fork from".to_string(),
+                });
+                return false;
+            }
+        };
+        if !self.current_session_persisted {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/fork: send a message first — there's nothing to fork yet".to_string(),
+            });
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn fork_for_seq(&mut self, seq: i64) {
+        if !self.fork_preconditions_ok() {
+            return;
+        }
+        let Some(idx) = self
+            .history
+            .iter()
+            .position(|entry| Self::entry_pin_seq(entry) == Some(seq))
+        else {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/fork: message is not recorded yet".to_string(),
+            });
+            return;
+        };
+        self.fork_at_seq(idx, seq);
+    }
+
     pub(super) fn confirm_fork_pick(&mut self) {
         let Some(pick) = self.fork_pick.take() else {
             return;
         };
-        let idx = pick.selected_history_index();
+        self.fork_history_index(pick.selected_history_index());
+    }
+
+    pub(super) fn fork_history_index(&mut self, idx: usize) {
         let Some(seq) = self.history.get(idx).and_then(Self::entry_pin_seq) else {
             self.history.push(HistoryEntry::CommandError {
                 line: "/fork: message is not recorded yet".to_string(),
             });
             return;
         };
+        self.fork_at_seq(idx, seq);
+    }
+
+    pub(super) fn fork_at_seq(&mut self, idx: usize, seq: i64) {
         let seed_composer = match self.history.get(idx) {
             Some(HistoryEntry::User { text, .. }) => Some(text.clone()),
             _ => None,
@@ -755,11 +823,11 @@ mod tests {
     /// click to the right `seq` only when it lands inside the recorded
     /// `[col_start, col_end)` range on the control's row — a click on the
     /// same row but one column outside (either side), or on a different row,
-    /// is a no-op. `pin_seq_at` is the pure predicate the mouse handler runs
-    /// before routing into `toggle_pin_for_seq`.
+    /// is a no-op. `control_chip_at` is the pure predicate the mouse handler
+    /// runs before routing into fork or pin actions.
     #[test]
     fn pin_hit_test_targets_only_the_control_columns() {
-        use crate::tui::app::render::{ChatRowKind, ChatRowMeta, PinHit};
+        use crate::tui::app::render::{ChatRowKind, ChatRowMeta, ControlChip, PinHit};
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
         // Agent `[pin]` control rides row 3, columns 52..57 (5 wide), seq 42.
@@ -776,6 +844,7 @@ mod tests {
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
+            fork_hit: None,
             continuation: false,
             selectable: false,
         };
@@ -786,30 +855,133 @@ mod tests {
             empty.clone(),
             empty,
         ];
+        app.chat_row_meta[3].fork_hit = Some(PinHit {
+            seq: 42,
+            col_start: 45,
+            col_end: 51,
+        });
         app.chat_row_meta[3].pin_hit = Some(PinHit {
             seq: 42,
             col_start: 52,
             col_end: 57,
         });
 
-        // Inside the region → resolves to the seq (every live column).
+        // Inside the fork region → resolves to fork, not pin.
+        for col in 45..51 {
+            assert_eq!(
+                app.control_chip_at(3, col),
+                Some(ControlChip::Fork { seq: 42 }),
+                "col {col} is fork"
+            );
+            assert_ne!(
+                app.control_chip_at(3, col),
+                Some(ControlChip::Pin { seq: 42 }),
+                "fork col {col} is not pin"
+            );
+        }
+        // Inside the pin region → resolves to the seq (every live column).
         for col in 52..57 {
-            assert_eq!(app.pin_seq_at(3, col), Some(42), "col {col} is live");
+            assert_eq!(
+                app.control_chip_at(3, col),
+                Some(ControlChip::Pin { seq: 42 }),
+                "col {col} is pin"
+            );
         }
         // Just outside on either side → no-op.
-        assert_eq!(app.pin_seq_at(3, 51), None, "one left of the glyphs");
+        assert_eq!(app.control_chip_at(3, 51), None, "one left of the glyphs");
         assert_eq!(
-            app.pin_seq_at(3, 57),
+            app.control_chip_at(3, 57),
             None,
             "one past the glyphs (half-open)"
         );
         // A different row, even at a live column → no-op.
-        assert_eq!(app.pin_seq_at(2, 53), None, "wrong row");
-        assert_eq!(app.pin_seq_at(4, 53), None, "wrong row");
+        assert_eq!(app.control_chip_at(2, 53), None, "wrong row");
+        assert_eq!(app.control_chip_at(4, 53), None, "wrong row");
         // A row with no recorded control → no-op.
-        assert_eq!(app.pin_seq_at(0, 53), None, "no control on this row");
+        assert_eq!(app.control_chip_at(0, 53), None, "no control on this row");
         // Out-of-bounds row → no panic, no-op.
-        assert_eq!(app.pin_seq_at(99, 53), None, "out of range");
+        assert_eq!(app.control_chip_at(99, 53), None, "out of range");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_for_seq_sends_fork_session_request_with_message_seq() {
+        use crate::daemon::proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let child_session_id = uuid::Uuid::new_v4();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut proto = ProtoStream::new(stream);
+            let env = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request { id, request } = env.body else {
+                panic!("expected request envelope");
+            };
+            let parent_session_id = match &request {
+                Request::ForkSession {
+                    parent_session_id, ..
+                } => *parent_session_id,
+                other => panic!("expected fork request, got {other:?}"),
+            };
+            proto
+                .send(&Envelope::response(
+                    id,
+                    Response::Forked {
+                        session_id: child_session_id,
+                        short_id: "fork77".to_string(),
+                        parent_session_id,
+                        fork_point_turn_id: Some("77".to_string()),
+                    },
+                ))
+                .await
+                .unwrap();
+            request
+        });
+
+        let mut app = test_app(tmp.path());
+        let mut runner = runner();
+        runner.socket = socket;
+        let parent_session_id = runner.session_id;
+        app.agent_runner = Some(Ok(runner));
+        app.current_session_persisted = true;
+        app.history.push(HistoryEntry::User {
+            text: "seed me".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(77),
+            preflight_pending: false,
+            persist_failed: false,
+        });
+
+        app.fork_for_seq(77);
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("fork request reached daemon stub")
+            .unwrap();
+        match request {
+            Request::ForkSession {
+                parent_session_id: got_parent,
+                fork_point_turn_id,
+                ephemeral,
+            } => {
+                assert_eq!(got_parent, parent_session_id);
+                assert_eq!(fork_point_turn_id, Some("77".to_string()));
+                assert!(!ephemeral);
+            }
+            other => panic!("expected fork request, got {other:?}"),
+        }
+        assert!(app.history.iter().any(|entry| {
+            matches!(entry, HistoryEntry::Plain { line } if line == "/fork: pending")
+        }));
     }
 
     /// Only User/Agent messages WITH a resolved `seq` are pinnable; tool

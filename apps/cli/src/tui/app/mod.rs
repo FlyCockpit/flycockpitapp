@@ -292,6 +292,7 @@ mod selection_copy_state_tests {
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
+            fork_hit: None,
             continuation: false,
             selectable: true,
         }
@@ -327,6 +328,7 @@ mod selection_copy_state_tests {
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
+            fork_hit: None,
             continuation: false,
             selectable: true,
         }];
@@ -463,6 +465,7 @@ mod selection_copy_state_tests {
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
+            fork_hit: None,
             continuation: false,
             selectable: true,
         });

@@ -31,6 +31,10 @@ pub fn pin_control_width(pinned: bool) -> u16 {
     if pinned { 7 } else { 5 }
 }
 
+pub fn fork_control_width() -> u16 {
+    6
+}
+
 /// `/pin` pick-a-message mode. Holds the ordered list of pinnable message
 /// history indices (oldest→newest) and a cursor into it. Selection starts
 /// at the most recently completed message (the last entry) and navigates
@@ -271,11 +275,15 @@ pub fn preview_text(text: &str, max: usize) -> String {
     }
 }
 
-/// The single state-appropriate mouse control: yellow `[unpin]` when
-/// `pinned`, grey `[pin]` when not. Only one action is ever shown (no `|`
+/// The fork mouse control: grey `[fork]`, rendered unemphasized. It is drawn
+/// immediately left of the state-appropriate pin control when both fit.
+pub fn fork_control_spans() -> Vec<Span<'static>> {
+    vec![Span::styled("[fork]", Style::default().fg(PIN_GREY))]
+}
+
+/// The single state-appropriate pin mouse control: yellow `[unpin]` when
+/// `pinned`, grey `[pin]` when not. Only one pin action is ever shown (no `|`
 /// separator), rendered unemphasized — clicking it toggles the pin state.
-/// Used before assistant text and at the top-left border corner of user
-/// messages.
 pub fn pin_control_spans(pinned: bool) -> Vec<Span<'static>> {
     if pinned {
         vec![Span::styled("[unpin]", Style::default().fg(PIN_YELLOW))]
@@ -480,6 +488,7 @@ mod tests {
         // Width is the width of the single control actually shown.
         assert_eq!(pin_control_width(false), 5, "[pin] is 5 columns");
         assert_eq!(pin_control_width(true), 7, "[unpin] is 7 columns");
+        assert_eq!(fork_control_width(), 6, "[fork] is 6 columns");
 
         // The hit-test width equals the rendered span's column width.
         assert_eq!(
@@ -489,6 +498,10 @@ mod tests {
         assert_eq!(
             pin_control_width(true) as usize,
             pin_control_spans(true)[0].content.chars().count()
+        );
+        assert_eq!(
+            fork_control_width() as usize,
+            fork_control_spans()[0].content.chars().count()
         );
 
         // A click at column 6 (past `[pin]`) does NOT register on an

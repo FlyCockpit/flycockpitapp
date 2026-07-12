@@ -361,15 +361,20 @@ fn history_render_signature(
     hasher.finish()
 }
 
-/// A clickable pin-control region on one chat row: the message seq plus
-/// the half-open `[col_start, col_end)` column range of the `[pin]`/
-/// `[unpin]` glyphs. A left-click toggles the pin only when it lands
-/// inside this range (`pinned-messages`).
+/// A clickable control-chip region on one chat row: the message seq plus
+/// the half-open `[col_start, col_end)` column range of one visible chip.
+/// The owning row records separate fork and pin regions (`pinned-messages`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PinHit {
     pub seq: i64,
     pub col_start: u16,
     pub col_end: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlChip {
+    Fork { seq: i64 },
+    Pin { seq: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +423,7 @@ pub(crate) struct ChatRowMeta {
     pub reasoning_window_target: Option<usize>,
     pub diff_path: Option<String>,
     pub pin_hit: Option<PinHit>,
+    pub fork_hit: Option<PinHit>,
     pub continuation: bool,
     pub selectable: bool,
 }
@@ -437,6 +443,7 @@ impl ChatRowMeta {
             reasoning_window_target: None,
             diff_path: None,
             pin_hit: None,
+            fork_hit: None,
             continuation: false,
             selectable: false,
         }
@@ -1371,10 +1378,10 @@ impl App {
         for (idx, entry) in self.history.iter().enumerate() {
             // Pinned-message chrome (`pinned-messages`): the pick-mode arrow
             // (when this entry is the pick selection) and/or the clickable
-            // mouse pin control (`[pin]`/`[unpin]`, only when mouse mode is
-            // on) ride the message itself — inline left of the timestamp for
-            // an agent reply, in the top-right border corner for a user
-            // bubble. They cost no separate vertical space.
+            // mouse controls (`[fork]` + `[pin]`/`[unpin]`, only when mouse
+            // mode is on) ride the message itself — inline left of the
+            // timestamp for an agent reply, in the top-right border corner
+            // for a user bubble. They cost no separate vertical space.
             // The entry's first content line is the next row we push.
             msg_abs_line.insert(idx, all.len());
             let pin = Self::entry_pin_seq(entry).and_then(|seq| {
@@ -1478,6 +1485,19 @@ impl App {
                     }),
                     _ => None,
                 };
+                let fork_hit = match pin_region {
+                    Some(r) if Some(all.len() + i) == pin_abs => {
+                        match (r.fork_col_start, r.fork_col_end) {
+                            (Some(col_start), Some(col_end)) => Some(PinHit {
+                                seq: r.seq,
+                                col_start,
+                                col_end,
+                            }),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
                 let row_kind = if chip_target.is_some() || subagent_target.is_some() {
                     ChatRowKind::Chip
                 } else {
@@ -1518,6 +1538,7 @@ impl App {
                         .map(|_| idx),
                     diff_path: diff_path.clone(),
                     pin_hit,
+                    fork_hit,
                     continuation: false,
                     selectable: row_kind != ChatRowKind::Chip,
                 });
@@ -2897,6 +2918,9 @@ fn prewrap_chat_rows(
             meta.continuation = meta.continuation || part_idx > 0;
             meta.pin_hit = meta
                 .pin_hit
+                .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
+            meta.fork_hit = meta
+                .fork_hit
                 .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
             visual_meta.push(meta);
         }

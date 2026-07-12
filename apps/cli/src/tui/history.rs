@@ -638,19 +638,19 @@ pub struct Rendered {
     pub tool_result_scroll_regions: Vec<ToolResultScrollRegion>,
     /// Relative row range for a scrollable expanded reasoning window.
     pub reasoning_scroll_region: Option<ReasoningScrollRegion>,
-    /// Where the clickable `[pin]`/`[unpin]` mouse control landed within
-    /// `lines`, when one was drawn (`pinned-messages`). `None` when the
-    /// entry is not pinnable, the control is hidden (mouse mode off), or
-    /// the line was too narrow to fit it. Carries the seq + the exact
-    /// row/column range so the hit-test toggles only on the glyphs.
+    /// Where the clickable `[fork]` and/or `[pin]`/`[unpin]` mouse controls
+    /// landed within `lines`, when drawn. `None` when the entry is not
+    /// pinnable, the controls are hidden (mouse mode off), or the line was
+    /// too narrow to fit any control. Carries the seq + exact row/column
+    /// ranges so hit-tests route only visible glyphs.
     pub pin_region: Option<PinRegion>,
 }
 
-/// The render-time placement + state of a pinnable message's pin control,
+/// The render-time placement + state of a pinnable message's fork/pin controls,
 /// computed by the chrome from `App` state and threaded into
-/// [`render_entry`] (`pinned-messages`). When the control should be drawn
-/// at all, it rides the message's own first line (agent) or top border
-/// row (user) — not a separate prefix row.
+/// [`render_entry`] (`pinned-messages`). When controls should be drawn, they
+/// ride the message's own first line (agent) or top border row (user) — not a
+/// separate prefix row.
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct PinControl {
     /// The message's pin seq (the DB key the toggle operates on).
@@ -659,36 +659,56 @@ pub struct PinControl {
     /// `false` → not pinned (`[pin]`, grey). Drives the state-dependent
     /// control width (7 vs 5).
     pub pinned: bool,
-    /// `true` → draw the clickable `[pin]`/`[unpin]` control (mouse mode
-    /// on). When `false` the control is omitted and reserves no width.
+    /// `true` → draw the clickable `[fork]` plus `[pin]`/`[unpin]` controls
+    /// (mouse mode on). When `false` the controls are omitted and reserve no
+    /// width.
     pub show_control: bool,
-    /// `true` → this entry is the `/pin` pick-mode selection; the `▶`
-    /// arrow attaches immediately left of the (inline / corner) control.
+    /// `true` → this entry is the `/pin` or `/fork` pick-mode selection; the
+    /// `▶` arrow attaches immediately left of the inline/corner controls.
     pub is_pick: bool,
 }
 
 impl PinControl {
     /// Width (columns) the `[pin]`/`[unpin]` glyphs occupy when shown,
     /// else 0. State-dependent: 7 for `[unpin]`, 5 for `[pin]`.
-    fn control_width(&self) -> usize {
+    fn pin_control_width(&self) -> usize {
         if self.show_control {
             crate::tui::pins_overlay::pin_control_width(self.pinned) as usize
         } else {
             0
         }
     }
+
+    fn fork_control_width(&self) -> usize {
+        if self.show_control {
+            crate::tui::pins_overlay::fork_control_width() as usize
+        } else {
+            0
+        }
+    }
+
+    fn control_width(&self, include_fork: bool) -> usize {
+        let pin = self.pin_control_width();
+        if include_fork && self.fork_control_width() > 0 && pin > 0 {
+            self.fork_control_width() + 1 + pin
+        } else {
+            pin
+        }
+    }
 }
 
-/// Where a drawn pin control landed: its seq plus the row (within an
-/// entry's `lines`) and the half-open `[col_start, col_end)` column range
-/// of the clickable glyphs. The chrome offsets `row` by the entry's
-/// position in the scroll buffer and hit-tests `col_start..col_end`.
+/// Where drawn controls landed: their shared seq plus the row (within an
+/// entry's `lines`) and half-open column ranges for visible glyphs. The
+/// chrome offsets `row` by the entry's position in the scroll buffer and
+/// hit-tests only the recorded ranges.
 #[derive(Debug, Clone, Copy)]
 pub struct PinRegion {
     pub seq: i64,
     pub row: usize,
     pub col_start: u16,
     pub col_end: u16,
+    pub fork_col_start: Option<u16>,
+    pub fork_col_end: Option<u16>,
 }
 
 #[cfg(test)]
@@ -1464,9 +1484,9 @@ fn render_user(
 
     let mut out: Vec<Line<'static>> = Vec::new();
     // Top border row, optionally carrying the `⚙ preflighted` chip
-    // (implementation note) appended past the box, and the
-    // `[pin]`/`[unpin]` mouse control tucked into the top-right corner of
-    // the border itself (`pinned-messages`) — neither costs vertical space.
+    // (implementation note) appended past the box, and the mouse controls
+    // tucked into the top-right border corner (`pinned-messages`) — neither
+    // costs vertical space.
     let (border_spans, pin_region) =
         user_top_border(interior_w, border_style, pin, USER_GUTTER + 1);
     let mut top = vec![gutter.clone()];
@@ -1512,17 +1532,18 @@ fn render_user(
     (out, pin_region)
 }
 
-/// Build the bubble's top border spans (`╭───╮`) with the pin control —
-/// the `▶` pick-arrow (when selected) + the `[pin]`/`[unpin]` glyphs (when
+/// Build the bubble's top border spans (`╭───╮`) with the fork/pin controls —
+/// the `▶` pick-arrow (when selected) + `[fork] [pin]`/`[unpin]` glyphs (when
 /// mouse mode is on) — tucked into the top-right corner, replacing the
 /// rightmost run of `─` glyphs just inside the `╮` (`pinned-messages`).
 /// `first_dash_col` is the chat-relative column of the first `─` (i.e. the
 /// `╭` column + 1), so the recorded region's columns line up with the
 /// chat-area-relative coordinates the click hit-test uses. Returns
-/// `(spans, region)`; `region` carries the clickable `[pin]`/`[unpin]`
-/// columns, or `None` when no control was drawn (mouse off) or the bubble
-/// is too narrow to host it without breaking the box — the box width is
-/// preserved exactly in every case.
+/// `(spans, region)`; `region` carries the clickable fork and pin columns,
+/// or `None` when no control was drawn (mouse off) or the bubble is too
+/// narrow to host even `[pin]` without breaking the box — the box width is
+/// preserved exactly in every case. When both chips do not fit, `[fork]`
+/// is dropped first.
 fn user_top_border(
     interior_w: usize,
     border_style: Style,
@@ -1533,10 +1554,26 @@ fn user_top_border(
         .filter(|p| p.is_pick)
         .map(|_| crate::tui::pins_overlay::PICK_ARROW.width())
         .unwrap_or(0);
-    let ctrl_w = pin.map(|p| p.control_width()).unwrap_or(0);
+    let (ctrl_w, include_fork) = match pin {
+        Some(p) if p.show_control => {
+            let full = p.control_width(true);
+            if arrow_w + full < interior_w {
+                (full, true)
+            } else {
+                let pin_only = p.control_width(false);
+                if arrow_w + pin_only < interior_w {
+                    (pin_only, false)
+                } else {
+                    (0, false)
+                }
+            }
+        }
+        _ => (0, false),
+    };
     let corner = arrow_w + ctrl_w;
-    // Only host the corner control when the box is wide enough to keep at
-    // least one `─` to the left of it — otherwise drop it (box unbroken).
+    // Only host the corner controls when the box is wide enough to keep at
+    // least one `─` to the left of them — otherwise drop controls (box
+    // unbroken), falling back from `[fork] [pin]` to `[pin]` first.
     if corner == 0 || corner >= interior_w {
         return (
             vec![Span::styled(
@@ -1562,14 +1599,28 @@ fn user_top_border(
     let mut region = None;
     if ctrl_w > 0 {
         let p = pin.expect("ctrl_w > 0 implies Some");
-        // The control's glyphs occupy the `ctrl_w` columns immediately
-        // left of the `╮`: first-dash column + the dashes + the arrow.
-        let col_start = (first_dash_col + dashes + arrow_w) as u16;
+        // The controls occupy the columns immediately left of the `╮`:
+        // first-dash column + the dashes + the arrow.
+        let control_start = first_dash_col + dashes + arrow_w;
+        let mut pin_start = control_start;
+        let mut fork_range = None;
+        if include_fork {
+            let fork_start = control_start;
+            let fork_end = fork_start + p.fork_control_width();
+            fork_range = Some((fork_start as u16, fork_end as u16));
+            spans.extend(crate::tui::pins_overlay::fork_control_spans());
+            spans.push(Span::styled(" ".to_string(), border_style));
+            pin_start = fork_end + 1;
+        }
+        let pin_w = p.pin_control_width();
+        let col_start = pin_start as u16;
         region = Some(PinRegion {
             seq: p.seq,
             row: 0,
             col_start,
-            col_end: col_start + ctrl_w as u16,
+            col_end: col_start + pin_w as u16,
+            fork_col_start: fork_range.map(|(start, _)| start),
+            fork_col_end: fork_range.map(|(_, end)| end),
         });
         spans.extend(crate::tui::pins_overlay::pin_control_spans(p.pinned));
     }
@@ -1594,11 +1645,11 @@ fn render_user_markdown(
     let body = markdown::render_with_width(text, md_width);
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(body.len() + 1);
-    // The pin control rides the first body line (no bubble to host a
-    // corner here), inline immediately left of the timestamp — same shape
-    // as an agent line (`pinned-messages`). The chip stays on its own row.
+    // The controls ride the first body line (no bubble to host a corner
+    // here), inline immediately left of the timestamp — same shape as an
+    // agent line (`pinned-messages`). The chip stays on its own row.
     let mut pin_region: Option<PinRegion> = None;
-    // The pin block lives on the first *body* line; once the chip takes
+    // The control block lives on the first *body* line; once the chip takes
     // row 0, the body's first line is offset by one.
     let body_row_offset = chip.is_some() as usize;
     // Request-preflight chip on its own row 0 (implementation note)
@@ -1765,9 +1816,9 @@ fn render_agent(
         };
     let indent_span = || Span::raw(" ".repeat(AGENT_INDENT));
     let has_reasoning = !reasoning.trim().is_empty();
-    // The inline pin block (`▶ ` + `[pin]`/`[unpin]`) rides immediately
-    // left of the timestamp on the first content line, so the first line's
-    // right-edge reservation grows by the pin block's columns
+    // The inline control block (`▶ ` + `[fork] [pin]`/`[unpin]`) rides
+    // immediately left of the timestamp on the first content line, so the
+    // first line's right-edge reservation grows by the control block's columns
     // (`pinned-messages`).
     let pin_reserve = agent_pin_reserve(pin);
     let reserve_first = TIMESTAMP_WIDTH + 1 + pin_reserve;
@@ -1981,8 +2032,8 @@ fn render_agent(
         // The reservation is relative to `body_content_w`, which already
         // accounts for the left AGENT_INDENT applied by indent_lines;
         // `render_first_line_with_pin_and_timestamp` adds AGENT_INDENT back
-        // to `used`, so reserving (TIMESTAMP_WIDTH + 1 + pin block) here
-        // leaves the right-edge pin + timestamp + gap exactly clear on row 1.
+        // to `used`, so reserving (TIMESTAMP_WIDTH + 1 + control block) here
+        // leaves the right-edge controls + timestamp + gap exactly clear on row 1.
         let (wrapped_md, md_conts) = wrap_lines_to_width_reserving_first(
             markdown::render_with_width(text, body_content_w),
             body_content_w,
@@ -2900,9 +2951,9 @@ fn render_first_line_timestamped(
     Line::from(spans)
 }
 
-/// Columns the inline pin block (`▶ ` pick-arrow when selected + the
-/// `[pin]`/`[unpin]` control when shown) reserves on an agent's first
-/// line, *plus* one separating space before the timestamp when the
+/// Columns the inline control block (`▶ ` pick-arrow when selected + the
+/// `[fork] [pin]`/`[unpin]` controls when shown) reserves on an agent's
+/// first line, *plus* one separating space before the timestamp when the
 /// control is present (`pinned-messages`). Zero when neither arrow nor
 /// control is drawn — the line then reserves only the timestamp, exactly
 /// as before this feature.
@@ -2913,21 +2964,21 @@ fn agent_pin_reserve(pin: Option<PinControl>) -> usize {
         // `▶ ` — arrow glyph + a trailing space.
         w += crate::tui::pins_overlay::PICK_ARROW.width() + 1;
     }
-    let ctrl = p.control_width();
+    let ctrl = p.control_width(true);
     if ctrl > 0 {
-        // The control's glyphs + one space separating it from the ts.
+        // The controls' glyphs + one space separating them from the ts.
         w += ctrl + 1;
     }
     w
 }
 
-/// Build an agent first line with the inline pin block sitting immediately
-/// left of the right-aligned timestamp: `…content…  ▶ [pin] 12:00`
+/// Build an agent first line with the inline control block sitting immediately
+/// left of the right-aligned timestamp: `…content…  ▶ [fork] [pin] 12:00`
 /// (`pinned-messages`). The caller has already wrapped `spans`' text
-/// leaving the pin block plus `TIMESTAMP_WIDTH + 1` columns clear on the
+/// leaving the control block plus `TIMESTAMP_WIDTH + 1` columns clear on the
 /// right. Degrades gracefully on narrow widths: the timestamp always wins;
-/// if the pin block can't fit it is dropped (no region returned) rather
-/// than overlapping the timestamp.
+/// if both chips cannot fit, `[fork]` is dropped before `[pin]`; if `[pin]`
+/// cannot fit either, no region is returned.
 fn render_first_line_with_pin_and_timestamp(
     mut spans: Vec<Span<'static>>,
     timestamp: DateTime<Local>,
@@ -2937,22 +2988,39 @@ fn render_first_line_with_pin_and_timestamp(
     let area = width as usize;
     let ts = format_timestamp(timestamp);
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
-    let pin_block = agent_pin_reserve(pin);
-    // Timestamp keeps priority: only attempt the pin block if content +
-    // block + ts + the leading gap all fit on the line.
-    let fits = pin_block > 0 && used + pin_block + TIMESTAMP_WIDTH < area;
-    if !fits {
-        // No room (or nothing to draw): timestamp-only, as before.
+    let Some(p) = pin else {
         return (
             render_first_line_timestamped(spans, timestamp, width, true),
             None,
         );
-    }
-    let p = pin.expect("pin_block > 0 implies Some");
-    // Slack pushes the pin block + timestamp to the right edge.
+    };
+    let arrow_w = if p.is_pick {
+        crate::tui::pins_overlay::PICK_ARROW.width() + 1
+    } else {
+        0
+    };
+    let pin_w = p.pin_control_width();
+    let full_ctrl = p.control_width(true);
+    let pin_only_ctrl = p.control_width(false);
+    let (control_w, include_fork) =
+        if full_ctrl > 0 && used + arrow_w + full_ctrl + 1 + TIMESTAMP_WIDTH < area {
+            (full_ctrl, true)
+        } else if pin_only_ctrl > 0 && used + arrow_w + pin_only_ctrl + 1 + TIMESTAMP_WIDTH < area {
+            (pin_only_ctrl, false)
+        } else if arrow_w > 0 && used + arrow_w + TIMESTAMP_WIDTH < area {
+            (0, false)
+        } else {
+            return (
+                render_first_line_timestamped(spans, timestamp, width, true),
+                None,
+            );
+        };
+    let pin_block = arrow_w + control_w + usize::from(control_w > 0);
+    // Slack pushes the controls + timestamp to the right edge.
     let pad = area.saturating_sub(used + pin_block + TIMESTAMP_WIDTH + 1);
     spans.push(Span::raw(" ".repeat(pad + 1)));
-    // `▶ ` first (immediately left of the control), then the control.
+    // `▶ ` first (immediately left of the controls), then optional `[fork]`,
+    // then the `[pin]`/`[unpin]` control.
     if p.is_pick {
         spans.push(Span::styled(
             format!("{} ", crate::tui::pins_overlay::PICK_ARROW),
@@ -2961,19 +3029,29 @@ fn render_first_line_with_pin_and_timestamp(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    let ctrl_w = p.control_width();
     let mut region = None;
-    if ctrl_w > 0 {
-        // The control's left edge is at: area - TIMESTAMP_WIDTH - 1 - ctrl_w.
-        let col_start = (area - TIMESTAMP_WIDTH - 1 - ctrl_w) as u16;
+    if control_w > 0 {
+        let pin_end = area - TIMESTAMP_WIDTH - 1;
+        let pin_start = pin_end - pin_w;
+        let fork_range = if include_fork {
+            let fork_end = pin_start - 1;
+            let fork_start = fork_end - p.fork_control_width();
+            spans.extend(crate::tui::pins_overlay::fork_control_spans());
+            spans.push(Span::raw(" "));
+            Some((fork_start as u16, fork_end as u16))
+        } else {
+            None
+        };
+        let col_start = pin_start as u16;
         region = Some(PinRegion {
             seq: p.seq,
             row: 0,
             col_start,
-            col_end: col_start + ctrl_w as u16,
+            col_end: col_start + pin_w as u16,
+            fork_col_start: fork_range.map(|(start, _)| start),
+            fork_col_end: fork_range.map(|(_, end)| end),
         });
         spans.extend(crate::tui::pins_overlay::pin_control_spans(p.pinned));
-        // One space between the control and the timestamp.
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
@@ -3744,6 +3822,36 @@ mod tests {
     }
 
     #[test]
+    fn user_top_border_draws_fork_left_of_pin_and_drops_fork_first() {
+        let ctrl = PinControl {
+            seq: 42,
+            pinned: false,
+            show_control: true,
+            is_pick: false,
+        };
+
+        let (wide, wide_region) = user_top_border(20, Style::default(), Some(ctrl), 3);
+        let wide_text = line_text(&Line::from(wide));
+        assert_eq!(wide_text, "╭────────[fork] [pin]╮");
+        let wide_region = wide_region.expect("wide border records controls");
+        assert_eq!(wide_region.fork_col_start, Some(11));
+        assert_eq!(wide_region.fork_col_end, Some(17));
+        assert_eq!((wide_region.col_start, wide_region.col_end), (18, 23));
+
+        let (pin_only, pin_only_region) = user_top_border(12, Style::default(), Some(ctrl), 3);
+        let pin_only_text = line_text(&Line::from(pin_only));
+        assert_eq!(pin_only_text, "╭───────[pin]╮");
+        let pin_only_region = pin_only_region.expect("pin survives narrow fallback");
+        assert_eq!(pin_only_region.fork_col_start, None);
+        assert_eq!(pin_only_region.fork_col_end, None);
+        assert_eq!(pin_only_region.col_end - pin_only_region.col_start, 5);
+
+        let (too_narrow, too_narrow_region) = user_top_border(5, Style::default(), Some(ctrl), 3);
+        assert_eq!(line_text(&Line::from(too_narrow)), "╭─────╮");
+        assert!(too_narrow_region.is_none());
+    }
+
+    #[test]
     fn failed_user_markdown_recolors_left_bar_without_adding_chip_or_rows() {
         let ts = fixed_ts();
         let (normal, _) = render_user("**hello**", ts, 60, true, None, false, None);
@@ -4166,14 +4274,12 @@ mod tests {
         HashSet::new()
     }
 
-    /// `pinned-messages`: the relocated pin control rides an agent reply's
+    /// `pinned-messages`: the relocated controls ride an agent reply's
     /// first content line, immediately left of the right-aligned timestamp
-    /// — `[pin] HH:MM` (grey) / `[unpin] HH:MM` (yellow). The first-line
-    /// width is reserved for BOTH the pin block AND the timestamp in each
-    /// state (5-col `[pin]` vs 7-col `[unpin]`), and the returned region
-    /// pins the exact clickable columns just left of the `ts` + its gap.
+    /// — `[fork] [pin] HH:MM` (grey) / `[fork] [unpin] HH:MM` (yellow for
+    /// unpin). The returned region records separate fork and pin ranges.
     #[test]
-    fn agent_inline_pin_sits_left_of_timestamp_for_both_states() {
+    fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
         let width: u16 = 60;
         let ctrl = |pinned: bool| PinControl {
             seq: 42,
@@ -4196,40 +4302,86 @@ mod tests {
                 Some(ctrl(pinned)),
             );
             let first = line_text(&r.lines[0]);
-            // The control sits immediately left of the timestamp, one space
-            // between: `…  [pin] HH:MM`.
             let ts: String = first.chars().rev().take(TIMESTAMP_WIDTH).collect();
             assert!(
                 ts.chars().rev().collect::<String>().contains(':'),
                 "row ends with the HH:MM timestamp: {first:?}"
             );
-            let needle = format!("{label} ");
-            let at = first.find(&needle).expect("control left of ts");
-            // The `[pin]`/`[unpin]` glyphs end exactly one space before the
-            // 5-col timestamp, i.e. at column width - TIMESTAMP_WIDTH - 1.
-            let ctrl_end = at + label.chars().count();
+            let fork_at = first.find("[fork] ").expect("fork control left of pin");
+            let pin_at = first
+                .find(&format!("{label} "))
+                .expect("pin control left of ts");
+            assert_eq!(pin_at, fork_at + "[fork] ".chars().count());
+            let pin_end = pin_at + label.chars().count();
             assert_eq!(
-                ctrl_end,
+                pin_end,
                 width as usize - TIMESTAMP_WIDTH - 1,
-                "control ends just left of the ts gap: {first:?}"
+                "pin control ends just left of the ts gap: {first:?}"
             );
 
-            // The clickable region matches the rendered glyph columns and is
-            // state-width-correct (5 vs 7).
-            let region = r.pin_region.expect("clickable pin region recorded");
+            let region = r.pin_region.expect("clickable control region recorded");
             assert_eq!(region.seq, 42);
-            assert_eq!(region.row, 0, "pin rides the first content line");
+            assert_eq!(region.row, 0, "controls ride the first content line");
+            assert_eq!(region.fork_col_start, Some(fork_at as u16));
+            assert_eq!(region.fork_col_end, Some((fork_at + 6) as u16));
             assert_eq!(region.col_end - region.col_start, pin_w, "{label} width");
             assert_eq!(
                 region.col_end,
                 width - TIMESTAMP_WIDTH as u16 - 1,
-                "region ends just left of the ts gap"
+                "pin region ends just left of the ts gap"
             );
-            assert_eq!(region.col_start as usize, at, "region starts at the glyphs");
-            // First line never overflows the area in either state — the
-            // larger `[unpin]` reservation must not push the ts off the row.
+            assert_eq!(
+                region.col_start as usize, pin_at,
+                "pin region starts at glyphs"
+            );
             assert!(line_width(&r.lines[0]) <= width as usize);
         }
+    }
+
+    #[test]
+    fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
+        let ctrl = PinControl {
+            seq: 42,
+            pinned: false,
+            show_control: true,
+            is_pick: false,
+        };
+
+        let pin_only = render_agent(
+            "Auto",
+            "ok",
+            "",
+            fixed_ts(),
+            false,
+            0,
+            None,
+            20,
+            false,
+            Some(ctrl),
+        );
+        let first = line_text(&pin_only.lines[0]);
+        assert!(!first.contains("[fork]"));
+        assert!(first.contains("[pin]"));
+        let region = pin_only.pin_region.expect("pin survives narrow fallback");
+        assert_eq!(region.fork_col_start, None);
+        assert_eq!(region.fork_col_end, None);
+        assert_eq!(region.col_end - region.col_start, 5);
+
+        let too_narrow = render_agent(
+            "Auto",
+            "ok",
+            "",
+            fixed_ts(),
+            false,
+            0,
+            None,
+            12,
+            false,
+            Some(ctrl),
+        );
+        let first = line_text(&too_narrow.lines[0]);
+        assert!(!first.contains("[fork]") && !first.contains("[pin]"));
+        assert!(too_narrow.pin_region.is_none());
     }
 
     /// `pinned-messages`: visibility is preserved — with the control hidden

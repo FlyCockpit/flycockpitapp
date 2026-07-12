@@ -352,17 +352,19 @@ impl App {
         }
         let rel = (mouse.row - area.y) as usize;
         let rel_col = mouse.column - area.x;
-        // Mouse pin control click wins (`pinned-messages`): only present when
-        // mouse mode is enabled. The `[pin]`/`[unpin]` control now rides the
-        // message's own first content line (inline, left of the timestamp) or
-        // the user bubble's top-right border corner, so the hit region is a
-        // recorded column range `[col_start, col_end)` on that row — a click
-        // toggles only when it lands inside it.
+        // Mouse control chips win (`pinned-messages` / fork-chip): the
+        // `[fork]` and `[pin]`/`[unpin]` controls ride the message's own first
+        // content line or top-right user-bubble border. Hit regions are exact
+        // recorded column ranges, so fork, pin, and reasoning-chip clicks stay
+        // distinct on a shared row.
         if self.mouse_capture
-            && let Some(seq) = self.pin_seq_at(rel, rel_col)
+            && let Some(chip) = self.control_chip_at(rel, rel_col)
         {
             self.selection = None;
-            self.toggle_pin_for_seq(seq);
+            match chip {
+                super::render::ControlChip::Fork { seq } => self.fork_for_seq(seq),
+                super::render::ControlChip::Pin { seq } => self.toggle_pin_for_seq(seq),
+            }
             return;
         }
         if let Some(entry_idx) = self
@@ -986,6 +988,7 @@ mod affordance_hover_tests {
             reasoning_window_target,
             diff_path: None,
             pin_hit: None,
+            fork_hit: None,
             continuation: false,
             selectable: false,
         }

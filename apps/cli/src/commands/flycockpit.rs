@@ -46,7 +46,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         "Enter this one-time code in any browser: {}",
         login.user_code
     );
-    if let Err(error) = crate::auth::xai_oauth::webbrowser_open(login.open_url()) {
+    if let Err(error) = crate::browser::open(login.open_url()) {
         eprintln!("Could not open browser ({error}). Open the URL manually.");
     }
 

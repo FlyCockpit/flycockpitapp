@@ -11,6 +11,7 @@ mod approval;
 mod auth;
 mod auto_title;
 mod banner;
+mod browser;
 mod cli;
 mod clipboard;
 mod commands;

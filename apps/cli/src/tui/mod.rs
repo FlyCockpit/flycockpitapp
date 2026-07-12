@@ -32,6 +32,7 @@ pub mod geometry;
 pub mod history;
 pub mod input_source;
 pub mod keys_overlay;
+pub mod links;
 pub mod markdown;
 pub mod math_render;
 pub mod model_picker;

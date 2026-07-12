@@ -185,10 +185,7 @@ pub(super) fn oauth_setup_lines(flow: OAuthSetupFlow<'_>) -> Vec<Line<'static>> 
 }
 
 pub(super) fn render_oauth_setup(frame: &mut Frame, area: Rect, flow: OAuthSetupFlow<'_>) {
-    frame.render_widget(
-        Paragraph::new(oauth_setup_lines(flow)).wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(oauth_setup_lines(flow)), area);
 }
 
 pub(super) fn render_oauth_body(lines: &mut Vec<Line<'static>>, flow: OAuthSetupFlow<'_>) {
@@ -347,7 +344,7 @@ fn render_grok_oauth_body(lines: &mut Vec<Line<'static>>, s: &GrokOAuthSetupStat
         )));
         lines.push(Line::from(vec![
             Span::styled("Open: ", muted),
-            Span::styled(url.clone(), cyan),
+            Span::styled(url.clone(), cyan.add_modifier(Modifier::UNDERLINED)),
         ]));
         lines.push(Line::from(Span::styled("c copy URL".to_string(), muted)));
         lines.push(Line::default());
@@ -483,7 +480,10 @@ fn render_codex_oauth_body(lines: &mut Vec<Line<'static>>, s: &CodexOAuthSetupSt
         )));
         lines.push(Line::from(vec![
             Span::styled("Open: ", muted),
-            Span::styled(login.verification_uri.clone(), cyan),
+            Span::styled(
+                login.verification_uri.clone(),
+                cyan.add_modifier(Modifier::UNDERLINED),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Code: ", muted),

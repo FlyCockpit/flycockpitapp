@@ -1032,7 +1032,8 @@ impl App {
                 dialog.render(frame, rects.compact);
             }
         } else if self.dialog.is_active() {
-            self.dialog.render(frame, rects.body);
+            self.dialog
+                .render(frame, rects.body, &mut self.link_registry);
         } else {
             let overlay = std::mem::take(&mut self.overlay);
             match overlay {

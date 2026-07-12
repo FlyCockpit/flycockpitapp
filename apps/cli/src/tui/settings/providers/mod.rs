@@ -464,6 +464,31 @@ pub(super) enum ProvidersPage {
 }
 
 impl ProvidersPage {
+    pub(super) fn oauth_link(&self) -> Option<(&str, usize)> {
+        let (url, flow) = match self {
+            Self::GrokOAuthSetup { state, .. }
+            | Self::Add(AddState {
+                step: AddStep::GrokOAuthAuth(state),
+                ..
+            }) => (state.authorize_url.as_deref()?, OAuthSetupFlow::Grok(state)),
+            Self::CodexOAuthSetup { state, .. }
+            | Self::Add(AddState {
+                step: AddStep::CodexOAuthAuth(state),
+                ..
+            }) => (
+                state.pending.as_ref()?.verification_uri.as_str(),
+                OAuthSetupFlow::Codex(state),
+            ),
+            _ => return None,
+        };
+        let row = oauth_setup_lines(flow)
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.as_ref() == url))?;
+        Some((url, row))
+    }
+}
+
+impl ProvidersPage {
     /// The text field a paste should land in for the page's current focus,
     /// or `None` while no field is open. Mirrors the char-dispatch focus
     /// logic in the page's key handlers so paste targets the same buffer.

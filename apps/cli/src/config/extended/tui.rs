@@ -39,6 +39,10 @@ pub struct TuiConfig {
     /// for the common path.
     #[serde(default = "default_true")]
     pub mouse_capture: bool,
+    /// Emit OSC 8 terminal hyperlinks for registered TUI links. Terminals
+    /// without OSC 8 support ignore them; disable for misbehaving terminals.
+    #[serde(default = "default_true")]
+    pub hyperlinks: bool,
     /// Allow `Ctrl+Shift+Y` to copy the focused agent message as
     /// rich text (HTML to the system clipboard via the local OS
     /// clipboard layer; falls back to plain text over SSH).
@@ -239,6 +243,7 @@ impl Default for TuiConfig {
             banner: BannerConfig::default(),
             diff_style: DiffStyle::default(),
             mouse_capture: true,
+            hyperlinks: true,
             rich_text_copy: true,
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,

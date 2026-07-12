@@ -81,7 +81,7 @@ pub async fn run_login_flow(manual_paste: bool) -> Result<StoredTokens> {
         "binding xAI OAuth callback on 127.0.0.1:56121; use manual paste if the port is busy",
     )?;
     eprintln!("Opening browser for xAI Grok subscription OAuth...");
-    if let Err(e) = webbrowser_open(&login.authorize_url) {
+    if let Err(e) = crate::browser::open(&login.authorize_url) {
         eprintln!("Could not open browser ({e}). Open this URL manually:");
         eprintln!("{}", login.authorize_url);
     }
@@ -417,29 +417,6 @@ fn form_body(params: &[(&str, &str)]) -> String {
         .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
         .collect::<Vec<_>>()
         .join("&")
-}
-
-pub(crate) fn webbrowser_open(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut cmd = {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    cmd.spawn().context("launching browser")?;
-    Ok(())
 }
 
 fn unix_now() -> i64 {

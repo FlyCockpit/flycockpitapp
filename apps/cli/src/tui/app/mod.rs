@@ -1759,7 +1759,8 @@ pub struct App {
     /// `tui.mouse_capture` at startup; mutated when the user toggles
     /// the setting mid-session.
     pub(super) mouse_capture: bool,
-    pub(super) oauth_mouse_restore: Option<bool>,
+    pub(super) hyperlinks: bool,
+    pub(super) link_registry: crate::tui::links::LinkRegistry,
     /// User's `tui.exit_tail_lines` setting (GOALS §1d). Cached at
     /// startup so the exit-tail dump survives the dialog being closed.
     pub(super) exit_tail_lines: i32,
@@ -2780,6 +2781,7 @@ impl App {
 
         let diff_style = tui_cfg.diff_style;
         let mouse_capture = tui_cfg.mouse_capture;
+        let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
         let use_emojis = tui_cfg.use_emojis;
@@ -2899,7 +2901,8 @@ impl App {
             pending_usage: Vec::new(),
             pending_external_edit: false,
             mouse_capture,
-            oauth_mouse_restore: None,
+            hyperlinks,
+            link_registry: crate::tui::links::LinkRegistry::default(),
             exit_tail_lines,
             rich_text_copy,
             tmux_copy_hint_shown: false,
@@ -3306,7 +3309,9 @@ impl App {
             if take_redraw_request(&mut needs_redraw) {
                 #[cfg(test)]
                 EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                self.link_registry.begin_frame();
                 terminal.draw(|frame| self.render(frame))?;
+                crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
                 // The composer is the user's active input surface this frame iff
                 // no question dialog is displacing it
                 // (implementation note). A render with no
@@ -3721,15 +3726,6 @@ impl App {
     /// The setting itself is persisted by the dialog's save path; this
     /// just keeps the live terminal state in sync.
     pub(super) fn sync_mouse_capture_from_dialog(&mut self) {
-        let oauth_wants_mouse_off = self.dialog.oauth_wants_mouse_off();
-        if let Some(want) = reconcile_oauth_mouse_capture(
-            self.mouse_capture,
-            &mut self.oauth_mouse_restore,
-            oauth_wants_mouse_off,
-        ) {
-            self.set_mouse_capture_live(want);
-            return;
-        }
         let Some(want) = self.dialog.take_pending_mouse_capture() else {
             return;
         };
@@ -3750,6 +3746,7 @@ impl App {
             if !want {
                 self.hovered_affordance = None;
                 self.hovered_suggestion = None;
+                self.link_registry.clear_hover();
             }
         }
     }
@@ -4182,10 +4179,9 @@ impl App {
                                     browser_error: None,
                                 });
                             }
-                            let browser_error =
-                                crate::auth::xai_oauth::webbrowser_open(&login.authorize_url)
-                                    .err()
-                                    .map(|e| e.to_string());
+                            let browser_error = crate::browser::open(&login.authorize_url)
+                                .err()
+                                .map(|e| e.to_string());
                             Ok(AsyncActionPayload::OAuthGrokBegin {
                                 login,
                                 auto_attempted: browser_error.is_none(),
@@ -7534,21 +7530,6 @@ impl App {
             );
         });
     }
-}
-
-fn reconcile_oauth_mouse_capture(
-    current: bool,
-    restore: &mut Option<bool>,
-    wants_mouse_off: bool,
-) -> Option<bool> {
-    if wants_mouse_off && restore.is_none() {
-        *restore = Some(current);
-        return Some(false);
-    }
-    if !wants_mouse_off && let Some(want) = restore.take() {
-        return Some(want);
-    }
-    None
 }
 
 fn editor_argv_for_cwd(editor: &std::ffi::OsStr, cwd: &std::path::Path) -> Vec<String> {
@@ -14032,7 +14013,6 @@ mod skill_auto_injected_tests {
 
 #[cfg(test)]
 mod resume_history_conversion_tests {
-    use super::reconcile_oauth_mouse_capture;
     use super::wire_history_to_entries;
     use crate::daemon::proto::HistoryEntry as Wire;
     use crate::tui::history::{HistoryEntry, ToolCallState};
@@ -14250,32 +14230,5 @@ mod resume_history_conversion_tests {
             }
             other => panic!("entries[2] should be child Agent, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn oauth_mouse_reconcile_disables_then_restores_prior_state() {
-        let mut restore = None;
-        assert_eq!(
-            reconcile_oauth_mouse_capture(true, &mut restore, true),
-            Some(false)
-        );
-        assert_eq!(restore, Some(true));
-        assert_eq!(
-            reconcile_oauth_mouse_capture(false, &mut restore, false),
-            Some(true)
-        );
-        assert_eq!(restore, None);
-
-        let mut restore = None;
-        assert_eq!(
-            reconcile_oauth_mouse_capture(false, &mut restore, true),
-            Some(false)
-        );
-        assert_eq!(restore, Some(false));
-        assert_eq!(
-            reconcile_oauth_mouse_capture(false, &mut restore, false),
-            Some(false)
-        );
-        assert_eq!(restore, None);
     }
 }

@@ -40,7 +40,34 @@ impl App {
             self.toast = None;
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
+            if self.mouse_capture {
+                self.link_registry.update_hover(mouse.column, mouse.row);
+            }
             self.update_hovered_affordance(&mouse);
+            return;
+        }
+        if self.mouse_capture
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(url) = self
+                .link_registry
+                .at(mouse.column, mouse.row)
+                .map(|link| link.url.clone())
+        {
+            if crate::clipboard::is_ssh() {
+                match crate::clipboard::copy_plain(&url) {
+                    Ok(_) => self.show_toast("Link copied (SSH session)", ToastKind::Success),
+                    Err(error) => {
+                        self.show_toast(format!("Copy failed: {error}"), ToastKind::Error)
+                    }
+                }
+            } else {
+                match crate::tui::links::open_browser(&url) {
+                    Ok(()) => self.show_toast("Opened link in browser", ToastKind::Success),
+                    Err(error) => {
+                        self.show_toast(format!("Could not open link: {error}"), ToastKind::Error)
+                    }
+                }
+            }
             return;
         }
         if self.mouse_capture

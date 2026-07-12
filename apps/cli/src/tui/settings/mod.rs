@@ -828,13 +828,6 @@ impl Dialog {
         }
     }
 
-    pub fn oauth_wants_mouse_off(&self) -> bool {
-        match self {
-            Dialog::Settings(s) => s.oauth_wants_mouse_off(),
-            _ => false,
-        }
-    }
-
     pub fn apply_oauth_codex_begin(
         &mut self,
         result: Result<crate::auth::codex_oauth::DeviceLogin, String>,
@@ -865,7 +858,12 @@ impl Dialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        links: &mut crate::tui::links::LinkRegistry,
+    ) {
         match self {
             Dialog::None => {}
             Dialog::PickConfig {
@@ -907,7 +905,7 @@ impl Dialog {
                 None,
                 "↑/↓  enter: select  esc: back to picker",
             ),
-            Dialog::Settings(s) => s.render(frame, area),
+            Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
 }
@@ -1151,25 +1149,6 @@ impl SettingsDialog {
                 }
                 _ => {}
             }
-        }
-    }
-
-    fn oauth_wants_mouse_off(&self) -> bool {
-        let Some(page) = self.page.downcast_ref::<ProvidersPage>() else {
-            return false;
-        };
-        match page {
-            ProvidersPage::GrokOAuthSetup { state, .. }
-            | ProvidersPage::Add(AddState {
-                step: AddStep::GrokOAuthAuth(state),
-                ..
-            }) => state.pending && state.authorize_url.is_some(),
-            ProvidersPage::CodexOAuthSetup { state, .. }
-            | ProvidersPage::Add(AddState {
-                step: AddStep::CodexOAuthAuth(state),
-                ..
-            }) => state.polling && state.pending.is_some(),
-            _ => false,
         }
     }
 
@@ -1474,7 +1453,7 @@ impl SettingsDialog {
 
     // ── Rendering ────────────────────────────────────────────────────────
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
         let title = self.title();
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1484,6 +1463,20 @@ impl SettingsDialog {
 
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
         self.page.render(&self.cx, frame, layout[0]);
+        if let Some(page) = self.page.downcast_ref::<ProvidersPage>()
+            && let Some((url, row)) = page.oauth_link()
+        {
+            let x = layout[0].x.saturating_add(6);
+            let width = layout[0]
+                .right()
+                .saturating_sub(x)
+                .min(unicode_width::UnicodeWidthStr::width(url) as u16);
+            links.register(
+                Rect::new(x, layout[0].y.saturating_add(row as u16), width, 1),
+                url,
+                url,
+            );
+        }
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
             frame.set_cursor_position(cursor);
         }
@@ -2931,8 +2924,9 @@ mod tests {
     fn render_settings_rows(d: &SettingsDialog, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut links = crate::tui::links::LinkRegistry::default();
         terminal
-            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height)))
+            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
             .expect("draw");
         terminal
             .backend()
@@ -3449,8 +3443,9 @@ mod tests {
         let height = 24;
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut links = crate::tui::links::LinkRegistry::default();
         terminal
-            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height)))
+            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
             .expect("draw");
         let rendered: Vec<String> = terminal
             .backend()

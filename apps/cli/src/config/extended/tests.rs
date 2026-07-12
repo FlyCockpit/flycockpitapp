@@ -292,6 +292,26 @@ fn command_resource_profiles_reject_legacy_rust_toolchain_key() {
 }
 
 #[test]
+fn malformed_data_syntax_section_warns_and_uses_defaults() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"data_syntax":"not an object"}"#).unwrap();
+
+    let (cfg, warnings) = ExtendedConfigDoc::load(&path)
+        .unwrap()
+        .config_with_warnings();
+
+    assert!(cfg.data_syntax.enabled);
+    assert_eq!(cfg.data_syntax.max_bytes, 10 * 1024 * 1024);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("data_syntax")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn resource_scheduler_defaults_enabled_with_builtin_pools() {
     let cfg: ExtendedConfig = serde_json::from_str("{}").unwrap();
     assert!(cfg.resource_scheduler.enabled);

@@ -19,6 +19,7 @@ pub(crate) use crate::config::merge::deep_merge_value;
 use crate::config::dirs::{ConfigDirKind, config_file_paths_for_load, discover_config_dirs};
 
 mod daemon;
+mod data_syntax;
 mod delegation;
 mod guards;
 mod harness;
@@ -28,6 +29,8 @@ mod tui;
 
 #[allow(unused_imports)]
 pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
+#[allow(unused_imports)]
+pub use data_syntax::DataSyntaxConfig;
 #[allow(unused_imports)]
 pub use delegation::{
     DEFAULT_DELEGATION_MAX_PARALLEL, DEFAULT_SWARM_MAX_CONCURRENCY, DEFAULT_SWARM_MAX_DEPTH,
@@ -253,6 +256,11 @@ pub struct ExtendedConfig {
     /// Language Server Protocol diagnostics and navigation settings.
     #[serde(default)]
     pub lsp: LspConfig,
+
+    /// In-process syntax validation notes for standardized data files written
+    /// by native write tools.
+    #[serde(default)]
+    pub data_syntax: DataSyntaxConfig,
 
     /// Loop-guard knobs: the back-to-back identical tool-call threshold.
     #[serde(default)]
@@ -1309,6 +1317,7 @@ impl Default for ExtendedConfig {
             swarm: SwarmConfig::default(),
             review: ReviewConfig::default(),
             lsp: LspConfig::default(),
+            data_syntax: DataSyntaxConfig::default(),
             loop_guard: LoopGuardConfig::default(),
             max_primary_rounds: 0,
             dialog: DialogConfig::default(),
@@ -1524,6 +1533,7 @@ impl ExtendedConfigDoc {
         parse_field!("swarm", swarm);
         parse_field!("review", review);
         parse_field!("lsp", lsp);
+        parse_field!("data_syntax", data_syntax);
         parse_field!("loop_guard", loop_guard);
         parse_field!("maxPrimaryRounds", max_primary_rounds);
         parse_field!("dialog", dialog);

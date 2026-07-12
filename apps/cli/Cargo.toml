@@ -104,6 +104,8 @@ lsp-types = "0.97"
 flycockpit-relay-protocol = { path = "../../crates/relay-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# YAML syntax validation for native write tools. `serde_yaml` 0.9 is archived,
+# but YAML syntax is stable and this existing dependency is sufficient here.
 serde_yaml = "0.9"
 # TOML parsing for env-file format auto-detection (§7). Used to walk a
 # matched env file's leaf string scalars as redaction candidates.
@@ -237,6 +239,8 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 rayon = "1"
 firecrawl = "2"
+# In-process JSONC syntax validation for writeunlock/editunlock data files.
+jsonc-parser = { version = "0.33.0", default-features = false }
 
 # Linux-only: logind `handle-lid-switch` inhibitor lock for
 # `/caffeinate` lid-close survival (the high-level inhibitor logind

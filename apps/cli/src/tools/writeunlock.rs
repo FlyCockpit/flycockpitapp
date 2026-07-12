@@ -118,9 +118,14 @@ impl Tool for WriteunlockTool {
             normalized.len(),
             if want_crlf { "CRLF" } else { "LF" }
         );
+        let config = crate::config::extended::load_for_cwd(&ctx.cwd);
         if let Some(lsp) = &ctx.lsp {
-            let config = crate::config::extended::load_for_cwd(&ctx.cwd);
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
+        }
+        if let Some(note) =
+            crate::tools::data_syntax::data_syntax_note(&path, &normalized, &config.data_syntax)
+        {
+            message.push_str(&note);
         }
         if let Some(advisory) = outcome.advisory() {
             message.push_str(advisory);
@@ -388,8 +393,8 @@ mod tests {
     async fn writeunlock_reports_success_when_release_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, db) = test_ctx_with_db(tmp.path());
-        let file = tmp.path().join("existing.md");
-        std::fs::write(&file, "old\n").unwrap();
+        let file = tmp.path().join("existing.json");
+        std::fs::write(&file, "{}\n").unwrap();
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
         ctx.locks
             .acquire(&file, &ctx.agent_id, ctx.session.id)
@@ -398,16 +403,23 @@ mod tests {
 
         let out = WriteunlockTool
             .call(
-                serde_json::json!({"path": "existing.md", "content": "new\n"}),
+                serde_json::json!({"path": "existing.json", "content": "{\"ok\":true}\n"}),
                 &ctx,
             )
             .await
             .unwrap();
 
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"ok\":true}\n");
         assert!(out.content.contains("wrote `"), "{}", out.content);
+        assert!(out.content.contains("syntax OK (JSON)"), "{}", out.content);
         assert!(
             out.content.contains("lock bookkeeping did not persist"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.find("syntax OK (JSON)").unwrap()
+                < out.content.find(LOCK_BOOKKEEPING_ADVISORY).unwrap(),
             "{}",
             out.content
         );
@@ -417,5 +429,44 @@ mod tests {
         ctx.locks
             .check_write_permitted(&file, &ctx.agent_id, ctx.session.id)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn writeunlock_json_syntax_notes_are_advisory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let out = WriteunlockTool
+            .call(
+                serde_json::json!({"path": "bad.json", "content": "{\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("bad.json")).unwrap(),
+            "{\n"
+        );
+        assert!(
+            out.content.contains("warning: content is not valid JSON"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("line 2 column"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn writeunlock_json_success_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let out = WriteunlockTool
+            .call(
+                serde_json::json!({"path": "ok.json", "content": "{}\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("syntax OK (JSON)"), "{}", out.content);
     }
 }

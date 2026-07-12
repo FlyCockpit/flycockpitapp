@@ -154,9 +154,14 @@ impl Tool for EditunlockTool {
             stage,
             normalized.len()
         );
+        let config = crate::config::extended::load_for_cwd(&ctx.cwd);
         if let Some(lsp) = &ctx.lsp {
-            let config = crate::config::extended::load_for_cwd(&ctx.cwd);
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
+        }
+        if let Some(note) =
+            crate::tools::data_syntax::data_syntax_note(&path, &normalized, &config.data_syntax)
+        {
+            message.push_str(&note);
         }
         if let Some(advisory) = outcome.advisory() {
             message.push_str(advisory);
@@ -776,6 +781,60 @@ mod tests {
         assert!(out.content.ends_with(LOCK_BOOKKEEPING_ADVISORY));
         assert!(ctx.locks.holder(&file).is_none());
         assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+    }
+
+    #[tokio::test]
+    async fn editunlock_toml_syntax_notes_are_advisory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("Cargo.toml");
+        std::fs::write(&file, "[package]\nname = \"ok\"\n").unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+
+        let out = EditunlockTool
+            .call(
+                serde_json::json!({
+                    "path": "Cargo.toml",
+                    "old_string": "name = \"ok\"",
+                    "new_string": "name =",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[package]\nname =\n"
+        );
+        assert!(
+            out.content.contains("warning: content is not valid TOML"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn editunlock_toml_success_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("Cargo.toml");
+        std::fs::write(&file, "[package]\nname = \"old\"\n").unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+
+        let out = EditunlockTool
+            .call(
+                serde_json::json!({
+                    "path": "Cargo.toml",
+                    "old_string": "old",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("syntax OK (TOML)"), "{}", out.content);
     }
 
     #[test]

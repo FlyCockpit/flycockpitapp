@@ -851,17 +851,20 @@ impl App {
                         }
                     )
                 });
-                self.notify_attention(if is_approval {
-                    crate::tui::attention::AttentionEvent::Approval
-                } else {
-                    crate::tui::attention::AttentionEvent::Question
-                });
                 self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
                     interrupt_id,
                     description,
                     questions,
                     lockout,
                 ));
+                self.raise_attention_interrupt(
+                    if is_approval {
+                        AttentionInterruptKind::Approval
+                    } else {
+                        AttentionInterruptKind::Question
+                    },
+                    true,
+                );
             }
             TurnEvent::ScheduleStarted {
                 session_id,

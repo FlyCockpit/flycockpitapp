@@ -349,6 +349,7 @@ pub(super) enum SettingId {
     ShowBranch,
     CaffeinateDisplay,
     AttentionEnabled,
+    AttentionTitle,
     AttentionBell,
     AttentionDesktop,
     ExitTailLines,
@@ -446,6 +447,7 @@ const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::ShowBranch,
     SettingId::CaffeinateDisplay,
     SettingId::AttentionEnabled,
+    SettingId::AttentionTitle,
     SettingId::AttentionBell,
     SettingId::AttentionDesktop,
     SettingId::ExitTailLines,
@@ -543,6 +545,7 @@ impl SettingId {
             SettingId::ShowBranch => "show branch",
             SettingId::CaffeinateDisplay => "caffeinate display",
             SettingId::AttentionEnabled => "attention notifications",
+            SettingId::AttentionTitle => "attention title marker",
             SettingId::AttentionBell => "attention bell",
             SettingId::AttentionDesktop => "attention desktop",
             SettingId::ExitTailLines => "exit tail lines",
@@ -692,7 +695,12 @@ impl SettingId {
                  question or approval waiting, a turn finishing or failing, a job \
                  completing, or a plan step needing attention. On (default) shows a \
                  brief toast for each; off silences the whole subsystem (toast, \
-                 bell, and desktop)."
+                 title marker, bell, and desktop)."
+            }
+            SettingId::AttentionTitle => {
+                "Show a terminal-title marker while a question or approval is waiting. \
+                 On by default so another terminal tab/window shows action is needed; \
+                 fixed strings only, never command text, paths, or prompt content."
             }
             SettingId::AttentionBell => {
                 "Ring the terminal bell once for events that need you to act — a \
@@ -1532,6 +1540,7 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ShowBranch),
             Setting(S::CaffeinateDisplay),
             Setting(S::AttentionEnabled),
+            Setting(S::AttentionTitle),
             Setting(S::AttentionBell),
             Setting(S::AttentionDesktop),
             Setting(S::ExitTailLines),
@@ -1690,6 +1699,11 @@ impl SettingsCx {
                 e.tui.attention.enabled,
                 "on (default — toast for attention events)",
                 "off (no attention notifications)",
+            ),
+            S::AttentionTitle => on_off(
+                e.tui.attention.title,
+                "on (default — title marker for waiting questions)",
+                "off (no title marker)",
             ),
             S::AttentionBell => on_off(
                 e.tui.attention.bell,
@@ -2413,6 +2427,7 @@ impl SettingsCx {
                 e.tui.caffeinate_display_awake = !e.tui.caffeinate_display_awake
             }
             S::AttentionEnabled => e.tui.attention.enabled = !e.tui.attention.enabled,
+            S::AttentionTitle => e.tui.attention.title = !e.tui.attention.title,
             S::AttentionBell => e.tui.attention.bell = !e.tui.attention.bell,
             S::AttentionDesktop => e.tui.attention.desktop = !e.tui.attention.desktop,
             S::ExperimentalMode => {
@@ -3010,6 +3025,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::ShowBranch => &["tui", "show_branch"],
         S::CaffeinateDisplay => &["tui", "caffeinate_display_awake"],
         S::AttentionEnabled => &["tui", "attention", "enabled"],
+        S::AttentionTitle => &["tui", "attention", "title"],
         S::AttentionBell => &["tui", "attention", "bell"],
         S::AttentionDesktop => &["tui", "attention", "desktop"],
         S::LlmMode => &["llm_mode"],

@@ -74,11 +74,11 @@ impl App {
             };
         }
 
-        // Any meaningful keystroke dismisses the toast — the user has
-        // moved on. Pure-modifier presses (Shift, Ctrl, etc. alone)
-        // don't count.
+        // Any meaningful keystroke dismisses transient toasts — the user has
+        // moved on. Persistent action-required toasts stay until resolved.
+        // Pure-modifier presses (Shift, Ctrl, etc. alone) don't count.
         if !is_modifier_only(&key) {
-            if self.toast.is_some() {
+            if self.toast.as_ref().is_some_and(|toast| !toast.persistent) {
                 self.toast = None;
             }
             // Record the interaction as the attention subsystem's conservative
@@ -337,6 +337,7 @@ impl App {
                         };
                         self.resolve_local_choice(selection);
                     } else {
+                        self.resolve_attention_interrupt();
                         self.resolve_question_dialog(result);
                     }
                 }

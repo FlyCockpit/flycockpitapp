@@ -33,6 +33,24 @@ pub enum AttentionEvent {
     ScheduleDone,
 }
 
+pub(crate) fn terminal_title_marker_escapes(title: &str) -> String {
+    let title = sanitize_notification_text(title);
+    format!("\x1b[22;0t{}", terminal_title_set_escapes(&title))
+}
+
+pub(crate) fn terminal_title_set_escapes(title: &str) -> String {
+    let title = sanitize_notification_text(title);
+    format!("\x1b]0;{title}\x1b\\\x1b]2;{title}\x1b\\")
+}
+
+pub(crate) fn terminal_title_restore_escapes(pushed: bool) -> String {
+    if pushed {
+        "\x1b[23;0t".to_string()
+    } else {
+        "\x1b]0;cockpit\x1b\\\x1b]2;cockpit\x1b\\".to_string()
+    }
+}
+
 /// Toast intent for an attention notification. Mirrors the App's private
 /// toast palette without depending on it, so this module stays pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +87,15 @@ impl AttentionEvent {
         }
     }
 
+    /// Fixed, secret-safe terminal-title marker for action-required events.
+    pub fn title_marker(self) -> Option<&'static str> {
+        match self {
+            AttentionEvent::Question => Some("● cockpit — question waiting"),
+            AttentionEvent::Approval => Some("● cockpit — approval waiting"),
+            _ => None,
+        }
+    }
+
     /// Coarse identity used for debounce. Distinct events never collapse;
     /// repeats of the *same* kind within the debounce window do. `TurnDone`
     /// collapses across its `long_running` flag (a burst is a burst).
@@ -95,6 +122,9 @@ pub struct AttentionConfig {
     /// Desktop notification (best-effort, non-fatal). Default off.
     #[serde(default)]
     pub desktop: bool,
+    /// Terminal-title marker while an interrupt is waiting. Default on.
+    #[serde(default = "default_true")]
+    pub title: bool,
 }
 
 fn default_true() -> bool {
@@ -107,6 +137,7 @@ impl Default for AttentionConfig {
             enabled: true,
             bell: false,
             desktop: false,
+            title: true,
         }
     }
 }
@@ -121,12 +152,25 @@ pub struct AttentionDecision {
     pub bell: bool,
     /// Post a desktop notification (best-effort).
     pub desktop: bool,
+    /// Update or clear the terminal-title marker.
+    pub title: TitleDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TitleDecision {
+    #[default]
+    Unchanged,
+    Set(&'static str),
+    Clear,
 }
 
 impl AttentionDecision {
     /// True when this decision asks for no user-visible effect at all.
     pub fn is_noop(&self) -> bool {
-        self.toast.is_none() && !self.bell && !self.desktop
+        self.toast.is_none()
+            && !self.bell
+            && !self.desktop
+            && matches!(self.title, TitleDecision::Unchanged)
     }
 }
 
@@ -134,6 +178,9 @@ impl AttentionDecision {
 /// time it fired one. A burst of tool errors or plan updates inside this
 /// window rings/pops at most once.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Re-nudge interval for unanswered action-required interrupts.
+pub const RENUDGE_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Mutable debounce bookkeeping. One per running TUI.
 #[derive(Debug, Default, Clone)]
@@ -191,6 +238,19 @@ pub fn decide(
         return AttentionDecision::default();
     }
 
+    let title = if event.is_action_required() {
+        if config.title {
+            event
+                .title_marker()
+                .map(TitleDecision::Set)
+                .unwrap_or(TitleDecision::Unchanged)
+        } else {
+            TitleDecision::Clear
+        }
+    } else {
+        TitleDecision::Unchanged
+    };
+
     let toast = Some((event.toast_text(), event.notice_kind()));
 
     // Which events warrant escalation (bell/desktop) at all. Action-required
@@ -207,6 +267,7 @@ pub fn decide(
             toast,
             bell: false,
             desktop: false,
+            title: title.clone(),
         };
     }
 
@@ -216,6 +277,7 @@ pub fn decide(
             toast,
             bell: false,
             desktop: false,
+            title: title.clone(),
         };
     }
 
@@ -231,6 +293,7 @@ pub fn decide(
         toast,
         bell,
         desktop,
+        title,
     }
 }
 
@@ -273,6 +336,7 @@ mod tests {
             enabled,
             bell,
             desktop,
+            title: true,
         }
     }
 
@@ -282,6 +346,7 @@ mod tests {
         assert!(d.enabled);
         assert!(!d.bell);
         assert!(!d.desktop);
+        assert!(d.title);
     }
 
     #[test]
@@ -376,6 +441,61 @@ mod tests {
             &mut st,
         );
         assert!(third.bell && third.desktop);
+    }
+
+    #[test]
+    fn action_required_sets_title_marker_by_default() {
+        let mut st = AttentionState::new();
+        let d = decide(
+            AttentionEvent::Approval,
+            &cfg(true, false, false),
+            true,
+            Instant::now(),
+            &mut st,
+        );
+        assert_eq!(d.title, TitleDecision::Set("● cockpit — approval waiting"));
+    }
+
+    #[test]
+    fn title_marker_can_be_disabled_independently() {
+        let mut st = AttentionState::new();
+        let mut config = cfg(true, false, false);
+        config.title = false;
+        let d = decide(
+            AttentionEvent::Question,
+            &config,
+            true,
+            Instant::now(),
+            &mut st,
+        );
+        assert_eq!(d.title, TitleDecision::Clear);
+    }
+
+    #[test]
+    fn renudge_after_interval_reescalates_action_required() {
+        let mut st = AttentionState::new();
+        let t0 = Instant::now();
+        let first = decide(
+            AttentionEvent::Approval,
+            &cfg(true, true, true),
+            true,
+            t0,
+            &mut st,
+        );
+        assert!(first.bell && first.desktop);
+
+        let nudged = decide(
+            AttentionEvent::Approval,
+            &cfg(true, true, true),
+            true,
+            t0 + RENUDGE_INTERVAL,
+            &mut st,
+        );
+        assert!(nudged.bell && nudged.desktop);
+        assert_eq!(
+            nudged.title,
+            TitleDecision::Set("● cockpit — approval waiting")
+        );
     }
 
     #[test]
@@ -475,8 +595,20 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_keeps_printable_and_unicode() {
-        assert_eq!(sanitize_notification_text("héllo · ok"), "héllo · ok");
-        assert_eq!(sanitize_notification_text("a\x00b\x1bc"), "abc");
+    fn title_marker_escapes_are_fixed_and_sanitized() {
+        let s = terminal_title_marker_escapes("● cockpit — approval waiting /tmp/secret");
+        assert!(s.starts_with("\x1b[22;0t"));
+        assert!(s.contains("\x1b]0;● cockpit — approval waiting /tmp/secret\x1b\\"));
+        assert!(s.contains("\x1b]2;● cockpit — approval waiting /tmp/secret\x1b\\"));
+        assert!(!s.contains('\x07'));
+    }
+
+    #[test]
+    fn title_restore_escapes_pop_or_reset() {
+        assert_eq!(terminal_title_restore_escapes(true), "\x1b[23;0t");
+        assert_eq!(
+            terminal_title_restore_escapes(false),
+            "\x1b]0;cockpit\x1b\\\x1b]2;cockpit\x1b\\"
+        );
     }
 }

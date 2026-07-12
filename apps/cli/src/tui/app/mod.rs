@@ -543,6 +543,7 @@ enum TerminalCleanupCommand {
     DisableBracketedPaste,
     PopKeyboardEnhancementFlags,
     RestoreDefaultCursorShape,
+    RestoreTerminalTitle,
     RestoreRatatui,
 }
 
@@ -607,6 +608,11 @@ impl TerminalModeSink for CrosstermTerminalModeSink {
             }
             TerminalCleanupCommand::RestoreDefaultCursorShape => {
                 crossterm::execute!(stdout(), SetCursorStyle::DefaultUserShape)?;
+            }
+            TerminalCleanupCommand::RestoreTerminalTitle => {
+                emit_terminal_title_sequence(
+                    &crate::tui::attention::terminal_title_restore_escapes(false),
+                );
             }
             TerminalCleanupCommand::RestoreRatatui => {
                 ratatui::try_restore()?;
@@ -699,6 +705,10 @@ impl<S: TerminalModeSink> TerminalModeGuard<S> {
             );
             self.restore_cursor_shape = false;
         }
+        self.apply_cleanup_command(
+            TerminalCleanupCommand::RestoreTerminalTitle,
+            &mut first_error,
+        );
         self.apply_cleanup_command(TerminalCleanupCommand::RestoreRatatui, &mut first_error);
         if let Some(err) = first_error {
             Err(err)
@@ -1824,12 +1834,18 @@ pub struct App {
     /// auto-off). Not client-owned: the assertion lives in the daemon.
     pub(super) caffeinate_active: bool,
     /// User attention-notification settings (implementation note):
-    /// in-TUI toast (default on), terminal bell, desktop notification.
+    /// in-TUI toast (default on), terminal title (default on), terminal bell,
+    /// desktop notification.
     pub(super) attention: crate::tui::attention::AttentionConfig,
     /// Debounce bookkeeping for the attention subsystem so a burst of
     /// identical events (tool errors, plan updates) rings the bell / pops a
     /// desktop notification at most once per window.
     pub(super) attention_state: crate::tui::attention::AttentionState,
+    /// Pending action-required interrupt tracked for persistent toast,
+    /// terminal-title marker, and periodic re-nudge.
+    attention_interrupt: Option<AttentionInterruptState>,
+    /// Terminal-title marker push/pop state.
+    terminal_title: TerminalTitleState,
     /// When the user last pressed a meaningful key. Used as a conservative
     /// "is the user actively here?" proxy (terminals can't report focus
     /// reliably) so a turn the user watched finish stays subtle.
@@ -2141,6 +2157,36 @@ struct Toast {
     text: String,
     kind: ToastKind,
     expires_at: Instant,
+    persistent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AttentionInterruptKind {
+    Question,
+    Approval,
+}
+
+impl AttentionInterruptKind {
+    fn event(self) -> crate::tui::attention::AttentionEvent {
+        match self {
+            Self::Question => crate::tui::attention::AttentionEvent::Question,
+            Self::Approval => crate::tui::attention::AttentionEvent::Approval,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttentionInterruptState {
+    kind: AttentionInterruptKind,
+    pending: bool,
+    foreground: bool,
+    next_renudge_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalTitleState {
+    active: bool,
+    stack_pushed: bool,
 }
 
 /// Default toast lifetime per TUI-design-philosophy §7.
@@ -2156,6 +2202,16 @@ const RECENT_INTERACTION_WINDOW: Duration = Duration::from_secs(20);
 /// attention subsystem: its completion escalates (desktop) even when the user
 /// is still at the keyboard, since a long wait is exactly when they look away.
 const LONG_RUNNING_TURN: Duration = Duration::from_secs(30);
+
+fn emit_terminal_title_sequence(sequence: &str) {
+    use std::io::{IsTerminal, Write};
+    let mut out = stdout();
+    if !out.is_terminal() {
+        return;
+    }
+    let _ = out.write_all(sequence.as_bytes());
+    let _ = out.flush();
+}
 
 /// Ring the terminal bell once (`BEL`, `0x07`). Best-effort: a write failure
 /// (closed/odd terminal) is ignored — a missed bell must never crash the TUI.
@@ -2867,6 +2923,11 @@ impl App {
             caffeinate_active: false,
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),
+            attention_interrupt: None,
+            terminal_title: TerminalTitleState {
+                active: false,
+                stack_pushed: false,
+            },
             last_user_interaction: Instant::now(),
             waiting_for_lock: None,
             sandbox_down_notice: None,
@@ -3237,6 +3298,9 @@ impl App {
             if self.service_event_loop_wake(terminal, &mut terminal_input)? {
                 needs_redraw = true;
             }
+            if self.tick_attention_interrupt() {
+                needs_redraw = true;
+            }
             self.start_startup_background_tasks();
 
             if take_redraw_request(&mut needs_redraw) {
@@ -3394,6 +3458,7 @@ impl App {
             text: text.into(),
             kind,
             expires_at: Instant::now() + TOAST_TTL,
+            persistent: false,
         });
     }
 
@@ -3411,7 +3476,16 @@ impl App {
     /// this method only performs the side effects it asks for, each of which
     /// is failure-tolerant.
     pub(super) fn notify_attention(&mut self, event: crate::tui::attention::AttentionEvent) {
-        use crate::tui::attention::{NoticeKind, decide};
+        self.apply_attention_decision(event, false, true);
+    }
+
+    fn apply_attention_decision(
+        &mut self,
+        event: crate::tui::attention::AttentionEvent,
+        persistent_toast: bool,
+        show_toast: bool,
+    ) {
+        use crate::tui::attention::{NoticeKind, TitleDecision, decide};
         let now = Instant::now();
         // "Recently interacted" — a conservative focus proxy. Terminals can't
         // reliably report focus, so we treat a keystroke within the last few
@@ -3428,13 +3502,18 @@ impl App {
         if decision.is_noop() {
             return;
         }
-        if let Some((text, kind)) = decision.toast {
+        if show_toast && let Some((text, kind)) = decision.toast {
             let toast_kind = match kind {
                 NoticeKind::Info => ToastKind::Info,
                 NoticeKind::Success => ToastKind::Success,
                 NoticeKind::Error => ToastKind::Error,
             };
-            self.show_toast(text, toast_kind);
+            self.toast = Some(Toast {
+                text: text.to_string(),
+                kind: toast_kind,
+                expires_at: Instant::now() + TOAST_TTL,
+                persistent: persistent_toast,
+            });
         }
         if decision.bell {
             ring_terminal_bell();
@@ -3442,6 +3521,74 @@ impl App {
         if decision.desktop {
             post_desktop_notification(event.toast_text());
         }
+        match decision.title {
+            TitleDecision::Set(title) => self.set_terminal_title_marker(title),
+            TitleDecision::Clear => self.clear_terminal_title_marker(),
+            TitleDecision::Unchanged => {}
+        }
+    }
+
+    fn raise_attention_interrupt(&mut self, kind: AttentionInterruptKind, foreground: bool) {
+        let event = kind.event();
+        self.attention_interrupt = Some(AttentionInterruptState {
+            kind,
+            pending: true,
+            foreground,
+            next_renudge_at: Instant::now() + crate::tui::attention::RENUDGE_INTERVAL,
+        });
+        self.apply_attention_decision(event, !foreground, !foreground);
+    }
+
+    fn resolve_attention_interrupt(&mut self) {
+        self.attention_interrupt = None;
+        if self.toast.as_ref().is_some_and(|toast| toast.persistent) {
+            self.toast = None;
+        }
+        self.clear_terminal_title_marker();
+    }
+
+    fn tick_attention_interrupt(&mut self) -> bool {
+        let Some(state) = self.attention_interrupt.as_mut() else {
+            return false;
+        };
+        if !state.pending {
+            return false;
+        }
+        let now = Instant::now();
+        if now < state.next_renudge_at {
+            return false;
+        }
+        let kind = state.kind;
+        let foreground = state.foreground;
+        state.next_renudge_at = now + crate::tui::attention::RENUDGE_INTERVAL;
+        self.apply_attention_decision(kind.event(), !foreground, !foreground);
+        true
+    }
+
+    fn set_terminal_title_marker(&mut self, title: &str) {
+        if !self.attention.title {
+            return;
+        }
+        if !self.terminal_title.stack_pushed {
+            emit_terminal_title_sequence(&crate::tui::attention::terminal_title_marker_escapes(
+                title,
+            ));
+            self.terminal_title.stack_pushed = true;
+        } else {
+            emit_terminal_title_sequence(&crate::tui::attention::terminal_title_set_escapes(title));
+        }
+        self.terminal_title.active = true;
+    }
+
+    fn clear_terminal_title_marker(&mut self) {
+        if !self.terminal_title.active {
+            return;
+        }
+        emit_terminal_title_sequence(&crate::tui::attention::terminal_title_restore_escapes(
+            self.terminal_title.stack_pushed,
+        ));
+        self.terminal_title.active = false;
+        self.terminal_title.stack_pushed = false;
     }
 
     /// Drop the toast if it has expired. Called once per event-loop
@@ -3449,6 +3596,7 @@ impl App {
     /// up without needing a new event to fire.
     pub(super) fn tick_toast(&mut self) -> bool {
         if let Some(toast) = &self.toast
+            && !toast.persistent
             && Instant::now() > toast.expires_at
         {
             self.toast = None;
@@ -3515,6 +3663,7 @@ impl App {
             text: "Press ctrl+c again to exit".to_string(),
             kind: ToastKind::Info,
             expires_at: Instant::now() + CTRL_C_EXIT_WINDOW,
+            persistent: false,
         });
     }
 

@@ -1543,6 +1543,7 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::PopKeyboardEnhancementFlags,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
+                TerminalCleanupCommand::RestoreTerminalTitle,
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
@@ -1573,6 +1574,7 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::DisableMouseCapture,
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
+                TerminalCleanupCommand::RestoreTerminalTitle,
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
@@ -1597,6 +1599,7 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::PopKeyboardEnhancementFlags,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
+                TerminalCleanupCommand::RestoreTerminalTitle,
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
@@ -1616,6 +1619,7 @@ mod terminal_mode_guard_tests {
             vec![
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
+                TerminalCleanupCommand::RestoreTerminalTitle,
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );

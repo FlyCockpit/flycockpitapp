@@ -1618,7 +1618,7 @@ fn user_top_border(
             let fork_end = fork_start + p.fork_control_width();
             fork_range = Some((fork_start as u16, fork_end as u16));
             spans.extend(crate::tui::pins_overlay::fork_control_spans());
-            spans.push(Span::styled(" ".to_string(), border_style));
+            spans.push(Span::styled("─".to_string(), border_style));
             pin_start = fork_end + 1;
         }
         let pin_w = p.pin_control_width();
@@ -3964,7 +3964,7 @@ mod tests {
 
         let (wide, wide_region) = user_top_border(20, Style::default(), Some(ctrl), 3);
         let wide_text = line_text(&Line::from(wide));
-        assert_eq!(wide_text, "╭────────[fork] [pin]╮");
+        assert_eq!(wide_text, "╭────────[fork]─[pin]╮");
         let wide_region = wide_region.expect("wide border records controls");
         assert_eq!(wide_region.fork_col_start, Some(11));
         assert_eq!(wide_region.fork_col_end, Some(17));

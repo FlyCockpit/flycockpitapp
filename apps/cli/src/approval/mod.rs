@@ -28,7 +28,7 @@
 //! [`Db::raise_interrupt_questions`], [`InterruptHub::register`] a
 //! wakeup, [`InterruptHub::emit_raised`] to attached clients, then block
 //! on [`PendingInterrupt::wait`]. The TUI renders it with
-//! [`crate::tui::dialog::approval::ApprovalDialog`] over the shared
+//! [`crate::tui::dialog::question::QuestionDialog`] over the shared
 //! [`crate::tui::dialog::DialogState`]. The resolved option id maps back
 //! to a [`Scope`]; a non-`Once` choice records the grant *before* the
 //! decision returns.
@@ -1952,7 +1952,7 @@ mod tests {
 
     #[test]
     fn repeat_response_mapping_round_trips() {
-        use crate::tui::dialog::approval::{
+        use crate::approval::{
             ID_LOOP_ACCEPT_ONCE, ID_LOOP_ACCEPT_PROJECT, ID_LOOP_ACCEPT_SESSION,
             ID_LOOP_REJECT_ONCE, ID_LOOP_REJECT_PROJECT, ID_LOOP_REJECT_SESSION,
         };
@@ -2068,7 +2068,7 @@ mod tests {
             assert!(hub.resolve(
                 iid,
                 ResolveResponse::Single {
-                    selected_id: crate::tui::dialog::approval::ID_LOOP_ACCEPT_ONCE.into(),
+                    selected_id: crate::approval::ID_LOOP_ACCEPT_ONCE.into(),
                 }
             ));
         });
@@ -2099,7 +2099,7 @@ mod tests {
             assert!(hub.resolve(
                 iid,
                 ResolveResponse::Single {
-                    selected_id: crate::tui::dialog::approval::ID_LOOP_REJECT_SESSION.into(),
+                    selected_id: crate::approval::ID_LOOP_REJECT_SESSION.into(),
                 }
             ));
         });

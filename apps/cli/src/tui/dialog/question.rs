@@ -58,7 +58,7 @@ const EXPANDED_HEIGHT_DEN: u16 = 6;
 const MIN_PROMPT_ROWS: usize = 2;
 const MIN_ANSWER_ROWS: usize = 3;
 
-const CUSTOM_LABEL: &str = "Type your own answer";
+const CUSTOM_LABEL: &str = "Other…";
 const NEXT_LABEL: &str = "Next";
 
 /// Leading hover/cursor glyph on every option row: "▸ " when focused,
@@ -383,12 +383,31 @@ impl QuestionDialog {
         let mut counts: Vec<usize> = page
             .options
             .iter()
-            .map(|o| 1 + o.description.as_deref().map(|_| 1).unwrap_or(0))
+            .map(|o| {
+                1 + o
+                    .description
+                    .as_deref()
+                    .map(|description| {
+                        wrapped_height(
+                            &[Line::from(description.to_string())],
+                            self.last_inner_width.saturating_sub(8),
+                        )
+                    })
+                    .unwrap_or(0)
+            })
             .collect();
         // Custom affordance: one row (its typed text shares the row).
         // Suppressed on permission pages (no free-text option).
         if page.has_custom() {
-            counts.push(1);
+            let custom = self.state.custom_text(_page_idx);
+            counts.push(if custom.is_empty() {
+                1
+            } else {
+                wrapped_height(
+                    &[Line::from(custom.to_string())],
+                    self.last_inner_width.saturating_sub(4),
+                )
+            });
         }
         // Multiselect "Next" entry.
         if page.next_index().is_some() {
@@ -674,7 +693,7 @@ impl QuestionDialog {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         // Interrupt-level context header (codex `Reason:` style).
-        if !self.description.trim().is_empty() {
+        if !self.description.trim().is_empty() && self.description.trim() != page.prompt.trim() {
             lines.push(Line::from(Span::styled(
                 self.description.clone(),
                 muted.add_modifier(Modifier::ITALIC),
@@ -822,16 +841,21 @@ impl QuestionDialog {
                             (false, true) => "[x] ",
                             (false, false) => "[ ] ",
                         };
-                        let num = format!("{}. ", row_idx + 1);
+                        let num = if row_idx < 9 {
+                            format!("{}. ", row_idx + 1)
+                        } else {
+                            "   ".to_string()
+                        };
                         lines.push(self.option_line(&num, marker, &opt.label, hovered));
                         if let Some(desc) = opt.description.as_deref() {
                             // Continuation line aligned under the label
                             // column (cursor + number + marker width).
                             let indent = 2 + num.len() + marker.len();
-                            lines.push(Line::from(Span::styled(
+                            let description = Line::from(Span::styled(
                                 format!("{}{desc}", " ".repeat(indent)),
                                 muted,
-                            )));
+                            ));
+                            lines.extend(wrap_lines(&[description], area.width));
                         }
                     } else if row_idx == custom_idx {
                         let typed = self.state.custom_text(page_idx);
@@ -846,10 +870,13 @@ impl QuestionDialog {
                         };
                         let marker = if self.state.is_typing() && hovered {
                             "✎ "
-                        } else {
+                        } else if page.kind_is_select() || typed.is_empty() {
                             "+ "
+                        } else {
+                            "[x] "
                         };
-                        lines.push(self.option_line("", marker, &label, hovered));
+                        let custom_line = self.option_line("", marker, &label, hovered);
+                        lines.extend(wrap_lines(&[custom_line], area.width));
                         if self.state.is_typing() && hovered {
                             // Park the cursor at the caret's display column.
                             // The rendered prefix on this row is the

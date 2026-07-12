@@ -448,11 +448,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::approval::Approver;
+    use crate::approval::ID_APPROVE_SESSION;
     use crate::approval::store::GrantStore;
     use crate::daemon::proto::ResolveResponse;
     use crate::engine::interrupt::InterruptHub;
     use crate::engine::tool::ToolCtx;
-    use crate::tui::dialog::approval::ID_APPROVE_SESSION;
 
     fn symlink_file(target: &std::path::Path, link: &std::path::Path) {
         #[cfg(unix)]
@@ -863,8 +863,8 @@ mod tests {
     /// session allowlist, so a second read is silent.
     #[tokio::test]
     async fn gitignore_gate_two_stage_session_approval() {
+        use crate::approval::{ID_GITIGNORE_FILE, ID_SESSION};
         use crate::daemon::proto::ResolveResponse;
-        use crate::tui::dialog::approval::{ID_GITIGNORE_FILE, ID_SESSION};
         let tmp = tempfile::tempdir().unwrap();
         let ctx = gitignore_ctx(tmp.path());
         let db = ctx.session.db.clone();

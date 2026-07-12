@@ -71,12 +71,12 @@ impl DaemonPromptDialog {
                 self.chosen = Some(DaemonChoice::Exit);
                 true
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h') => {
                 // 3 rows: start+connect / continue-without / exit.
                 self.cursor = crate::tui::nav::wrap_prev(self.cursor, 3);
                 false
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Right | KeyCode::Char('j') | KeyCode::Char('l') => {
                 self.cursor = crate::tui::nav::wrap_next(self.cursor, 3);
                 false
             }

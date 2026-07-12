@@ -2619,10 +2619,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::approval::Approver;
+    use crate::approval::ID_APPROVE_SESSION;
     use crate::approval::classify::SimpleCommandInfo;
     use crate::approval::store::{GrantStore, Scope};
     use crate::daemon::proto::ResolveResponse;
-    use crate::tui::dialog::approval::ID_APPROVE_SESSION;
 
     /// Build a sandbox-enabled ctx with an approver + grant store.
     fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
@@ -3499,7 +3499,7 @@ mod tests {
             assert!(hub.resolve(
                 iid,
                 crate::daemon::proto::ResolveResponse::Single {
-                    selected_id: crate::tui::dialog::approval::ID_APPROVE_SESSION.into(),
+                    selected_id: crate::approval::ID_APPROVE_SESSION.into(),
                 }
             ));
         });

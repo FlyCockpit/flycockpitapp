@@ -233,63 +233,64 @@ const EMBEDDED_PANE: KeyGroup = KeyGroup {
     ],
 };
 
+const DIALOG_BINDINGS: &[KeyBinding] = &[
+    KeyBinding {
+        key: "1-9",
+        action: "select",
+        desc: "choose a numbered option",
+    },
+    KeyBinding {
+        key: "↑/↓ or j/k",
+        action: "move",
+        desc: "highlight an option",
+    },
+    KeyBinding {
+        key: "←/→ or h/l",
+        action: "questions",
+        desc: "move between question pages",
+    },
+    KeyBinding {
+        key: "Space",
+        action: "toggle/type",
+        desc: "toggle selection or edit Other…",
+    },
+    KeyBinding {
+        key: "Enter",
+        action: "select/confirm",
+        desc: "select, then confirm permission choices",
+    },
+    KeyBinding {
+        key: "PgUp/PgDn",
+        action: "prompt scroll",
+        desc: "scroll dialog prompt content",
+    },
+    KeyBinding {
+        key: "Shift+PgUp/PgDn",
+        action: "chat scroll",
+        desc: "scroll the transcript behind the dialog",
+    },
+    KeyBinding {
+        key: "Ctrl+E",
+        action: "expand",
+        desc: "expand or collapse the dialog",
+    },
+    KeyBinding {
+        key: "Esc",
+        action: "cancel",
+        desc: "cancel the dialog",
+    },
+];
+
 /// Approval-dialog bindings (required decision).
 const APPROVAL_DIALOG: KeyGroup = KeyGroup {
     title: "Approval",
-    bindings: &[
-        KeyBinding {
-            key: "y / n",
-            action: "decide",
-            desc: "approve or deny the requested action",
-        },
-        KeyBinding {
-            key: "↑/↓",
-            action: "move",
-            desc: "highlight a scope/option",
-        },
-        KeyBinding {
-            key: "Enter",
-            action: "confirm",
-            desc: "confirm the highlighted choice",
-        },
-        KeyBinding {
-            key: "Esc",
-            action: "deny",
-            desc: "decline",
-        },
-    ],
+    bindings: DIALOG_BINDINGS,
 };
 
 /// Question-dialog bindings (`question` tool interrupt).
 const QUESTION_DIALOG: KeyGroup = KeyGroup {
     title: "Question",
-    bindings: &[
-        KeyBinding {
-            key: "↑/↓",
-            action: "move",
-            desc: "highlight an option",
-        },
-        KeyBinding {
-            key: "Space",
-            action: "check",
-            desc: "toggle an option (multi-select)",
-        },
-        KeyBinding {
-            key: "Enter",
-            action: "submit",
-            desc: "send the answer",
-        },
-        KeyBinding {
-            key: "Ctrl+E",
-            action: "expand",
-            desc: "expand a long prompt / option list",
-        },
-        KeyBinding {
-            key: "Esc",
-            action: "cancel",
-            desc: "decline to answer",
-        },
-    ],
+    bindings: DIALOG_BINDINGS,
 };
 
 /// Model-picker bindings.
@@ -680,9 +681,10 @@ mod tests {
         let global_at = text.find("Global").expect("Global heading present");
         assert!(approval_at < global_at, "Approval precedes Global:\n{text}");
         assert!(
-            text.contains("y / n"),
-            "approval shows the y/n decision keys"
+            text.contains("1-9"),
+            "approval shows numbered selection keys"
         );
+        assert_eq!(APPROVAL_DIALOG.bindings, QUESTION_DIALOG.bindings);
     }
 
     #[test]
@@ -819,7 +821,7 @@ mod tests {
             text.contains("keybindings — Approval"),
             "titled box:\n{text}"
         );
-        assert!(text.contains("y / n"), "approval decision keys present");
+        assert!(text.contains("1-9"), "approval decision keys present");
     }
 
     #[test]

@@ -29,7 +29,6 @@
 //! ([`super::dialog::question::QuestionDialog`]), so a second use-case
 //! gets its own thin wrapper over this same state machine.
 
-pub mod approval;
 pub mod question;
 
 use std::time::{Duration, Instant};

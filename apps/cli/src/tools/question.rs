@@ -159,7 +159,7 @@ impl Tool for QuestionTool {
         // and the dialog title hint. Single-question batches read more
         // naturally with the prompt verbatim.
         let description = if n == 1 {
-            question_prompt(&set.questions[0]).to_string()
+            String::new()
         } else {
             format!("{n} questions need your answer")
         };

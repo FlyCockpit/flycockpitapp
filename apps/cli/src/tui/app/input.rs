@@ -322,6 +322,19 @@ impl App {
         // composer, so it routes before the settings dialog / picker. On
         // close, send the resolution back to the daemon as
         // `ResolveInterrupt`; the agent's blocked `question` tool wakes.
+        if self.question_dialog.is_some()
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+        {
+            let page = self.chat_visible_lines.saturating_sub(1).max(1);
+            self.selection = None;
+            match key.code {
+                KeyCode::PageUp => self.scroll_chat_up(page),
+                KeyCode::PageDown => self.scroll_chat_down(page),
+                _ => unreachable!(),
+            }
+            return false;
+        }
         if let Some(dialog) = self.question_dialog.as_mut() {
             let should_close = dialog.handle_key(key);
             if should_close {

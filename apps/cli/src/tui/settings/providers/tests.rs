@@ -1105,9 +1105,9 @@ fn copy_oauth_url_reports_success_error_and_missing_url() {
 }
 
 #[test]
-fn add_grok_oauth_manual_mode_reports_active_text_field() {
+fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let mut state = AddState::new();
-    state.step = AddStep::GrokOAuthAuth(Box::new(GrokOAuthSetupState::new()));
+    state.step = AddStep::GrokOAuthAuth(Box::new(BrowserCallbackOAuthState::new()));
     let mut page = ProvidersPage::Add(state);
 
     assert!(page.active_text_field().is_none());
@@ -1118,7 +1118,7 @@ fn add_grok_oauth_manual_mode_reports_active_text_field() {
     let AddStep::GrokOAuthAuth(grok) = &mut add.step else {
         unreachable!();
     };
-    grok.manual_mode = true;
+    grok.paste_focused = true;
 
     let field = page
         .active_text_field()
@@ -1135,12 +1135,12 @@ fn add_grok_oauth_manual_mode_reports_active_text_field() {
 }
 
 #[test]
-fn grok_manual_mode_char_c_inserts_instead_of_copying_url() {
-    let mut state = GrokOAuthSetupState::new();
-    state.manual_mode = true;
+fn grok_paste_focus_char_c_inserts_instead_of_copying_url() {
+    let mut state = BrowserCallbackOAuthState::new();
+    state.paste_focused = true;
     state.authorize_url = Some("https://example.test/oauth".to_string());
 
-    let (_close, action) = handle_grok_oauth_setup_key(press(KeyCode::Char('c')), &mut state);
+    let (_close, action) = handle_browser_callback_oauth_key(press(KeyCode::Char('c')), &mut state);
 
     assert!(action.is_none());
     assert_eq!(state.manual_input.text(), "c");
@@ -1148,13 +1148,13 @@ fn grok_manual_mode_char_c_inserts_instead_of_copying_url() {
 }
 
 #[test]
-fn grok_manual_mode_char_by_char_callback_keeps_shortcut_letters() {
-    let mut state = GrokOAuthSetupState::new();
-    state.manual_mode = true;
+fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
+    let mut state = BrowserCallbackOAuthState::new();
+    state.paste_focused = true;
     let callback = "http://127.0.0.1:56121/callback?code=abc123&state=s";
 
     for ch in callback.chars() {
-        handle_grok_oauth_setup_key(press(KeyCode::Char(ch)), &mut state);
+        handle_browser_callback_oauth_key(press(KeyCode::Char(ch)), &mut state);
     }
 
     assert_eq!(state.manual_input.text(), callback);
@@ -1162,12 +1162,12 @@ fn grok_manual_mode_char_by_char_callback_keeps_shortcut_letters() {
 
 #[test]
 fn codex_oauth_logged_in_renders_single_continue_row() {
-    let mut state = CodexOAuthSetupState::new();
+    let mut state = DeviceCodeOAuthState::new();
     state.logged_in = true;
     state.status = Some(Ok("Codex OAuth login complete".to_string()));
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthSetupFlow::Codex(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::Codex(&state));
     let rendered = rendered_text(&lines);
 
     assert!(rendered.contains("continue"), "{rendered}");
@@ -1179,11 +1179,11 @@ fn codex_oauth_logged_in_renders_single_continue_row() {
 
 #[test]
 fn codex_oauth_logged_out_renders_start_or_poll_menu() {
-    let mut state = CodexOAuthSetupState::new();
+    let mut state = DeviceCodeOAuthState::new();
     state.logged_in = false;
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthSetupFlow::Codex(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::Codex(&state));
     let rendered = rendered_text(&lines);
     assert!(rendered.contains("log in"), "{rendered}");
     assert!(rendered.contains("skip / continue"), "{rendered}");
@@ -1193,7 +1193,7 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
         "ABCD-EFGH",
     ));
     lines.clear();
-    render_oauth_body(&mut lines, OAuthSetupFlow::Codex(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::Codex(&state));
     let rendered = rendered_text(&lines);
     assert!(rendered.contains("poll for approval"), "{rendered}");
     assert!(rendered.contains("skip / continue"), "{rendered}");
@@ -1202,12 +1202,12 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
 
 #[test]
 fn grok_oauth_logged_in_renders_single_continue_row() {
-    let mut state = GrokOAuthSetupState::new();
+    let mut state = BrowserCallbackOAuthState::new();
     state.logged_in = true;
     state.status = Some(Ok("xAI OAuth login complete".to_string()));
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthSetupFlow::Grok(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::Grok(&state));
     let rendered = rendered_text(&lines);
 
     assert!(rendered.contains("continue"), "{rendered}");
@@ -1219,11 +1219,11 @@ fn grok_oauth_logged_in_renders_single_continue_row() {
 
 #[test]
 fn grok_oauth_logged_out_renders_full_menu() {
-    let mut state = GrokOAuthSetupState::new();
+    let mut state = BrowserCallbackOAuthState::new();
     state.logged_in = false;
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthSetupFlow::Grok(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::Grok(&state));
     let rendered = rendered_text(&lines);
 
     assert!(rendered.contains("log in"), "{rendered}");
@@ -1234,26 +1234,26 @@ fn grok_oauth_logged_out_renders_full_menu() {
 
 #[test]
 fn logged_in_oauth_navigation_clamps_to_single_continue_row() {
-    let mut codex = CodexOAuthSetupState::new();
+    let mut codex = DeviceCodeOAuthState::new();
     codex.logged_in = true;
     codex.cursor = 99;
-    handle_codex_oauth_setup_key(press(KeyCode::Down), &mut codex);
+    handle_device_code_oauth_key(press(KeyCode::Down), &mut codex);
     assert_eq!(codex.cursor, 0);
 
-    let mut grok = GrokOAuthSetupState::new();
+    let mut grok = BrowserCallbackOAuthState::new();
     grok.logged_in = true;
     grok.cursor = 99;
-    handle_grok_oauth_setup_key(press(KeyCode::Up), &mut grok);
+    handle_browser_callback_oauth_key(press(KeyCode::Up), &mut grok);
     assert_eq!(grok.cursor, 0);
 }
 
 #[test]
 fn grok_oauth_logged_out_enter_still_begins_login() {
-    let mut state = GrokOAuthSetupState::new();
+    let mut state = BrowserCallbackOAuthState::new();
     state.logged_in = false;
     state.ssh_manual_only = false;
     state.cursor = 0;
-    let (_close, action) = handle_grok_oauth_setup_key(press(KeyCode::Enter), &mut state);
+    let (_close, action) = handle_browser_callback_oauth_key(press(KeyCode::Enter), &mut state);
 
     assert!(matches!(
         action,
@@ -1273,13 +1273,13 @@ async fn logged_in_oauth_enter_advances_add_wizard() {
         state.url_field.set(template.url);
         state.step = match template_id {
             "codex-oauth" => {
-                let mut oauth = CodexOAuthSetupState::new();
+                let mut oauth = DeviceCodeOAuthState::new();
                 oauth.logged_in = true;
                 oauth.cursor = 0;
                 AddStep::CodexOAuthAuth(Box::new(oauth))
             }
             "grok-oauth" => {
-                let mut oauth = GrokOAuthSetupState::new();
+                let mut oauth = BrowserCallbackOAuthState::new();
                 oauth.logged_in = true;
                 oauth.cursor = 0;
                 AddStep::GrokOAuthAuth(Box::new(oauth))

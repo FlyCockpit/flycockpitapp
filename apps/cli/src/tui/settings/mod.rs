@@ -1156,19 +1156,39 @@ impl SettingsDialog {
         &mut self,
         result: Result<crate::auth::codex_oauth::DeviceLogin, String>,
     ) {
-        let Some(state) = self.codex_oauth_state_mut() else {
-            return;
-        };
-        state.polling = false;
         match result {
             Ok(login) => {
-                state.status = Some(Ok(format!(
-                    "Open {} in any browser and enter code {}. Press Enter to poll for approval; c copies the URL.",
-                    login.verification_uri, login.user_code
-                )));
-                state.pending = Some(login);
+                let copied = crate::clipboard::copy_plain(&login.user_code).is_ok();
+                let ssh = crate::clipboard::is_ssh();
+                let opened = ssh || crate::browser::open(&login.verification_uri).is_ok();
+                let status = if ssh {
+                    if copied {
+                        "Code copied. Open the link and enter the code. Waiting for approval..."
+                    } else {
+                        "Open the link and enter the code. Waiting for approval (code copy failed)."
+                    }
+                } else if copied && opened {
+                    "Opened browser; code copied. Waiting for approval..."
+                } else if opened {
+                    "Opened browser. Waiting for approval (code copy failed)."
+                } else if copied {
+                    "Code copied. Open the link manually. Waiting for approval..."
+                } else {
+                    "Open the link manually. Waiting for approval (code copy failed)."
+                };
+                if let Some(state) = self.codex_oauth_state_mut() {
+                    state.polling = true;
+                    state.status = Some(Ok(status.to_string()));
+                    state.pending = Some(login.clone());
+                }
+                self.pending_oauth_action = Some(OAuthActionRequest::CodexPoll(login));
             }
-            Err(e) => state.status = Some(Err(e)),
+            Err(e) => {
+                if let Some(state) = self.codex_oauth_state_mut() {
+                    state.polling = false;
+                    state.status = Some(Err(e));
+                }
+            }
         }
     }
 
@@ -1196,7 +1216,7 @@ impl SettingsDialog {
             Ok((login, auto_attempted, browser_error)) => {
                 state.authorize_url = Some(login.authorize_url.clone());
                 state.manual_login = Some(login);
-                state.manual_mode = true;
+                state.paste_focused = false;
                 state.pending = auto_attempted && browser_error.is_none();
                 state.status = Some(Ok(match browser_error {
                     Some(e) => format!("Could not open browser ({e}); paste callback URL or code."),
@@ -1225,13 +1245,13 @@ impl SettingsDialog {
             result.as_ref().copied().unwrap_or(false) || crate::auth::xai_oauth::is_logged_in();
         state.status = Some(result.map(|_| "xAI OAuth login complete".to_string()));
         if state.logged_in {
-            state.manual_mode = false;
+            state.paste_focused = false;
             state.manual_login = None;
             state.manual_input.set("");
         }
     }
 
-    fn grok_oauth_state_mut(&mut self) -> Option<&mut providers::GrokOAuthSetupState> {
+    fn grok_oauth_state_mut(&mut self) -> Option<&mut providers::BrowserCallbackOAuthState> {
         let page = self.page.downcast_mut::<ProvidersPage>()?;
         match page {
             ProvidersPage::GrokOAuthSetup { state, .. } => Some(state),
@@ -1243,7 +1263,7 @@ impl SettingsDialog {
         }
     }
 
-    fn codex_oauth_state_mut(&mut self) -> Option<&mut providers::CodexOAuthSetupState> {
+    fn codex_oauth_state_mut(&mut self) -> Option<&mut providers::DeviceCodeOAuthState> {
         let page = self.page.downcast_mut::<ProvidersPage>()?;
         match page {
             ProvidersPage::CodexOAuthSetup { state, .. } => Some(state),
@@ -1286,6 +1306,9 @@ impl SettingsDialog {
     fn paste(&mut self, text: &str) {
         let cwd = self.agents_cwd();
         if let Some(p) = self.page.downcast_mut::<ProvidersPage>() {
+            if p.paste_oauth(text) {
+                return;
+            }
             if let Some(field) = p.active_text_field() {
                 field.paste(text);
             }
@@ -1464,17 +1487,17 @@ impl SettingsDialog {
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
         self.page.render(&self.cx, frame, layout[0]);
         if let Some(page) = self.page.downcast_ref::<ProvidersPage>()
-            && let Some((url, row)) = page.oauth_link()
+            && let Some((url, label, row)) = page.oauth_link()
         {
             let x = layout[0].x.saturating_add(6);
             let width = layout[0]
                 .right()
                 .saturating_sub(x)
-                .min(unicode_width::UnicodeWidthStr::width(url) as u16);
+                .min(unicode_width::UnicodeWidthStr::width(label) as u16);
             links.register(
                 Rect::new(x, layout[0].y.saturating_add(row as u16), width, 1),
                 url,
-                url,
+                label,
             );
         }
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
@@ -2778,7 +2801,7 @@ mod tests {
     fn oauth_add_step_help_collapses_after_login() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        let mut codex = providers::CodexOAuthSetupState::new();
+        let mut codex = providers::DeviceCodeOAuthState::new();
         codex.logged_in = true;
         d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
             step: AddStep::CodexOAuthAuth(Box::new(codex)),
@@ -2792,7 +2815,7 @@ mod tests {
         })));
         assert_eq!(d.help_text(), "enter: continue  esc: back");
 
-        let mut grok = providers::GrokOAuthSetupState::new();
+        let mut grok = providers::BrowserCallbackOAuthState::new();
         grok.logged_in = false;
         d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
             step: AddStep::GrokOAuthAuth(Box::new(grok)),
@@ -2814,8 +2837,8 @@ mod tests {
     fn paste_routes_to_add_grok_oauth_manual_input() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        let mut grok = providers::GrokOAuthSetupState::new();
-        grok.manual_mode = true;
+        let mut grok = providers::BrowserCallbackOAuthState::new();
+        grok.paste_focused = true;
         d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
             step: AddStep::GrokOAuthAuth(Box::new(grok)),
             template: None,
@@ -2845,8 +2868,8 @@ mod tests {
     fn paste_routes_to_standalone_grok_oauth_manual_input() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        let mut grok = providers::GrokOAuthSetupState::new();
-        grok.manual_mode = true;
+        let mut grok = providers::BrowserCallbackOAuthState::new();
+        grok.paste_focused = true;
         d.set_test_page(Page::Providers(ProvidersPage::GrokOAuthSetup {
             state: Box::new(grok),
             parent: Box::new(providers::EditState::new(

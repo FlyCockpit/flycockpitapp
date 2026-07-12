@@ -137,20 +137,20 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum OAuthSetupFlow<'a> {
+pub(super) enum OAuthFlowView<'a> {
     Copilot(&'a CopilotSetupState),
-    Grok(&'a GrokOAuthSetupState),
-    Codex(&'a CodexOAuthSetupState),
+    Grok(&'a BrowserCallbackOAuthState),
+    Codex(&'a DeviceCodeOAuthState),
 }
 
-impl OAuthSetupFlow<'_> {
+impl OAuthFlowView<'_> {
     pub(super) fn confirming(self) -> bool {
         match self {
-            OAuthSetupFlow::Copilot(_) => false,
-            OAuthSetupFlow::Grok(s) => {
-                oauth_setup_confirming_logged_in(s.logged_in, s.pending, s.manual_mode)
+            OAuthFlowView::Copilot(_) => false,
+            OAuthFlowView::Grok(s) => {
+                oauth_setup_confirming_logged_in(s.logged_in, s.pending, s.paste_focused)
             }
-            OAuthSetupFlow::Codex(s) => {
+            OAuthFlowView::Codex(s) => {
                 oauth_setup_confirming_logged_in(s.logged_in, s.polling, false)
             }
         }
@@ -161,19 +161,19 @@ impl OAuthSetupFlow<'_> {
             return 1;
         }
         match self {
-            OAuthSetupFlow::Copilot(_) => 1,
-            OAuthSetupFlow::Grok(_) => 3,
-            OAuthSetupFlow::Codex(_) => 2,
+            OAuthFlowView::Copilot(_) => 1,
+            OAuthFlowView::Grok(_) => 3,
+            OAuthFlowView::Codex(_) => 2,
         }
     }
 }
 
-pub(super) fn oauth_setup_lines(flow: OAuthSetupFlow<'_>) -> Vec<Line<'static>> {
+pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let title = match flow {
-        OAuthSetupFlow::Copilot(_) => "Set up GitHub Copilot auth",
-        OAuthSetupFlow::Grok(_) => "Set up Grok subscription auth",
-        OAuthSetupFlow::Codex(_) => "Set up Codex subscription auth",
+        OAuthFlowView::Copilot(_) => "Set up GitHub Copilot auth",
+        OAuthFlowView::Grok(_) => "Set up Grok subscription auth",
+        OAuthFlowView::Codex(_) => "Set up Codex subscription auth",
     };
     lines.push(Line::from(Span::styled(
         title.to_string(),
@@ -184,39 +184,32 @@ pub(super) fn oauth_setup_lines(flow: OAuthSetupFlow<'_>) -> Vec<Line<'static>> 
     lines
 }
 
-pub(super) fn render_oauth_setup(frame: &mut Frame, area: Rect, flow: OAuthSetupFlow<'_>) {
+pub(super) fn render_oauth_setup(frame: &mut Frame, area: Rect, flow: OAuthFlowView<'_>) {
     frame.render_widget(Paragraph::new(oauth_setup_lines(flow)), area);
 }
 
-pub(super) fn render_oauth_body(lines: &mut Vec<Line<'static>>, flow: OAuthSetupFlow<'_>) {
+pub(super) fn render_oauth_body(lines: &mut Vec<Line<'static>>, flow: OAuthFlowView<'_>) {
     match flow {
-        OAuthSetupFlow::Copilot(s) => render_copilot_body(lines, s),
-        OAuthSetupFlow::Grok(s) => render_grok_oauth_body(lines, s),
-        OAuthSetupFlow::Codex(s) => render_codex_oauth_body(lines, s),
+        OAuthFlowView::Copilot(s) => render_copilot_body(lines, s),
+        OAuthFlowView::Grok(s) => render_grok_oauth_body(lines, s),
+        OAuthFlowView::Codex(s) => render_codex_oauth_body(lines, s),
     }
 }
 
-pub(super) fn handle_grok_oauth_setup_key(
+pub(super) fn handle_browser_callback_oauth_key(
     key: KeyEvent,
-    s: &mut GrokOAuthSetupState,
+    s: &mut BrowserCallbackOAuthState,
 ) -> (bool, Option<OAuthActionRequest>) {
-    if s.pending && matches!(key.code, KeyCode::Esc) {
-        s.pending = false;
-        s.status = Some(Ok("OAuth login cancelled".to_string()));
-        return (false, Some(OAuthActionRequest::GrokCancel));
-    }
-    if s.manual_mode {
+    if s.paste_focused {
         match key.code {
             KeyCode::Esc => {
-                s.manual_mode = false;
-                s.manual_input.set("");
-                s.pending = false;
-                return (false, Some(OAuthActionRequest::GrokCancel));
+                s.paste_focused = false;
+                return (false, None);
             }
             KeyCode::Enter => {
                 let Some(login) = s.manual_login.clone() else {
                     s.status = Some(Err("manual OAuth session was not initialized".into()));
-                    s.manual_mode = false;
+                    s.paste_focused = false;
                     return (false, None);
                 };
                 let input = s.manual_input.text().to_string();
@@ -238,6 +231,12 @@ pub(super) fn handle_grok_oauth_setup_key(
         }
     }
 
+    if s.pending && matches!(key.code, KeyCode::Esc) {
+        s.pending = false;
+        s.status = Some(Ok("OAuth login cancelled".to_string()));
+        return (false, Some(OAuthActionRequest::GrokCancel));
+    }
+
     if matches!(key.code, KeyCode::Char('c')) {
         copy_oauth_url_with(
             s.authorize_url.as_deref(),
@@ -250,21 +249,25 @@ pub(super) fn handle_grok_oauth_setup_key(
     match key.code {
         KeyCode::Esc => (true, Some(OAuthActionRequest::GrokCancel)),
         KeyCode::Up | KeyCode::Char('k') => {
-            let len = OAuthSetupFlow::Grok(s).option_count();
+            let len = OAuthFlowView::Grok(s).option_count();
             s.cursor = oauth_option_cursor_prev(s.cursor, len);
             (false, None)
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let len = OAuthSetupFlow::Grok(s).option_count();
+            let len = OAuthFlowView::Grok(s).option_count();
             s.cursor = oauth_option_cursor_next(s.cursor, len);
             (false, None)
         }
         KeyCode::Enter => {
-            if OAuthSetupFlow::Grok(s).confirming() {
+            if OAuthFlowView::Grok(s).confirming() {
                 s.cursor = 0;
                 return (false, None);
             }
             if s.pending {
+                if s.cursor == 0 {
+                    s.paste_focused = true;
+                    s.manual_input.set("");
+                }
                 return (false, None);
             }
             if s.cursor == 0 || s.cursor == 1 {
@@ -274,7 +277,7 @@ pub(super) fn handle_grok_oauth_setup_key(
                     grok_login_selection(s.ssh_manual_only)
                 };
                 s.pending = true;
-                s.manual_mode = matches!(selection, GrokLoginSelection::ManualOnly);
+                s.paste_focused = false;
                 s.manual_input.set("");
                 s.status = Some(Ok(if s.cursor == 0 && !s.ssh_manual_only {
                     "Preparing xAI OAuth login...".to_string()
@@ -296,7 +299,7 @@ pub(super) fn handle_grok_oauth_setup_key(
     }
 }
 
-fn render_grok_oauth_body(lines: &mut Vec<Line<'static>>, s: &GrokOAuthSetupState) {
+fn render_grok_oauth_body(lines: &mut Vec<Line<'static>>, s: &BrowserCallbackOAuthState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
@@ -337,31 +340,36 @@ fn render_grok_oauth_body(lines: &mut Vec<Line<'static>>, s: &GrokOAuthSetupStat
         )));
         lines.push(Line::default());
     }
-    if let Some(url) = &s.authorize_url {
+    if s.authorize_url.is_some() {
         lines.push(Line::from(Span::styled(
             "Open this URL in a browser, then paste the callback URL or code below.".to_string(),
             muted,
         )));
         lines.push(Line::from(vec![
             Span::styled("Open: ", muted),
-            Span::styled(url.clone(), cyan.add_modifier(Modifier::UNDERLINED)),
+            Span::styled(
+                "open xai.com authorization page",
+                cyan.add_modifier(Modifier::UNDERLINED),
+            ),
         ]));
         lines.push(Line::from(Span::styled("c copy URL".to_string(), muted)));
         lines.push(Line::default());
     }
-    if s.manual_mode {
+    if s.paste_focused {
         lines.push(Line::from(Span::styled(
             "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
             muted,
         )));
-        lines.push(Line::from(Span::styled(
-            s.manual_input.text().to_string(),
-            cyan,
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(s.manual_input.text().to_string(), cyan),
+            crate::tui::settings::shell::cursor_marker_span(),
+        ]));
         return;
     }
-    let opts: &[&str] = if OAuthSetupFlow::Grok(s).confirming() {
+    let opts: &[&str] = if OAuthFlowView::Grok(s).confirming() {
         &["continue"]
+    } else if s.pending {
+        &["paste code manually", "skip / continue"]
     } else {
         &["log in", "manual paste", "skip / continue"]
     };
@@ -379,15 +387,23 @@ fn render_grok_oauth_body(lines: &mut Vec<Line<'static>>, s: &GrokOAuthSetupStat
     }
 }
 
-pub(super) fn handle_codex_oauth_setup_key(
+pub(super) fn handle_device_code_oauth_key(
     key: KeyEvent,
-    s: &mut CodexOAuthSetupState,
+    s: &mut DeviceCodeOAuthState,
 ) -> (bool, Option<OAuthActionRequest>) {
     if matches!(key.code, KeyCode::Char('c')) {
         copy_oauth_url_with(
             s.pending
                 .as_ref()
                 .map(|login| login.verification_uri.as_str()),
+            &mut s.status,
+            crate::clipboard::copy_plain,
+        );
+        return (false, None);
+    }
+    if matches!(key.code, KeyCode::Char('y')) {
+        copy_oauth_url_with(
+            s.pending.as_ref().map(|login| login.user_code.as_str()),
             &mut s.status,
             crate::clipboard::copy_plain,
         );
@@ -401,17 +417,17 @@ pub(super) fn handle_codex_oauth_setup_key(
     match key.code {
         KeyCode::Esc => (true, Some(OAuthActionRequest::CodexCancel)),
         KeyCode::Up | KeyCode::Char('k') => {
-            let len = OAuthSetupFlow::Codex(s).option_count();
+            let len = OAuthFlowView::Codex(s).option_count();
             s.cursor = oauth_option_cursor_prev(s.cursor, len);
             (false, None)
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let len = OAuthSetupFlow::Codex(s).option_count();
+            let len = OAuthFlowView::Codex(s).option_count();
             s.cursor = oauth_option_cursor_next(s.cursor, len);
             (false, None)
         }
         KeyCode::Enter => {
-            if OAuthSetupFlow::Codex(s).confirming() {
+            if OAuthFlowView::Codex(s).confirming() {
                 s.cursor = 0;
                 return (false, None);
             }
@@ -435,7 +451,7 @@ pub(super) fn handle_codex_oauth_setup_key(
     }
 }
 
-fn render_codex_oauth_body(lines: &mut Vec<Line<'static>>, s: &CodexOAuthSetupState) {
+fn render_codex_oauth_body(lines: &mut Vec<Line<'static>>, s: &DeviceCodeOAuthState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
@@ -490,8 +506,7 @@ fn render_codex_oauth_body(lines: &mut Vec<Line<'static>>, s: &CodexOAuthSetupSt
             Span::styled(login.user_code.clone(), yellow.add_modifier(Modifier::BOLD)),
         ]));
         lines.push(Line::from(Span::styled(
-            "After approving, poll here; Cockpit waits for the full 15 minute device-code window. c copies the URL."
-                .to_string(),
+            "Polling starts automatically. c copies the URL; y copies the user code.".to_string(),
             muted,
         )));
         lines.push(Line::default());
@@ -503,7 +518,7 @@ fn render_codex_oauth_body(lines: &mut Vec<Line<'static>>, s: &CodexOAuthSetupSt
         )));
         lines.push(Line::default());
     }
-    let opts: &[&str] = if OAuthSetupFlow::Codex(s).confirming() {
+    let opts: &[&str] = if OAuthFlowView::Codex(s).confirming() {
         &["continue"]
     } else if s.pending.is_some() {
         &["poll for approval", "skip / continue"]

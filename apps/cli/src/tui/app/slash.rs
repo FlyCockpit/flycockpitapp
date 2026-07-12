@@ -1115,16 +1115,19 @@ impl App {
                             description: Some(
                                 "Revise and extend, preserving accurate content".into(),
                             ),
+                            secondary: false,
                         },
                         InterruptOption {
                             id: "overwrite".into(),
                             label: "Overwrite from scratch".into(),
                             description: Some("Replace the file entirely".into()),
+                            secondary: false,
                         },
                         InterruptOption {
                             id: "cancel".into(),
                             label: "Cancel".into(),
                             description: None,
+                            secondary: false,
                         },
                     ],
                     allow_freetext: false,

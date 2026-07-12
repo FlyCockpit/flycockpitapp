@@ -16,51 +16,14 @@ use uuid::Uuid;
 use crate::approval::store::Scope;
 use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page};
 
-/// Stable option ids for the page-1 **verdict** select (approve vs reject).
-/// They ride through the interrupt as the selected id and decide whether the
-/// page-2 scope yields an [`ApprovalChoice::Approve`] or
-/// [`ApprovalChoice::Reject`].
-pub const ID_APPROVE: &str = "approve";
-pub const ID_REJECT: &str = "reject";
-
-/// Stable option ids for the single-surface scoped approval prompt.
-pub const ID_APPROVE_ONCE: &str = "approve_once";
-pub const ID_APPROVE_SESSION: &str = "approve_session";
-pub const ID_APPROVE_PROJECT: &str = "approve_project";
-pub const ID_APPROVE_GLOBAL: &str = "approve_global";
-pub const ID_REJECT_ONCE: &str = "reject_once";
-pub const ID_REJECT_SESSION: &str = "reject_session";
-pub const ID_REJECT_PROJECT: &str = "reject_project";
-pub const ID_REJECT_GLOBAL: &str = "reject_global";
-
-/// Stable option ids for approval-adjacent scope selects, such as gitignore
-/// persistence and package-add once approval.
-pub const ID_ONCE: &str = "once";
-pub const ID_SESSION: &str = "session";
-pub const ID_PROJECT: &str = "project";
-pub const ID_GLOBAL: &str = "global";
-
-/// Stable option ids for the loop-guard approval prompt (back-to-back
-/// identical tool call). These ride through the generic interrupt the
-/// same way the scope-select ids do; the loop guard maps the selected id
-/// back to an accept/reject verdict + scope. No TUI special-casing is
-/// needed — the answering dialog renders any option set generically.
-pub const ID_LOOP_ACCEPT_ONCE: &str = "loop_accept_once";
-pub const ID_LOOP_REJECT_ONCE: &str = "loop_reject_once";
-pub const ID_LOOP_ACCEPT_SESSION: &str = "loop_accept_session";
-pub const ID_LOOP_REJECT_SESSION: &str = "loop_reject_session";
-pub const ID_LOOP_ACCEPT_PROJECT: &str = "loop_accept_project";
-pub const ID_LOOP_REJECT_PROJECT: &str = "loop_reject_project";
-
-/// Stable option ids for the gitignore read-allowlist two-stage approval
-/// (implementation note). Stage 1 chooses the glob *shape*
-/// (this exact file / its parent directory) or rejects; stage 2 reuses the
-/// scope ids ([`ID_ONCE`]/[`ID_SESSION`]/[`ID_PROJECT`]) for *persistence*.
-/// They ride the generic interrupt exactly like the scope-select ids; no TUI
-/// special-casing is needed.
-pub const ID_GITIGNORE_FILE: &str = "gitignore_file";
-pub const ID_GITIGNORE_PARENT: &str = "gitignore_parent";
-pub const ID_GITIGNORE_REJECT: &str = "gitignore_reject";
+#[allow(unused_imports)]
+pub use crate::approval::{
+    ID_APPROVE, ID_APPROVE_GLOBAL, ID_APPROVE_ONCE, ID_APPROVE_PROJECT, ID_APPROVE_SESSION,
+    ID_GITIGNORE_FILE, ID_GITIGNORE_PARENT, ID_GITIGNORE_REJECT, ID_LOOP_ACCEPT_ONCE,
+    ID_LOOP_ACCEPT_PROJECT, ID_LOOP_ACCEPT_SESSION, ID_LOOP_REJECT_ONCE,
+    ID_LOOP_REJECT_PROJECT, ID_LOOP_REJECT_SESSION, ID_MORE_OPTIONS, ID_ONCE, ID_PROJECT,
+    ID_REJECT, ID_REJECT_GLOBAL, ID_REJECT_PROJECT, ID_REJECT_SESSION, ID_SESSION,
+};
 
 /// The user's choice on an approval prompt. `Deny` is the dismissal
 /// path (Esc / cancel — persists nothing); `Approve(scope)` allows at the
@@ -160,15 +123,20 @@ fn scoped_approval_page(prompt: String) -> Page {
     let title = format!("Run `{prompt}`?");
     let options = vec![
         opt(ID_APPROVE_ONCE, "Approve once"),
-        opt(ID_APPROVE_SESSION, "Approve for this session"),
         opt(ID_APPROVE_PROJECT, "Approve for this project"),
-        opt(ID_APPROVE_GLOBAL, "Approve everywhere"),
-        opt(ID_REJECT_ONCE, "Reject once"),
-        opt(ID_REJECT_SESSION, "Reject for this session"),
-        opt(ID_REJECT_PROJECT, "Reject for this project"),
-        opt(ID_REJECT_GLOBAL, "Reject everywhere"),
+        opt(ID_REJECT, "Deny"),
+        opt(ID_MORE_OPTIONS, "More options…"),
     ];
-    Page::select(title, options).permission()
+    let secondary = vec![
+        secondary_opt(ID_APPROVE_SESSION, "Approve for this session"),
+        secondary_opt(ID_APPROVE_GLOBAL, "Approve everywhere"),
+        secondary_opt(ID_REJECT_SESSION, "Reject for this session"),
+        secondary_opt(ID_REJECT_PROJECT, "Reject for this project"),
+        secondary_opt(ID_REJECT_GLOBAL, "Reject everywhere"),
+    ];
+    Page::select(title, options)
+        .with_secondary_options(secondary)
+        .permission()
 }
 
 /// Build the wrapper-restricted page. Both choices are transient because a
@@ -184,6 +152,12 @@ fn wrapper_page(prompt: String) -> Page {
 
 fn opt(id: &str, label: &str) -> DialogOption {
     DialogOption::new(id, label)
+}
+
+fn secondary_opt(id: &str, label: &str) -> DialogOption {
+    let mut option = opt(id, label);
+    option.secondary = true;
+    option
 }
 
 /// Map the one-page answer into an [`ApprovalChoice`]. Any malformed/unknown
@@ -216,7 +190,7 @@ fn answer_scoped_choice(answer: &Answer) -> ApprovalChoice {
             ID_APPROVE_SESSION => ApprovalChoice::Approve(Scope::Session),
             ID_APPROVE_PROJECT => ApprovalChoice::Approve(Scope::Project),
             ID_APPROVE_GLOBAL => ApprovalChoice::Approve(Scope::Global),
-            ID_REJECT_ONCE => ApprovalChoice::Deny,
+            ID_REJECT => ApprovalChoice::Deny,
             ID_REJECT_SESSION => ApprovalChoice::Reject(Scope::Session),
             ID_REJECT_PROJECT => ApprovalChoice::Reject(Scope::Project),
             ID_REJECT_GLOBAL => ApprovalChoice::Reject(Scope::Global),
@@ -253,15 +227,11 @@ mod tests {
         let d = ApprovalDialog::new(Uuid::new_v4(), "gh pr".into(), false, Duration::ZERO);
         assert_eq!(d.state().pages().len(), 1);
         let options = &d.state().pages()[0].options;
-        assert_eq!(options.len(), 8);
+        assert_eq!(options.len(), 4);
         assert_eq!(options[0].label, "Approve once");
-        assert_eq!(options[1].label, "Approve for this session");
-        assert_eq!(options[2].label, "Approve for this project");
-        assert_eq!(options[3].label, "Approve everywhere");
-        assert_eq!(options[4].label, "Reject once");
-        assert_eq!(options[5].label, "Reject for this session");
-        assert_eq!(options[6].label, "Reject for this project");
-        assert_eq!(options[7].label, "Reject everywhere");
+        assert_eq!(options[1].label, "Approve for this project");
+        assert_eq!(options[2].label, "Deny");
+        assert_eq!(options[3].label, "More options…");
     }
 
     #[test]
@@ -291,7 +261,11 @@ mod tests {
     fn approve_session_resolves_from_first_surface() {
         let iid = Uuid::new_v4();
         let mut d = ApprovalDialog::new(iid, "gh pr".into(), false, Duration::ZERO);
-        d.handle_key(press(KeyCode::Char('j')));
+        for _ in 0..3 {
+            d.handle_key(press(KeyCode::Char('j')));
+        }
+        assert!(!d.handle_key(press(KeyCode::Enter)));
+        assert!(!d.handle_key(press(KeyCode::Enter)));
         assert!(d.handle_key(press(KeyCode::Enter)));
         assert_eq!(drain(&mut d), ApprovalChoice::Approve(Scope::Session));
     }
@@ -300,22 +274,26 @@ mod tests {
     fn reject_project_resolves_from_first_surface() {
         let iid = Uuid::new_v4();
         let mut d = ApprovalDialog::new(iid, "gh pr".into(), false, Duration::ZERO);
-        for _ in 0..6 {
+        for _ in 0..3 {
             d.handle_key(press(KeyCode::Char('j')));
         }
+        assert!(!d.handle_key(press(KeyCode::Enter)));
+        for _ in 0..3 {
+            d.handle_key(press(KeyCode::Char('j')));
+        }
+        assert!(!d.handle_key(press(KeyCode::Enter)));
         assert!(d.handle_key(press(KeyCode::Enter)));
         assert_eq!(drain(&mut d), ApprovalChoice::Reject(Scope::Project));
     }
 
     #[test]
-    fn reject_once_is_treated_as_deny() {
-        // `Reject(Once)` is the explicit-menu equivalent of Esc: deny this
-        // invocation, persist nothing.
+    fn deny_is_transient() {
         let iid = Uuid::new_v4();
         let mut d = ApprovalDialog::new(iid, "rm".into(), false, Duration::ZERO);
-        for _ in 0..4 {
+        for _ in 0..2 {
             d.handle_key(press(KeyCode::Char('j')));
         }
+        assert!(!d.handle_key(press(KeyCode::Enter)));
         assert!(d.handle_key(press(KeyCode::Enter)));
         assert_eq!(drain(&mut d), ApprovalChoice::Deny);
     }
@@ -345,7 +323,7 @@ mod tests {
     fn wrapper_approve_once_resolves_to_approve_once() {
         let iid = Uuid::new_v4();
         let mut d = ApprovalDialog::new(iid, "bash".into(), true, Duration::ZERO);
-        // Single page, first option = `Approve once` → fast-path submit.
+        assert!(!d.handle_key(press(KeyCode::Enter)));
         assert!(d.handle_key(press(KeyCode::Enter)));
         assert_eq!(drain(&mut d), ApprovalChoice::Approve(Scope::Once));
     }
@@ -356,6 +334,7 @@ mod tests {
         let mut d = ApprovalDialog::new(iid, "bash".into(), true, Duration::ZERO);
         // Second option = `Reject once` → fast-path submit → Deny.
         d.handle_key(press(KeyCode::Char('j')));
+        assert!(!d.handle_key(press(KeyCode::Enter)));
         assert!(d.handle_key(press(KeyCode::Enter)));
         assert_eq!(drain(&mut d), ApprovalChoice::Deny);
     }

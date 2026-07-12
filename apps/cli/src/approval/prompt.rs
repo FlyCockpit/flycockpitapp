@@ -162,9 +162,17 @@ impl Approver {
         detail: Option<CommandDetail>,
         escalation: Option<SandboxEscalation>,
         offered_scopes: &[Scope],
+        batch_count: Option<u32>,
     ) -> Result<ApprovalChoice> {
         let description = prompt_description(label, wrapper, detail.as_ref(), escalation.as_ref());
-        let question = approval_question(label, wrapper, detail, escalation, offered_scopes);
+        let question = approval_question(
+            label,
+            wrapper,
+            detail,
+            escalation,
+            offered_scopes,
+            batch_count,
+        );
         let response = self.raise_and_wait(&description, question).await?;
         Ok(response_to_approval_choice(&response, wrapper))
     }

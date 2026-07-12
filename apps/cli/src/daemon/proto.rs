@@ -749,6 +749,11 @@ pub struct InterruptOption {
     /// un-annotated option is wire-equivalent to the legacy shape).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Approval dialogs can mark rows as primary (shown immediately) or
+    /// secondary (revealed by the local `More options…` row). Non-approval
+    /// options leave this false, preserving the legacy flat option list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secondary: bool,
 }
 
 /// Structured detail for a bash-command approval prompt. Rides on a
@@ -1291,11 +1296,13 @@ mod tests {
                     id: "now".into(),
                     label: "Backfill now".into(),
                     description: None,
+                    secondary: false,
                 },
                 InterruptOption {
                     id: "later".into(),
                     label: "Defer".into(),
                     description: None,
+                    secondary: false,
                 },
             ],
             allow_freetext: true,
@@ -1324,6 +1331,7 @@ mod tests {
                 id: "once".into(),
                 label: "Yes, once".into(),
                 description: None,
+                secondary: false,
             }],
             allow_freetext: false,
             command_detail: None,
@@ -1360,6 +1368,7 @@ mod tests {
                 id: "once".into(),
                 label: "Yes, once".into(),
                 description: None,
+                secondary: false,
             }],
             allow_freetext: false,
             permission: true,
@@ -1420,6 +1429,7 @@ mod tests {
                 id: "once".into(),
                 label: "Yes, once".into(),
                 description: None,
+                secondary: false,
             }],
             allow_freetext: false,
             permission: true,

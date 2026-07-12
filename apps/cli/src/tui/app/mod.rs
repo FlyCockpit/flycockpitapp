@@ -5880,11 +5880,13 @@ impl App {
                         id: "resume".into(),
                         label: "Resume".into(),
                         description: Some("Continue through the normal approval flow".into()),
+                        secondary: false,
                     },
                     InterruptOption {
                         id: "cancel".into(),
                         label: "Cancel".into(),
                         description: Some("Mark paused work cancelled and wait for input".into()),
+                        secondary: false,
                     },
                 ],
                 allow_freetext: false,
@@ -5922,6 +5924,7 @@ impl App {
                 id: "read_only".into(),
                 label: "Read-only".into(),
                 description: Some("Keep browsing, copying, and exporting this transcript".into()),
+                secondary: false,
             },
             InterruptOption {
                 id: "fork".into(),
@@ -5929,6 +5932,7 @@ impl App {
                 description: Some(
                     "Create a normal continuation from the last provider-valid turn".into(),
                 ),
+                secondary: false,
             },
             InterruptOption {
                 id: "repair".into(),
@@ -5936,16 +5940,19 @@ impl App {
                 description: Some(
                     "Requires explicit synthetic-result repair support before dispatch".into(),
                 ),
+                secondary: false,
             },
             InterruptOption {
                 id: "export".into(),
                 label: "Export".into(),
                 description: Some("Export a debug bundle with identity provenance".into()),
+                secondary: false,
             },
             InterruptOption {
                 id: "cancel".into(),
                 label: "Cancel".into(),
                 description: Some("Close this dialog and leave the transcript read-only".into()),
+                secondary: false,
             },
         ];
         if state.safe_last_turn_seq.is_none() {
@@ -6338,16 +6345,19 @@ impl App {
                         id: REDACT_OPT_ENV.into(),
                         label: "redact environment variables".into(),
                         description: None,
+                        secondary: false,
                     },
                     InterruptOption {
                         id: REDACT_OPT_FILE.into(),
                         label: "redact environment files (default: .env)".into(),
                         description: None,
+                        secondary: false,
                     },
                     InterruptOption {
                         id: REDACT_OPT_SSH.into(),
                         label: "redact private SSH keys (~/.ssh)".into(),
                         description: None,
+                        secondary: false,
                     },
                 ],
                 // A blank multiselect (both unchecked) is a valid answer here:
@@ -6446,6 +6456,7 @@ impl App {
                 id: i.to_string(),
                 label: format!("{p}/{m}"),
                 description: None,
+                secondary: false,
             })
             .collect();
         // Pre-check rows already in the session's tandem set.
@@ -11555,11 +11566,13 @@ mod keys_overlay_tests {
                             id: "yes".to_string(),
                             label: "Yes".to_string(),
                             description: None,
+                            secondary: false,
                         },
                         InterruptOption {
                             id: "no".to_string(),
                             label: "No".to_string(),
                             description: None,
+                            secondary: false,
                         },
                     ],
                     allow_freetext: false,

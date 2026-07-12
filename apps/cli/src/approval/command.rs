@@ -1,5 +1,17 @@
 use super::*;
 
+enum CommandStepDecision {
+    Decision(Decision),
+    ApproveAllOnce,
+}
+
+struct CommandPromptContext {
+    step: u32,
+    step_count: u32,
+    escalation: Option<SandboxEscalation>,
+    batch_count: Option<u32>,
+}
+
 impl Approver {
     /// Decide a whole command string. Classifies it, then requires that
     /// **every** constituent simple command be allowed: an already-granted
@@ -125,6 +137,11 @@ impl Approver {
         // prompting constituent is a wrapper → once only).
         let offered = offered_scopes(&prompting);
         let audit = PermissionDecisionAudit::from_prompting(&prompting);
+        let batch_count = (step_count > 1
+            && prompting.iter().all(|(info, _)| {
+                !matches!(info.risk.tier, RiskTier::Destructive | RiskTier::Privileged)
+            }))
+        .then_some(step_count);
 
         // Track the broadest scope we settled on, for the caller's info.
         // A chain is only as "remembered" as its narrowest decision; we
@@ -145,9 +162,28 @@ impl Approver {
             } else {
                 None
             };
-            let decision = self
-                .approve_one(info, policy, command, step, step_count, esc)
-                .await?;
+            let context = CommandPromptContext {
+                step,
+                step_count,
+                escalation: esc,
+                batch_count: (prompts && step == 1).then_some(batch_count).flatten(),
+            };
+            let step_decision = self.approve_one(info, policy, command, &context).await?;
+            if matches!(step_decision, CommandStepDecision::ApproveAllOnce) {
+                let decision = Decision::Allow { scope: Scope::Once };
+                self.record_permission_decision_with_audit(
+                    "bash",
+                    command,
+                    &offered,
+                    decision,
+                    DecisionSource::UserPrompt,
+                    Some(audit),
+                );
+                return Ok(decision);
+            }
+            let CommandStepDecision::Decision(decision) = step_decision else {
+                unreachable!()
+            };
             match decision {
                 Decision::Deny => {
                     self.record_permission_decision_with_audit(
@@ -233,10 +269,8 @@ impl Approver {
         info: &SimpleCommandInfo,
         policy: &ApprovalPromptPolicy,
         full_command: &str,
-        step: u32,
-        step_count: u32,
-        escalation: Option<SandboxEscalation>,
-    ) -> Result<Decision> {
+        context: &CommandPromptContext,
+    ) -> Result<CommandStepDecision> {
         // Standing reject short-circuit (checked before allow; the two are
         // mutually exclusive, so order is a safety belt). A wrapper is never
         // persistable in either polarity, so it can never carry a standing
@@ -250,14 +284,14 @@ impl Approver {
             // Auto-deny with no prompt; the caller surfaces the terse guidance
             // error. The `StandingReject` source is recorded by the chain
             // driver (`approve_command_inner`).
-            return Ok(Decision::Deny);
+            return Ok(CommandStepDecision::Decision(Decision::Deny));
         }
         if !info.wrapper
             && let Some(scope) = self.store.command_grant_scope(&info.key)
             && scope.within(policy.max_scope)
         {
             // Already remembered at some applicable scope.
-            return Ok(Decision::Allow { scope });
+            return Ok(CommandStepDecision::Decision(Decision::Allow { scope }));
         }
         // The heading still shows the approval key — the exact thing a grant
         // would cover (`gh pr`, `cargo build`, `ls`) — so a "remember" choice
@@ -270,41 +304,47 @@ impl Approver {
             full_command,
             self.store.cwd(),
             None,
-            step,
-            step_count,
+            context.step,
+            context.step_count,
         );
         let choice = self
             .prompt(
                 &label,
                 info.wrapper,
                 detail,
-                escalation,
+                context.escalation.clone(),
                 &policy.offered_scopes,
+                context.batch_count,
             )
             .await?;
         match choice {
-            ApprovalChoice::Deny => Ok(Decision::Deny),
-            ApprovalChoice::Approve(Scope::Once) => Ok(Decision::Allow { scope: Scope::Once }),
+            ApprovalChoice::ApproveAllOnce => Ok(CommandStepDecision::ApproveAllOnce),
+            ApprovalChoice::Deny => Ok(CommandStepDecision::Decision(Decision::Deny)),
+            ApprovalChoice::Approve(Scope::Once) => {
+                Ok(CommandStepDecision::Decision(Decision::Allow {
+                    scope: Scope::Once,
+                }))
+            }
             ApprovalChoice::Approve(scope) => {
                 if !scope.within(policy.max_scope) {
-                    return Ok(Decision::Deny);
+                    return Ok(CommandStepDecision::Decision(Decision::Deny));
                 }
                 // Record BEFORE returning the decision (§3). A wrapper can
                 // never reach here at a non-Once scope: the prompt only
                 // offered Once for wrappers. The store rejects it anyway as
                 // a belt-and-braces guard.
                 self.store.record_command(info, scope)?;
-                Ok(Decision::Allow { scope })
+                Ok(CommandStepDecision::Decision(Decision::Allow { scope }))
             }
             // `Reject(Once)` is mapped to `Deny` upstream; only a persistable
             // reject reaches here. Record the standing reject BEFORE returning
             // (mirrors the allow record), then deny this invocation.
             ApprovalChoice::Reject(scope) => {
                 if !scope.within(policy.max_scope) {
-                    return Ok(Decision::Deny);
+                    return Ok(CommandStepDecision::Decision(Decision::Deny));
                 }
                 self.store.record_command_reject(info, scope)?;
-                Ok(Decision::Deny)
+                Ok(CommandStepDecision::Decision(Decision::Deny))
             }
         }
     }

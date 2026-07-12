@@ -1630,11 +1630,13 @@ impl Driver {
                     id: ID_PRIMARY_ROUNDS_CONTINUE.to_string(),
                     label: "Continue".to_string(),
                     description: Some("allow another chunk for this message".to_string()),
+                    secondary: false,
                 },
                 InterruptOption {
                     id: ID_PRIMARY_ROUNDS_STOP.to_string(),
                     label: "Stop".to_string(),
                     description: Some("end this turn now".to_string()),
+                    secondary: false,
                 },
             ],
             allow_freetext: false,
@@ -3221,11 +3223,13 @@ impl Driver {
                     description: Some(
                         "Permit schedule limit=0 loops until this session ends".into(),
                     ),
+                    secondary: false,
                 },
                 InterruptOption {
                     id: "deny".into(),
                     label: "Deny".into(),
                     description: Some("Reject this unbounded loop request".into()),
+                    secondary: false,
                 },
             ],
             allow_freetext: false,

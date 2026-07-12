@@ -47,6 +47,7 @@ pub struct DialogOption {
     /// Optional one-line description rendered dimmed under the label.
     /// `None` renders exactly as a label-only option (back-compat).
     pub description: Option<String>,
+    pub secondary: bool,
 }
 
 impl DialogOption {
@@ -57,6 +58,7 @@ impl DialogOption {
             id: id.into(),
             label: label.into(),
             description: None,
+            secondary: false,
         }
     }
 }
@@ -80,6 +82,7 @@ pub struct Page {
     pub prompt: String,
     pub kind: PageKind,
     pub options: Vec<DialogOption>,
+    secondary_options: Vec<DialogOption>,
     /// Presentation: when `true` this page is rendered in the stripped
     /// **permission/approval** style — no selection marker (`(•)`/`( )`)
     /// and no free-text custom affordance. Default `false` keeps the question
@@ -102,6 +105,7 @@ impl Page {
             prompt: prompt.into(),
             kind: PageKind::Select,
             options,
+            secondary_options: Vec::new(),
             permission: false,
             allow_custom: true,
             masked_text: false,
@@ -113,6 +117,7 @@ impl Page {
             prompt: prompt.into(),
             kind: PageKind::Multiselect,
             options,
+            secondary_options: Vec::new(),
             permission: false,
             allow_custom: true,
             masked_text: false,
@@ -124,6 +129,7 @@ impl Page {
             prompt: prompt.into(),
             kind: PageKind::Text,
             options: Vec::new(),
+            secondary_options: Vec::new(),
             permission: false,
             allow_custom: false,
             masked_text: false,
@@ -135,6 +141,7 @@ impl Page {
             prompt: prompt.into(),
             kind: PageKind::Text,
             options: Vec::new(),
+            secondary_options: Vec::new(),
             permission: false,
             allow_custom: false,
             masked_text: true,
@@ -156,6 +163,11 @@ impl Page {
 
     pub fn allow_custom(mut self, allow: bool) -> Self {
         self.allow_custom = allow;
+        self
+    }
+
+    pub fn with_secondary_options(mut self, options: Vec<DialogOption>) -> Self {
+        self.secondary_options = options;
         self
     }
 
@@ -745,9 +757,15 @@ impl DialogState {
     /// A number key targeted option `idx`. Single-select: select it and
     /// advance (instant-accept). Multi-select: toggle it, no advance.
     fn number_select(&mut self, idx: usize) -> DialogOutcome {
-        let page = &self.pages[self.page];
-        let id = page.options[idx].id.clone();
-        if page.is_select() {
+        if self.pages[self.page].permission
+            && self.pages[self.page].options[idx].id == crate::approval::ID_MORE_OPTIONS
+        {
+            return self.reveal_secondary_options();
+        }
+        let id = self.pages[self.page].options[idx].id.clone();
+        let is_select = self.pages[self.page].is_select();
+        let permission = self.pages[self.page].permission;
+        if is_select {
             self.list.set_cursor(idx);
             self.clamp_scroll();
             let st = &mut self.page_states[self.page];
@@ -755,7 +773,11 @@ impl DialogState {
             // clears any typed custom answer.
             st.selected = vec![id];
             st.custom.set("");
-            self.fast_path_submit_or_advance()
+            if permission {
+                DialogOutcome::Continue
+            } else {
+                self.fast_path_submit_or_advance()
+            }
         } else {
             let st = &mut self.page_states[self.page];
             if let Some(pos) = st.selected.iter().position(|s| *s == id) {
@@ -855,6 +877,15 @@ impl DialogState {
         };
         let id = option.id.clone();
         if page.is_select() {
+            if page.permission && id == crate::approval::ID_MORE_OPTIONS {
+                return self.reveal_secondary_options();
+            }
+            if page.permission && self.page_states[self.page].selected.as_slice() != [id.as_str()] {
+                let st = &mut self.page_states[self.page];
+                st.selected = vec![id];
+                st.custom.set("");
+                return DialogOutcome::Continue;
+            }
             // Single-select: choose it (mutually exclusive with custom)
             // and auto-advance.
             let st = &mut self.page_states[self.page];
@@ -872,6 +903,24 @@ impl DialogState {
             }
             DialogOutcome::Continue
         }
+    }
+
+    fn reveal_secondary_options(&mut self) -> DialogOutcome {
+        let page = &mut self.pages[self.page];
+        let more_index = page
+            .options
+            .iter()
+            .position(|option| option.id == crate::approval::ID_MORE_OPTIONS);
+        if let Some(index) = more_index {
+            page.options.remove(index);
+            let first = page.options.len();
+            page.options.append(&mut page.secondary_options);
+            self.page_states[self.page].selected.clear();
+            self.list
+                .set_cursor(first.min(page.options.len().saturating_sub(1)));
+            self.clamp_scroll();
+        }
+        DialogOutcome::Continue
     }
 
     /// Single-question fast path: if this is the only page and it's now

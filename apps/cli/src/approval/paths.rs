@@ -50,7 +50,7 @@ impl Approver {
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         let label = path_prompt_label(&target, required);
         let description = path_prompt_description(&target, required);
-        let question = approval_question(&label, false, detail, None, &offered);
+        let question = approval_question(&label, false, detail, None, &offered, None);
         let response = self.raise_and_wait(&description, question).await?;
         let choice = response_to_approval_choice(&response, false);
         let decision = match choice {
@@ -60,6 +60,7 @@ impl Approver {
                 self.store.record_path(path, scope, required)?;
                 Decision::Allow { scope }
             }
+            ApprovalChoice::ApproveAllOnce => Decision::Deny,
             // A persistable path reject: record the standing reject, then deny
             // this access. (`Reject(Once)` is mapped to `Deny` upstream.)
             ApprovalChoice::Reject(scope) => {

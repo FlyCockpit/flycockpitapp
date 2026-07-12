@@ -706,7 +706,8 @@ pub(crate) async fn run_turn(
                                                 "Retries this turn on the alternate endpoint and saves it if successful."
                                                     .to_string(),
                                             ),
-                                        },
+                                            secondary: false,
+},
                                         crate::daemon::proto::InterruptOption {
                                             id: ID_CANCEL.to_string(),
                                             label: "Cancel".to_string(),
@@ -714,7 +715,8 @@ pub(crate) async fn run_turn(
                                                 "Surface the endpoint mismatch without retrying."
                                                     .to_string(),
                                             ),
-                                        },
+                                            secondary: false,
+},
                                     ],
                                     allow_freetext: false,
                                     command_detail: None,

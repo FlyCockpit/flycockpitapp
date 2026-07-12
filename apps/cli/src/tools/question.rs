@@ -252,6 +252,7 @@ fn parse_options_arg(q: &QuestionArg) -> Vec<InterruptOption> {
                 id: opt.id.clone(),
                 label,
                 description: opt.description.clone(),
+                secondary: false,
             }
         })
         .collect()
@@ -373,6 +374,7 @@ mod tests {
                         id: "pg".into(),
                         label: "Postgres".into(),
                         description: None,
+                        secondary: false,
                     }],
                     allow_freetext: true,
                     command_detail: None,

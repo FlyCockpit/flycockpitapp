@@ -627,7 +627,9 @@ impl QuestionDialog {
         } else {
             ""
         };
-        let pick = if self.state.next_index().is_some() {
+        let pick = if self.is_approval() {
+            "1-9/enter: select  ·  enter again: confirm  ·  ↑/↓: move"
+        } else if self.state.next_index().is_some() {
             "1-9/enter: toggle  ·  ↑/↓: move"
         } else {
             "1-9: pick  ·  ↑/↓: move  ·  enter: choose"
@@ -814,18 +816,11 @@ impl QuestionDialog {
                     if row_idx < page.options.len() {
                         let opt = &page.options[row_idx];
                         let checked = selected.contains(&opt.id);
-                        // Permission pages drop the selection marker entirely:
-                        // cursor-highlight is the sole indicator. Question
-                        // pages keep the radio (single) / checkbox (multi).
-                        let marker = if page.permission {
-                            ""
-                        } else {
-                            match (radio, checked) {
-                                (true, true) => "(•) ",
-                                (true, false) => "( ) ",
-                                (false, true) => "[x] ",
-                                (false, false) => "[ ] ",
-                            }
+                        let marker = match (radio, checked) {
+                            (true, true) => "(•) ",
+                            (true, false) => "( ) ",
+                            (false, true) => "[x] ",
+                            (false, false) => "[ ] ",
                         };
                         let num = format!("{}. ", row_idx + 1);
                         lines.push(self.option_line(&num, marker, &opt.label, hovered));
@@ -1309,14 +1304,18 @@ fn page_for(q: &InterruptQuestion) -> Page {
             // the single place the permission-vs-question distinction is
             // branched on the dialog side — driven by the interrupt's intent,
             // never by inspecting option labels.
-            let page = Page::select(prompt.clone(), opts(options)).allow_custom(*allow_freetext);
+            let primary = opts(options.iter().filter(|option| !option.secondary));
+            let secondary = opts(options.iter().filter(|option| option.secondary));
+            let page = Page::select(prompt.clone(), primary)
+                .with_secondary_options(secondary)
+                .allow_custom(*allow_freetext);
             if *permission { page.permission() } else { page }
         }
         InterruptQuestion::Multi {
             prompt,
             options,
             allow_freetext,
-        } => Page::multiselect(prompt.clone(), opts(options)).allow_custom(*allow_freetext),
+        } => Page::multiselect(prompt.clone(), opts(options.iter())).allow_custom(*allow_freetext),
         InterruptQuestion::Freetext { prompt, masked } => {
             if *masked {
                 Page::text_masked(prompt.clone())
@@ -1327,13 +1326,14 @@ fn page_for(q: &InterruptQuestion) -> Page {
     }
 }
 
-fn opts(options: &[InterruptOption]) -> Vec<DialogOption> {
+fn opts<'a>(options: impl IntoIterator<Item = &'a InterruptOption>) -> Vec<DialogOption> {
     options
-        .iter()
+        .into_iter()
         .map(|o| DialogOption {
             id: o.id.clone(),
             label: o.label.clone(),
             description: o.description.clone(),
+            secondary: o.secondary,
         })
         .collect()
 }
@@ -1432,6 +1432,7 @@ mod tests {
             id: id.into(),
             label: label.into(),
             description: None,
+            secondary: false,
         }
     }
 
@@ -1634,11 +1635,13 @@ mod tests {
                         id: "pg".into(),
                         label: "Postgres".into(),
                         description: Some("Relational, ACID".into()),
+                        secondary: false,
                     },
                     InterruptOption {
                         id: "sqlite".into(),
                         label: "SQLite".into(),
                         description: Some("Embedded, single-file".into()),
+                        secondary: false,
                     },
                 ],
                 allow_freetext: true,
@@ -1663,6 +1666,7 @@ mod tests {
                     id: "pg".into(),
                     label: "Postgres".into(),
                     description: Some("Relational engine".into()),
+                    secondary: false,
                 }],
                 allow_freetext: true,
                 command_detail: None,
@@ -2629,10 +2633,7 @@ mod tests {
     // ---- permission-prompt presentation (no marker, no freeform) --------
 
     #[test]
-    fn permission_prompt_drops_radio_marker_and_freeform_row() {
-        // A bash/tool approval (permission `Single`) renders neither the
-        // `(•)`/`( )` radio marker nor the `Type your own answer` row, but
-        // keeps the numbered prefixes.
+    fn permission_prompt_shows_radio_marker_and_drops_freeform_row() {
         let d = approval_dialog(CommandDetail {
             full_command: "rm -rf /tmp/x".into(),
             highlight: None,
@@ -2651,12 +2652,8 @@ mod tests {
         let area = Rect::new(0, 0, 80, 16);
         let text = render_text(&d, area);
         assert!(
-            !text.contains("(•)"),
-            "no filled radio on a permission prompt"
-        );
-        assert!(
-            !text.contains("( )"),
-            "no empty radio on a permission prompt"
+            text.contains("( )"),
+            "selection marker is visible on a permission prompt"
         );
         assert!(
             !text.contains(CUSTOM_LABEL),
@@ -2664,10 +2661,10 @@ mod tests {
         );
         // Numbered prefixes + labels survive.
         assert!(
-            text.contains("1. Yes, once"),
+            text.contains("1. ( ) Yes, once"),
             "numbered prefix kept: {text}"
         );
-        assert!(text.contains("2. Yes, for this session"));
+        assert!(text.contains("2. ( ) Yes, for this session"));
     }
 
     #[test]
@@ -2726,10 +2723,9 @@ mod tests {
             offered_scopes: Vec::new(),
             policy_cap: None,
         });
-        assert!(
-            d.handle_key(press(KeyCode::Char('2'))),
-            "number key submits"
-        );
+        assert!(!d.handle_key(press(KeyCode::Char('2'))));
+        assert!(d.take_result().is_none(), "number key only selects");
+        assert!(d.handle_key(press(KeyCode::Enter)), "Enter confirms");
         match d.take_result() {
             Some(QuestionResult::Submit { responses, .. }) => assert!(matches!(
                 responses.as_slice(),

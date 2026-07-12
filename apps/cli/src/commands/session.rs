@@ -303,6 +303,7 @@ mod tests {
             id: id.to_string(),
             label: id.to_string(),
             description: None,
+            secondary: false,
         }
     }
 

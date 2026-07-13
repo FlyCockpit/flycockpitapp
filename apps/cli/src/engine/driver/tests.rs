@@ -285,8 +285,24 @@ async fn quick_recursion_override_depths_apply_without_bypassing_policy() {
     }
 }
 
-#[tokio::test]
-async fn goal_idle_guard_needs_intervention_without_blocking_goal() {
+fn record_goal_tool_event(driver: &Driver, tool: &str, wire_input: serde_json::Value) {
+    driver
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::ToolCall,
+            Some("Build"),
+            Some(&uuid::Uuid::new_v4().to_string()),
+            &serde_json::json!({
+                "tool": tool,
+                "wire_input": wire_input,
+                "original_input": wire_input,
+            }),
+        )
+        .unwrap();
+}
+
+#[test]
+fn goal_read_only_turns_count_as_no_progress_after_bound() {
     let (mut driver, _tmp) = test_driver(1);
     driver
         .session
@@ -294,83 +310,188 @@ async fn goal_idle_guard_needs_intervention_without_blocking_goal() {
         .create_session_goal(
             driver.session.id,
             &driver.session.project_id,
-            "ship goal flow",
+            "ship without looping on reads",
             None,
             None,
         )
         .unwrap();
+    driver.goal_progress_last_seq = driver.latest_session_event_seq();
+
+    record_goal_tool_event(&driver, "read", serde_json::json!({"path": "src/lib.rs"}));
+    let first = driver.observe_goal_progress_turn().unwrap();
+    assert!(first.no_progress());
+    assert_eq!(driver.goal_turns_since_mutating_action, 1);
+    assert_eq!(driver.goal_turns_since_goal_context_delta, 1);
+
+    record_goal_tool_event(
+        &driver,
+        "grep",
+        serde_json::json!({"pattern": "TODO", "path": "src"}),
+    );
+    let second = driver.observe_goal_progress_turn().unwrap();
+
+    assert!(second.no_progress());
+    assert_eq!(
+        driver.goal_turns_since_mutating_action,
+        GOAL_NO_PROGRESS_NUDGE_BOUND
+    );
+    assert!(
+        driver.goal_turns_since_goal_context_delta >= GOAL_NO_PROGRESS_NUDGE_BOUND,
+        "read/search-only turns should cross the nudge bound"
+    );
+    assert_eq!(driver.goal_stall_prompt(), GOAL_IDLE_CONTINUATION);
+}
+
+#[test]
+fn goal_mutating_action_and_context_delta_reset_progress_counters() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "reset counters on durable progress",
+            None,
+            None,
+        )
+        .unwrap();
+    driver.goal_progress_last_seq = driver.latest_session_event_seq();
+    driver.goal_turns_since_mutating_action = 4;
+    driver.goal_turns_since_goal_context_delta = 4;
+
+    record_goal_tool_event(
+        &driver,
+        "writeunlock",
+        serde_json::json!({"path": "src/lib.rs", "content": "changed"}),
+    );
+    let mutating = driver.observe_goal_progress_turn().unwrap();
+    assert!(mutating.mutating_action);
+    assert_eq!(driver.goal_turns_since_mutating_action, 0);
+    assert_eq!(driver.goal_turns_since_goal_context_delta, 5);
+
+    record_goal_tool_event(
+        &driver,
+        "update_goal",
+        serde_json::json!({"status": "active", "context_delta": "edited src/lib.rs"}),
+    );
+    let context = driver.observe_goal_progress_turn().unwrap();
+    assert!(context.context_delta);
+    assert_eq!(driver.goal_turns_since_goal_context_delta, 0);
+    assert_eq!(driver.goal_turns_since_mutating_action, 1);
+}
+
+#[test]
+fn goal_prose_without_tools_counts_as_no_progress_subset() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "catch prose-only stalls",
+            None,
+            None,
+        )
+        .unwrap();
+    driver.goal_progress_last_seq = driver.latest_session_event_seq();
     driver
         .stack
         .first_mut()
         .unwrap()
         .history
-        .push(Message::assistant(
-            "I will keep working without using a tool.",
-        ));
-    driver.goal_no_tool_idle_count = 2;
+        .push(Message::assistant("I will keep working."));
 
-    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
-    let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let observation = driver.observe_goal_progress_turn().unwrap();
 
+    assert!(observation.no_progress());
+    assert_eq!(driver.goal_turns_since_mutating_action, 1);
+    assert_eq!(driver.goal_turns_since_goal_context_delta, 1);
+}
+
+#[tokio::test]
+async fn goal_no_progress_intervention_waits_for_budget_cap() {
+    let (mut driver, tmp) = test_driver(1);
     driver
-        .maybe_continue_active_goal(&input_queue, &tx)
-        .await
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "do not stop at three strikes",
+            None,
+            None,
+        )
         .unwrap();
-
-    let notice = rx.try_recv().expect("intervention notice should emit");
-    match notice {
-        TurnEvent::Notice { text } => {
-            assert!(
-                text.contains("needs intervention")
-                    && text.contains("agent_failed_to_progress")
-                    && !text.contains("goal: blocked"),
-                "notice must describe runtime intervention, not terminal block: {text}"
-            );
-        }
-        other => panic!("expected intervention Notice, got {other:?}"),
-    }
+    driver.goal_no_tool_idle_count = 5;
+    driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
+    driver.goal_turns_since_goal_context_delta = GOAL_NO_PROGRESS_NUDGE_BOUND;
     let goal = driver
         .session
         .db
         .current_session_goal(driver.session.id, false)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        goal.status,
-        crate::db::session_goals::GoalStatus::Active,
-        "runtime non-progress must not terminally block the persisted goal"
-    );
-    assert_eq!(
-        goal.blocked_attempts, 0,
-        "driver intervention must not consume model-facing blocked attempts"
-    );
-    assert_eq!(driver.goal_no_tool_idle_count, 0);
-    assert!(driver.goal_idle_intervention_pending);
-
-    driver
-        .maybe_continue_active_goal(&input_queue, &tx)
-        .await
-        .unwrap();
     assert!(
-        rx.try_recv().is_err(),
-        "latched intervention should not spin or emit duplicate notices"
+        !driver.goal_continuation_budget_exhausted(&goal),
+        "fixed strike count must not be the terminating condition"
     );
+    assert_eq!(driver.goal_stall_prompt(), GOAL_IDLE_CONTINUATION_STRONGEST);
+    assert!(!driver.goal_idle_intervention_pending);
 
     driver
-        .stack
-        .first_mut()
+        .session
+        .db
+        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
+            call_id: uuid::Uuid::new_v4(),
+            session_id: driver.session.id,
+            project_id: driver.session.project_id.clone(),
+            project_root: tmp.path().display().to_string(),
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            input_tokens: GOAL_DEFAULT_CONTINUATION_TOKEN_CAP,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cost_usd_micros: None,
+            is_utility: false,
+        })
+        .unwrap();
+    driver
+        .session
+        .db
+        .refresh_session_goal_usage(driver.session.id)
+        .unwrap();
+    let capped = driver
+        .session
+        .db
+        .current_session_goal(driver.session.id, false)
         .unwrap()
-        .history
-        .push(Message::user("Try again with a concrete tool call."));
-    driver
-        .maybe_continue_active_goal(&input_queue, &tx)
-        .await
         .unwrap();
-    assert!(
-        !driver.goal_idle_intervention_pending,
-        "a real follow-up should clear the intervention latch"
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+    driver
+        .emit_goal_no_progress_budget_exhausted(&capped, &tx)
+        .await;
+
+    assert!(driver.goal_idle_intervention_pending);
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::NeedsIntervention {
+            code: "agent_failed_to_progress_budget_exhausted".to_string()
+        }
     );
+    match rx
+        .try_recv()
+        .expect("budget intervention notice should emit")
+    {
+        TurnEvent::Notice { text } => {
+            assert!(text.contains("agent_failed_to_progress_budget_exhausted"));
+        }
+        other => panic!("expected intervention Notice, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -423,6 +544,64 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
     assert_eq!(
         driver.take_idle_reason(),
         crate::engine::IdleReason::BudgetLimited
+    );
+}
+
+#[tokio::test]
+async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
+    let (mut driver, tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "stop stalled work at explicit budget",
+            None,
+            Some(10),
+        )
+        .unwrap();
+    driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
+    driver.goal_turns_since_goal_context_delta = GOAL_NO_PROGRESS_NUDGE_BOUND;
+    driver
+        .session
+        .db
+        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
+            call_id: uuid::Uuid::new_v4(),
+            session_id: driver.session.id,
+            project_id: driver.session.project_id.clone(),
+            project_root: tmp.path().display().to_string(),
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            input_tokens: 10,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cost_usd_micros: None,
+            is_utility: false,
+        })
+        .unwrap();
+    driver
+        .session
+        .db
+        .refresh_session_goal_usage(driver.session.id)
+        .unwrap();
+    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
+    let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    driver
+        .maybe_continue_active_goal(&input_queue, &tx)
+        .await
+        .unwrap();
+
+    assert!(driver.goal_idle_intervention_pending);
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::NeedsIntervention {
+            code: "agent_failed_to_progress_budget_exhausted".to_string()
+        }
     );
 }
 
@@ -597,26 +776,22 @@ async fn goal_idle_intervention_idle_reason_carries_code() {
             None,
         )
         .unwrap();
-    driver
-        .stack
-        .first_mut()
-        .unwrap()
-        .history
-        .push(Message::assistant("I am done for now."));
-    driver.goal_no_tool_idle_count = 2;
-    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
-    let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let goal = driver
+        .session
+        .db
+        .current_session_goal(driver.session.id, false)
+        .unwrap()
+        .unwrap();
 
     driver
-        .maybe_continue_active_goal(&input_queue, &tx)
-        .await
-        .unwrap();
+        .emit_goal_no_progress_budget_exhausted(&goal, &tx)
+        .await;
 
     assert_eq!(
         driver.take_idle_reason(),
         crate::engine::IdleReason::NeedsIntervention {
-            code: "agent_failed_to_progress".to_string()
+            code: "agent_failed_to_progress_budget_exhausted".to_string()
         }
     );
 }

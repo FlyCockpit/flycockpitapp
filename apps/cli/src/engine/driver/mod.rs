@@ -157,10 +157,16 @@ pub enum DriverControl {
 /// concat-joining a hundred would bloat the next inference. If we
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
-const GOAL_IDLE_CONTINUATION: &str = "An active goal is still in progress. Your previous response did not call a tool and did not mark the goal complete or blocked.\n\nRead the current goal, decide the next concrete action, and continue working. This turn must produce visible progress: call a tool, update the goal status, or provide a concrete blocker that is shown to the user. If the goal is complete, call update_goal with status \"complete\" and evidence. If truly blocked, call update_goal with status \"blocked\" and explain the blocker. Otherwise use tools to make progress.";
-const GOAL_IDLE_CONTINUATION_STRONG: &str = "An active goal is still in progress and this is the second consecutive prose-only idle turn. You must choose one exit: call a tool to make progress, call get_goal then update_goal(status=\"complete\", evidence=...), or call update_goal(status=\"blocked\", blocker=...) only for a true blocker. Do not finish this turn silently; it must leave a visible assistant message, tool call, or goal-status event.";
+const GOAL_IDLE_CONTINUATION: &str = "An active goal is still in progress, but recent turns did not record concrete progress.\n\nRead the current goal, decide the next concrete action, and continue working. This turn must produce visible progress: edit/write a file, run the relevant gate, update the goal with a non-empty context_delta, or provide a concrete blocker that is shown to the user. If the goal is complete, call update_goal with status \"complete\" and evidence. If truly blocked, call update_goal with status \"blocked\" and explain the blocker. Otherwise use tools to make progress.";
+const GOAL_IDLE_CONTINUATION_STRONG: &str = "An active goal is still in progress and repeated recent turns did not edit/write a file, run the gate, commit, or record progress with update_goal(context_delta=...). You must choose one exit: call a tool that makes concrete progress, call get_goal then update_goal(status=\"complete\", evidence=...), call update_goal(status=\"active\", context_delta=...) to record real progress, or call update_goal(status=\"blocked\", blocker=...) only for a true blocker. Do not finish this turn silently.";
+const GOAL_IDLE_CONTINUATION_STRONGEST: &str = "An active goal is still in progress and the no-progress budget is being consumed by repeated read/search/prose-only turns. Stop researching in circles: make a concrete change, run the relevant validation gate, record a non-empty goal context_delta that explains durable progress, or surface the exact blocker. Do not bypass approvals, sandboxing, or safety checks.";
 const GOAL_WATCHDOG_CONTINUATION: &str = "An active goal is still in progress, and background work has been pending for 10 minutes.\n\nCheck the status of the pending background task(s). If one is hung, decide whether to cancel, retry, inspect logs, or continue with other work. If the goal is complete, call update_goal(status=\"complete\"). If blocked, call update_goal(status=\"blocked\").";
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
+const GOAL_NO_PROGRESS_NUDGE_BOUND: u16 = 2;
+/// Finite continuation cap for goals created without an explicit token budget.
+/// Large enough for ordinary multi-turn runs, but not unbounded if the agent
+/// repeatedly fails to make durable progress.
+const GOAL_DEFAULT_CONTINUATION_TOKEN_CAP: i64 = 200_000;
 const GOAL_USAGE_LIMIT_AUTO_RESUME: &str = "An active goal was paused because the provider reported a usage or rate limit. The backoff window has elapsed.\n\nResume the goal from the current context. If the provider is still rate-limiting, stop after the failed turn and leave the goal usage-limited. If the goal is complete, call update_goal(status=\"complete\"). If truly blocked for a non-usage-limit reason, call update_goal(status=\"blocked\").";
 const GOAL_USAGE_LIMIT_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const GOAL_USAGE_LIMIT_BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -172,6 +178,19 @@ enum GoalUsageLimitWatchdogAction {
     NotUsageLimited,
     AutoResume,
     Exhausted,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GoalProgressObservation {
+    observed_turn: bool,
+    mutating_action: bool,
+    context_delta: bool,
+}
+
+impl GoalProgressObservation {
+    fn no_progress(self) -> bool {
+        self.observed_turn && !self.mutating_action && !self.context_delta
+    }
 }
 
 const ID_PRIMARY_ROUNDS_CONTINUE: &str = "primary_rounds_continue";
@@ -450,6 +469,9 @@ pub struct Driver {
     /// consecutive user messages on the wire.
     pending_seed_context: Option<String>,
     goal_no_tool_idle_count: u8,
+    goal_turns_since_mutating_action: u16,
+    goal_turns_since_goal_context_delta: u16,
+    goal_progress_last_seq: i64,
     /// Latches after the active-goal no-tool idle guard stops automatic
     /// continuation. Cleared when a real user turn or a non-prose/toolful state
     /// gives the agent a fresh chance to progress.
@@ -857,6 +879,9 @@ impl Driver {
             prune_effectiveness: self.prune_effectiveness.clone(),
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
+            goal_turns_since_mutating_action: self.goal_turns_since_mutating_action,
+            goal_turns_since_goal_context_delta: self.goal_turns_since_goal_context_delta,
+            goal_progress_last_seq: self.goal_progress_last_seq,
             goal_idle_intervention_pending: false,
             goal_idle_intervention_code: None,
             goal_was_active_recently: self.goal_was_active_recently,
@@ -1120,6 +1145,9 @@ impl Driver {
             prune_effectiveness: std::collections::VecDeque::new(),
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
+            goal_turns_since_mutating_action: 0,
+            goal_turns_since_goal_context_delta: 0,
+            goal_progress_last_seq: -1,
             goal_idle_intervention_pending: false,
             goal_idle_intervention_code: None,
             goal_was_active_recently: false,
@@ -1820,9 +1848,8 @@ impl Driver {
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
             {
-                self.goal_no_tool_idle_count = 0;
-                self.goal_idle_intervention_pending = false;
-                self.goal_idle_intervention_code = None;
+                self.reset_goal_progress_tracking();
+                self.clear_goal_idle_intervention();
                 self.maybe_continue_active_goal(&input_queue, tx).await?;
                 self.refresh_goal_watchdog(&mut goal_watchdog);
                 continue;
@@ -1844,9 +1871,8 @@ impl Driver {
                     drain_queue(&input_queue, &mut batch, &active_target_id).await;
                     let items = fold_submission_commands(batch);
                     if items.iter().any(|item| matches!(item, FoldedSubmission::User(_))) {
-                        self.goal_no_tool_idle_count = 0;
-                        self.goal_idle_intervention_pending = false;
-                        self.goal_idle_intervention_code = None;
+                        self.reset_goal_progress_tracking();
+                        self.clear_goal_idle_intervention();
                         self.goal_usage_limit_auto_resume_attempts = 0;
                     }
                     self.run_folded_submission_commands(items, &input_queue, tx).await?;
@@ -1871,9 +1897,8 @@ impl Driver {
                     goal_watchdog = None;
                     match ev {
                         Some(event) => {
-                            self.goal_no_tool_idle_count = 0;
-                            self.goal_idle_intervention_pending = false;
-                            self.goal_idle_intervention_code = None;
+                            self.reset_goal_progress_tracking();
+                            self.clear_goal_idle_intervention();
                             self.run_job_event(event, &input_queue, tx).await?;
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
                             self.refresh_goal_watchdog(&mut goal_watchdog);
@@ -1887,9 +1912,8 @@ impl Driver {
                         .deliver_background_noninteractive_completion(completion, &input_queue, tx)
                         .await?;
                     if delivered {
-                        self.goal_no_tool_idle_count = 0;
-                        self.goal_idle_intervention_pending = false;
-                        self.goal_idle_intervention_code = None;
+                        self.reset_goal_progress_tracking();
+                        self.clear_goal_idle_intervention();
                         self.maybe_continue_active_goal(&input_queue, tx).await?;
                         self.refresh_goal_watchdog(&mut goal_watchdog);
                     }
@@ -2150,15 +2174,13 @@ impl Driver {
                 if self.goal_was_active_recently {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
                 }
-                self.goal_no_tool_idle_count = 0;
-                self.goal_idle_intervention_pending = false;
-                self.goal_idle_intervention_code = None;
+                self.reset_goal_progress_tracking();
+                self.clear_goal_idle_intervention();
                 return Ok(());
             };
             if goal.status != crate::db::session_goals::GoalStatus::Active {
-                self.goal_no_tool_idle_count = 0;
-                self.goal_idle_intervention_pending = false;
-                self.goal_idle_intervention_code = None;
+                self.reset_goal_progress_tracking();
+                self.clear_goal_idle_intervention();
                 return Ok(());
             }
             self.goal_was_active_recently = true;
@@ -2167,6 +2189,10 @@ impl Driver {
                 .token_budget
                 .is_some_and(|budget| goal.tokens_used >= budget)
             {
+                if self.goal_stall_budget_context_active() {
+                    self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
+                    return Ok(());
+                }
                 let _ = self.session.db.update_session_goal(
                     self.session.id,
                     crate::db::session_goals::GoalStatus::BudgetLimited,
@@ -2174,9 +2200,8 @@ impl Driver {
                     None,
                     Some("token budget exhausted"),
                 );
-                self.goal_no_tool_idle_count = 0;
-                self.goal_idle_intervention_pending = false;
-                self.goal_idle_intervention_code = None;
+                self.reset_goal_progress_tracking();
+                self.clear_goal_idle_intervention();
                 return Ok(());
             }
             if self.goal_idle_intervention_pending {
@@ -2184,41 +2209,109 @@ impl Driver {
                     .root_last_user_text()
                     .is_some_and(|text| !is_continue_command(&text))
                 {
-                    self.goal_no_tool_idle_count = 0;
-                    self.goal_idle_intervention_pending = false;
-                    self.goal_idle_intervention_code = None;
+                    self.reset_goal_progress_tracking();
+                    self.clear_goal_idle_intervention();
                 }
-                return Ok(());
-            }
-            if !self.root_last_assistant_was_prose_without_tools() {
-                self.goal_no_tool_idle_count = 0;
-                self.goal_idle_intervention_pending = false;
-                self.goal_idle_intervention_code = None;
                 return Ok(());
             }
             if !self.schedule.snapshot().is_empty() {
                 return Ok(());
             }
-            self.goal_no_tool_idle_count = self.goal_no_tool_idle_count.saturating_add(1);
-            if self.goal_no_tool_idle_count >= 3 {
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: "goal: needs intervention — agent_failed_to_progress".to_string(),
-                    })
-                    .await;
-                self.goal_no_tool_idle_count = 0;
-                self.goal_idle_intervention_pending = true;
-                self.goal_idle_intervention_code = Some("agent_failed_to_progress");
+            let observation = self.observe_goal_progress_turn()?;
+            if !observation.no_progress()
+                || (self.goal_turns_since_mutating_action < GOAL_NO_PROGRESS_NUDGE_BOUND
+                    && self.goal_turns_since_goal_context_delta < GOAL_NO_PROGRESS_NUDGE_BOUND)
+            {
+                if observation.mutating_action || observation.context_delta {
+                    self.goal_no_tool_idle_count = 0;
+                }
                 return Ok(());
             }
-            let prompt = if self.goal_no_tool_idle_count == 1 {
-                GOAL_IDLE_CONTINUATION
-            } else {
-                GOAL_IDLE_CONTINUATION_STRONG
-            };
+            if self.goal_continuation_budget_exhausted(&goal) {
+                self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
+                return Ok(());
+            }
+            let prompt = self.goal_stall_prompt();
+            self.goal_no_tool_idle_count = self.goal_no_tool_idle_count.saturating_add(1);
             self.run_user_input(UserSubmission::text(prompt), input_rx, tx)
                 .await?;
         }
+    }
+
+    fn reset_goal_progress_tracking(&mut self) {
+        self.goal_no_tool_idle_count = 0;
+        self.goal_turns_since_mutating_action = 0;
+        self.goal_turns_since_goal_context_delta = 0;
+        self.goal_progress_last_seq = self.latest_session_event_seq();
+    }
+
+    fn clear_goal_idle_intervention(&mut self) {
+        self.goal_idle_intervention_pending = false;
+        self.goal_idle_intervention_code = None;
+    }
+
+    fn goal_stall_prompt(&self) -> &'static str {
+        match self.goal_no_tool_idle_count {
+            0 => GOAL_IDLE_CONTINUATION,
+            1 => GOAL_IDLE_CONTINUATION_STRONG,
+            _ => GOAL_IDLE_CONTINUATION_STRONGEST,
+        }
+    }
+
+    fn goal_continuation_budget_exhausted(
+        &self,
+        goal: &crate::db::session_goals::SessionGoal,
+    ) -> bool {
+        let cap = goal
+            .token_budget
+            .unwrap_or(GOAL_DEFAULT_CONTINUATION_TOKEN_CAP);
+        goal.tokens_used >= cap
+    }
+
+    fn goal_stall_budget_context_active(&self) -> bool {
+        self.goal_no_tool_idle_count > 0
+            || self.goal_turns_since_mutating_action >= GOAL_NO_PROGRESS_NUDGE_BOUND
+            || self.goal_turns_since_goal_context_delta >= GOAL_NO_PROGRESS_NUDGE_BOUND
+    }
+
+    async fn emit_goal_no_progress_budget_exhausted(
+        &mut self,
+        goal: &crate::db::session_goals::SessionGoal,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let code = "agent_failed_to_progress_budget_exhausted";
+        let data = serde_json::json!({
+            "kind": "goal_no_progress_budget_exhausted",
+            "goal_id": goal.id.to_string(),
+            "turns_since_mutating_action": self.goal_turns_since_mutating_action,
+            "turns_since_goal_context_delta": self.goal_turns_since_goal_context_delta,
+            "tokens_used": goal.tokens_used,
+            "token_budget": goal.token_budget,
+            "default_token_cap": if goal.token_budget.is_none() {
+                Some(GOAL_DEFAULT_CONTINUATION_TOKEN_CAP)
+            } else {
+                None
+            },
+        });
+        if let Err(e) = self.session.record_event(
+            crate::db::session_log::SessionEventKind::GoalProgressDiagnostic,
+            Some(self.active_agent()),
+            None,
+            &data,
+        ) {
+            tracing::warn!(error = %e, "recording goal no-progress budget diagnostic failed");
+        }
+        let _ = tx
+            .send(TurnEvent::Notice {
+                text: "goal: needs intervention — agent_failed_to_progress_budget_exhausted; run `/goal resume` after adding direction or budget".to_string(),
+            })
+            .await;
+        self.reset_goal_progress_tracking();
+        self.goal_idle_intervention_pending = true;
+        self.goal_idle_intervention_code = Some(code);
+        self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+            code: code.to_string(),
+        });
     }
 
     fn inference_failure_provider_status(
@@ -2255,9 +2348,8 @@ impl Driver {
             tracing::warn!(error = %e, "marking goal usage_limited failed");
             return false;
         }
-        self.goal_no_tool_idle_count = 0;
-        self.goal_idle_intervention_pending = false;
-        self.goal_idle_intervention_code = None;
+        self.reset_goal_progress_tracking();
+        self.clear_goal_idle_intervention();
         if self.goal_usage_limit_auto_resume_attempts >= GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS {
             self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                 code: GOAL_USAGE_LIMIT_INTERVENTION_CODE.to_string(),
@@ -2319,6 +2411,107 @@ impl Driver {
         self.goal_idle_intervention_pending = false;
         self.goal_idle_intervention_code = None;
         Ok(GoalUsageLimitWatchdogAction::AutoResume)
+    }
+
+    fn observe_goal_progress_turn(&mut self) -> Result<GoalProgressObservation> {
+        let latest_seq = self.latest_session_event_seq();
+        if self.goal_progress_last_seq < 0 {
+            self.goal_progress_last_seq = latest_seq;
+            if !self.root_last_assistant_was_prose_without_tools() {
+                return Ok(GoalProgressObservation::default());
+            }
+        }
+        let observation = self.goal_progress_observation_since(self.goal_progress_last_seq)?;
+        self.goal_progress_last_seq = latest_seq;
+        if !observation.observed_turn {
+            return Ok(observation);
+        }
+        if observation.mutating_action {
+            self.goal_turns_since_mutating_action = 0;
+        } else {
+            self.goal_turns_since_mutating_action =
+                self.goal_turns_since_mutating_action.saturating_add(1);
+        }
+        if observation.context_delta {
+            self.goal_turns_since_goal_context_delta = 0;
+        } else {
+            self.goal_turns_since_goal_context_delta =
+                self.goal_turns_since_goal_context_delta.saturating_add(1);
+        }
+        Ok(observation)
+    }
+
+    fn goal_progress_observation_since(&self, anchor_seq: i64) -> Result<GoalProgressObservation> {
+        let mut observation = GoalProgressObservation {
+            observed_turn: self.root_last_assistant_was_prose_without_tools(),
+            mutating_action: false,
+            context_delta: false,
+        };
+        for event in self
+            .session
+            .db
+            .list_session_events(self.session.id)?
+            .into_iter()
+            .filter(|event| event.seq > anchor_seq)
+        {
+            match event.kind.as_str() {
+                "assistant_message" | "inference_failure" | "failed_turn_recovery" => {
+                    observation.observed_turn = true;
+                }
+                "tool_call" | "tool_call_completed" => {
+                    observation.observed_turn = true;
+                    if Self::goal_event_is_mutating_action(&event.data) {
+                        observation.mutating_action = true;
+                    }
+                    if Self::goal_event_has_context_delta(&event.data) {
+                        observation.context_delta = true;
+                    }
+                }
+                "resource_promotion" | "session_compacted" => {
+                    observation.observed_turn = true;
+                    observation.mutating_action = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(observation)
+    }
+
+    fn goal_event_is_mutating_action(data: &serde_json::Value) -> bool {
+        let Some(tool) = data.get("tool").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        match tool {
+            "writeunlock" | "editunlock" => true,
+            "bash" => data
+                .get("wire_input")
+                .or_else(|| data.get("original_input"))
+                .and_then(|input| input.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(Self::goal_bash_command_is_mutating),
+            _ => false,
+        }
+    }
+
+    fn goal_event_has_context_delta(data: &serde_json::Value) -> bool {
+        data.get("tool")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|tool| tool == "update_goal")
+            && data
+                .get("wire_input")
+                .or_else(|| data.get("original_input"))
+                .and_then(|input| input.get("context_delta"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|delta| !delta.trim().is_empty())
+    }
+
+    fn goal_bash_command_is_mutating(command: &str) -> bool {
+        let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        normalized == "git commit"
+            || normalized.starts_with("git commit ")
+            || normalized.contains("&& git commit ")
+            || normalized.contains("; git commit ")
+            || normalized.contains("| git commit ")
     }
 
     fn root_last_assistant_was_prose_without_tools(&self) -> bool {
@@ -2579,7 +2772,7 @@ impl Driver {
             tracing::warn!(error = %e, "recording goal progress diagnostic failed");
         }
         let _ = tx.send(TurnEvent::Notice { text }).await;
-        self.goal_no_tool_idle_count = 0;
+        self.reset_goal_progress_tracking();
         self.goal_idle_intervention_pending = true;
         self.goal_idle_intervention_code = Some("agent_failed_to_progress_after_continue");
     }
@@ -4327,9 +4520,8 @@ impl Driver {
                     }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
                         if self.goal_continue_progress_since(anchor_seq) {
-                            self.goal_no_tool_idle_count = 0;
-                            self.goal_idle_intervention_pending = false;
-                            self.goal_idle_intervention_code = None;
+                            self.reset_goal_progress_tracking();
+                            self.clear_goal_idle_intervention();
                         } else {
                             self.emit_goal_continue_no_progress(anchor_seq, tx).await;
                         }

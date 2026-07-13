@@ -2007,6 +2007,7 @@ pub struct App {
     /// request. Renders LAST over the chat body (never over a required-decision
     /// dialog) and consumes its own keys while open.
     pub(super) keys_overlay: Option<crate::tui::keys_overlay::KeysOverlay>,
+    pub(super) keyboard_enhancement_active: bool,
 }
 
 /// Shared slot a spawned prediction task posts its `(turn, bounded-text)`
@@ -2979,6 +2980,7 @@ impl App {
             pinned_seqs_cache: HashSet::new(),
             pinned_seqs_session: None,
             keys_overlay: None,
+            keyboard_enhancement_active: false,
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -3173,6 +3175,7 @@ impl App {
         .is_ok()
         {
             terminal_mode_guard.mark_keyboard_enhancement_pushed();
+            self.keyboard_enhancement_active = true;
         }
 
         // Bracketed paste (composer-paste-handling): the terminal wraps a
@@ -6055,12 +6058,15 @@ impl App {
             interrupt_id,
             session_id,
         }));
-        self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
-            interrupt_id,
-            String::new(),
-            set,
-            self.dialog_lockout(),
-        ));
+        self.question_dialog = Some(
+            crate::tui::dialog::question::QuestionDialog::new(
+                interrupt_id,
+                String::new(),
+                set,
+                self.dialog_lockout(),
+            )
+            .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
+        );
     }
 
     fn maybe_prompt_resume_repair(&mut self, state: crate::daemon::proto::ResumeRepairState) {
@@ -6129,12 +6135,15 @@ impl App {
             interrupt_id,
             state,
         }));
-        self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
-            interrupt_id,
-            String::new(),
-            set,
-            self.dialog_lockout(),
-        ));
+        self.question_dialog = Some(
+            crate::tui::dialog::question::QuestionDialog::new(
+                interrupt_id,
+                String::new(),
+                set,
+                self.dialog_lockout(),
+            )
+            .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
+        );
     }
 
     fn resolve_resume_repair_choice(
@@ -6540,7 +6549,8 @@ impl App {
                 set,
                 lockout,
                 &[preselected],
-            ),
+            )
+            .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
         );
     }
 
@@ -6645,7 +6655,8 @@ impl App {
                 set,
                 lockout,
                 &[preselected],
-            ),
+            )
+            .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
         );
     }
 
@@ -7455,7 +7466,12 @@ impl App {
             return;
         }
         let context = self.key_context();
-        self.keys_overlay = Some(crate::tui::keys_overlay::KeysOverlay::open(context));
+        self.keys_overlay = Some(
+            crate::tui::keys_overlay::KeysOverlay::open_with_keyboard_enhancement(
+                context,
+                self.keyboard_enhancement_active,
+            ),
+        );
     }
 
     /// `/export debug` (hidden) — write the full CLI bundle `.zip` for

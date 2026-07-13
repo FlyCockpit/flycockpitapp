@@ -911,7 +911,8 @@ impl App {
                         questions,
                         lockout,
                     )
-                    .with_pending_count(pending_count),
+                    .with_pending_count(pending_count)
+                    .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
                 );
                 self.raise_attention_interrupt(
                     session_id,

@@ -1143,12 +1143,15 @@ impl App {
                 interrupt_id,
                 display,
             }));
-            self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
-                interrupt_id,
-                String::new(),
-                set,
-                lockout,
-            ));
+            self.question_dialog = Some(
+                crate::tui::dialog::question::QuestionDialog::new(
+                    interrupt_id,
+                    String::new(),
+                    set,
+                    lockout,
+                )
+                .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
+            );
             return;
         }
 

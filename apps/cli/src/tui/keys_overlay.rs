@@ -48,6 +48,50 @@ pub struct KeyBinding {
     pub desc: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogBindingId {
+    Pick,
+    ApprovalPick,
+    Toggle,
+    Move,
+    Choose,
+    SpaceToggle,
+    EnterSelectConfirm,
+    ConfirmAgain,
+    Questions,
+    PromptScroll,
+    ChatScroll,
+    Expand,
+    Collapse,
+    Cancel,
+    TypeAnswer,
+    Done,
+    Submit,
+    Back,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialogBinding {
+    pub id: DialogBindingId,
+    pub key: &'static str,
+    pub action: &'static str,
+    pub desc: &'static str,
+    pub footer: &'static str,
+    pub priority: u8,
+    pub requires_keyboard_enhancement: bool,
+    pub which_key: bool,
+}
+
+impl DialogBinding {
+    pub fn key_binding(self) -> KeyBinding {
+        KeyBinding {
+            key: self.key,
+            action: self.action,
+            desc: self.desc,
+        }
+    }
+}
+
 /// A titled group of [`KeyBinding`]s for one context, e.g. `Sessions`,
 /// `Composer`, `Global`. The overlay renders these in order, context-first.
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +100,21 @@ pub struct KeyGroup {
     pub title: &'static str,
     /// The rows in this group.
     pub bindings: &'static [KeyBinding],
+}
+
+#[derive(Debug, Clone)]
+struct OwnedKeyGroup {
+    title: &'static str,
+    bindings: Vec<KeyBinding>,
+}
+
+impl From<KeyGroup> for OwnedKeyGroup {
+    fn from(group: KeyGroup) -> Self {
+        Self {
+            title: group.title,
+            bindings: group.bindings.to_vec(),
+        }
+    }
 }
 
 /// The active TUI context the overlay was opened in. Determines which group
@@ -233,65 +292,214 @@ const EMBEDDED_PANE: KeyGroup = KeyGroup {
     ],
 };
 
-const DIALOG_BINDINGS: &[KeyBinding] = &[
-    KeyBinding {
+pub const DIALOG_BINDINGS: &[DialogBinding] = &[
+    DialogBinding {
+        id: DialogBindingId::Pick,
         key: "1-9",
         action: "select",
         desc: "choose a numbered option",
+        footer: "1-9: pick",
+        priority: 20,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::ApprovalPick,
+        key: "1-9/Enter",
+        action: "select",
+        desc: "select an approval option",
+        footer: "1-9/enter: select",
+        priority: 20,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::Toggle,
+        key: "1-9/Enter",
+        action: "toggle",
+        desc: "toggle a multiselect option",
+        footer: "1-9/enter: toggle",
+        priority: 20,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
         key: "↑/↓ or j/k",
+        id: DialogBindingId::Move,
         action: "move",
         desc: "highlight an option",
+        footer: "↑/↓: move",
+        priority: 35,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::Choose,
+        key: "Enter",
+        action: "choose",
+        desc: "choose the highlighted answer",
+        footer: "enter: choose",
+        priority: 5,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::ConfirmAgain,
+        key: "Enter",
+        action: "confirm",
+        desc: "confirm a selected approval choice",
+        footer: "enter again: confirm",
+        priority: 6,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::Questions,
         key: "←/→ or h/l",
         action: "questions",
         desc: "move between question pages",
+        footer: "←/→: questions",
+        priority: 50,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::SpaceToggle,
         key: "Space",
         action: "toggle/type",
         desc: "toggle selection or edit Other…",
+        footer: "space: toggle/type",
+        priority: 60,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::EnterSelectConfirm,
         key: "Enter",
         action: "select/confirm",
         desc: "select, then confirm permission choices",
+        footer: "enter: choose",
+        priority: 5,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::PromptScroll,
         key: "PgUp/PgDn",
         action: "prompt scroll",
         desc: "scroll dialog prompt content",
+        footer: "pgup/pgdn: scroll",
+        priority: 70,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::ChatScroll,
         key: "Shift+PgUp/PgDn",
         action: "chat scroll",
         desc: "scroll the transcript behind the dialog",
+        footer: "shift+pgup/pgdn: chat",
+        priority: 80,
+        requires_keyboard_enhancement: true,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::Expand,
         key: "Ctrl+E",
         action: "expand",
         desc: "expand or collapse the dialog",
+        footer: "ctrl+e: expand",
+        priority: 90,
+        requires_keyboard_enhancement: false,
+        which_key: true,
     },
-    KeyBinding {
+    DialogBinding {
+        id: DialogBindingId::Collapse,
+        key: "Ctrl+E",
+        action: "collapse",
+        desc: "collapse the dialog",
+        footer: "ctrl+e: collapse",
+        priority: 90,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::Cancel,
         key: "Esc",
         action: "cancel",
         desc: "cancel the dialog",
+        footer: "esc: cancel",
+        priority: 0,
+        requires_keyboard_enhancement: false,
+        which_key: true,
+    },
+    DialogBinding {
+        id: DialogBindingId::TypeAnswer,
+        key: "type",
+        action: "answer",
+        desc: "type a free-text answer",
+        footer: "type your answer",
+        priority: 10,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::Done,
+        key: "Enter",
+        action: "done",
+        desc: "finish editing",
+        footer: "enter: done",
+        priority: 5,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::Submit,
+        key: "Enter",
+        action: "submit",
+        desc: "submit all answers",
+        footer: "enter: submit",
+        priority: 5,
+        requires_keyboard_enhancement: false,
+        which_key: false,
+    },
+    DialogBinding {
+        id: DialogBindingId::Back,
+        key: "←/h",
+        action: "back",
+        desc: "return to the previous question",
+        footer: "←/h: back",
+        priority: 25,
+        requires_keyboard_enhancement: false,
+        which_key: false,
     },
 ];
 
-/// Approval-dialog bindings (required decision).
-const APPROVAL_DIALOG: KeyGroup = KeyGroup {
-    title: "Approval",
-    bindings: DIALOG_BINDINGS,
-};
+pub fn dialog_binding(id: DialogBindingId) -> &'static DialogBinding {
+    DIALOG_BINDINGS
+        .iter()
+        .find(|binding| binding.id == id)
+        .expect("dialog binding id exists")
+}
 
-/// Question-dialog bindings (`question` tool interrupt).
-const QUESTION_DIALOG: KeyGroup = KeyGroup {
-    title: "Question",
-    bindings: DIALOG_BINDINGS,
-};
+pub fn dialog_which_key_bindings(keyboard_enhancement_active: bool) -> Vec<KeyBinding> {
+    DIALOG_BINDINGS
+        .iter()
+        .filter(|binding| binding.which_key)
+        .filter(|binding| !binding.requires_keyboard_enhancement || keyboard_enhancement_active)
+        .map(|binding| binding.key_binding())
+        .collect()
+}
+
+pub fn dialog_footer_bindings(
+    ids: &[DialogBindingId],
+    keyboard_enhancement_active: bool,
+) -> Vec<&'static DialogBinding> {
+    ids.iter()
+        .map(|id| dialog_binding(*id))
+        .filter(|binding| !binding.requires_keyboard_enhancement || keyboard_enhancement_active)
+        .collect()
+}
 
 /// Model-picker bindings.
 const MODEL_PICKER: KeyGroup = KeyGroup {
@@ -378,24 +586,45 @@ const PINS: KeyGroup = KeyGroup {
 /// first, then [`GLOBAL`]. Pane-owned groups come from each pane's
 /// `keybindings()` descriptor so the source of truth lives next to the
 /// handler (data-driven, no prose duplication).
+#[cfg(test)]
 pub fn groups_for(context: KeyContext) -> Vec<KeyGroup> {
+    groups_for_owned(context, true)
+        .into_iter()
+        .map(|group| {
+            let leaked: &'static [KeyBinding] = Box::leak(group.bindings.into_boxed_slice());
+            KeyGroup {
+                title: group.title,
+                bindings: leaked,
+            }
+        })
+        .collect()
+}
+
+fn groups_for_owned(context: KeyContext, keyboard_enhancement_active: bool) -> Vec<OwnedKeyGroup> {
     let first = match context {
-        KeyContext::Composer => COMPOSER,
-        KeyContext::SlashMenu => SLASH_MENU,
-        KeyContext::ModelPicker => MODEL_PICKER,
-        KeyContext::Settings => SETTINGS,
-        KeyContext::Sessions => crate::tui::sessions_pane::SessionsPane::keybindings(),
-        KeyContext::Permissions => crate::tui::permissions_pane::PermissionsPane::keybindings(),
-        KeyContext::Resources => crate::tui::resources_pane::ResourcesPane::keybindings(),
-        KeyContext::QuickSettings => crate::tui::quick_dialog::QuickDialog::keybindings(),
-        KeyContext::Scratchpad => crate::tui::notes_pane::NotesPane::keybindings(),
-        KeyContext::Diff => crate::tui::diff_pane::DiffPane::keybindings(),
-        KeyContext::Pins => PINS,
-        KeyContext::EmbeddedPane => EMBEDDED_PANE,
-        KeyContext::QuestionDialog => QUESTION_DIALOG,
-        KeyContext::ApprovalDialog => APPROVAL_DIALOG,
+        KeyContext::QuestionDialog | KeyContext::ApprovalDialog => OwnedKeyGroup {
+            title: match context {
+                KeyContext::QuestionDialog => "Question",
+                _ => "Approval",
+            },
+            bindings: dialog_which_key_bindings(keyboard_enhancement_active),
+        },
+        KeyContext::Composer => COMPOSER.into(),
+        KeyContext::SlashMenu => SLASH_MENU.into(),
+        KeyContext::ModelPicker => MODEL_PICKER.into(),
+        KeyContext::Settings => SETTINGS.into(),
+        KeyContext::Sessions => crate::tui::sessions_pane::SessionsPane::keybindings().into(),
+        KeyContext::Permissions => {
+            crate::tui::permissions_pane::PermissionsPane::keybindings().into()
+        }
+        KeyContext::Resources => crate::tui::resources_pane::ResourcesPane::keybindings().into(),
+        KeyContext::QuickSettings => crate::tui::quick_dialog::QuickDialog::keybindings().into(),
+        KeyContext::Scratchpad => crate::tui::notes_pane::NotesPane::keybindings().into(),
+        KeyContext::Diff => crate::tui::diff_pane::DiffPane::keybindings().into(),
+        KeyContext::Pins => PINS.into(),
+        KeyContext::EmbeddedPane => EMBEDDED_PANE.into(),
     };
-    vec![first, GLOBAL]
+    vec![first, GLOBAL.into()]
 }
 
 /// The modal which-key overlay. Scrollable, informational, bottom-anchored
@@ -405,7 +634,7 @@ pub struct KeysOverlay {
     /// The context the overlay was opened in (drives the title + ordering).
     context: KeyContext,
     /// The aggregated groups (context-first, then global), captured at open.
-    groups: Vec<KeyGroup>,
+    groups: Vec<OwnedKeyGroup>,
     /// Vertical scroll offset (in rendered body rows).
     scroll: usize,
     /// Rendered body height at the last draw — drives scroll clamping.
@@ -416,10 +645,18 @@ pub struct KeysOverlay {
 
 impl KeysOverlay {
     /// Open the overlay for `context`, capturing its ordered groups.
+    #[cfg(test)]
     pub fn open(context: KeyContext) -> Self {
+        Self::open_with_keyboard_enhancement(context, true)
+    }
+
+    pub fn open_with_keyboard_enhancement(
+        context: KeyContext,
+        keyboard_enhancement_active: bool,
+    ) -> Self {
         Self {
             context,
-            groups: groups_for(context),
+            groups: groups_for_owned(context, keyboard_enhancement_active),
             scroll: 0,
             last_body_height: 0,
             last_content_rows: 0,
@@ -583,7 +820,7 @@ impl KeysOverlay {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )));
-            for b in group.bindings {
+            for b in &group.bindings {
                 let pad = key_w.saturating_sub(b.key.chars().count());
                 out.push(Line::from(vec![
                     Span::raw("  "),
@@ -684,7 +921,25 @@ mod tests {
             text.contains("1-9"),
             "approval shows numbered selection keys"
         );
-        assert_eq!(APPROVAL_DIALOG.bindings, QUESTION_DIALOG.bindings);
+        assert_eq!(
+            dialog_which_key_bindings(true),
+            groups_for(KeyContext::QuestionDialog)[0].bindings
+        );
+        assert_eq!(
+            groups_for(KeyContext::ApprovalDialog)[0].bindings,
+            groups_for(KeyContext::QuestionDialog)[0].bindings
+        );
+    }
+
+    #[test]
+    fn dialog_shift_page_keys_are_protocol_gated() {
+        let off = KeysOverlay::open_with_keyboard_enhancement(KeyContext::QuestionDialog, false)
+            .snapshot();
+        assert!(!off.contains("Shift+PgUp/PgDn"));
+
+        let on = KeysOverlay::open_with_keyboard_enhancement(KeyContext::QuestionDialog, true)
+            .snapshot();
+        assert!(on.contains("Shift+PgUp/PgDn"));
     }
 
     #[test]

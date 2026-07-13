@@ -4581,8 +4581,11 @@ mod slash_cursor_tests {
 mod chat_scrollback_key_tests {
     use super::super::Selection;
     use super::*;
+    use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crossterm::event::{KeyEventState, KeyModifiers};
+    use std::time::Duration;
+    use uuid::Uuid;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -4628,6 +4631,29 @@ mod chat_scrollback_key_tests {
         app.chat_total_lines = 20;
         app.chat_visible_lines = 6;
         app
+    }
+
+    fn question_dialog() -> crate::tui::dialog::question::QuestionDialog {
+        crate::tui::dialog::question::QuestionDialog::new(
+            Uuid::new_v4(),
+            String::new(),
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Proceed?".into(),
+                    options: vec![InterruptOption {
+                        id: "yes".into(),
+                        label: "Yes".into(),
+                        description: None,
+                        secondary: false,
+                    }],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: false,
+                    sandbox_escalation: None,
+                }],
+            },
+            Duration::ZERO,
+        )
     }
 
     #[test]
@@ -4696,6 +4722,22 @@ mod chat_scrollback_key_tests {
         app.handle_key(press(KeyCode::PageUp));
 
         assert_eq!(app.chat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn shift_page_up_scrolls_transcript_while_plain_page_up_reaches_dialog() {
+        let mut app = scrollable_app();
+        app.question_dialog = Some(question_dialog());
+
+        app.handle_key(shifted(KeyCode::PageUp));
+        assert_eq!(app.chat_scroll_offset, app.chat_visible_lines - 1);
+
+        app.chat_scroll_offset = 0;
+        app.handle_key(press(KeyCode::PageUp));
+        assert_eq!(
+            app.chat_scroll_offset, 0,
+            "plain PageUp is routed to the dialog prompt, not transcript scroll"
+        );
     }
 
     #[test]

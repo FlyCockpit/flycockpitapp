@@ -29,6 +29,7 @@ use crate::daemon::proto::{
 };
 use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page, PageKind};
 use crate::tui::geometry::{MIN_HISTORY_HEIGHT, STATUS_HEIGHT};
+use crate::tui::keys_overlay::{DialogBindingId, dialog_binding, dialog_footer_bindings};
 use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
@@ -104,6 +105,7 @@ pub struct QuestionDialog {
     /// `0` until the first render.
     last_inner_width: u16,
     pending_count: usize,
+    keyboard_enhancement_active: bool,
 }
 
 impl QuestionDialog {
@@ -127,6 +129,7 @@ impl QuestionDialog {
             last_term_height: 0,
             last_inner_width: 0,
             pending_count: 0,
+            keyboard_enhancement_active: true,
         }
     }
 
@@ -152,7 +155,13 @@ impl QuestionDialog {
             last_term_height: 0,
             last_inner_width: 0,
             pending_count: 0,
+            keyboard_enhancement_active: true,
         }
+    }
+
+    pub fn with_keyboard_enhancement_active(mut self, active: bool) -> Self {
+        self.keyboard_enhancement_active = active;
+        self
     }
 
     pub fn with_pending_count(mut self, pending_count: usize) -> Self {
@@ -404,10 +413,14 @@ impl QuestionDialog {
                     .description
                     .as_deref()
                     .map(|description| {
-                        wrapped_height(
-                            &[Line::from(description.to_string())],
-                            self.last_inner_width.saturating_sub(8),
+                        let indent = OPTION_CURSOR_WIDTH + 3 + 4;
+                        wrap_indented_text(
+                            description,
+                            indent,
+                            self.last_inner_width,
+                            Style::default(),
                         )
+                        .len()
                     })
                     .unwrap_or(0)
             })
@@ -474,9 +487,10 @@ impl QuestionDialog {
         // The options region carries no "more" markers, so the whole answer
         // slice is available for option rows (no marker-row reservation).
         let rows = self.row_line_counts(page_idx, &page);
+        let scroll = self.state.scroll().min(rows.len().saturating_sub(1));
         let mut fit = 0usize;
         let mut used = 0usize;
-        for &c in rows.iter().take(MAX_VISIBLE_OPTION_ROWS) {
+        for &c in rows.iter().skip(scroll).take(MAX_VISIBLE_OPTION_ROWS) {
             if used + c > answer_h && fit > 0 {
                 break;
             }
@@ -582,7 +596,7 @@ impl QuestionDialog {
         let hint = if locked {
             "waiting…".to_string()
         } else {
-            self.footer_hint()
+            self.footer_hint_for_width(layout[1].width)
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -647,45 +661,102 @@ impl QuestionDialog {
     }
 
     fn footer_hint(&self) -> String {
+        self.footer_hint_for_width(u16::MAX)
+    }
+
+    fn footer_hint_for_width(&self, width: u16) -> String {
+        let mut ids: Vec<DialogBindingId> = Vec::new();
         if self.state.is_typing() {
-            return "type your answer  ·  enter: done  ·  esc: cancel".to_string();
+            ids.extend([
+                DialogBindingId::TypeAnswer,
+                DialogBindingId::Done,
+                DialogBindingId::Cancel,
+            ]);
+            return self.format_footer(ids, width);
         }
-        let expand = self.expand_hint();
-        let scroll = if self.state.prompt_overflows() {
-            "  ·  pgup/pgdn: scroll"
-        } else {
-            ""
-        };
         if self.state.on_confirm_page() {
-            return format!("enter: submit  ·  ←/h: back{scroll}{expand}  ·  esc: cancel");
+            ids.extend([
+                DialogBindingId::Submit,
+                DialogBindingId::Back,
+                DialogBindingId::Cancel,
+            ]);
+        } else {
+            if self.is_approval() {
+                ids.extend([
+                    DialogBindingId::ApprovalPick,
+                    DialogBindingId::ConfirmAgain,
+                    DialogBindingId::Move,
+                ]);
+            } else if self.state.next_index().is_some() {
+                ids.extend([DialogBindingId::Toggle, DialogBindingId::Move]);
+            } else {
+                ids.extend([
+                    DialogBindingId::Pick,
+                    DialogBindingId::Move,
+                    DialogBindingId::Choose,
+                ]);
+            }
+            if self.state.page_count() > 1 {
+                ids.push(DialogBindingId::Questions);
+            }
         }
-        let multi = self.state.page_count() > 1;
-        let nav = if multi {
-            "  ·  ←/→: questions"
-        } else {
-            ""
+        if self.state.prompt_overflows() {
+            ids.push(DialogBindingId::PromptScroll);
+        }
+        if self.keyboard_enhancement_active {
+            ids.push(DialogBindingId::ChatScroll);
+        }
+        if let Some(expand) = self.expand_binding_id() {
+            ids.push(expand);
+        }
+        if !ids.contains(&DialogBindingId::Cancel) {
+            ids.push(DialogBindingId::Cancel);
+        }
+        self.format_footer(ids, width)
+    }
+
+    fn format_footer(&self, ids: Vec<DialogBindingId>, width: u16) -> String {
+        let mut rows = dialog_footer_bindings(&ids, self.keyboard_enhancement_active);
+        rows.sort_by_key(|row| row.priority);
+        let join = |rows: &[&crate::tui::keys_overlay::DialogBinding]| {
+            rows.iter()
+                .map(|row| row.footer)
+                .collect::<Vec<_>>()
+                .join("  ·  ")
         };
-        let pick = if self.is_approval() {
-            "1-9/enter: select  ·  enter again: confirm  ·  ↑/↓: move"
+        let width = width as usize;
+        while rows.len() > 2 && UnicodeWidthStr::width(join(&rows).as_str()) > width {
+            let Some((idx, _)) = rows.iter().enumerate().max_by_key(|(_, row)| row.priority) else {
+                break;
+            };
+            rows.remove(idx);
+        }
+        join(&rows)
+    }
+
+    fn expand_binding_id(&self) -> Option<DialogBindingId> {
+        if self.state.is_expanded() {
+            Some(DialogBindingId::Collapse)
         } else if self.state.next_index().is_some() {
-            "1-9/enter: toggle  ·  ↑/↓: move"
+            if self.has_more_than_collapsed_fits() {
+                Some(DialogBindingId::Expand)
+            } else {
+                None
+            }
+        } else if self.has_more_than_collapsed_fits() {
+            Some(DialogBindingId::Expand)
         } else {
-            "1-9: pick  ·  ↑/↓: move  ·  enter: choose"
-        };
-        format!("{pick}{nav}{scroll}{expand}  ·  esc: cancel")
+            None
+        }
     }
 
     /// Footer fragment for the whole-dialog `Ctrl+E` expand toggle. Shown
     /// whenever the dialog is collapsible (expanded) or has more content than
     /// fits (worth expanding); empty when it already fits collapsed.
     fn expand_hint(&self) -> String {
-        if self.state.is_expanded() {
-            "  ·  ctrl+e: collapse".to_string()
-        } else if self.has_more_than_collapsed_fits() {
-            "  ·  ctrl+e: expand".to_string()
-        } else {
-            String::new()
-        }
+        self.expand_binding_id()
+            .map(|id| format!("  ·  {}", dialog_binding(id).footer))
+            .unwrap_or_default()
     }
 
     /// Whether the current view's content exceeds the collapsed overlay's
@@ -807,6 +878,7 @@ impl QuestionDialog {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cursor: Option<(u16, u16)> = None;
+        let mut hovered_rows: Option<(usize, usize)> = None;
 
         match page.kind {
             PageKind::Text => {
@@ -851,6 +923,7 @@ impl QuestionDialog {
                 // straight, reclaiming the rows the markers used to reserve.
                 for row_idx in scroll..scroll + shown {
                     let hovered = self.state.cursor() == row_idx;
+                    let row_start = lines.len();
                     if row_idx < page.options.len() {
                         let opt = &page.options[row_idx];
                         let checked = selected.contains(&opt.id);
@@ -869,12 +942,10 @@ impl QuestionDialog {
                         if let Some(desc) = opt.description.as_deref() {
                             // Continuation line aligned under the label
                             // column (cursor + number + marker width).
-                            let indent = 2 + num.len() + marker.len();
-                            let description = Line::from(Span::styled(
-                                format!("{}{desc}", " ".repeat(indent)),
-                                muted,
-                            ));
-                            lines.extend(wrap_lines(&[description], area.width));
+                            let indent = OPTION_CURSOR_WIDTH
+                                + UnicodeWidthStr::width(num.as_str())
+                                + UnicodeWidthStr::width(marker);
+                            lines.extend(wrap_indented_text(desc, indent, area.width, muted));
                         }
                     } else if row_idx == custom_idx {
                         let typed = self.state.custom_text(page_idx);
@@ -915,8 +986,28 @@ impl QuestionDialog {
                     } else if Some(row_idx) == next_idx {
                         lines.push(self.option_line("", "→ ", NEXT_LABEL, hovered));
                     }
+                    if hovered {
+                        hovered_rows = Some((row_start, lines.len()));
+                    }
                 }
             }
+        }
+        let visible_h = area.height as usize;
+        if visible_h > 0 && lines.len() > visible_h {
+            let start = hovered_rows
+                .map(|(_, end)| end.saturating_sub(visible_h))
+                .unwrap_or(0)
+                .min(lines.len().saturating_sub(visible_h));
+            let end = start + visible_h;
+            lines = lines[start..end].to_vec();
+            cursor = cursor.and_then(|(x, y)| {
+                let row = y.saturating_sub(area.y) as usize;
+                if (start..end).contains(&row) {
+                    Some((x, area.y + (row - start) as u16))
+                } else {
+                    None
+                }
+            });
         }
         (lines, cursor)
     }
@@ -1291,6 +1382,35 @@ fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+fn wrap_indented_text(text: &str, indent: usize, width: u16, style: Style) -> Vec<Line<'static>> {
+    let prefix = " ".repeat(indent);
+    let available = (width as usize).saturating_sub(indent).max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut col = 0usize;
+    for word in split_keep_spaces(text) {
+        let word_width = UnicodeWidthStr::width(word.as_str());
+        if col > 0 && col + word_width > available {
+            rows.push(current.trim_end().to_string());
+            current.clear();
+            col = 0;
+        }
+        current.push_str(&word);
+        col += word_width;
+        while col > available {
+            rows.push(current.chars().take(available).collect::<String>());
+            current = current.chars().skip(available).collect::<String>();
+            col = UnicodeWidthStr::width(current.as_str());
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current.trim_end().to_string());
+    }
+    rows.into_iter()
+        .map(|row| Line::from(Span::styled(format!("{prefix}{row}"), style)))
+        .collect()
 }
 
 /// Rows one logical line wraps to at `width` (≥1). Word-wrap with hard
@@ -1773,6 +1893,190 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn footer_and_which_key_shift_page_binding_are_protocol_gated() {
+        let off = dialog(single_q()).with_keyboard_enhancement_active(false);
+        assert!(!off.footer_hint().contains("shift+pgup/pgdn"));
+
+        let on = dialog(single_q()).with_keyboard_enhancement_active(true);
+        assert!(on.footer_hint().contains("shift+pgup/pgdn"));
+    }
+
+    #[test]
+    fn scrolled_heterogeneous_rows_fit_from_scroll_offset() {
+        let mut set = single_q();
+        if let InterruptQuestion::Single { options, .. } = &mut set.questions[0] {
+            options[0].description = Some("short".into());
+            options[1].description = Some("word ".repeat(40) + "tail");
+        }
+        let mut d = dialog(set);
+        let area = Rect::new(0, 0, 60, 8);
+        d.sync_viewport(area, 12);
+        d.handle_key(press(KeyCode::Down));
+        d.sync_viewport(area, 12);
+
+        let answer = d.render_answer(Rect::new(0, 0, 60, 3)).0;
+        let text = answer
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("tail"),
+            "tall focused option tail is reachable: {text}"
+        );
+    }
+
+    #[test]
+    fn two_hundred_char_description_at_sixty_cols_keeps_tail_reachable() {
+        let mut set = single_q();
+        if let InterruptQuestion::Single { options, .. } = &mut set.questions[0] {
+            options[0].description = Some(format!("{} tail", "x".repeat(200)));
+        }
+        let d = dialog(set);
+        let answer = d.render_answer(Rect::new(0, 0, 60, 4)).0;
+        let text = answer
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("tail"), "{text}");
+    }
+
+    #[test]
+    fn narrow_width_tall_option_keeps_tail_reachable() {
+        let mut set = single_q();
+        if let InterruptQuestion::Single { options, .. } = &mut set.questions[0] {
+            options[0].description = Some("narrow ".repeat(40) + "tail");
+        }
+        let d = dialog(set);
+        let answer = d.render_answer(Rect::new(0, 0, 40, 3)).0;
+        let text = answer
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("tail"), "{text}");
+        assert!(!answer.is_empty());
+    }
+
+    #[test]
+    fn option_description_continuations_use_display_width_indent() {
+        let mut set = single_q();
+        if let InterruptQuestion::Single { options, .. } = &mut set.questions[0] {
+            options[0].description = Some("alpha beta gamma delta epsilon zeta eta theta".into());
+        }
+        let d = dialog(set);
+        let answer = d.render_answer(Rect::new(0, 0, 32, 8)).0;
+        let rows = answer
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let desc_rows = rows
+            .iter()
+            .filter(|row| {
+                row.trim_start().starts_with("alpha") || row.trim_start().starts_with("epsilon")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            desc_rows.iter().all(|row| row.starts_with("         ")),
+            "{rows:?}"
+        );
+        assert!(
+            desc_rows.iter().all(|row| !row.starts_with("          ")),
+            "indent is display width 9, not byte width 11: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn twelve_option_list_numbers_one_through_nine_only() {
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Pick".into(),
+                options: (1..=12)
+                    .map(|n| InterruptOption {
+                        id: format!("o{n}"),
+                        label: format!("Option {n}"),
+                        description: None,
+                        secondary: false,
+                    })
+                    .collect(),
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                sandbox_escalation: None,
+            }],
+        };
+        let mut d = dialog(set);
+        d.sync_viewport(Rect::new(0, 0, 80, 16), 24);
+        for _ in 0..8 {
+            d.handle_key(press(KeyCode::Down));
+        }
+        let lines = d.render_answer(Rect::new(0, 0, 80, 16)).0;
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("9. ( ) Option 9"));
+        assert!(text.contains("   ( ) Option 10"));
+        assert!(!text.contains("10. Option 10"));
+        assert!(!text.contains("11. Option 11"));
+        assert!(!text.contains("12. Option 12"));
+    }
+
+    #[test]
+    fn multiselect_typed_custom_renders_checked_after_navigation() {
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Multi {
+                prompt: "Pick".into(),
+                options: vec![InterruptOption {
+                    id: "a".into(),
+                    label: "A".into(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: true,
+            }],
+        };
+        let mut d = dialog(set);
+        d.handle_key(press(KeyCode::Down)); // custom
+        d.handle_key(press(KeyCode::Enter)); // begin typing
+        for ch in "custom value".chars() {
+            d.handle_key(press(KeyCode::Char(ch)));
+        }
+        d.handle_key(press(KeyCode::Esc)); // leave typing, keep custom text
+        d.handle_key(press(KeyCode::Down)); // navigate to Next
+
+        let text = render_lines(&d, Rect::new(0, 0, 60, 10)).join("\n");
+        assert!(text.contains("[x] custom value"), "{text}");
     }
 
     #[test]

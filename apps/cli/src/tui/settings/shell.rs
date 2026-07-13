@@ -171,7 +171,6 @@ impl SettingsScrollStates {
         frame.render_stateful_widget(List::new(items).scroll_padding(1), area, state);
     }
 
-    #[cfg(test)]
     pub(super) fn offset_for(&self, key: &str) -> usize {
         self.states
             .borrow()

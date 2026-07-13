@@ -41,9 +41,16 @@ impl App {
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             if self.mouse_capture {
-                self.link_registry.update_hover(mouse.column, mouse.row);
+                let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
+            } else {
+                self.link_registry.clear_hover();
             }
             self.update_hovered_affordance(&mouse);
+            if self.link_registry.hovered().is_some() {
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+            }
             return;
         }
         if self.mouse_capture

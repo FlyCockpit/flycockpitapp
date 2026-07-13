@@ -156,6 +156,15 @@ pub(super) struct RootPage {
 pub(super) trait SettingsPage: Any {
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav;
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect);
+    fn render_with_links(
+        &self,
+        cx: &SettingsCx,
+        frame: &mut Frame,
+        area: Rect,
+        _links: &mut crate::tui::links::LinkRegistry,
+    ) {
+        self.render(cx, frame, area);
+    }
     fn title(&self, cx: &SettingsCx) -> String;
     fn help_text(&self, cx: &SettingsCx) -> &'static str;
     fn as_any(&self) -> &dyn Any;
@@ -1485,21 +1494,8 @@ impl SettingsDialog {
         frame.render_widget(block, area);
 
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-        self.page.render(&self.cx, frame, layout[0]);
-        if let Some(page) = self.page.downcast_ref::<ProvidersPage>()
-            && let Some((url, label, row)) = page.oauth_link()
-        {
-            let x = layout[0].x.saturating_add(6);
-            let width = layout[0]
-                .right()
-                .saturating_sub(x)
-                .min(unicode_width::UnicodeWidthStr::width(label) as u16);
-            links.register(
-                Rect::new(x, layout[0].y.saturating_add(row as u16), width, 1),
-                url,
-                label,
-            );
-        }
+        self.page
+            .render_with_links(&self.cx, frame, layout[0], links);
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
             frame.set_cursor_position(cursor);
         }
@@ -2887,6 +2883,51 @@ mod tests {
         assert_eq!(state.manual_input.text(), "manual-code");
     }
 
+    #[test]
+    fn grok_and_codex_oauth_render_register_link_regions() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+
+        let mut grok = providers::BrowserCallbackOAuthState::new();
+        grok.authorize_url = Some("https://x.ai/oauth/authorize?state=abc".to_string());
+        d.set_test_page(Page::Providers(ProvidersPage::GrokOAuthSetup {
+            state: Box::new(grok),
+            parent: Box::new(providers::EditState::new(
+                "grok-oauth".to_string(),
+                Default::default(),
+            )),
+        }));
+        let links = render_settings_links(&d, 96, 24);
+        assert_eq!(links.regions().len(), 1);
+        assert_eq!(
+            links.regions()[0].url,
+            "https://x.ai/oauth/authorize?state=abc"
+        );
+        assert_eq!(links.regions()[0].rect.height, 1);
+        assert_eq!(links.regions()[0].label, "open xai.com authorization page");
+
+        let mut codex = providers::DeviceCodeOAuthState::new();
+        codex.pending = Some(crate::auth::codex_oauth::DeviceLogin::for_test(
+            "https://microsoft.com/devicelogin",
+            "ABCD-EFGH",
+        ));
+        d.set_test_page(Page::Providers(ProvidersPage::CodexOAuthSetup {
+            state: Box::new(codex),
+            parent: Box::new(providers::EditState::new(
+                "codex-oauth".to_string(),
+                Default::default(),
+            )),
+        }));
+        let links = render_settings_links(&d, 96, 24);
+        assert_eq!(links.regions().len(), 1);
+        assert_eq!(links.regions()[0].url, "https://microsoft.com/devicelogin");
+        assert_eq!(links.regions()[0].rect.height, 1);
+        assert_eq!(
+            links.regions()[0].label,
+            "https://microsoft.com/devicelogin"
+        );
+    }
+
     // ── Category-page tests (reorganized /settings) ────────────────────
 
     use category::{Category, SettingId};
@@ -2958,6 +2999,20 @@ mod tests {
             .chunks(usize::from(width))
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
+    }
+
+    fn render_settings_links(
+        d: &SettingsDialog,
+        width: u16,
+        height: u16,
+    ) -> crate::tui::links::LinkRegistry {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut links = crate::tui::links::LinkRegistry::default();
+        terminal
+            .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+            .expect("draw");
+        links
     }
 
     fn rendered_char(row: &str, x: u16) -> char {

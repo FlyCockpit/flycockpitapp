@@ -38,6 +38,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::auth::{
     codex_oauth,
@@ -477,33 +478,88 @@ impl ProvidersPage {
         state.manual_input.paste(text);
         true
     }
+}
 
-    pub(super) fn oauth_link(&self) -> Option<(&str, &str, usize)> {
-        let (url, label, flow) = match self {
-            Self::GrokOAuthSetup { state, .. }
-            | Self::Add(AddState {
-                step: AddStep::GrokOAuthAuth(state),
-                ..
-            }) => (
-                state.authorize_url.as_deref()?,
-                "open xai.com authorization page",
-                OAuthFlowView::Grok(state),
-            ),
-            Self::CodexOAuthSetup { state, .. }
-            | Self::Add(AddState {
-                step: AddStep::CodexOAuthAuth(state),
-                ..
-            }) => (
-                state.pending.as_ref()?.verification_uri.as_str(),
-                state.pending.as_ref()?.verification_uri.as_str(),
-                OAuthFlowView::Codex(state),
-            ),
-            _ => return None,
-        };
-        let row = oauth_setup_lines(flow)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedLinkRegion {
+    row: usize,
+    x_offset: u16,
+    width: u16,
+    url: String,
+    label: String,
+}
+
+fn prepare_oauth_link_regions(
+    lines: &mut [Line<'static>],
+    area: Rect,
+    flow: OAuthFlowView<'_>,
+    links: Option<&crate::tui::links::LinkRegistry>,
+) -> Option<Vec<RenderedLinkRegion>> {
+    let (url, raw_label) = oauth_link_target(flow)?;
+    let row = lines.iter().position(|line| {
+        line.spans
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.as_ref() == label))?;
-        Some((url, label, row))
+            .any(|span| span.content.as_ref() == raw_label)
+    })?;
+    let line = lines.get_mut(row)?;
+    let span_index = line
+        .spans
+        .iter()
+        .position(|span| span.content.as_ref() == raw_label)?;
+    let x_offset = line.spans[..span_index]
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let available = usize::from(area.width).saturating_sub(x_offset);
+    let painted = crate::tui::links::clipped_label(raw_label, available as u16);
+    let width = UnicodeWidthStr::width(painted.as_str()).min(available) as u16;
+    let hovered = links
+        .and_then(crate::tui::links::LinkRegistry::hovered_url)
+        .is_some_and(|hovered| hovered == url);
+    line.spans[span_index].content = painted.clone().into();
+    line.spans[span_index].style = crate::tui::links::link_style(hovered);
+    Some(vec![RenderedLinkRegion {
+        row,
+        x_offset: x_offset as u16,
+        width,
+        url: url.to_string(),
+        label: painted,
+    }])
+}
+
+fn register_visible_link_regions(
+    links: &mut crate::tui::links::LinkRegistry,
+    area: Rect,
+    scroll_offset: usize,
+    regions: Vec<RenderedLinkRegion>,
+) {
+    let visible_end = scroll_offset.saturating_add(usize::from(area.height));
+    for region in regions {
+        if region.row < scroll_offset || region.row >= visible_end || region.width == 0 {
+            continue;
+        }
+        let y = area
+            .y
+            .saturating_add(region.row.saturating_sub(scroll_offset) as u16);
+        links.register(
+            Rect::new(area.x.saturating_add(region.x_offset), y, region.width, 1),
+            region.url,
+            region.label,
+        );
+    }
+}
+
+fn oauth_link_target(flow: OAuthFlowView<'_>) -> Option<(&str, &str)> {
+    match flow {
+        OAuthFlowView::Grok(state) => Some((
+            state.authorize_url.as_deref()?,
+            "open xai.com authorization page",
+        )),
+        OAuthFlowView::Codex(state) => {
+            let uri = state.pending.as_ref()?.verification_uri.as_str();
+            Some((uri, uri))
+        }
+        OAuthFlowView::Copilot(_) => None,
     }
 }
 
@@ -2143,6 +2199,7 @@ impl SettingsCx {
         frame: &mut Frame,
         area: Rect,
         page: &ProvidersPage,
+        links: Option<&mut crate::tui::links::LinkRegistry>,
     ) {
         match page {
             ProvidersPage::List {
@@ -2152,7 +2209,7 @@ impl SettingsCx {
             } => {
                 self.render_providers_list(frame, area, *cursor, status.as_deref(), *delete_pending)
             }
-            ProvidersPage::Add(s) => self.render_add(frame, area, s),
+            ProvidersPage::Add(s) => self.render_add(frame, area, s, links),
             ProvidersPage::Edit(s) => self.render_edit(frame, area, s),
             ProvidersPage::Headers { editor, parent } => {
                 self.render_headers_page(frame, area, editor, parent.as_ref())
@@ -2175,10 +2232,10 @@ impl SettingsCx {
                 self.render_copilot_setup(frame, area, state)
             }
             ProvidersPage::GrokOAuthSetup { state, .. } => {
-                render_oauth_setup(frame, area, OAuthFlowView::Grok(state))
+                render_oauth_setup(frame, area, OAuthFlowView::Grok(state), links)
             }
             ProvidersPage::CodexOAuthSetup { state, .. } => {
-                render_oauth_setup(frame, area, OAuthFlowView::Codex(state))
+                render_oauth_setup(frame, area, OAuthFlowView::Codex(state), links)
             }
         }
     }
@@ -2284,7 +2341,13 @@ impl SettingsCx {
         );
     }
 
-    fn render_add(&self, frame: &mut Frame, area: Rect, s: &AddState) {
+    fn render_add(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        s: &AddState,
+        links: Option<&mut crate::tui::links::LinkRegistry>,
+    ) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let red = Style::default().fg(Color::Red);
@@ -2444,9 +2507,25 @@ impl SettingsCx {
             };
             lines.push(Line::from(Span::styled(err.clone(), style)));
         }
+        let oauth_flow = match &s.step {
+            AddStep::GrokOAuthAuth(state) => Some(OAuthFlowView::Grok(state)),
+            AddStep::CodexOAuthAuth(state) => Some(OAuthFlowView::Codex(state)),
+            _ => None,
+        };
+        let link_regions = oauth_flow
+            .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
+            .unwrap_or_default();
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states
             .render_lines(frame, area, "providers:add", lines, selected_line);
+        if let Some(links) = links {
+            register_visible_link_regions(
+                links,
+                area,
+                self.scroll_states.offset_for("providers:add"),
+                link_regions,
+            );
+        }
         if matches!(s.step, AddStep::EditHeaders) && s.headers.is_editing() {
             render_header_edit_popup(frame, area, &s.headers);
         }
@@ -3474,7 +3553,17 @@ impl SettingsPage for ProvidersPage {
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        cx.render_providers_page(frame, area, self);
+        cx.render_providers_page(frame, area, self, None);
+    }
+
+    fn render_with_links(
+        &self,
+        cx: &SettingsCx,
+        frame: &mut Frame,
+        area: Rect,
+        links: &mut crate::tui::links::LinkRegistry,
+    ) {
+        cx.render_providers_page(frame, area, self, Some(links));
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

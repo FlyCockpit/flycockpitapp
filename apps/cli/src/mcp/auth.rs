@@ -371,7 +371,7 @@ pub async fn run_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<StoredTo
 
     eprintln!("Opening browser for MCP server `{server}` OAuth…");
     eprintln!("If it doesn't open, visit:\n  {url}");
-    let _ = webbrowser_open(&url);
+    let _ = crate::browser::open(&url);
 
     let (code, got_state) = wait_for_callback(listener).await?;
     if got_state != state {
@@ -383,31 +383,6 @@ pub async fn run_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<StoredTo
     store.set(cred_key(server), serde_json::to_value(&tokens)?);
     store.save()?;
     Ok(tokens)
-}
-
-/// Best-effort browser open without pulling a dependency: shell out to the
-/// platform opener. Failure is non-fatal (the URL is also printed).
-fn webbrowser_open(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut cmd = {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    cmd.spawn().context("launching browser")?;
-    Ok(())
 }
 
 /// Block on the loopback listener until the OAuth provider redirects back

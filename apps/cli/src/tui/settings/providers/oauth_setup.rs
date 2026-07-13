@@ -184,8 +184,19 @@ pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>) -> Vec<Line<'static>> {
     lines
 }
 
-pub(super) fn render_oauth_setup(frame: &mut Frame, area: Rect, flow: OAuthFlowView<'_>) {
-    frame.render_widget(Paragraph::new(oauth_setup_lines(flow)), area);
+pub(super) fn render_oauth_setup(
+    frame: &mut Frame,
+    area: Rect,
+    flow: OAuthFlowView<'_>,
+    links: Option<&mut crate::tui::links::LinkRegistry>,
+) {
+    let mut lines = oauth_setup_lines(flow);
+    let link_regions = super::prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref())
+        .unwrap_or_default();
+    frame.render_widget(Paragraph::new(lines), area);
+    if let Some(links) = links {
+        super::register_visible_link_regions(links, area, 0, link_regions);
+    }
 }
 
 pub(super) fn render_oauth_body(lines: &mut Vec<Line<'static>>, flow: OAuthFlowView<'_>) {

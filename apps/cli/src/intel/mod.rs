@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::db::Db;
@@ -161,7 +161,7 @@ impl Index {
             .db
             .read(move |conn| {
                 let indexed = load_indexed(conn, &read_root_key)?;
-                let version = load_index_logic_version(conn)?;
+                let version = load_index_logic_version(conn, &read_root_key)?;
                 Ok((indexed, version == Some(INTEL_INDEX_LOGIC_VERSION)))
             })
             .await?;
@@ -193,7 +193,7 @@ impl Index {
                             callgraph::recompute_centrality(conn, &write_root_key)?;
                         }
                         if write_version {
-                            store_index_logic_version(conn)?;
+                            store_index_logic_version(conn, &write_root_key)?;
                         }
                         Ok(())
                     })
@@ -238,7 +238,7 @@ impl Index {
             .write(move |conn| {
                 callgraph::recompute_centrality(conn, &write_root_key)?;
                 if write_version {
-                    store_index_logic_version(conn)?;
+                    store_index_logic_version(conn, &write_root_key)?;
                 }
                 Ok(())
             })
@@ -810,22 +810,22 @@ fn disk_file_for(abs: &Path, root: &Path) -> Option<DiskFile> {
 
 type IndexedMap = HashMap<String, (i64, i64, String)>;
 
-fn load_index_logic_version(conn: &Connection) -> Result<Option<i64>> {
+fn load_index_logic_version(conn: &Connection, root_key: &str) -> Result<Option<i64>> {
     let version = conn
         .query_row(
-            "SELECT value FROM intel_meta WHERE key = 'index_logic_version'",
-            [],
+            "SELECT value FROM intel_meta WHERE root = ?1 AND key = 'index_logic_version'",
+            [root_key],
             |r| r.get(0),
         )
         .optional()?;
     Ok(version)
 }
 
-fn store_index_logic_version(conn: &Connection) -> Result<()> {
+fn store_index_logic_version(conn: &Connection, root_key: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO intel_meta (key, value) VALUES ('index_logic_version', ?1) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [INTEL_INDEX_LOGIC_VERSION],
+        "INSERT INTO intel_meta (root, key, value) VALUES (?1, 'index_logic_version', ?2) \
+         ON CONFLICT(root, key) DO UPDATE SET value = excluded.value",
+        params![root_key, INTEL_INDEX_LOGIC_VERSION],
     )?;
     Ok(())
 }
@@ -1119,6 +1119,28 @@ mod tests {
         .unwrap()
     }
 
+    fn stored_index_logic_version(db: &Db, root_key: &str) -> i64 {
+        db.read_blocking(|conn| {
+            Ok(conn.query_row(
+                "SELECT value FROM intel_meta WHERE root = ?1 AND key = 'index_logic_version'",
+                [root_key],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+    }
+
+    fn indexed_language(db: &Db, root_key: &str, path: &str) -> String {
+        db.read_blocking(|conn| {
+            Ok(conn.query_row(
+                "SELECT language FROM intel_files WHERE root = ?1 AND path = ?2",
+                params![root_key, path],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn indexes_two_languages() {
         let db = Db::open_in_memory().unwrap();
@@ -1155,28 +1177,12 @@ mod tests {
         let index = Index::new(db.clone(), root.clone());
         index.ensure_fresh().await.unwrap();
 
-        let stored_version: i64 = db
-            .read_blocking(|conn| {
-                Ok(conn.query_row(
-                    "SELECT value FROM intel_meta WHERE key = 'index_logic_version'",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
-            .unwrap();
+        let stored_version = stored_index_logic_version(&db, &root_key);
         assert_eq!(stored_version, INTEL_INDEX_LOGIC_VERSION);
-        let query_root_key = root_key.clone();
-        let language = || {
-            db.read_blocking(|conn| {
-                Ok(conn.query_row(
-                    "SELECT language FROM intel_files WHERE root = ?1 AND path = 'Dockerfile.dev'",
-                    [&query_root_key],
-                    |r| r.get::<_, String>(0),
-                )?)
-            })
-            .unwrap()
-        };
-        assert_eq!(language(), "dockerfile");
+        assert_eq!(
+            indexed_language(&db, &root_key, "Dockerfile.dev"),
+            "dockerfile"
+        );
 
         let write_root_key = root_key.clone();
         db.write(move |conn| {
@@ -1190,32 +1196,100 @@ mod tests {
         .unwrap();
         index.ensure_fresh().await.unwrap();
         assert_eq!(
-            language(),
+            indexed_language(&db, &root_key, "Dockerfile.dev"),
             "unknown",
             "matching logic version should preserve unchanged rows"
         );
 
-        db.write(|conn| {
+        let write_root_key = root_key.clone();
+        db.write(move |conn| {
             conn.execute(
-                "UPDATE intel_meta SET value = ?1 WHERE key = 'index_logic_version'",
-                [INTEL_INDEX_LOGIC_VERSION + 1],
+                "UPDATE intel_meta SET value = ?1 WHERE root = ?2 AND key = 'index_logic_version'",
+                params![INTEL_INDEX_LOGIC_VERSION + 1, write_root_key],
             )?;
             Ok(())
         })
         .await
         .unwrap();
         index.ensure_fresh().await.unwrap();
-        assert_eq!(language(), "dockerfile");
-        let stored_version: i64 = db
-            .read_blocking(|conn| {
-                Ok(conn.query_row(
-                    "SELECT value FROM intel_meta WHERE key = 'index_logic_version'",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
-            .unwrap();
+        assert_eq!(
+            indexed_language(&db, &root_key, "Dockerfile.dev"),
+            "dockerfile"
+        );
+        let stored_version = stored_index_logic_version(&db, &root_key);
         assert_eq!(stored_version, INTEL_INDEX_LOGIC_VERSION);
+    }
+
+    #[tokio::test]
+    async fn index_logic_version_is_partitioned_by_root() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let root_a = tmp_a.path().to_path_buf();
+        let root_b = tmp_b.path().to_path_buf();
+        let root_key_a = root_a.to_string_lossy().into_owned();
+        let root_key_b = root_b.to_string_lossy().into_owned();
+        write_file(&root_a, "Dockerfile.dev", "FROM scratch\n");
+        write_file(&root_b, "Dockerfile.dev", "FROM scratch\n");
+
+        let index_a = Index::new(db.clone(), root_a);
+        let index_b = Index::new(db.clone(), root_b);
+        index_a.ensure_fresh().await.unwrap();
+        index_b.ensure_fresh().await.unwrap();
+        assert_eq!(
+            stored_index_logic_version(&db, &root_key_a),
+            INTEL_INDEX_LOGIC_VERSION
+        );
+        assert_eq!(
+            stored_index_logic_version(&db, &root_key_b),
+            INTEL_INDEX_LOGIC_VERSION
+        );
+
+        let write_root_key_a = root_key_a.clone();
+        let write_root_key_b = root_key_b.clone();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE intel_meta SET value = ?1 WHERE root IN (?2, ?3) AND key = 'index_logic_version'",
+                params![INTEL_INDEX_LOGIC_VERSION + 1, write_root_key_a, write_root_key_b],
+            )?;
+            conn.execute(
+                "UPDATE intel_files SET language = 'unknown' WHERE root IN (?1, ?2) AND path = 'Dockerfile.dev'",
+                params![write_root_key_a, write_root_key_b],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        index_a.ensure_fresh().await.unwrap();
+        assert_eq!(
+            indexed_language(&db, &root_key_a, "Dockerfile.dev"),
+            "dockerfile"
+        );
+        assert_eq!(
+            stored_index_logic_version(&db, &root_key_a),
+            INTEL_INDEX_LOGIC_VERSION
+        );
+        assert_eq!(
+            indexed_language(&db, &root_key_b, "Dockerfile.dev"),
+            "unknown",
+            "root A reindex must not rewrite root B rows"
+        );
+        assert_eq!(
+            stored_index_logic_version(&db, &root_key_b),
+            INTEL_INDEX_LOGIC_VERSION + 1,
+            "root A version write must not satisfy root B"
+        );
+
+        index_b.ensure_fresh().await.unwrap();
+        assert_eq!(
+            indexed_language(&db, &root_key_b, "Dockerfile.dev"),
+            "dockerfile"
+        );
+        assert_eq!(
+            stored_index_logic_version(&db, &root_key_b),
+            INTEL_INDEX_LOGIC_VERSION
+        );
     }
 
     /// A gitignored source file is skipped by the default walk, but

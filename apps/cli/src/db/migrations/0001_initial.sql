@@ -336,8 +336,10 @@ CREATE TABLE tokenizer_calibration (
 -- in one statement.
 
 CREATE TABLE intel_meta (
-    key   TEXT PRIMARY KEY,
-    value INTEGER NOT NULL
+    root  TEXT    NOT NULL,
+    key   TEXT    NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (root, key)
 );
 
 CREATE TABLE intel_files (

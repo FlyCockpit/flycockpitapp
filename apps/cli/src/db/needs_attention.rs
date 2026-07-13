@@ -130,7 +130,6 @@ impl Db {
         })
     }
 
-    #[allow(dead_code)]
     pub fn list_open_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn

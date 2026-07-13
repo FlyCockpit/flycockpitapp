@@ -326,6 +326,7 @@ pub enum TurnEvent {
         description: String,
         questions: crate::daemon::proto::InterruptQuestionSet,
         pending_count: usize,
+        reason: crate::daemon::proto::InterruptRaiseReason,
     },
     InterruptQueueChanged {
         session_id: uuid::Uuid,

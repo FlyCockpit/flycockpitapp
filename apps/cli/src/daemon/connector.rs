@@ -1536,6 +1536,7 @@ mod tests {
             }),
             questions: None,
             pending_count: 0,
+            reason: crate::daemon::proto::InterruptRaiseReason::Initial,
         };
         let payload = attention_payload_for_event(&event, &ctx, "instance-1").unwrap();
         assert_eq!(payload["kind"], "approval");

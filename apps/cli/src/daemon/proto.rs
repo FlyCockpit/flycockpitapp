@@ -866,6 +866,14 @@ pub struct InterruptDecision {
     pub lines: Vec<InterruptDecisionLine>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptRaiseReason {
+    Initial,
+    Advance,
+    Rehydration,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", content = "data")]
 pub enum ResolveResponse {

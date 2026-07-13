@@ -93,6 +93,12 @@ pub enum HistoryEntry {
     Maintenance {
         line: String,
     },
+    /// Structured question/approval resolution row. Distinct from generic
+    /// maintenance so dismissed decisions can be styled from the wire
+    /// `cancelled` flag instead of string-matching the answer.
+    InterruptDecision {
+        decision: crate::daemon::proto::InterruptDecision,
+    },
     /// A user-authored session-history note (`/note <text>`,
     /// implementation note). Rendered as a DISTINCT "note to
     /// self" row — visually separate from a normal user message and from
@@ -798,6 +804,12 @@ pub fn export_transcript(history: &[HistoryEntry]) -> serde_json::Value {
                     "text": line,
                 })
             }
+            HistoryEntry::InterruptDecision { decision } => serde_json::json!({
+                "type": "interrupt_decision",
+                "permission": decision.permission,
+                "cancelled": decision.cancelled,
+                "lines": decision.lines,
+            }),
             HistoryEntry::UserNote {
                 text, timestamp, ..
             } => serde_json::json!({
@@ -1026,6 +1038,19 @@ pub fn render_entry(
             reasoning_scroll_region: None,
             pin_region: None,
         },
+        HistoryEntry::InterruptDecision { decision } => {
+            let lines = render_interrupt_decision(decision);
+            let continuations = vec![false; lines.len()];
+            Rendered {
+                lines,
+                chip_row: None,
+                continuations,
+                tool_call_rows: Vec::new(),
+                tool_result_scroll_regions: Vec::new(),
+                reasoning_scroll_region: None,
+                pin_region: None,
+            }
+        }
         HistoryEntry::UserNote {
             text, timestamp, ..
         } => {
@@ -1696,6 +1721,52 @@ fn render_user_markdown(
         out.push(timestamped);
     }
     (out, pin_region)
+}
+
+fn render_interrupt_decision(
+    decision: &crate::daemon::proto::InterruptDecision,
+) -> Vec<Line<'static>> {
+    let prefix = if decision.permission {
+        "approval"
+    } else {
+        "decision"
+    };
+    let prefix_style = Style::default()
+        .fg(if decision.permission {
+            PLAN_YELLOW
+        } else {
+            INFO_TEXT
+        })
+        .add_modifier(Modifier::BOLD);
+    let answer_style = if decision.cancelled {
+        Style::default()
+            .fg(WARNING_TEXT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(SUCCESS_TEXT)
+    };
+    decision
+        .lines
+        .iter()
+        .map(|line| {
+            let answer = if decision.cancelled {
+                "dismissed"
+            } else {
+                line.answer.as_str()
+            };
+            Line::from(vec![
+                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(INFO_TEXT)),
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::styled(": ", Style::default().fg(INFO_TEXT)),
+                Span::styled(line.prompt.clone(), Style::default().fg(INFO_TEXT)),
+                Span::styled(
+                    " → ",
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                ),
+                Span::styled(answer.to_string(), answer_style),
+            ])
+        })
+        .collect()
 }
 
 /// A user-authored session-history note (`/note <text>`). Rendered as a
@@ -3553,6 +3624,63 @@ mod tests {
         assert_eq!(arr[1]["text"], "remember the retry change broke it");
         assert!(arr[1].get("timestamp").is_some());
         assert_eq!(arr[2]["type"], "assistant");
+    }
+
+    #[test]
+    fn export_transcript_includes_interrupt_decision_rows() {
+        let history = vec![HistoryEntry::InterruptDecision {
+            decision: crate::daemon::proto::InterruptDecision {
+                permission: false,
+                cancelled: true,
+                lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                    prompt: "Proceed?".to_string(),
+                    answer: "No".to_string(),
+                }],
+            },
+        }];
+
+        let v = export_transcript(&history);
+        let arr = v.as_array().expect("turns array");
+        assert_eq!(arr[0]["type"], "interrupt_decision");
+        assert_eq!(arr[0]["cancelled"], true);
+        assert_eq!(arr[0]["lines"][0]["prompt"], "Proceed?");
+    }
+
+    #[test]
+    fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
+        let entry = HistoryEntry::InterruptDecision {
+            decision: crate::daemon::proto::InterruptDecision {
+                permission: true,
+                cancelled: true,
+                lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                    prompt: "Run command?".to_string(),
+                    answer: "Allow".to_string(),
+                }],
+            },
+        };
+
+        let rendered = render_entry(
+            &entry,
+            80,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            crate::config::extended::DiffStyle::default(),
+            false,
+            &no_elided(),
+            0,
+            None,
+        );
+
+        assert_eq!(rendered.lines.len(), 1);
+        assert_eq!(
+            line_text(&rendered.lines[0]),
+            "  approval: Run command? → dismissed"
+        );
+        let spans = &rendered.lines[0].spans;
+        assert_eq!(spans[1].style.add_modifier, Modifier::BOLD);
+        assert_eq!(spans[5].content.as_ref(), "dismissed");
+        assert_eq!(spans[5].style.fg, Some(WARNING_TEXT));
+        assert_eq!(spans[5].style.add_modifier, Modifier::BOLD);
     }
 
     #[test]

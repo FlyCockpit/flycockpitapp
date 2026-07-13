@@ -375,6 +375,8 @@ pub enum Event {
         questions: Option<InterruptQuestionSet>,
         #[serde(default)]
         pending_count: usize,
+        #[serde(default = "default_interrupt_raise_reason")]
+        reason: super::InterruptRaiseReason,
     },
 
     InterruptQueueChanged {
@@ -704,6 +706,10 @@ pub enum Event {
 
 fn default_idle_reason() -> crate::engine::IdleReason {
     crate::engine::IdleReason::Completed
+}
+
+fn default_interrupt_raise_reason() -> super::InterruptRaiseReason {
+    super::InterruptRaiseReason::Initial
 }
 
 /// Convert a single engine `TurnEvent` into one or more wire

@@ -575,6 +575,7 @@ impl SessionWorkerHandle {
                 question: None,
                 questions: Some(questions),
                 pending_count: open.len().saturating_sub(1),
+                reason: proto::InterruptRaiseReason::Rehydration,
             },
         );
     }

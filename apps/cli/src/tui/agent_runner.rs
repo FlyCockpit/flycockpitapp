@@ -1292,6 +1292,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             description,
             questions: Some(questions),
             pending_count,
+            reason,
             ..
         } => TurnEvent::InterruptRaised {
             session_id,
@@ -1299,6 +1300,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             description,
             questions,
             pending_count,
+            reason,
         },
         InterruptQueueChanged {
             session_id,

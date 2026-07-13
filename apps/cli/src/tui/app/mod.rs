@@ -5862,6 +5862,16 @@ impl App {
         lockout
     }
 
+    /// Fresh lockout for daemon-authoritative interrupt re-install paths:
+    /// queue advance and attach re-hydration. The old zero-lockout branch is
+    /// still valid for a genuine same-flow continuation, but FIFO advance and
+    /// re-hydration are new dialogs from the user's perspective and must not
+    /// be immediately answerable.
+    pub(super) fn fresh_dialog_lockout(&mut self) -> Duration {
+        self.composer_active_since_dialog = false;
+        Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms)
+    }
+
     /// Send the answering dialog's outcome back to the daemon (GOALS
     /// §3b). Both submit and cancel become a `ResolveInterrupt` — cancel
     /// carries `ResolveResponse::Cancel`, which the worker fans out to a
@@ -7782,6 +7792,23 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
         HistoryEntry::Plain { line }
         | HistoryEntry::CommandError { line }
         | HistoryEntry::Maintenance { line } => vec![line.clone()],
+        HistoryEntry::InterruptDecision { decision } => decision
+            .lines
+            .iter()
+            .map(|line| {
+                let answer = if decision.cancelled {
+                    "dismissed"
+                } else {
+                    line.answer.as_str()
+                };
+                let prefix = if decision.permission {
+                    "approval"
+                } else {
+                    "decision"
+                };
+                format!("{prefix}: {} → {answer}", line.prompt)
+            })
+            .collect(),
         HistoryEntry::InferenceError {
             summary,
             detail,
@@ -13446,8 +13473,11 @@ mod fresh_queue_ack_tests {
 #[cfg(test)]
 mod attention_interrupt_surface_tests {
     use super::{App, ToastKind};
-    use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    use crate::daemon::proto::{
+        InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
+    };
     use crate::engine::TurnEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use uuid::Uuid;
 
     fn app() -> App {
@@ -13482,12 +13512,27 @@ mod attention_interrupt_surface_tests {
     }
 
     fn raise(session_id: Uuid, interrupt_id: Uuid, pending_count: usize) -> TurnEvent {
+        raise_with_reason(
+            session_id,
+            interrupt_id,
+            pending_count,
+            InterruptRaiseReason::Initial,
+        )
+    }
+
+    fn raise_with_reason(
+        session_id: Uuid,
+        interrupt_id: Uuid,
+        pending_count: usize,
+        reason: InterruptRaiseReason,
+    ) -> TurnEvent {
         TurnEvent::InterruptRaised {
             session_id,
             interrupt_id,
             description: String::new(),
             questions: question_set(false),
             pending_count,
+            reason,
         }
     }
 
@@ -13548,6 +13593,67 @@ mod attention_interrupt_surface_tests {
         assert!(
             app.toast.is_none(),
             "background toast clears once only a visible foreground dialog remains"
+        );
+    }
+
+    #[test]
+    fn advance_interrupt_opens_with_fresh_lockout_and_esc_does_not_dismiss() {
+        let mut app = app();
+        let session_id = Uuid::new_v4();
+        let interrupt_id = Uuid::new_v4();
+        app.launch.session_id = Some(session_id);
+
+        app.apply_event(raise_with_reason(
+            session_id,
+            interrupt_id,
+            1,
+            InterruptRaiseReason::Advance,
+        ));
+
+        let dialog = app.question_dialog.as_mut().expect("advanced dialog");
+        assert_eq!(dialog.interrupt_id(), interrupt_id);
+        assert_eq!(dialog.pending_count(), 1);
+        assert!(dialog.locked(), "queue advance must start a fresh lockout");
+        assert!(!dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(
+            dialog.take_result().is_none(),
+            "Esc during lockout must not cancel the advanced interrupt"
+        );
+    }
+
+    #[test]
+    fn repeated_raise_for_active_interrupt_updates_counter_without_takeover() {
+        let mut app = app();
+        let session_id = Uuid::new_v4();
+        let interrupt_id = Uuid::new_v4();
+        app.launch.session_id = Some(session_id);
+
+        app.apply_event(raise(session_id, interrupt_id, 0));
+        let dialog = app.question_dialog.as_ref().expect("initial dialog");
+        assert_eq!(dialog.interrupt_id(), interrupt_id);
+        assert!(!dialog.is_approval());
+
+        app.apply_event(TurnEvent::InterruptRaised {
+            session_id,
+            interrupt_id,
+            description: "new payload should not replace the active dialog".to_string(),
+            questions: question_set(true),
+            pending_count: 3,
+            reason: InterruptRaiseReason::Rehydration,
+        });
+
+        let dialog = app.question_dialog.as_ref().expect("same active dialog");
+        assert_eq!(dialog.interrupt_id(), interrupt_id);
+        assert_eq!(dialog.pending_count(), 3);
+        assert!(
+            !dialog.is_approval(),
+            "same-id re-raise should update queue metadata without replacing the visible dialog"
+        );
+        assert_eq!(
+            app.attention_interrupt
+                .as_ref()
+                .map(|state| state.pending_count),
+            Some(3)
         );
     }
 }
@@ -14470,6 +14576,31 @@ mod resume_history_conversion_tests {
                 assert_eq!(calls[0].state, ToolCallState::Success);
             }
             other => panic!("entries[2] should be ToolBox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converts_interrupt_decision_to_dedicated_tui_entry() {
+        let entries = wire_history_to_entries(vec![Wire::InterruptDecision {
+            decision: crate::daemon::proto::InterruptDecision {
+                permission: true,
+                cancelled: false,
+                lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                    prompt: "Run command?".into(),
+                    answer: "Allow".into(),
+                }],
+            },
+            seq: 42,
+        }]);
+
+        match &entries[..] {
+            [HistoryEntry::InterruptDecision { decision }] => {
+                assert!(decision.permission);
+                assert!(!decision.cancelled);
+                assert_eq!(decision.lines[0].prompt, "Run command?");
+                assert_eq!(decision.lines[0].answer, "Allow");
+            }
+            other => panic!("expected dedicated interrupt decision entry, got {other:?}"),
         }
     }
 

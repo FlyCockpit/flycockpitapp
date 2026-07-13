@@ -242,6 +242,15 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
         | HistoryEntry::Maintenance { line }
         | HistoryEntry::BackupWarning { line }
         | HistoryEntry::InferenceWarning { line } => hash_len(&mut hasher, line),
+        HistoryEntry::InterruptDecision { decision } => {
+            decision.permission.hash(&mut hasher);
+            decision.cancelled.hash(&mut hasher);
+            decision.lines.len().hash(&mut hasher);
+            for line in &decision.lines {
+                hash_len(&mut hasher, &line.prompt);
+                hash_len(&mut hasher, &line.answer);
+            }
+        }
         HistoryEntry::UserNote { text, timestamp } => {
             hash_len(&mut hasher, text);
             timestamp.hash(&mut hasher);
@@ -886,6 +895,9 @@ impl App {
                 HistoryEntry::Plain { .. }
                 | HistoryEntry::CommandError { .. }
                 | HistoryEntry::Maintenance { .. } => 1,
+                HistoryEntry::InterruptDecision { decision } => u16::try_from(decision.lines.len())
+                    .unwrap_or(u16::MAX)
+                    .max(1),
                 HistoryEntry::InferenceError {
                     detail, expanded, ..
                 } => {
@@ -2399,6 +2411,10 @@ impl App {
                 HistoryEntry::Plain { line }
                 | HistoryEntry::CommandError { line }
                 | HistoryEntry::Maintenance { line } => crate::tokens::count(line),
+                // UI/export-only acknowledgement of a settled interrupt; the
+                // model context receives the actual decision through the
+                // daemon event stream, not this rendered row.
+                HistoryEntry::InterruptDecision { .. } => 0,
                 HistoryEntry::ToolLine { summary, .. } => crate::tokens::count(summary),
                 HistoryEntry::ToolBox { calls, .. } => calls
                     .iter()
@@ -2456,6 +2472,12 @@ impl App {
                 HistoryEntry::Plain { line }
                 | HistoryEntry::CommandError { line }
                 | HistoryEntry::Maintenance { line } => line.len(),
+                HistoryEntry::InterruptDecision { decision } => {
+                    decision.lines.iter().fold(0usize, |acc, line| {
+                        acc + line.prompt.len() + line.answer.len()
+                    }) + usize::from(decision.permission)
+                        + usize::from(decision.cancelled)
+                }
                 HistoryEntry::ToolLine { summary, .. } => summary.len(),
                 HistoryEntry::ToolBox { calls, .. } => {
                     calls.iter().map(|c| c.summary.len() + c.output.len()).sum()
@@ -3554,6 +3576,9 @@ fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
         HistoryEntry::Plain { .. }
         | HistoryEntry::CommandError { .. }
         | HistoryEntry::Maintenance { .. } => 1,
+        HistoryEntry::InterruptDecision { decision } => u16::try_from(decision.lines.len())
+            .unwrap_or(u16::MAX)
+            .max(1),
         HistoryEntry::InferenceError {
             detail, expanded, ..
         } => {

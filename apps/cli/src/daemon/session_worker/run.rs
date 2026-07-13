@@ -1,3 +1,64 @@
+const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
+
+fn redaction_failed_interrupt_decision_payload(
+    interrupt_id: uuid::Uuid,
+    decision: &crate::daemon::proto::InterruptDecision,
+) -> serde_json::Value {
+    let lines = decision
+        .lines
+        .iter()
+        .map(|_| {
+            serde_json::json!({
+                "prompt": INTERRUPT_REDACTION_FAILED,
+                "answer": INTERRUPT_REDACTION_FAILED,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "interrupt_id": interrupt_id,
+        "decision": {
+            "permission": decision.permission,
+            "cancelled": decision.cancelled,
+            "lines": lines,
+        },
+    })
+}
+
+#[cfg(test)]
+mod interrupt_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redaction_failure_payload_preserves_shape_without_raw_interrupt_text() {
+        let interrupt_id = uuid::Uuid::new_v4();
+        let decision = crate::daemon::proto::InterruptDecision {
+            permission: true,
+            cancelled: false,
+            lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                prompt: "Run `cat /tmp/secret`?".to_string(),
+                answer: "Allow once".to_string(),
+            }],
+        };
+
+        let payload = redaction_failed_interrupt_decision_payload(interrupt_id, &decision);
+        let serialized = payload.to_string();
+
+        assert_eq!(payload["interrupt_id"], interrupt_id.to_string());
+        assert_eq!(payload["decision"]["permission"], true);
+        assert_eq!(payload["decision"]["cancelled"], false);
+        assert_eq!(
+            payload["decision"]["lines"][0]["prompt"],
+            INTERRUPT_REDACTION_FAILED
+        );
+        assert_eq!(
+            payload["decision"]["lines"][0]["answer"],
+            INTERRUPT_REDACTION_FAILED
+        );
+        assert!(!serialized.contains("/tmp/secret"));
+        assert!(!serialized.contains("Allow once"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_worker(
     session: Arc<Session>,
@@ -799,10 +860,16 @@ async fn run_worker(
                         "interrupt_id": interrupt_id,
                         "decision": decision,
                     });
-                    let redacted_data = serde_json::from_str(
-                        &crate::daemon::current_redaction(&redaction).scrub(&data.to_string()),
-                    )
-                    .unwrap_or(data);
+                    let scrubbed =
+                        crate::daemon::current_redaction(&redaction).scrub(&data.to_string());
+                    let redacted_data = serde_json::from_str(&scrubbed).unwrap_or_else(|error| {
+                        tracing::warn!(
+                            %error,
+                            %interrupt_id,
+                            "interrupt decision redaction produced invalid JSON; persisting fail-closed placeholder"
+                        );
+                        redaction_failed_interrupt_decision_payload(interrupt_id, decision)
+                    });
                     session
                         .record_event(
                             crate::db::session_log::SessionEventKind::InterruptDecision,

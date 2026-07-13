@@ -171,6 +171,7 @@ impl InterruptHub {
                     question: None,
                     questions: Some(questions),
                     pending_count,
+                    reason: proto::InterruptRaiseReason::Initial,
                 },
             );
         }
@@ -211,6 +212,7 @@ impl InterruptHub {
                     question: None,
                     questions: Some(questions),
                     pending_count,
+                    reason: proto::InterruptRaiseReason::Advance,
                 },
             );
         }
@@ -495,7 +497,12 @@ mod tests {
 
         assert!(matches!(
             events.recv().await.unwrap().event,
-            proto::Event::InterruptRaised { interrupt_id, pending_count: 0, .. }
+            proto::Event::InterruptRaised {
+                interrupt_id,
+                pending_count: 0,
+                reason: proto::InterruptRaiseReason::Initial,
+                ..
+            }
                 if interrupt_id == first
         ));
         assert!(matches!(
@@ -514,7 +521,12 @@ mod tests {
         ));
         assert!(matches!(
             events.recv().await.unwrap().event,
-            proto::Event::InterruptRaised { interrupt_id, pending_count: 1, .. }
+            proto::Event::InterruptRaised {
+                interrupt_id,
+                pending_count: 1,
+                reason: proto::InterruptRaiseReason::Advance,
+                ..
+            }
                 if interrupt_id == first
         ));
 
@@ -529,8 +541,50 @@ mod tests {
         ));
         assert!(matches!(
             events.recv().await.unwrap().event,
-            proto::Event::InterruptRaised { interrupt_id, pending_count: 0, .. }
+            proto::Event::InterruptRaised {
+                interrupt_id,
+                pending_count: 0,
+                reason: proto::InterruptRaiseReason::Advance,
+                ..
+            }
                 if interrupt_id == second
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_active_waiter_withdraws_and_advances_to_next_interrupt() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, mut events) = attached_hub(db.clone(), session.session_id);
+        let set = question_set();
+        let first = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .unwrap();
+        let second = db
+            .raise_interrupt_questions(session.session_id, "b", "second", &set)
+            .unwrap();
+        let pending = hub.register(first);
+
+        drop(pending);
+
+        assert_eq!(
+            db.list_open_interrupts(session.session_id).unwrap()[0].interrupt_id,
+            second
+        );
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptQueueChanged {
+                active_interrupt_id: Some(interrupt_id), pending_count: 0, ..
+            } if interrupt_id == second
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            proto::Event::InterruptRaised {
+                interrupt_id,
+                pending_count: 0,
+                reason: proto::InterruptRaiseReason::Advance,
+                ..
+            } if interrupt_id == second
         ));
     }
 

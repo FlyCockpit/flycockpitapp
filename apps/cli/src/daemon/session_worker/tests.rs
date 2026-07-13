@@ -728,6 +728,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let session_id = session.id;
+        let set = proto::InterruptQuestionSet {
+            questions: vec![proto::InterruptQuestion::Single {
+                prompt: "Proceed?".to_string(),
+                options: vec![proto::InterruptOption {
+                    id: "yes".to_string(),
+                    label: "Yes".to_string(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                sandbox_escalation: None,
+            }],
+        };
+        let interrupt_id = db
+            .raise_interrupt_questions(session_id, "Build", "context", &set)
+            .unwrap();
+        let _queued = db
+            .raise_interrupt_questions(session_id, "Build", "queued", &set)
+            .unwrap();
+        let locks = Arc::new(LockManager::in_memory(db));
+        let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
+
+        let mut rx = handle.subscribe();
+        handle.broadcast_active_interrupt();
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("active interrupt broadcast")
+            .expect("event envelope");
+        match envelope.event {
+            proto::Event::InterruptRaised {
+                session_id: got_session_id,
+                interrupt_id: got_interrupt_id,
+                description,
+                pending_count,
+                reason,
+                ..
+            } => {
+                assert_eq!(got_session_id, session_id);
+                assert_eq!(got_interrupt_id, interrupt_id);
+                assert_eq!(description, "context");
+                assert_eq!(pending_count, 1);
+                assert_eq!(reason, proto::InterruptRaiseReason::Rehydration);
+            }
+            other => panic!("expected InterruptRaised, got {other:?}"),
+        }
+    }
+
     /// §6.5 de-dupe: the latch fires the broadcast exactly once per condition.
     /// Two failed `bash` calls (two `SandboxUnavailable` events) → one forward;
     /// `set_sandbox` re-arms it (clearing the latch) so a renewed condition

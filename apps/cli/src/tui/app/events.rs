@@ -160,18 +160,8 @@ impl App {
                     self.question_dialog = None;
                 }
                 self.resolve_attention_interrupt_for(session_id, interrupt_id);
-                let prefix = if decision.permission {
-                    "approval"
-                } else {
-                    "decision"
-                };
-                let lines = decision
-                    .lines
-                    .into_iter()
-                    .map(|line| format!("{prefix}: {} → {}", line.prompt, line.answer))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.history.push(HistoryEntry::Maintenance { line: lines });
+                self.history
+                    .push(HistoryEntry::InterruptDecision { decision });
             }
             TurnEvent::Reconnecting {
                 agent: _,
@@ -858,16 +848,21 @@ impl App {
                 description,
                 questions,
                 pending_count,
+                reason,
             } => {
                 // A `question` tool blocked the agent (GOALS §3b). Open
                 // the answering dialog over the composer. The
-                // anti-misfire lockout arms with the configured delay only
-                // on the genuine composer→dialog edge; a follow-up that
-                // directly succeeds another dialog opens immediately
-                // answerable (implementation note). If
-                // a dialog is somehow already open (re-raise), the newest
-                // one wins — the prior interrupt stays parked in the DB.
-                let lockout = self.dialog_lockout();
+                // anti-misfire lockout arms with the configured delay on the
+                // genuine composer→dialog edge, queue advancement, and attach
+                // rehydration. A same-id re-raise only updates queue metadata
+                // for the visible dialog.
+                let lockout = match reason {
+                    crate::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
+                    crate::daemon::proto::InterruptRaiseReason::Advance
+                    | crate::daemon::proto::InterruptRaiseReason::Rehydration => {
+                        self.fresh_dialog_lockout()
+                    }
+                };
                 // Attention: a permission/approval prompt vs an agent question
                 // (implementation note). Classify off the
                 // `permission` flag on any constituent `Single` — an approval
@@ -1613,19 +1608,7 @@ pub(super) fn wire_history_to_entries(
     for entry in wire {
         match entry {
             Wire::InterruptDecision { decision, .. } => {
-                let prefix = if decision.permission {
-                    "approval"
-                } else {
-                    "decision"
-                };
-                out.push(HistoryEntry::Maintenance {
-                    line: decision
-                        .lines
-                        .into_iter()
-                        .map(|line| format!("{prefix}: {} → {}", line.prompt, line.answer))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                });
+                out.push(HistoryEntry::InterruptDecision { decision });
             }
             Wire::User {
                 text,

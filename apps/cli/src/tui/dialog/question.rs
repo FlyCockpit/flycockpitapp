@@ -192,6 +192,11 @@ impl QuestionDialog {
         self.state.locked()
     }
 
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.pending_count
+    }
+
     /// Whether this dialog is a command/permission **approval** prompt (any
     /// page carries the permission flag) rather than a plain `question`
     /// interrupt. Used by the which-key overlay (`which-key-overlay.md`) to
@@ -2734,6 +2739,28 @@ mod tests {
         let text = rendered_dialog_text(q, 80, 10);
         assert!(text.contains(" question "), "{text}");
         assert!(!text.contains(" approval "), "{text}");
+    }
+
+    #[test]
+    fn title_includes_waiting_suffix_for_queued_interrupts() {
+        let q = QuestionDialog::new(
+            Uuid::new_v4(),
+            String::new(),
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Pick?".into(),
+                    options: vec![opt("a", "A")],
+                    allow_freetext: true,
+                    command_detail: None,
+                    permission: false,
+                    sandbox_escalation: None,
+                }],
+            },
+            Duration::ZERO,
+        )
+        .with_pending_count(2);
+        let text = rendered_dialog_text(q, 80, 10);
+        assert!(text.contains("question· 2 waiting"), "{text}");
     }
 
     #[test]

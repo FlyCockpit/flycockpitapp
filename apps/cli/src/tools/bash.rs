@@ -842,6 +842,12 @@ pub(crate) enum ShellWriteTargets {
 enum WriteToken {
     Word(String),
     Op(&'static str),
+    HeredocBody(String),
+}
+
+struct PendingHeredoc {
+    delimiter: String,
+    strip_tabs: bool,
 }
 
 pub(crate) fn shell_write_targets(command: &str, cwd: &Path) -> ShellWriteTargets {
@@ -887,7 +893,7 @@ pub(crate) fn shell_write_targets(command: &str, cwd: &Path) -> ShellWriteTarget
                     let mut j = i + 1;
                     while j < tokens.len() {
                         match &tokens[j] {
-                            WriteToken::Op(_) => break,
+                            WriteToken::Op(_) | WriteToken::HeredocBody(_) => break,
                             WriteToken::Word(arg) if arg.starts_with('-') && arg != "-" => {
                                 j += 1;
                             }
@@ -902,6 +908,9 @@ pub(crate) fn shell_write_targets(command: &str, cwd: &Path) -> ShellWriteTarget
                     }
                 }
                 command_start = false;
+                i += 1;
+            }
+            WriteToken::HeredocBody(_) => {
                 i += 1;
             }
         }
@@ -937,6 +946,12 @@ pub(crate) fn shell_write_content_preview(
 
 fn shell_write_content_preview_inner(command: &str) -> ShellWriteContentPreview {
     let tokens = shell_write_tokens(command);
+    if let Some(body) = tokens.iter().find_map(|token| match token {
+        WriteToken::HeredocBody(body) => Some(body),
+        _ => None,
+    }) {
+        return ShellWriteContentPreview::Literal(body.clone());
+    }
     let Some((op_index, _)) = tokens
         .iter()
         .enumerate()
@@ -958,7 +973,7 @@ fn words_before_redirect(tokens: &[WriteToken]) -> Vec<&str> {
         .iter()
         .filter_map(|token| match token {
             WriteToken::Word(word) => Some(word.as_str()),
-            WriteToken::Op(_) => None,
+            WriteToken::Op(_) | WriteToken::HeredocBody(_) => None,
         })
         .collect()
 }
@@ -1017,6 +1032,9 @@ fn durable_shell_write_hint(command: &str) -> Option<&'static str> {
                 }
                 i += 1;
             }
+            WriteToken::HeredocBody(_) => {
+                i += 1;
+            }
             WriteToken::Word(word) => {
                 if command_start {
                     if word == "tee" {
@@ -1034,6 +1052,72 @@ fn durable_shell_write_hint(command: &str) -> Option<&'static str> {
 
 fn shell_write_tokens(command: &str) -> Vec<WriteToken> {
     let mut tokens = Vec::new();
+    let mut lines = command.split_inclusive('\n').peekable();
+    while let Some(raw_line) = lines.next() {
+        let had_newline = raw_line.ends_with('\n');
+        let line = raw_line.trim_end_matches('\n');
+        let line_start = tokens.len();
+        tokenize_write_line(line, &mut tokens);
+        let pending = pending_heredocs(&tokens[line_start..]);
+        if had_newline {
+            tokens.push(WriteToken::Op(";"));
+        }
+        for heredoc in pending {
+            let mut body = String::new();
+            for body_raw in lines.by_ref() {
+                let body_had_newline = body_raw.ends_with('\n');
+                let body_line = body_raw.trim_end_matches('\n');
+                let compare = if heredoc.strip_tabs {
+                    body_line.trim_start_matches('\t')
+                } else {
+                    body_line
+                };
+                if compare == heredoc.delimiter {
+                    break;
+                }
+                let content = if heredoc.strip_tabs {
+                    body_line.trim_start_matches('\t')
+                } else {
+                    body_line
+                };
+                body.push_str(content);
+                if body_had_newline {
+                    body.push('\n');
+                }
+            }
+            tokens.push(WriteToken::HeredocBody(body));
+            tokens.push(WriteToken::Op(";"));
+        }
+    }
+    tokens
+}
+
+fn pending_heredocs(tokens: &[WriteToken]) -> Vec<PendingHeredoc> {
+    let mut pending = Vec::new();
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        match (&tokens[i], &tokens[i + 1]) {
+            (WriteToken::Op("<<"), WriteToken::Word(delimiter)) => {
+                pending.push(PendingHeredoc {
+                    delimiter: delimiter.clone(),
+                    strip_tabs: false,
+                });
+                i += 2;
+            }
+            (WriteToken::Op("<<-"), WriteToken::Word(delimiter)) => {
+                pending.push(PendingHeredoc {
+                    delimiter: delimiter.clone(),
+                    strip_tabs: true,
+                });
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    pending
+}
+
+fn tokenize_write_line(command: &str, tokens: &mut Vec<WriteToken>) {
     let mut word = String::new();
     let mut chars = command.chars().peekable();
     let mut quote: Option<char> = None;
@@ -1059,9 +1143,9 @@ fn shell_write_tokens(command: &str) -> Vec<WriteToken> {
                     word.push(next);
                 }
             }
-            c if c.is_whitespace() => push_write_word(&mut tokens, &mut word),
+            c if c.is_whitespace() => push_write_word(tokens, &mut word),
             ';' | '(' | ')' => {
-                push_write_word(&mut tokens, &mut word);
+                push_write_word(tokens, &mut word);
                 tokens.push(WriteToken::Op(match ch {
                     ';' => ";",
                     '(' => "(",
@@ -1070,7 +1154,7 @@ fn shell_write_tokens(command: &str) -> Vec<WriteToken> {
                 }));
             }
             '&' | '|' => {
-                push_write_word(&mut tokens, &mut word);
+                push_write_word(tokens, &mut word);
                 let op = if chars.peek().copied() == Some(ch) {
                     chars.next();
                     if ch == '&' { "&&" } else { "||" }
@@ -1082,7 +1166,7 @@ fn shell_write_tokens(command: &str) -> Vec<WriteToken> {
                 tokens.push(WriteToken::Op(op));
             }
             '>' => {
-                push_write_word(&mut tokens, &mut word);
+                push_write_word(tokens, &mut word);
                 let op = match chars.peek().copied() {
                     Some('>') => {
                         chars.next();
@@ -1097,10 +1181,13 @@ fn shell_write_tokens(command: &str) -> Vec<WriteToken> {
                 tokens.push(WriteToken::Op(op));
             }
             '<' => {
-                push_write_word(&mut tokens, &mut word);
+                push_write_word(tokens, &mut word);
                 let op = if chars.peek().copied() == Some('<') {
                     chars.next();
-                    if chars.peek().copied() == Some('-') {
+                    if chars.peek().copied() == Some('<') {
+                        chars.next();
+                        "<<<"
+                    } else if chars.peek().copied() == Some('-') {
                         chars.next();
                         "<<-"
                     } else {
@@ -1114,8 +1201,7 @@ fn shell_write_tokens(command: &str) -> Vec<WriteToken> {
             _ => word.push(ch),
         }
     }
-    push_write_word(&mut tokens, &mut word);
-    tokens
+    push_write_word(tokens, &mut word);
 }
 
 fn push_write_word(tokens: &mut Vec<WriteToken>, word: &mut String) {
@@ -3100,6 +3186,45 @@ mod tests {
         assert_eq!(
             shell_write_targets("printf a > a.txt && printf b > b.txt", root),
             ShellWriteTargets::Concrete(vec![root.join("a.txt"), root.join("b.txt")])
+        );
+    }
+
+    #[test]
+    fn shell_write_targets_ignore_redirect_like_heredoc_body_lines() {
+        let root = Path::new("/workspace/project");
+        assert_eq!(
+            shell_write_targets("cat <<EOF\n> /etc/passwd\nEOF", root),
+            ShellWriteTargets::None
+        );
+        assert_eq!(
+            shell_write_targets(
+                "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: /tmp/x\n> /\n*** End Patch\nPATCH",
+                root,
+            ),
+            ShellWriteTargets::None
+        );
+        assert_eq!(
+            shell_write_targets("cat <<EOF > /real/file\n> /etc/passwd\nEOF", root),
+            ShellWriteTargets::Concrete(vec![PathBuf::from("/real/file")])
+        );
+    }
+
+    #[test]
+    fn shell_write_tokens_handle_quoted_and_tab_stripped_heredocs() {
+        assert_eq!(
+            shell_write_content_preview_inner("cat <<'EOF' > out.txt\nbody > /\nEOF"),
+            ShellWriteContentPreview::Literal("body > /\n".to_string())
+        );
+        assert_eq!(
+            shell_write_content_preview_inner("cat <<-EOF > out.txt\n\tbody\n\tEOF"),
+            ShellWriteContentPreview::Literal("body\n".to_string())
+        );
+        assert_eq!(
+            shell_write_targets(
+                "cat <<< hello > /real/path",
+                Path::new("/workspace/project")
+            ),
+            ShellWriteTargets::Concrete(vec![PathBuf::from("/real/path")])
         );
     }
 

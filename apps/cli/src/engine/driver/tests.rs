@@ -426,6 +426,153 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
     );
 }
 
+#[tokio::test]
+async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "keep going through provider throttling",
+            None,
+            None,
+        )
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let failure = crate::engine::model::InferenceFailure {
+        provider: "test-provider".to_string(),
+        model: "test-model".to_string(),
+        phase: "stream".to_string(),
+        class: "http_429".to_string(),
+        elapsed_ms: 42,
+        detail: "rate limited".to_string(),
+    };
+
+    assert!(driver.handle_goal_usage_limit_failure(&failure, &tx).await);
+
+    let goal = driver
+        .session
+        .db
+        .current_session_goal(driver.session.id, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        goal.status,
+        crate::db::session_goals::GoalStatus::UsageLimited
+    );
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::UsageLimited
+    );
+    let mut watchdog = None;
+    driver.refresh_goal_watchdog(&mut watchdog);
+    assert!(watchdog.is_some(), "usage_limited goal should arm backoff");
+    match rx.try_recv().expect("usage-limit notice should emit") {
+        TurnEvent::Notice { text } => {
+            assert!(text.contains("auto-resuming after backoff"), "{text}");
+        }
+        other => panic!("expected usage-limit Notice, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_usage_limit_watchdog_auto_resumes_to_active() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "resume after throttling",
+            None,
+            None,
+        )
+        .unwrap();
+    driver
+        .session
+        .db
+        .update_session_goal(
+            driver.session.id,
+            crate::db::session_goals::GoalStatus::UsageLimited,
+            None,
+            None,
+            Some("provider usage or rate limit reached"),
+        )
+        .unwrap();
+
+    let action = driver.goal_usage_limit_watchdog_action().unwrap();
+
+    assert_eq!(action, GoalUsageLimitWatchdogAction::AutoResume);
+    assert_eq!(driver.goal_usage_limit_auto_resume_attempts, 1);
+    let goal = driver
+        .session
+        .db
+        .current_session_goal(driver.session.id, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.status, crate::db::session_goals::GoalStatus::Active);
+}
+
+#[tokio::test]
+async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "stop retrying after bounded throttling",
+            None,
+            None,
+        )
+        .unwrap();
+    driver.goal_usage_limit_auto_resume_attempts = GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS;
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let failure = crate::engine::model::InferenceFailure {
+        provider: "test-provider".to_string(),
+        model: "test-model".to_string(),
+        phase: "dispatch".to_string(),
+        class: "rate_limit_exceeded".to_string(),
+        elapsed_ms: 7,
+        detail: "quota exhausted".to_string(),
+    };
+
+    assert!(driver.handle_goal_usage_limit_failure(&failure, &tx).await);
+
+    let goal = driver
+        .session
+        .db
+        .current_session_goal(driver.session.id, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        goal.status,
+        crate::db::session_goals::GoalStatus::UsageLimited
+    );
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::NeedsIntervention {
+            code: GOAL_USAGE_LIMIT_INTERVENTION_CODE.to_string()
+        }
+    );
+    let mut watchdog = None;
+    driver.refresh_goal_watchdog(&mut watchdog);
+    assert!(
+        watchdog.is_none(),
+        "bounded usage-limit exhaustion should not re-arm auto-resume"
+    );
+    match rx.try_recv().expect("manual resume notice should emit") {
+        TurnEvent::Notice { text } => {
+            assert!(text.contains("run `/goal resume`"), "{text}");
+        }
+        other => panic!("expected manual resume Notice, got {other:?}"),
+    }
+}
+
 #[test]
 fn ordinary_non_goal_idle_reason_is_completed() {
     let (mut driver, _tmp) = test_driver(1);

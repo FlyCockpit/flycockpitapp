@@ -161,6 +161,18 @@ const GOAL_IDLE_CONTINUATION: &str = "An active goal is still in progress. Your 
 const GOAL_IDLE_CONTINUATION_STRONG: &str = "An active goal is still in progress and this is the second consecutive prose-only idle turn. You must choose one exit: call a tool to make progress, call get_goal then update_goal(status=\"complete\", evidence=...), or call update_goal(status=\"blocked\", blocker=...) only for a true blocker. Do not finish this turn silently; it must leave a visible assistant message, tool call, or goal-status event.";
 const GOAL_WATCHDOG_CONTINUATION: &str = "An active goal is still in progress, and background work has been pending for 10 minutes.\n\nCheck the status of the pending background task(s). If one is hung, decide whether to cancel, retry, inspect logs, or continue with other work. If the goal is complete, call update_goal(status=\"complete\"). If blocked, call update_goal(status=\"blocked\").";
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
+const GOAL_USAGE_LIMIT_AUTO_RESUME: &str = "An active goal was paused because the provider reported a usage or rate limit. The backoff window has elapsed.\n\nResume the goal from the current context. If the provider is still rate-limiting, stop after the failed turn and leave the goal usage-limited. If the goal is complete, call update_goal(status=\"complete\"). If truly blocked for a non-usage-limit reason, call update_goal(status=\"blocked\").";
+const GOAL_USAGE_LIMIT_BACKOFF_BASE: Duration = Duration::from_secs(30);
+const GOAL_USAGE_LIMIT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+const GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS: u8 = 3;
+const GOAL_USAGE_LIMIT_INTERVENTION_CODE: &str = "usage_limit_persisted";
+
+#[derive(Debug, PartialEq, Eq)]
+enum GoalUsageLimitWatchdogAction {
+    NotUsageLimited,
+    AutoResume,
+    Exhausted,
+}
 
 const ID_PRIMARY_ROUNDS_CONTINUE: &str = "primary_rounds_continue";
 const ID_PRIMARY_ROUNDS_STOP: &str = "primary_rounds_stop";
@@ -444,6 +456,7 @@ pub struct Driver {
     goal_idle_intervention_pending: bool,
     goal_idle_intervention_code: Option<&'static str>,
     goal_was_active_recently: bool,
+    goal_usage_limit_auto_resume_attempts: u8,
     pending_idle_reason: Option<crate::engine::IdleReason>,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
@@ -847,6 +860,7 @@ impl Driver {
             goal_idle_intervention_pending: false,
             goal_idle_intervention_code: None,
             goal_was_active_recently: self.goal_was_active_recently,
+            goal_usage_limit_auto_resume_attempts: self.goal_usage_limit_auto_resume_attempts,
             pending_idle_reason: self.pending_idle_reason.clone(),
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
@@ -1109,6 +1123,7 @@ impl Driver {
             goal_idle_intervention_pending: false,
             goal_idle_intervention_code: None,
             goal_was_active_recently: false,
+            goal_usage_limit_auto_resume_attempts: 0,
             pending_idle_reason: None,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
@@ -1832,6 +1847,7 @@ impl Driver {
                         self.goal_no_tool_idle_count = 0;
                         self.goal_idle_intervention_pending = false;
                         self.goal_idle_intervention_code = None;
+                        self.goal_usage_limit_auto_resume_attempts = 0;
                     }
                     self.run_folded_submission_commands(items, &input_queue, tx).await?;
                     self.maybe_continue_active_goal(&input_queue, tx).await?;
@@ -1894,8 +1910,38 @@ impl Driver {
                     }
                 } => {
                     goal_watchdog = None;
-                    self.run_user_input(UserSubmission::text(GOAL_WATCHDOG_CONTINUATION), &input_queue, tx).await?;
-                    self.maybe_continue_active_goal(&input_queue, tx).await?;
+                    match self.goal_usage_limit_watchdog_action()? {
+                        GoalUsageLimitWatchdogAction::AutoResume => {
+                            let _ = tx
+                                .send(TurnEvent::Notice {
+                                    text: "goal: usage limit backoff elapsed; auto-resuming".to_string(),
+                                })
+                                .await;
+                            self.run_user_input(
+                                UserSubmission::text(GOAL_USAGE_LIMIT_AUTO_RESUME),
+                                &input_queue,
+                                tx,
+                            )
+                            .await?;
+                            self.maybe_continue_active_goal(&input_queue, tx).await?;
+                        }
+                        GoalUsageLimitWatchdogAction::Exhausted => {
+                            let _ = tx
+                                .send(TurnEvent::Notice {
+                                    text: "goal: usage limit persisted after bounded auto-resume attempts; run `/goal resume` to retry manually".to_string(),
+                                })
+                                .await;
+                        }
+                        GoalUsageLimitWatchdogAction::NotUsageLimited => {
+                            self.run_user_input(
+                                UserSubmission::text(GOAL_WATCHDOG_CONTINUATION),
+                                &input_queue,
+                                tx,
+                            )
+                            .await?;
+                            self.maybe_continue_active_goal(&input_queue, tx).await?;
+                        }
+                    }
                     self.refresh_goal_watchdog(&mut goal_watchdog);
                 }
             }
@@ -2116,6 +2162,7 @@ impl Driver {
                 return Ok(());
             }
             self.goal_was_active_recently = true;
+            self.goal_usage_limit_auto_resume_attempts = 0;
             if goal
                 .token_budget
                 .is_some_and(|budget| goal.tokens_used >= budget)
@@ -2172,6 +2219,106 @@ impl Driver {
             self.run_user_input(UserSubmission::text(prompt), input_rx, tx)
                 .await?;
         }
+    }
+
+    fn inference_failure_provider_status(
+        failure: &crate::engine::model::InferenceFailure,
+    ) -> Option<u16> {
+        failure
+            .class
+            .strip_prefix("http_")
+            .and_then(|s| s.parse::<u16>().ok())
+    }
+
+    async fn handle_goal_usage_limit_failure(
+        &mut self,
+        failure: &crate::engine::model::InferenceFailure,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        let provider_status = Self::inference_failure_provider_status(failure);
+        if !crate::engine::retry::is_usage_limit_failure(&failure.class, provider_status) {
+            return false;
+        }
+        let Ok(Some(goal)) = self.session.db.current_session_goal(self.session.id, false) else {
+            return false;
+        };
+        if goal.status != crate::db::session_goals::GoalStatus::Active {
+            return false;
+        }
+        if let Err(e) = self.session.db.update_session_goal(
+            self.session.id,
+            crate::db::session_goals::GoalStatus::UsageLimited,
+            None,
+            None,
+            Some("provider usage or rate limit reached"),
+        ) {
+            tracing::warn!(error = %e, "marking goal usage_limited failed");
+            return false;
+        }
+        self.goal_no_tool_idle_count = 0;
+        self.goal_idle_intervention_pending = false;
+        self.goal_idle_intervention_code = None;
+        if self.goal_usage_limit_auto_resume_attempts >= GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: GOAL_USAGE_LIMIT_INTERVENTION_CODE.to_string(),
+            });
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "goal: usage limit persisted after bounded auto-resume attempts; run `/goal resume` to retry manually".to_string(),
+                })
+                .await;
+        } else {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::UsageLimited);
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "goal: provider usage limit reached; auto-resuming after backoff"
+                        .to_string(),
+                })
+                .await;
+        }
+        true
+    }
+
+    fn goal_usage_limit_backoff(&self) -> Duration {
+        let multiplier = 1u64
+            .checked_shl(u32::from(self.goal_usage_limit_auto_resume_attempts))
+            .unwrap_or(u64::MAX);
+        let secs = GOAL_USAGE_LIMIT_BACKOFF_BASE
+            .as_secs()
+            .saturating_mul(multiplier)
+            .min(GOAL_USAGE_LIMIT_BACKOFF_MAX.as_secs());
+        Duration::from_secs(secs)
+    }
+
+    fn goal_usage_limit_watchdog_action(&mut self) -> Result<GoalUsageLimitWatchdogAction> {
+        let Some(goal) = self
+            .session
+            .db
+            .current_session_goal(self.session.id, false)?
+        else {
+            return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
+        };
+        if goal.status != crate::db::session_goals::GoalStatus::UsageLimited {
+            return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
+        }
+        if self.goal_usage_limit_auto_resume_attempts >= GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: GOAL_USAGE_LIMIT_INTERVENTION_CODE.to_string(),
+            });
+            return Ok(GoalUsageLimitWatchdogAction::Exhausted);
+        }
+        self.goal_usage_limit_auto_resume_attempts =
+            self.goal_usage_limit_auto_resume_attempts.saturating_add(1);
+        self.session.db.update_session_goal(
+            self.session.id,
+            crate::db::session_goals::GoalStatus::Active,
+            None,
+            None,
+            Some("auto-resuming after provider usage-limit backoff"),
+        )?;
+        self.goal_idle_intervention_pending = false;
+        self.goal_idle_intervention_code = None;
+        Ok(GoalUsageLimitWatchdogAction::AutoResume)
     }
 
     fn root_last_assistant_was_prose_without_tools(&self) -> bool {
@@ -2627,19 +2774,31 @@ impl Driver {
     }
 
     fn refresh_goal_watchdog(&self, watchdog: &mut Option<Pin<Box<Sleep>>>) {
-        let active = self
+        let status = self
             .session
             .db
             .current_session_goal(self.session.id, false)
             .ok()
             .flatten()
-            .is_some_and(|g| g.status == crate::db::session_goals::GoalStatus::Active);
-        let should_arm = active
-            && self.root_last_assistant_was_prose_without_tools()
-            && !self.schedule.snapshot().is_empty();
-        if should_arm {
+            .map(|g| g.status);
+        let delay = match status {
+            Some(crate::db::session_goals::GoalStatus::Active)
+                if self.root_last_assistant_was_prose_without_tools()
+                    && !self.schedule.snapshot().is_empty() =>
+            {
+                Some(GOAL_WATCHDOG_DELAY)
+            }
+            Some(crate::db::session_goals::GoalStatus::UsageLimited)
+                if self.goal_usage_limit_auto_resume_attempts
+                    < GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS =>
+            {
+                Some(self.goal_usage_limit_backoff())
+            }
+            _ => None,
+        };
+        if let Some(delay) = delay {
             if watchdog.is_none() {
-                *watchdog = Some(Box::pin(tokio::time::sleep(GOAL_WATCHDOG_DELAY)));
+                *watchdog = Some(Box::pin(tokio::time::sleep(delay)));
             }
         } else {
             *watchdog = None;
@@ -3996,9 +4155,11 @@ impl Driver {
                     );
                     self.record_failed_turn_recovery(&agent, &attempted_prompt, call_id, f, tx)
                         .await;
-                    self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
-                        class: f.class.clone(),
-                    });
+                    if !self.handle_goal_usage_limit_failure(f, tx).await {
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: f.class.clone(),
+                        });
+                    }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),

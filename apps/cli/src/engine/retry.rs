@@ -112,6 +112,18 @@ pub(crate) fn failure_retry_decision_and_rationale(
     }
 }
 
+pub(crate) fn is_usage_limit_failure(class: &str, provider_status: Option<u16>) -> bool {
+    if provider_status == Some(429) {
+        return true;
+    }
+    let normalized = class.to_ascii_lowercase();
+    normalized == "http_429"
+        || normalized.contains("rate_limit")
+        || normalized.contains("rate_limited")
+        || normalized.contains("usage_limit")
+        || normalized.contains("quota")
+}
+
 /// Classify a [`CompletionError`] into the retry taxonomy.
 ///
 /// Built on how rig 0.37 + reqwest 0.13 surface errors (verified via

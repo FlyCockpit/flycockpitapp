@@ -1213,7 +1213,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
                 cache_creation_input_tokens,
             },
         },
-        AgentIdle { turn_id, .. } => TurnEvent::AgentIdle { turn_id },
+        AgentIdle {
+            turn_id, reason, ..
+        } => TurnEvent::AgentIdle { turn_id, reason },
         PausedWorkAvailable { .. } => return None,
         ScheduleStarted {
             session_id,
@@ -1797,12 +1799,14 @@ mod tests {
         let event = proto_event_to_turn_event(proto::Event::AgentIdle {
             session_id,
             turn_id: Some("turn-1".to_string()),
+            reason: crate::engine::IdleReason::Completed,
         })
         .expect("idle event maps");
         assert!(matches!(
             event,
             TurnEvent::AgentIdle {
                 turn_id: Some(turn_id),
+                reason: crate::engine::IdleReason::Completed,
             } if turn_id == "turn-1"
         ));
     }

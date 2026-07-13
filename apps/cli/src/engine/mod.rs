@@ -54,7 +54,7 @@ pub mod tool;
 pub mod translate;
 pub mod validation_hint;
 
-pub use agent::TurnEvent;
+pub use agent::{IdleReason, TurnEvent};
 pub use driver::Driver;
 
 /// Whether the conversation is at a point where context-reduction

@@ -68,6 +68,7 @@ mod tests {
         let out = c.push(proto::Event::AgentIdle {
             session_id: Uuid::nil(),
             turn_id: None,
+            reason: crate::engine::IdleReason::Completed,
         });
         assert_eq!(out.len(), 2);
         assert!(matches!(
@@ -479,6 +480,7 @@ mod tests {
         let out = proto::turn_event_to_proto(
             TurnEvent::AgentIdle {
                 turn_id: Some("turn-1".to_string()),
+                reason: crate::engine::IdleReason::Completed,
             },
             sid,
         );
@@ -487,10 +489,12 @@ mod tests {
                 proto::Event::AgentIdle {
                     session_id,
                     turn_id,
+                    reason,
                 },
             ] => {
                 assert_eq!(*session_id, sid);
                 assert_eq!(turn_id.as_deref(), Some("turn-1"));
+                assert_eq!(reason, &crate::engine::IdleReason::Completed);
             }
             other => panic!("expected one AgentIdle, got {other:?}"),
         }

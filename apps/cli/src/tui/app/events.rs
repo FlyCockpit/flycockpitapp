@@ -800,12 +800,13 @@ impl App {
                 // accounts for it.
                 self.estimate_at_last_usage = self.estimate_context_tokens();
             }
-            TurnEvent::AgentIdle { turn_id } => {
+            TurnEvent::AgentIdle { turn_id, reason } => {
                 let has_working_span = self.has_working_span_in_progress();
                 let matches_working_span = self.working_span_matches(turn_id.as_deref());
                 if has_working_span && !matches_working_span {
                     return;
                 }
+                self.apply_idle_reason_status(reason);
                 self.reconnect = None;
                 self.finalize_pending();
                 if self.agent_path.len() > 1 {

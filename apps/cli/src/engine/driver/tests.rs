@@ -374,6 +374,107 @@ async fn goal_idle_guard_needs_intervention_without_blocking_goal() {
 }
 
 #[tokio::test]
+async fn goal_budget_autopause_idle_reason_is_budget_limited() {
+    let (mut driver, tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "stay within budget",
+            None,
+            Some(1),
+        )
+        .unwrap();
+    driver
+        .session
+        .db
+        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
+            call_id: uuid::Uuid::new_v4(),
+            session_id: driver.session.id,
+            project_id: driver.session.project_id.clone(),
+            project_root: tmp.path().display().to_string(),
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            input_tokens: 2,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cost_usd_micros: None,
+            is_utility: false,
+        })
+        .unwrap();
+    driver
+        .session
+        .db
+        .refresh_session_goal_usage(driver.session.id)
+        .unwrap();
+    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
+    let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    driver
+        .maybe_continue_active_goal(&input_queue, &tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::BudgetLimited
+    );
+}
+
+#[test]
+fn ordinary_non_goal_idle_reason_is_completed() {
+    let (mut driver, _tmp) = test_driver(1);
+
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::Completed
+    );
+}
+
+#[tokio::test]
+async fn goal_idle_intervention_idle_reason_carries_code() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "ship goal flow",
+            None,
+            None,
+        )
+        .unwrap();
+    driver
+        .stack
+        .first_mut()
+        .unwrap()
+        .history
+        .push(Message::assistant("I am done for now."));
+    driver.goal_no_tool_idle_count = 2;
+    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
+    let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    driver
+        .maybe_continue_active_goal(&input_queue, &tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        driver.take_idle_reason(),
+        crate::engine::IdleReason::NeedsIntervention {
+            code: "agent_failed_to_progress".to_string()
+        }
+    );
+}
+
+#[tokio::test]
 async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch() {
     let (mut driver, _tmp) = test_driver(1);
     driver

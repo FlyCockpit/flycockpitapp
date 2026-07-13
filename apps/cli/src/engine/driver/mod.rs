@@ -442,6 +442,9 @@ pub struct Driver {
     /// continuation. Cleared when a real user turn or a non-prose/toolful state
     /// gives the agent a fresh chance to progress.
     goal_idle_intervention_pending: bool,
+    goal_idle_intervention_code: Option<&'static str>,
+    goal_was_active_recently: bool,
+    pending_idle_reason: Option<crate::engine::IdleReason>,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
     /// [`detached`](crate::engine::interrupt::InterruptHub::detached) hub
@@ -842,6 +845,9 @@ impl Driver {
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_idle_intervention_pending: false,
+            goal_idle_intervention_code: None,
+            goal_was_active_recently: self.goal_was_active_recently,
+            pending_idle_reason: self.pending_idle_reason.clone(),
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
             injection_no_scan_logged: self.injection_no_scan_logged,
@@ -1101,6 +1107,9 @@ impl Driver {
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_idle_intervention_pending: false,
+            goal_idle_intervention_code: None,
+            goal_was_active_recently: false,
+            pending_idle_reason: None,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
             injection_no_scan_logged: false,
@@ -1798,6 +1807,7 @@ impl Driver {
             {
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = false;
+                self.goal_idle_intervention_code = None;
                 self.maybe_continue_active_goal(&input_queue, tx).await?;
                 self.refresh_goal_watchdog(&mut goal_watchdog);
                 continue;
@@ -1821,6 +1831,7 @@ impl Driver {
                     if items.iter().any(|item| matches!(item, FoldedSubmission::User(_))) {
                         self.goal_no_tool_idle_count = 0;
                         self.goal_idle_intervention_pending = false;
+                        self.goal_idle_intervention_code = None;
                     }
                     self.run_folded_submission_commands(items, &input_queue, tx).await?;
                     self.maybe_continue_active_goal(&input_queue, tx).await?;
@@ -1846,6 +1857,7 @@ impl Driver {
                         Some(event) => {
                             self.goal_no_tool_idle_count = 0;
                             self.goal_idle_intervention_pending = false;
+                            self.goal_idle_intervention_code = None;
                             self.run_job_event(event, &input_queue, tx).await?;
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
                             self.refresh_goal_watchdog(&mut goal_watchdog);
@@ -1861,6 +1873,7 @@ impl Driver {
                     if delivered {
                         self.goal_no_tool_idle_count = 0;
                         self.goal_idle_intervention_pending = false;
+                        self.goal_idle_intervention_code = None;
                         self.maybe_continue_active_goal(&input_queue, tx).await?;
                         self.refresh_goal_watchdog(&mut goal_watchdog);
                     }
@@ -1899,9 +1912,50 @@ impl Driver {
             // now-settled foreground history.
             self.emit_context_projection(tx).await;
             let turn_id = self.current_lifecycle_turn_id.take();
-            let _ = tx.send(TurnEvent::AgentIdle { turn_id }).await;
+            let reason = self.take_idle_reason();
+            let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
         }
         Ok(())
+    }
+
+    fn take_idle_reason(&mut self) -> crate::engine::IdleReason {
+        if let Some(reason) = self.pending_idle_reason.take() {
+            self.goal_was_active_recently = false;
+            return reason;
+        }
+        if self.goal_idle_intervention_pending {
+            let code = self
+                .goal_idle_intervention_code
+                .unwrap_or("agent_failed_to_progress");
+            return crate::engine::IdleReason::NeedsIntervention {
+                code: code.to_string(),
+            };
+        }
+        match self
+            .session
+            .db
+            .current_session_goal(self.session.id, false)
+            .ok()
+            .flatten()
+            .map(|goal| goal.status)
+        {
+            Some(crate::db::session_goals::GoalStatus::BudgetLimited) => {
+                crate::engine::IdleReason::BudgetLimited
+            }
+            Some(crate::db::session_goals::GoalStatus::UsageLimited) => {
+                crate::engine::IdleReason::UsageLimited
+            }
+            Some(crate::db::session_goals::GoalStatus::Active) => {
+                self.goal_was_active_recently = true;
+                crate::engine::IdleReason::Completed
+            }
+            Some(_) => crate::engine::IdleReason::Completed,
+            None if self.goal_was_active_recently => {
+                self.goal_was_active_recently = false;
+                crate::engine::IdleReason::GoalComplete
+            }
+            None => crate::engine::IdleReason::Completed,
+        }
     }
 
     /// Whether the conversation is at a safe boundary for context
@@ -2047,15 +2101,21 @@ impl Driver {
                 .db
                 .current_session_goal(self.session.id, false)?
             else {
+                if self.goal_was_active_recently {
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
+                }
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = false;
+                self.goal_idle_intervention_code = None;
                 return Ok(());
             };
             if goal.status != crate::db::session_goals::GoalStatus::Active {
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = false;
+                self.goal_idle_intervention_code = None;
                 return Ok(());
             }
+            self.goal_was_active_recently = true;
             if goal
                 .token_budget
                 .is_some_and(|budget| goal.tokens_used >= budget)
@@ -2069,6 +2129,7 @@ impl Driver {
                 );
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = false;
+                self.goal_idle_intervention_code = None;
                 return Ok(());
             }
             if self.goal_idle_intervention_pending {
@@ -2078,12 +2139,14 @@ impl Driver {
                 {
                     self.goal_no_tool_idle_count = 0;
                     self.goal_idle_intervention_pending = false;
+                    self.goal_idle_intervention_code = None;
                 }
                 return Ok(());
             }
             if !self.root_last_assistant_was_prose_without_tools() {
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = false;
+                self.goal_idle_intervention_code = None;
                 return Ok(());
             }
             if !self.schedule.snapshot().is_empty() {
@@ -2098,6 +2161,7 @@ impl Driver {
                     .await;
                 self.goal_no_tool_idle_count = 0;
                 self.goal_idle_intervention_pending = true;
+                self.goal_idle_intervention_code = Some("agent_failed_to_progress");
                 return Ok(());
             }
             let prompt = if self.goal_no_tool_idle_count == 1 {
@@ -2370,6 +2434,7 @@ impl Driver {
         let _ = tx.send(TurnEvent::Notice { text }).await;
         self.goal_no_tool_idle_count = 0;
         self.goal_idle_intervention_pending = true;
+        self.goal_idle_intervention_code = Some("agent_failed_to_progress_after_continue");
     }
 
     async fn record_queued_user_fold(
@@ -2434,7 +2499,8 @@ impl Driver {
             let _ = tx.send(TurnEvent::UserMessageRetracted).await;
             self.emit_context_projection(tx).await;
             let turn_id = self.current_lifecycle_turn_id.take();
-            let _ = tx.send(TurnEvent::AgentIdle { turn_id }).await;
+            let reason = self.take_idle_reason();
+            let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
             return None;
         }
         let (raw_text, cleaned_for_display, forced_skill) = self
@@ -3881,6 +3947,7 @@ impl Driver {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::Cancelled,
                         input_rx,
@@ -3929,6 +3996,9 @@ impl Driver {
                     );
                     self.record_failed_turn_recovery(&agent, &attempted_prompt, call_id, f, tx)
                         .await;
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                        class: f.class.clone(),
+                    });
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),
@@ -4098,6 +4168,7 @@ impl Driver {
                         if self.goal_continue_progress_since(anchor_seq) {
                             self.goal_no_tool_idle_count = 0;
                             self.goal_idle_intervention_pending = false;
+                            self.goal_idle_intervention_code = None;
                         } else {
                             self.emit_goal_continue_no_progress(anchor_seq, tx).await;
                         }

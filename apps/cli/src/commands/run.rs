@@ -780,6 +780,7 @@ mod tests {
             &proto::Event::AgentIdle {
                 session_id,
                 turn_id: None,
+                reason: crate::engine::IdleReason::Completed,
             },
             false,
         )

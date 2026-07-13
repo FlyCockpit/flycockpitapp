@@ -47,7 +47,7 @@ mod text_recovery;
 mod turn_phases;
 
 pub use backup::turn_with_backup;
-pub use events::TurnEvent;
+pub use events::{IdleReason, TurnEvent};
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
 

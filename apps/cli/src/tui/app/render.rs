@@ -2921,6 +2921,13 @@ impl App {
                 Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
             ));
         }
+        if let Some(status) = &self.idle_reason_status {
+            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
+            left.push(Span::styled(
+                status.text.clone(),
+                Style::default().fg(toast_fg(status.kind)),
+            ));
+        }
         let right_width: u16 = right
             .iter()
             .map(|s| s.width() as u16)

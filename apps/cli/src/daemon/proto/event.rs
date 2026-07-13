@@ -409,6 +409,8 @@ pub enum Event {
         session_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        #[serde(default = "default_idle_reason")]
+        reason: crate::engine::IdleReason,
     },
 
     /// The primary (root-frame) agent was swapped in place (`/plan` →
@@ -698,6 +700,10 @@ pub enum Event {
         holder_agent: String,
         waiting: bool,
     },
+}
+
+fn default_idle_reason() -> crate::engine::IdleReason {
+    crate::engine::IdleReason::Completed
 }
 
 /// Convert a single engine `TurnEvent` into one or more wire
@@ -1025,10 +1031,11 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
             }]
         }
-        TurnEvent::AgentIdle { turn_id } => {
+        TurnEvent::AgentIdle { turn_id, reason } => {
             vec![Event::AgentIdle {
                 session_id,
                 turn_id,
+                reason,
             }]
         }
         TurnEvent::PrimarySwapped { name } => {

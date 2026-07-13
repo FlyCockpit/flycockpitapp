@@ -1781,6 +1781,7 @@ pub struct App {
     /// (TUI-design-philosophy §7). 3-second TTL; dismissed early by
     /// any user interaction (keystroke or mouse click/wheel).
     pub(super) toast: Option<Toast>,
+    pub(super) idle_reason_status: Option<IdleReasonStatus>,
     /// Live embedded `$EDITOR` / `lazygit` pane (GOALS §1i/§1j). One at
     /// a time; `None` when no pane is open. Auto-closes when the child
     /// exits, serviced once per event-loop tick.
@@ -2167,6 +2168,43 @@ struct Toast {
     kind: ToastKind,
     expires_at: Instant,
     persistent: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct IdleReasonStatus {
+    text: String,
+    kind: ToastKind,
+}
+
+fn idle_reason_status(reason: crate::engine::IdleReason) -> Option<IdleReasonStatus> {
+    match reason {
+        crate::engine::IdleReason::Completed => None,
+        crate::engine::IdleReason::GoalComplete => Some(IdleReasonStatus {
+            text: "goal session completed".to_string(),
+            kind: ToastKind::Success,
+        }),
+        crate::engine::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
+            text: format!("goal stalled ({code}) — run `/goal resume` or send guidance"),
+            kind: ToastKind::Warning,
+        }),
+        crate::engine::IdleReason::BudgetLimited => Some(IdleReasonStatus {
+            text: "goal paused: token budget reached — run `/goal resume` or adjust budget"
+                .to_string(),
+            kind: ToastKind::Warning,
+        }),
+        crate::engine::IdleReason::UsageLimited => Some(IdleReasonStatus {
+            text: "usage limit — auto-resuming shortly".to_string(),
+            kind: ToastKind::Warning,
+        }),
+        crate::engine::IdleReason::Error { class } => Some(IdleReasonStatus {
+            text: format!("turn stopped on {class} — inspect the error and retry"),
+            kind: ToastKind::Error,
+        }),
+        crate::engine::IdleReason::Interrupted => Some(IdleReasonStatus {
+            text: "turn interrupted".to_string(),
+            kind: ToastKind::Info,
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2919,6 +2957,7 @@ impl App {
             tmux_copy_hint_shown: false,
             context_menu: None,
             toast: None,
+            idle_reason_status: None,
             pane: None,
             pane_side: PaneSide::Full,
             pane_ratio: 0.5,
@@ -3483,6 +3522,17 @@ impl App {
             expires_at: Instant::now() + TOAST_TTL,
             persistent: false,
         });
+    }
+
+    pub(super) fn apply_idle_reason_status(&mut self, reason: crate::engine::IdleReason) {
+        self.idle_reason_status = idle_reason_status(reason);
+    }
+
+    #[cfg(test)]
+    pub(super) fn idle_reason_status_text(&self) -> Option<&str> {
+        self.idle_reason_status
+            .as_ref()
+            .map(|status| status.text.as_str())
     }
 
     pub(super) fn push_plain(&mut self, line: impl Into<String>) {
@@ -13505,7 +13555,7 @@ mod attention_interrupt_surface_tests {
 #[cfg(test)]
 mod working_span_lifecycle_tests {
     use super::{App, WorkingSpanState};
-    use crate::engine::TurnEvent;
+    use crate::engine::{IdleReason, TurnEvent};
 
     fn app() -> App {
         let tmp = tempfile::tempdir().unwrap();
@@ -13518,7 +13568,10 @@ mod working_span_lifecycle_tests {
         app.begin_working_span();
         let turn = app.prediction_state.turn();
 
-        app.apply_event(TurnEvent::AgentIdle { turn_id: None });
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: IdleReason::Completed,
+        });
 
         assert!(app.busy);
         assert!(app.span_started_at.is_some());
@@ -13545,6 +13598,7 @@ mod working_span_lifecycle_tests {
 
         app.apply_event(TurnEvent::AgentIdle {
             turn_id: Some("turn-1".to_string()),
+            reason: IdleReason::Completed,
         });
 
         assert!(!app.busy);
@@ -13562,7 +13616,10 @@ mod working_span_lifecycle_tests {
             agent: "Build".to_string(),
             turn_id: None,
         });
-        app.apply_event(TurnEvent::AgentIdle { turn_id: None });
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: IdleReason::Completed,
+        });
 
         assert!(!app.busy);
         assert_eq!(app.working_span_state, WorkingSpanState::Idle);
@@ -13599,6 +13656,7 @@ mod working_span_lifecycle_tests {
         });
         app.apply_event(TurnEvent::AgentIdle {
             turn_id: Some("stale".to_string()),
+            reason: IdleReason::Completed,
         });
 
         assert!(app.busy);
@@ -13610,6 +13668,45 @@ mod working_span_lifecycle_tests {
             }
         );
         assert_eq!(app.prediction_state.turn(), turn);
+    }
+
+    #[test]
+    fn idle_reason_status_copy_matches_reason_severity() {
+        let mut app = app();
+
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: IdleReason::Completed,
+        });
+        assert_eq!(app.idle_reason_status_text(), None);
+
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: IdleReason::NeedsIntervention {
+                code: "agent_failed_to_progress".to_string(),
+            },
+        });
+        let stalled = app.idle_reason_status_text().unwrap();
+        assert!(stalled.contains("run `/goal resume`"));
+        assert!(stalled.contains("send guidance"));
+
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: IdleReason::BudgetLimited,
+        });
+        assert!(
+            app.idle_reason_status_text()
+                .is_some_and(|text| text.contains("token budget reached"))
+        );
+
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: IdleReason::GoalComplete,
+        });
+        let complete = app.idle_reason_status_text().unwrap();
+        assert!(complete.contains("goal session completed"));
+        assert!(!complete.contains("workspace"));
+        assert!(!complete.contains("queue"));
     }
 
     #[test]

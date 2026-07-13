@@ -6,6 +6,7 @@ use crate::config::extended::DataSyntaxConfig;
 
 const INVALID_TRAILER: &str =
     "The file was written exactly as given; if this was unintended, fix it and rewrite.";
+const MAX_DETAIL_CHARS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataFormat {
@@ -172,12 +173,23 @@ fn csv_error_message(error: &csv::Error) -> String {
 }
 
 fn invalid_note(format: DataFormat, detail: String) -> String {
+    let detail = truncate_detail(detail);
     format!(
         "\nwarning: content is not valid {} — {}. {}",
         format.label(),
         detail.trim_end_matches('.'),
         INVALID_TRAILER
     )
+}
+
+fn truncate_detail(detail: String) -> String {
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail;
+    }
+
+    let mut truncated = detail.chars().take(MAX_DETAIL_CHARS).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -222,6 +234,8 @@ mod tests {
         assert!(plain.contains("warning: content is not valid JSON"));
         let bad = data_syntax_note(Path::new("foo.jsonc"), "{ \"x\": ", &cfg()).unwrap();
         assert!(bad.contains("warning: content is not valid JSONC"));
+        assert!(bad.contains("line"));
+        assert!(bad.contains("column"));
     }
 
     #[test]
@@ -248,6 +262,41 @@ mod tests {
         );
         let bad = data_syntax_note(Path::new("a.toml"), "a = ", &cfg()).unwrap();
         assert!(bad.contains("warning: content is not valid TOML"));
+    }
+
+    #[test]
+    fn invalid_note_truncates_long_parser_details() {
+        let detail = "x".repeat(MAX_DETAIL_CHARS + 10);
+        let note = invalid_note(DataFormat::Toml, detail);
+        let capped = format!("{}…", "x".repeat(MAX_DETAIL_CHARS));
+
+        assert!(note.contains(&capped));
+        assert!(note.contains(INVALID_TRAILER));
+        assert_eq!(
+            note.chars().count(),
+            "\nwarning: content is not valid TOML — ".chars().count()
+                + capped.chars().count()
+                + ". ".chars().count()
+                + INVALID_TRAILER.chars().count()
+        );
+    }
+
+    #[test]
+    fn invalid_note_does_not_truncate_short_parser_details() {
+        let note = invalid_note(DataFormat::Json, "short parser detail".to_string());
+
+        assert!(note.contains("short parser detail"));
+        assert!(!note.contains('…'));
+    }
+
+    #[test]
+    fn invalid_note_truncates_on_char_boundaries() {
+        let detail = "世".repeat(MAX_DETAIL_CHARS + 1);
+        let note = invalid_note(DataFormat::Yaml, detail);
+        let capped = format!("{}…", "世".repeat(MAX_DETAIL_CHARS));
+
+        assert!(note.contains(&capped));
+        assert!(note.is_char_boundary(note.len()));
     }
 
     #[test]

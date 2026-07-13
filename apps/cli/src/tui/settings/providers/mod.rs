@@ -15,7 +15,7 @@
 //!     `apply_copilot_setup`, `render_copilot_body`).
 
 mod fetch;
-mod oauth_setup;
+mod oauth_flow;
 mod row_editor;
 
 use std::path::PathBuf;
@@ -26,9 +26,13 @@ pub(super) use fetch::{
     FetchAllState, FetchFallbackPromptState, FetchOnePromptState, compute_unlisted_for_models,
     render_fetch_all_results,
 };
-use oauth_setup::{
-    OAuthFlowView, handle_browser_callback_oauth_key, handle_device_code_oauth_key,
-    oauth_setup_lines, render_oauth_body, render_oauth_setup,
+#[cfg(test)]
+use oauth_flow::handle_oauth_flow_key_with;
+pub(crate) use oauth_flow::{
+    OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthProvider,
+};
+use oauth_flow::{
+    OAuthFlowView, handle_oauth_flow_key, oauth_setup_lines, render_oauth_body, render_oauth_setup,
 };
 
 use chrono::Utc;
@@ -78,9 +82,8 @@ enum EditAction {
     Headers,
     /// Only present for Copilot providers.
     CopilotAuth,
-    /// Present for xAI SuperGrok OAuth providers.
-    GrokOAuthAuth,
-    CodexOAuthAuth,
+    /// Present for third-party OAuth-backed providers.
+    OAuthAuth(OAuthProvider),
     Models,
     Settings,
     Favorite,
@@ -101,8 +104,12 @@ fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec<EditAction
     let provider = registry.provider_for(provider_id, entry);
     match provider.id() {
         "copilot" => actions.push(EditAction::CopilotAuth),
-        crate::auth::xai_oauth::CREDENTIAL_KEY => actions.push(EditAction::GrokOAuthAuth),
-        crate::auth::codex_oauth::CREDENTIAL_KEY => actions.push(EditAction::CodexOAuthAuth),
+        crate::auth::xai_oauth::CREDENTIAL_KEY => {
+            actions.push(EditAction::OAuthAuth(OAuthProvider::Grok))
+        }
+        crate::auth::codex_oauth::CREDENTIAL_KEY => {
+            actions.push(EditAction::OAuthAuth(OAuthProvider::Codex))
+        }
         _ => {}
     }
     actions.extend([
@@ -454,12 +461,8 @@ pub(super) enum ProvidersPage {
         state: CopilotSetupState,
         parent: Box<EditState>,
     },
-    GrokOAuthSetup {
-        state: Box<BrowserCallbackOAuthState>,
-        parent: Box<EditState>,
-    },
-    CodexOAuthSetup {
-        state: Box<DeviceCodeOAuthState>,
+    OAuthSetup {
+        state: Box<OAuthFlowState>,
         parent: Box<EditState>,
     },
 }
@@ -467,11 +470,11 @@ pub(super) enum ProvidersPage {
 impl ProvidersPage {
     pub(super) fn paste_oauth(&mut self, text: &str) -> bool {
         let state = match self {
-            Self::GrokOAuthSetup { state, .. }
+            Self::OAuthSetup { state, .. }
             | Self::Add(AddState {
-                step: AddStep::GrokOAuthAuth(state),
+                step: AddStep::OAuthAuth(state),
                 ..
-            }) if state.manual_login.is_some() => state,
+            }) if state.has_browser_session() => state,
             _ => return false,
         };
         state.paste_focused = true;
@@ -551,15 +554,15 @@ fn register_visible_link_regions(
 
 fn oauth_link_target(flow: OAuthFlowView<'_>) -> Option<(&str, &str)> {
     match flow {
-        OAuthFlowView::Grok(state) => Some((
-            state.authorize_url.as_deref()?,
-            "open xai.com authorization page",
-        )),
-        OAuthFlowView::Codex(state) => {
-            let uri = state.pending.as_ref()?.verification_uri.as_str();
+        OAuthFlowView::OAuth(state) if state.provider == OAuthProvider::Grok => {
+            Some((state.authorize_url()?, "open xai.com authorization page"))
+        }
+        OAuthFlowView::OAuth(state) if state.provider == OAuthProvider::Codex => {
+            let uri = state.device_login()?.verification_uri.as_str();
             Some((uri, uri))
         }
         OAuthFlowView::Copilot(_) => None,
+        OAuthFlowView::OAuth(_) => None,
     }
 }
 
@@ -574,20 +577,16 @@ impl ProvidersPage {
             | ProvidersPage::FetchOnePrompt(_)
             | ProvidersPage::FetchFallbackPrompt(_)
             | ProvidersPage::CopilotSetup { .. } => None,
-            ProvidersPage::GrokOAuthSetup { state, .. } => {
+            ProvidersPage::OAuthSetup { state, .. } => {
                 state.paste_focused.then_some(&mut state.manual_input)
             }
-            ProvidersPage::CodexOAuthSetup { .. } => None,
             ProvidersPage::Add(s) => match &mut s.step {
                 AddStep::EditId => Some(&mut s.id_field),
                 AddStep::EditUrl => Some(&mut s.url_field),
                 AddStep::EditHeaders => s.headers.active_text_field(),
-                AddStep::GrokOAuthAuth(state) => {
-                    state.paste_focused.then_some(&mut state.manual_input)
-                }
+                AddStep::OAuthAuth(state) => state.paste_focused.then_some(&mut state.manual_input),
                 AddStep::PickTemplate { .. }
                 | AddStep::CopilotAuth(_)
-                | AddStep::CodexOAuthAuth(_)
                 | AddStep::Saving
                 | AddStep::Fetching
                 | AddStep::Done => None,
@@ -634,58 +633,6 @@ impl CopilotSetupState {
     }
 }
 
-pub(super) struct BrowserCallbackOAuthState {
-    pub(super) cursor: usize,
-    pub(super) logged_in: bool,
-    pub(super) status: Option<Result<String, String>>,
-    pub(super) paste_focused: bool,
-    pub(super) manual_input: TextField,
-    pub(super) manual_login: Option<xai_oauth::ManualLogin>,
-    pub(super) authorize_url: Option<String>,
-    pub(super) pending: bool,
-    pub(super) ssh_manual_only: bool,
-    pub(super) spinner_tick: usize,
-}
-
-pub(super) struct DeviceCodeOAuthState {
-    pub(super) cursor: usize,
-    pub(super) logged_in: bool,
-    pub(super) status: Option<Result<String, String>>,
-    pub(super) pending: Option<codex_oauth::DeviceLogin>,
-    pub(super) polling: bool,
-    pub(super) spinner_tick: usize,
-}
-
-impl DeviceCodeOAuthState {
-    pub(super) fn new() -> Self {
-        Self {
-            cursor: 0,
-            logged_in: codex_oauth::is_logged_in(),
-            status: None,
-            pending: None,
-            polling: false,
-            spinner_tick: 0,
-        }
-    }
-}
-
-impl BrowserCallbackOAuthState {
-    pub(super) fn new() -> Self {
-        Self {
-            cursor: 0,
-            logged_in: xai_oauth::is_logged_in(),
-            status: None,
-            paste_focused: false,
-            manual_input: TextField::default(),
-            manual_login: None,
-            authorize_url: None,
-            pending: false,
-            ssh_manual_only: crate::clipboard::is_ssh(),
-            spinner_tick: 0,
-        }
-    }
-}
-
 pub(super) fn oauth_setup_confirming_logged_in(
     logged_in: bool,
     in_progress: bool,
@@ -715,34 +662,6 @@ fn oauth_option_cursor_next(cursor: usize, len: usize) -> usize {
         0
     } else {
         crate::tui::nav::wrap_next(cursor, len)
-    }
-}
-
-pub(crate) enum OAuthActionRequest {
-    CodexBegin,
-    CodexPoll(codex_oauth::DeviceLogin),
-    CodexCancel,
-    GrokBegin {
-        is_ssh: bool,
-    },
-    GrokComplete {
-        login: xai_oauth::ManualLogin,
-        input: String,
-    },
-    GrokCancel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GrokLoginSelection {
-    ManualOnly,
-    Auto,
-}
-
-fn grok_login_selection(is_ssh: bool) -> GrokLoginSelection {
-    if is_ssh {
-        GrokLoginSelection::ManualOnly
-    } else {
-        GrokLoginSelection::Auto
     }
 }
 
@@ -788,10 +707,8 @@ pub(super) enum AddStep {
     /// EditHeaders step for the Copilot template; the canonical
     /// Authorization header is fixed by the template anyway.
     CopilotAuth(CopilotSetupState),
-    /// xAI SuperGrok OAuth setup step for the `grok-oauth` template.
-    GrokOAuthAuth(Box<BrowserCallbackOAuthState>),
-    /// OpenAI Codex device-code OAuth setup step for the `codex-oauth` template.
-    CodexOAuthAuth(Box<DeviceCodeOAuthState>),
+    /// Shared OAuth setup step for provider templates that need browser or device auth.
+    OAuthAuth(Box<OAuthFlowState>),
     /// Saving config + kicking off /models fetch.
     Saving,
     /// Background fetch is in flight.
@@ -1201,21 +1118,8 @@ impl SettingsCx {
             ProvidersPage::CopilotSetup { state, parent } => {
                 self.handle_copilot_setup_key(key, state, parent)
             }
-            ProvidersPage::GrokOAuthSetup { state, parent } => {
-                let (close, action) = handle_browser_callback_oauth_key(key, state);
-                self.pending_oauth_action = action;
-                if close {
-                    let owned = std::mem::replace(
-                        parent,
-                        Box::new(EditState::new(String::new(), ProviderEntry::default())),
-                    );
-                    Nav::Replace(super::providers_page(ProvidersPage::Edit(*owned)))
-                } else {
-                    Nav::Stay
-                }
-            }
-            ProvidersPage::CodexOAuthSetup { state, parent } => {
-                let (close, action) = handle_device_code_oauth_key(key, state);
+            ProvidersPage::OAuthSetup { state, parent } => {
+                let (close, action) = handle_oauth_flow_key(key, state);
                 self.pending_oauth_action = action;
                 if close {
                     let owned = std::mem::replace(
@@ -1261,12 +1165,7 @@ impl SettingsCx {
 
     fn handle_add_key(&mut self, key: KeyEvent, s: &mut AddState) -> Nav {
         // Back/escape unconditionally returns to the list.
-        if matches!(key.code, KeyCode::Esc)
-            && !matches!(
-                s.step,
-                AddStep::GrokOAuthAuth(_) | AddStep::CodexOAuthAuth(_)
-            )
-        {
+        if matches!(key.code, KeyCode::Esc) && !matches!(s.step, AddStep::OAuthAuth(_)) {
             return Nav::Replace(super::providers_page(ProvidersPage::List {
                 cursor: initial_list_cursor(&self.config),
                 status: None,
@@ -1335,10 +1234,13 @@ impl SettingsCx {
                         if matches!(s.template.map(|t| t.id), Some("copilot")) {
                             s.step = AddStep::CopilotAuth(CopilotSetupState::new());
                         } else if matches!(s.template.map(|t| t.id), Some("grok-oauth")) {
-                            s.step =
-                                AddStep::GrokOAuthAuth(Box::new(BrowserCallbackOAuthState::new()));
+                            s.step = AddStep::OAuthAuth(Box::new(OAuthFlowState::new(
+                                OAuthProvider::Grok,
+                            )));
                         } else if matches!(s.template.map(|t| t.id), Some("codex-oauth")) {
-                            s.step = AddStep::CodexOAuthAuth(Box::new(DeviceCodeOAuthState::new()));
+                            s.step = AddStep::OAuthAuth(Box::new(OAuthFlowState::new(
+                                OAuthProvider::Codex,
+                            )));
                         } else {
                             s.step = AddStep::EditHeaders;
                         }
@@ -1422,8 +1324,8 @@ impl SettingsCx {
                 }
                 _ => {}
             },
-            AddStep::GrokOAuthAuth(state) => {
-                let (close, action) = handle_browser_callback_oauth_key(key, state);
+            AddStep::OAuthAuth(state) => {
+                let (close, action) = handle_oauth_flow_key(key, state);
                 self.pending_oauth_action = action;
                 if close {
                     s.step = AddStep::EditUrl;
@@ -1431,30 +1333,14 @@ impl SettingsCx {
                 }
                 if (matches!(key.code, KeyCode::Char('s')) && !state.paste_focused)
                     || (matches!(key.code, KeyCode::Enter)
-                        && OAuthFlowView::Grok(state).confirming())
+                        && OAuthFlowView::OAuth(state).confirming())
                     || (matches!(key.code, KeyCode::Enter)
-                        && state.cursor == 2
-                        && !state.paste_focused)
-                {
-                    let template = s.template.expect("template chosen");
-                    let id = s.id_field.text().trim().to_string();
-                    let entry = provider_entry_from_add(s, template, Vec::new());
-                    self.save_and_fetch_provider(s, id, entry, template);
-                }
-            }
-            AddStep::CodexOAuthAuth(state) => {
-                let (close, action) = handle_device_code_oauth_key(key, state);
-                self.pending_oauth_action = action;
-                if close {
-                    s.step = AddStep::EditUrl;
-                    return Nav::Stay;
-                }
-                if matches!(key.code, KeyCode::Char('s'))
-                    || (matches!(key.code, KeyCode::Enter)
-                        && OAuthFlowView::Codex(state).confirming())
-                    || (matches!(key.code, KeyCode::Enter)
-                        && state.cursor == 1
-                        && state.pending.is_none())
+                        && ((state.provider == OAuthProvider::Grok
+                            && state.cursor == 2
+                            && !state.paste_focused)
+                            || (state.provider == OAuthProvider::Codex
+                                && state.cursor == 1
+                                && state.device_login().is_none())))
                 {
                     let template = s.template.expect("template chosen");
                     let id = s.id_field.text().trim().to_string();
@@ -1638,20 +1524,11 @@ impl SettingsCx {
                     parent: Box::new(owned),
                 }));
             }
-            Some(EditAction::GrokOAuthAuth) => {
-                let state = Box::new(BrowserCallbackOAuthState::new());
+            Some(EditAction::OAuthAuth(provider)) => {
+                let state = Box::new(OAuthFlowState::new(provider));
                 let owned =
                     std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
-                return Nav::Replace(super::providers_page(ProvidersPage::GrokOAuthSetup {
-                    state,
-                    parent: Box::new(owned),
-                }));
-            }
-            Some(EditAction::CodexOAuthAuth) => {
-                let state = Box::new(DeviceCodeOAuthState::new());
-                let owned =
-                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
-                return Nav::Replace(super::providers_page(ProvidersPage::CodexOAuthSetup {
+                return Nav::Replace(super::providers_page(ProvidersPage::OAuthSetup {
                     state,
                     parent: Box::new(owned),
                 }));
@@ -2231,11 +2108,8 @@ impl SettingsCx {
             ProvidersPage::CopilotSetup { state, .. } => {
                 self.render_copilot_setup(frame, area, state)
             }
-            ProvidersPage::GrokOAuthSetup { state, .. } => {
-                render_oauth_setup(frame, area, OAuthFlowView::Grok(state), links)
-            }
-            ProvidersPage::CodexOAuthSetup { state, .. } => {
-                render_oauth_setup(frame, area, OAuthFlowView::Codex(state), links)
+            ProvidersPage::OAuthSetup { state, .. } => {
+                render_oauth_setup(frame, area, OAuthFlowView::OAuth(state), links)
             }
         }
     }
@@ -2443,40 +2317,14 @@ impl SettingsCx {
                     muted,
                 )));
             }
-            AddStep::GrokOAuthAuth(state) => {
+            AddStep::OAuthAuth(state) => {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "Uses your SuperGrok subscription quota via xAI's sanctioned OAuth flow."
-                        .to_string(),
-                    muted,
-                )));
-                lines.push(Line::default());
-                render_oauth_body(&mut lines, OAuthFlowView::Grok(state));
-            }
-            AddStep::CodexOAuthAuth(state) => {
-                let t = s.template.expect("template chosen");
-                lines.push(Line::from(vec![
-                    Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
-                ]));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "Uses your ChatGPT Plus/Pro subscription quota via OpenAI's documented Codex agent login."
-                        .to_string(),
-                    muted,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "Uses a separate credential store from the Codex CLI; re-login if inference fails after CLI use."
-                        .to_string(),
-                    muted,
-                )));
-                lines.push(Line::default());
-                render_oauth_body(&mut lines, OAuthFlowView::Codex(state));
+                render_oauth_body(&mut lines, OAuthFlowView::OAuth(state));
             }
             AddStep::Saving | AddStep::Fetching => {
                 lines.push(Line::from(Span::styled(
@@ -2508,8 +2356,7 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(err.clone(), style)));
         }
         let oauth_flow = match &s.step {
-            AddStep::GrokOAuthAuth(state) => Some(OAuthFlowView::Grok(state)),
-            AddStep::CodexOAuthAuth(state) => Some(OAuthFlowView::Codex(state)),
+            AddStep::OAuthAuth(state) => Some(OAuthFlowView::OAuth(state)),
             _ => None,
         };
         let link_regions = oauth_flow
@@ -2590,7 +2437,7 @@ impl SettingsCx {
                 EditAction::Url => ("URL", s.entry.url.clone()),
                 EditAction::Headers => ("Headers", headers_summary.clone()),
                 EditAction::CopilotAuth => ("Copilot auth", String::new()),
-                EditAction::GrokOAuthAuth => (
+                EditAction::OAuthAuth(OAuthProvider::Grok) => (
                     "Grok subscription auth",
                     if xai_oauth::is_logged_in() {
                         "logged in"
@@ -2599,7 +2446,7 @@ impl SettingsCx {
                     }
                     .to_string(),
                 ),
-                EditAction::CodexOAuthAuth => (
+                EditAction::OAuthAuth(OAuthProvider::Codex) => (
                     "Codex subscription auth",
                     if codex_oauth::is_logged_in() {
                         "logged in"
@@ -3617,12 +3464,10 @@ impl SettingsPage for ProvidersPage {
             ProvidersPage::CopilotSetup { .. } => {
                 format!(" › {} › Copilot setup", super::PROVIDERS_TITLE)
             }
-            ProvidersPage::GrokOAuthSetup { .. } => {
-                format!(" › {} › Grok OAuth", super::PROVIDERS_TITLE)
-            }
-            ProvidersPage::CodexOAuthSetup { .. } => {
-                format!(" › {} › Codex OAuth", super::PROVIDERS_TITLE)
-            }
+            ProvidersPage::OAuthSetup { state, .. } => match state.provider {
+                OAuthProvider::Grok => format!(" › {} › Grok OAuth", super::PROVIDERS_TITLE),
+                OAuthProvider::Codex => format!(" › {} › Codex OAuth", super::PROVIDERS_TITLE),
+            },
         };
         format!(
             "{}{}",
@@ -3647,19 +3492,21 @@ impl SettingsPage for ProvidersPage {
                     }
                 }
                 AddStep::CopilotAuth(_) => "enter: apply  s: skip  esc: cancel",
-                AddStep::GrokOAuthAuth(state) => {
-                    if state.paste_focused {
-                        return "type/paste code  enter: submit  esc: options";
+                AddStep::OAuthAuth(state) => match state.provider {
+                    OAuthProvider::Grok => {
+                        if state.paste_focused {
+                            return "type/paste code  enter: submit  esc: options";
+                        }
+                        oauth_setup_help_text(oauth_setup_confirming_logged_in(
+                            state.logged_in,
+                            state.pending,
+                            state.paste_focused,
+                        ))
                     }
-                    oauth_setup_help_text(oauth_setup_confirming_logged_in(
-                        state.logged_in,
-                        state.pending,
-                        state.paste_focused,
-                    ))
-                }
-                AddStep::CodexOAuthAuth(state) => oauth_setup_help_text(
-                    oauth_setup_confirming_logged_in(state.logged_in, state.polling, false),
-                ),
+                    OAuthProvider::Codex => oauth_setup_help_text(
+                        oauth_setup_confirming_logged_in(state.logged_in, state.polling, false),
+                    ),
+                },
                 AddStep::Saving | AddStep::Fetching => "(in progress)  esc: cancel",
                 AddStep::Done => "enter: back to list",
             },
@@ -3714,13 +3561,13 @@ impl SettingsPage for ProvidersPage {
                 "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel"
             }
             ProvidersPage::CopilotSetup { .. } => "enter: apply  esc: cancel",
-            ProvidersPage::GrokOAuthSetup { state, .. } if state.paste_focused => {
+            ProvidersPage::OAuthSetup { state, .. } if state.paste_focused => {
                 "type/paste code  enter: submit  esc: options"
             }
-            ProvidersPage::GrokOAuthSetup { .. } => {
-                "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  esc: back"
-            }
-            ProvidersPage::CodexOAuthSetup { .. } => "↑/↓/Tab/Shift+Tab  enter: choose  esc: back",
+            ProvidersPage::OAuthSetup { state, .. } => match state.provider {
+                OAuthProvider::Grok => "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  esc: back",
+                OAuthProvider::Codex => "↑/↓/Tab/Shift+Tab  enter: choose  esc: back",
+            },
         }
     }
 

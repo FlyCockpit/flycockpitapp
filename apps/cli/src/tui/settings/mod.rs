@@ -343,7 +343,7 @@ pub struct SettingsCx {
     pub(super) env_lookup: fn(&str) -> Option<String>,
     pub(super) credential_store_path: Option<PathBuf>,
     pending_daemon_request: Option<Request>,
-    pending_oauth_action: Option<OAuthActionRequest>,
+    pending_oauth_action: Option<OAuthFlowRequest>,
 }
 
 fn root_page(cursor: usize) -> PageBox {
@@ -399,8 +399,8 @@ use category::{Category, CategoryPage};
 use harnesses_page::HarnessesPage;
 use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
-pub(crate) use providers::OAuthActionRequest;
 use providers::{AddState, AddStep, ProvidersPage};
+pub(crate) use providers::{OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthProvider};
 use reset::{ResetButton, ResetOutcome};
 use skills_page::SkillsPage;
 use string_list::StringListPage;
@@ -830,40 +830,22 @@ impl Dialog {
         }
     }
 
-    pub fn take_oauth_action(&mut self) -> Option<OAuthActionRequest> {
+    pub fn take_oauth_action(&mut self) -> Option<OAuthFlowRequest> {
         match self {
             Dialog::Settings(s) => s.pending_oauth_action.take(),
             _ => None,
         }
     }
 
-    pub fn apply_oauth_codex_begin(
-        &mut self,
-        result: Result<crate::auth::codex_oauth::DeviceLogin, String>,
-    ) {
+    pub fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_codex_begin(result);
+            s.apply_oauth_begin(provider, result);
         }
     }
 
-    pub fn apply_oauth_codex_complete(&mut self, result: Result<bool, String>) {
+    pub fn apply_oauth_complete(&mut self, provider: OAuthProvider, result: Result<bool, String>) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_codex_complete(result);
-        }
-    }
-
-    pub fn apply_oauth_grok_begin(
-        &mut self,
-        result: Result<(crate::auth::xai_oauth::ManualLogin, bool, Option<String>), String>,
-    ) {
-        if let Dialog::Settings(s) = self {
-            s.apply_oauth_grok_begin(result);
-        }
-    }
-
-    pub fn apply_oauth_grok_complete(&mut self, result: Result<bool, String>) {
-        if let Dialog::Settings(s) = self {
-            s.apply_oauth_grok_complete(result);
+            s.apply_oauth_complete(provider, result);
         }
     }
 
@@ -1142,18 +1124,11 @@ impl SettingsDialog {
         self.drain_fetch_all();
         if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
             match page {
-                ProvidersPage::GrokOAuthSetup { state, .. }
+                ProvidersPage::OAuthSetup { state, .. }
                 | ProvidersPage::Add(AddState {
-                    step: AddStep::GrokOAuthAuth(state),
+                    step: AddStep::OAuthAuth(state),
                     ..
-                }) if state.pending => {
-                    state.spinner_tick = state.spinner_tick.wrapping_add(1);
-                }
-                ProvidersPage::CodexOAuthSetup { state, .. }
-                | ProvidersPage::Add(AddState {
-                    step: AddStep::CodexOAuthAuth(state),
-                    ..
-                }) if state.polling => {
+                }) if state.pending || state.polling => {
                     state.spinner_tick = state.spinner_tick.wrapping_add(1);
                 }
                 _ => {}
@@ -1161,125 +1136,32 @@ impl SettingsDialog {
         }
     }
 
-    fn apply_oauth_codex_begin(
+    fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        self.pending_oauth_action =
+            state.apply_begin(result, providers::OAuthEffects::production());
+    }
+
+    fn apply_oauth_complete(&mut self, provider: OAuthProvider, result: Result<bool, String>) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        state.apply_complete(result);
+    }
+
+    fn oauth_flow_state_mut(
         &mut self,
-        result: Result<crate::auth::codex_oauth::DeviceLogin, String>,
-    ) {
-        match result {
-            Ok(login) => {
-                let copied = crate::clipboard::copy_plain(&login.user_code).is_ok();
-                let ssh = crate::clipboard::is_ssh();
-                let opened = ssh || crate::browser::open(&login.verification_uri).is_ok();
-                let status = if ssh {
-                    if copied {
-                        "Code copied. Open the link and enter the code. Waiting for approval..."
-                    } else {
-                        "Open the link and enter the code. Waiting for approval (code copy failed)."
-                    }
-                } else if copied && opened {
-                    "Opened browser; code copied. Waiting for approval..."
-                } else if opened {
-                    "Opened browser. Waiting for approval (code copy failed)."
-                } else if copied {
-                    "Code copied. Open the link manually. Waiting for approval..."
-                } else {
-                    "Open the link manually. Waiting for approval (code copy failed)."
-                };
-                if let Some(state) = self.codex_oauth_state_mut() {
-                    state.polling = true;
-                    state.status = Some(Ok(status.to_string()));
-                    state.pending = Some(login.clone());
-                }
-                self.pending_oauth_action = Some(OAuthActionRequest::CodexPoll(login));
-            }
-            Err(e) => {
-                if let Some(state) = self.codex_oauth_state_mut() {
-                    state.polling = false;
-                    state.status = Some(Err(e));
-                }
-            }
-        }
-    }
-
-    fn apply_oauth_codex_complete(&mut self, result: Result<bool, String>) {
-        let Some(state) = self.codex_oauth_state_mut() else {
-            return;
-        };
-        state.polling = false;
-        state.logged_in =
-            result.as_ref().copied().unwrap_or(false) || crate::auth::codex_oauth::is_logged_in();
-        state.status = Some(result.map(|_| "Codex OAuth login complete".to_string()));
-        if state.logged_in {
-            state.pending = None;
-        }
-    }
-
-    fn apply_oauth_grok_begin(
-        &mut self,
-        result: Result<(crate::auth::xai_oauth::ManualLogin, bool, Option<String>), String>,
-    ) {
-        let Some(state) = self.grok_oauth_state_mut() else {
-            return;
-        };
-        match result {
-            Ok((login, auto_attempted, browser_error)) => {
-                state.authorize_url = Some(login.authorize_url.clone());
-                state.manual_login = Some(login);
-                state.paste_focused = false;
-                state.pending = auto_attempted && browser_error.is_none();
-                state.status = Some(Ok(match browser_error {
-                    Some(e) => format!("Could not open browser ({e}); paste callback URL or code."),
-                    None if auto_attempted => {
-                        "Opened browser; waiting for callback. Paste callback/code here if needed."
-                            .to_string()
-                    }
-                    None => {
-                        "SSH detected; open the URL manually and paste callback/code.".to_string()
-                    }
-                }));
-            }
-            Err(e) => {
-                state.pending = false;
-                state.status = Some(Err(e));
-            }
-        }
-    }
-
-    fn apply_oauth_grok_complete(&mut self, result: Result<bool, String>) {
-        let Some(state) = self.grok_oauth_state_mut() else {
-            return;
-        };
-        state.pending = false;
-        state.logged_in =
-            result.as_ref().copied().unwrap_or(false) || crate::auth::xai_oauth::is_logged_in();
-        state.status = Some(result.map(|_| "xAI OAuth login complete".to_string()));
-        if state.logged_in {
-            state.paste_focused = false;
-            state.manual_login = None;
-            state.manual_input.set("");
-        }
-    }
-
-    fn grok_oauth_state_mut(&mut self) -> Option<&mut providers::BrowserCallbackOAuthState> {
+        provider: OAuthProvider,
+    ) -> Option<&mut providers::OAuthFlowState> {
         let page = self.page.downcast_mut::<ProvidersPage>()?;
         match page {
-            ProvidersPage::GrokOAuthSetup { state, .. } => Some(state),
+            ProvidersPage::OAuthSetup { state, .. } if state.provider == provider => Some(state),
             ProvidersPage::Add(AddState {
-                step: AddStep::GrokOAuthAuth(state),
+                step: AddStep::OAuthAuth(state),
                 ..
-            }) => Some(state),
-            _ => None,
-        }
-    }
-
-    fn codex_oauth_state_mut(&mut self) -> Option<&mut providers::DeviceCodeOAuthState> {
-        let page = self.page.downcast_mut::<ProvidersPage>()?;
-        match page {
-            ProvidersPage::CodexOAuthSetup { state, .. } => Some(state),
-            ProvidersPage::Add(AddState {
-                step: AddStep::CodexOAuthAuth(state),
-                ..
-            }) => Some(state),
+            }) if state.provider == provider => Some(state),
             _ => None,
         }
     }
@@ -2797,10 +2679,10 @@ mod tests {
     fn oauth_add_step_help_collapses_after_login() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        let mut codex = providers::DeviceCodeOAuthState::new();
+        let mut codex = providers::OAuthFlowState::new(OAuthProvider::Codex);
         codex.logged_in = true;
         d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
-            step: AddStep::CodexOAuthAuth(Box::new(codex)),
+            step: AddStep::OAuthAuth(Box::new(codex)),
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
@@ -2811,10 +2693,10 @@ mod tests {
         })));
         assert_eq!(d.help_text(), "enter: continue  esc: back");
 
-        let mut grok = providers::BrowserCallbackOAuthState::new();
+        let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
         grok.logged_in = false;
         d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
-            step: AddStep::GrokOAuthAuth(Box::new(grok)),
+            step: AddStep::OAuthAuth(Box::new(grok)),
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
@@ -2833,10 +2715,11 @@ mod tests {
     fn paste_routes_to_add_grok_oauth_manual_input() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        let mut grok = providers::BrowserCallbackOAuthState::new();
+        let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
         grok.paste_focused = true;
+        grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
         d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
-            step: AddStep::GrokOAuthAuth(Box::new(grok)),
+            step: AddStep::OAuthAuth(Box::new(grok)),
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
@@ -2851,8 +2734,8 @@ mod tests {
         let TestPageRef::Providers(ProvidersPage::Add(add)) = d.test_page() else {
             panic!("expected Add provider page");
         };
-        let AddStep::GrokOAuthAuth(grok) = &add.step else {
-            panic!("expected Grok OAuth add step");
+        let AddStep::OAuthAuth(grok) = &add.step else {
+            panic!("expected OAuth add step");
         };
         assert_eq!(
             grok.manual_input.text(),
@@ -2864,9 +2747,10 @@ mod tests {
     fn paste_routes_to_standalone_grok_oauth_manual_input() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
-        let mut grok = providers::BrowserCallbackOAuthState::new();
+        let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
         grok.paste_focused = true;
-        d.set_test_page(Page::Providers(ProvidersPage::GrokOAuthSetup {
+        grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
+        d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
             state: Box::new(grok),
             parent: Box::new(providers::EditState::new(
                 "grok-oauth".to_string(),
@@ -2876,8 +2760,7 @@ mod tests {
 
         d.paste("manual-code");
 
-        let TestPageRef::Providers(ProvidersPage::GrokOAuthSetup { state, .. }) = d.test_page()
-        else {
+        let TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) = d.test_page() else {
             panic!("expected standalone Grok OAuth page");
         };
         assert_eq!(state.manual_input.text(), "manual-code");
@@ -2888,9 +2771,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
 
-        let mut grok = providers::BrowserCallbackOAuthState::new();
-        grok.authorize_url = Some("https://x.ai/oauth/authorize?state=abc".to_string());
-        d.set_test_page(Page::Providers(ProvidersPage::GrokOAuthSetup {
+        let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
+        grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
+        d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
             state: Box::new(grok),
             parent: Box::new(providers::EditState::new(
                 "grok-oauth".to_string(),
@@ -2905,13 +2788,25 @@ mod tests {
         );
         assert_eq!(links.regions()[0].rect.height, 1);
         assert_eq!(links.regions()[0].label, "open xai.com authorization page");
+        let mut grok_confirming = providers::OAuthFlowState::new(OAuthProvider::Grok);
+        grok_confirming.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
+        grok_confirming.apply_complete(Ok(true));
+        d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
+            state: Box::new(grok_confirming),
+            parent: Box::new(providers::EditState::new(
+                "grok-oauth".to_string(),
+                Default::default(),
+            )),
+        }));
+        let links = render_settings_links(&d, 96, 24);
+        assert_eq!(links.regions().len(), 0);
 
-        let mut codex = providers::DeviceCodeOAuthState::new();
-        codex.pending = Some(crate::auth::codex_oauth::DeviceLogin::for_test(
+        let mut codex = providers::OAuthFlowState::new(OAuthProvider::Codex);
+        codex.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
             "https://microsoft.com/devicelogin",
             "ABCD-EFGH",
         ));
-        d.set_test_page(Page::Providers(ProvidersPage::CodexOAuthSetup {
+        d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
             state: Box::new(codex),
             parent: Box::new(providers::EditState::new(
                 "codex-oauth".to_string(),
@@ -2926,6 +2821,24 @@ mod tests {
             links.regions()[0].label,
             "https://microsoft.com/devicelogin"
         );
+
+        let mut codex_confirming = providers::OAuthFlowState::new(OAuthProvider::Codex);
+        codex_confirming.set_device_login_for_test(
+            crate::auth::codex_oauth::DeviceLogin::for_test(
+                "https://microsoft.com/devicelogin",
+                "ABCD-EFGH",
+            ),
+        );
+        codex_confirming.apply_complete(Ok(true));
+        d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
+            state: Box::new(codex_confirming),
+            parent: Box::new(providers::EditState::new(
+                "codex-oauth".to_string(),
+                Default::default(),
+            )),
+        }));
+        let links = render_settings_links(&d, 96, 24);
+        assert_eq!(links.regions().len(), 0);
     }
 
     // ── Category-page tests (reorganized /settings) ────────────────────

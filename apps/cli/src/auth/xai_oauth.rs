@@ -54,6 +54,18 @@ pub struct ManualLogin {
     token_endpoint: String,
 }
 
+#[cfg(test)]
+impl ManualLogin {
+    pub(crate) fn for_test(authorize_url: &str) -> Self {
+        Self {
+            authorize_url: authorize_url.to_string(),
+            state: "state".to_string(),
+            verifier: "verifier".to_string(),
+            token_endpoint: "https://auth.x.ai/oauth/token".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,

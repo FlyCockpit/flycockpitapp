@@ -1075,12 +1075,6 @@ fn apply_fetch_result_save_failure_surfaces() {
 }
 
 #[test]
-fn grok_login_selection_is_ssh_aware() {
-    assert_eq!(grok_login_selection(true), GrokLoginSelection::ManualOnly);
-    assert_eq!(grok_login_selection(false), GrokLoginSelection::Auto);
-}
-
-#[test]
 fn copy_oauth_url_reports_success_error_and_missing_url() {
     let mut status = None;
     let copied = crate::clipboard::CopyOutcome {
@@ -1104,10 +1098,132 @@ fn copy_oauth_url_reports_success_error_and_missing_url() {
     );
 }
 
+static OAUTH_EFFECTS_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static OAUTH_EFFECTS_SSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn reset_oauth_effects(ssh: bool) {
+    OAUTH_EFFECTS_SSH.store(ssh, std::sync::atomic::Ordering::SeqCst);
+    OAUTH_EFFECTS_LOG.lock().unwrap().clear();
+}
+
+fn oauth_effects_log() -> Vec<String> {
+    OAUTH_EFFECTS_LOG.lock().unwrap().clone()
+}
+
+fn fake_copy(value: &str) -> Result<crate::clipboard::CopyOutcome, crate::clipboard::CopyError> {
+    OAUTH_EFFECTS_LOG
+        .lock()
+        .unwrap()
+        .push(format!("copy:{value}"));
+    Ok(crate::clipboard::CopyOutcome {
+        osc52_written: true,
+        local_clipboard_written: false,
+    })
+}
+
+fn fake_open(value: &str) -> anyhow::Result<()> {
+    OAUTH_EFFECTS_LOG
+        .lock()
+        .unwrap()
+        .push(format!("open:{value}"));
+    Ok(())
+}
+
+fn fake_is_ssh() -> bool {
+    OAUTH_EFFECTS_SSH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn fake_oauth_effects() -> OAuthEffects {
+    OAuthEffects {
+        copy: fake_copy,
+        is_ssh: fake_is_ssh,
+        open: fake_open,
+    }
+}
+
+#[test]
+fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
+    reset_oauth_effects(false);
+    let login =
+        crate::auth::codex_oauth::DeviceLogin::for_test("https://example.test/device", "CODE-123");
+    let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Codex, fake_oauth_effects());
+    let action = state.apply_begin(
+        OAuthBeginResult::Device(Ok(login.clone())),
+        fake_oauth_effects(),
+    );
+
+    assert!(state.polling);
+    assert!(matches!(
+        action,
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Codex,
+            op: OAuthFlowOp::Poll(_),
+        })
+    ));
+    assert_eq!(
+        oauth_effects_log(),
+        vec![
+            "copy:CODE-123".to_string(),
+            "open:https://example.test/device".to_string()
+        ]
+    );
+}
+
+#[test]
+fn codex_copy_keys_are_ssh_aware() {
+    let login =
+        crate::auth::codex_oauth::DeviceLogin::for_test("https://example.test/device", "CODE-123");
+
+    reset_oauth_effects(true);
+    let mut ssh_state =
+        OAuthFlowState::new_with_effects(OAuthProvider::Codex, fake_oauth_effects());
+    ssh_state.set_device_login_for_test(login.clone());
+    handle_oauth_flow_key_with(
+        press(KeyCode::Char('c')),
+        &mut ssh_state,
+        fake_oauth_effects(),
+    );
+    handle_oauth_flow_key_with(
+        press(KeyCode::Char('y')),
+        &mut ssh_state,
+        fake_oauth_effects(),
+    );
+    assert_eq!(
+        oauth_effects_log(),
+        vec![
+            "copy:https://example.test/device".to_string(),
+            "copy:CODE-123".to_string()
+        ]
+    );
+
+    reset_oauth_effects(false);
+    let mut local_state =
+        OAuthFlowState::new_with_effects(OAuthProvider::Codex, fake_oauth_effects());
+    local_state.set_device_login_for_test(login);
+    handle_oauth_flow_key_with(
+        press(KeyCode::Char('c')),
+        &mut local_state,
+        fake_oauth_effects(),
+    );
+    handle_oauth_flow_key_with(
+        press(KeyCode::Char('y')),
+        &mut local_state,
+        fake_oauth_effects(),
+    );
+    assert_eq!(
+        oauth_effects_log(),
+        vec![
+            "copy:CODE-123".to_string(),
+            "open:https://example.test/device".to_string(),
+            "copy:CODE-123".to_string()
+        ]
+    );
+}
+
 #[test]
 fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let mut state = AddState::new();
-    state.step = AddStep::GrokOAuthAuth(Box::new(BrowserCallbackOAuthState::new()));
+    state.step = AddStep::OAuthAuth(Box::new(OAuthFlowState::new(OAuthProvider::Grok)));
     let mut page = ProvidersPage::Add(state);
 
     assert!(page.active_text_field().is_none());
@@ -1115,7 +1231,7 @@ fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let ProvidersPage::Add(add) = &mut page else {
         unreachable!();
     };
-    let AddStep::GrokOAuthAuth(grok) = &mut add.step else {
+    let AddStep::OAuthAuth(grok) = &mut add.step else {
         unreachable!();
     };
     grok.paste_focused = true;
@@ -1128,7 +1244,7 @@ fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let ProvidersPage::Add(add) = &page else {
         unreachable!();
     };
-    let AddStep::GrokOAuthAuth(grok) = &add.step else {
+    let AddStep::OAuthAuth(grok) = &add.step else {
         unreachable!();
     };
     assert_eq!(grok.manual_input.text(), "callback-code");
@@ -1136,11 +1252,11 @@ fn add_grok_oauth_paste_focus_reports_active_text_field() {
 
 #[test]
 fn grok_paste_focus_char_c_inserts_instead_of_copying_url() {
-    let mut state = BrowserCallbackOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
     state.paste_focused = true;
-    state.authorize_url = Some("https://example.test/oauth".to_string());
+    state.set_browser_session_for_test("https://example.test/oauth");
 
-    let (_close, action) = handle_browser_callback_oauth_key(press(KeyCode::Char('c')), &mut state);
+    let (_close, action) = handle_oauth_flow_key(press(KeyCode::Char('c')), &mut state);
 
     assert!(action.is_none());
     assert_eq!(state.manual_input.text(), "c");
@@ -1149,12 +1265,12 @@ fn grok_paste_focus_char_c_inserts_instead_of_copying_url() {
 
 #[test]
 fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
-    let mut state = BrowserCallbackOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
     state.paste_focused = true;
     let callback = "http://127.0.0.1:56121/callback?code=abc123&state=s";
 
     for ch in callback.chars() {
-        handle_browser_callback_oauth_key(press(KeyCode::Char(ch)), &mut state);
+        handle_oauth_flow_key(press(KeyCode::Char(ch)), &mut state);
     }
 
     assert_eq!(state.manual_input.text(), callback);
@@ -1162,12 +1278,12 @@ fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
 
 #[test]
 fn codex_oauth_logged_in_renders_single_continue_row() {
-    let mut state = DeviceCodeOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Codex);
     state.logged_in = true;
     state.status = Some(Ok("Codex OAuth login complete".to_string()));
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthFlowView::Codex(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::OAuth(&state));
     let rendered = rendered_text(&lines);
 
     assert!(rendered.contains("continue"), "{rendered}");
@@ -1179,21 +1295,21 @@ fn codex_oauth_logged_in_renders_single_continue_row() {
 
 #[test]
 fn codex_oauth_logged_out_renders_start_or_poll_menu() {
-    let mut state = DeviceCodeOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Codex);
     state.logged_in = false;
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthFlowView::Codex(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::OAuth(&state));
     let rendered = rendered_text(&lines);
     assert!(rendered.contains("log in"), "{rendered}");
     assert!(rendered.contains("skip / continue"), "{rendered}");
 
-    state.pending = Some(crate::auth::codex_oauth::DeviceLogin::for_test(
+    state.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "ABCD-EFGH",
     ));
     lines.clear();
-    render_oauth_body(&mut lines, OAuthFlowView::Codex(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::OAuth(&state));
     let rendered = rendered_text(&lines);
     assert!(rendered.contains("poll for approval"), "{rendered}");
     assert!(rendered.contains("skip / continue"), "{rendered}");
@@ -1202,12 +1318,12 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
 
 #[test]
 fn grok_oauth_logged_in_renders_single_continue_row() {
-    let mut state = BrowserCallbackOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
     state.logged_in = true;
     state.status = Some(Ok("xAI OAuth login complete".to_string()));
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthFlowView::Grok(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::OAuth(&state));
     let rendered = rendered_text(&lines);
 
     assert!(rendered.contains("continue"), "{rendered}");
@@ -1219,11 +1335,11 @@ fn grok_oauth_logged_in_renders_single_continue_row() {
 
 #[test]
 fn grok_oauth_logged_out_renders_full_menu() {
-    let mut state = BrowserCallbackOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
     state.logged_in = false;
     let mut lines = Vec::new();
 
-    render_oauth_body(&mut lines, OAuthFlowView::Grok(&state));
+    render_oauth_body(&mut lines, OAuthFlowView::OAuth(&state));
     let rendered = rendered_text(&lines);
 
     assert!(rendered.contains("log in"), "{rendered}");
@@ -1234,30 +1350,33 @@ fn grok_oauth_logged_out_renders_full_menu() {
 
 #[test]
 fn logged_in_oauth_navigation_clamps_to_single_continue_row() {
-    let mut codex = DeviceCodeOAuthState::new();
+    let mut codex = OAuthFlowState::new(OAuthProvider::Codex);
     codex.logged_in = true;
     codex.cursor = 99;
-    handle_device_code_oauth_key(press(KeyCode::Down), &mut codex);
+    handle_oauth_flow_key(press(KeyCode::Down), &mut codex);
     assert_eq!(codex.cursor, 0);
 
-    let mut grok = BrowserCallbackOAuthState::new();
+    let mut grok = OAuthFlowState::new(OAuthProvider::Grok);
     grok.logged_in = true;
     grok.cursor = 99;
-    handle_browser_callback_oauth_key(press(KeyCode::Up), &mut grok);
+    handle_oauth_flow_key(press(KeyCode::Up), &mut grok);
     assert_eq!(grok.cursor, 0);
 }
 
 #[test]
 fn grok_oauth_logged_out_enter_still_begins_login() {
-    let mut state = BrowserCallbackOAuthState::new();
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
     state.logged_in = false;
-    state.ssh_manual_only = false;
+    state.ssh = false;
     state.cursor = 0;
-    let (_close, action) = handle_browser_callback_oauth_key(press(KeyCode::Enter), &mut state);
+    let (_close, action) = handle_oauth_flow_key(press(KeyCode::Enter), &mut state);
 
     assert!(matches!(
         action,
-        Some(OAuthActionRequest::GrokBegin { is_ssh: false })
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Grok,
+            op: OAuthFlowOp::Begin,
+        })
     ));
     assert!(state.pending);
 }
@@ -1273,16 +1392,16 @@ async fn logged_in_oauth_enter_advances_add_wizard() {
         state.url_field.set(template.url);
         state.step = match template_id {
             "codex-oauth" => {
-                let mut oauth = DeviceCodeOAuthState::new();
+                let mut oauth = OAuthFlowState::new(OAuthProvider::Codex);
                 oauth.logged_in = true;
                 oauth.cursor = 0;
-                AddStep::CodexOAuthAuth(Box::new(oauth))
+                AddStep::OAuthAuth(Box::new(oauth))
             }
             "grok-oauth" => {
-                let mut oauth = BrowserCallbackOAuthState::new();
+                let mut oauth = OAuthFlowState::new(OAuthProvider::Grok);
                 oauth.logged_in = true;
                 oauth.cursor = 0;
-                AddStep::GrokOAuthAuth(Box::new(oauth))
+                AddStep::OAuthAuth(Box::new(oauth))
             }
             _ => unreachable!(),
         };
@@ -1290,10 +1409,7 @@ async fn logged_in_oauth_enter_advances_add_wizard() {
         dialog.handle_add_key(press(KeyCode::Enter), &mut state);
 
         assert!(
-            !matches!(
-                state.step,
-                AddStep::CodexOAuthAuth(_) | AddStep::GrokOAuthAuth(_)
-            ),
+            !matches!(state.step, AddStep::OAuthAuth(_)),
             "{template_id} should advance past the OAuth confirmation step"
         );
     }

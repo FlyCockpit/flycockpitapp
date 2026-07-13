@@ -81,7 +81,7 @@ use crate::tui::history::{
     ToolCallState, classify_subagent_status, route_text_delta,
 };
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput, with_input_suspended};
-use crate::tui::settings::{self, Dialog, OAuthActionRequest};
+use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
 use crate::welcome::{self, LaunchBundle, LaunchInfo};
 
 const MIN_INPUT_CONTENT: u16 = 1;
@@ -4293,7 +4293,8 @@ impl App {
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
                 };
-                self.dialog.apply_oauth_codex_begin(payload);
+                self.dialog
+                    .apply_oauth_begin(OAuthProvider::Codex, OAuthBeginResult::Device(payload));
             }
             AsyncActionKind::Internal("oauth.codex.poll") => {
                 let payload = match result.payload {
@@ -4301,7 +4302,8 @@ impl App {
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
                 };
-                self.dialog.apply_oauth_codex_complete(payload);
+                self.dialog
+                    .apply_oauth_complete(OAuthProvider::Codex, payload);
             }
             AsyncActionKind::Internal("oauth.grok.begin") => {
                 let payload = match result.payload {
@@ -4332,7 +4334,8 @@ impl App {
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
                 };
-                self.dialog.apply_oauth_grok_begin(payload);
+                self.dialog
+                    .apply_oauth_begin(OAuthProvider::Grok, OAuthBeginResult::Browser(payload));
             }
             AsyncActionKind::Internal("oauth.grok.complete") => {
                 let payload = match result.payload {
@@ -4340,7 +4343,8 @@ impl App {
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
                 };
-                self.dialog.apply_oauth_grok_complete(payload);
+                self.dialog
+                    .apply_oauth_complete(OAuthProvider::Grok, payload);
             }
             _ => self.completed_async_actions.push(result),
         }
@@ -4348,8 +4352,8 @@ impl App {
 
     pub(super) fn drain_oauth_actions(&mut self) {
         while let Some(action) = self.dialog.take_oauth_action() {
-            match action {
-                OAuthActionRequest::CodexBegin => {
+            match (action.provider, action.op) {
+                (OAuthProvider::Codex, OAuthFlowOp::Begin) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
@@ -4361,7 +4365,7 @@ impl App {
                         },
                     );
                 }
-                OAuthActionRequest::CodexPoll(login) => {
+                (OAuthProvider::Codex, OAuthFlowOp::Poll(login)) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.poll"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
@@ -4373,11 +4377,11 @@ impl App {
                         },
                     );
                 }
-                OAuthActionRequest::CodexCancel => {
+                (OAuthProvider::Codex, OAuthFlowOp::Cancel) => {
                     self.async_actions
                         .abort_key(&AsyncActionKey::new("oauth.codex"));
                 }
-                OAuthActionRequest::GrokBegin { is_ssh } => {
+                (OAuthProvider::Grok, OAuthFlowOp::Begin) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
@@ -4385,7 +4389,7 @@ impl App {
                             let login = crate::auth::xai_oauth::begin_manual_login()
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            if is_ssh {
+                            if crate::clipboard::is_ssh() {
                                 return Ok(AsyncActionPayload::OAuthGrokBegin {
                                     login,
                                     auto_attempted: false,
@@ -4403,7 +4407,7 @@ impl App {
                         },
                     );
                 }
-                OAuthActionRequest::GrokComplete { login, input } => {
+                (OAuthProvider::Grok, OAuthFlowOp::Complete { login, input }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.complete"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
@@ -4415,10 +4419,12 @@ impl App {
                         },
                     );
                 }
-                OAuthActionRequest::GrokCancel => {
+                (OAuthProvider::Grok, OAuthFlowOp::Cancel) => {
                     self.async_actions
                         .abort_key(&AsyncActionKey::new("oauth.grok"));
                 }
+                (OAuthProvider::Codex, OAuthFlowOp::Complete { .. })
+                | (OAuthProvider::Grok, OAuthFlowOp::Poll(_)) => {}
             }
         }
     }

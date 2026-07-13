@@ -301,6 +301,7 @@ fn response_to_repeat_choice(response: &ResolveResponse) -> RepeatChoice {
 fn approval_question(
     label: &str,
     wrapper: bool,
+    prompt_override: Option<&str>,
     detail: Option<CommandDetail>,
     escalation: Option<SandboxEscalation>,
     offered_scopes: &[Scope],
@@ -309,15 +310,19 @@ fn approval_question(
     // The escalation variant reframes the ask: the command already ran
     // confined and failed, so the question is "re-run WITHOUT the sandbox?"
     // — never "the sandbox blocked this" (zerobox gives no such signal).
-    let prompt = match (&escalation, wrapper) {
-        (Some(_), true) => format!(
-            "`{label}` failed while sandboxed. Re-run it without the sandbox? Wrappers can't be remembered — once only."
-        ),
-        (Some(_), false) => {
-            format!("`{label}` failed while sandboxed. Re-run it without the sandbox?")
+    let prompt = if let Some(prompt) = prompt_override {
+        prompt.to_string()
+    } else {
+        match (&escalation, wrapper) {
+            (Some(_), true) => format!(
+                "`{label}` failed while sandboxed. Re-run it without the sandbox? Wrappers can't be remembered — once only."
+            ),
+            (Some(_), false) => {
+                format!("`{label}` failed while sandboxed. Re-run it without the sandbox?")
+            }
+            (None, true) => format!("Run `{label}`? Wrappers can't be remembered."),
+            (None, false) => format!("Run `{label}`?"),
         }
-        (None, true) => format!("Run `{label}`? Wrappers can't be remembered."),
-        (None, false) => format!("Run `{label}`?"),
     };
     let options = if wrapper {
         // Both transient: a wrapper can only ever be approved/rejected once.
@@ -849,7 +854,7 @@ mod tests {
 
     #[test]
     fn approval_question_omits_scopes_above_policy_cap() {
-        let q = approval_question("rm foo", false, None, None, &[Scope::Once], None);
+        let q = approval_question("rm foo", false, None, None, None, &[Scope::Once], None);
         let InterruptQuestion::Single { options, .. } = q else {
             panic!("expected single");
         };
@@ -859,6 +864,7 @@ mod tests {
         let q = approval_question(
             "mkdir logs",
             false,
+            None,
             None,
             None,
             &[Scope::Once, Scope::Session],
@@ -878,6 +884,47 @@ mod tests {
                 ID_REJECT_SESSION
             ]
         );
+    }
+
+    #[test]
+    fn path_approval_prompt_uses_allow_wording() {
+        let path = "/tmp/outside";
+        let description = path_prompt_description(
+            path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        );
+        let q = approval_question(
+            &path_prompt_label(
+                path,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            ),
+            false,
+            Some(&description),
+            None,
+            None,
+            &[Scope::Once],
+            None,
+        );
+        let InterruptQuestion::Single { prompt, .. } = q else {
+            panic!("expected single");
+        };
+        assert_eq!(prompt, "Allow read-write access to /tmp/outside?");
+
+        let description =
+            path_prompt_description(path, crate::tools::shell_sandbox::SandboxPathAccess::Read);
+        let q = approval_question(
+            &path_prompt_label(path, crate::tools::shell_sandbox::SandboxPathAccess::Read),
+            false,
+            Some(&description),
+            None,
+            None,
+            &[Scope::Once],
+            None,
+        );
+        let InterruptQuestion::Single { prompt, .. } = q else {
+            panic!("expected single");
+        };
+        assert_eq!(prompt, "Allow read access to /tmp/outside?");
     }
 
     /// Spawn a background resolver that answers a sequence of prompts in

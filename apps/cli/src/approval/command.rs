@@ -12,6 +12,17 @@ struct CommandPromptContext {
     batch_count: Option<u32>,
 }
 
+fn batch_count_for_prompting(
+    prompting: &[(&classify::SimpleCommandInfo, &ApprovalPromptPolicy)],
+) -> Option<u32> {
+    let step_count = prompting.len() as u32;
+    (step_count > 1
+        && prompting.iter().all(|(info, _)| {
+            !matches!(info.risk.tier, RiskTier::Destructive | RiskTier::Privileged)
+        }))
+    .then_some(step_count)
+}
+
 impl Approver {
     /// Decide a whole command string. Classifies it, then requires that
     /// **every** constituent simple command be allowed: an already-granted
@@ -137,11 +148,7 @@ impl Approver {
         // prompting constituent is a wrapper → once only).
         let offered = offered_scopes(&prompting);
         let audit = PermissionDecisionAudit::from_prompting(&prompting);
-        let batch_count = (step_count > 1
-            && prompting.iter().all(|(info, _)| {
-                !matches!(info.risk.tier, RiskTier::Destructive | RiskTier::Privileged)
-            }))
-        .then_some(step_count);
+        let batch_count = batch_count_for_prompting(&prompting);
 
         // Track the broadest scope we settled on, for the caller's info.
         // A chain is only as "remembered" as its narrowest decision; we
@@ -347,5 +354,34 @@ impl Approver {
                 Ok(CommandStepDecision::Decision(Decision::Deny))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> ApprovalPromptPolicy {
+        ApprovalPromptPolicy::new(Scope::Global)
+    }
+
+    #[test]
+    fn batch_count_excludes_destructive_and_privileged_constituents() {
+        let policies = [policy(), policy(), policy()];
+
+        let ordinary = classify::classify("echo a && mkdir b && touch c");
+        let ordinary_commands = ordinary.simple_commands();
+        let prompting: Vec<_> = ordinary_commands.iter().zip(policies.iter()).collect();
+        assert_eq!(batch_count_for_prompting(&prompting), Some(3));
+
+        let destructive = classify::classify("echo a && rm b && touch c");
+        let destructive_commands = destructive.simple_commands();
+        let prompting: Vec<_> = destructive_commands.iter().zip(policies.iter()).collect();
+        assert_eq!(batch_count_for_prompting(&prompting), None);
+
+        let privileged = classify::classify("echo a && sudo true && touch c");
+        let privileged_commands = privileged.simple_commands();
+        let prompting: Vec<_> = privileged_commands.iter().zip(policies.iter()).collect();
+        assert_eq!(batch_count_for_prompting(&prompting), None);
     }
 }

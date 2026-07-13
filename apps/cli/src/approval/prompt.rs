@@ -168,6 +168,7 @@ impl Approver {
         let question = approval_question(
             label,
             wrapper,
+            None,
             detail,
             escalation,
             offered_scopes,

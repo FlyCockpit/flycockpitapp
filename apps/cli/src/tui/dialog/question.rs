@@ -503,8 +503,7 @@ impl QuestionDialog {
             return;
         }
         // Anti-misfire lockout: grey border while locked; once interactive,
-        // destructive/privileged approvals tint red and mutating approvals
-        // tint yellow.
+        // only destructive/privileged approvals tint red.
         let locked = self.state.locked();
         let risk_color = self.current_risk_color();
         let border_color = if locked {
@@ -987,11 +986,12 @@ impl QuestionDialog {
             out.push(Line::from(Span::styled("content:", muted)));
             if preview.dynamic {
                 out.push(Line::from(Span::styled(
-                    format!("  {}", preview.content),
+                    format!("  {}", sanitize_preview_content(&preview.content)),
                     muted,
                 )));
             } else {
-                for line in truncated_preview_lines(&preview.content) {
+                let content = sanitize_preview_content(&preview.content);
+                for line in truncated_preview_lines(&content) {
                     out.push(Line::from(Span::styled(
                         format!("  {line}"),
                         Style::default().fg(Color::White),
@@ -1006,7 +1006,7 @@ impl QuestionDialog {
     fn current_risk_color(&self) -> Option<Color> {
         self.command_detail()
             .and_then(|cd| cd.risk_tier.as_deref())
-            .and_then(risk_tier_color)
+            .and_then(risk_tier_border_color)
     }
 
     fn command_risk_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
@@ -1224,7 +1224,21 @@ fn risk_tier_color(tier: &str) -> Option<Color> {
     }
 }
 
+fn risk_tier_border_color(tier: &str) -> Option<Color> {
+    match tier {
+        "destructive" | "privileged" => Some(Color::Red),
+        _ => None,
+    }
+}
+
 const WRITE_PREVIEW_MAX_LINES: usize = 12;
+
+fn sanitize_preview_content(content: &str) -> String {
+    content
+        .chars()
+        .filter(|ch| *ch == '\n' || !ch.is_control())
+        .collect()
+}
 
 fn truncated_preview_lines(content: &str) -> Vec<String> {
     let lines: Vec<&str> = content.lines().collect();
@@ -2233,6 +2247,36 @@ mod tests {
         QuestionDialog::new(Uuid::new_v4(), String::new(), set, Duration::ZERO)
     }
 
+    fn base_command_detail() -> CommandDetail {
+        CommandDetail {
+            full_command: "echo hi".into(),
+            highlight: None,
+            step: 1,
+            step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
+            risk_tier: None,
+            risk_reasons: Vec::new(),
+            affected_targets: Vec::new(),
+            native_tool_hints: Vec::new(),
+            offered_scopes: Vec::new(),
+            policy_cap: None,
+        }
+    }
+
+    fn line_texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     fn tall_approval_dialog() -> QuestionDialog {
         let cmd: String = (0..200)
             .map(|i| format!("line {i}"))
@@ -2253,6 +2297,79 @@ mod tests {
             offered_scopes: Vec::new(),
             policy_cap: None,
         })
+    }
+
+    #[test]
+    fn risk_tier_border_color_is_destructive_only_but_value_color_is_full_tier() {
+        assert_eq!(risk_tier_border_color("ordinary"), None);
+        assert_eq!(risk_tier_border_color("mutating"), None);
+        assert_eq!(risk_tier_border_color("destructive"), Some(Color::Red));
+        assert_eq!(risk_tier_border_color("privileged"), Some(Color::Red));
+        assert_eq!(risk_tier_border_color("unknown"), None);
+
+        assert_eq!(
+            risk_tier_color("ordinary"),
+            Some(Color::Indexed(MUTED_COLOR_INDEX))
+        );
+        assert_eq!(risk_tier_color("mutating"), Some(Color::Yellow));
+        assert_eq!(risk_tier_color("destructive"), Some(Color::Red));
+        assert_eq!(risk_tier_color("privileged"), Some(Color::Red));
+
+        for (tier, expected) in [
+            ("ordinary", None),
+            ("mutating", None),
+            ("destructive", Some(Color::Red)),
+            ("privileged", Some(Color::Red)),
+        ] {
+            let mut detail = base_command_detail();
+            detail.risk_tier = Some(tier.to_string());
+            let d = approval_dialog(detail);
+            assert_eq!(d.current_risk_color(), expected, "{tier}");
+        }
+    }
+
+    #[test]
+    fn is_approval_detects_permission_pages_without_command_detail() {
+        let path_set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Allow read access to /tmp/x?".into(),
+                options: vec![opt("once", "Approve once")],
+                allow_freetext: false,
+                command_detail: None,
+                permission: true,
+                sandbox_escalation: None,
+            }],
+        };
+        assert!(dialog(path_set).is_approval());
+        assert!(approval_dialog(base_command_detail()).is_approval());
+        assert!(!dialog(single_q()).is_approval());
+    }
+
+    #[test]
+    fn command_block_renders_cwd_remembered_key_and_sanitized_preview() {
+        let mut detail = base_command_detail();
+        detail.cwd = Some("/workspace/project".into());
+        detail.remembered_key = Some("echo hi".into());
+        detail.write_content = Some(crate::daemon::proto::WriteContentPreview {
+            content: "safe\x1b[2Jbell\x07del\x7f\nnext".into(),
+            dynamic: false,
+        });
+        let d = approval_dialog(detail);
+        let lines = line_texts(&d.command_block_lines(d.command_detail().unwrap()));
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("cwd: /workspace/project"));
+        assert!(joined.contains("remembers: `echo hi`"));
+        assert!(joined.contains("  safe[2Jbelldel"));
+        assert!(joined.contains("  next"));
+        assert!(!joined.chars().any(|ch| ch != '\n' && ch.is_control()));
+
+        let mut detail = base_command_detail();
+        detail.cwd = Some("/workspace/project".into());
+        let d = approval_dialog(detail);
+        let joined = line_texts(&d.command_block_lines(d.command_detail().unwrap())).join("\n");
+        assert!(joined.contains("cwd: /workspace/project"));
+        assert!(!joined.contains("remembers:"));
     }
 
     fn render_text(d: &QuestionDialog, area: Rect) -> String {

@@ -50,7 +50,15 @@ impl Approver {
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         let label = path_prompt_label(&target, required);
         let description = path_prompt_description(&target, required);
-        let question = approval_question(&label, false, detail, None, &offered, None);
+        let question = approval_question(
+            &label,
+            false,
+            Some(&description),
+            detail,
+            None,
+            &offered,
+            None,
+        );
         let response = self.raise_and_wait(&description, question).await?;
         let choice = response_to_approval_choice(&response, false);
         let decision = match choice {

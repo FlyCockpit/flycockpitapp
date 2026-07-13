@@ -944,35 +944,39 @@ fn shell_write_content_preview_inner(command: &str) -> ShellWriteContentPreview 
     else {
         return ShellWriteContentPreview::Dynamic(command.trim().to_string());
     };
-    let source = command_source_before_redirect(&tokens[..op_index]);
-    if let Some(literal) = literal_shell_write_source(&source) {
+    let words = words_before_redirect(&tokens[..op_index]);
+    if let Some(literal) = literal_shell_write_source(&words) {
         ShellWriteContentPreview::Literal(literal)
     } else {
+        let source = words.join(" ");
         ShellWriteContentPreview::Dynamic(source)
     }
 }
 
-fn command_source_before_redirect(tokens: &[WriteToken]) -> String {
+fn words_before_redirect(tokens: &[WriteToken]) -> Vec<&str> {
     tokens
         .iter()
         .filter_map(|token| match token {
             WriteToken::Word(word) => Some(word.as_str()),
             WriteToken::Op(_) => None,
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
-fn literal_shell_write_source(source: &str) -> Option<String> {
-    let tokens = shell_write_tokens(source);
-    let mut words = tokens.iter().filter_map(|token| match token {
-        WriteToken::Word(word) => Some(word.as_str()),
-        WriteToken::Op(_) => None,
-    });
+fn literal_shell_write_source(words: &[&str]) -> Option<String> {
+    let mut words = words.iter().copied();
     let program = words.next()?;
-    let args: Vec<&str> = words.collect();
+    let mut args: Vec<&str> = words.collect();
     match program {
-        "echo" => Some(format!("{}\n", args.join(" "))),
+        "echo" => {
+            let newline = if args.first() == Some(&"-n") {
+                args.remove(0);
+                ""
+            } else {
+                "\n"
+            };
+            Some(format!("{}{newline}", args.join(" ")))
+        }
         "printf" => printf_literal_preview(&args),
         _ => None,
     }
@@ -3109,6 +3113,41 @@ mod tests {
         assert_eq!(
             shell_write_targets("printf x > logs/*.txt", root),
             ShellWriteTargets::Dynamic
+        );
+    }
+
+    #[test]
+    fn shell_write_content_preview_preserves_literal_words() {
+        assert_eq!(
+            shell_write_content_preview_inner(r#"echo "a > b" > out.txt"#),
+            ShellWriteContentPreview::Literal("a > b\n".to_string())
+        );
+        assert_eq!(
+            shell_write_content_preview_inner(r#"echo "a   b" > out.txt"#),
+            ShellWriteContentPreview::Literal("a   b\n".to_string())
+        );
+        assert_eq!(
+            shell_write_content_preview_inner("echo -n hello > out.txt"),
+            ShellWriteContentPreview::Literal("hello".to_string())
+        );
+        assert_eq!(
+            shell_write_content_preview_inner("echo hello > out.txt"),
+            ShellWriteContentPreview::Literal("hello\n".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_write_content_preview_keeps_printf_and_dynamic_fallback() {
+        assert_eq!(
+            shell_write_content_preview_inner("printf hello > out.txt"),
+            ShellWriteContentPreview::Literal("hello".to_string())
+        );
+        assert_eq!(
+            shell_write_content_preview("somecmd > out.txt"),
+            crate::daemon::proto::WriteContentPreview {
+                content: "(output of `somecmd`)".to_string(),
+                dynamic: true,
+            }
         );
     }
 

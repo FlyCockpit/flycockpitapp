@@ -1098,6 +1098,40 @@ mod tests {
     }
 
     #[test]
+    fn permission_more_options_reveals_secondary_and_renumbers() {
+        let mut more = DialogOption::new(crate::approval::ID_MORE_OPTIONS, "More options…");
+        more.secondary = false;
+        let mut secondary_b = opt("b");
+        secondary_b.secondary = true;
+        let mut secondary_c = opt("c");
+        secondary_c.secondary = true;
+        let mut page = Page::select("Approve?", vec![opt("a"), more])
+            .with_secondary_options(vec![secondary_b, secondary_c]);
+        page.permission = true;
+        page.allow_custom = false;
+        let mut d = unlocked(vec![page]);
+
+        assert_eq!(
+            d.handle_key(press(KeyCode::Char('2'))),
+            DialogOutcome::Continue
+        );
+        assert_eq!(d.cursor(), 1, "cursor lands on first revealed row");
+        assert_eq!(d.pages[0].options[1].id, "b");
+
+        assert_eq!(
+            d.handle_key(press(KeyCode::Char('2'))),
+            DialogOutcome::Continue
+        );
+        assert_eq!(d.selected_ids(0), &["b".to_string()]);
+        assert_eq!(
+            d.handle_key(press(KeyCode::Enter)),
+            DialogOutcome::Submit(vec![Answer::Single {
+                id: "b".to_string()
+            }])
+        );
+    }
+
+    #[test]
     fn jk_navigates_and_wraps_through_custom() {
         let mut d = unlocked(vec![Page::select("?", vec![opt("a"), opt("b")])]);
         // 2 options + custom affordance => 3 cursor slots.

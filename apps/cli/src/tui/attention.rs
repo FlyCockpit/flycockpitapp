@@ -47,7 +47,7 @@ pub(crate) fn terminal_title_restore_escapes(pushed: bool) -> String {
     if pushed {
         "\x1b[23;0t".to_string()
     } else {
-        "\x1b]0;cockpit\x1b\\\x1b]2;cockpit\x1b\\".to_string()
+        String::new()
     }
 }
 
@@ -87,11 +87,18 @@ impl AttentionEvent {
         }
     }
 
-    /// Fixed, secret-safe terminal-title marker for action-required events.
-    pub fn title_marker(self) -> Option<&'static str> {
+    /// Secret-safe terminal-title marker for action-required events.
+    pub fn title_marker(self, waiting_count: usize) -> Option<String> {
+        let waiting_count = waiting_count.max(1);
         match self {
-            AttentionEvent::Question => Some("● cockpit — question waiting"),
-            AttentionEvent::Approval => Some("● cockpit — approval waiting"),
+            AttentionEvent::Question if waiting_count > 1 => {
+                Some(format!("● {waiting_count} waiting — cockpit"))
+            }
+            AttentionEvent::Approval if waiting_count > 1 => {
+                Some(format!("● {waiting_count} waiting — cockpit"))
+            }
+            AttentionEvent::Question => Some("● cockpit — question waiting".to_string()),
+            AttentionEvent::Approval => Some("● cockpit — approval waiting".to_string()),
             _ => None,
         }
     }
@@ -160,7 +167,7 @@ pub struct AttentionDecision {
 pub enum TitleDecision {
     #[default]
     Unchanged,
-    Set(&'static str),
+    Set(String),
     Clear,
 }
 
@@ -231,6 +238,7 @@ pub fn decide(
     event: AttentionEvent,
     config: &AttentionConfig,
     recently_interacted: bool,
+    waiting_count: usize,
     now: Instant,
     state: &mut AttentionState,
 ) -> AttentionDecision {
@@ -241,7 +249,7 @@ pub fn decide(
     let title = if event.is_action_required() {
         if config.title {
             event
-                .title_marker()
+                .title_marker(waiting_count)
                 .map(TitleDecision::Set)
                 .unwrap_or(TitleDecision::Unchanged)
         } else {
@@ -356,6 +364,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(false, true, true),
             false,
+            1,
             Instant::now(),
             &mut st,
         );
@@ -370,6 +379,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, false),
             true,
+            1,
             now,
             &mut st,
         );
@@ -385,6 +395,7 @@ mod tests {
             AttentionEvent::Question,
             &cfg(true, false, false),
             true,
+            1,
             Instant::now(),
             &mut st,
         );
@@ -400,6 +411,7 @@ mod tests {
             AttentionEvent::TurnError,
             &cfg(true, true, false),
             false,
+            1,
             Instant::now(),
             &mut st,
         );
@@ -415,6 +427,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, true),
             true,
+            1,
             t0,
             &mut st,
         );
@@ -425,6 +438,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, true),
             true,
+            1,
             t0 + Duration::from_millis(200),
             &mut st,
         );
@@ -437,6 +451,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, true),
             true,
+            1,
             t0 + DEBOUNCE_WINDOW + Duration::from_millis(1),
             &mut st,
         );
@@ -450,10 +465,31 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, false, false),
             true,
+            1,
             Instant::now(),
             &mut st,
         );
-        assert_eq!(d.title, TitleDecision::Set("● cockpit — approval waiting"));
+        assert_eq!(
+            d.title,
+            TitleDecision::Set("● cockpit — approval waiting".to_string())
+        );
+    }
+
+    #[test]
+    fn multiple_waiting_interrupts_set_counted_title_marker() {
+        let mut st = AttentionState::new();
+        let d = decide(
+            AttentionEvent::Question,
+            &cfg(true, false, false),
+            true,
+            3,
+            Instant::now(),
+            &mut st,
+        );
+        assert_eq!(
+            d.title,
+            TitleDecision::Set("● 3 waiting — cockpit".to_string())
+        );
     }
 
     #[test]
@@ -465,6 +501,7 @@ mod tests {
             AttentionEvent::Question,
             &config,
             true,
+            1,
             Instant::now(),
             &mut st,
         );
@@ -479,6 +516,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, true),
             true,
+            1,
             t0,
             &mut st,
         );
@@ -488,13 +526,14 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, true),
             true,
+            1,
             t0 + RENUDGE_INTERVAL,
             &mut st,
         );
         assert!(nudged.bell && nudged.desktop);
         assert_eq!(
             nudged.title,
-            TitleDecision::Set("● cockpit — approval waiting")
+            TitleDecision::Set("● cockpit — approval waiting".to_string())
         );
     }
 
@@ -506,6 +545,7 @@ mod tests {
             AttentionEvent::Approval,
             &cfg(true, true, true),
             true,
+            1,
             t0,
             &mut st,
         );
@@ -515,6 +555,7 @@ mod tests {
             AttentionEvent::Question,
             &cfg(true, true, true),
             true,
+            1,
             t0 + Duration::from_millis(10),
             &mut st,
         );
@@ -530,6 +571,7 @@ mod tests {
             },
             &cfg(true, true, true),
             true, // user is right here
+            1,
             Instant::now(),
             &mut st,
         );
@@ -545,6 +587,7 @@ mod tests {
             AttentionEvent::TurnDone { long_running: true },
             &cfg(true, false, true),
             true,
+            1,
             Instant::now(),
             &mut st,
         );
@@ -562,6 +605,7 @@ mod tests {
             },
             &cfg(true, false, true),
             false, // stepped away
+            1,
             Instant::now(),
             &mut st,
         );
@@ -606,9 +650,6 @@ mod tests {
     #[test]
     fn title_restore_escapes_pop_or_reset() {
         assert_eq!(terminal_title_restore_escapes(true), "\x1b[23;0t");
-        assert_eq!(
-            terminal_title_restore_escapes(false),
-            "\x1b]0;cockpit\x1b\\\x1b]2;cockpit\x1b\\"
-        );
+        assert_eq!(terminal_title_restore_escapes(false), "");
     }
 }

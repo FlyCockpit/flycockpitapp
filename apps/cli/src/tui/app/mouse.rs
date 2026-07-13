@@ -1534,6 +1534,8 @@ mod terminal_mode_guard_tests {
     use crossterm::event::KeyboardEnhancementFlags;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn any_motion_escape_sequences_are_paired() {
@@ -1577,7 +1579,7 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::PopKeyboardEnhancementFlags,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreTerminalTitle,
+                TerminalCleanupCommand::RestoreTerminalTitle { pushed: false },
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
@@ -1608,7 +1610,26 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::DisableMouseCapture,
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreTerminalTitle,
+                TerminalCleanupCommand::RestoreTerminalTitle { pushed: false },
+                TerminalCleanupCommand::RestoreRatatui,
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_title_cleanup_pops_when_marker_pushed() {
+        let sink = RecordingSink::default();
+        let observed = sink.clone();
+        {
+            let pushed = Arc::new(AtomicBool::new(true));
+            let _guard = TerminalModeGuard::with_sink_and_title_state(sink, pushed);
+        }
+
+        assert_eq!(
+            observed.commands(),
+            vec![
+                TerminalCleanupCommand::RestoreDefaultCursorShape,
+                TerminalCleanupCommand::RestoreTerminalTitle { pushed: true },
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
@@ -1633,7 +1654,7 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::PopKeyboardEnhancementFlags,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreTerminalTitle,
+                TerminalCleanupCommand::RestoreTerminalTitle { pushed: false },
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );
@@ -1653,7 +1674,7 @@ mod terminal_mode_guard_tests {
             vec![
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
-                TerminalCleanupCommand::RestoreTerminalTitle,
+                TerminalCleanupCommand::RestoreTerminalTitle { pushed: false },
                 TerminalCleanupCommand::RestoreRatatui,
             ]
         );

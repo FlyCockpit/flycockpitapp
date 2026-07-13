@@ -543,7 +543,7 @@ enum TerminalCleanupCommand {
     DisableBracketedPaste,
     PopKeyboardEnhancementFlags,
     RestoreDefaultCursorShape,
-    RestoreTerminalTitle,
+    RestoreTerminalTitle { pushed: bool },
     RestoreRatatui,
 }
 
@@ -609,9 +609,9 @@ impl TerminalModeSink for CrosstermTerminalModeSink {
             TerminalCleanupCommand::RestoreDefaultCursorShape => {
                 crossterm::execute!(stdout(), SetCursorStyle::DefaultUserShape)?;
             }
-            TerminalCleanupCommand::RestoreTerminalTitle => {
+            TerminalCleanupCommand::RestoreTerminalTitle { pushed } => {
                 emit_terminal_title_sequence(
-                    &crate::tui::attention::terminal_title_restore_escapes(false),
+                    &crate::tui::attention::terminal_title_restore_escapes(pushed),
                 );
             }
             TerminalCleanupCommand::RestoreRatatui => {
@@ -628,23 +628,24 @@ struct TerminalModeGuard<S: TerminalModeSink = CrosstermTerminalModeSink> {
     bracketed_paste_enabled: bool,
     keyboard_enhancement_pushed: bool,
     restore_cursor_shape: bool,
+    terminal_title_pushed: Arc<AtomicBool>,
     restored: bool,
 }
 
-impl TerminalModeGuard<CrosstermTerminalModeSink> {
-    fn new() -> Self {
-        Self::with_sink(CrosstermTerminalModeSink)
-    }
-}
-
 impl<S: TerminalModeSink> TerminalModeGuard<S> {
+    #[cfg(test)]
     fn with_sink(sink: S) -> Self {
+        Self::with_sink_and_title_state(sink, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_sink_and_title_state(sink: S, terminal_title_pushed: Arc<AtomicBool>) -> Self {
         Self {
             sink,
             mouse_capture_enabled: false,
             bracketed_paste_enabled: false,
             keyboard_enhancement_pushed: false,
             restore_cursor_shape: true,
+            terminal_title_pushed,
             restored: false,
         }
     }
@@ -705,8 +706,9 @@ impl<S: TerminalModeSink> TerminalModeGuard<S> {
             );
             self.restore_cursor_shape = false;
         }
+        let pushed = self.terminal_title_pushed.swap(false, Ordering::SeqCst);
         self.apply_cleanup_command(
-            TerminalCleanupCommand::RestoreTerminalTitle,
+            TerminalCleanupCommand::RestoreTerminalTitle { pushed },
             &mut first_error,
         );
         self.apply_cleanup_command(TerminalCleanupCommand::RestoreRatatui, &mut first_error);
@@ -1845,6 +1847,11 @@ pub struct App {
     /// Pending action-required interrupt tracked for persistent toast,
     /// terminal-title marker, and periodic re-nudge.
     attention_interrupt: Option<AttentionInterruptState>,
+    /// Action-required interrupts from sessions other than the attached
+    /// foreground session. They never open a dialog in this TUI, but still
+    /// drive persistent toast, title marker, and periodic re-nudge.
+    background_attention_interrupts:
+        std::collections::BTreeMap<uuid::Uuid, AttentionInterruptState>,
     /// Terminal-title marker push/pop state.
     terminal_title: TerminalTitleState,
     /// When the user last pressed a meaningful key. Used as a conservative
@@ -2178,9 +2185,10 @@ impl AttentionInterruptKind {
 
 #[derive(Debug, Clone)]
 struct AttentionInterruptState {
+    interrupt_id: uuid::Uuid,
     kind: AttentionInterruptKind,
     pending: bool,
-    foreground: bool,
+    pending_count: usize,
     next_renudge_at: Instant,
 }
 
@@ -2188,6 +2196,7 @@ struct AttentionInterruptState {
 struct TerminalTitleState {
     active: bool,
     stack_pushed: bool,
+    pushed_for_cleanup: Arc<AtomicBool>,
 }
 
 /// Default toast lifetime per TUI-design-philosophy §7.
@@ -2787,6 +2796,7 @@ impl App {
         let use_emojis = tui_cfg.use_emojis;
         let attention = tui_cfg.attention;
         let initial_agent_path = vec![launch.agent_name.clone()];
+        let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let mut app = Self {
             launch,
             composer,
@@ -2927,9 +2937,11 @@ impl App {
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),
             attention_interrupt: None,
+            background_attention_interrupts: std::collections::BTreeMap::new(),
             terminal_title: TerminalTitleState {
                 active: false,
                 stack_pushed: false,
+                pushed_for_cleanup: terminal_title_pushed_for_cleanup,
             },
             last_user_interaction: Instant::now(),
             waiting_for_lock: None,
@@ -3149,7 +3161,10 @@ impl App {
         // the session for the clean full-screen experience; on exit
         // we leave alt screen and print the tail to stdout.
         let mut terminal = ratatui::try_init()?;
-        let mut terminal_mode_guard = TerminalModeGuard::new();
+        let mut terminal_mode_guard = TerminalModeGuard::with_sink_and_title_state(
+            CrosstermTerminalModeSink,
+            self.terminal_title.pushed_for_cleanup.clone(),
+        );
 
         if crossterm::execute!(
             stdout(),
@@ -3481,7 +3496,7 @@ impl App {
     /// this method only performs the side effects it asks for, each of which
     /// is failure-tolerant.
     pub(super) fn notify_attention(&mut self, event: crate::tui::attention::AttentionEvent) {
-        self.apply_attention_decision(event, false, true);
+        self.apply_attention_decision(event, false, true, 1);
     }
 
     fn apply_attention_decision(
@@ -3489,6 +3504,7 @@ impl App {
         event: crate::tui::attention::AttentionEvent,
         persistent_toast: bool,
         show_toast: bool,
+        waiting_count: usize,
     ) {
         use crate::tui::attention::{NoticeKind, TitleDecision, decide};
         let now = Instant::now();
@@ -3501,6 +3517,7 @@ impl App {
             event,
             &self.attention,
             recently_interacted,
+            waiting_count,
             now,
             &mut self.attention_state,
         );
@@ -3527,46 +3544,183 @@ impl App {
             post_desktop_notification(event.toast_text());
         }
         match decision.title {
-            TitleDecision::Set(title) => self.set_terminal_title_marker(title),
+            TitleDecision::Set(title) => self.set_terminal_title_marker(&title),
             TitleDecision::Clear => self.clear_terminal_title_marker(),
             TitleDecision::Unchanged => {}
         }
     }
 
-    fn raise_attention_interrupt(&mut self, kind: AttentionInterruptKind, foreground: bool) {
+    fn raise_attention_interrupt(
+        &mut self,
+        session_id: uuid::Uuid,
+        interrupt_id: uuid::Uuid,
+        kind: AttentionInterruptKind,
+        pending_count: usize,
+    ) {
         let event = kind.event();
-        self.attention_interrupt = Some(AttentionInterruptState {
+        let state = AttentionInterruptState {
+            interrupt_id,
             kind,
             pending: true,
-            foreground,
+            pending_count,
             next_renudge_at: Instant::now() + crate::tui::attention::RENUDGE_INTERVAL,
-        });
-        self.apply_attention_decision(event, !foreground, !foreground);
+        };
+        let foreground = self.current_session_id() == Some(session_id);
+        if foreground {
+            self.attention_interrupt = Some(state);
+        } else {
+            self.background_attention_interrupts
+                .insert(session_id, state);
+        }
+        let visible = foreground && self.foreground_interrupt_visible();
+        self.apply_attention_decision(event, !visible, !visible, self.attention_waiting_count());
     }
 
     fn resolve_attention_interrupt(&mut self) {
         self.attention_interrupt = None;
-        if self.toast.as_ref().is_some_and(|toast| toast.persistent) {
+        self.refresh_attention_interrupt_surfaces();
+    }
+
+    fn resolve_attention_interrupt_for(
+        &mut self,
+        session_id: uuid::Uuid,
+        interrupt_id: uuid::Uuid,
+    ) {
+        if self.current_session_id() == Some(session_id)
+            && self
+                .attention_interrupt
+                .as_ref()
+                .is_some_and(|state| state.interrupt_id == interrupt_id)
+        {
+            self.attention_interrupt = None;
+        }
+        self.background_attention_interrupts
+            .retain(|sid, state| *sid != session_id || state.interrupt_id != interrupt_id);
+        self.refresh_attention_interrupt_surfaces();
+    }
+
+    fn refresh_attention_interrupt_surfaces(&mut self) {
+        let foreground_visible = self.foreground_interrupt_visible();
+        let persistent_toast_needed = !self.background_attention_interrupts.is_empty()
+            || (self.attention_interrupt.is_some() && !foreground_visible);
+        let Some(kind) = self
+            .attention_interrupt
+            .as_ref()
+            .map(|state| state.kind)
+            .or_else(|| {
+                self.background_attention_interrupts
+                    .values()
+                    .next()
+                    .map(|state| state.kind)
+            })
+        else {
+            if self.toast.as_ref().is_some_and(|toast| toast.persistent) {
+                self.toast = None;
+            }
+            self.clear_terminal_title_marker();
+            return;
+        };
+        if !persistent_toast_needed && self.toast.as_ref().is_some_and(|toast| toast.persistent) {
             self.toast = None;
         }
-        self.clear_terminal_title_marker();
+        self.apply_attention_decision(kind.event(), true, false, self.attention_waiting_count());
+    }
+
+    fn foreground_interrupt_visible(&self) -> bool {
+        self.question_dialog.is_some() && !self.overlay.is_open() && self.keys_overlay.is_none()
+    }
+
+    fn attention_waiting_count(&self) -> usize {
+        let foreground_count = self
+            .attention_interrupt
+            .as_ref()
+            .filter(|state| state.pending)
+            .map(|state| state.pending_count.saturating_add(1))
+            .unwrap_or(0);
+        foreground_count
+            + self
+                .background_attention_interrupts
+                .values()
+                .filter(|state| state.pending)
+                .map(|state| state.pending_count.saturating_add(1))
+                .sum::<usize>()
+    }
+
+    fn update_background_attention_interrupt(
+        &mut self,
+        session_id: uuid::Uuid,
+        active_interrupt_id: Option<uuid::Uuid>,
+        pending_count: usize,
+    ) {
+        match active_interrupt_id {
+            Some(active) => {
+                if let Some(state) = self.background_attention_interrupts.get_mut(&session_id) {
+                    state.interrupt_id = active;
+                    state.pending_count = pending_count;
+                }
+            }
+            None => {
+                self.background_attention_interrupts.remove(&session_id);
+            }
+        }
+        self.refresh_attention_interrupt_surfaces();
+    }
+
+    fn update_foreground_attention_interrupt(
+        &mut self,
+        active_interrupt_id: Option<uuid::Uuid>,
+        pending_count: usize,
+    ) {
+        match (self.question_dialog.as_mut(), active_interrupt_id) {
+            (Some(dialog), Some(active)) if dialog.interrupt_id() == active => {
+                dialog.set_pending_count(pending_count);
+                if let Some(state) = self.attention_interrupt.as_mut() {
+                    state.interrupt_id = active;
+                    state.pending_count = pending_count;
+                }
+                self.refresh_attention_interrupt_surfaces();
+            }
+            (Some(_), None) => {
+                self.question_dialog = None;
+                self.resolve_attention_interrupt();
+            }
+            (Some(_), Some(_)) => {
+                self.question_dialog = None;
+                self.resolve_attention_interrupt();
+            }
+            _ => {}
+        }
     }
 
     fn tick_attention_interrupt(&mut self) -> bool {
-        let Some(state) = self.attention_interrupt.as_mut() else {
+        let now = Instant::now();
+        let mut nudge = None;
+        let foreground_visible = self.foreground_interrupt_visible();
+        if let Some(state) = self.attention_interrupt.as_mut()
+            && state.pending
+            && now >= state.next_renudge_at
+        {
+            state.next_renudge_at = now + crate::tui::attention::RENUDGE_INTERVAL;
+            nudge = Some((state.kind, !foreground_visible, !foreground_visible));
+        }
+        if nudge.is_none()
+            && let Some(state) = self
+                .background_attention_interrupts
+                .values_mut()
+                .find(|state| state.pending && now >= state.next_renudge_at)
+        {
+            state.next_renudge_at = now + crate::tui::attention::RENUDGE_INTERVAL;
+            nudge = Some((state.kind, true, true));
+        }
+        let Some((kind, persistent_toast, show_toast)) = nudge else {
             return false;
         };
-        if !state.pending {
-            return false;
-        }
-        let now = Instant::now();
-        if now < state.next_renudge_at {
-            return false;
-        }
-        let kind = state.kind;
-        let foreground = state.foreground;
-        state.next_renudge_at = now + crate::tui::attention::RENUDGE_INTERVAL;
-        self.apply_attention_decision(kind.event(), !foreground, !foreground);
+        self.apply_attention_decision(
+            kind.event(),
+            persistent_toast,
+            show_toast,
+            self.attention_waiting_count(),
+        );
         true
     }
 
@@ -3579,6 +3733,9 @@ impl App {
                 title,
             ));
             self.terminal_title.stack_pushed = true;
+            self.terminal_title
+                .pushed_for_cleanup
+                .store(true, Ordering::SeqCst);
         } else {
             emit_terminal_title_sequence(&crate::tui::attention::terminal_title_set_escapes(title));
         }
@@ -3594,6 +3751,9 @@ impl App {
         ));
         self.terminal_title.active = false;
         self.terminal_title.stack_pushed = false;
+        self.terminal_title
+            .pushed_for_cleanup
+            .store(false, Ordering::SeqCst);
     }
 
     /// Drop the toast if it has expired. Called once per event-loop
@@ -13214,6 +13374,115 @@ mod fresh_queue_ack_tests {
             "the queued tag expansion renders under the folded user row"
         );
         assert!(app.folding_tag_batches.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attention_interrupt_surface_tests {
+    use super::{App, ToastKind};
+    use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    use crate::engine::TurnEvent;
+    use uuid::Uuid;
+
+    fn app() -> App {
+        let tmp = tempfile::tempdir().unwrap();
+        App::new(Some(tmp.path()), false)
+    }
+
+    fn question_set(permission: bool) -> InterruptQuestionSet {
+        InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Proceed?".to_string(),
+                options: vec![
+                    InterruptOption {
+                        id: "yes".to_string(),
+                        label: "Yes".to_string(),
+                        description: None,
+                        secondary: false,
+                    },
+                    InterruptOption {
+                        id: "no".to_string(),
+                        label: "No".to_string(),
+                        description: None,
+                        secondary: false,
+                    },
+                ],
+                allow_freetext: false,
+                command_detail: None,
+                permission,
+                sandbox_escalation: None,
+            }],
+        }
+    }
+
+    fn raise(session_id: Uuid, interrupt_id: Uuid, pending_count: usize) -> TurnEvent {
+        TurnEvent::InterruptRaised {
+            session_id,
+            interrupt_id,
+            description: String::new(),
+            questions: question_set(false),
+            pending_count,
+        }
+    }
+
+    #[test]
+    fn foreground_visible_interrupt_opens_dialog_without_persistent_toast() {
+        let mut app = app();
+        let session_id = Uuid::new_v4();
+        app.launch.session_id = Some(session_id);
+
+        app.apply_event(raise(session_id, Uuid::new_v4(), 0));
+
+        assert!(app.question_dialog.is_some());
+        assert!(app.attention_interrupt.is_some());
+        assert!(
+            app.toast.is_none(),
+            "visible foreground dialog should not create an action-required toast"
+        );
+    }
+
+    #[test]
+    fn background_interrupt_uses_persistent_toast_without_dialog() {
+        let mut app = app();
+        let foreground_session = Uuid::new_v4();
+        let background_session = Uuid::new_v4();
+        app.launch.session_id = Some(foreground_session);
+
+        app.apply_event(raise(background_session, Uuid::new_v4(), 1));
+
+        assert!(app.question_dialog.is_none());
+        assert_eq!(app.background_attention_interrupts.len(), 1);
+        let toast = app.toast.as_ref().expect("background interrupt toast");
+        assert!(toast.persistent);
+        assert_eq!(toast.kind, ToastKind::Info);
+        assert_eq!(toast.text, "Question waiting");
+        assert_eq!(app.attention_waiting_count(), 2);
+    }
+
+    #[test]
+    fn background_resolve_clears_stale_persistent_toast_while_foreground_remains_visible() {
+        let mut app = app();
+        let foreground_session = Uuid::new_v4();
+        let background_session = Uuid::new_v4();
+        let background_interrupt = Uuid::new_v4();
+        app.launch.session_id = Some(foreground_session);
+
+        app.apply_event(raise(foreground_session, Uuid::new_v4(), 0));
+        app.apply_event(raise(background_session, background_interrupt, 0));
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.persistent));
+
+        app.apply_event(TurnEvent::InterruptResolved {
+            session_id: background_session,
+            interrupt_id: background_interrupt,
+        });
+
+        assert!(app.question_dialog.is_some());
+        assert!(app.attention_interrupt.is_some());
+        assert!(app.background_attention_interrupts.is_empty());
+        assert!(
+            app.toast.is_none(),
+            "background toast clears once only a visible foreground dialog remains"
+        );
     }
 }
 

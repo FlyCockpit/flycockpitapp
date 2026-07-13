@@ -147,6 +147,7 @@ impl App {
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::InterruptDecision {
+                session_id,
                 interrupt_id,
                 decision,
                 ..
@@ -157,8 +158,8 @@ impl App {
                     .is_some_and(|dialog| dialog.interrupt_id() == interrupt_id)
                 {
                     self.question_dialog = None;
-                    self.resolve_attention_interrupt();
                 }
+                self.resolve_attention_interrupt_for(session_id, interrupt_id);
                 let prefix = if decision.permission {
                     "approval"
                 } else {
@@ -851,6 +852,7 @@ impl App {
                 self.push_plain(format!("Switched to `{}` LLM mode", mode.as_str()));
             }
             TurnEvent::InterruptRaised {
+                session_id,
                 interrupt_id,
                 description,
                 questions,
@@ -878,9 +880,27 @@ impl App {
                         }
                     )
                 });
+                let foreground = self.current_session_id() == Some(session_id);
+                if !foreground {
+                    self.raise_attention_interrupt(
+                        session_id,
+                        interrupt_id,
+                        if is_approval {
+                            AttentionInterruptKind::Approval
+                        } else {
+                            AttentionInterruptKind::Question
+                        },
+                        pending_count,
+                    );
+                    return;
+                }
                 if let Some(dialog) = self.question_dialog.as_mut() {
                     if dialog.interrupt_id() == interrupt_id {
                         dialog.set_pending_count(pending_count);
+                        if let Some(state) = self.attention_interrupt.as_mut() {
+                            state.pending_count = pending_count;
+                        }
+                        self.refresh_attention_interrupt_surfaces();
                     }
                     return;
                 }
@@ -894,31 +914,37 @@ impl App {
                     .with_pending_count(pending_count),
                 );
                 self.raise_attention_interrupt(
+                    session_id,
+                    interrupt_id,
                     if is_approval {
                         AttentionInterruptKind::Approval
                     } else {
                         AttentionInterruptKind::Question
                     },
-                    true,
+                    pending_count,
                 );
             }
             TurnEvent::InterruptQueueChanged {
+                session_id,
                 active_interrupt_id,
                 pending_count,
-            } => match (self.question_dialog.as_mut(), active_interrupt_id) {
-                (Some(dialog), Some(active)) if dialog.interrupt_id() == active => {
-                    dialog.set_pending_count(pending_count);
+            } => {
+                if self.current_session_id() == Some(session_id) {
+                    self.update_foreground_attention_interrupt(active_interrupt_id, pending_count);
+                } else {
+                    self.update_background_attention_interrupt(
+                        session_id,
+                        active_interrupt_id,
+                        pending_count,
+                    );
                 }
-                (Some(_), None) => {
-                    self.question_dialog = None;
-                    self.resolve_attention_interrupt();
-                }
-                (Some(_), Some(_)) => {
-                    self.question_dialog = None;
-                    self.resolve_attention_interrupt();
-                }
-                _ => {}
-            },
+            }
+            TurnEvent::InterruptResolved {
+                session_id,
+                interrupt_id,
+            } => {
+                self.resolve_attention_interrupt_for(session_id, interrupt_id);
+            }
             TurnEvent::ScheduleStarted {
                 session_id,
                 job_id,

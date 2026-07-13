@@ -166,6 +166,9 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::ConnectorStatus { .. }
             | proto::Event::LspNotice { .. }
             | proto::Event::EnvDriftWarning { .. }
+            | proto::Event::InterruptRaised { .. }
+            | proto::Event::InterruptResolved { .. }
+            | proto::Event::InterruptQueueChanged { .. }
     )
 }
 
@@ -1279,24 +1282,29 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // surface it so the TUI opens the answering dialog. A bare
         // `InterruptRaised` with no batch (the `schedule` needs-attention
         // nudge) has no dialog and stays a no-op here. `InterruptResolved`
-        // / `SessionEnded` have no TurnEvent analogue.
+        // is translated below so attention surfaces can clear even for
+        // background sessions.
         InterruptRaised {
+            session_id,
             interrupt_id,
             description,
             questions: Some(questions),
             pending_count,
             ..
         } => TurnEvent::InterruptRaised {
+            session_id,
             interrupt_id,
             description,
             questions,
             pending_count,
         },
         InterruptQueueChanged {
+            session_id,
             active_interrupt_id,
             pending_count,
             ..
         } => TurnEvent::InterruptQueueChanged {
+            session_id,
             active_interrupt_id,
             pending_count,
         },
@@ -1386,17 +1394,27 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             queue: queue.into_iter().map(queue_item_from_proto).collect(),
         },
         InterruptResolved {
+            session_id,
             interrupt_id,
             decision: Some(decision),
             seq,
             ..
         } => TurnEvent::InterruptDecision {
+            session_id,
             interrupt_id,
             decision,
             seq,
         },
+        InterruptResolved {
+            session_id,
+            interrupt_id,
+            decision: None,
+            ..
+        } => TurnEvent::InterruptResolved {
+            session_id,
+            interrupt_id,
+        },
         InterruptRaised { .. }
-        | InterruptResolved { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }

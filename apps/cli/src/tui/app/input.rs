@@ -340,6 +340,7 @@ impl App {
             if should_close {
                 let result = dialog.take_result();
                 self.question_dialog = None;
+                self.resolve_attention_interrupt();
                 if let Some(result) = result {
                     let interrupt_id = question_result_interrupt_id(&result);
                     if self.pending_local_choice_matches(interrupt_id) {
@@ -350,7 +351,6 @@ impl App {
                         };
                         self.resolve_local_choice(selection);
                     } else {
-                        self.resolve_attention_interrupt();
                         self.resolve_question_dialog(result);
                     }
                 }

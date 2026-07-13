@@ -6,6 +6,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     InterruptDecision {
+        session_id: uuid::Uuid,
         interrupt_id: uuid::Uuid,
         decision: crate::daemon::proto::InterruptDecision,
         seq: Option<i64>,
@@ -303,6 +304,7 @@ pub enum TurnEvent {
     /// dialog from this; the answer round-trips back to the daemon as
     /// `ResolveInterrupt`. Carries the batch of questions to render.
     InterruptRaised {
+        session_id: uuid::Uuid,
         interrupt_id: uuid::Uuid,
         /// Interrupt-level context (from `raise_interrupt(description, …)`),
         /// rendered as a muted context header above the question prompt.
@@ -312,8 +314,13 @@ pub enum TurnEvent {
         pending_count: usize,
     },
     InterruptQueueChanged {
+        session_id: uuid::Uuid,
         active_interrupt_id: Option<uuid::Uuid>,
         pending_count: usize,
+    },
+    InterruptResolved {
+        session_id: uuid::Uuid,
+        interrupt_id: uuid::Uuid,
     },
 
     /// An async job (loop / timer / background, GOALS §22) started. UI

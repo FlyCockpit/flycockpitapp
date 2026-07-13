@@ -709,6 +709,7 @@ pub enum Event {
 pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Event> {
     match event {
         TurnEvent::InterruptDecision {
+            session_id: _,
             interrupt_id,
             decision,
             seq,
@@ -719,6 +720,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             seq,
         }],
         TurnEvent::InterruptQueueChanged {
+            session_id: _,
             active_interrupt_id,
             pending_count,
         } => vec![Event::InterruptQueueChanged {
@@ -1041,6 +1043,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         // (`proto_event_to_turn_event`) is the only place that
         // synthesizes the `TurnEvent` form. No wire event to forward.
         TurnEvent::InterruptRaised { .. } => vec![],
+        TurnEvent::InterruptResolved { .. } => vec![],
         TurnEvent::ScheduleStarted {
             // The engine stamps the originating session; the worker's own
             // `session_id` is authoritative for the wire event and equals it.

@@ -947,6 +947,27 @@ pub fn list_sessions_blocking(
     }
 }
 
+pub fn read_session_messages_blocking(
+    session_id: uuid::Uuid,
+    before_seq: Option<i64>,
+    limit: u32,
+) -> Result<(Vec<proto::SessionMessage>, bool), String> {
+    match daemon_request_blocking(Request::ReadSessionMessages {
+        session_id,
+        before_seq,
+        limit,
+    })? {
+        Response::SessionMessages {
+            session_id: got,
+            messages,
+            has_more,
+        } if got == session_id => Ok((messages, has_more)),
+        other => Err(format!(
+            "unexpected read_session_messages response: {other:?}"
+        )),
+    }
+}
+
 pub fn resource_snapshot_blocking() -> Result<proto::Response, String> {
     match daemon_request_blocking(Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),

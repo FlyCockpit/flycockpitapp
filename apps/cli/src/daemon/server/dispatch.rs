@@ -427,6 +427,27 @@ async fn handle_request(
             parent_session_id,
         } => list_sessions(ctx, &state.principal, project_id, parent_session_id).await,
 
+        Request::ReadSessionMessages {
+            session_id,
+            before_seq,
+            limit,
+        } => {
+            let db = ctx.db.clone();
+            let (messages, has_more) = db
+                .read(move |conn| {
+                    crate::db::Db::read_session_messages_conn(
+                        conn, session_id, before_seq, limit,
+                    )
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::SessionMessages {
+                session_id,
+                messages,
+                has_more,
+            })
+        }
+
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {

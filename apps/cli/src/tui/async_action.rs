@@ -29,6 +29,12 @@ pub enum AsyncActionPayload {
     #[allow(dead_code)]
     DaemonResponse(Box<crate::daemon::proto::Response>),
     Sessions(Vec<crate::daemon::proto::SessionSummary>),
+    SessionMessages {
+        session_id: uuid::Uuid,
+        before_seq: Option<i64>,
+        messages: Vec<crate::daemon::proto::SessionMessage>,
+        has_more: bool,
+    },
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
     ResourceSnapshot(crate::engine::resource_scheduler::ResourceSchedulerSnapshot),
     PromoteResource {

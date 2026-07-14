@@ -4088,6 +4088,8 @@ impl App {
     fn apply_async_action_result(&mut self, result: AsyncActionResult) {
         match result.kind {
             AsyncActionKind::DaemonRpc("sessions.list") => {
+                let mut live_ids = None;
+                let mut preview_request = None;
                 if let Overlay::Sessions(pane) = &mut self.overlay {
                     let payload = match result.payload {
                         Ok(AsyncActionPayload::Sessions(sessions)) => Ok(sessions),
@@ -4096,8 +4098,22 @@ impl App {
                     };
                     let ids = pane.apply_sessions_result(payload);
                     if !ids.is_empty() {
-                        self.start_sessions_live_status_action(ids);
+                        live_ids = Some(ids);
                     }
+                    if pane.is_preview_enabled()
+                        && let Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
+                            session_id,
+                            before_seq,
+                        }) = pane.ensure_preview_for_selection()
+                    {
+                        preview_request = Some((session_id, before_seq));
+                    }
+                }
+                if let Some(ids) = live_ids {
+                    self.start_sessions_live_status_action(ids);
+                }
+                if let Some((session_id, before_seq)) = preview_request {
+                    self.start_sessions_preview_action(session_id, before_seq);
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.live") => {
@@ -4105,6 +4121,28 @@ impl App {
                     && let Ok(AsyncActionPayload::SessionLiveStatus(live)) = result.payload
                 {
                     pane.apply_live_status(live);
+                }
+            }
+            AsyncActionKind::DaemonRpc("sessions.preview") => {
+                if let Overlay::Sessions(pane) = &mut self.overlay {
+                    match result.payload {
+                        Ok(AsyncActionPayload::SessionMessages {
+                            session_id,
+                            before_seq,
+                            messages,
+                            has_more,
+                        }) => pane.apply_preview_result(
+                            session_id,
+                            before_seq,
+                            Ok((messages, has_more)),
+                        ),
+                        Err(error) => {
+                            if let Some((session_id, before_seq)) = pane.take_preview_load() {
+                                pane.apply_preview_result(session_id, before_seq, Err(error));
+                            }
+                        }
+                        Ok(_) => {}
+                    }
                 }
             }
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
@@ -4516,6 +4554,29 @@ impl App {
                 Ok(AsyncActionPayload::SessionLiveStatus(
                     crate::tui::agent_runner::session_live_status_blocking(ids),
                 ))
+            },
+        );
+    }
+
+    pub(super) fn start_sessions_preview_action(
+        &mut self,
+        session_id: uuid::Uuid,
+        before_seq: Option<i64>,
+    ) {
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("sessions.preview"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.preview")),
+            move || {
+                let (messages, has_more) =
+                    crate::tui::agent_runner::read_session_messages_blocking(
+                        session_id, before_seq, 50,
+                    )?;
+                Ok(AsyncActionPayload::SessionMessages {
+                    session_id,
+                    before_seq,
+                    messages,
+                    has_more,
+                })
             },
         );
     }

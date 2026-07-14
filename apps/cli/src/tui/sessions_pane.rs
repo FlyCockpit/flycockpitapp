@@ -35,15 +35,16 @@
 //! [`SessionsOutcome`] the `App` acts on, reusing the existing
 //! session-switch path (`attach_to_session`).
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
-use crate::daemon::proto::SessionSummary;
+use crate::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
 use crate::db::Db;
 use crate::tui::agent_runner;
 use crate::tui::pane::{Pane, ScrollList};
@@ -53,6 +54,8 @@ use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 /// Root-session row cap for the daemonless direct-DB list — matches the
 /// daemon `ListSessions` handler's `100` so both modes show the same set.
 const DAEMONLESS_LIST_LIMIT: u32 = 100;
+const PREVIEW_PAGE_LIMIT: u32 = 50;
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Non-error status shown daemonless when the user tries an action that
 /// needs a live daemon (resume, archive/delete, unarchive). Browsing is
@@ -67,6 +70,12 @@ const DAEMONLESS_HINT: &str =
 pub enum Tier {
     /// 1 — has active background/loop/timer jobs (daemon-reported).
     ActiveSchedules,
+    /// Currently executing a tool call.
+    ToolRunning,
+    /// Currently waiting on model inference.
+    InferenceInProgress,
+    /// Durable mid-turn interruption marker.
+    Interrupted,
     /// 2 — currently processing a turn (daemon-reported).
     Processing,
     /// 3 — unread: the most recent agent event is newer than the marker.
@@ -82,6 +91,9 @@ impl Tier {
     fn label(self) -> &'static str {
         match self {
             Tier::ActiveSchedules => "● jobs running",
+            Tier::ToolRunning => "● tool running",
+            Tier::InferenceInProgress => "● inference",
+            Tier::Interrupted => "● interrupted",
             Tier::Processing => "● working",
             Tier::Unread => "● unread",
             Tier::PendingQuestion => "● question pending",
@@ -89,10 +101,22 @@ impl Tier {
         }
     }
 
+    fn label_for(self, summary: &SessionSummary) -> String {
+        match self {
+            Tier::PendingQuestion if summary.open_interrupts > 0 => {
+                format!("● {} pending", summary.open_interrupts)
+            }
+            _ => self.label().to_string(),
+        }
+    }
+
     /// Accent color for the status indicator.
     fn color(self) -> Color {
         match self {
             Tier::ActiveSchedules => Color::Green,
+            Tier::ToolRunning => Color::Blue,
+            Tier::InferenceInProgress => Color::Cyan,
+            Tier::Interrupted => Color::Red,
             Tier::Processing => Color::Cyan,
             Tier::Unread => Color::Yellow,
             Tier::PendingQuestion => Color::Magenta,
@@ -106,13 +130,30 @@ impl Tier {
 /// live worker (or is unreachable) — then only the DB-derived tiers 3-5
 /// apply. Pure so the tiering rules are unit-testable without a daemon.
 pub fn classify(summary: &SessionSummary, live: Option<(bool, bool)>) -> Tier {
-    if let Some((has_schedules, processing)) = live {
-        if has_schedules {
-            return Tier::ActiveSchedules;
+    if let Some((has_schedules, _processing)) = live
+        && has_schedules
+    {
+        return Tier::ActiveSchedules;
+    }
+    match summary.activity_state {
+        Some(crate::daemon::proto::SessionActivityState::ToolRunning) => {
+            return Tier::ToolRunning;
         }
-        if processing {
-            return Tier::Processing;
+        Some(crate::daemon::proto::SessionActivityState::InferenceInProgress) => {
+            return Tier::InferenceInProgress;
         }
+        Some(crate::daemon::proto::SessionActivityState::Interrupted) => {
+            return Tier::Interrupted;
+        }
+        Some(crate::daemon::proto::SessionActivityState::PendingQuestion) => {
+            return Tier::PendingQuestion;
+        }
+        Some(crate::daemon::proto::SessionActivityState::Parked) | None => {}
+    }
+    if let Some((_has_schedules, processing)) = live
+        && processing
+    {
+        return Tier::Processing;
     }
     if is_unread(summary) {
         return Tier::Unread;
@@ -209,6 +250,63 @@ pub enum SessionsOutcome {
     Resume(Uuid),
     /// Load the current browser level via the app-owned async daemon path.
     LoadList,
+    /// Load a preview page via the app-owned async daemon path.
+    LoadPreview {
+        session_id: Uuid,
+        before_seq: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    List,
+    Preview,
+}
+
+#[derive(Debug, Clone)]
+struct PreviewState {
+    session_id: Uuid,
+    messages: Vec<SessionMessage>,
+    has_more: bool,
+    loading: bool,
+    error: Option<String>,
+    scroll: usize,
+}
+
+impl PreviewState {
+    fn new(session_id: Uuid) -> Self {
+        Self {
+            session_id,
+            messages: Vec::new(),
+            has_more: false,
+            loading: false,
+            error: None,
+            scroll: 0,
+        }
+    }
+
+    fn oldest_seq(&self) -> Option<i64> {
+        self.messages.first().map(|message| message.seq)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionsLayout {
+    Single {
+        body: Rect,
+    },
+    Split {
+        list: Rect,
+        preview: Rect,
+        left_width: u16,
+        right_width: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CardHit {
+    index: usize,
+    rect: Rect,
 }
 
 pub struct SessionsPane {
@@ -242,6 +340,15 @@ pub struct SessionsPane {
     /// Rendered body height + content rows at last draw (scroll clamp).
     last_body_height: usize,
     last_content_rows: usize,
+    focus: Focus,
+    preview: Option<PreviewState>,
+    preview_enabled: bool,
+    preview_area: Option<Rect>,
+    list_area: Option<Rect>,
+    card_hits: Vec<CardHit>,
+    last_preview_height: usize,
+    last_preview_rows: usize,
+    last_card_click: Option<(usize, std::time::Instant)>,
 }
 
 impl SessionsPane {
@@ -331,6 +438,15 @@ impl SessionsPane {
             db,
             last_body_height: 0,
             last_content_rows: 0,
+            focus: Focus::List,
+            preview: None,
+            preview_enabled: false,
+            preview_area: None,
+            list_area: None,
+            card_hits: Vec::new(),
+            last_preview_height: 0,
+            last_preview_rows: 0,
+            last_card_click: None,
         };
         if daemon_connected {
             pane.loading = Some("Loading sessions...");
@@ -381,6 +497,10 @@ impl SessionsPane {
         (project_id, None)
     }
 
+    pub fn is_preview_enabled(&self) -> bool {
+        self.preview_enabled
+    }
+
     pub fn apply_sessions_result(
         &mut self,
         result: Result<Vec<SessionSummary>, String>,
@@ -398,6 +518,14 @@ impl SessionsPane {
                     level.cards = cards;
                     level.list.clamp_cursor(level.cards.len());
                     level.list.set_scroll(0);
+                }
+                if self.selected_id().is_some() && self.preview_enabled {
+                    self.preview = None;
+                    if !self.daemon_connected {
+                        let _ = self.ensure_preview_for_selection();
+                    }
+                } else {
+                    self.preview = None;
                 }
                 ids
             }
@@ -540,6 +668,114 @@ impl SessionsPane {
         level.cards.get(level.list.cursor()).map(|(s, _)| s)
     }
 
+    fn selected_id(&self) -> Option<Uuid> {
+        self.selected().map(|summary| summary.session_id)
+    }
+
+    pub fn take_preview_load(&mut self) -> Option<(Uuid, Option<i64>)> {
+        let preview = self.preview.as_ref()?;
+        (self.daemon_connected && preview.loading)
+            .then_some((preview.session_id, preview.oldest_seq()))
+    }
+
+    pub fn ensure_preview_for_selection(&mut self) -> Option<SessionsOutcome> {
+        let session_id = self.selected_id()?;
+        let needs_reset = self
+            .preview
+            .as_ref()
+            .map(|preview| preview.session_id != session_id)
+            .unwrap_or(true);
+        if needs_reset {
+            self.preview = Some(PreviewState::new(session_id));
+        }
+        self.load_preview_page(session_id, None)
+    }
+
+    pub fn apply_preview_result(
+        &mut self,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+        result: Result<(Vec<SessionMessage>, bool), String>,
+    ) {
+        if self.selected_id() != Some(session_id) {
+            return;
+        }
+        if self
+            .preview
+            .as_ref()
+            .map(|preview| preview.session_id != session_id)
+            .unwrap_or(true)
+        {
+            self.preview = Some(PreviewState::new(session_id));
+        }
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        preview.loading = false;
+        match result {
+            Ok((messages, has_more)) => {
+                preview.error = None;
+                preview.has_more = has_more;
+                if before_seq.is_none() {
+                    preview.messages = messages;
+                    preview.scroll = usize::MAX;
+                } else {
+                    let existing: std::collections::HashSet<i64> =
+                        preview.messages.iter().map(|message| message.seq).collect();
+                    let mut older: Vec<_> = messages
+                        .into_iter()
+                        .filter(|message| !existing.contains(&message.seq))
+                        .collect();
+                    older.append(&mut preview.messages);
+                    preview.messages = older;
+                }
+            }
+            Err(error) => {
+                preview.error = Some(error);
+            }
+        }
+    }
+
+    fn load_preview_page(
+        &mut self,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+    ) -> Option<SessionsOutcome> {
+        if self
+            .preview
+            .as_ref()
+            .map(|preview| preview.session_id != session_id)
+            .unwrap_or(true)
+        {
+            self.preview = Some(PreviewState::new(session_id));
+        }
+        if self.daemon_connected {
+            if let Some(preview) = self.preview.as_mut() {
+                preview.loading = true;
+                preview.error = None;
+            }
+            return Some(SessionsOutcome::LoadPreview {
+                session_id,
+                before_seq,
+            });
+        }
+        let result = self.read_preview_daemonless(session_id, before_seq);
+        self.apply_preview_result(session_id, before_seq, result);
+        None
+    }
+
+    fn read_preview_daemonless(
+        &self,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+    ) -> Result<(Vec<SessionMessage>, bool), String> {
+        let Some(db) = self.db.as_ref() else {
+            return Err("could not open the session database".to_string());
+        };
+        db.read_session_messages(session_id, before_seq, PREVIEW_PAGE_LIMIT)
+            .map_err(|error| error.to_string())
+    }
+
     /// Handle a key. Returns `Some(outcome)` for close/resume; `None`
     /// otherwise (the pane stays open). Always consumed by `App` so
     /// nothing leaks to the composer (the modal rule).
@@ -557,6 +793,7 @@ impl SessionsPane {
             KeyCode::Esc => {
                 if self.levels.len() > 1 {
                     self.drill_out();
+                    self.preview = None;
                     if self.daemon_connected {
                         self.mark_current_level_loading();
                         return Some(SessionsOutcome::LoadList);
@@ -565,8 +802,34 @@ impl SessionsPane {
                     return Some(SessionsOutcome::Close);
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
+            KeyCode::Tab | KeyCode::BackTab if self.preview_enabled => {
+                self.focus = match self.focus {
+                    Focus::List => Focus::Preview,
+                    Focus::Preview => Focus::List,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Preview => {
+                return self.scroll_preview_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Preview => {
+                self.scroll_preview_down();
+            }
+            KeyCode::PageUp if self.focus == Focus::Preview => {
+                return self.page_preview_up();
+            }
+            KeyCode::PageDown if self.focus == Focus::Preview => {
+                self.page_preview_down();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.move_cursor(-1) && self.preview_enabled {
+                    return self.ensure_preview_for_selection();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.move_cursor(1) && self.preview_enabled {
+                    return self.ensure_preview_for_selection();
+                }
+            }
             KeyCode::Enter => {
                 // Resume needs the daemon (agent loop + locks + single
                 // writer live there). Daemonless we must NOT auto-spawn one
@@ -595,6 +858,7 @@ impl SessionsPane {
                     Scope::Project => Scope::All,
                     Scope::All => Scope::Project,
                 };
+                self.preview = None;
                 self.load_root();
                 if self.daemon_connected {
                     return Some(SessionsOutcome::LoadList);
@@ -603,6 +867,7 @@ impl SessionsPane {
             // Reveal / hide archived sessions.
             KeyCode::Char('a') => {
                 self.show_archived = !self.show_archived;
+                self.preview = None;
                 if self.daemon_connected {
                     self.mark_current_level_loading();
                     return Some(SessionsOutcome::LoadList);
@@ -620,10 +885,10 @@ impl SessionsPane {
         None
     }
 
-    fn move_cursor(&mut self, delta: isize) {
+    fn move_cursor(&mut self, delta: isize) -> bool {
         let len = self.current().cards.len();
         if len == 0 {
-            return;
+            return false;
         }
         let level = self.current_mut();
         let prev = level.list.cursor();
@@ -647,6 +912,7 @@ impl SessionsPane {
         } else {
             level.list.set_scroll(level.list.scroll() + 1);
         }
+        level.list.cursor() != prev
     }
 
     /// Drill into the highlighted session's direct forks (unbounded
@@ -826,7 +1092,116 @@ impl SessionsPane {
         level.list.set_scroll((level.list.scroll() + 1).min(max));
     }
 
+    fn scroll_preview_up(&mut self) -> Option<SessionsOutcome> {
+        let preview = self.preview.as_mut()?;
+        if preview.scroll == 0 {
+            let request = (preview.has_more && !preview.loading)
+                .then(|| {
+                    preview
+                        .oldest_seq()
+                        .map(|before_seq| (preview.session_id, before_seq))
+                })
+                .flatten();
+            if let Some((session_id, before_seq)) = request {
+                return self.load_preview_page(session_id, Some(before_seq));
+            }
+            return None;
+        }
+        preview.scroll = preview.scroll.saturating_sub(1);
+        None
+    }
+
+    fn scroll_preview_down(&mut self) {
+        let max = self
+            .last_preview_rows
+            .saturating_sub(self.last_preview_height);
+        if let Some(preview) = self.preview.as_mut() {
+            preview.scroll = (preview.scroll + 1).min(max);
+        }
+    }
+
+    fn page_preview_up(&mut self) -> Option<SessionsOutcome> {
+        let amount = self.last_preview_height.max(1);
+        for _ in 0..amount {
+            if let Some(outcome) = self.scroll_preview_up() {
+                return Some(outcome);
+            }
+        }
+        None
+    }
+
+    fn page_preview_down(&mut self) {
+        let amount = self.last_preview_height.max(1);
+        for _ in 0..amount {
+            self.scroll_preview_down();
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<SessionsOutcome> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self
+                    .preview_area
+                    .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+                {
+                    self.focus = Focus::Preview;
+                    self.scroll_preview_up()
+                } else {
+                    self.focus = Focus::List;
+                    self.scroll_up();
+                    None
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self
+                    .preview_area
+                    .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+                {
+                    self.focus = Focus::Preview;
+                    self.scroll_preview_down();
+                } else {
+                    self.focus = Focus::List;
+                    self.scroll_down();
+                }
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self
+                    .preview_area
+                    .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+                {
+                    self.focus = Focus::Preview;
+                    return None;
+                }
+                let index = hit_card(&self.card_hits, mouse.column, mouse.row)?;
+                self.focus = Focus::List;
+                let now = std::time::Instant::now();
+                let double_click = is_double_click(self.last_card_click, index, now);
+                self.last_card_click = Some((index, now));
+                let selected = self.current().list.cursor();
+                if click_resumes(selected, index, double_click) {
+                    if !self.daemon_connected {
+                        self.notice = Some(DAEMONLESS_HINT.to_string());
+                        return None;
+                    }
+                    if let Some((summary, _)) = self.current().cards.get(index) {
+                        return Some(SessionsOutcome::Resume(summary.session_id));
+                    }
+                    return None;
+                }
+                if let Some(level) = self.levels.last_mut() {
+                    level.list.set_cursor(index);
+                }
+                self.ensure_preview_for_selection()
+            }
+            _ => None,
+        }
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.card_hits.clear();
+        self.list_area = None;
+        self.preview_area = None;
         let title = self.title();
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
@@ -844,7 +1219,51 @@ impl SessionsPane {
 
         frame.render_widget(Paragraph::new(self.breadcrumb_line()), crumb_area);
 
-        let (lines, selected_span) = self.body_lines_with_selected_span(body.width as usize);
+        match sessions_layout_for_inner(body) {
+            SessionsLayout::Single { body } => {
+                self.preview_enabled = false;
+                self.focus = Focus::List;
+                self.render_list_body(frame, body, body.width as usize, false);
+            }
+            SessionsLayout::Split { list, preview, .. } => {
+                self.preview_enabled = true;
+                self.list_area = Some(list);
+                self.preview_area = Some(preview);
+                if self.preview.is_none() && !self.daemon_connected {
+                    let _ = self.ensure_preview_for_selection();
+                }
+
+                let list_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(column_border_style(self.focus, Focus::List))
+                    .title(" sessions ");
+                let list_inner = list_block.inner(list);
+                frame.render_widget(list_block, list);
+                self.render_list_body(frame, list_inner, list_inner.width as usize, true);
+
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(column_border_style(self.focus, Focus::Preview))
+                    .title(" preview ");
+                let preview_inner = preview_block.inner(preview);
+                frame.render_widget(preview_block, preview);
+                self.render_preview_body(frame, preview_inner);
+            }
+        }
+
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        frame.render_widget(Paragraph::new(self.help_line()).style(muted), help_area);
+
+        // The confirm sub-dialog draws over the bottom of the body.
+        if let Step::Confirm { .. } = &self.step {
+            self.render_confirm(frame, body);
+        }
+    }
+
+    fn render_list_body(&mut self, frame: &mut Frame, body: Rect, width: usize, record_hits: bool) {
+        let (lines, selected_span) = self.body_lines_with_selected_span(width);
         self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
         let mut scroll = self
@@ -864,15 +1283,28 @@ impl SessionsPane {
         if let Some(level) = self.levels.last_mut() {
             level.list.set_scroll(scroll);
         }
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
-
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        frame.render_widget(Paragraph::new(self.help_line()).style(muted), help_area);
-
-        // The confirm sub-dialog draws over the bottom of the body.
-        if let Step::Confirm { .. } = &self.step {
-            self.render_confirm(frame, body);
+        if record_hits {
+            self.record_card_hits(body, scroll);
         }
+        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+    }
+
+    fn render_preview_body(&mut self, frame: &mut Frame, area: Rect) {
+        let lines = self.preview_lines(area.width as usize);
+        self.last_preview_rows = lines.len();
+        self.last_preview_height = area.height as usize;
+        let max = self
+            .last_preview_rows
+            .saturating_sub(self.last_preview_height);
+        let scroll = self
+            .preview
+            .as_ref()
+            .map(|preview| preview.scroll.min(max))
+            .unwrap_or(0);
+        if let Some(preview) = self.preview.as_mut() {
+            preview.scroll = scroll;
+        }
+        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
     }
 
     fn title(&self) -> Line<'static> {
@@ -1002,6 +1434,94 @@ impl SessionsPane {
         (lines, selected_span)
     }
 
+    fn record_card_hits(&mut self, body: Rect, scroll: usize) {
+        let mut hits = Vec::new();
+        let show_project = matches!(self.scope, Scope::All) || self.levels.len() > 1;
+        let mut row = 0usize;
+        for (index, (summary, tier)) in self.current().cards.iter().enumerate() {
+            let height = card_lines(
+                summary,
+                *tier,
+                index == self.current().list.cursor(),
+                show_project,
+                body.width as usize,
+                self.use_emojis,
+            )
+            .len();
+            let start = row;
+            let end = row + height;
+            row = end;
+            let visible_start = start.max(scroll);
+            let visible_end = end.min(scroll + body.height as usize);
+            if visible_start < visible_end {
+                hits.push(CardHit {
+                    index,
+                    rect: Rect {
+                        x: body.x,
+                        y: body.y + (visible_start - scroll) as u16,
+                        width: body.width,
+                        height: (visible_end - visible_start) as u16,
+                    },
+                });
+            }
+        }
+        self.card_hits = hits;
+    }
+
+    fn preview_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let Some(preview) = self.preview.as_ref() else {
+            return vec![Line::from(Span::styled("  (no session selected)", muted))];
+        };
+        if let Some(error) = &preview.error {
+            return vec![Line::from(Span::styled(
+                format!("preview unavailable: {error}"),
+                Style::default().fg(Color::Red),
+            ))];
+        }
+        if preview.messages.is_empty() {
+            if preview.loading {
+                return vec![Line::from(Span::styled("  Loading messages...", muted))];
+            }
+            return vec![Line::from(Span::styled("  (no messages yet)", muted))];
+        }
+        let mut lines = Vec::new();
+        if preview.has_more {
+            lines.push(Line::from(Span::styled("  ↑ more messages", muted)));
+        }
+        if preview.loading {
+            lines.push(Line::from(Span::styled(
+                "  Loading older messages...",
+                muted,
+            )));
+        }
+        for message in &preview.messages {
+            let role = match message.role {
+                MessageRole::User => "User",
+                MessageRole::Agent => "Agent",
+            };
+            let style = match message.role {
+                MessageRole::User => Style::default().fg(Color::Yellow),
+                MessageRole::Agent => Style::default().fg(Color::White),
+            };
+            for (line_index, text) in wrap_message(role, &message.text, width)
+                .into_iter()
+                .enumerate()
+            {
+                if line_index == 0 {
+                    lines.push(Line::from(Span::styled(text, style)));
+                } else {
+                    lines.push(Line::from(text));
+                }
+            }
+            lines.push(Line::default());
+        }
+        if lines.last().is_some_and(|line| line.spans.is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
     fn render_confirm(&self, frame: &mut Frame, body: Rect) {
         let Step::Confirm {
             label,
@@ -1099,7 +1619,7 @@ pub fn card_lines(
 
     // Row 1: description + tier status.
     let desc = card_description(s);
-    let status = Span::styled(tier.label().to_string(), Style::default().fg(tier.color()));
+    let status = Span::styled(tier.label_for(s), Style::default().fg(tier.color()));
     out.push(boxed_row(
         vec![
             Span::styled(
@@ -1267,6 +1787,93 @@ fn project_label(root: &str) -> String {
         .unwrap_or_else(|| root.to_string())
 }
 
+pub fn sessions_layout_for_inner(inner: Rect) -> SessionsLayout {
+    if inner.width < 100 {
+        return SessionsLayout::Single { body: inner };
+    }
+    let left_width = (inner.width / 5).max(64).min(inner.width.saturating_sub(2));
+    let preview_x = inner.x + left_width + 1;
+    let right_width = inner.width.saturating_sub(left_width).saturating_sub(1);
+    SessionsLayout::Split {
+        list: Rect {
+            x: inner.x,
+            y: inner.y,
+            width: left_width,
+            height: inner.height,
+        },
+        preview: Rect {
+            x: preview_x,
+            y: inner.y,
+            width: right_width,
+            height: inner.height,
+        },
+        left_width,
+        right_width,
+    }
+}
+
+pub fn column_border_style(focus: Focus, column: Focus) -> Style {
+    if focus == column {
+        Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
+    } else {
+        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+    }
+}
+
+fn point_in_rect(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+fn hit_card(hits: &[CardHit], col: u16, row: u16) -> Option<usize> {
+    hits.iter()
+        .find(|hit| point_in_rect(hit.rect, col, row))
+        .map(|hit| hit.index)
+}
+
+fn click_resumes(selected: usize, clicked: usize, double_click: bool) -> bool {
+    selected == clicked || double_click
+}
+
+fn is_double_click(
+    previous: Option<(usize, std::time::Instant)>,
+    clicked: usize,
+    now: std::time::Instant,
+) -> bool {
+    previous
+        .map(|(index, at)| index == clicked && now.duration_since(at) <= DOUBLE_CLICK_WINDOW)
+        .unwrap_or(false)
+}
+
+fn wrap_message(role: &str, text: &str, width: usize) -> Vec<String> {
+    let prefix = format!("{role}: ");
+    let indent = " ".repeat(prefix.width());
+    let width = width.max(prefix.width() + 1);
+    let mut out = Vec::new();
+    for paragraph in text
+        .lines()
+        .chain(if text.is_empty() { Some("") } else { None })
+    {
+        let mut current = prefix.clone();
+        let mut current_width = prefix.width();
+        let mut first = true;
+        for ch in paragraph.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + ch_width > width && current_width > prefix.width() {
+                out.push(current);
+                current = indent.clone();
+                current_width = indent.width();
+                first = false;
+            }
+            if !first || current_width + ch_width <= width {
+                current.push(ch);
+                current_width += ch_width;
+            }
+        }
+        out.push(current);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1987,174 @@ mod tests {
     }
 
     #[test]
+    fn split_layout_breakpoint_and_widths_are_stable() {
+        let layout = |width| sessions_layout_for_inner(Rect::new(0, 0, width, 20));
+        assert!(matches!(
+            layout(300),
+            SessionsLayout::Split {
+                left_width: 64,
+                right_width: 235,
+                ..
+            }
+        ));
+        assert!(matches!(
+            layout(120),
+            SessionsLayout::Split {
+                left_width: 64,
+                right_width: 55,
+                ..
+            }
+        ));
+        assert!(matches!(layout(100), SessionsLayout::Split { .. }));
+        assert!(matches!(
+            layout(400),
+            SessionsLayout::Split { left_width: 80, .. }
+        ));
+        assert!(matches!(layout(99), SessionsLayout::Single { .. }));
+        assert!(matches!(layout(80), SessionsLayout::Single { .. }));
+    }
+
+    #[test]
+    fn classify_distinguishes_activity_states() {
+        let mut s = summary(Uuid::new_v4(), 100);
+        s.activity_state = Some(crate::daemon::proto::SessionActivityState::ToolRunning);
+        assert_eq!(classify(&s, Some((false, true))), Tier::ToolRunning);
+        s.activity_state = Some(crate::daemon::proto::SessionActivityState::InferenceInProgress);
+        assert_eq!(classify(&s, None), Tier::InferenceInProgress);
+        s.activity_state = Some(crate::daemon::proto::SessionActivityState::Interrupted);
+        assert_eq!(classify(&s, None), Tier::Interrupted);
+        s.activity_state = Some(crate::daemon::proto::SessionActivityState::PendingQuestion);
+        s.open_interrupts = 2;
+        assert_eq!(classify(&s, None), Tier::PendingQuestion);
+        assert_eq!(classify(&s, Some((true, true))), Tier::ActiveSchedules);
+    }
+
+    #[test]
+    fn preview_pages_prepend_without_duplicates_and_discard_stale() {
+        let session_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut pane = test_pane(vec![
+            (summary(session_id, 100), Tier::Idle),
+            (summary(other_id, 90), Tier::Idle),
+        ]);
+        pane.preview = Some(PreviewState::new(session_id));
+        pane.apply_preview_result(
+            session_id,
+            None,
+            Ok((
+                vec![
+                    message(3, MessageRole::User, "three"),
+                    message(4, MessageRole::Agent, "four"),
+                ],
+                true,
+            )),
+        );
+        pane.apply_preview_result(
+            other_id,
+            None,
+            Ok((vec![message(9, MessageRole::User, "stale")], false)),
+        );
+        pane.apply_preview_result(
+            session_id,
+            Some(3),
+            Ok((
+                vec![
+                    message(1, MessageRole::User, "one"),
+                    message(2, MessageRole::Agent, "two"),
+                    message(3, MessageRole::User, "duplicate"),
+                ],
+                false,
+            )),
+        );
+        let preview = pane.preview.as_ref().unwrap();
+        assert_eq!(
+            preview
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(!preview.has_more);
+    }
+
+    #[test]
+    fn hit_rect_and_double_click_decisions_are_pure() {
+        let hits = vec![
+            CardHit {
+                index: 0,
+                rect: Rect::new(0, 0, 10, 3),
+            },
+            CardHit {
+                index: 1,
+                rect: Rect::new(0, 3, 10, 3),
+            },
+        ];
+        assert_eq!(hit_card(&hits, 2, 4), Some(1));
+        assert_eq!(hit_card(&hits, 20, 4), None);
+        assert!(click_resumes(1, 1, false));
+        assert!(click_resumes(0, 1, true));
+        assert!(!click_resumes(0, 1, false));
+
+        let now = std::time::Instant::now();
+        assert!(is_double_click(
+            Some((1, now)),
+            1,
+            now + std::time::Duration::from_millis(10)
+        ));
+        assert!(!is_double_click(
+            Some((1, now)),
+            1,
+            now + DOUBLE_CLICK_WINDOW + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn focus_tab_and_border_style_are_distinct() {
+        assert_eq!(
+            column_border_style(Focus::List, Focus::List),
+            Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
+        );
+        assert_eq!(
+            column_border_style(Focus::List, Focus::Preview),
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+        );
+        let mut pane = test_pane(vec![(summary(Uuid::new_v4(), 100), Tier::Idle)]);
+        pane.preview_enabled = true;
+        assert_eq!(pane.focus, Focus::List);
+        pane.handle_key(press(KeyCode::Tab));
+        assert_eq!(pane.focus, Focus::Preview);
+        pane.preview_enabled = false;
+        pane.handle_key(press(KeyCode::Tab));
+        assert_eq!(pane.focus, Focus::Preview, "single-column Tab is a no-op");
+    }
+
+    #[test]
+    fn preview_error_does_not_replace_list_body() {
+        let session_id = Uuid::new_v4();
+        let mut s = summary(session_id, 100);
+        s.title = Some("keep visible".into());
+        let mut pane = test_pane(vec![(s, Tier::Idle)]);
+        pane.preview = Some(PreviewState::new(session_id));
+        pane.apply_preview_result(session_id, None, Err("boom".into()));
+        let body = pane
+            .body_lines_with_selected_span(80)
+            .0
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = pane
+            .preview_lines(80)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("keep visible"));
+        assert!(preview.contains("preview unavailable: boom"));
+    }
+
+    #[test]
     fn card_fields_assemble() {
         let mut s = summary(Uuid::new_v4(), 1_700_000_000);
         s.title = Some("fix the parser".into());
@@ -1402,6 +2177,18 @@ mod tests {
         );
         assert!(text.contains("[alpha]"), "all-projects label shown");
         assert!(text.contains("╭") && text.contains("╰"), "rounded corners");
+    }
+
+    #[test]
+    fn pending_card_renders_interrupt_count() {
+        let mut s = summary(Uuid::new_v4(), 1_700_000_000);
+        s.open_interrupts = 3;
+        let text: String = card_lines(&s, Tier::PendingQuestion, false, false, 60, false)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("● 3 pending"), "{text}");
     }
 
     #[test]
@@ -1873,6 +2660,24 @@ mod tests {
             db: None,
             last_body_height: 100,
             last_content_rows: 0,
+            focus: Focus::List,
+            preview: None,
+            preview_enabled: false,
+            preview_area: None,
+            list_area: None,
+            card_hits: Vec::new(),
+            last_preview_height: 0,
+            last_preview_rows: 0,
+            last_card_click: None,
+        }
+    }
+
+    fn message(seq: i64, role: MessageRole, text: &str) -> SessionMessage {
+        SessionMessage {
+            seq,
+            ts_ms: seq * 10,
+            role,
+            text: text.to_string(),
         }
     }
 

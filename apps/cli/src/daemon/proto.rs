@@ -537,6 +537,21 @@ pub struct LiveStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMessage {
+    pub seq: i64,
+    pub ts_ms: i64,
+    pub role: MessageRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Agent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PausedWorkSummary {
     pub session_id: Uuid,
     pub active_agent: String,

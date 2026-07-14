@@ -268,6 +268,31 @@ fn authorize_subagent_transcript(
     }
 }
 
+fn authorize_read_session_messages(
+    request: &Request,
+    state: &ClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &state.principal;
+    let Request::ReadSessionMessages { session_id, .. } = request else {
+        unreachable!("authorize_read_session_messages called for non-ReadSessionMessages request");
+    };
+
+    match ctx.db.get_session(*session_id) {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
+        },
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        Err(e) => Err(internal(e)),
+    }
+}
+
 fn authorize_begin_attachment_upload(
     request: &Request,
     state: &ClientState,
@@ -450,4 +475,3 @@ fn authorize_request(
         principal
     )
 }
-

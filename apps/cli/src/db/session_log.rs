@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+const READ_SESSION_MESSAGES_MAX_LIMIT: u32 = 200;
+
 /// Event-type discriminants for the session log. The string forms are
 /// the stable on-disk + `events.json` values; keep them aligned with the
 /// engine `TurnEvent` vocabulary.
@@ -376,6 +378,67 @@ impl Db {
         Ok(out)
     }
 
+    pub fn read_session_messages(
+        &self,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<(Vec<crate::daemon::proto::SessionMessage>, bool)> {
+        self.read_blocking(|conn| {
+            Self::read_session_messages_conn(conn, session_id, before_seq, limit)
+        })
+    }
+
+    pub fn read_session_messages_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<(Vec<crate::daemon::proto::SessionMessage>, bool)> {
+        let limit = limit.clamp(1, READ_SESSION_MESSAGES_MAX_LIMIT);
+        let fetch_limit = i64::from(limit) + 1;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, ts_ms, type, json_extract(data_json, '$.text') AS text
+                   FROM session_events
+                  WHERE session_id = ?1
+                    AND type IN ('user_message', 'assistant_message')
+                    AND (?2 IS NULL OR seq < ?3)
+                  ORDER BY seq DESC
+                  LIMIT ?4",
+            )
+            .context("preparing read_session_messages")?;
+        let rows = stmt
+            .query_map(
+                params![session_id.to_string(), before_seq, before_seq, fetch_limit],
+                |row| {
+                    let kind: String = row.get("type")?;
+                    let role = match kind.as_str() {
+                        "assistant_message" => crate::daemon::proto::MessageRole::Agent,
+                        _ => crate::daemon::proto::MessageRole::User,
+                    };
+                    let text: Option<String> = row.get("text")?;
+                    Ok(crate::daemon::proto::SessionMessage {
+                        seq: row.get("seq")?,
+                        ts_ms: row.get("ts_ms")?,
+                        role,
+                        text: text.unwrap_or_default(),
+                    })
+                },
+            )
+            .context("querying read_session_messages")?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.context("decoding session message")?);
+        }
+        let has_more = messages.len() > limit as usize;
+        if has_more {
+            messages.truncate(limit as usize);
+        }
+        messages.reverse();
+        Ok((messages, has_more))
+    }
+
     /// Look up the stored (post-redaction) request payload + lifecycle
     /// `status` for one `call_id`. `None` when no payload was captured (e.g. a
     /// pre-0009 call). The export writes the payload verbatim and surfaces the
@@ -706,5 +769,77 @@ mod tests {
             .read_blocking(|conn| Db::list_session_events_since_conn(conn, s.session_id, seq3))
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn read_session_messages_pages_message_rows_only() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let user_one = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "one"}),
+            )
+            .unwrap();
+        db.insert_session_event(
+            s.session_id,
+            SessionEventKind::ToolCall,
+            Some("builder"),
+            None,
+            &json!({"text": "ignored tool"}),
+        )
+        .unwrap();
+        let agent_two = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "two"}),
+            )
+            .unwrap();
+        let user_three = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "three"}),
+            )
+            .unwrap();
+
+        let before = db
+            .list_session_summaries(Some("p"), None, 10)
+            .unwrap()
+            .remove(0);
+        let (page, has_more) = db
+            .read_session_messages(s.session_id, None, 2)
+            .expect("newest page");
+        assert!(has_more);
+        assert_eq!(
+            page.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            vec![agent_two, user_three]
+        );
+        assert_eq!(page[0].role, crate::daemon::proto::MessageRole::Agent);
+        assert_eq!(page[0].text, "two");
+        assert_eq!(page[1].role, crate::daemon::proto::MessageRole::User);
+        assert_eq!(page[1].text, "three");
+
+        let (older, has_more) = db
+            .read_session_messages(s.session_id, Some(agent_two), 2)
+            .expect("older page");
+        assert!(!has_more);
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].seq, user_one);
+
+        let after = db
+            .list_session_summaries(Some("p"), None, 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(after.last_viewed_at, before.last_viewed_at);
+        assert_eq!(after.latest_activity_at, before.latest_activity_at);
     }
 }

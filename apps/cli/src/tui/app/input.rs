@@ -425,6 +425,13 @@ impl App {
                         self.overlay = Overlay::Sessions(pane);
                         self.start_sessions_list_action();
                     }
+                    Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
+                        session_id,
+                        before_seq,
+                    }) => {
+                        self.overlay = Overlay::Sessions(pane);
+                        self.start_sessions_preview_action(session_id, before_seq);
+                    }
                     None => {
                         self.overlay = Overlay::Sessions(pane);
                     }

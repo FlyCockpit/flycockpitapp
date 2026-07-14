@@ -107,6 +107,12 @@ pub enum Response {
         sessions: Vec<SessionSummary>,
     },
 
+    SessionMessages {
+        session_id: Uuid,
+        messages: Vec<SessionMessage>,
+        has_more: bool,
+    },
+
     /// A `/note` session-history note was recorded ([`Request::RecordSessionNote`]).
     /// `seq` is the assigned monotonic `session_events` sequence so the client
     /// can place the note row in the correct chronological position.

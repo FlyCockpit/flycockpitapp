@@ -82,6 +82,58 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotAttached);
     }
 
+    #[tokio::test]
+    async fn read_session_messages_requires_read_access_and_returns_page() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        let seq = ctx
+            .db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "hello"}),
+            )
+            .unwrap();
+        let request = Request::ReadSessionMessages {
+            session_id: session.session_id,
+            before_seq: None,
+            limit: 20,
+        };
+        let grant = crate::daemon::principal::PrincipalGrant {
+            scope: crate::daemon::principal::PrincipalScope::AgentReadonly,
+            project_root: Some("/repo".to_string()),
+        };
+        let mut denied = remote_state_with_grants(vec![grant.clone()]);
+        let error = handle_request(request.clone(), &mut denied, &ctx)
+            .await
+            .expect_err("unshared session is not readable to a remote principal");
+        assert_eq!(error.code, ErrorCode::Authorization);
+
+        ctx.db
+            .set_session_shared_with_collaborators(session.session_id, true)
+            .unwrap();
+        let mut allowed = remote_state_with_grants(vec![grant]);
+        let response = handle_request(request, &mut allowed, &ctx)
+            .await
+            .expect("readonly collaborator can read shared session messages");
+        let Response::SessionMessages {
+            session_id,
+            messages,
+            has_more,
+        } = response
+        else {
+            panic!("expected SessionMessages response");
+        };
+        assert_eq!(session_id, session.session_id);
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].seq, seq);
+        assert_eq!(messages[0].role, proto::MessageRole::User);
+        assert_eq!(messages[0].text, "hello");
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -888,6 +940,17 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::ReadSessionMessages {
+                    session_id: transcript_session_id,
+                    before_seq: None,
+                    limit: 20,
+                },
+                kind: "read_session_messages",
+                session_id: Some(transcript_session_id),
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
                 request: Request::SendUserMessage {
                     text: "hello".into(),
                     image_refs: Vec::new(),
@@ -1526,7 +1589,7 @@ mod tests {
 
         assert_eq!(
             cases.len(),
-            70,
+            71,
             "every Request variant has one metadata case"
         );
         let mut kinds = HashSet::new();

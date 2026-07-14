@@ -141,6 +141,44 @@ impl App {
             }
             return;
         }
+        if matches!(self.overlay, Overlay::Sessions(_)) {
+            let overlay = std::mem::take(&mut self.overlay);
+            let Overlay::Sessions(mut pane) = overlay else {
+                unreachable!();
+            };
+            let click = matches!(mouse.kind, MouseEventKind::Down(_));
+            let wheel = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            let outcome = if wheel || (self.mouse_capture && click) {
+                pane.handle_mouse(mouse)
+            } else {
+                None
+            };
+            match outcome {
+                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {}
+                Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
+                    self.resume_session(session_id);
+                }
+                Some(crate::tui::sessions_pane::SessionsOutcome::LoadList) => {
+                    self.overlay = Overlay::Sessions(pane);
+                    self.start_sessions_list_action();
+                }
+                Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
+                    session_id,
+                    before_seq,
+                }) => {
+                    self.overlay = Overlay::Sessions(pane);
+                    self.start_sessions_preview_action(session_id, before_seq);
+                }
+                None => {
+                    self.overlay = Overlay::Sessions(pane);
+                }
+            }
+            return;
+        }
+
         match &mut self.overlay {
             Overlay::Stats(pane) => {
                 match mouse.kind {
@@ -150,14 +188,7 @@ impl App {
                 }
                 return;
             }
-            Overlay::Sessions(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
+            Overlay::Sessions(_) => return,
             Overlay::Skills(pane) => {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => pane.scroll_up(),

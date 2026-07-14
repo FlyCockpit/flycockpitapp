@@ -44,6 +44,7 @@ mod loop_guard;
 mod outcome;
 mod recheck;
 mod text_recovery;
+mod tool_dispatch;
 mod turn_phases;
 
 pub use backup::turn_with_backup;

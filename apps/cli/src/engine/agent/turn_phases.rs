@@ -733,7 +733,8 @@ pub(crate) async fn run_turn(
                                 set,
                                 "endpoint recovery",
                             )
-                            .await;
+                            .await
+                            .into_response_or_cancel();
                             crate::engine::interrupt::selected_id_of(&response).as_deref()
                                 == Some(ID_TRY)
                         })

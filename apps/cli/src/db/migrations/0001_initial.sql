@@ -230,15 +230,20 @@ CREATE TABLE needs_attention (
     session_id     TEXT    NOT NULL,
     agent_id       TEXT    NOT NULL,
     description    TEXT    NOT NULL,
+    state          TEXT    NOT NULL DEFAULT 'open',
     question_json  TEXT,                            -- serialized proto::InterruptQuestion or NULL
     raised_at      INTEGER NOT NULL,
     resolved_at    INTEGER,
     response_json  TEXT,                            -- serialized proto::ResolveResponse, NULL if unresolved
     questions_json TEXT,                            -- serialized proto::InterruptQuestionSet or NULL
+    parked_tool    TEXT,                            -- wire tool name for parked replay, or NULL
+    parked_args_json TEXT,                          -- verbatim wire args for parked replay, or NULL
+    parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
+    parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_na_session_open ON needs_attention (session_id, resolved_at);
+CREATE INDEX idx_na_session_open ON needs_attention (session_id, state);
 
 -- ---- tool_call_stats view ----------------------------------------------------
 

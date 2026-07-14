@@ -44,7 +44,7 @@ mod loop_guard;
 mod outcome;
 mod recheck;
 mod text_recovery;
-mod tool_dispatch;
+pub(crate) mod tool_dispatch;
 mod turn_phases;
 
 pub use backup::turn_with_backup;
@@ -87,7 +87,7 @@ pub struct Agent {
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
-fn turn_toolbox(agent: &Agent, session: &Session) -> ToolBox {
+pub(crate) fn turn_toolbox(agent: &Agent, session: &Session) -> ToolBox {
     toolbox_with_retrieval_if_needed(agent.tools.clone(), session)
 }
 
@@ -473,7 +473,7 @@ fn inline_think_enabled(session: &Session, cwd: &std::path::Path) -> bool {
 /// default (off). An unset override, an unknown model, or an unresolvable
 /// config falls through to the global, so default behavior is unchanged
 /// (silent canonical rewrite + user chip). Mirrors [`inline_think_enabled`].
-fn hint_tool_call_corrections_enabled(session: &Session, cwd: &std::path::Path) -> bool {
+pub(crate) fn hint_tool_call_corrections_enabled(session: &Session, cwd: &std::path::Path) -> bool {
     let (extended, providers) = crate::auto_title::load_configs_for(cwd);
     let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
         return extended.hint_tool_call_corrections;
@@ -749,6 +749,7 @@ async fn raise_and_wait_in_turn(
         "result injection override",
     )
     .await
+    .into_response_or_cancel()
 }
 
 async fn dispatch_one(

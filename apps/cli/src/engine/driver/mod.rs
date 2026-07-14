@@ -75,6 +75,15 @@ pub enum DriverControl {
         root_agent: String,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<usize, String>>,
     },
+    /// Execute a parked interrupt's persisted tool call through the canonical
+    /// ordinary-tool dispatcher, injecting the already-recorded answer at the
+    /// interrupt seam so approval/question behavior matches the live path.
+    ReplayParkedInterrupt {
+        interrupt_id: uuid::Uuid,
+        payload: crate::db::needs_attention::InterruptParkPayload,
+        response: crate::daemon::proto::ResolveResponse,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Swap the **primary** (root-frame) agent in place (`/plan` → `Plan`,
     /// `/build` → `Build`, `plan.md §4.6.d`). Handled at the idle boundary
     /// like other control requests; the root history is preserved so the
@@ -1647,6 +1656,7 @@ impl Driver {
             "injection override",
         )
         .await
+        .into_response_or_cancel()
     }
 
     async fn primary_round_ceiling_allows_more(
@@ -1793,6 +1803,100 @@ impl Driver {
         CancelHandle {
             current: self.cancel_current.clone(),
         }
+    }
+
+    async fn replay_parked_interrupt_call(
+        &mut self,
+        interrupt_id: uuid::Uuid,
+        payload: crate::db::needs_attention::InterruptParkPayload,
+        response: crate::daemon::proto::ResolveResponse,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        use rig::message::ToolFunction;
+
+        let agent = self
+            .stack
+            .last()
+            .context("driver stack is empty")?
+            .agent
+            .clone();
+        if agent.name != payload.resume.agent_id {
+            bail!(
+                "parked interrupt belongs to agent `{}`, active agent is `{}`",
+                payload.resume.agent_id,
+                agent.name
+            );
+        }
+        let active_tools = crate::engine::agent::turn_toolbox(&agent, &self.session);
+        if active_tools.get(&payload.tool).is_none() {
+            bail!("parked interrupt tool `{}` is not registered", payload.tool);
+        }
+        {
+            let history = &self.stack.last().context("driver stack is empty")?.history;
+            ensure_unpaired_tool_call(history, &payload.call_id, &payload.tool)?;
+        }
+
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            llm_mode: agent.llm_mode,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            approver: self.approver.clone(),
+            deferred_log: self
+                .stack
+                .last()
+                .context("driver stack is empty")?
+                .deferred_log
+                .clone(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
+            has_tree: agent.tools.get("tree").is_some(),
+            has_bash: agent.tools.get("bash").is_some(),
+            events: Some(tx.clone()),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            env_overlay: agent.env_overlay.clone(),
+        };
+        let call = crate::engine::message::ToolCall {
+            id: payload.call_id.clone(),
+            call_id: payload.resume.provider_call_id.clone(),
+            function: ToolFunction {
+                name: payload.tool.clone(),
+                arguments: payload.args.clone(),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+            agent: &agent,
+            session: &self.session,
+            model: &agent.model,
+            active_tools: &active_tools,
+            ctx: &ctx,
+            tx,
+            hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
+                &self.session,
+                &self.cwd,
+            ),
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+        };
+        crate::engine::interrupt::with_pre_resolved_interrupt(interrupt_id, response, async {
+            let frame = self.stack.last_mut().context("driver stack is empty")?;
+            crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                &env,
+                &mut frame.history,
+                &call,
+                &payload.tool,
+                crate::engine::repair::Recovery::Clean,
+                None,
+            )
+            .await
+        })
+        .await
     }
 
     /// Long-running main loop: pulls user input from `input_rx` and
@@ -2081,6 +2185,18 @@ impl Driver {
                     Ok(None) => Ok(0),
                     Err(error) => Err(format!("{error:#}")),
                 };
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ReplayParkedInterrupt {
+                interrupt_id,
+                payload,
+                response,
+                respond_to,
+            } => {
+                let result = self
+                    .replay_parked_interrupt_call(interrupt_id, payload, response, tx)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
             }
             DriverControl::SwapPrimary { name } => {
@@ -3668,7 +3784,9 @@ impl Driver {
             "schedule unbounded loop approval",
         )
         .await;
-        if crate::engine::interrupt::selected_id_of(&resp).as_deref() == Some("approve") {
+        if crate::engine::interrupt::selected_id_of(&resp.into_response_or_cancel()).as_deref()
+            == Some("approve")
+        {
             self.unbounded_schedule_loops_approved = true;
             Ok(())
         } else {
@@ -5636,6 +5754,50 @@ fn skill_pair_call_ids_in_history(history: &[Message]) -> std::collections::Hash
         }
     }
     skill_calls.intersection(&skill_results).cloned().collect()
+}
+
+fn ensure_unpaired_tool_call(history: &[Message], call_id: &str, tool: &str) -> Result<()> {
+    use crate::engine::message::AssistantContent;
+    use rig::message::UserContent;
+
+    let mut found_call = false;
+    let mut found_result = false;
+    for msg in history {
+        match msg {
+            Message::Assistant { content, .. } => {
+                for part in content.iter() {
+                    if let AssistantContent::ToolCall(tc) = part
+                        && tc.id == call_id
+                    {
+                        if tc.function.name != tool {
+                            bail!(
+                                "parked call `{call_id}` expected tool `{tool}`, transcript has `{}`",
+                                tc.function.name
+                            );
+                        }
+                        found_call = true;
+                    }
+                }
+            }
+            Message::User { content } => {
+                for part in content.iter() {
+                    if let UserContent::ToolResult(tr) = part
+                        && tr.id == call_id
+                    {
+                        found_result = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !found_call {
+        bail!("parked call `{call_id}` is missing from the transcript");
+    }
+    if found_result {
+        bail!("parked call `{call_id}` already has a tool result");
+    }
+    Ok(())
 }
 
 /// Opening of the cross-agent tool-call attribution note

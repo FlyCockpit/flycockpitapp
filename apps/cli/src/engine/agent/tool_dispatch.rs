@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::db::needs_attention::{InterruptParkPayload, InterruptResumeAnchor};
 
 pub(crate) struct DispatchEnv<'a> {
     pub(crate) agent: &'a Agent,
@@ -305,6 +306,7 @@ pub(crate) async fn execute_ordinary_call(
         None
     };
     let lifecycle_started = repair_outcome.valid && env.active_tools.get(resolved_name).is_some();
+    let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
         let start_data = serde_json::json!({
@@ -314,13 +316,18 @@ pub(crate) async fn execute_ordinary_call(
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
         });
-        if let Err(e) = env.session.record_event(
+        match env.session.record_event(
             crate::db::session_log::SessionEventKind::ToolCallStarted,
             Some(&env.agent.name),
             Some(&tc.id),
             &start_data,
         ) {
-            tracing::warn!(error = %e, tool = %resolved_name, "record tool_call_started event failed");
+            Ok(seq) => {
+                assistant_seq = Some(seq);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, tool = %resolved_name, "record tool_call_started event failed");
+            }
         }
     }
     let gate_blocked = gate_block.is_some();
@@ -348,7 +355,21 @@ pub(crate) async fn execute_ordinary_call(
     } else if let Some(msg) = gate_block {
         (Err(invalid_input(msg)), 0)
     } else if repair_outcome.valid {
-        dispatch_one_timed(env.active_tools, resolved_name, args.clone(), env.ctx).await
+        let payload = InterruptParkPayload {
+            tool: resolved_name.to_string(),
+            args: args.clone(),
+            call_id: tc.id.clone(),
+            resume: InterruptResumeAnchor {
+                agent_id: env.agent.name.clone(),
+                call_id: tc.id.clone(),
+                provider_call_id: tc.call_id.clone(),
+                assistant_seq,
+            },
+        };
+        crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+            dispatch_one_timed(env.active_tools, resolved_name, args.clone(), env.ctx).await
+        })
+        .await
     } else {
         let msg = repair_outcome
             .error

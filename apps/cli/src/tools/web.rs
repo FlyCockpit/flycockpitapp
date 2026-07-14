@@ -674,7 +674,8 @@ async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) ->
         set,
         "web key prompt",
     )
-    .await;
+    .await
+    .into_response_or_cancel();
     if ctx.cancel.is_cancelled() {
         return false;
     }

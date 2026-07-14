@@ -11,6 +11,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -18,6 +20,62 @@ use crate::daemon::proto::{
     ResolveResponse,
 };
 use crate::db::Db;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptState {
+    Open,
+    Parked,
+    Executing,
+    Interrupted,
+    Resolved,
+}
+
+impl InterruptState {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Parked => "parked",
+            Self::Executing => "executing",
+            Self::Interrupted => "interrupted",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    fn parse(s: &str) -> rusqlite::Result<Self> {
+        match s {
+            "open" => Ok(Self::Open),
+            "parked" => Ok(Self::Parked),
+            "executing" => Ok(Self::Executing),
+            "interrupted" => Ok(Self::Interrupted),
+            "resolved" => Ok(Self::Resolved),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown interrupt state `{other}`").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterruptResumeAnchor {
+    pub agent_id: String,
+    pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_seq: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterruptParkPayload {
+    pub tool: String,
+    pub args: Value,
+    pub call_id: String,
+    pub resume: InterruptResumeAnchor,
+}
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
 // not-yet-wired interrupt-resolution UI, so the struct is retained whole.
@@ -36,6 +94,8 @@ pub struct NeedsAttentionRow {
     pub raised_at: i64,
     pub resolved_at: Option<i64>,
     pub response: Option<ResolveResponse>,
+    pub state: InterruptState,
+    pub parked: Option<InterruptParkPayload>,
 }
 
 impl Db {
@@ -78,6 +138,7 @@ impl Db {
     /// [`Self::raise_interrupt`]: identical except the payload is a
     /// [`InterruptQuestionSet`] stored in `questions_json` (the legacy
     /// `question_json` column stays NULL). Used by the `question` tool.
+    #[allow(dead_code)]
     pub fn raise_interrupt_questions(
         &self,
         session_id: Uuid,
@@ -85,16 +146,44 @@ impl Db {
         description: &str,
         questions: &InterruptQuestionSet,
     ) -> Result<Uuid> {
+        self.raise_interrupt_questions_with_payload(
+            session_id,
+            agent_id,
+            description,
+            questions,
+            None,
+        )
+    }
+
+    pub fn raise_interrupt_questions_with_payload(
+        &self,
+        session_id: Uuid,
+        agent_id: &str,
+        description: &str,
+        questions: &InterruptQuestionSet,
+        parked: Option<&InterruptParkPayload>,
+    ) -> Result<Uuid> {
         let interrupt_id = Uuid::new_v4();
         let raised_at = Utc::now().timestamp();
         let questions_json = serde_json::to_string(questions).context("serializing questions")?;
+        let parked_tool = parked.map(|payload| payload.tool.clone());
+        let parked_args_json = parked
+            .map(|payload| serde_json::to_string(&payload.args))
+            .transpose()
+            .context("serializing parked args")?;
+        let parked_call_id = parked.map(|payload| payload.call_id.clone());
+        let parked_resume_json = parked
+            .map(|payload| serde_json::to_string(&payload.resume))
+            .transpose()
+            .context("serializing parked resume anchor")?;
         let agent_id = agent_id.to_owned();
         let description = description.to_owned();
         self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
-                 (interrupt_id, session_id, agent_id, description, questions_json, raised_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (interrupt_id, session_id, agent_id, description, questions_json, raised_at,
+                  state, parked_tool, parked_args_json, parked_call_id, parked_resume_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -102,6 +191,10 @@ impl Db {
                     description,
                     questions_json,
                     raised_at,
+                    parked_tool,
+                    parked_args_json,
+                    parked_call_id,
+                    parked_resume_json,
                 ],
             )
             .context("inserting needs_attention (questions)")?;
@@ -118,13 +211,13 @@ impl Db {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
-                        SET resolved_at = ?1, response_json = ?2
-                      WHERE interrupt_id = ?3 AND resolved_at IS NULL",
+                        SET resolved_at = ?1, response_json = ?2, state = 'resolved'
+                      WHERE interrupt_id = ?3 AND state = 'open'",
                     params![now, response_json, interrupt_id.to_string()],
                 )
                 .context("resolving needs_attention")?;
             if affected == 0 {
-                anyhow::bail!("interrupt {interrupt_id} not found or already resolved");
+                anyhow::bail!("interrupt {interrupt_id} not found or not open");
             }
             Ok(())
         })
@@ -135,9 +228,10 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
-                            question_json, questions_json, raised_at, resolved_at, response_json
+                            question_json, questions_json, raised_at, resolved_at, response_json,
+                            state, parked_tool, parked_args_json, parked_call_id, parked_resume_json
                        FROM needs_attention
-                      WHERE session_id = ?1 AND resolved_at IS NULL
+                      WHERE session_id = ?1 AND state IN ('open', 'parked')
                       ORDER BY raised_at ASC, rowid ASC",
                 )
                 .context("preparing list_open_interrupts")?;
@@ -157,7 +251,8 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
-                            question_json, questions_json, raised_at, resolved_at, response_json
+                            question_json, questions_json, raised_at, resolved_at, response_json,
+                            state, parked_tool, parked_args_json, parked_call_id, parked_resume_json
                        FROM needs_attention
                       WHERE interrupt_id = ?1",
                 )
@@ -169,6 +264,69 @@ impl Db {
                 Some(row) => Ok(Some(row.context("decoding needs_attention row")?)),
                 None => Ok(None),
             }
+        })
+    }
+
+    pub fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
+        self.write_blocking(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE needs_attention
+                        SET state = 'parked'
+                      WHERE interrupt_id = ?1 AND state = 'open'",
+                    params![interrupt_id.to_string()],
+                )
+                .context("parking needs_attention")?;
+            Ok(affected > 0)
+        })
+    }
+
+    pub fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
+        self.write_blocking(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE needs_attention
+                        SET state = 'interrupted'
+                      WHERE interrupt_id = ?1 AND state IN ('open', 'parked')",
+                    params![interrupt_id.to_string()],
+                )
+                .context("marking needs_attention interrupted")?;
+            Ok(affected > 0)
+        })
+    }
+
+    pub fn begin_parked_interrupt_execution(
+        &self,
+        interrupt_id: Uuid,
+        response: &ResolveResponse,
+    ) -> Result<bool> {
+        let response_json =
+            serde_json::to_string(response).context("serializing parked interrupt response")?;
+        self.write_blocking(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE needs_attention
+                        SET state = 'executing', response_json = ?1
+                      WHERE interrupt_id = ?2 AND state = 'parked'",
+                    params![response_json, interrupt_id.to_string()],
+                )
+                .context("marking parked interrupt executing")?;
+            Ok(affected > 0)
+        })
+    }
+
+    pub fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
+        let now = Utc::now().timestamp();
+        self.write_blocking(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE needs_attention
+                        SET state = 'resolved', resolved_at = ?1
+                      WHERE interrupt_id = ?2 AND state = 'executing'",
+                    params![now, interrupt_id.to_string()],
+                )
+                .context("completing executing interrupt")?;
+            Ok(affected > 0)
         })
     }
 }
@@ -290,6 +448,42 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
         })?),
         None => None,
     };
+    let state_raw: String = row.get("state")?;
+    let state = InterruptState::parse(&state_raw)?;
+    let parked_tool: Option<String> = row.get("parked_tool")?;
+    let parked_args_json: Option<String> = row.get("parked_args_json")?;
+    let parked_call_id: Option<String> = row.get("parked_call_id")?;
+    let parked_resume_json: Option<String> = row.get("parked_resume_json")?;
+    let parked = match (
+        parked_tool,
+        parked_args_json,
+        parked_call_id,
+        parked_resume_json,
+    ) {
+        (Some(tool), Some(args_json), Some(call_id), Some(resume_json)) => {
+            let args = serde_json::from_str(&args_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            let resume = serde_json::from_str(&resume_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Some(InterruptParkPayload {
+                tool,
+                args,
+                call_id,
+                resume,
+            })
+        }
+        _ => None,
+    };
     Ok(NeedsAttentionRow {
         interrupt_id,
         session_id,
@@ -300,6 +494,8 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
         raised_at: row.get("raised_at")?,
         resolved_at: row.get("resolved_at")?,
         response,
+        state,
+        parked,
     })
 }
 
@@ -386,6 +582,8 @@ mod tests {
             raised_at: 0,
             resolved_at: None,
             response: None,
+            state: InterruptState::Open,
+            parked: None,
         };
         let decision = summarize_interrupt_decision(
             &row,
@@ -455,6 +653,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.list_open_interrupts(s.session_id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parked_payload_round_trips_and_executes_once() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Freetext {
+                prompt: "why?".into(),
+                masked: false,
+            }],
+        };
+        let payload = InterruptParkPayload {
+            tool: "bash".into(),
+            args: serde_json::json!({ "command": "echo yes" }),
+            call_id: "call-1".into(),
+            resume: InterruptResumeAnchor {
+                agent_id: "builder".into(),
+                call_id: "call-1".into(),
+                provider_call_id: Some("provider-call-1".into()),
+                assistant_seq: Some(42),
+            },
+        };
+        let iid = db
+            .raise_interrupt_questions_with_payload(
+                s.session_id,
+                "builder",
+                "approval",
+                &set,
+                Some(&payload),
+            )
+            .unwrap();
+
+        let row = db.get_interrupt(iid).unwrap().unwrap();
+        assert_eq!(row.state, InterruptState::Open);
+        assert_eq!(row.parked.as_ref(), Some(&payload));
+
+        assert!(db.park_interrupt(iid).unwrap());
+        assert!(!db.park_interrupt(iid).unwrap());
+        assert!(
+            db.resolve_interrupt(iid, &ResolveResponse::Freetext { text: "no".into() })
+                .is_err()
+        );
+
+        assert!(
+            db.begin_parked_interrupt_execution(
+                iid,
+                &ResolveResponse::Freetext { text: "yes".into() },
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.begin_parked_interrupt_execution(
+                iid,
+                &ResolveResponse::Freetext {
+                    text: "again".into()
+                },
+            )
+            .unwrap()
+        );
+        let executing = db.get_interrupt(iid).unwrap().unwrap();
+        assert_eq!(executing.state, InterruptState::Executing);
+        assert!(matches!(
+            executing.response,
+            Some(ResolveResponse::Freetext { ref text }) if text == "yes"
+        ));
+
+        assert!(db.complete_executing_interrupt(iid).unwrap());
+        assert!(!db.complete_executing_interrupt(iid).unwrap());
+        let resolved = db.get_interrupt(iid).unwrap().unwrap();
+        assert_eq!(resolved.state, InterruptState::Resolved);
+        assert!(resolved.resolved_at.is_some());
     }
 
     #[test]

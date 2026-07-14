@@ -168,24 +168,17 @@ impl Tool for QuestionTool {
         // still find and answer the parked interrupt), then register the
         // wakeup, then emit the event. Registering before emitting
         // guarantees a fast client can't resolve before we're listening.
-        let interrupt_id = ctx.session.db.raise_interrupt_questions(
+        let response = crate::engine::interrupt::raise_and_wait(
+            &ctx.session.db,
+            &ctx.interrupts,
             ctx.session.id,
-            &ctx.agent_id,
-            &description,
-            &set,
-        )?;
-        let pending = ctx.interrupts.register(interrupt_id);
-        ctx.interrupts.emit_raised(
-            ctx.session.id,
-            interrupt_id,
             &ctx.agent_id,
             &description,
             set.clone(),
-        );
-
-        // Block until a client answers. No timeout: a headless interrupt
-        // parks here forever until someone resolves it.
-        let response = pending.wait().await;
+            "question tool",
+        )
+        .await
+        .into_response_or_cancel();
         let answers = response.into_batch(n);
 
         Ok(ToolOutput::text(render_answers(&set, &answers)))

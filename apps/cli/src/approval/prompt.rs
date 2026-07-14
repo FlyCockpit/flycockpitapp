@@ -13,21 +13,17 @@ impl Approver {
         let set = InterruptQuestionSet {
             questions: vec![question],
         };
-        let interrupt_id = self.db.raise_interrupt_questions(
+        Ok(crate::engine::interrupt::raise_and_wait(
+            &self.db,
+            &self.interrupts,
             self.session_id,
-            &self.agent_id,
-            description,
-            &set,
-        )?;
-        let pending = self.interrupts.register(interrupt_id);
-        self.interrupts.emit_raised(
-            self.session_id,
-            interrupt_id,
             &self.agent_id,
             description,
             set,
-        );
-        Ok(pending.wait().await)
+            "approval prompt",
+        )
+        .await
+        .into_response_or_cancel())
     }
 
     /// Decide a back-to-back identical tool call (the loop guard, GOALS
@@ -131,22 +127,17 @@ impl Approver {
         };
         let description = format!("Repeated `{tool}` call — likely a loop. Allow it?");
 
-        let interrupt_id = self.db.raise_interrupt_questions(
+        let response = crate::engine::interrupt::raise_and_wait(
+            &self.db,
+            &self.interrupts,
             self.session_id,
-            &self.agent_id,
-            &description,
-            &set,
-        )?;
-        let pending = self.interrupts.register(interrupt_id);
-        self.interrupts.emit_raised(
-            self.session_id,
-            interrupt_id,
             &self.agent_id,
             &description,
             set,
-        );
-
-        let response = pending.wait().await;
+            "loop-guard prompt",
+        )
+        .await
+        .into_response_or_cancel();
         Ok(response_to_repeat_choice(&response))
     }
 

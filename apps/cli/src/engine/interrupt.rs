@@ -45,13 +45,65 @@ use uuid::Uuid;
 
 use crate::daemon::proto::{self, InterruptQuestionSet, ResolveResponse};
 use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
+use crate::db::needs_attention::InterruptParkPayload;
+
+tokio::task_local! {
+    static CURRENT_INTERRUPT_PARK_PAYLOAD: InterruptParkPayload;
+}
+
+tokio::task_local! {
+    static CURRENT_PRE_RESOLVED_INTERRUPT: (Uuid, ResolveResponse);
+}
+
+pub async fn with_interrupt_park_payload<F>(payload: InterruptParkPayload, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_INTERRUPT_PARK_PAYLOAD.scope(payload, fut).await
+}
+
+pub fn current_interrupt_park_payload() -> Option<InterruptParkPayload> {
+    CURRENT_INTERRUPT_PARK_PAYLOAD.try_with(Clone::clone).ok()
+}
+
+pub async fn with_pre_resolved_interrupt<F>(
+    interrupt_id: Uuid,
+    response: ResolveResponse,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_PRE_RESOLVED_INTERRUPT
+        .scope((interrupt_id, response), fut)
+        .await
+}
+
+fn current_pre_resolved_interrupt() -> Option<(Uuid, ResolveResponse)> {
+    CURRENT_PRE_RESOLVED_INTERRUPT.try_with(Clone::clone).ok()
+}
+
+#[derive(Debug, Clone)]
+pub enum InterruptOutcome {
+    Resolved(ResolveResponse),
+    Parked,
+}
+
+impl InterruptOutcome {
+    pub fn into_response_or_cancel(self) -> ResolveResponse {
+        match self {
+            Self::Resolved(response) => response,
+            Self::Parked => ResolveResponse::Cancel,
+        }
+    }
+}
 
 /// Shared interrupt rendezvous. Cheap to clone via `Arc`.
 pub struct InterruptHub {
     /// Pending wakeups keyed by interrupt id. A sender is inserted by
     /// [`Self::register`] and removed when [`Self::resolve`] fires it
     /// (or when the [`PendingInterrupt`] guard drops on cancellation).
-    waiters: Mutex<HashMap<Uuid, oneshot::Sender<ResolveResponse>>>,
+    waiters: Mutex<HashMap<Uuid, oneshot::Sender<InterruptOutcome>>>,
     /// Outbound event channel to attached clients. `None` in
     /// non-daemon paths (tool unit tests, the standalone run shim) where
     /// no client is listening — raising still works; the event is just
@@ -275,7 +327,21 @@ impl InterruptHub {
         let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) else {
             return false;
         };
-        tx.send(response).is_ok()
+        tx.send(InterruptOutcome::Resolved(response)).is_ok()
+    }
+
+    #[allow(dead_code)]
+    pub fn park(&self, interrupt_id: Uuid) -> bool {
+        let parked = self
+            .db
+            .as_ref()
+            .and_then(|db| db.park_interrupt(interrupt_id).ok())
+            .unwrap_or(false);
+        let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) else {
+            return parked;
+        };
+        let _ = tx.send(InterruptOutcome::Parked);
+        true
     }
 }
 
@@ -289,42 +355,25 @@ pub struct PendingInterrupt<'a> {
     /// `Option` so [`Self::wait`] can take the receiver out of `self`
     /// without fighting the `Drop` guard (a `Drop` type can't be moved
     /// out of field-by-field).
-    rx: Option<oneshot::Receiver<ResolveResponse>>,
+    rx: Option<oneshot::Receiver<InterruptOutcome>>,
 }
 
 impl PendingInterrupt<'_> {
-    /// Block until resolved. Returns the human's resolution, or
-    /// [`ResolveResponse::Cancel`] if the wakeup channel closed without
-    /// a value (only happens on worker teardown — the agent treats it
-    /// as a dismissal, the safe default).
-    pub async fn wait(mut self) -> ResolveResponse {
+    /// Block until resolved or parked. A closed wakeup channel is treated
+    /// as parked: teardown must never auto-answer or auto-cancel a row.
+    pub async fn wait(mut self) -> InterruptOutcome {
         let rx = self.rx.take().expect("wait called once");
         match rx.await {
-            Ok(response) => response,
-            Err(_) => ResolveResponse::Cancel,
+            Ok(outcome) => outcome,
+            Err(_) => InterruptOutcome::Parked,
         }
     }
 }
 
 impl Drop for PendingInterrupt<'_> {
     fn drop(&mut self) {
-        // Idempotent: `resolve` already removed it on the happy path.
-        let removed = lock_or_recover(&self.hub.waiters)
-            .remove(&self.interrupt_id)
-            .is_some();
-        if removed && let (Some(db), Some(session_id)) = (&self.hub.db, self.hub.session_id) {
-            let was_active = db
-                .list_open_interrupts(session_id)
-                .ok()
-                .and_then(|open| open.first().map(|row| row.interrupt_id))
-                == Some(self.interrupt_id);
-            let _ = db.resolve_interrupt(self.interrupt_id, &ResolveResponse::Cancel);
-            if was_active {
-                self.hub.emit_active_from_db();
-            } else {
-                self.hub.emit_queue_state();
-            }
-        }
+        // Idempotent: `resolve`/`park` already removed it on the happy path.
+        let _ = lock_or_recover(&self.hub.waiters).remove(&self.interrupt_id);
     }
 }
 
@@ -367,12 +416,22 @@ pub async fn raise_and_wait(
     description: &str,
     set: InterruptQuestionSet,
     log_label: &str,
-) -> ResolveResponse {
-    let interrupt_id = match db.raise_interrupt_questions(session_id, agent, description, &set) {
+) -> InterruptOutcome {
+    if let Some((_interrupt_id, response)) = current_pre_resolved_interrupt() {
+        return InterruptOutcome::Resolved(response);
+    }
+    let payload = current_interrupt_park_payload();
+    let interrupt_id = match db.raise_interrupt_questions_with_payload(
+        session_id,
+        agent,
+        description,
+        &set,
+        payload.as_ref(),
+    ) {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = %e, "{log_label}: raising interrupt failed");
-            return ResolveResponse::Cancel;
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
         }
     };
     let pending = interrupts.register(interrupt_id);
@@ -436,7 +495,9 @@ mod tests {
             }
         ));
         let got = pending.wait().await;
-        assert!(matches!(got, ResolveResponse::Single { selected_id } if selected_id == "y"));
+        assert!(
+            matches!(got, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "y")
+        );
     }
 
     #[tokio::test]
@@ -466,18 +527,40 @@ mod tests {
         let id = Uuid::new_v4();
         let pending = hub.register(id);
         assert!(hub.resolve(id, ResolveResponse::Cancel));
-        assert!(matches!(pending.wait().await, ResolveResponse::Cancel));
+        assert!(matches!(
+            pending.wait().await,
+            InterruptOutcome::Resolved(ResolveResponse::Cancel)
+        ));
     }
 
     #[tokio::test]
-    async fn dropped_sender_resolves_to_cancel() {
+    async fn dropped_sender_resolves_to_parked() {
         // Worker teardown: the registry is cleared (sender dropped)
-        // while a tool is still awaiting. `wait` must yield `Cancel`.
+        // while a tool is still awaiting. `wait` must yield `Parked`.
         let hub = InterruptHub::detached();
         let id = Uuid::new_v4();
         let pending = hub.register(id);
         lock_or_recover(&hub.waiters).clear();
-        assert!(matches!(pending.wait().await, ResolveResponse::Cancel));
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+    }
+
+    #[tokio::test]
+    async fn explicit_park_wakes_waiter_as_parked() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let set = question_set();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .unwrap();
+        let pending = hub.register(id);
+
+        assert!(hub.park(id));
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert_eq!(
+            db.get_interrupt(id).unwrap().unwrap().state,
+            crate::db::needs_attention::InterruptState::Parked
+        );
     }
 
     #[tokio::test]
@@ -552,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_active_waiter_withdraws_and_advances_to_next_interrupt() {
+    async fn dropping_active_waiter_leaves_row_open_without_advancing() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
@@ -567,29 +650,19 @@ mod tests {
 
         drop(pending);
 
-        assert_eq!(
-            db.list_open_interrupts(session.session_id).unwrap()[0].interrupt_id,
-            second
+        let open = db.list_open_interrupts(session.session_id).unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].interrupt_id, first);
+        assert_eq!(open[1].interrupt_id, second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
         );
-        assert!(matches!(
-            events.recv().await.unwrap().event,
-            proto::Event::InterruptQueueChanged {
-                active_interrupt_id: Some(interrupt_id), pending_count: 0, ..
-            } if interrupt_id == second
-        ));
-        assert!(matches!(
-            events.recv().await.unwrap().event,
-            proto::Event::InterruptRaised {
-                interrupt_id,
-                pending_count: 0,
-                reason: proto::InterruptRaiseReason::Advance,
-                ..
-            } if interrupt_id == second
-        ));
     }
 
     #[tokio::test]
-    async fn dropping_queued_waiter_withdraws_only_that_interrupt() {
+    async fn dropping_queued_waiter_leaves_fifo_unchanged() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
@@ -603,15 +676,14 @@ mod tests {
         let pending = hub.register(second);
         drop(pending);
 
-        assert_eq!(
-            db.list_open_interrupts(session.session_id).unwrap()[0].interrupt_id,
-            first
+        let open = db.list_open_interrupts(session.session_id).unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].interrupt_id, first);
+        assert_eq!(open[1].interrupt_id, second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
         );
-        assert!(matches!(
-            events.recv().await.unwrap().event,
-            proto::Event::InterruptQueueChanged {
-                active_interrupt_id: Some(interrupt_id), pending_count: 0, ..
-            } if interrupt_id == first
-        ));
     }
 }

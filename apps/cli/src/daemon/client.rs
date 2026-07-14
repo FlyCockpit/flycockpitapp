@@ -452,7 +452,10 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                     socket: discovered.paths.socket,
                 });
             }
-            if matches!(discovered.status, DaemonStatus::LivePidSocketUnreachable) {
+            if matches!(
+                discovered.status,
+                DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid
+            ) {
                 anyhow::bail!(
                     "shared daemon pid is live but socket is unreachable: {}",
                     discovered.paths.socket.display()

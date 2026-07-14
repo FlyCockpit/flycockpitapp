@@ -113,6 +113,9 @@ impl DaemonPromptDialog {
                 DaemonStatus::LivePidSocketUnreachable => {
                     "A cockpit daemon pid is live, but its recorded socket is unreachable."
                 }
+                DaemonStatus::UnverifiedPid => {
+                    "A live daemon pid file was found, but the process identity could not be verified."
+                }
                 DaemonStatus::Running => "Daemon is running.",
             }
             .to_string(),

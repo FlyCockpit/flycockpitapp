@@ -4,6 +4,7 @@ use super::*;
 use super::recheck::{RecheckAction, result_recheck_action};
 
 /// What the command-safety gate decided for one call.
+#[derive(Clone)]
 pub(super) enum GateOutcome {
     /// Proceed to dispatch. `recheck` is whether the call's result must be
     /// injection-re-checked afterward.
@@ -11,6 +12,28 @@ pub(super) enum GateOutcome {
     /// Skip dispatch; the string is the model-readable tool result
     /// (`invalid_input`) explaining why the call was withheld.
     Block(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAFETY_GATE_TEST_OVERRIDE: std::cell::RefCell<Option<GateOutcome>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct SafetyGateTestOverrideGuard;
+
+#[cfg(test)]
+pub(super) fn set_safety_gate_test_override(outcome: GateOutcome) -> SafetyGateTestOverrideGuard {
+    SAFETY_GATE_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(outcome));
+    SafetyGateTestOverrideGuard
+}
+
+#[cfg(test)]
+impl Drop for SafetyGateTestOverrideGuard {
+    fn drop(&mut self) {
+        SAFETY_GATE_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 /// Decide a single gated call under the session's approval mode
@@ -32,6 +55,10 @@ pub(super) async fn safety_gate_decision(
     ctx: &ToolCtx,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> GateOutcome {
+    #[cfg(test)]
+    if let Some(outcome) = SAFETY_GATE_TEST_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return outcome;
+    }
     let (extended, providers) = crate::auto_title::load_configs_for(&ctx.cwd);
     safety_gate_decision_with_configs(tool, args, ctx, tx, extended.guard_model_ref(), &providers)
         .await

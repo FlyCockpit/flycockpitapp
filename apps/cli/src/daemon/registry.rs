@@ -1407,6 +1407,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn park_on_drain_zero_grace_delivers_shutdown_to_worker_before_force() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let id = session.id;
+        let (handle, mut work_rx) = session_worker::SessionWorkerHandle::test_handle_with_receiver(
+            session,
+            reg.inner.locks.clone(),
+        );
+        let join = tokio::spawn(async move {
+            match work_rx.recv().await {
+                Some(session_worker::SessionWork::Shutdown { pause_for_resume }) => {
+                    assert!(pause_for_resume);
+                }
+                other => panic!("expected shutdown work before zero-grace force, got {other:?}"),
+            }
+        });
+        reg.insert_test_worker(handle, join);
+
+        let clean = reg.drain_all(Duration::ZERO).await;
+
+        assert!(
+            clean,
+            "a worker that parks/exits immediately must finish cleanly under --grace 0"
+        );
+        assert_no_live_worker(&reg, id);
+    }
+
+    #[tokio::test]
     async fn drain_removes_forced_aborted_worker_handles() {
         let reg = test_registry();
         let session = test_session(&reg);
@@ -1456,6 +1484,63 @@ mod tests {
             .iter()
             .find(|event| event.kind == "turn_interrupted")
             .expect("turn_interrupted event");
+        assert_eq!(interrupted.data["reason"], "daemon_shutdown_grace_expired");
+        assert_eq!(interrupted.data["activity_state"], "tool_running");
+    }
+
+    #[tokio::test]
+    async fn mixed_session_drain_clean_blocked_worker_and_forces_long_running_tool_worker() {
+        let reg = test_registry();
+        let blocked = test_session(&reg);
+        let blocked_id = blocked.id;
+        let (blocked_handle, mut blocked_rx) =
+            session_worker::SessionWorkerHandle::test_handle_with_receiver(
+                blocked,
+                reg.inner.locks.clone(),
+            );
+        let blocked_join = tokio::spawn(async move {
+            match blocked_rx.recv().await {
+                Some(session_worker::SessionWork::Shutdown { pause_for_resume }) => {
+                    assert!(pause_for_resume);
+                }
+                other => panic!("expected blocked worker shutdown, got {other:?}"),
+            }
+        });
+        reg.insert_test_worker(blocked_handle, blocked_join);
+
+        let long_running = persisted_test_session(&reg);
+        let long_running_id = long_running.id;
+        let long_running_handle = test_handle(&reg, long_running);
+        long_running_handle.set_test_live_status(false, true, true);
+        let killed = Arc::new(AtomicBool::new(false));
+        struct KillFlag(Arc<AtomicBool>);
+        impl Drop for KillFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let kill_flag = KillFlag(killed.clone());
+        let long_running_join = tokio::spawn(async move {
+            let _kill_flag = kill_flag;
+            std::future::pending::<()>().await;
+        });
+        reg.insert_test_worker(long_running_handle, long_running_join);
+
+        let clean = reg.drain_all(Duration::from_millis(20)).await;
+
+        assert!(!clean, "long-running tool worker should exhaust grace");
+        assert_no_live_worker(&reg, blocked_id);
+        assert_no_live_worker(&reg, long_running_id);
+        tokio::task::yield_now().await;
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "forced drain must abort the long-running worker task"
+        );
+        let events = reg.inner.db.list_session_events(long_running_id).unwrap();
+        let interrupted = events
+            .iter()
+            .find(|event| event.kind == "turn_interrupted")
+            .expect("long-running worker interrupted event");
         assert_eq!(interrupted.data["reason"], "daemon_shutdown_grace_expired");
         assert_eq!(interrupted.data["activity_state"], "tool_running");
     }

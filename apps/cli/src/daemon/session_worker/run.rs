@@ -1622,17 +1622,8 @@ async fn run_worker(
                 }
             }
             SessionWork::Shutdown { pause_for_resume } => {
-                let parked_count = interrupts.park_all_registered();
-                let pending_tool_count = session
-                    .db
-                    .list_open_interrupts(session_id)
-                    .map(|rows| rows.len() as i64)
-                    .unwrap_or(parked_count as i64);
-                let active = {
-                    let (has_schedules, processing) =
-                        (live.has_active_schedules(), live.processing());
-                    has_schedules || processing || pending_tool_count > 0
-                };
+                let (active, pending_tool_count) =
+                    shutdown_activity_snapshot(&session, session_id, &interrupts, &live);
                 break WorkerStop::Shutdown {
                     pause_for_resume,
                     active,
@@ -1694,6 +1685,25 @@ async fn run_worker(
         },
     );
     tracing::info!(session_id = %session_id, "session worker exited");
+}
+
+fn shutdown_activity_snapshot(
+    session: &Session,
+    session_id: Uuid,
+    interrupts: &crate::engine::interrupt::InterruptHub,
+    live: &LiveState,
+) -> (bool, i64) {
+    let parked_count = interrupts.park_all_registered();
+    let pending_tool_count = session
+        .db
+        .list_open_interrupts(session_id)
+        .map(|rows| rows.len() as i64)
+        .unwrap_or(parked_count as i64);
+    let active = {
+        let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
+        has_schedules || processing || pending_tool_count > 0
+    };
+    (active, pending_tool_count)
 }
 
 // Decide whether a just-landed user write/edit in this session earns the

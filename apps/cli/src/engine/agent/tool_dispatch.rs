@@ -904,9 +904,12 @@ pub(crate) async fn execute_ordinary_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::{Approver, store::GrantStore};
+    use crate::config::extended::ApprovalMode;
     use crate::engine::message::OneOrMany;
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct EchoTool;
 
@@ -985,6 +988,65 @@ mod tests {
         }
     }
 
+    struct NeverCalledTool {
+        name: &'static str,
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for NeverCalledTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Fails the test if dispatch reaches the tool body."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "command": { "type": "string" },
+                    "url": { "type": "string" }
+                }
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.called.store(true, Ordering::SeqCst);
+            anyhow::bail!("NeverCalledTool was dispatched")
+        }
+    }
+
+    struct BashFixtureTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for BashFixtureTool {
+        fn name(&self) -> &str {
+            "bash"
+        }
+
+        fn description(&self) -> &str {
+            "Synthetic bash output for dispatch assembly tests."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("stdout:\nbody\nstderr:\nerr\nexit: 1").with_exit_code(1))
+        }
+    }
+
     fn test_model() -> Arc<Model> {
         let mut cfg = crate::config::providers::ProvidersConfig::default();
         cfg.providers.insert(
@@ -1059,6 +1121,24 @@ mod tests {
             lsp: None,
             resource_scheduler: None,
         }
+    }
+
+    fn tool_ctx_with_approver(
+        session: Arc<Session>,
+        root: &std::path::Path,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> ToolCtx {
+        let mut ctx = tool_ctx(session.clone(), root, tx);
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+        let store = GrantStore::new(session.db.clone(), session.id, root.to_path_buf());
+        ctx.approver = Some(Arc::new(Approver::new(
+            store,
+            session.db.clone(),
+            session.id,
+            "Build",
+            hub,
+        )));
+        ctx
     }
 
     fn test_session(root: &std::path::Path) -> Arc<Session> {
@@ -1194,6 +1274,194 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "missing");
         assert!(rows[0].hard_fail);
+        let rejected = session
+            .db
+            .list_session_events(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_rejected")
+            .expect("tool_rejected event");
+        assert_eq!(rejected.data["reason"], "not_in_advertised_set");
+    }
+
+    #[tokio::test]
+    async fn dispatch_loop_guard_reject_does_not_dispatch_and_collapses_wire_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "echo",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(16);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 1,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": "again" }));
+        let mut history = Vec::new();
+
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "loop-guard rejection must synthesize a result without dispatching"
+        );
+        assert_eq!(
+            history.len(),
+            2,
+            "second contiguous loop rejection replaces the prior collapse pair"
+        );
+        let wire = last_tool_result_text(&history);
+        assert!(wire.contains("Loop blocked"), "{wire}");
+        assert!(wire.contains("called 2 times"), "{wire}");
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "echo")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolError { error, .. }) if error.contains("Loop blocked"))
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "echo")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolError { error, .. }) if error.contains("Loop blocked"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_safety_gate_block_does_not_dispatch_and_uses_gate_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "bash",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Auto);
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "bash",
+            serde_json::json!({ "command": "curl https://example.test" }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let _gate =
+            set_safety_gate_test_override(GateOutcome::Block(gate_block_message("bash", true)));
+
+        execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "safety-gate block must not dispatch the gated tool"
+        );
+        let wire = last_tool_result_text(&history);
+        assert!(
+            wire.contains("command-safety gate could not reach"),
+            "{wire}"
+        );
+        let row = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(row.tool, "bash");
+        let event = session
+            .db
+            .list_session_events(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_call_completed")
+            .expect("tool_call_completed event");
+        assert_eq!(event.data["status"], "blocked_safety_gate");
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "bash")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolError { error, .. }) if error.contains("command-safety gate"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_wire_output_orders_failure_guard_body_nudge_then_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(BashFixtureTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        session.push_recent_bash("rg foo src".to_string(), Some(1));
+        session.push_recent_bash("rg foo src | grep -v one".to_string(), Some(1));
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "bash",
+            serde_json::json!({ "command": "rg foo src | grep -v one | grep -v two" }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        let guard = wire.find("FAILED (exit 1)").expect("failure guard");
+        let body = wire.find("stdout:\nbody").expect("bash body");
+        let nudge = wire
+            .find("This command FAILED (exit 1)")
+            .expect("failure nudge");
+        let hint = wire
+            .find("--- hint(filter_refinement_loop):")
+            .expect("bash hint");
+        assert_eq!(guard, 0, "{wire}");
+        assert!(guard < body && body < nudge && nudge < hint, "{wire}");
     }
 
     #[tokio::test]

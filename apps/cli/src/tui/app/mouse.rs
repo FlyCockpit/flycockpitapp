@@ -157,7 +157,9 @@ impl App {
                 None
             };
             match outcome {
-                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {}
+                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {
+                    // The overlay was taken above; leaving it unrestored closes it.
+                }
                 Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
                     self.resume_session(session_id);
                 }

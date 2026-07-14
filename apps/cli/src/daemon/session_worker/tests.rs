@@ -784,6 +784,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let session_id = session.id;
+        let set = proto::InterruptQuestionSet {
+            questions: vec![proto::InterruptQuestion::Single {
+                prompt: "Proceed?".to_string(),
+                options: vec![proto::InterruptOption {
+                    id: "yes".to_string(),
+                    label: "Yes".to_string(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                sandbox_escalation: None,
+            }],
+        };
+        let open = db
+            .raise_interrupt_questions(session_id, "Build", "open", &set)
+            .unwrap();
+        let parked = db
+            .raise_interrupt_questions(session_id, "Build", "parked", &set)
+            .unwrap();
+        assert!(db.park_interrupt(parked).unwrap());
+
+        let live = LiveState::default();
+        let interrupts = crate::engine::interrupt::InterruptHub::detached();
+        let (active, pending_tool_count) =
+            shutdown_activity_snapshot(&session, session_id, &interrupts, &live);
+
+        assert!(active, "blocked-only sessions must be paused on shutdown");
+        assert_eq!(
+            pending_tool_count, 2,
+            "paused row count must include both open and already-parked interrupts"
+        );
+        assert_eq!(db.list_open_interrupts(session_id).unwrap().len(), 2);
+        assert!(db.get_interrupt(open).unwrap().is_some());
+    }
+
     /// §6.5 de-dupe: the latch fires the broadcast exactly once per condition.
     /// Two failed `bash` calls (two `SandboxUnavailable` events) → one forward;
     /// `set_sandbox` re-arms it (clearing the latch) so a renewed condition

@@ -1,6 +1,7 @@
 //! `cockpit daemon` subcommands.
 
 use anyhow::{Result, bail};
+use std::time::Duration;
 
 use crate::cli::DaemonCommand;
 use crate::daemon::client::DaemonClient;
@@ -82,8 +83,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             validate_grace(grace)?;
             let old_pid = daemon::daemon_pid(&paths);
             let discovered = daemon::discover().await;
-            let should_stop =
-                old_pid.is_some() || !matches!(discovered.status, DaemonStatus::NotRunning);
+            let should_stop = restart_should_stop(discovered.status);
             let replacement_no_sandbox = if should_stop {
                 daemon::derive_restart_no_sandbox(&paths, no_sandbox)
             } else {
@@ -92,33 +92,29 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let resume = !no_resume;
 
             if should_stop {
-                if let Ok(client) = DaemonClient::connect(&paths.socket).await {
+                let stop_via_socket = if let Ok(client) = DaemonClient::connect(&paths.socket).await
+                {
                     client
                         .request_ok(Request::StopDaemon { grace_secs: grace })
                         .await?;
+                    true
                 } else {
                     let _ = daemon::stop(&paths)?;
-                }
+                    false
+                };
                 daemon::wait_for_restart_release(
                     &paths,
                     old_pid,
-                    daemon::restart_release_timeout(grace),
+                    restart_release_timeout_for_stop_path(grace, stop_via_socket),
                 )
                 .await;
             }
 
             let pid = daemon::spawn_detached_with_resume(replacement_no_sandbox, resume)?;
-            if should_stop {
-                println!(
-                    "daemon: restarted (pid {pid})\n  socket: {}",
-                    paths.socket.display()
-                );
-            } else {
-                println!(
-                    "daemon: was not running; started (pid {pid})\n  socket: {}",
-                    paths.socket.display()
-                );
-            }
+            println!(
+                "{}",
+                restart_started_message(should_stop, pid, &paths.socket)
+            );
             Ok(())
         }
         DaemonCommand::Status => {
@@ -133,6 +129,14 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 DaemonStatus::LivePidSocketUnreachable => {
                     println!(
                         "daemon: pid file belongs to a live cockpit daemon, but the recorded socket is unreachable\n  pid: {}\n  socket: {}\n{}",
+                        probe.paths.pid_file.display(),
+                        probe.paths.socket.display(),
+                        EPHEMERAL_TUI_NOTE
+                    );
+                }
+                DaemonStatus::UnverifiedPid => {
+                    println!(
+                        "daemon: pid file names a live process whose identity could not be verified\n  pid: {}\n  socket: {}\n{}",
                         probe.paths.pid_file.display(),
                         probe.paths.socket.display(),
                         EPHEMERAL_TUI_NOTE
@@ -164,9 +168,45 @@ fn validate_grace(grace: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+fn restart_should_stop(status: DaemonStatus) -> bool {
+    matches!(
+        status,
+        DaemonStatus::Running
+            | DaemonStatus::LivePidSocketUnreachable
+            | DaemonStatus::UnverifiedPid
+    )
+}
+
+fn restart_release_timeout_for_stop_path(grace: Option<u64>, stop_via_socket: bool) -> Duration {
+    if stop_via_socket {
+        daemon::restart_release_timeout(grace)
+    } else {
+        daemon::restart_release_timeout(None)
+    }
+}
+
+fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) -> String {
+    if restarted {
+        format!(
+            "daemon: restarted (pid {pid})\n  socket: {}",
+            socket.display()
+        )
+    } else {
+        format!(
+            "daemon: was not running; started (pid {pid})\n  socket: {}",
+            socket.display()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EPHEMERAL_TUI_NOTE, validate_grace};
+    use super::{
+        EPHEMERAL_TUI_NOTE, restart_release_timeout_for_stop_path, restart_should_stop,
+        restart_started_message, validate_grace,
+    };
+    use crate::daemon::{self, DaemonStatus};
+    use std::time::Duration;
 
     #[test]
     fn stale_and_not_running_note_mentions_ephemeral_tui_without_discovery() {
@@ -182,5 +222,39 @@ mod tests {
         assert!(validate_grace(Some(24 * 60 * 60)).is_ok());
         let err = validate_grace(Some(24 * 60 * 60 + 1)).unwrap_err();
         assert!(err.to_string().contains("--grace"));
+    }
+
+    #[test]
+    fn restart_message_routing_uses_verified_daemon_status_not_stale_pid_file() {
+        assert!(restart_should_stop(DaemonStatus::Running));
+        assert!(restart_should_stop(DaemonStatus::LivePidSocketUnreachable));
+        assert!(restart_should_stop(DaemonStatus::UnverifiedPid));
+        assert!(!restart_should_stop(DaemonStatus::Stale));
+        assert!(!restart_should_stop(DaemonStatus::NotRunning));
+    }
+
+    #[test]
+    fn restart_output_strings_distinguish_restarted_from_started() {
+        let socket = std::path::Path::new("/tmp/cockpit.sock");
+        assert_eq!(
+            restart_started_message(true, 123, socket),
+            "daemon: restarted (pid 123)\n  socket: /tmp/cockpit.sock"
+        );
+        assert_eq!(
+            restart_started_message(false, 456, socket),
+            "daemon: was not running; started (pid 456)\n  socket: /tmp/cockpit.sock"
+        );
+    }
+
+    #[test]
+    fn restart_fallback_release_wait_uses_default_grace_when_override_cannot_be_forwarded() {
+        assert_eq!(
+            restart_release_timeout_for_stop_path(Some(0), true),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            restart_release_timeout_for_stop_path(Some(0), false),
+            daemon::restart_release_timeout(None)
+        );
     }
 }

@@ -678,6 +678,18 @@ impl SessionsPane {
             .then_some((preview.session_id, preview.oldest_seq()))
     }
 
+    pub fn needs_preview_for_selection(&self) -> bool {
+        self.daemon_connected
+            && self.preview_enabled
+            && self.preview.is_none()
+            && self.selected_id().is_some()
+    }
+
+    #[cfg(test)]
+    pub fn preview_error(&self) -> Option<&str> {
+        self.preview.as_ref()?.error.as_deref()
+    }
+
     pub fn ensure_preview_for_selection(&mut self) -> Option<SessionsOutcome> {
         let session_id = self.selected_id()?;
         let needs_reset = self
@@ -841,15 +853,23 @@ impl SessionsPane {
                 }
             }
             // Drill into the highlighted session's forks.
-            KeyCode::Right | KeyCode::Char('l') if self.drill_in() => {
-                return Some(SessionsOutcome::LoadList);
+            KeyCode::Right | KeyCode::Char('l') => {
+                let before_depth = self.levels.len();
+                if self.drill_in() || self.levels.len() != before_depth {
+                    self.preview = None;
+                    if self.daemon_connected {
+                        return Some(SessionsOutcome::LoadList);
+                    }
+                }
             }
-            KeyCode::Right | KeyCode::Char('l') => {}
             // Go back up one fork level (no-op at the root).
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.drill_out() && self.daemon_connected {
-                    self.mark_current_level_loading();
-                    return Some(SessionsOutcome::LoadList);
+                if self.drill_out() {
+                    self.preview = None;
+                    if self.daemon_connected {
+                        self.mark_current_level_loading();
+                        return Some(SessionsOutcome::LoadList);
+                    }
                 }
             }
             // Scope toggle — only meaningful with a current project.
@@ -1229,9 +1249,6 @@ impl SessionsPane {
                 self.preview_enabled = true;
                 self.list_area = Some(list);
                 self.preview_area = Some(preview);
-                if self.preview.is_none() && !self.daemon_connected {
-                    let _ = self.ensure_preview_for_selection();
-                }
 
                 let list_block = Block::default()
                     .borders(Borders::ALL)
@@ -1878,6 +1895,7 @@ fn wrap_message(role: &str, text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -2296,6 +2314,53 @@ mod tests {
         let mut pane = test_pane(vec![(summary(Uuid::new_v4(), 1), Tier::Idle)]);
         pane.drill_in();
         assert_eq!(pane.levels.len(), 1);
+    }
+
+    #[test]
+    fn sessions_pane_preview_resets_on_fork_drill_in_and_out() {
+        let parent_id = Uuid::new_v4();
+        let mut parent = summary(parent_id, 1);
+        parent.fork_count = 1;
+        let mut pane = test_pane(vec![(parent.clone(), Tier::Idle)]);
+        pane.preview = Some(PreviewState::new(parent_id));
+
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Right)),
+            Some(SessionsOutcome::LoadList)
+        ));
+        assert!(pane.preview.is_none());
+
+        pane.apply_sessions_result(Ok(vec![summary(Uuid::new_v4(), 2)]));
+        pane.preview = Some(PreviewState::new(Uuid::new_v4()));
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Left)),
+            Some(SessionsOutcome::LoadList)
+        ));
+        assert!(pane.preview.is_none());
+    }
+
+    #[test]
+    fn sessions_pane_resize_to_split_starts_daemon_preview_load() {
+        let session_id = Uuid::new_v4();
+        let mut pane = test_pane(vec![(summary(session_id, 100), Tier::Idle)]);
+        pane.preview = None;
+        pane.preview_enabled = false;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 120, 24)))
+            .unwrap();
+
+        assert!(pane.is_preview_enabled());
+        assert!(pane.needs_preview_for_selection());
+        assert!(matches!(
+            pane.ensure_preview_for_selection(),
+            Some(SessionsOutcome::LoadPreview {
+                session_id: got,
+                before_seq: None,
+            }) if got == session_id
+        ));
     }
 
     #[test]

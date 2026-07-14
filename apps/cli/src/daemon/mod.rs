@@ -460,6 +460,10 @@ pub enum DaemonStatus {
     /// PID file exists and belongs to a verified cockpit daemon, but no
     /// socket path we know about answers the daemon handshake.
     LivePidSocketUnreachable,
+    /// PID file exists and names a live process whose identity could not be
+    /// verified. Mutating commands must fail closed rather than assuming it is
+    /// safe to ignore or signal.
+    UnverifiedPid,
     /// PID file exists but the process is dead, not a daemon, or the socket is gone.
     Stale,
     /// No PID file.
@@ -515,13 +519,18 @@ fn status_for_unreachable_pid_with_cleanup(
     let Some(pid) = read_pid(paths) else {
         return DaemonStatus::Stale;
     };
-    match verify_daemon_pid_identity(pid) {
+    status_for_pid_identity(verify_daemon_pid_identity(pid), cleanup)
+}
+
+#[cfg(unix)]
+fn status_for_pid_identity(identity: PidIdentity, cleanup: impl FnOnce()) -> DaemonStatus {
+    match identity {
         PidIdentity::VerifiedDaemon => DaemonStatus::LivePidSocketUnreachable,
         PidIdentity::Missing | PidIdentity::NotDaemon => {
             cleanup();
             DaemonStatus::Stale
         }
-        PidIdentity::Unverified => DaemonStatus::Stale,
+        PidIdentity::Unverified => DaemonStatus::UnverifiedPid,
     }
 }
 
@@ -929,7 +938,9 @@ async fn run_foreground_inner_with_boot_db(
         let discovered = discover().await;
         if matches!(
             discovered.status,
-            DaemonStatus::Running | DaemonStatus::LivePidSocketUnreachable
+            DaemonStatus::Running
+                | DaemonStatus::LivePidSocketUnreachable
+                | DaemonStatus::UnverifiedPid
         ) && discovered.paths.socket != paths.socket
         {
             anyhow::bail!(
@@ -1060,14 +1071,12 @@ async fn run_foreground_inner_with_boot_db(
         tracing::warn!("daemon: forced shutdown — in-flight work aborted at grace deadline");
     }
 
-    // Cleanup on every path: remove our own socket + pid files whether we
-    // drained cleanly or hit the force deadline. For an ephemeral daemon
-    // these are the unique `cockpit-eph-<pid>-<nonce>` files; for the canonical
-    // daemon they're the shared persistent files — either way, the process
-    // that bound them is the one cleaning them up.
-    let _ = std::fs::remove_file(&paths.socket);
-    let _ = std::fs::remove_file(&paths.pid_file);
-    remove_endpoint_record_if_owned(&paths);
+    // Cleanup on every path, but only while the pid file still names this
+    // process. A restart replacement may have taken ownership of the shared
+    // canonical paths before the old daemon finishes draining.
+    if remove_metadata_if_pid_matches(&paths, std::process::id()) {
+        remove_endpoint_record_if_owned(&paths);
+    }
 
     signal_task.abort();
     if let Some(watchdog) = watchdog_task {
@@ -2169,6 +2178,16 @@ mod tests {
 
         assert!(err.to_string().contains("could not be verified"));
         assert!(paths.pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreachable_unverified_pid_is_not_reported_stale() {
+        let status = status_for_pid_identity(PidIdentity::Unverified, || {
+            panic!("unverified live pid must not be cleaned up as stale")
+        });
+
+        assert_eq!(status, DaemonStatus::UnverifiedPid);
     }
 
     #[test]

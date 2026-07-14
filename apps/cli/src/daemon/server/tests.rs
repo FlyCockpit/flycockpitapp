@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_session_messages_requires_read_access_and_returns_page() {
+    async fn read_session_messages_requires_read_access_returns_page_and_does_not_spawn_worker() {
         let ctx = test_ctx();
         let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
         let seq = ctx
@@ -132,6 +132,12 @@ mod tests {
         assert_eq!(messages[0].seq, seq);
         assert_eq!(messages[0].role, proto::MessageRole::User);
         assert_eq!(messages[0].text, "hello");
+        assert!(
+            !ctx.registry
+                .active_session_ids()
+                .contains(&session.session_id),
+            "read-messages is a DB/RPC read and must not create a session worker"
+        );
     }
 
     #[test]
@@ -2636,6 +2642,29 @@ mod tests {
         // A third request is a no-op — already forced, no further events.
         request_shutdown(&ctx);
         assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_grace_override_reaches_shutdown_context() {
+        let ctx = test_ctx();
+        let mut state = ClientState::detached_for_test();
+
+        let response = handle_request(
+            Request::StopDaemon {
+                grace_secs: Some(7),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("stop daemon ack");
+
+        assert!(matches!(response, Response::Ack));
+        assert_eq!(
+            ctx.take_shutdown_grace_override(),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
     }
 
     /// `/note` (`RecordSessionNote`) records a durable `user_note` session

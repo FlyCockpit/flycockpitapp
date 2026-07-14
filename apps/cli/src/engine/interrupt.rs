@@ -334,7 +334,6 @@ impl InterruptHub {
         tx.send(InterruptOutcome::Resolved(response)).is_ok()
     }
 
-    #[allow(dead_code)]
     pub fn park(&self, interrupt_id: Uuid) -> bool {
         let parked = self
             .db
@@ -349,23 +348,14 @@ impl InterruptHub {
     }
 
     pub fn park_all_registered(&self) -> usize {
-        let waiters = {
-            let mut guard = lock_or_recover(&self.waiters);
-            std::mem::take(&mut *guard)
+        let interrupt_ids = {
+            let guard = lock_or_recover(&self.waiters);
+            guard.keys().copied().collect::<Vec<_>>()
         };
-        let mut parked = 0usize;
-        for (interrupt_id, tx) in waiters {
-            let db_parked = self
-                .db
-                .as_ref()
-                .and_then(|db| db.park_interrupt(interrupt_id).ok())
-                .unwrap_or(false);
-            let woke = tx.send(InterruptOutcome::Parked).is_ok();
-            if db_parked || woke {
-                parked += 1;
-            }
-        }
-        parked
+        interrupt_ids
+            .into_iter()
+            .filter(|interrupt_id| self.park(*interrupt_id))
+            .count()
     }
 }
 
@@ -762,6 +752,28 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(10), events.recv())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn park_all_registered_delegates_to_park_marks_row_and_wakes_waiter() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .unwrap();
+        let pending = hub.register(interrupt_id);
+
+        assert_eq!(hub.park_all_registered(), 1);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        let open = db.list_open_interrupts(session.session_id).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].interrupt_id, interrupt_id);
+        assert_eq!(
+            open[0].state,
+            crate::db::needs_attention::InterruptState::Parked
         );
     }
 

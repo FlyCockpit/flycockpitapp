@@ -1097,7 +1097,21 @@ impl App {
                 }
                 Overlay::Sessions(mut pane) => {
                     pane.render(frame, rects.body);
+                    let preview_request = if pane.needs_preview_for_selection() {
+                        match pane.ensure_preview_for_selection() {
+                            Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
+                                session_id,
+                                before_seq,
+                            }) => Some((session_id, before_seq)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     self.overlay = Overlay::Sessions(pane);
+                    if let Some((session_id, before_seq)) = preview_request {
+                        self.start_sessions_preview_action(session_id, before_seq);
+                    }
                 }
                 Overlay::Skills(mut pane) => {
                     pane.render(frame, rects.body);

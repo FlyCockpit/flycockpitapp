@@ -11803,9 +11803,12 @@ mod reasoning_toggle_key_tests {
 #[cfg(test)]
 mod keys_overlay_tests {
     use super::{App, HistoryEntry, Overlay, SLASH_COMMANDS, SideConversation, input};
-    use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    use crate::daemon::proto::{
+        InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary,
+    };
     use crate::tui::keys_overlay::KeyContext;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
@@ -11841,6 +11844,31 @@ mod keys_overlay_tests {
         )
         .unwrap();
         App::new(Some(tmp.path()), false)
+    }
+
+    fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            short_id: Some("abcdef".to_string()),
+            project_root,
+            project_id: "pid".to_string(),
+            started_at: 1,
+            last_active_at: 2,
+            turns: 1,
+            active_agent: "Build".to_string(),
+            title: Some("summary".to_string()),
+            parent_session_id: None,
+            created_by_principal: None,
+            shared_with_collaborators: false,
+            fork_count: 0,
+            descendant_count: 0,
+            last_viewed_at: None,
+            latest_activity_at: None,
+            open_interrupts: 0,
+            activity_state: None,
+            archived_at: None,
+            pin_count: 0,
+        }
     }
 
     fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
@@ -11917,6 +11945,36 @@ mod keys_overlay_tests {
         app.question_dialog = None;
         assert_eq!(app.key_context(), KeyContext::Sessions);
         assert!(matches!(app.overlay, Overlay::Sessions(_)));
+    }
+
+    #[tokio::test]
+    async fn sessions_resize_to_split_render_starts_preview_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.daemon_prompt = None;
+        let session_id = Uuid::new_v4();
+        let mut pane = crate::tui::sessions_pane::SessionsPane::open(&app.launch.cwd, true);
+        pane.apply_sessions_result(Ok(vec![session_summary(
+            session_id,
+            app.launch.cwd.display().to_string(),
+        )]));
+        app.overlay = Overlay::Sessions(pane);
+        assert_eq!(app.async_actions.pending_count(), 0);
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        for _ in 0..50 {
+            app.drain_async_actions();
+            if let Overlay::Sessions(pane) = &app.overlay
+                && pane.preview_error().is_some()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("split-layout render did not start and apply the daemon preview RPC failure");
     }
 
     /// The leader (`Ctrl+K`) in the main chat opens the overlay in the

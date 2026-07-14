@@ -237,7 +237,7 @@ CREATE TABLE needs_attention (
     response_json  TEXT,                            -- serialized proto::ResolveResponse, NULL if unresolved
     questions_json TEXT,                            -- serialized proto::InterruptQuestionSet or NULL
     parked_tool    TEXT,                            -- wire tool name for parked replay, or NULL
-    parked_args_json TEXT,                          -- verbatim wire args for parked replay, or NULL
+    parked_args_json TEXT,                          -- verbatim replay wire args; same exposure boundary as session_events.wire_input_json
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE

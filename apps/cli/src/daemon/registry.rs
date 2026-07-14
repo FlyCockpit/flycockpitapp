@@ -688,6 +688,10 @@ impl SessionRegistry {
                 })
                 .await;
         }
+        if grace.is_zero() {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // Await all worker tasks concurrently, racing the shared grace
         // deadline. We wait for ALL to finish (or the deadline), never just
@@ -710,7 +714,7 @@ impl SessionRegistry {
                 tracing::warn!("daemon drain grace exhausted; forcing worker abort");
                 for h in &handles {
                     let (has_schedules, processing, tool_running) = h.live_status();
-                    if has_schedules || processing {
+                    if processing {
                         self.record_forced_drain_interruption(
                             h,
                             grace,
@@ -1454,6 +1458,35 @@ mod tests {
             .expect("turn_interrupted event");
         assert_eq!(interrupted.data["reason"], "daemon_shutdown_grace_expired");
         assert_eq!(interrupted.data["activity_state"], "tool_running");
+    }
+
+    #[tokio::test]
+    async fn forced_drain_does_not_record_interrupted_marker_for_schedule_only_worker() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let id = session.id;
+        let handle = test_handle(&reg, session);
+        handle.set_test_live_status(true, false, false);
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        reg.insert_test_worker(handle, join);
+
+        let clean = reg.drain_all(Duration::from_millis(20)).await;
+
+        assert!(!clean);
+        let summaries = reg
+            .inner
+            .db
+            .list_session_summaries(None, None, 100)
+            .unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.session_id == id)
+            .unwrap();
+        assert_eq!(summary.activity_state, None);
+        let events = reg.inner.db.list_session_events(id).unwrap();
+        assert!(events.iter().all(|event| event.kind != "turn_interrupted"));
     }
 
     #[tokio::test]

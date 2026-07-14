@@ -1,5 +1,12 @@
 const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 
+struct ParkedReplayCompletion {
+    interrupt_id: uuid::Uuid,
+    decision: Option<proto::InterruptDecision>,
+    was_active: bool,
+    result: std::result::Result<(), String>,
+}
+
 fn redaction_failed_interrupt_decision_payload(
     interrupt_id: uuid::Uuid,
     decision: &crate::daemon::proto::InterruptDecision,
@@ -22,6 +29,121 @@ fn redaction_failed_interrupt_decision_payload(
             "lines": lines,
         },
     })
+}
+
+fn record_interrupt_decision_event(
+    session: &Session,
+    redaction: &SharedRedactionTable,
+    interrupt_id: uuid::Uuid,
+    decision: &proto::InterruptDecision,
+) -> Option<i64> {
+    let data = serde_json::json!({
+        "interrupt_id": interrupt_id,
+        "decision": decision,
+    });
+    let scrubbed = crate::daemon::current_redaction(redaction).scrub(&data.to_string());
+    let redacted_data = serde_json::from_str(&scrubbed).unwrap_or_else(|error| {
+        tracing::warn!(
+            %error,
+            %interrupt_id,
+            "interrupt decision redaction produced invalid JSON; persisting fail-closed placeholder"
+        );
+        redaction_failed_interrupt_decision_payload(interrupt_id, decision)
+    });
+    session
+        .record_event(
+            crate::db::session_log::SessionEventKind::InterruptDecision,
+            None,
+            None,
+            &redacted_data,
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, %interrupt_id, "recording interrupt decision failed");
+            error
+        })
+        .ok()
+}
+
+fn finish_parked_replay_completion(
+    session: &Session,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    interrupts: &Arc<crate::engine::interrupt::InterruptHub>,
+    session_id: uuid::Uuid,
+    completion: ParkedReplayCompletion,
+) {
+    if let Err(error) = completion.result {
+        let _ = session
+            .db
+            .mark_interrupt_interrupted(completion.interrupt_id);
+        tracing::warn!(
+            %error,
+            interrupt_id = %completion.interrupt_id,
+            "parked interrupt replay failed"
+        );
+        send_current_event(
+            event_tx,
+            redaction,
+            proto::Event::Notice {
+                session_id,
+                text: format!(
+                    "Interrupted parked request {}: {error}",
+                    completion.interrupt_id
+                ),
+            },
+        );
+        interrupts.emit_queue_state();
+        return;
+    }
+    if let Err(error) = session
+        .db
+        .complete_executing_interrupt(completion.interrupt_id)
+    {
+        tracing::warn!(
+            %error,
+            interrupt_id = %completion.interrupt_id,
+            "completing parked interrupt failed"
+        );
+    }
+    let seq = completion.decision.as_ref().and_then(|decision| {
+        record_interrupt_decision_event(session, redaction, completion.interrupt_id, decision)
+    });
+    send_current_event(
+        event_tx,
+        redaction,
+        proto::Event::InterruptResolved {
+            session_id,
+            interrupt_id: completion.interrupt_id,
+            decision: completion.decision,
+            seq,
+        },
+    );
+    if completion.was_active {
+        interrupts.emit_active_from_db();
+    } else {
+        interrupts.emit_queue_state();
+    }
+}
+
+fn validate_parked_interrupt_payload(
+    row: &crate::db::needs_attention::NeedsAttentionRow,
+) -> std::result::Result<(), &'static str> {
+    let Some(payload) = row.parked.as_ref() else {
+        return Err("missing replay payload");
+    };
+    if payload.tool.trim().is_empty() {
+        return Err("missing parked tool name");
+    }
+    if payload.call_id.trim().is_empty() {
+        return Err("missing parked tool call id");
+    }
+    if payload.resume.agent_id != row.agent_id {
+        return Err("parked replay agent does not match interrupt row");
+    }
+    if payload.resume.call_id != payload.call_id {
+        return Err("parked replay call id does not match resume anchor");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -515,11 +637,13 @@ async fn run_worker(
         );
     }
 
-    match session.db.list_open_interrupts(session_id) {
+    match session.db.list_reconcilable_interrupts(session_id) {
         Ok(rows) => {
             for row in rows {
-                match (row.state, row.parked.is_some()) {
-                    (crate::db::needs_attention::InterruptState::Open, true) => {
+                match row.state {
+                    crate::db::needs_attention::InterruptState::Open
+                        if validate_parked_interrupt_payload(&row).is_ok() =>
+                    {
                         if let Err(error) = session.db.park_interrupt(row.interrupt_id) {
                             tracing::warn!(
                                 %error,
@@ -528,8 +652,11 @@ async fn run_worker(
                             );
                         }
                     }
-                    (crate::db::needs_attention::InterruptState::Open, false)
-                    | (crate::db::needs_attention::InterruptState::Parked, false) => {
+                    crate::db::needs_attention::InterruptState::Parked
+                        if validate_parked_interrupt_payload(&row).is_ok() => {}
+                    crate::db::needs_attention::InterruptState::Open
+                    | crate::db::needs_attention::InterruptState::Parked
+                    | crate::db::needs_attention::InterruptState::Executing => {
                         if let Err(error) = session.db.mark_interrupt_interrupted(row.interrupt_id)
                         {
                             tracing::warn!(
@@ -543,10 +670,16 @@ async fn run_worker(
                             &redaction,
                             proto::Event::Notice {
                                 session_id,
-                                text: format!(
-                                    "Interrupted request {}: missing replay payload.",
-                                    row.interrupt_id
-                                ),
+                                text: match validate_parked_interrupt_payload(&row) {
+                                    Ok(()) => format!(
+                                        "Interrupted request {}: replay was in progress during worker restart.",
+                                        row.interrupt_id
+                                    ),
+                                    Err(reason) => format!(
+                                        "Interrupted request {}: {reason}.",
+                                        row.interrupt_id
+                                    ),
+                                },
                             },
                         );
                     }
@@ -616,12 +749,29 @@ async fn run_worker(
     });
 
     // Main work loop.
+    enum WorkerInput {
+        Work(SessionWork),
+        ParkedReplay(ParkedReplayCompletion),
+    }
+    let (replay_completion_tx, mut replay_completion_rx) =
+        mpsc::channel::<ParkedReplayCompletion>(WORK_QUEUE_CAPACITY);
     let mut driver_failed = false;
     let mut driver_joined = false;
     let stop = loop {
-        let work = tokio::select! {
+        let input = tokio::select! {
             biased;
-            work = work_rx.recv() => work,
+            replay = replay_completion_rx.recv() => {
+                match replay {
+                    Some(replay) => WorkerInput::ParkedReplay(replay),
+                    None => continue,
+                }
+            }
+            work = work_rx.recv() => {
+                match work {
+                    Some(work) => WorkerInput::Work(work),
+                    None => break WorkerStop::WorkerStopped,
+                }
+            }
             outcome = &mut driver_handle => {
                 driver_joined = true;
                 let outcome = driver_join_outcome(outcome);
@@ -638,10 +788,18 @@ async fn run_worker(
                 break WorkerStop::DriverExited;
             }
         };
-        let Some(work) = work else {
-            break WorkerStop::WorkerStopped;
-        };
-        match work {
+        match input {
+            WorkerInput::ParkedReplay(completion) => {
+                finish_parked_replay_completion(
+                    &session,
+                    &event_tx,
+                    &redaction,
+                    &interrupts,
+                    session_id,
+                    completion,
+                );
+            }
+            WorkerInput::Work(work) => match work {
             SessionWork::UserMessage {
                 submission,
                 respond_to,
@@ -939,118 +1097,45 @@ async fn run_worker(
                         interrupts.emit_queue_state();
                         continue;
                     };
-                    let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-                    let replay_result = if driver_control_tx
-                        .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                            interrupt_id,
-                            payload,
-                            response: response.clone(),
-                            respond_to,
-                        })
-                        .await
-                        .is_ok()
-                    {
-                        replay_result_rx
-                            .await
-                            .unwrap_or_else(|error| Err(format!("driver replay response dropped: {error}")))
-                    } else {
-                        Err("driver is not available for parked interrupt replay".to_string())
-                    };
-                    if let Err(error) = replay_result {
-                        let _ = session.db.mark_interrupt_interrupted(interrupt_id);
-                        tracing::warn!(%error, %interrupt_id, "parked interrupt replay failed");
-                        send_current_event(
-                            &event_tx,
-                            &redaction,
-                            proto::Event::Notice {
-                                session_id,
-                                text: format!(
-                                    "Interrupted parked request {interrupt_id}: {error}"
-                                ),
-                            },
-                        );
-                        interrupts.emit_queue_state();
-                        continue;
-                    }
-                    if let Err(error) = session.db.complete_executing_interrupt(interrupt_id) {
-                        tracing::warn!(%error, %interrupt_id, "completing parked interrupt failed");
-                    }
-                    let seq = decision.as_ref().and_then(|decision| {
-                        let data = serde_json::json!({
-                            "interrupt_id": interrupt_id,
-                            "decision": decision,
-                        });
-                        let scrubbed =
-                            crate::daemon::current_redaction(&redaction).scrub(&data.to_string());
-                        let redacted_data =
-                            serde_json::from_str(&scrubbed).unwrap_or_else(|error| {
-                                tracing::warn!(
-                                    %error,
-                                    %interrupt_id,
-                                    "interrupt decision redaction produced invalid JSON; persisting fail-closed placeholder"
-                                );
-                                redaction_failed_interrupt_decision_payload(interrupt_id, decision)
-                            });
-                        session
-                            .record_event(
-                                crate::db::session_log::SessionEventKind::InterruptDecision,
-                                None,
-                                None,
-                                &redacted_data,
-                            )
-                            .map_err(|error| {
-                                tracing::warn!(%error, %interrupt_id, "recording interrupt decision failed");
-                                error
+                    let driver_control_tx = driver_control_tx.clone();
+                    let replay_completion_tx = replay_completion_tx.clone();
+                    let replay_response = response.clone();
+                    tokio::spawn(async move {
+                        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+                        let result = if driver_control_tx
+                            .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                                interrupt_id,
+                                payload,
+                                response: replay_response,
+                                respond_to,
                             })
-                            .ok()
+                            .await
+                            .is_ok()
+                        {
+                            replay_result_rx.await.unwrap_or_else(|error| {
+                                Err(format!("driver replay response dropped: {error}"))
+                            })
+                        } else {
+                            Err("driver is not available for parked interrupt replay".to_string())
+                        };
+                        let _ = replay_completion_tx
+                            .send(ParkedReplayCompletion {
+                                interrupt_id,
+                                decision,
+                                was_active,
+                                result,
+                            })
+                            .await;
                     });
-                    send_current_event(
-                        &event_tx,
-                        &redaction,
-                        proto::Event::InterruptResolved {
-                            session_id,
-                            interrupt_id,
-                            decision,
-                            seq,
-                        },
-                    );
-                    if was_active {
-                        interrupts.emit_active_from_db();
-                    } else {
-                        interrupts.emit_queue_state();
-                    }
                     continue;
                 }
                 if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response) {
                     tracing::warn!(error = %e, %interrupt_id, "resolve_interrupt failed");
+                    interrupts.emit_queue_state();
+                    continue;
                 }
                 let seq = decision.as_ref().and_then(|decision| {
-                    let data = serde_json::json!({
-                        "interrupt_id": interrupt_id,
-                        "decision": decision,
-                    });
-                    let scrubbed =
-                        crate::daemon::current_redaction(&redaction).scrub(&data.to_string());
-                    let redacted_data = serde_json::from_str(&scrubbed).unwrap_or_else(|error| {
-                        tracing::warn!(
-                            %error,
-                            %interrupt_id,
-                            "interrupt decision redaction produced invalid JSON; persisting fail-closed placeholder"
-                        );
-                        redaction_failed_interrupt_decision_payload(interrupt_id, decision)
-                    });
-                    session
-                        .record_event(
-                            crate::db::session_log::SessionEventKind::InterruptDecision,
-                            None,
-                            None,
-                            &redacted_data,
-                        )
-                        .map_err(|error| {
-                            tracing::warn!(%error, %interrupt_id, "recording interrupt decision failed");
-                            error
-                        })
-                        .ok()
+                    record_interrupt_decision_event(&session, &redaction, interrupt_id, decision)
                 });
                 send_current_event(
                     &event_tx,
@@ -1554,6 +1639,7 @@ async fn run_worker(
                     pending_tool_count,
                 };
             }
+            },
         }
     };
 

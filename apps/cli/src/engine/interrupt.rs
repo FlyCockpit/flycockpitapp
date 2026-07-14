@@ -34,6 +34,7 @@
 //! handler hold an `Arc` to the same instance. The `Mutex` is held only
 //! for map insert/remove — never across an `.await`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,7 +53,7 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
-    static CURRENT_PRE_RESOLVED_INTERRUPT: (Uuid, ResolveResponse);
+    static CURRENT_PRE_RESOLVED_INTERRUPT: RefCell<Option<(Uuid, ResolveResponse)>>;
 }
 
 pub async fn with_interrupt_park_payload<F>(payload: InterruptParkPayload, fut: F) -> F::Output
@@ -75,12 +76,15 @@ where
     F: std::future::Future,
 {
     CURRENT_PRE_RESOLVED_INTERRUPT
-        .scope((interrupt_id, response), fut)
+        .scope(RefCell::new(Some((interrupt_id, response))), fut)
         .await
 }
 
-fn current_pre_resolved_interrupt() -> Option<(Uuid, ResolveResponse)> {
-    CURRENT_PRE_RESOLVED_INTERRUPT.try_with(Clone::clone).ok()
+fn take_pre_resolved_interrupt() -> Option<(Uuid, ResolveResponse)> {
+    CURRENT_PRE_RESOLVED_INTERRUPT
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
 #[derive(Debug, Clone)]
@@ -437,7 +441,7 @@ pub async fn raise_and_wait(
     set: InterruptQuestionSet,
     log_label: &str,
 ) -> InterruptOutcome {
-    if let Some((_interrupt_id, response)) = current_pre_resolved_interrupt() {
+    if let Some((_interrupt_id, response)) = take_pre_resolved_interrupt() {
         return InterruptOutcome::Resolved(response);
     }
     let payload = current_interrupt_park_payload();
@@ -580,6 +584,86 @@ mod tests {
         assert_eq!(
             db.get_interrupt(id).unwrap().unwrap().state,
             crate::db::needs_attention::InterruptState::Parked
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolved_replay_answer_is_consumed_once() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let hub = Arc::new(hub);
+        let resolver_db = db.clone();
+        let resolver_hub = hub.clone();
+        let session_id = session.session_id;
+        tokio::spawn(async move {
+            loop {
+                if let Some(row) = resolver_db
+                    .list_open_interrupts(session_id)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    resolver_db
+                        .resolve_interrupt(
+                            row.interrupt_id,
+                            &ResolveResponse::Single {
+                                selected_id: "second".into(),
+                            },
+                        )
+                        .unwrap();
+                    assert!(resolver_hub.resolve(
+                        row.interrupt_id,
+                        ResolveResponse::Single {
+                            selected_id: "second".into(),
+                        }
+                    ));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let (first, second) = with_pre_resolved_interrupt(
+            Uuid::new_v4(),
+            ResolveResponse::Single {
+                selected_id: "first".into(),
+            },
+            async {
+                let first = raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "first",
+                    question_set(),
+                    "test",
+                )
+                .await;
+                let second = raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "second",
+                    question_set(),
+                    "test",
+                )
+                .await;
+                (first, second)
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(first, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "first")
+        );
+        assert!(
+            matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second")
+        );
+        assert_eq!(
+            db.list_open_interrupts(session.session_id).unwrap().len(),
+            0
         );
     }
 

@@ -1899,6 +1899,189 @@ impl Driver {
         .await
     }
 
+    async fn continue_after_parked_interrupt_replay(
+        &mut self,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        let mut next_prompt = {
+            let frame = self.stack.last_mut().context("driver stack is empty")?;
+            frame
+                .history
+                .pop()
+                .context("parked interrupt replay produced no tool result")?
+        };
+        let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
+        self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.refresh_redaction_table_for_turn(tx).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = {
+            *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
+            CancelSlotGuard {
+                slot: self.cancel_current.clone(),
+            }
+        };
+        let max_primary_rounds = self.max_primary_rounds;
+        let mut primary_rounds_in_chunk: u32 = 0;
+
+        loop {
+            self.maybe_auto_prune(tx).await;
+            let agent = {
+                let top = self.stack.last().expect("stack never empty");
+                top.agent.clone()
+            };
+            let is_root = self.stack.len() == 1;
+            let backup_model = self.resolve_backup_model(&agent.model);
+            let call_id = uuid::Uuid::new_v4();
+            let tandem = self
+                .tandem_set
+                .is_enabled()
+                .then(|| self.tandem_set.clone());
+            let turn_result = {
+                let top = self.stack.last_mut().expect("stack never empty");
+                let deferred_log = top.deferred_log.clone();
+                turn_with_backup(
+                    &agent,
+                    backup_model.as_ref(),
+                    &mut top.history,
+                    next_prompt.clone(),
+                    self.session.clone(),
+                    self.locks.clone(),
+                    self.redact.clone(),
+                    self.cwd.clone(),
+                    self.interrupts.clone(),
+                    cancel.clone(),
+                    self.approver.clone(),
+                    self.lsp.clone(),
+                    self.resource_scheduler.clone(),
+                    self.loop_guard_threshold,
+                    is_root,
+                    deferred_log,
+                    crate::engine::seed_collector::SeedCollector::new(),
+                    call_id,
+                    tandem.as_ref(),
+                    Some(lifecycle_turn_id.clone()),
+                    tx,
+                )
+                .await
+            };
+            let outcome = match turn_result {
+                Ok(outcome) => outcome,
+                Err(e) if crate::engine::model::is_cancelled(&e) => {
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
+                    self.unwind_stack_to_root_and_discard_pending_input(
+                        StackUnwindReason::Cancelled,
+                        input_rx,
+                        tx,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(e) if crate::engine::model::is_gated(&e) => {
+                    self.unwind_stack_to_root_and_discard_pending_input(
+                        StackUnwindReason::Gated,
+                        input_rx,
+                        tx,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(e) if crate::engine::model::as_inference_failure(&e).is_some() => {
+                    let f = crate::engine::model::as_inference_failure(&e)
+                        .expect("match guard established inference failure");
+                    self.record_failed_turn_recovery(&agent, &next_prompt, call_id, f, tx)
+                        .await;
+                    if !self.handle_goal_usage_limit_failure(f, tx).await {
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: f.class.clone(),
+                        });
+                    }
+                    self.unwind_stack_to_root_and_discard_pending_input(
+                        StackUnwindReason::InferenceFailed {
+                            provider: f.provider.clone(),
+                            model: f.model.clone(),
+                            class: f.class.clone(),
+                            phase: f.phase.clone(),
+                        },
+                        input_rx,
+                        tx,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+
+            if is_root {
+                self.persist_prune_ledger();
+                if let Err(e) = self.session.db.refresh_session_goal_usage(self.session.id) {
+                    tracing::warn!(error = %e, "refreshing goal usage failed");
+                }
+            }
+
+            match outcome {
+                TurnOutcome::Continue => {
+                    if is_root && max_primary_rounds > 0 {
+                        primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
+                        if !self
+                            .primary_round_ceiling_allows_more(
+                                primary_rounds_in_chunk,
+                                max_primary_rounds,
+                                tx,
+                            )
+                            .await
+                        {
+                            self.acknowledge_interrupted_turns_after_progress();
+                            return Ok(());
+                        }
+                        if primary_rounds_in_chunk >= max_primary_rounds {
+                            primary_rounds_in_chunk = 0;
+                        }
+                    }
+                    next_prompt = self
+                        .stack
+                        .last_mut()
+                        .expect("stack never empty")
+                        .history
+                        .pop()
+                        .context("Continue with empty history after parked replay")?;
+                }
+                TurnOutcome::Done => {
+                    if self.stack.len() > 1
+                        && let Some(np) = self.pop_child_with_envelope(None, tx).await
+                    {
+                        next_prompt = np;
+                        continue;
+                    }
+                    self.acknowledge_interrupted_turns_after_progress();
+                    return Ok(());
+                }
+                TurnOutcome::Return { fields } => {
+                    if let Some(np) = self.pop_child_with_envelope(Some(&fields), tx).await {
+                        next_prompt = np;
+                        continue;
+                    }
+                    self.acknowledge_interrupted_turns_after_progress();
+                    return Ok(());
+                }
+                _ => bail!("parked interrupt replay continuation produced unsupported outcome"),
+            }
+        }
+    }
+
+    fn acknowledge_interrupted_turns_after_progress(&self) {
+        match self
+            .session
+            .db
+            .acknowledge_interrupted_turns(self.session.id)
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::debug!(count, "acknowledged interrupted session markers"),
+            Err(error) => tracing::warn!(%error, "acknowledging interrupted markers failed"),
+        }
+    }
+
     /// Long-running main loop: pulls user input from `input_rx` and
     /// drives it through the agent stack, draining queued user messages
     /// (GOALS §1c) at inference boundaries. A drained batch preserves one
@@ -1993,7 +2176,10 @@ impl Driver {
                         Some(DriverControl::AbortForTest) => {
                             anyhow::bail!("driver abort requested for test");
                         }
-                        Some(control) => self.run_control(control, tx).await,
+                        Some(control) => {
+                            self.run_control_with_input_queue(control, &input_queue, tx)
+                                .await
+                        }
                         None => break,
                     }
                 }
@@ -2152,7 +2338,21 @@ impl Driver {
     /// Run an out-of-band control request against the **foreground**
     /// agent (top of stack) — never a hardcoded root. Scope == current
     /// conversational agent (GOALS §3b).
+    #[cfg(test)]
     async fn run_control(&mut self, control: DriverControl, tx: &mpsc::Sender<TurnEvent>) {
+        let (queue_update_tx, _queue_update_rx) =
+            mpsc::unbounded_channel::<Vec<crate::engine::message::QueuedUserMessage>>();
+        let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_update_tx);
+        self.run_control_with_input_queue(control, &input_queue, tx)
+            .await;
+    }
+
+    async fn run_control_with_input_queue(
+        &mut self,
+        control: DriverControl,
+        input_queue: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
         if !self.at_safe_boundary() {
             // Not safe — drop rather than corrupt the transcript split.
             // The TUI re-issues on the next idle (control requests are
@@ -2193,10 +2393,14 @@ impl Driver {
                 response,
                 respond_to,
             } => {
-                let result = self
-                    .replay_parked_interrupt_call(interrupt_id, payload, response, tx)
-                    .await
-                    .map_err(|error| format!("{error:#}"));
+                let result = async {
+                    self.replay_parked_interrupt_call(interrupt_id, payload, response, tx)
+                        .await?;
+                    self.continue_after_parked_interrupt_replay(input_queue, tx)
+                        .await
+                }
+                .await
+                .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
             }
             DriverControl::SwapPrimary { name } => {
@@ -4084,6 +4288,9 @@ impl Driver {
             )
             .await;
         input_rx.finish(&queue_item_ids).await;
+        if result.is_ok() {
+            self.acknowledge_interrupted_turns_after_progress();
+        }
         result
     }
 

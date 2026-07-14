@@ -1453,7 +1453,8 @@ impl Db {
                    FROM needs_attention
                   WHERE session_id = ?1
                     AND state IN ('open', 'parked', 'interrupted')
-                  ORDER BY CASE state WHEN 'interrupted' THEN 0 ELSE 1 END, raised_at ASC, rowid ASC
+                  ORDER BY CASE state WHEN 'open' THEN 0 WHEN 'parked' THEN 0 ELSE 1 END,
+                           raised_at ASC, rowid ASC
                   LIMIT 1",
             )
             .context("preparing interrupt activity state")?;
@@ -2695,6 +2696,38 @@ mod tests {
         assert_eq!(
             interrupted_summary.activity_state,
             Some(SessionActivityState::Interrupted)
+        );
+    }
+
+    #[test]
+    fn list_session_summaries_prefers_actionable_interrupt_over_stale_interrupted_marker() {
+        use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
+
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("pid", "/proj", "builder").unwrap();
+        db.raise_interrupted_turn(session.session_id, "builder", "forced drain")
+            .unwrap();
+        db.raise_interrupt_questions(
+            session.session_id,
+            "builder",
+            "question",
+            &InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Freetext {
+                    prompt: "Name?".into(),
+                    masked: false,
+                }],
+            },
+        )
+        .unwrap();
+
+        let summaries = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.session_id == session.session_id)
+            .unwrap();
+        assert_eq!(
+            summary.activity_state,
+            Some(SessionActivityState::PendingQuestion)
         );
     }
 

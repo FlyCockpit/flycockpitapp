@@ -167,6 +167,10 @@ impl Db {
         let raised_at = Utc::now().timestamp();
         let questions_json = serde_json::to_string(questions).context("serializing questions")?;
         let parked_tool = parked.map(|payload| payload.tool.clone());
+        // Stored verbatim because parked replay must re-run the exact tool
+        // wire input. This has the same exposure boundary as
+        // session_events.wire_input_json and must not be presented as
+        // user-authored text.
         let parked_args_json = parked
             .map(|payload| serde_json::to_string(&payload.args))
             .transpose()
@@ -246,6 +250,29 @@ impl Db {
         })
     }
 
+    pub fn list_reconcilable_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
+        self.read_blocking(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT interrupt_id, session_id, agent_id, description,
+                            question_json, questions_json, raised_at, resolved_at, response_json,
+                            state, parked_tool, parked_args_json, parked_call_id, parked_resume_json
+                       FROM needs_attention
+                      WHERE session_id = ?1 AND state IN ('open', 'parked', 'executing')
+                      ORDER BY raised_at ASC, rowid ASC",
+                )
+                .context("preparing list_reconcilable_interrupts")?;
+            let rows = stmt
+                .query_map([session_id.to_string()], decode_row)
+                .context("querying reconcilable needs_attention")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("decoding reconcilable needs_attention row")?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn get_interrupt(&self, interrupt_id: Uuid) -> Result<Option<NeedsAttentionRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -287,11 +314,26 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET state = 'interrupted'
-                      WHERE interrupt_id = ?1 AND state IN ('open', 'parked')",
+                      WHERE interrupt_id = ?1 AND state IN ('open', 'parked', 'executing')",
                     params![interrupt_id.to_string()],
                 )
                 .context("marking needs_attention interrupted")?;
             Ok(affected > 0)
+        })
+    }
+
+    pub fn acknowledge_interrupted_turns(&self, session_id: Uuid) -> Result<usize> {
+        let now = Utc::now().timestamp();
+        self.write_blocking(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE needs_attention
+                        SET state = 'resolved', resolved_at = ?1
+                      WHERE session_id = ?2 AND state = 'interrupted'",
+                    params![now, session_id.to_string()],
+                )
+                .context("acknowledging interrupted needs_attention markers")?;
+            Ok(affected)
         })
     }
 
@@ -754,6 +796,70 @@ mod tests {
         let resolved = db.get_interrupt(iid).unwrap().unwrap();
         assert_eq!(resolved.state, InterruptState::Resolved);
         assert!(resolved.resolved_at.is_some());
+    }
+
+    #[test]
+    fn executing_interrupt_can_be_marked_interrupted_and_reconciled() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Freetext {
+                prompt: "why?".into(),
+                masked: false,
+            }],
+        };
+        let payload = InterruptParkPayload {
+            tool: "bash".into(),
+            args: serde_json::json!({ "command": "echo yes" }),
+            call_id: "call-1".into(),
+            resume: InterruptResumeAnchor {
+                agent_id: "builder".into(),
+                call_id: "call-1".into(),
+                provider_call_id: None,
+                assistant_seq: Some(42),
+            },
+        };
+        let iid = db
+            .raise_interrupt_questions_with_payload(
+                s.session_id,
+                "builder",
+                "approval",
+                &set,
+                Some(&payload),
+            )
+            .unwrap();
+
+        assert!(db.park_interrupt(iid).unwrap());
+        assert!(
+            db.begin_parked_interrupt_execution(
+                iid,
+                &ResolveResponse::Freetext { text: "yes".into() },
+            )
+            .unwrap()
+        );
+        let reconcilable = db.list_reconcilable_interrupts(s.session_id).unwrap();
+        assert_eq!(reconcilable.len(), 1);
+        assert_eq!(reconcilable[0].state, InterruptState::Executing);
+
+        assert!(db.mark_interrupt_interrupted(iid).unwrap());
+        let row = db.get_interrupt(iid).unwrap().unwrap();
+        assert_eq!(row.state, InterruptState::Interrupted);
+        assert!(!db.complete_executing_interrupt(iid).unwrap());
+    }
+
+    #[test]
+    fn interrupted_markers_are_acknowledged_after_forward_progress() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let iid = db
+            .raise_interrupted_turn(s.session_id, "builder", "forced drain")
+            .unwrap();
+
+        assert_eq!(db.acknowledge_interrupted_turns(s.session_id).unwrap(), 1);
+        let row = db.get_interrupt(iid).unwrap().unwrap();
+        assert_eq!(row.state, InterruptState::Resolved);
+        assert!(row.resolved_at.is_some());
+        assert_eq!(db.acknowledge_interrupted_turns(s.session_id).unwrap(), 0);
     }
 
     #[test]

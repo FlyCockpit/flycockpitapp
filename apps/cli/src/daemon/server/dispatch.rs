@@ -742,7 +742,7 @@ async fn handle_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
-            crate::auth::flycockpit::store_credential(&credential).map_err(internal)?;
+            ctx.store_flycockpit_credential(&credential).map_err(internal)?;
             ctx.wake_connector();
             Ok(Response::Ack)
         }
@@ -753,7 +753,7 @@ async fn handle_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
-            crate::auth::flycockpit::clear_credential().map_err(internal)?;
+            ctx.clear_flycockpit_credential().map_err(internal)?;
             ctx.wake_connector();
             Ok(Response::Ack)
         }

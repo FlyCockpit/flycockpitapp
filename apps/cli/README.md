@@ -261,6 +261,19 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
+For faster local test diagnostics with per-test timing, install
+`cargo-nextest` and run:
+
+```sh
+cargo nextest run -p cockpit-cli
+```
+
+The canonical CI gate remains `cargo test --locked`.
+
+Tests that exercise retry, timeout, or backoff behavior should use paused
+Tokio time or an injected fake clock/probe. Do not depend on wall-clock sleeps
+or a real connection failure to drive test control flow.
+
 For local diagnostics:
 
 ```sh

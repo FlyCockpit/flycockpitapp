@@ -219,6 +219,11 @@ pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
 pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     use std::sync::Arc;
 
+    debug_assert!(
+        root.parent().is_some(),
+        "tool test_ctx must use an isolated temp/project root, not the filesystem root"
+    );
+
     let db = crate::db::Db::open_in_memory().unwrap();
     let session =
         crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap();

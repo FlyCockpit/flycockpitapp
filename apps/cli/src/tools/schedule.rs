@@ -455,7 +455,7 @@ mod tests {
     async fn fork_schedule_routes_create_to_request() {
         let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
         let tool = ForkScheduleTool::new(state.clone());
-        let ctx = test_ctx();
+        let (_dir, ctx) = test_ctx();
         let out = tool
             .call(
                 json!({ "action": "background.start", "args": { "command": "cargo test" } }),
@@ -473,7 +473,7 @@ mod tests {
     async fn fork_schedule_cancel_sets_flag() {
         let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
         let tool = ForkScheduleTool::new(state.clone());
-        let ctx = test_ctx();
+        let (_dir, ctx) = test_ctx();
         assert!(!state.is_cancelled());
         tool.call(json!({ "action": "loop.cancel" }), &ctx)
             .await
@@ -485,7 +485,7 @@ mod tests {
     async fn fork_schedule_rejects_main_only_actions() {
         let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
         let tool = ForkScheduleTool::new(state);
-        let ctx = test_ctx();
+        let (_dir, ctx) = test_ctx();
         assert!(tool.call(json!({ "action": "list" }), &ctx).await.is_err());
         assert!(
             tool.call(
@@ -502,7 +502,7 @@ mod tests {
         let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
         let (tx, mut rx) = mpsc::channel(8);
         let tool = NoteTool::new(state.clone(), tx);
-        let ctx = test_ctx();
+        let (_dir, ctx) = test_ctx();
         tool.call(json!({ "text": "halfway there" }), &ctx)
             .await
             .unwrap();
@@ -516,7 +516,9 @@ mod tests {
 
     /// Minimal `ToolCtx` for unit-testing fork tools (they don't touch the
     /// session / locks / cwd).
-    fn test_ctx() -> ToolCtx {
-        crate::tools::common::test_ctx(std::path::Path::new("/"))
+    fn test_ctx() -> (tempfile::TempDir, ToolCtx) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(dir.path());
+        (dir, ctx)
     }
 }

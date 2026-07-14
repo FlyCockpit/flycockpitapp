@@ -338,7 +338,7 @@ pub fn walk_up_to_stops(cwd: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 pub(crate) mod test_support {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::daemon::test_harness::lock_env()
+        crate::test_env::lock()
     }
 
     pub(crate) struct CockpitConfigOverride {

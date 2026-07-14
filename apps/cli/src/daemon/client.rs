@@ -441,8 +441,6 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         DaemonPaths, DaemonStatus, discover, spawn_detached, spawn_detached_ephemeral,
     };
 
-    let canonical = DaemonPaths::resolve_canonical()?;
-
     match mode {
         LifecycleMode::AttachOrAutoPromote | LifecycleMode::AttachOrEphemeral => {
             let discovered = discover().await;
@@ -511,6 +509,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         // client flag (that's a per-session default passed at attach;
         // sandboxing part 2 precedence). Only an explicit
         // `cockpit daemon start --no-sandbox` sets the daemon-level flag.
+        let canonical = DaemonPaths::resolve_canonical()?;
         let pid = spawn_detached(false)?;
         (canonical, pid)
     };
@@ -589,7 +588,6 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
 mod tests {
     use super::*;
     use crate::daemon::DaemonPaths;
-    use crate::daemon::test_harness::DaemonEnvGuard;
 
     static OWN_EPHEMERAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -722,16 +720,15 @@ mod tests {
         let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
         reset_own_ephemeral_paths_for_test();
         let root = tempfile::tempdir().expect("daemon path tempdir");
-        let data = tempfile::tempdir().expect("daemon data tempdir");
-        let mut env = DaemonEnvGuard::new();
-        env.set_path("XDG_DATA_HOME", data.path());
 
         let paths = temp_ephemeral_paths(root.path(), "cockpit-in-process-test");
         assert!(
             !paths.socket.exists(),
             "in-process transport must not require a socket file"
         );
-        let ctx = crate::daemon::boot_in_process(paths.clone()).expect("boot local daemon context");
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let ctx = crate::daemon::boot_in_process_with_db(paths.clone(), db)
+            .expect("boot local daemon context");
         let client = DaemonClient::connect(&paths.socket)
             .await
             .expect("connect by local socket key");
@@ -759,12 +756,12 @@ mod tests {
         let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
         reset_own_ephemeral_paths_for_test();
         let root = tempfile::tempdir().expect("daemon path tempdir");
-        let data = tempfile::tempdir().expect("daemon data tempdir");
-        let mut env = DaemonEnvGuard::new();
-        env.set_path("XDG_DATA_HOME", data.path());
 
         let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-owned");
         set_own_ephemeral_paths_for_test(own.clone());
+        let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
+        let _ctx = crate::daemon::boot_in_process_with_db(own.clone(), db)
+            .expect("boot local daemon context");
 
         let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)
             .await

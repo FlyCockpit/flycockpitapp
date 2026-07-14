@@ -463,6 +463,16 @@ async fn select_relay_from_candidates(
     first_connect: bool,
     jitter: &mut impl JitterSource,
 ) -> Result<Option<SelectedRelay>> {
+    select_relay_from_candidates_with_timeout(candidates, first_connect, jitter, PROBE_TIMEOUT)
+        .await
+}
+
+async fn select_relay_from_candidates_with_timeout(
+    candidates: Vec<RelayCandidate>,
+    first_connect: bool,
+    jitter: &mut impl JitterSource,
+    probe_timeout: Duration,
+) -> Result<Option<SelectedRelay>> {
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -483,9 +493,20 @@ async fn select_relay_from_candidates(
             .iter()
             .cloned()
             .enumerate()
-            .map(|(idx, candidate)| probe_candidate(http.clone(), idx, candidate)),
+            .map(|(idx, candidate)| probe_candidate(http.clone(), idx, candidate, probe_timeout)),
     )
     .await;
+    let choice = select_choice_from_probe_results(&candidates, probes);
+    Ok(Some(SelectedRelay {
+        choice,
+        from_cache: false,
+    }))
+}
+
+fn select_choice_from_probe_results(
+    candidates: &[RelayCandidate],
+    probes: Vec<Option<ProbeResult>>,
+) -> RelayChoice {
     let mut best: Option<ProbeResult> = None;
     for probe in probes.into_iter().flatten() {
         match best.as_ref() {
@@ -498,7 +519,7 @@ async fn select_relay_from_candidates(
         }
     }
 
-    let choice = if let Some(best) = best {
+    if let Some(best) = best {
         choice_from_candidate(
             best.candidate,
             Some(best.rtt.as_millis().min(u128::from(u64::MAX)) as u64),
@@ -506,11 +527,7 @@ async fn select_relay_from_candidates(
     } else {
         tracing::warn!("all relay health probes failed; falling back to first listed relay");
         choice_from_candidate(candidates[0].clone(), None)
-    };
-    Ok(Some(SelectedRelay {
-        choice,
-        from_cache: false,
-    }))
+    }
 }
 
 #[derive(Debug)]
@@ -523,10 +540,11 @@ async fn probe_candidate(
     http: reqwest::Client,
     _idx: usize,
     candidate: RelayCandidate,
+    probe_timeout: Duration,
 ) -> Option<ProbeResult> {
     let url = healthz_url(&candidate.ws_url).ok()?;
     let started = Instant::now();
-    let response = tokio::time::timeout(PROBE_TIMEOUT, http.get(url).send())
+    let response = tokio::time::timeout(probe_timeout, http.get(url).send())
         .await
         .ok()?
         .ok()?;
@@ -1394,66 +1412,40 @@ mod tests {
         assert_eq!(slow_requests.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn probe_timeouts_fall_back_to_responding_or_first_candidate() {
-        let (timeout_a, _) = health_server(Duration::from_secs(3), 200).await;
-        let (ok, _) = health_server(Duration::from_millis(5), 200).await;
-        let (timeout_b, _) = health_server(Duration::from_secs(3), 200).await;
-        let mut jitter = ZeroJitter;
-        let selected = select_relay_from_candidates(
+    #[test]
+    fn probe_timeouts_fall_back_to_responding_or_first_candidate() {
+        let candidates = vec![
+            RelayCandidate {
+                relay_id: "relay-a".to_string(),
+                region: None,
+                ws_url: "wss://relay-a.example.test/ws".to_string(),
+            },
+            RelayCandidate {
+                relay_id: "relay-ok".to_string(),
+                region: None,
+                ws_url: "wss://relay-ok.example.test/ws".to_string(),
+            },
+            RelayCandidate {
+                relay_id: "relay-b".to_string(),
+                region: None,
+                ws_url: "wss://relay-b.example.test/ws".to_string(),
+            },
+        ];
+        let selected = select_choice_from_probe_results(
+            &candidates,
             vec![
-                RelayCandidate {
-                    relay_id: "relay-a".to_string(),
-                    region: None,
-                    ws_url: timeout_a.clone(),
-                },
-                RelayCandidate {
-                    relay_id: "relay-ok".to_string(),
-                    region: None,
-                    ws_url: ok,
-                },
-                RelayCandidate {
-                    relay_id: "relay-b".to_string(),
-                    region: None,
-                    ws_url: timeout_b,
-                },
+                None,
+                Some(ProbeResult {
+                    candidate: candidates[1].clone(),
+                    rtt: Duration::from_millis(7),
+                }),
+                None,
             ],
-            true,
-            &mut jitter,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(selected.choice.relay_id, "relay-ok");
+        );
+        assert_eq!(selected.relay_id, "relay-ok");
 
-        let (timeout_c, _) = health_server(Duration::from_secs(3), 200).await;
-        let (timeout_d, _) = health_server(Duration::from_secs(3), 200).await;
-        let (timeout_e, _) = health_server(Duration::from_secs(3), 200).await;
-        let selected = select_relay_from_candidates(
-            vec![
-                RelayCandidate {
-                    relay_id: "relay-first".to_string(),
-                    region: None,
-                    ws_url: timeout_c,
-                },
-                RelayCandidate {
-                    relay_id: "relay-second".to_string(),
-                    region: None,
-                    ws_url: timeout_d,
-                },
-                RelayCandidate {
-                    relay_id: "relay-third".to_string(),
-                    region: None,
-                    ws_url: timeout_e,
-                },
-            ],
-            true,
-            &mut jitter,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(selected.choice.relay_id, "relay-first");
+        let selected = select_choice_from_probe_results(&candidates, vec![None, None, None]);
+        assert_eq!(selected.relay_id, "relay-a");
     }
 
     #[tokio::test]

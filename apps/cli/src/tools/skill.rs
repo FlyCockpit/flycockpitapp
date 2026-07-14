@@ -117,10 +117,10 @@ mod tests {
     use super::*;
     use crate::config::extended::SkillsConfig;
 
-    fn no_redact() -> crate::redact::RedactionTable {
+    fn no_redact(root: &std::path::Path) -> crate::redact::RedactionTable {
         crate::redact::RedactionTable::build(
             &crate::config::extended::RedactConfig::default(),
-            std::path::Path::new("/"),
+            root,
         )
         .unwrap()
     }
@@ -153,9 +153,13 @@ mod tests {
             "---\nname: deploy\ndescription: deploy steps\n---\n",
             "Run the deploy checklist.",
         );
-        let out =
-            load_skill_into_output("deploy", tmp.path(), &cfg_for(&scan, false), &no_redact())
-                .unwrap();
+        let out = load_skill_into_output(
+            "deploy",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap();
         assert!(out.content.contains("Skill `deploy`"));
         assert!(out.content.contains("Run the deploy checklist."));
     }
@@ -165,8 +169,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
-        let err = load_skill_into_output("nope", tmp.path(), &cfg_for(&scan, false), &no_redact())
-            .unwrap_err();
+        let err = load_skill_into_output(
+            "nope",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap_err();
         assert_eq!(
             crate::engine::tool::classify_failure(&err),
             crate::engine::tool::ToolFailKind::Invocation
@@ -184,8 +193,13 @@ mod tests {
             "---\nname: ver\ndescription: version\n---\n",
             "current: !`echo SHOULD_NOT_RUN`",
         );
-        let out = load_skill_into_output("ver", tmp.path(), &cfg_for(&scan, false), &no_redact())
-            .unwrap();
+        let out = load_skill_into_output(
+            "ver",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap();
         assert!(
             out.content.contains("!`echo SHOULD_NOT_RUN`"),
             "Codex mode keeps the directive verbatim, got {:?}",
@@ -204,8 +218,13 @@ mod tests {
             "---\nname: ver\ndescription: version\n---\n",
             "current: !`echo RAN_OK`",
         );
-        let out =
-            load_skill_into_output("ver", tmp.path(), &cfg_for(&scan, true), &no_redact()).unwrap();
+        let out = load_skill_into_output(
+            "ver",
+            tmp.path(),
+            &cfg_for(&scan, true),
+            &no_redact(tmp.path()),
+        )
+        .unwrap();
         assert!(
             out.content.contains("current: RAN_OK"),
             "Claude mode substitutes stdout, got {:?}",

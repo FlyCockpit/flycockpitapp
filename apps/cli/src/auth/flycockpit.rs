@@ -535,6 +535,18 @@ impl FlycockpitClient {
 
 pub fn load_credential() -> Result<StoredFlycockpitCredential> {
     let store = CredentialStore::open_default()?;
+    load_credential_from_store(&store)
+}
+
+#[cfg(test)]
+pub(crate) fn load_credential_from_path(
+    path: std::path::PathBuf,
+) -> Result<StoredFlycockpitCredential> {
+    let store = CredentialStore::open(path)?;
+    load_credential_from_store(&store)
+}
+
+fn load_credential_from_store(store: &CredentialStore) -> Result<StoredFlycockpitCredential> {
     let raw = store
         .get(CREDENTIAL_KEY)
         .ok_or_else(|| anyhow!("not logged in to Flycockpit; run `cockpit login`"))?;
@@ -550,6 +562,21 @@ pub fn maybe_load_credential() -> Option<StoredFlycockpitCredential> {
 
 pub fn store_credential(credential: &StoredFlycockpitCredential) -> Result<()> {
     let mut store = CredentialStore::open_default()?;
+    store_credential_in_store(&mut store, credential)
+}
+
+pub(crate) fn store_credential_at_path(
+    path: std::path::PathBuf,
+    credential: &StoredFlycockpitCredential,
+) -> Result<()> {
+    let mut store = CredentialStore::open(path)?;
+    store_credential_in_store(&mut store, credential)
+}
+
+fn store_credential_in_store(
+    store: &mut CredentialStore,
+    credential: &StoredFlycockpitCredential,
+) -> Result<()> {
     store.set(CREDENTIAL_KEY, serde_json::to_value(credential)?);
     store.save()?;
     register_credential_for_redaction(credential);
@@ -568,6 +595,15 @@ pub fn store_relay_choice(
 
 pub fn clear_credential() -> Result<()> {
     let mut store = CredentialStore::open_default()?;
+    clear_credential_in_store(&mut store)
+}
+
+pub(crate) fn clear_credential_at_path(path: std::path::PathBuf) -> Result<()> {
+    let mut store = CredentialStore::open(path)?;
+    clear_credential_in_store(&mut store)
+}
+
+fn clear_credential_in_store(store: &mut CredentialStore) -> Result<()> {
     store.remove(CREDENTIAL_KEY);
     store.save()?;
     clear_credential_redaction_registration();

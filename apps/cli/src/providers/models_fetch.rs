@@ -1188,12 +1188,13 @@ fn push_missing(dst: &mut Vec<String>, src: &[String]) {
 mod tests {
     use super::*;
     use crate::config::providers::AuthKind;
+
     /// Cargo runs tests in parallel by default. Several tests below
     /// mutate process-wide env vars (`COPILOT_GITHUB_TOKEN`,
     /// `XDG_STATE_HOME`, and friends) to exercise resolver fallbacks, so
     /// they must serialize against every other test that touches those vars.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::daemon::test_harness::lock_env()
+        crate::test_env::lock()
     }
 
     fn clear_copilot_env() {

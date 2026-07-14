@@ -2146,6 +2146,9 @@ pub(super) fn slash_matches(
     query: &str,
     counts: &HashMap<String, u64>,
 ) -> Vec<&'static SlashCommand> {
+    let _lock = super::SLASH_MENU_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = tempfile::tempdir().expect("slash match tempdir");
     let app = App::new(Some(tmp.path()), false);
     let available: Vec<&'static SlashCommand> = SLASH_COMMANDS

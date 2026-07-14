@@ -34,9 +34,24 @@ pub(super) fn matched_dotenv_paths(
 
     let mut out: Vec<PathBuf> = Vec::new();
 
+    let in_git_repo = crate::git::find_worktree_root(cwd).is_some();
+    if !in_git_repo && dotenv_scan_start_is_unbounded(cwd) {
+        tracing::debug!(
+            cwd = %cwd.display(),
+            "redaction `.env` walk skipped from unbounded filesystem start; explicit extra dotenv paths are still honored"
+        );
+        for p in extra {
+            if p.is_file() {
+                out.push(p.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        return out;
+    }
+
     // Bound the walk only outside a git repo: inside one we keep the
     // unbounded walk so no `.env` is ever missed (correctness/safety #1).
-    let in_git_repo = crate::git::find_worktree_root(cwd).is_some();
     let max_depth = dotenv_max_depth(in_git_repo);
     if max_depth.is_some() {
         tracing::debug!(
@@ -85,6 +100,23 @@ pub(super) fn matched_dotenv_paths(
     out.sort();
     out.dedup();
     out
+}
+
+pub(super) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
+    if cwd.parent().is_none() {
+        return true;
+    }
+    dirs::home_dir().is_some_and(|home| same_path_lexical_or_canonical(cwd, &home))
+}
+
+fn same_path_lexical_or_canonical(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Auto-detect a matched env file's format and collect its scrub-candidate

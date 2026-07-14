@@ -524,6 +524,16 @@ impl Driver {
         // chain (implementation note):
         // `compact_prompt` (the brief-prompt override) and `compact_model`
         // (the dedicated drafting model).
+        #[cfg(test)]
+        let (extended, providers) = if let Some((providers, _, _)) = &self.test_providers_override {
+            (
+                crate::config::extended::ExtendedConfig::default(),
+                providers.clone(),
+            )
+        } else {
+            crate::auto_title::load_configs_for(&self.cwd)
+        };
+        #[cfg(not(test))]
         let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
         let prompt = Message::user(crate::engine::compact::brief_prompt(
             extended.compact_prompt.as_deref(),

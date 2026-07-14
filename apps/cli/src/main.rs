@@ -41,6 +41,8 @@ mod skills;
 mod startup;
 mod sync;
 mod sysinfo;
+#[cfg(test)]
+mod test_env;
 mod text;
 mod tokens;
 mod tools;

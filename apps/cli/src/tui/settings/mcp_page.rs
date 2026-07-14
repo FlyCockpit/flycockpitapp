@@ -1073,6 +1073,10 @@ fn format_pairs_for_edit(
 mod tests {
     use super::*;
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env::lock()
+    }
+
     fn server(auth: Auth, enabled: bool) -> ServerConfig {
         ServerConfig {
             transport: Transport::Streamable,
@@ -1193,7 +1197,7 @@ mod tests {
     #[test]
     fn editor_masks_stored_header_secret_and_preserves_ref_when_unchanged() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = crate::daemon::test_harness::lock_env();
+        let _env = env_lock();
         let old_xdg = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
         let store = crate::credentials::CredentialStore::open_default().unwrap();
@@ -1245,7 +1249,7 @@ mod tests {
     #[test]
     fn editor_replaces_stored_header_secret_only_when_new_value_typed() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = crate::daemon::test_harness::lock_env();
+        let _env = env_lock();
         let old_xdg = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
         let store = crate::credentials::CredentialStore::open_default().unwrap();
@@ -1295,7 +1299,7 @@ mod tests {
     #[test]
     fn editor_header_secret_builds_credential_ref_without_raw_value() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = crate::daemon::test_harness::lock_env();
+        let _env = env_lock();
         let old_xdg = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: settings tests in this module run synchronously here and only
         // need XDG_STATE_HOME isolated for this store write/read.

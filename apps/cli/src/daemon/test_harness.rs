@@ -1,7 +1,4 @@
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -10,99 +7,16 @@ use serde::{Deserialize, Serialize};
 use super::DaemonPaths;
 
 pub(crate) const TEST_OWNER_ENV: &str = "COCKPIT_DAEMON_TEST_OWNER";
-
-const DAEMON_ENV_VARS: &[&str] = &[
-    "XDG_STATE_HOME",
-    "XDG_RUNTIME_DIR",
-    "XDG_DATA_HOME",
-    "COCKPIT_EPHEMERAL_SOCKET",
-    "COCKPIT_EPHEMERAL_PID_FILE",
-    TEST_OWNER_ENV,
-];
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-pub(crate) struct DaemonEnvGuard {
-    saved: BTreeMap<&'static str, Option<OsString>>,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl DaemonEnvGuard {
-    pub(crate) fn new() -> Self {
-        let lock = lock_env();
-        let mut guard = Self {
-            saved: BTreeMap::new(),
-            _lock: lock,
-        };
-        for name in DAEMON_ENV_VARS {
-            guard.capture(name);
-        }
-        guard
-    }
-
-    pub(crate) fn set_paths(vars: &[(&'static str, &Path)]) -> Self {
-        let mut guard = Self::new();
-        for (name, value) in vars {
-            guard.set_path(name, value);
-        }
-        guard
-    }
-
-    pub(crate) fn set_path(&mut self, name: &'static str, value: &Path) {
-        self.capture(name);
-        unsafe {
-            std::env::set_var(name, value);
-        }
-    }
-
-    pub(crate) fn set_string(&mut self, name: &'static str, value: &str) {
-        self.capture(name);
-        unsafe {
-            std::env::set_var(name, value);
-        }
-    }
-
-    pub(crate) fn remove(&mut self, name: &'static str) {
-        self.capture(name);
-        unsafe {
-            std::env::remove_var(name);
-        }
-    }
-
-    fn capture(&mut self, name: &'static str) {
-        self.saved
-            .entry(name)
-            .or_insert_with(|| std::env::var_os(name));
-    }
-}
-
-impl Drop for DaemonEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            for (name, value) in std::mem::take(&mut self.saved) {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-}
+const STALE_MANIFEST_MIN_AGE: Duration = Duration::from_secs(60);
 
 pub(crate) struct DaemonTestHarness {
     root: tempfile::TempDir,
     pub(crate) state_home: PathBuf,
     pub(crate) _runtime_dir: PathBuf,
     pub(crate) _data_home: PathBuf,
+    pub(crate) db: crate::db::Db,
     pub(crate) owner: String,
     tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
-    _env: DaemonEnvGuard,
 }
 
 impl DaemonTestHarness {
@@ -113,21 +27,15 @@ impl DaemonTestHarness {
         let runtime_dir = root.path().join("runtime");
         let data_home = root.path().join("data");
         let owner = uuid::Uuid::new_v4().to_string();
-        let mut env = DaemonEnvGuard::new();
-        env.set_path("XDG_STATE_HOME", &state_home);
-        env.set_path("XDG_RUNTIME_DIR", &runtime_dir);
-        env.set_path("XDG_DATA_HOME", &data_home);
-        env.remove("COCKPIT_EPHEMERAL_SOCKET");
-        env.remove("COCKPIT_EPHEMERAL_PID_FILE");
-        env.set_string(TEST_OWNER_ENV, &owner);
+        let db = crate::db::Db::open_in_memory().expect("daemon harness db");
         Self {
             root,
             state_home,
             _runtime_dir: runtime_dir,
             _data_home: data_home,
+            db,
             owner,
             tasks: Vec::new(),
-            _env: env,
         }
     }
 
@@ -140,7 +48,7 @@ impl DaemonTestHarness {
     }
 
     pub(crate) fn manifest_path(&self, name: &str) -> PathBuf {
-        manifest_dir().join(format!("{name}.json"))
+        manifest_dir().join(format!("{}-{name}.json", self.owner))
     }
 }
 
@@ -219,12 +127,37 @@ pub(crate) fn sweep_stale_manifests() -> Result<CleanupReport> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let report = cleanup_manifest(&path)?;
-        total.removed_files += report.removed_files;
-        total.signaled_processes += report.signaled_processes;
-        total.dead_processes += report.dead_processes;
+        if !manifest_is_old_enough_to_sweep(&path) {
+            continue;
+        }
+        match cleanup_manifest(&path) {
+            Ok(report) => {
+                total.removed_files += report.removed_files;
+                total.signaled_processes += report.signaled_processes;
+                total.dead_processes += report.dead_processes;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %error,
+                    "skipping active or invalid daemon test manifest during stale sweep"
+                );
+            }
+        }
     }
     Ok(total)
+}
+
+fn manifest_is_old_enough_to_sweep(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .is_ok_and(|age| age >= STALE_MANIFEST_MIN_AGE)
 }
 
 pub(crate) fn manifest_dir() -> PathBuf {

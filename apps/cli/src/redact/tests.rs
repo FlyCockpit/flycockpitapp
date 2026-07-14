@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 use tempfile::TempDir;
 
 fn enabled_cfg() -> RedactConfig {
@@ -905,6 +906,31 @@ fn extra_dotenv_paths_still_honored() {
     cfg.extra_dotenv_paths = vec![extra];
     let t = RedactionTable::build(&cfg, root).unwrap();
     assert_eq!(t.scrub("extra-path-secret-value"), "***REDACT***");
+}
+
+#[test]
+fn dotenv_scan_refuses_filesystem_root_but_honors_explicit_extra_paths() {
+    let dir = TempDir::new().unwrap();
+    let extra = dir.path().join("explicit.env");
+    std::fs::write(&extra, "EXTRA=explicit-secret-value\n").unwrap();
+
+    let paths = matched_dotenv_paths(
+        Path::new("/"),
+        &crate::config::extended::default_dotenv_patterns(),
+        std::slice::from_ref(&extra),
+    );
+
+    assert_eq!(paths, vec![extra]);
+}
+
+#[test]
+fn dotenv_scan_refuses_home_without_project_marker() {
+    let home = dirs::home_dir().expect("home directory");
+
+    assert!(
+        dotenv_scan_start_is_unbounded(&home),
+        "home directory itself is an unbounded scan start"
+    );
 }
 
 #[test]

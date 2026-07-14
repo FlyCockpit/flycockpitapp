@@ -189,6 +189,7 @@ pub struct DaemonContext {
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
+    credential_store_path: Option<PathBuf>,
 }
 
 impl DaemonContext {
@@ -257,6 +258,32 @@ impl DaemonContext {
             ))),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
             connector_wake,
+            credential_store_path: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_credential_store_path(mut self, path: PathBuf) -> Self {
+        self.credential_store_path = Some(path);
+        self
+    }
+
+    pub(crate) fn store_flycockpit_credential(
+        &self,
+        credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
+    ) -> Result<()> {
+        if let Some(path) = &self.credential_store_path {
+            crate::auth::flycockpit::store_credential_at_path(path.clone(), credential)
+        } else {
+            crate::auth::flycockpit::store_credential(credential)
+        }
+    }
+
+    pub(crate) fn clear_flycockpit_credential(&self) -> Result<()> {
+        if let Some(path) = &self.credential_store_path {
+            crate::auth::flycockpit::clear_credential_at_path(path.clone())
+        } else {
+            crate::auth::flycockpit::clear_credential()
         }
     }
 
@@ -390,13 +417,22 @@ pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
 pub fn boot(paths: DaemonPaths) -> Result<DaemonContext> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
     let db = Db::open_default().context("opening session DB")?;
+    let ctx = boot_with_db(paths, db, &mut timer)?;
+    timer.done();
+    Ok(ctx)
+}
+
+pub(crate) fn boot_with_db(
+    paths: DaemonPaths,
+    db: Db,
+    timer: &mut crate::startup::PhaseTimer,
+) -> Result<DaemonContext> {
     timer.phase("db_open_and_migrate");
     let locks = Arc::new(LockManager::from_db(db.clone()).context("loading lock state")?);
     timer.phase("lock_manager");
     run_boot_housekeeping(&db);
     timer.phase("prune_and_sweep");
     let ctx = DaemonContext::new(db, locks, paths);
-    timer.done();
     Ok(ctx)
 }
 

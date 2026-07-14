@@ -50,8 +50,13 @@ pub fn cockpit_state_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env::lock()
+    }
+
     #[test]
     fn data_dir_respects_xdg() {
+        let _env = env_lock();
         // Save and restore so other tests don't see our env change.
         let prev = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-test") };
@@ -67,7 +72,7 @@ mod tests {
 
     #[test]
     fn state_dir_respects_xdg() {
-        let _env = crate::daemon::test_harness::lock_env();
+        let _env = env_lock();
         let prev = std::env::var("XDG_STATE_HOME").ok();
         unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-state-test") };
         let p = cockpit_state_dir().unwrap();

@@ -324,6 +324,28 @@ mod tests {
         Arc::new(DaemonContext::new(db, locks, paths))
     }
 
+    fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let paths = DaemonPaths {
+            socket: std::path::PathBuf::from("/tmp/cockpit-persistent-test.sock"),
+            pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
+            ephemeral: false,
+        };
+        Arc::new(DaemonContext::new(db, locks, paths).with_credential_store_path(path))
+    }
+
+    fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let paths = DaemonPaths {
+            socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
+            pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
+            ephemeral: true,
+        };
+        Arc::new(DaemonContext::new(db, locks, paths).with_credential_store_path(path))
+    }
+
     fn remote_state_with_grants(
         grants: Vec<crate::daemon::principal::PrincipalGrant>,
     ) -> ClientState {
@@ -391,13 +413,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let state_home = tmp.path().join("state");
-        let runtime_dir = tmp.path().join("runtime");
-        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-        let ctx = persistent_test_ctx();
+        let credential_path = tmp.path().join("state/cockpit/credentials.json");
+        let ctx = persistent_test_ctx_with_credential_path(credential_path.clone());
         let credential = flycockpit_credential();
         let mut state = owner_state();
         let mut wake_rx = ctx.connector_wake_rx();
@@ -426,12 +443,12 @@ mod tests {
             .expect("connector wake delivered")
             .expect("wake sender alive");
 
-        let stored = crate::auth::flycockpit::load_credential().unwrap();
+        let stored = crate::auth::flycockpit::load_credential_from_path(credential_path.clone()).unwrap();
         assert_eq!(stored, credential);
 
         #[cfg(unix)]
         {
-            let store = crate::credentials::CredentialStore::open_default().unwrap();
+            let store = crate::credentials::CredentialStore::open(credential_path.clone()).unwrap();
             let mode = std::fs::metadata(store.path())
                 .unwrap()
                 .permissions()
@@ -452,14 +469,13 @@ mod tests {
     #[tokio::test]
     async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
         let tmp = tempfile::tempdir().unwrap();
-        let state_home = tmp.path().join("state");
-        let runtime_dir = tmp.path().join("runtime");
-        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-        let ctx = persistent_test_ctx();
-        crate::auth::flycockpit::store_credential(&flycockpit_credential()).unwrap();
+        let credential_path = tmp.path().join("state/cockpit/credentials.json");
+        let ctx = persistent_test_ctx_with_credential_path(credential_path.clone());
+        crate::auth::flycockpit::store_credential_at_path(
+            credential_path.clone(),
+            &flycockpit_credential(),
+        )
+        .unwrap();
         let mut state = owner_state();
         let mut wake_rx = ctx.connector_wake_rx();
 
@@ -471,19 +487,14 @@ mod tests {
             .await
             .expect("connector wake delivered")
             .expect("wake sender alive");
-        assert!(crate::auth::flycockpit::load_credential().is_err());
+        assert!(crate::auth::flycockpit::load_credential_from_path(credential_path).is_err());
     }
 
     #[tokio::test]
     async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
         let tmp = tempfile::tempdir().unwrap();
-        let state_home = tmp.path().join("state");
-        let runtime_dir = tmp.path().join("runtime");
-        let _env = crate::daemon::test_harness::DaemonEnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-        let ctx = test_ctx();
+        let credential_path = tmp.path().join("state/cockpit/credentials.json");
+        let ctx = test_ctx_with_credential_path(credential_path.clone());
         let mut state = owner_state();
         let err = handle_request(
             Request::StoreFlycockpitCredential {
@@ -501,7 +512,7 @@ mod tests {
             .await
             .expect_err("ephemeral daemon must reject credential clears");
         assert_eq!(err.code, ErrorCode::BadRequest);
-        assert!(crate::auth::flycockpit::load_credential().is_err());
+        assert!(crate::auth::flycockpit::load_credential_from_path(credential_path).is_err());
     }
 
     #[tokio::test]

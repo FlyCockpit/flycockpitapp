@@ -155,6 +155,10 @@ fn endpoint_file_for_state(state: &Path) -> PathBuf {
 
 fn read_endpoint_record() -> Option<DaemonEndpointRecord> {
     let path = endpoint_file().ok()?;
+    read_endpoint_record_from(&path)
+}
+
+fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -164,12 +168,20 @@ fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
 }
 
 fn write_endpoint_record_with_pid(paths: &DaemonPaths, pid: u32) -> Result<()> {
+    let canonical = DaemonPaths::resolve_canonical()
+        .context("resolving canonical daemon paths for endpoint publication")?;
+    write_endpoint_record_with_pid_and_canonical(paths, &canonical, pid)
+}
+
+fn write_endpoint_record_with_pid_and_canonical(
+    paths: &DaemonPaths,
+    canonical: &DaemonPaths,
+    pid: u32,
+) -> Result<()> {
     if paths.ephemeral {
         return Ok(());
     }
-    let canonical = DaemonPaths::resolve_canonical()
-        .context("resolving canonical daemon paths for endpoint publication")?;
-    if paths != &canonical {
+    if paths != canonical {
         anyhow::bail!(
             "refusing to publish shared daemon endpoint from noncanonical paths: pid_file={}, socket={}",
             paths.pid_file.display(),
@@ -201,7 +213,14 @@ fn remove_endpoint_record_if_owned(paths: &DaemonPaths) {
         tracing::debug!("skipping shared daemon endpoint cleanup: canonical paths unavailable");
         return;
     };
-    if paths != &canonical {
+    remove_endpoint_record_if_owned_with_canonical(paths, &canonical);
+}
+
+fn remove_endpoint_record_if_owned_with_canonical(paths: &DaemonPaths, canonical: &DaemonPaths) {
+    if paths.ephemeral {
+        return;
+    }
+    if paths != canonical {
         tracing::debug!(
             pid_file = %paths.pid_file.display(),
             socket = %paths.socket.display(),
@@ -263,6 +282,25 @@ impl DaemonPaths {
         })
     }
 
+    #[cfg(test)]
+    fn resolve_canonical_in(state_home: &Path, runtime_dir: Option<&Path>) -> Result<Self> {
+        let state = state_home.join("cockpit");
+        ensure_private_dir(&state).with_context(|| format!("securing {}", state.display()))?;
+        let pid_file = state.join("daemon.pid");
+        let socket = if let Some(rt) = runtime_dir {
+            let rt = rt.join("cockpit");
+            ensure_private_dir(&rt).with_context(|| format!("securing {}", rt.display()))?;
+            rt.join("cockpit.sock")
+        } else {
+            state.join("daemon.sock")
+        };
+        Ok(Self {
+            pid_file,
+            socket,
+            ephemeral: false,
+        })
+    }
+
     /// Allocate a unique ephemeral path set:
     /// `cockpit-eph-<pid>-<nonce>.sock` + `cockpit-eph-<pid>-<nonce>.pid`,
     /// in the same directory the canonical socket/pid would live in.
@@ -276,8 +314,17 @@ impl DaemonPaths {
     }
 
     #[cfg(test)]
-    fn allocate_ephemeral_for_test(pid: u32) -> Result<Self> {
-        Self::ephemeral_with_nonce(pid, uuid::Uuid::new_v4().simple().to_string())
+    fn allocate_ephemeral_for_test_in(
+        pid: u32,
+        state_home: &Path,
+        runtime_dir: Option<&Path>,
+    ) -> Result<Self> {
+        Self::ephemeral_with_nonce_in(
+            pid,
+            uuid::Uuid::new_v4().simple().to_string(),
+            state_home,
+            runtime_dir,
+        )
     }
 
     fn ephemeral_with_nonce(pid: u32, nonce: String) -> Result<Self> {
@@ -298,21 +345,60 @@ impl DaemonPaths {
         })
     }
 
+    #[cfg(test)]
+    fn ephemeral_with_nonce_in(
+        pid: u32,
+        nonce: String,
+        state_home: &Path,
+        runtime_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let state = state_home.join("cockpit");
+        ensure_private_dir(&state).with_context(|| format!("securing {}", state.display()))?;
+        let stem = format!("cockpit-eph-{pid}-{nonce}");
+        let pid_file = state.join(format!("{stem}.pid"));
+        let socket = if let Some(rt) = runtime_dir {
+            let rt = rt.join("cockpit");
+            ensure_private_dir(&rt).with_context(|| format!("securing {}", rt.display()))?;
+            rt.join(format!("{stem}.sock"))
+        } else {
+            state.join(format!("{stem}.sock"))
+        };
+        Ok(Self {
+            pid_file,
+            socket,
+            ephemeral: true,
+        })
+    }
+
     /// Reconstruct the ephemeral path set the parent chose, from the
     /// internal env vars. Returns `Ok(None)` when not running as an
     /// ephemeral child (the common case).
     fn from_ephemeral_env() -> Result<Option<Self>> {
         let socket = std::env::var_os(EPHEMERAL_SOCKET_ENV);
         let pid_file = std::env::var_os(EPHEMERAL_PID_ENV);
+        Self::from_ephemeral_values(socket.map(PathBuf::from), pid_file.map(PathBuf::from))
+    }
+
+    #[cfg(test)]
+    fn from_ephemeral_paths(
+        socket: Option<PathBuf>,
+        pid_file: Option<PathBuf>,
+    ) -> Result<Option<Self>> {
+        Self::from_ephemeral_values(socket, pid_file)
+    }
+
+    fn from_ephemeral_values(
+        socket: Option<PathBuf>,
+        pid_file: Option<PathBuf>,
+    ) -> Result<Option<Self>> {
         match (socket, pid_file) {
             (Some(socket), Some(pid_file)) => {
-                let socket = PathBuf::from(socket);
                 if let Some(parent) = socket.parent() {
                     ensure_private_dir(parent)
                         .with_context(|| format!("securing {}", parent.display()))?;
                 }
                 Ok(Some(Self {
-                    pid_file: PathBuf::from(pid_file),
+                    pid_file,
                     socket,
                     ephemeral: true,
                 }))
@@ -418,13 +504,21 @@ fn socket_responds_blocking(socket: &Path) -> bool {
 
 #[cfg(unix)]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
+    status_for_unreachable_pid_with_cleanup(paths, remove_endpoint_record_unverified)
+}
+
+#[cfg(unix)]
+fn status_for_unreachable_pid_with_cleanup(
+    paths: &DaemonPaths,
+    cleanup: impl FnOnce(),
+) -> DaemonStatus {
     let Some(pid) = read_pid(paths) else {
         return DaemonStatus::Stale;
     };
     match verify_daemon_pid_identity(pid) {
         PidIdentity::VerifiedDaemon => DaemonStatus::LivePidSocketUnreachable,
         PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_endpoint_record_unverified();
+            cleanup();
             DaemonStatus::Stale
         }
         PidIdentity::Unverified => DaemonStatus::Stale,
@@ -519,6 +613,30 @@ pub fn discover_blocking() -> DaemonProbe {
         }
         if !canonical.socket.exists() && canonical.pid_file.exists() {
             return DaemonProbe::new(status_for_unreachable_pid(&canonical), recorded);
+        }
+    }
+
+    DaemonProbe::new(probe_direct_blocking(&canonical), canonical)
+}
+
+#[cfg(test)]
+fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
+    note_blocking_probe_call();
+    if let Some(state) = canonical.pid_file.parent() {
+        let endpoint = endpoint_file_for_state(state);
+        if let Some(record) = read_endpoint_record_from(&endpoint)
+            && record.kind == DaemonEndpointKind::Persistent
+        {
+            let recorded = endpoint_paths(&canonical, &record);
+            if socket_responds_blocking(&recorded.socket) {
+                return DaemonProbe::new(DaemonStatus::Running, recorded);
+            }
+            if !canonical.socket.exists() && canonical.pid_file.exists() {
+                let status = status_for_unreachable_pid_with_cleanup(&canonical, || {
+                    let _ = std::fs::remove_file(&endpoint);
+                });
+                return DaemonProbe::new(status, recorded);
+            }
         }
     }
 
@@ -761,6 +879,20 @@ pub(crate) fn boot_in_process(paths: DaemonPaths) -> Result<std::sync::Arc<serve
     Ok(ctx)
 }
 
+#[cfg(test)]
+pub(crate) fn boot_in_process_with_db(
+    paths: DaemonPaths,
+    db: crate::db::Db,
+) -> Result<std::sync::Arc<server::DaemonContext>> {
+    if let Some(ctx) = server::in_process_context(&paths.socket) {
+        return Ok(ctx);
+    }
+    let locks = Arc::new(crate::locks::LockManager::from_db(db.clone())?);
+    let ctx = std::sync::Arc::new(server::DaemonContext::new(db, locks, paths));
+    server::register_in_process_context(ctx.clone());
+    Ok(ctx)
+}
+
 /// Like [`run_foreground`] but with injectable idle- and drain-grace
 /// durations so tests can exercise the ephemeral watchdog (Layer C) and the
 /// graceful drain (`daemon-graceful-drain-shutdown.md`) without sleeping the
@@ -774,6 +906,18 @@ pub async fn run_foreground_inner(
     drain_grace: Duration,
     resume_all_sessions: bool,
 ) -> Result<()> {
+    run_foreground_inner_with_boot_db(paths, idle_grace, drain_grace, resume_all_sessions, None)
+        .await
+}
+
+#[cfg(unix)]
+async fn run_foreground_inner_with_boot_db(
+    paths: DaemonPaths,
+    idle_grace: Duration,
+    drain_grace: Duration,
+    resume_all_sessions: bool,
+    boot_db: Option<crate::db::Db>,
+) -> Result<()> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::run_foreground");
     if matches!(probe(&paths).await, DaemonStatus::Running) {
         anyhow::bail!(
@@ -781,7 +925,7 @@ pub async fn run_foreground_inner(
             paths.socket.display()
         );
     }
-    if !paths.ephemeral && paths == DaemonPaths::resolve_canonical()? {
+    if boot_db.is_none() && !paths.ephemeral && paths == DaemonPaths::resolve_canonical()? {
         let discovered = discover().await;
         if matches!(
             discovered.status,
@@ -800,10 +944,17 @@ pub async fn run_foreground_inner(
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
 
     let listener = bind_private_socket(&paths.socket)?;
-    write_endpoint_record(&paths)?;
+    if boot_db.is_some() {
+        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())?;
+    } else {
+        write_endpoint_record(&paths)?;
+    }
     timer.phase("probe_pidfile_bind");
 
-    let ctx = std::sync::Arc::new(server::boot(paths.clone())?);
+    let ctx = std::sync::Arc::new(match boot_db {
+        Some(db) => server::boot_with_db(paths.clone(), db, &mut timer)?,
+        None => server::boot(paths.clone())?,
+    });
     if resume_all_sessions {
         resume_all_paused_sessions(&ctx.db)?;
     }
@@ -1265,8 +1416,8 @@ fn read_pid(paths: &DaemonPaths) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::daemon::test_harness::{
-        CleanupReport, DaemonEnvGuard as EnvGuard, DaemonTestHarness, TEST_OWNER_ENV,
-        TestDaemonManifest, TestDaemonManifestEntry, cleanup_manifest, write_manifest,
+        CleanupReport, DaemonTestHarness, TEST_OWNER_ENV, TestDaemonManifest,
+        TestDaemonManifestEntry, cleanup_manifest, write_manifest,
     };
 
     #[cfg(unix)]
@@ -1287,17 +1438,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn daemon_env_guard_serializes_and_restores_values() {
-        let before = std::env::var_os(TEST_OWNER_ENV);
-        {
-            let mut env = EnvGuard::new();
-            env.set_string(TEST_OWNER_ENV, "owner-a");
-            assert_eq!(std::env::var(TEST_OWNER_ENV).as_deref(), Ok("owner-a"));
-            env.set_string(TEST_OWNER_ENV, "owner-b");
-            assert_eq!(std::env::var(TEST_OWNER_ENV).as_deref(), Ok("owner-b"));
-        }
-        assert_eq!(std::env::var_os(TEST_OWNER_ENV), before);
+    fn canonical_in(state_home: &Path, runtime_dir: &Path) -> DaemonPaths {
+        DaemonPaths::resolve_canonical_in(state_home, Some(runtime_dir)).expect("canonical paths")
     }
 
     #[test]
@@ -1399,25 +1541,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        {
-            let _env = EnvGuard::set_paths(&[
-                ("XDG_STATE_HOME", state_home.as_path()),
-                ("XDG_RUNTIME_DIR", runtime_a.as_path()),
-            ]);
-            let paths = DaemonPaths::resolve_canonical().expect("canonical a");
-            assert_eq!(paths.socket, socket_a);
-            std::fs::write(&paths.pid_file, std::process::id().to_string()).expect("pid file");
-            write_endpoint_record_with_pid(&paths, std::process::id()).expect("endpoint record");
-        }
+        let paths = canonical_in(&state_home, &runtime_a);
+        assert_eq!(paths.socket, socket_a);
+        std::fs::write(&paths.pid_file, std::process::id().to_string()).expect("pid file");
+        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())
+            .expect("endpoint record");
 
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_b.as_path()),
-        ]);
-        let canonical_b = DaemonPaths::resolve_canonical().expect("canonical b");
+        let canonical_b = canonical_in(&state_home, &runtime_b);
         assert_ne!(canonical_b.socket, socket_a);
 
-        let probe = discover_blocking();
+        let probe = discover_blocking_with_canonical(canonical_b);
         assert_eq!(probe.status, DaemonStatus::Running);
         assert_eq!(probe.paths.socket, socket_a);
         listener.join().expect("listener thread");
@@ -1425,17 +1558,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn no_endpoint_record_uses_environment_derived_canonical_socket() {
+    fn no_endpoint_record_uses_explicit_canonical_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-
-        let paths = DaemonPaths::resolve_canonical().expect("canonical");
-        let probe = discover_blocking();
+        let paths = canonical_in(&state_home, &runtime_dir);
+        let probe = discover_blocking_with_canonical(paths.clone());
         assert_eq!(probe.status, DaemonStatus::NotRunning);
         assert_eq!(probe.paths.socket, paths.socket);
     }
@@ -1446,12 +1574,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-
-        let paths = DaemonPaths::resolve_canonical().expect("canonical");
+        let paths = canonical_in(&state_home, &runtime_dir);
         std::fs::write(&paths.pid_file, "999999999").expect("pid file");
         let record = DaemonEndpointRecord {
             version: 1,
@@ -1459,10 +1582,10 @@ mod tests {
             socket: runtime_dir.join("other/cockpit.sock"),
             kind: DaemonEndpointKind::Persistent,
         };
-        let endpoint = endpoint_file().expect("endpoint file");
+        let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
         std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("write endpoint");
 
-        let probe = discover_blocking();
+        let probe = discover_blocking_with_canonical(paths);
         assert_eq!(probe.status, DaemonStatus::Stale);
         assert!(!endpoint.exists());
     }
@@ -1472,14 +1595,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-
-        let eph = DaemonPaths::allocate_ephemeral_for_test(111).expect("ephemeral");
-        write_endpoint_record(&eph).expect("skip endpoint");
-        assert!(!endpoint_file().expect("endpoint file").exists());
+        let eph = DaemonPaths::allocate_ephemeral_for_test_in(111, &state_home, Some(&runtime_dir))
+            .expect("ephemeral");
+        let canonical = canonical_in(&state_home, &runtime_dir);
+        write_endpoint_record_with_pid_and_canonical(&eph, &canonical, std::process::id())
+            .expect("skip endpoint");
+        assert!(!endpoint_file_for_state(canonical.pid_file.parent().unwrap()).exists());
     }
 
     #[test]
@@ -1487,23 +1608,24 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-
         let noncanonical = DaemonPaths {
             pid_file: state_home.join("cockpit").join("other.pid"),
             socket: runtime_dir.join("cockpit").join("other.sock"),
             ephemeral: false,
         };
+        let canonical = canonical_in(&state_home, &runtime_dir);
 
-        let err = write_endpoint_record(&noncanonical).expect_err("noncanonical write rejected");
+        let err = write_endpoint_record_with_pid_and_canonical(
+            &noncanonical,
+            &canonical,
+            std::process::id(),
+        )
+        .expect_err("noncanonical write rejected");
         assert!(
             err.to_string().contains("noncanonical paths"),
             "error names noncanonical paths: {err:#}"
         );
-        assert!(!endpoint_file().expect("endpoint file").exists());
+        assert!(!endpoint_file_for_state(canonical.pid_file.parent().unwrap()).exists());
     }
 
     #[test]
@@ -1511,14 +1633,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-
-        let canonical = DaemonPaths::resolve_canonical().expect("canonical");
-        write_endpoint_record(&canonical).expect("endpoint record");
-        let endpoint = endpoint_file().expect("endpoint file");
+        let canonical = canonical_in(&state_home, &runtime_dir);
+        write_endpoint_record_with_pid_and_canonical(&canonical, &canonical, std::process::id())
+            .expect("endpoint record");
+        let endpoint = endpoint_file_for_state(canonical.pid_file.parent().unwrap());
         assert!(endpoint.exists());
 
         let noncanonical = DaemonPaths {
@@ -1526,7 +1644,7 @@ mod tests {
             socket: canonical.socket.clone(),
             ephemeral: false,
         };
-        remove_endpoint_record_if_owned(&noncanonical);
+        remove_endpoint_record_if_owned_with_canonical(&noncanonical, &canonical);
 
         assert!(
             endpoint.exists(),
@@ -1554,24 +1672,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        {
-            let _env = EnvGuard::set_paths(&[
-                ("XDG_STATE_HOME", state_home.as_path()),
-                ("XDG_RUNTIME_DIR", runtime_a.as_path()),
-            ]);
-            let paths_a = DaemonPaths::resolve_canonical().expect("canonical a");
-            write_endpoint_record(&paths_a).expect("endpoint record");
-        }
+        let paths_a = canonical_in(&state_home, &runtime_a);
+        write_endpoint_record_with_pid_and_canonical(&paths_a, &paths_a, std::process::id())
+            .expect("endpoint record");
 
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_b.as_path()),
-        ]);
-        let paths_b = DaemonPaths::resolve_canonical().expect("canonical b");
+        let paths_b = canonical_in(&state_home, &runtime_b);
         assert_ne!(paths_b.socket, socket_a);
         assert_eq!(probe_blocking(&paths_b), DaemonStatus::NotRunning);
 
-        let discovered = discover_blocking();
+        let discovered = discover_blocking_with_canonical(paths_b);
         assert_eq!(discovered.status, DaemonStatus::Running);
         assert_eq!(discovered.paths.socket, socket_a);
         listener.join().expect("listener thread");
@@ -1586,14 +1695,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
-
-        let eph_a = DaemonPaths::allocate_ephemeral_for_test(111).expect("resolve eph a");
-        let eph_b = DaemonPaths::allocate_ephemeral_for_test(111).expect("resolve eph b");
-        let canonical = DaemonPaths::resolve_canonical().expect("resolve canonical");
+        let eph_a =
+            DaemonPaths::allocate_ephemeral_for_test_in(111, &state_home, Some(&runtime_dir))
+                .expect("resolve eph a");
+        let eph_b =
+            DaemonPaths::allocate_ephemeral_for_test_in(111, &state_home, Some(&runtime_dir))
+                .expect("resolve eph b");
+        let canonical = canonical_in(&state_home, &runtime_dir);
 
         // Unique even for the same pid.
         assert_ne!(eph_a.socket, eph_b.socket);
@@ -1672,19 +1780,21 @@ mod tests {
         let socket = dir.path().join("runtime").join("chosen.sock");
         let pid_file = dir.path().join("state").join("chosen.pid");
 
-        let mut env = EnvGuard::new();
-        env.set_path(EPHEMERAL_SOCKET_ENV, &socket);
-        env.set_path(EPHEMERAL_PID_ENV, &pid_file);
-        let resolved = DaemonPaths::resolve().expect("resolve with env");
+        let resolved =
+            DaemonPaths::from_ephemeral_paths(Some(socket.clone()), Some(pid_file.clone()))
+                .expect("resolve explicit ephemeral paths")
+                .expect("ephemeral paths");
         assert_eq!(resolved.socket, socket);
         assert_eq!(resolved.pid_file, pid_file);
         assert!(resolved.ephemeral);
         #[cfg(unix)]
         assert_eq!(mode(resolved.socket.parent().unwrap()), 0o700);
 
-        env.remove(EPHEMERAL_SOCKET_ENV);
-        env.remove(EPHEMERAL_PID_ENV);
-        let canonical = DaemonPaths::resolve().expect("resolve without env");
+        let canonical = DaemonPaths::from_ephemeral_paths(None, None)
+            .expect("resolve absent explicit ephemeral paths");
+        assert!(canonical.is_none());
+
+        let canonical = canonical_in(&dir.path().join("state"), &dir.path().join("runtime"));
         assert!(!canonical.ephemeral);
     }
 
@@ -1746,24 +1856,29 @@ mod tests {
     /// End-to-end gating (Layers B + C): a real *ephemeral* daemon with
     /// no client self-reaps within the injected grace and removes its
     /// own socket + pid files; a real *persistent* daemon with the same
-    /// idle conditions stays up. Uses a short real-time grace (not the
-    /// 30s production value) so the test stays fast.
+    /// idle conditions stays up. Uses a short injected grace and advances
+    /// paused Tokio time so the test does not depend on wall-clock sleeps.
     #[tokio::test]
     async fn ephemeral_self_reaps_persistent_does_not() {
-        let _harness = DaemonTestHarness::new();
+        let harness = DaemonTestHarness::new();
         let grace = Duration::from_millis(300);
 
         // --- Ephemeral: must self-reap. ---
-        let eph = _harness.ephemeral_paths("eph");
+        let eph = harness.ephemeral_paths("eph");
         let eph_clone = eph.clone();
-        let eph_task =
-            tokio::spawn(async move { run_foreground_inner(eph_clone, grace, grace, false).await });
+        let eph_db = harness.db.clone();
+        let eph_task = tokio::spawn(async move {
+            run_foreground_inner_with_boot_db(eph_clone, grace, grace, false, Some(eph_db)).await
+        });
 
         // Wait for it to come up.
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
         assert!(eph.pid_file.exists(), "ephemeral pid file written");
 
+        tokio::time::pause();
+
         // No client ever connects; it should self-reap and clean up.
+        tokio::time::advance(grace + Duration::from_millis(1)).await;
         let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
             .await
             .expect("ephemeral daemon did not self-reap in time");
@@ -1772,15 +1887,23 @@ mod tests {
         assert!(!eph.pid_file.exists(), "ephemeral pid removed on reap");
 
         // --- Persistent: must NOT self-reap. ---
-        let persistent = DaemonPaths::resolve_canonical().expect("persistent canonical paths");
+        let persistent = canonical_in(&harness.state_home, &harness._runtime_dir);
         let persistent_clone = persistent.clone();
+        let persistent_db = harness.db.clone();
         let persist_task = tokio::spawn(async move {
-            run_foreground_inner(persistent_clone, grace, grace, false).await
+            run_foreground_inner_with_boot_db(
+                persistent_clone,
+                grace,
+                grace,
+                false,
+                Some(persistent_db),
+            )
+            .await
         });
         wait_until(|| persistent.socket.exists(), Duration::from_secs(2)).await;
 
         // Past several grace windows with no client: still alive.
-        tokio::time::sleep(grace * 4).await;
+        tokio::time::advance(grace * 4).await;
         assert!(
             persistent.socket.exists(),
             "persistent daemon must never self-reap on idle"
@@ -1811,19 +1934,26 @@ mod tests {
     #[tokio::test]
     async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
         use crate::daemon::ephemeral_guard::stop_daemon_blocking;
-        use crate::db::Db;
         use crate::session::Session;
 
-        let _harness = DaemonTestHarness::new();
+        let harness = DaemonTestHarness::new();
         // Idle grace far longer than the test window: the watchdog can NOT be
         // what reaps the daemon — only the `StopDaemon` teardown can.
         let idle_grace = Duration::from_secs(3600);
         let drain_grace = Duration::from_millis(300);
 
-        let eph = _harness.ephemeral_paths("eph-with-session");
+        let eph = harness.ephemeral_paths("eph-with-session");
         let eph_clone = eph.clone();
+        let daemon_db = harness.db.clone();
         let eph_task = tokio::spawn(async move {
-            run_foreground_inner(eph_clone, idle_grace, drain_grace, false).await
+            run_foreground_inner_with_boot_db(
+                eph_clone,
+                idle_grace,
+                drain_grace,
+                false,
+                Some(daemon_db),
+            )
+            .await
         });
 
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
@@ -1833,9 +1963,8 @@ mod tests {
         // the first user message has. This is what the (suspected) lingering
         // bug pinned on; it must NOT keep the owned daemon alive.
         {
-            let db = Db::open_default().expect("open daemon DB");
-            let session =
-                Session::create(db, std::env::temp_dir(), "Build").expect("persist a session row");
+            let session = Session::create(harness.db.clone(), std::env::temp_dir(), "Build")
+                .expect("persist a session row");
             assert!(session.is_persisted(), "row is persisted");
         }
 
@@ -1872,15 +2001,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
-        let _env = EnvGuard::set_paths(&[
-            ("XDG_STATE_HOME", state_home.as_path()),
-            ("XDG_RUNTIME_DIR", runtime_dir.as_path()),
-        ]);
 
         // Two daemonless TUI instances, even if the OS later reuses a pid.
-        let tui_a = DaemonPaths::allocate_ephemeral_for_test(4242).expect("resolve eph a");
-        let tui_b = DaemonPaths::allocate_ephemeral_for_test(4242).expect("resolve eph b");
-        let canonical = DaemonPaths::resolve_canonical().expect("resolve canonical");
+        let tui_a =
+            DaemonPaths::allocate_ephemeral_for_test_in(4242, &state_home, Some(&runtime_dir))
+                .expect("resolve eph a");
+        let tui_b =
+            DaemonPaths::allocate_ephemeral_for_test_in(4242, &state_home, Some(&runtime_dir))
+                .expect("resolve eph b");
+        let canonical = canonical_in(&state_home, &runtime_dir);
 
         // Distinct sockets + pid files → two independent ephemeral daemons.
         assert_ne!(tui_a.socket, tui_b.socket);

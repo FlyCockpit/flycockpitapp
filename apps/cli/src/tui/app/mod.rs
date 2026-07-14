@@ -8540,6 +8540,9 @@ mod slash_rank_tests {
         // `slash_matches` hides unavailable commands (`/editor` without
         // `$EDITOR`, `/lazygit` off `PATH`), so compare against the
         // available subset — otherwise this is env-dependent on CI.
+        let _lock = SLASH_MENU_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let declared: Vec<&str> = SLASH_COMMANDS
             .iter()
             .filter(|c| c.is_available(&app))

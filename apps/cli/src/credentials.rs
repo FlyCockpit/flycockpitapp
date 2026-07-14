@@ -145,6 +145,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env::lock()
+    }
+
     #[test]
     fn round_trips_an_api_key() {
         let tmp = TempDir::new().unwrap();
@@ -267,7 +271,7 @@ mod tests {
     fn xdg_state_home_overrides_default_path() {
         // Sanity check: setting XDG_STATE_HOME points the default at it.
         let tmp = TempDir::new().unwrap();
-        let _env = crate::daemon::test_harness::lock_env();
+        let _env = env_lock();
         // Each test process is independent w/ respect to env vars in
         // single-threaded mode; cargo test multithreads so we just
         // observe the result rather than relying on a stable value.

@@ -62,10 +62,78 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
     assert!(parent_rx.recv().await.is_none());
 }
 
-/// Build a driver rooted on a keyless localhost agent (the model is
-/// never called by the action-dispatch paths under test).
+fn test_provider_base_url() -> String {
+    static BASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASE_URL
+        .get_or_init(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else {
+                        continue;
+                    };
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 512];
+                    loop {
+                        let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let header_end = request
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|idx| idx + 4)
+                        .unwrap_or(request.len());
+                    let header =
+                        String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let content_length = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body_read = request.len().saturating_sub(header_end);
+                    while body_read < content_length {
+                        let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        body_read += n;
+                    }
+                    let payload = if header.starts_with("post /v1/responses ") {
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"test compact brief\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"local\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":4},\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"test compact brief\"}]}],\"tools\":[]}}\n\n"
+                    } else {
+                        "data: {\"id\":\"c\",\"model\":\"local\",\"choices\":[{\"delta\":{\"content\":\"test compact brief\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+                         data: {\"id\":\"c\",\"model\":\"local\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}\n\n\
+                         data: [DONE]\n\n"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+                    let _ = std::io::Write::flush(&mut stream);
+                }
+            });
+            format!("http://{addr}/v1")
+        })
+        .clone()
+}
+
+/// Build a driver rooted on a keyless local fixture provider.
 fn test_driver(max_schedules: usize) -> (Driver, tempfile::TempDir) {
-    use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
+    use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
     use std::collections::BTreeMap;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -80,8 +148,9 @@ fn test_driver(max_schedules: usize) -> (Driver, tempfile::TempDir) {
     providers.insert(
         "lmstudio".to_string(),
         ProviderEntry {
-            url: "http://localhost:1/v1".into(),
+            url: test_provider_base_url(),
             headers: vec![],
+            wire_api: WireApi::Completions,
             ..ProviderEntry::default()
         },
     );
@@ -3482,15 +3551,16 @@ fn install_test_providers(
     context_length: u32,
 ) {
     use crate::config::providers::{
-        ActiveModelRef, CacheConfig, ModelEntry, ProviderEntry, ProvidersConfig,
+        ActiveModelRef, CacheConfig, ModelEntry, ProviderEntry, ProvidersConfig, WireApi,
     };
     let mut entry = ProviderEntry {
-        url: "http://localhost:1/v1".into(),
+        url: test_provider_base_url(),
         cache: CacheConfig {
             mode: cache_mode,
             ttl_secs: 300,
         },
         context: ctx,
+        wire_api: WireApi::Completions,
         ..ProviderEntry::default()
     };
     entry.models.push(ModelEntry {
@@ -3519,7 +3589,7 @@ fn install_test_providers(
         text_embedded_recovery: None,
         thinking_params: Default::default(),
         system_prompt: None,
-        wire_api: Default::default(),
+        wire_api: WireApi::Completions,
         extra: Default::default(),
         capabilities: Default::default(),
         capability_overrides: Default::default(),
@@ -3618,7 +3688,9 @@ async fn auto_compact_fires_at_threshold_once() {
     let (mut driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
-    let build = crate::engine::builtin::load("Build", &driver.spawn_args(true)).unwrap();
+    let fixture_model = driver.stack[0].agent.model.clone();
+    let mut build = crate::engine::builtin::load("Build", &driver.spawn_args(true)).unwrap();
+    build.model = fixture_model;
     driver.stack[0].agent = Arc::new(build);
     std::fs::write(driver.cwd.join("seed.txt"), "seed body").unwrap();
     driver

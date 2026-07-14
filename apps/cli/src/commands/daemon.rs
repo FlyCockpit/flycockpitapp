@@ -1,12 +1,15 @@
 //! `cockpit daemon` subcommands.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::cli::DaemonCommand;
+use crate::daemon::client::DaemonClient;
+use crate::daemon::proto::Request;
 use crate::daemon::{self, DaemonPaths, DaemonStatus};
 
 const EPHEMERAL_TUI_NOTE: &str =
     "  note: a live TUI may still be connected to a separate ephemeral daemon.";
+const MAX_STOP_GRACE_SECS: u64 = 24 * 60 * 60;
 
 pub async fn run(cmd: DaemonCommand) -> Result<()> {
     let paths = DaemonPaths::resolve()?;
@@ -48,10 +51,28 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 daemon::run_foreground(paths).await
             }
         }
-        DaemonCommand::Stop => {
+        DaemonCommand::Stop { grace } => {
+            if let Some(secs) = grace
+                && secs > MAX_STOP_GRACE_SECS
+            {
+                bail!("--grace must be <= {MAX_STOP_GRACE_SECS} seconds");
+            }
+            if let Ok(client) = DaemonClient::connect(&paths.socket).await {
+                client
+                    .request_ok(Request::StopDaemon { grace_secs: grace })
+                    .await?;
+                println!("daemon: stopped");
+                return Ok(());
+            }
             let stopped = daemon::stop(&paths)?;
             if stopped {
-                println!("daemon: stopped");
+                if grace.is_some() {
+                    println!(
+                        "daemon: stopped (socket unreachable; used SIGTERM with default grace)"
+                    );
+                } else {
+                    println!("daemon: stopped");
+                }
             } else {
                 println!("daemon: not running (no pid file)");
             }

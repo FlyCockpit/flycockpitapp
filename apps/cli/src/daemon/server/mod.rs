@@ -185,6 +185,7 @@ pub struct DaemonContext {
     /// (installed into worker models). New `SendUserMessage` requests are
     /// refused while it reports draining.
     shutdown: crate::daemon::shutdown::ShutdownSignal,
+    shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
@@ -250,6 +251,7 @@ impl DaemonContext {
             terminal_host,
             client_count,
             shutdown,
+            shutdown_grace_override: StdMutex::new(None),
             env_baseline: Arc::new(std::sync::RwLock::new(EnvSnapshot::from_process(
                 EnvSnapshotSource::DaemonStart,
             ))),
@@ -262,6 +264,14 @@ impl DaemonContext {
     /// single drain path both read it.
     pub fn shutdown_signal(&self) -> &crate::daemon::shutdown::ShutdownSignal {
         &self.shutdown
+    }
+
+    pub fn set_shutdown_grace_override(&self, grace: Duration) {
+        *crate::sync::lock_or_recover(&self.shutdown_grace_override) = Some(grace);
+    }
+
+    pub fn take_shutdown_grace_override(&self) -> Option<Duration> {
+        crate::sync::lock_or_recover(&self.shutdown_grace_override).take()
     }
 
     /// Subscribe to the daemon-global event bus. Every client task holds

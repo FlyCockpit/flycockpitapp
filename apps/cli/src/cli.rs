@@ -409,7 +409,11 @@ pub enum DaemonCommand {
         resume_all_sessions: bool,
     },
     /// Stop the running daemon.
-    Stop,
+    Stop {
+        /// Grace period, in seconds, before forcing in-flight work to stop.
+        #[arg(long, value_name = "SECS")]
+        grace: Option<u64>,
+    },
     /// Print whether the daemon is running.
     Status,
 }
@@ -991,6 +995,17 @@ mod tests {
 
         assert!(help.contains("provider"), "{help}");
         assert!(help.contains("Provider id"), "{help}");
+    }
+
+    #[test]
+    fn daemon_stop_grace_parses_zero() {
+        let cli = Cli::try_parse_from(["cockpit", "daemon", "stop", "--grace", "0"]).unwrap();
+        match cli.command {
+            Some(Command::Daemon(DaemonCommand::Stop { grace })) => {
+                assert_eq!(grace, Some(0));
+            }
+            other => panic!("expected daemon stop command, got {other:?}"),
+        }
     }
 
     #[test]

@@ -280,6 +280,8 @@ pub struct LiveState {
     /// Whether a turn is in flight: set on `ThinkingStarted`, cleared on
     /// `AgentIdle`.
     processing: AtomicBool,
+    /// Count of tool calls currently between `ToolStart` and `ToolEnd`.
+    tool_running: AtomicUsize,
 }
 
 impl LiveState {
@@ -289,6 +291,10 @@ impl LiveState {
 
     pub fn processing(&self) -> bool {
         self.processing.load(Ordering::Relaxed)
+    }
+
+    pub fn tool_running(&self) -> bool {
+        self.tool_running.load(Ordering::Relaxed) > 0
     }
 }
 

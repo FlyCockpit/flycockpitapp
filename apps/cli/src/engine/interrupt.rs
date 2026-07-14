@@ -343,6 +343,26 @@ impl InterruptHub {
         let _ = tx.send(InterruptOutcome::Parked);
         true
     }
+
+    pub fn park_all_registered(&self) -> usize {
+        let waiters = {
+            let mut guard = lock_or_recover(&self.waiters);
+            std::mem::take(&mut *guard)
+        };
+        let mut parked = 0usize;
+        for (interrupt_id, tx) in waiters {
+            let db_parked = self
+                .db
+                .as_ref()
+                .and_then(|db| db.park_interrupt(interrupt_id).ok())
+                .unwrap_or(false);
+            let woke = tx.send(InterruptOutcome::Parked).is_ok();
+            if db_parked || woke {
+                parked += 1;
+            }
+        }
+        parked
+    }
 }
 
 /// Guard returned by [`InterruptHub::register`]. Awaiting it (via

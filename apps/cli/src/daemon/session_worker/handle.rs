@@ -77,6 +77,7 @@ enum WorkerStop {
     Shutdown {
         pause_for_resume: bool,
         active: bool,
+        pending_tool_count: i64,
     },
     DriverFailed,
     DriverExited,
@@ -302,6 +303,26 @@ impl SessionWorkerHandle {
         self.env_overlay.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_live_status(
+        &self,
+        has_active_schedules: bool,
+        processing: bool,
+        tool_running: bool,
+    ) {
+        self.live.active_schedules.store(
+            usize::from(has_active_schedules),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.live
+            .processing
+            .store(processing, std::sync::atomic::Ordering::Relaxed);
+        self.live.tool_running.store(
+            usize::from(tool_running),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Set or toggle the session's sandbox mode. `None` toggles the legacy
     /// off/sandbox state; explicit container modes are validated before storing.
     pub fn set_sandbox(
@@ -508,8 +529,12 @@ impl SessionWorkerHandle {
     }
 
     /// Live job/turn status snapshot for the browser's tiers 1-2.
-    pub fn live_status(&self) -> (bool, bool) {
-        (self.live.has_active_schedules(), self.live.processing())
+    pub fn live_status(&self) -> (bool, bool, bool) {
+        (
+            self.live.has_active_schedules(),
+            self.live.processing(),
+            self.live.tool_running(),
+        )
     }
 
     pub fn foreground_snapshot(&self) -> ForegroundSnapshot {

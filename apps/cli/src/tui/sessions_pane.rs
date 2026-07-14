@@ -1298,6 +1298,7 @@ mod tests {
             last_viewed_at: None,
             latest_activity_at: None,
             open_interrupts: 0,
+            activity_state: None,
             archived_at: None,
             created_by_principal: None,
             shared_with_collaborators: false,

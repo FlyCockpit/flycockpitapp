@@ -101,6 +101,10 @@ pub enum SessionEventKind {
     /// prompt/progress needed for an explicit retry. Data/export only; the
     /// model sees the retried prompt only if the user triggers the retry.
     FailedTurnRecovery,
+    /// Daemon shutdown grace expired while this session still had live agent
+    /// work. Data/export only; paired with an `interrupted` needs-attention
+    /// marker so session lists surface the unrecoverable mid-turn stop.
+    TurnInterrupted,
     /// The utility-model skill selector skipped or rejected auto-injection
     /// candidates. Data/export only: never enters the transcript or model
     /// context.
@@ -137,6 +141,7 @@ impl SessionEventKind {
             SessionEventKind::PrimarySwap => "primary_swap",
             SessionEventKind::InferenceFailure => "inference_failure",
             SessionEventKind::FailedTurnRecovery => "failed_turn_recovery",
+            SessionEventKind::TurnInterrupted => "turn_interrupted",
             SessionEventKind::SkillAutoSelect => "skill_auto_select",
             SessionEventKind::AutoPruneDiagnostic => "auto_prune_diagnostic",
             SessionEventKind::GoalProgressDiagnostic => "goal_progress_diagnostic",

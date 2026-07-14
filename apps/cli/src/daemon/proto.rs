@@ -656,6 +656,8 @@ pub struct SessionSummary {
     /// (`needs_attention`). Drives the "read, pending question" tier.
     #[serde(default)]
     pub open_interrupts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_state: Option<SessionActivityState>,
     /// Epoch seconds the session was archived (GOALS §17h). `None` = live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<i64>,
@@ -663,6 +665,16 @@ pub struct SessionSummary {
     /// `/sessions` browser renders this; `0` = no pin chrome.
     #[serde(default)]
     pub pin_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityState {
+    Parked,
+    PendingQuestion,
+    Interrupted,
+    InferenceInProgress,
+    ToolRunning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

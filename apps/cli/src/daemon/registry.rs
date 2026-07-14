@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -707,6 +708,18 @@ impl SessionRegistry {
                 // worker's driver, which cancels its streaming inference and
                 // kills any running `bash` subprocess.
                 tracing::warn!("daemon drain grace exhausted; forcing worker abort");
+                for h in &handles {
+                    let (has_schedules, processing, tool_running) = h.live_status();
+                    if has_schedules || processing {
+                        self.record_forced_drain_interruption(
+                            h,
+                            grace,
+                            has_schedules,
+                            processing,
+                            tool_running,
+                        );
+                    }
+                }
                 for ah in &abort_handles {
                     ah.abort();
                 }
@@ -715,6 +728,60 @@ impl SessionRegistry {
         };
         self.forget_generations(drained_generations);
         clean
+    }
+
+    fn record_forced_drain_interruption(
+        &self,
+        handle: &SessionWorkerHandle,
+        grace: Duration,
+        has_active_schedules: bool,
+        processing: bool,
+        tool_running: bool,
+    ) {
+        let activity_state = if tool_running {
+            "tool_running"
+        } else if processing {
+            "inference_in_progress"
+        } else {
+            "scheduled_work"
+        };
+        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        match self.inner.db.raise_interrupted_turn(
+            handle.session_id,
+            &handle.active_agent_name,
+            "Daemon shutdown interrupted active work",
+        ) {
+            Ok(interrupt_id) => {
+                if let Err(error) = self.inner.db.insert_session_event(
+                    handle.session_id,
+                    crate::db::session_log::SessionEventKind::TurnInterrupted,
+                    Some(&handle.active_agent_name),
+                    None,
+                    &json!({
+                        "reason": "daemon_shutdown_grace_expired",
+                        "interrupt_id": interrupt_id.to_string(),
+                        "grace_ms": grace_ms,
+                        "activity_state": activity_state,
+                        "has_active_schedules": has_active_schedules,
+                        "processing": processing,
+                        "tool_running": tool_running,
+                    }),
+                ) {
+                    tracing::warn!(
+                        session_id = %handle.session_id,
+                        error = %error,
+                        "record forced drain interruption event failed"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %handle.session_id,
+                    error = %error,
+                    "record forced drain interruption marker failed"
+                );
+            }
+        }
     }
 
     /// Snapshot of currently-active session ids. Useful for `cockpit
@@ -746,16 +813,16 @@ impl SessionRegistry {
             .live
             .values()
             .any(|entry| {
-                let (has_schedules, processing) = entry.handle.live_status();
+                let (has_schedules, processing, _tool_running) = entry.handle.live_status();
                 has_schedules || processing
             })
     }
 
-    /// Live `(has_active_schedules, processing)` status for a session, or
+    /// Live `(has_active_schedules, processing, tool_running)` status for a session, or
     /// `None` when no worker is live for it (the browser then treats it
     /// as not-processing / no-jobs). Lock-free read of the worker's
     /// shared atomics (GOALS §17f).
-    pub fn live_status(&self, session_id: Uuid) -> Option<(bool, bool)> {
+    pub fn live_status(&self, session_id: Uuid) -> Option<(bool, bool, bool)> {
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
             .get(&session_id)
@@ -958,6 +1025,11 @@ mod tests {
             Session::create_deferred(reg.inner.db.clone(), tmp.keep(), "Build")
                 .expect("deferred session"),
         )
+    }
+
+    fn persisted_test_session(reg: &SessionRegistry) -> Arc<Session> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        Arc::new(Session::create(reg.inner.db.clone(), tmp.keep(), "Build").expect("session"))
     }
 
     fn test_handle(reg: &SessionRegistry, session: Arc<Session>) -> SessionWorkerHandle {
@@ -1345,6 +1417,43 @@ mod tests {
 
         assert!(!clean);
         assert_no_live_worker(&reg, id);
+    }
+
+    #[tokio::test]
+    async fn forced_drain_records_interrupted_marker_and_event() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let id = session.id;
+        let handle = test_handle(&reg, session);
+        handle.set_test_live_status(false, true, true);
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        reg.insert_test_worker(handle, join);
+
+        let clean = reg.drain_all(Duration::from_millis(20)).await;
+
+        assert!(!clean);
+        let summaries = reg
+            .inner
+            .db
+            .list_session_summaries(None, None, 100)
+            .unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.session_id == id)
+            .unwrap();
+        assert_eq!(
+            summary.activity_state,
+            Some(crate::daemon::proto::SessionActivityState::Interrupted)
+        );
+        let events = reg.inner.db.list_session_events(id).unwrap();
+        let interrupted = events
+            .iter()
+            .find(|event| event.kind == "turn_interrupted")
+            .expect("turn_interrupted event");
+        assert_eq!(interrupted.data["reason"], "daemon_shutdown_grace_expired");
+        assert_eq!(interrupted.data["activity_state"], "tool_running");
     }
 
     #[tokio::test]

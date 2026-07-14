@@ -1395,6 +1395,10 @@ impl Db {
                 row.session_id,
                 Self::open_interrupt_count_conn(conn, row.session_id),
             );
+            let activity_state = summary_activity_state_or_none(
+                row.session_id,
+                Self::interrupt_activity_state_conn(conn, row.session_id),
+            );
             // Pinned-message count (`pinned-messages`) for the browser's
             // per-session pin chrome. Best-effort: a query miss reads as 0.
             let pin_count = summary_pin_count_or_zero(
@@ -1417,6 +1421,7 @@ impl Db {
                 last_viewed_at: row.last_viewed_at,
                 latest_activity_at,
                 open_interrupts,
+                activity_state,
                 archived_at: row.archived_at,
                 created_by_principal: row.created_by_principal,
                 shared_with_collaborators: row.shared_with_collaborators,
@@ -1436,6 +1441,42 @@ impl Db {
             )
             .context("counting open interrupts")?;
         Ok(vec![(); count.max(0) as usize])
+    }
+
+    fn interrupt_activity_state_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Option<crate::daemon::proto::SessionActivityState>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT state, question_json, questions_json
+                   FROM needs_attention
+                  WHERE session_id = ?1
+                    AND state IN ('open', 'parked', 'interrupted')
+                  ORDER BY CASE state WHEN 'interrupted' THEN 0 ELSE 1 END, raised_at ASC, rowid ASC
+                  LIMIT 1",
+            )
+            .context("preparing interrupt activity state")?;
+        let mut rows = stmt
+            .query([session_id.to_string()])
+            .context("querying interrupt activity state")?;
+        let Some(row) = rows.next().context("reading interrupt activity state")? else {
+            return Ok(None);
+        };
+        let state: String = row.get(0).context("reading interrupt state")?;
+        if state == "interrupted" {
+            return Ok(Some(
+                crate::daemon::proto::SessionActivityState::Interrupted,
+            ));
+        }
+        let question_json: Option<String> = row.get(1).context("reading question_json")?;
+        let questions_json: Option<String> = row.get(2).context("reading questions_json")?;
+        let permission = interrupt_payload_has_permission(question_json, questions_json);
+        Ok(Some(if permission || state == "parked" {
+            crate::daemon::proto::SessionActivityState::Parked
+        } else {
+            crate::daemon::proto::SessionActivityState::PendingQuestion
+        }))
     }
 
     fn pin_count_conn(conn: &Connection, session_id: Uuid) -> Result<i64> {
@@ -1515,6 +1556,53 @@ fn summary_open_interrupt_count_or_zero<T>(session_id: Uuid, result: Result<Vec<
             0
         }
     }
+}
+
+fn summary_activity_state_or_none(
+    session_id: Uuid,
+    result: Result<Option<crate::daemon::proto::SessionActivityState>>,
+) -> Option<crate::daemon::proto::SessionActivityState> {
+    match result {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                field = "activity_state",
+                error = %error,
+                "session summary activity-state query failed; using none"
+            );
+            None
+        }
+    }
+}
+
+fn interrupt_payload_has_permission(
+    question_json: Option<String>,
+    questions_json: Option<String>,
+) -> bool {
+    use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet};
+
+    fn question_permission(question: &InterruptQuestion) -> bool {
+        matches!(
+            question,
+            InterruptQuestion::Single {
+                permission: true,
+                ..
+            }
+        )
+    }
+
+    if let Some(json) = questions_json
+        && let Ok(set) = serde_json::from_str::<InterruptQuestionSet>(&json)
+    {
+        return set.questions.iter().any(question_permission);
+    }
+    if let Some(json) = question_json
+        && let Ok(question) = serde_json::from_str::<InterruptQuestion>(&json)
+    {
+        return question_permission(&question);
+    }
+    false
 }
 
 fn summary_pin_count_or_zero(session_id: Uuid, result: Result<i64>) -> u32 {
@@ -2529,6 +2617,84 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&direct).unwrap(),
             serde_json::to_value(&wrapped).unwrap()
+        );
+    }
+
+    #[test]
+    fn list_session_summaries_populates_interrupt_activity_state() {
+        use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
+
+        let db = Db::open_in_memory().unwrap();
+        let pending = db.create_session("pid", "/proj", "builder").unwrap();
+        let parked = db.create_session("pid", "/proj", "builder").unwrap();
+        let interrupted = db.create_session("pid", "/proj", "builder").unwrap();
+        db.raise_interrupt_questions(
+            pending.session_id,
+            "builder",
+            "question",
+            &InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Freetext {
+                    prompt: "Name?".into(),
+                    masked: false,
+                }],
+            },
+        )
+        .unwrap();
+        db.raise_interrupt_questions(
+            parked.session_id,
+            "builder",
+            "approval",
+            &InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Run?".into(),
+                    options: Vec::new(),
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: true,
+                    sandbox_escalation: None,
+                }],
+            },
+        )
+        .unwrap();
+        let interrupted_id = db
+            .raise_interrupt_questions(
+                interrupted.session_id,
+                "builder",
+                "approval",
+                &InterruptQuestionSet {
+                    questions: vec![InterruptQuestion::Freetext {
+                        prompt: "Name?".into(),
+                        masked: false,
+                    }],
+                },
+            )
+            .unwrap();
+        db.mark_interrupt_interrupted(interrupted_id).unwrap();
+
+        let summaries = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let pending_summary = summaries
+            .iter()
+            .find(|summary| summary.session_id == pending.session_id)
+            .unwrap();
+        assert_eq!(
+            pending_summary.activity_state,
+            Some(SessionActivityState::PendingQuestion)
+        );
+        let parked_summary = summaries
+            .iter()
+            .find(|summary| summary.session_id == parked.session_id)
+            .unwrap();
+        assert_eq!(
+            parked_summary.activity_state,
+            Some(SessionActivityState::Parked)
+        );
+        let interrupted_summary = summaries
+            .iter()
+            .find(|summary| summary.session_id == interrupted.session_id)
+            .unwrap();
+        assert_eq!(
+            interrupted_summary.activity_state,
+            Some(SessionActivityState::Interrupted)
         );
     }
 

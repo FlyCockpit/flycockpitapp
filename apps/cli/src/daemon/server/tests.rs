@@ -1512,7 +1512,7 @@ mod tests {
                 mutating: false,
             },
             CommandMetadataCase {
-                request: Request::StopDaemon,
+                request: Request::StopDaemon { grace_secs: None },
                 kind: "stop_daemon",
                 session_id: None,
                 audit_path: None,

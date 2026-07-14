@@ -7,8 +7,9 @@ async fn list_sessions(
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
     // and the TUI's daemonless direct-DB fallback produce the same shape
-    // (ordering / scoping / fork-grouping). Live status is layered on by
-    // the client via `SessionLiveStatus`, not here.
+    // (ordering / scoping / fork-grouping). The daemon adds its live
+    // processing overlay below; daemonless readers still get the durable
+    // DB-derived state.
     let db = ctx.db.clone();
     let mut sessions = db
         .read(move |conn| {
@@ -26,7 +27,29 @@ async fn list_sessions(
             session_access_for_summary(principal, summary) != SessionAccess::None
         });
     }
+    for summary in &mut sessions {
+        if let Some((_has_active_schedules, processing, tool_running)) =
+            ctx.registry.live_status(summary.session_id)
+        {
+            apply_live_activity_state(summary, processing, tool_running);
+        }
+    }
     Ok(Response::Sessions { sessions })
+}
+
+fn apply_live_activity_state(
+    summary: &mut proto::SessionSummary,
+    processing: bool,
+    tool_running: bool,
+) {
+    if summary.activity_state.is_some() {
+        return;
+    }
+    if tool_running {
+        summary.activity_state = Some(proto::SessionActivityState::ToolRunning);
+    } else if processing {
+        summary.activity_state = Some(proto::SessionActivityState::InferenceInProgress);
+    }
 }
 
 fn resource_scheduler_snapshot(
@@ -446,6 +469,60 @@ fn not_implemented(what: &str) -> ErrorPayload {
     }
 }
 
+#[cfg(test)]
+mod sessions_activity_tests {
+    use super::*;
+
+    fn summary(activity_state: Option<proto::SessionActivityState>) -> proto::SessionSummary {
+        proto::SessionSummary {
+            session_id: Uuid::new_v4(),
+            short_id: None,
+            project_root: "/proj".into(),
+            project_id: "pid".into(),
+            started_at: 1,
+            last_active_at: 1,
+            turns: 0,
+            active_agent: "Build".into(),
+            title: None,
+            parent_session_id: None,
+            created_by_principal: None,
+            shared_with_collaborators: false,
+            fork_count: 0,
+            descendant_count: 0,
+            last_viewed_at: None,
+            latest_activity_at: None,
+            open_interrupts: 0,
+            activity_state,
+            archived_at: None,
+            pin_count: 0,
+        }
+    }
+
+    #[test]
+    fn live_activity_overlay_distinguishes_tool_from_inference() {
+        let mut tool = summary(None);
+        apply_live_activity_state(&mut tool, true, true);
+        assert_eq!(
+            tool.activity_state,
+            Some(proto::SessionActivityState::ToolRunning)
+        );
+
+        let mut inference = summary(None);
+        apply_live_activity_state(&mut inference, true, false);
+        assert_eq!(
+            inference.activity_state,
+            Some(proto::SessionActivityState::InferenceInProgress)
+        );
+
+        let mut durable = summary(Some(proto::SessionActivityState::PendingQuestion));
+        apply_live_activity_state(&mut durable, true, true);
+        assert_eq!(
+            durable.activity_state,
+            Some(proto::SessionActivityState::PendingQuestion)
+        );
+    }
+}
+
 /// Read the effective layered provider/model and former-`ExtendedConfig` keys
 /// out of `config.json` (GOALS §2a). This mirrors
 /// `tui::agent_runner::load_providers` / `load_extended` so the in-process and
@@ -462,4 +539,3 @@ fn load_configs_with_trust(
 ) -> Result<(ProvidersConfig, ExtendedConfig)> {
     crate::config::trust::with_workspace_trust_policy(policy.clone(), || load_configs(cwd))
 }
-

@@ -448,7 +448,7 @@ async fn handle_request(
                 .filter_map(|id| {
                     ctx.registry
                         .live_status(id)
-                        .map(|(has_active_schedules, processing)| proto::LiveStatus {
+                        .map(|(has_active_schedules, processing, _tool_running)| proto::LiveStatus {
                             session_id: id,
                             has_active_schedules,
                             processing,
@@ -844,8 +844,11 @@ async fn handle_request(
             }
         }
 
-        Request::StopDaemon => {
-            tracing::info!("StopDaemon requested via client");
+        Request::StopDaemon { grace_secs } => {
+            tracing::info!(?grace_secs, "StopDaemon requested via client");
+            if let Some(secs) = grace_secs {
+                ctx.set_shutdown_grace_override(std::time::Duration::from_secs(secs));
+            }
             // Route through the single graceful-shutdown path
             // (`daemon-graceful-drain-shutdown.md`): the same begin-drain /
             // shorten-to-force transition SIGINT/SIGTERM and the ephemeral

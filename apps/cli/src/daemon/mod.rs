@@ -835,6 +835,7 @@ pub async fn run_foreground_inner(
     // notice), so a hung provider request can't block shutdown past the
     // deadline. `drain_all` awaits the workers up to the same grace and
     // aborts whatever remains.
+    let drain_grace = ctx.take_shutdown_grace_override().unwrap_or(drain_grace);
     spawn_force_timer(ctx.clone(), drain_grace);
     let drained_clean = ctx.registry.drain_all(drain_grace).await;
     if !drained_clean {

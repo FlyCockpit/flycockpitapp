@@ -213,6 +213,9 @@ async fn run_worker(
                 }
                 proto::Event::AgentIdle { .. } => {
                     live_for_forward.processing.store(false, Ordering::Relaxed);
+                    live_for_forward
+                        .tool_running
+                        .store(0, Ordering::Relaxed);
                     // Last-detach-while-idle edge, idle side
                     // (implementation note): the turn just finished, so if no
                     // interactive client is attached, release this session's locks now.
@@ -240,6 +243,18 @@ async fn run_worker(
                 proto::Event::ScheduleCompleted { .. } => {
                     // Saturating: never underflow if a completion is ever seen without its start.
                     let _ = live_for_forward.active_schedules.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |n| Some(n.saturating_sub(1)),
+                    );
+                }
+                proto::Event::ToolStart { .. } => {
+                    live_for_forward
+                        .tool_running
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                proto::Event::ToolEnd { .. } | proto::Event::ToolError { .. } => {
+                    let _ = live_for_forward.tool_running.fetch_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |n| Some(n.saturating_sub(1)),
@@ -1522,14 +1537,21 @@ async fn run_worker(
                 }
             }
             SessionWork::Shutdown { pause_for_resume } => {
+                let parked_count = interrupts.park_all_registered();
+                let pending_tool_count = session
+                    .db
+                    .list_open_interrupts(session_id)
+                    .map(|rows| rows.len() as i64)
+                    .unwrap_or(parked_count as i64);
                 let active = {
                     let (has_schedules, processing) =
                         (live.has_active_schedules(), live.processing());
-                    has_schedules || processing
+                    has_schedules || processing || pending_tool_count > 0
                 };
                 break WorkerStop::Shutdown {
                     pause_for_resume,
                     active,
+                    pending_tool_count,
                 };
             }
         }
@@ -1552,6 +1574,7 @@ async fn run_worker(
     if let WorkerStop::Shutdown {
         pause_for_resume: true,
         active,
+        pending_tool_count,
     } = stop
     {
         if active
@@ -1560,7 +1583,7 @@ async fn run_worker(
                 &root_agent_name,
                 &project_root.display().to_string(),
                 "daemon shutdown paused active work",
-                0,
+                pending_tool_count,
                 proto::DAEMON_VERSION,
             )
         {

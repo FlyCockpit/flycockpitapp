@@ -71,7 +71,7 @@ impl Drop for EphemeralDaemonGuard {
 pub fn stop_daemon_blocking(socket: &Path) {
     let Ok(envelope) = serde_json::to_string(&Envelope::request(
         uuid::Uuid::new_v4(),
-        Request::StopDaemon,
+        Request::StopDaemon { grace_secs: None },
     )) else {
         return;
     };
@@ -198,7 +198,10 @@ mod tests {
             .expect("server timed out")
             .unwrap()
             .expect("a line arrived");
-        assert!(matches!(parse_request(&line), Request::StopDaemon));
+        assert!(matches!(
+            parse_request(&line),
+            Request::StopDaemon { grace_secs: None }
+        ));
     }
 
     /// Layer A: an explicit `shutdown()` (the happy path) disarms the
@@ -230,6 +233,9 @@ mod tests {
             .expect("server timed out")
             .unwrap()
             .expect("a line arrived");
-        assert!(matches!(parse_request(&line), Request::StopDaemon));
+        assert!(matches!(
+            parse_request(&line),
+            Request::StopDaemon { grace_secs: None }
+        ));
     }
 }

@@ -295,6 +295,35 @@ impl Db {
         })
     }
 
+    pub fn raise_interrupted_turn(
+        &self,
+        session_id: Uuid,
+        agent_id: &str,
+        description: &str,
+    ) -> Result<Uuid> {
+        let interrupt_id = Uuid::new_v4();
+        let raised_at = Utc::now().timestamp();
+        let agent_id = agent_id.to_owned();
+        let description = description.to_owned();
+        self.write_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO needs_attention
+                 (interrupt_id, session_id, agent_id, description, state, raised_at)
+                 VALUES (?1, ?2, ?3, ?4, 'interrupted', ?5)",
+                params![
+                    interrupt_id.to_string(),
+                    session_id.to_string(),
+                    agent_id,
+                    description,
+                    raised_at,
+                ],
+            )
+            .context("inserting interrupted needs_attention")?;
+            Ok(())
+        })?;
+        Ok(interrupt_id)
+    }
+
     pub fn begin_parked_interrupt_execution(
         &self,
         interrupt_id: Uuid,

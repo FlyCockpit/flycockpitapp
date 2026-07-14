@@ -595,7 +595,10 @@ pub enum Request {
 
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
-    StopDaemon,
+    StopDaemon {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grace_secs: Option<u64>,
+    },
 }
 
 // Keep daemon command metadata centralized. Callers provide a local callback
@@ -674,7 +677,7 @@ macro_rules! command {
             (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, none);
             (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, true, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, none);
-            (Request::StopDaemon, "stop_daemon", owner_only, none, true, none);
+            (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, none);
         ] }
     };
 }

@@ -768,6 +768,9 @@ impl App {
     /// agent has been busy past the startup grace. `None` (→ indicator
     /// hidden) when idle or still inside the grace window.
     pub(super) fn status_span_elapsed(&self) -> Option<Duration> {
+        if let Some(status) = &self.daemon_link {
+            return Some(status.started_at.elapsed());
+        }
         if !self.busy {
             return None;
         }
@@ -795,6 +798,25 @@ impl App {
         let block_elapsed = self.pending.as_ref().map(|p| p.started_at.elapsed());
         let thinking =
             self.in_thinking_block() && block_elapsed.is_some_and(|e| e >= THINKING_FLIP_AFTER);
+
+        if let Some(status) = &self.daemon_link {
+            let text = daemon_link_status_text(
+                status,
+                &dots,
+                &format_status_elapsed(status.started_at.elapsed()),
+            );
+            let line = Line::from(vec![
+                Span::raw(" ".repeat(AGENT_INDENT)),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(WARNING_TEXT)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
 
         // A mid-retry network reconnect overrides everything else
         // (Thinking and the generic working line both): it's the most
@@ -3936,6 +3958,18 @@ fn reconnect_status_text(reconnect: &super::ReconnectStatus, dots: &str, elapsed
     )
 }
 
+fn daemon_link_status_text(status: &super::DaemonLinkStatus, dots: &str, elapsed: &str) -> String {
+    let label = if status.restarting {
+        "daemon restarting"
+    } else {
+        "daemon connection lost"
+    };
+    format!(
+        "{label} — reconnecting{dots} (attempt {}) {elapsed}",
+        status.attempt
+    )
+}
+
 #[cfg(test)]
 mod slash_popup_full_list_tests {
     use super::App;
@@ -6102,8 +6136,9 @@ mod hybrid_context_tokens_tests {
 
 #[cfg(test)]
 mod reconnect_status_tests {
-    use super::super::ReconnectStatus;
-    use super::{reconnect_status_text, reconnect_target_label};
+    use super::super::{DaemonLinkStatus, ReconnectStatus};
+    use super::{daemon_link_status_text, reconnect_status_text, reconnect_target_label};
+    use std::time::Instant;
 
     fn status(attempt: u32) -> ReconnectStatus {
         ReconnectStatus {
@@ -6137,6 +6172,27 @@ mod reconnect_status_tests {
         // number — the status updates as retries proceed.
         assert!(reconnect_status_text(&status(1), "…", "1s").contains("(attempt 1)"));
         assert!(reconnect_status_text(&status(7), "…", "1s").contains("(attempt 7)"));
+    }
+
+    #[test]
+    fn daemon_link_status_is_distinct_from_inference_reconnect() {
+        let status = DaemonLinkStatus {
+            restarting: true,
+            attempt: 2,
+            started_at: Instant::now(),
+        };
+        let text = daemon_link_status_text(&status, "…", "3s");
+        assert_eq!(text, "daemon restarting — reconnecting… (attempt 2) 3s");
+        assert!(!text.contains("unreachable at"));
+
+        let lost = DaemonLinkStatus {
+            restarting: false,
+            attempt: 4,
+            started_at: Instant::now(),
+        };
+        let text = daemon_link_status_text(&lost, "…", "5s");
+        assert!(text.starts_with("daemon connection lost"));
+        assert!(text.contains("(attempt 4)"));
     }
 
     #[test]

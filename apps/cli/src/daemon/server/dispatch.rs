@@ -34,6 +34,7 @@ async fn handle_request(
     match request {
         Request::Attach {
             session_id,
+            since_seq,
             project_root,
             no_sandbox,
             interactive,
@@ -47,6 +48,7 @@ async fn handle_request(
                 state,
                 ctx,
                 session_id,
+                since_seq,
                 project_root,
                 no_sandbox,
                 interactive,
@@ -1026,6 +1028,7 @@ async fn attach(
     state: &mut ClientState,
     ctx: &DaemonContext,
     session_id: Option<Uuid>,
+    since_seq: Option<i64>,
     project_root: Option<String>,
     no_sandbox: bool,
     interactive: bool,
@@ -1172,28 +1175,53 @@ async fn attach(
     let db = ctx.db.clone();
     let extended_cfg_for_attach = extended_cfg.clone();
     let active_subagent_for_attach = foreground.active_subagent.clone();
-    let (history, paused_work): (Vec<proto::HistoryEntry>, Vec<proto::PausedWorkSummary>) = db
+    let (mut history, paused_work, replay_max_seq): (
+        Vec<proto::HistoryEntry>,
+        Vec<proto::PausedWorkSummary>,
+        Option<i64>,
+    ) = db
         .read(move |conn| {
             let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
                 conn,
                 session_id,
                 &extended_cfg_for_attach,
             );
-            let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
-                conn,
-                session_id,
-                &root_agent,
-                active_subagent_for_attach.as_ref(),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, %session_id, "building attach history snapshot failed; sending empty history");
-                Vec::new()
-            });
+            let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
+                let replay_max_seq =
+                    crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)
+                        .ok()
+                        .and_then(|rows| rows.into_iter().map(|row| row.seq).max());
+                let history =
+                    crate::engine::rehydrate::history_snapshot_since_with_active_subagent_conn(
+                        conn,
+                        session_id,
+                        &root_agent,
+                        active_subagent_for_attach.as_ref(),
+                        since_seq,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, %session_id, since_seq, "building attach replay snapshot failed; sending empty replay");
+                        Vec::new()
+                    });
+                (history, replay_max_seq)
+            } else {
+                let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
+                    conn,
+                    session_id,
+                    &root_agent,
+                    active_subagent_for_attach.as_ref(),
+                )
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, %session_id, "building attach history snapshot failed; sending empty history");
+                    Vec::new()
+                });
+                (history, None)
+            };
             let paused_work = crate::db::Db::paused_session_work_conn(conn, session_id)?
                 .into_iter()
                 .map(paused_work_to_proto)
                 .collect();
-            Ok((history, paused_work))
+            Ok((history, paused_work, replay_max_seq))
         })
         .await
         .map_err(internal)?;
@@ -1205,12 +1233,22 @@ async fn attach(
         );
     }
 
-    let history = if let Some(att) = state.attached.as_ref() {
+    history = if let Some(att) = state.attached.as_ref() {
         let redact = att.handle.redaction_table();
         scrub_history_for_principal(&state.principal, history, &redact)
     } else {
         history
     };
+    if let Some(max_seq) = replay_max_seq {
+        if !history.is_empty() {
+            state.pending_replay.push(proto::Event::HistoryReplay {
+                session_id,
+                entries: history,
+                max_seq,
+            });
+        }
+        history = Vec::new();
+    }
 
     Ok(Response::Attached {
         session_id,

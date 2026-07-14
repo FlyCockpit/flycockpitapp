@@ -904,6 +904,13 @@ pub(super) struct ReconnectStatus {
     pub(super) url: String,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct DaemonLinkStatus {
+    pub(super) restarting: bool,
+    pub(super) attempt: u32,
+    pub(super) started_at: Instant,
+}
+
 /// Legacy `/compact` handoff state from the old review-then-commit path.
 /// New compactions are queued and applied in place by the driver.
 #[allow(dead_code)]
@@ -1403,6 +1410,10 @@ pub struct App {
     /// bare `ThinkingStarted`, which fires once at turn start before the
     /// retry loop and must not blank the reconnect status mid-loop.
     pub(super) reconnect: Option<ReconnectStatus>,
+    /// Local TUI↔daemon socket reconnect status. Separate from inference
+    /// provider reconnects so daemon restarts do not collide with model retry
+    /// state.
+    pub(super) daemon_link: Option<DaemonLinkStatus>,
     /// Live git status; updated by a background tokio task spawned in
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
@@ -2861,6 +2872,7 @@ impl App {
             span_started_at: None,
             working_msg_idx: WORKING_MESSAGES.len(),
             reconnect: None,
+            daemon_link: None,
             repo_status,
             dialog: Dialog::None,
             overlay: Overlay::None,

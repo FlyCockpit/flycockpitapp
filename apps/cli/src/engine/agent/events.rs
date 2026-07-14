@@ -60,6 +60,14 @@ pub enum TurnEvent {
         model: String,
         url: String,
     },
+    /// The TUI lost its daemon socket and is retrying the local link.
+    DaemonLinkReconnecting { restarting: bool, attempt: u32 },
+    /// The TUI reattached to the daemon after a socket drop.
+    DaemonLinkReconnected,
+    /// Warm daemon reattach replay of persisted history entries.
+    HistoryReplay {
+        entries: Vec<crate::daemon::proto::HistoryEntry>,
+    },
     /// A configured stream wait threshold elapsed. The TUI shows a yellow
     /// warning; without a backup the stream keeps waiting, while with a backup
     /// this can immediately precede fallback. UI-only and never enters model

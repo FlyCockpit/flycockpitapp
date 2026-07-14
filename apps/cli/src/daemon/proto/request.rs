@@ -12,6 +12,11 @@ pub enum Request {
     Attach {
         #[serde(default)]
         session_id: Option<Uuid>,
+        /// Replay cursor for reconnecting clients. When set, the daemon
+        /// returns an empty attach history and emits persisted timeline
+        /// entries with `seq > since_seq` as replay events before live events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_seq: Option<i64>,
         /// Project root override; when None the daemon uses the cwd
         /// it knows for this client connection.
         #[serde(default)]

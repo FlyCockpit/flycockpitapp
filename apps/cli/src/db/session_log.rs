@@ -353,6 +353,29 @@ impl Db {
         Ok(out)
     }
 
+    pub fn list_session_events_since_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        since_seq: i64,
+    ) -> Result<Vec<SessionEventRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json
+                   FROM session_events
+                  WHERE session_id = ?1 AND seq > ?2
+                  ORDER BY seq ASC",
+            )
+            .context("preparing list_session_events_since")?;
+        let rows = stmt
+            .query_map(params![session_id.to_string(), since_seq], decode_event_row)
+            .context("querying session_events since seq")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("decoding session_event row")??);
+        }
+        Ok(out)
+    }
+
     /// Look up the stored (post-redaction) request payload + lifecycle
     /// `status` for one `call_id`. `None` when no payload was captured (e.g. a
     /// pre-0009 call). The export writes the payload verbatim and surfaces the
@@ -639,5 +662,49 @@ mod tests {
         assert_eq!(b_events.len(), 1);
         assert_eq!(b_events[0].kind, "assistant_message");
         assert_eq!(b_events[0].data, json!({"text": "second"}));
+    }
+
+    #[test]
+    fn list_session_events_since_filters_strictly_after_seq() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let seq1 = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "one"}),
+            )
+            .unwrap();
+        let seq2 = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "two"}),
+            )
+            .unwrap();
+        let seq3 = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::UserNote,
+                Some("builder"),
+                None,
+                &json!({"text": "three"}),
+            )
+            .unwrap();
+
+        let rows = db
+            .read_blocking(|conn| Db::list_session_events_since_conn(conn, s.session_id, seq1))
+            .unwrap();
+        let got: Vec<i64> = rows.into_iter().map(|row| row.seq).collect();
+        assert_eq!(got, vec![seq2, seq3]);
+
+        let rows = db
+            .read_blocking(|conn| Db::list_session_events_since_conn(conn, s.session_id, seq3))
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }

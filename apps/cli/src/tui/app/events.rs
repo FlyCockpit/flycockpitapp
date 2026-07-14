@@ -188,6 +188,31 @@ impl App {
                     url,
                 });
             }
+            TurnEvent::DaemonLinkReconnecting {
+                restarting,
+                attempt,
+            } => match &mut self.daemon_link {
+                Some(status) => {
+                    status.restarting = restarting;
+                    status.attempt = attempt;
+                }
+                None => {
+                    self.daemon_link = Some(super::DaemonLinkStatus {
+                        restarting,
+                        attempt,
+                        started_at: Instant::now(),
+                    });
+                }
+            },
+            TurnEvent::DaemonLinkReconnected => {
+                if self.daemon_link.take().is_some() {
+                    self.daemon_draining = false;
+                    self.show_toast("daemon reconnected", ToastKind::Success);
+                }
+            }
+            TurnEvent::HistoryReplay { entries } => {
+                self.history.extend(wire_history_to_entries(entries));
+            }
             TurnEvent::QueueUpdated { queue } => {
                 self.reconcile_queue_update(queue);
             }

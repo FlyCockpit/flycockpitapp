@@ -632,6 +632,7 @@ fn validate_peer_uid(peer_uid: libc::uid_t, daemon_uid: libc::uid_t) -> Result<(
 struct ClientState {
     principal: ClientPrincipal,
     attached: Option<AttachedSession>,
+    pending_replay: Vec<proto::Event>,
     pending_uploads: HashMap<Uuid, PendingAttachmentUpload>,
     ready_attachments: HashMap<Uuid, ReadyAttachment>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -649,6 +650,7 @@ impl ClientState {
         Self {
             principal,
             attached: None,
+            pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting,
@@ -934,11 +936,17 @@ async fn run_in_process_client(
                 let result = handle_request(request, &mut state, &ctx).await;
                 let attached = matches!(&result, Ok(Response::Attached { .. }));
                 let _ = reply.send(result);
-                if is_attach && attached
-                    && let Some(event) = ctx.drain_state_event()
-                    && event_tx.send(event).await.is_err()
-                {
-                    return;
+                if is_attach && attached {
+                    for event in std::mem::take(&mut state.pending_replay) {
+                        if event_tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(event) = ctx.drain_state_event()
+                        && event_tx.send(event).await.is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -1187,6 +1195,12 @@ where
                 log_response_send_failed(id, envelope_kind(&envelope), &error);
             }
             if is_attach && attached {
+                for event in std::mem::take(&mut state.pending_replay) {
+                    if let Err(error) = proto.send(&Envelope::event(event)).await {
+                        tracing::debug!(error = ?error, "client disconnected during attach replay");
+                        return Ok(());
+                    }
+                }
                 let _ = ctx.resync_drain_state(proto).await;
             }
         }

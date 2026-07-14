@@ -281,6 +281,7 @@ mod tests {
                 grants,
             }),
             attached: None,
+            pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
@@ -308,6 +309,7 @@ mod tests {
         ClientState {
             principal: ClientPrincipal::owner(),
             attached: None,
+            pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
@@ -818,6 +820,7 @@ mod tests {
                     event_rx,
                     _interactive_guard: None,
                 }),
+                pending_replay: Vec::new(),
                 pending_uploads: HashMap::new(),
                 ready_attachments: HashMap::new(),
                 upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
@@ -859,6 +862,7 @@ mod tests {
             CommandMetadataCase {
                 request: Request::Attach {
                     session_id: Some(attach_session_id),
+                    since_seq: None,
                     project_root: Some(project_root.clone()),
                     no_sandbox: false,
                     interactive: false,
@@ -2724,6 +2728,7 @@ mod tests {
                 request_id,
                 Request::Attach {
                     session_id: Some(session.session_id),
+                    since_seq: None,
                     project_root: Some(tmp.path().to_string_lossy().into_owned()),
                     no_sandbox: false,
                     interactive: true,
@@ -2773,6 +2778,7 @@ mod tests {
         let response = handle_request(
             Request::Attach {
                 session_id: None,
+                since_seq: None,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
                 no_sandbox: false,
                 interactive: true,
@@ -2795,6 +2801,7 @@ mod tests {
         let response = handle_request(
             Request::Attach {
                 session_id: None,
+                since_seq: None,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
                 no_sandbox: false,
                 interactive: true,
@@ -2863,6 +2870,7 @@ mod tests {
         let err = handle_request(
             Request::Attach {
                 session_id: None,
+                since_seq: None,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
                 no_sandbox: false,
                 interactive: true,

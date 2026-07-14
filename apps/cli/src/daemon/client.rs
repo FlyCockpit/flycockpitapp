@@ -204,6 +204,17 @@ impl DaemonClient {
         let mut events = self.events.lock().await;
         events.recv().await
     }
+
+    pub fn is_socket_backed(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self.backend, ClientBackend::Wire(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -656,6 +667,7 @@ mod tests {
 
         let request = client.request(Request::Attach {
             session_id: None,
+            since_seq: None,
             project_root: Some("/tmp".into()),
             no_sandbox: false,
             interactive: true,

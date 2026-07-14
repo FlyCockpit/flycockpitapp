@@ -288,6 +288,28 @@ pub fn history_snapshot_with_active_subagent_conn(
 ) -> Result<Vec<proto::HistoryEntry>> {
     let events = Db::list_session_events_conn(conn, session_id)
         .map_err(|e| anyhow!("loading session events for history snapshot: {e}"))?;
+    history_snapshot_from_events_conn(conn, session_id, root_agent, active_subagent, events)
+}
+
+pub fn history_snapshot_since_with_active_subagent_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+    active_subagent: Option<&proto::ActiveSubagent>,
+    since_seq: i64,
+) -> Result<Vec<proto::HistoryEntry>> {
+    let events = Db::list_session_events_since_conn(conn, session_id, since_seq)
+        .map_err(|e| anyhow!("loading session events for history replay: {e}"))?;
+    history_snapshot_from_events_conn(conn, session_id, root_agent, active_subagent, events)
+}
+
+fn history_snapshot_from_events_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+    active_subagent: Option<&proto::ActiveSubagent>,
+    events: Vec<SessionEventRow>,
+) -> Result<Vec<proto::HistoryEntry>> {
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for history snapshot: {e}"))?;
 
@@ -3715,6 +3737,44 @@ mod tests {
             serde_json::to_value(&direct).unwrap(),
             serde_json::to_value(&wrapped).unwrap()
         );
+    }
+
+    #[test]
+    fn history_snapshot_since_replays_only_rows_after_cursor() {
+        let s = root_session();
+        record_user(&s, "already rendered");
+        record_assistant(&s, "infer-1", "also rendered");
+        let cursor =
+            s.db.list_session_events(s.id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.seq)
+                .max()
+                .unwrap();
+        record_user(&s, "missed user");
+        record_assistant(&s, "infer-2", "missed assistant");
+
+        let replay =
+            s.db.read_blocking(|conn| {
+                history_snapshot_since_with_active_subagent_conn(conn, s.id, "Build", None, cursor)
+            })
+            .unwrap();
+
+        assert_eq!(replay.len(), 2);
+        match &replay[0] {
+            proto::HistoryEntry::User { text, seq, .. } => {
+                assert_eq!(text, "missed user");
+                assert!(*seq > cursor);
+            }
+            other => panic!("expected replayed user entry, got {other:?}"),
+        }
+        match &replay[1] {
+            proto::HistoryEntry::Assistant { text, seq, .. } => {
+                assert_eq!(text, "missed assistant");
+                assert!(*seq > cursor);
+            }
+            other => panic!("expected replayed assistant entry, got {other:?}"),
+        }
     }
 
     #[tokio::test]

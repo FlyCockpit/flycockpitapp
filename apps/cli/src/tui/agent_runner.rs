@@ -13,14 +13,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
+use crate::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
 use crate::daemon::proto::{self, ErrorCode, Request, Response};
 use crate::engine::TurnEvent;
 
@@ -158,6 +159,98 @@ pub(crate) fn drain_turn_events(events: &Arc<Mutex<Vec<TurnEvent>>>) -> Vec<Turn
     std::mem::take(&mut *guard)
 }
 
+#[derive(Clone)]
+struct AttachRequestContext {
+    session_id: Uuid,
+    project_root: String,
+    no_sandbox: bool,
+    env_snapshot: crate::env_snapshot::EnvSnapshotWire,
+}
+
+#[derive(Clone)]
+struct LocalReconnectDriver {
+    socket: PathBuf,
+}
+
+impl LocalReconnectDriver {
+    async fn connect(&self) -> Result<DaemonClient, anyhow::Error> {
+        DaemonClient::connect(&self.socket).await
+    }
+}
+
+struct IncomingEventContext<'a> {
+    session_id: Uuid,
+    events: &'a Arc<Mutex<Vec<TurnEvent>>>,
+    event_notify: &'a Arc<Notify>,
+    active_agent: &'a Arc<Mutex<String>>,
+    active_agent_path: &'a Arc<Mutex<Vec<String>>>,
+    primary_agent: &'a Arc<Mutex<String>>,
+    last_applied_seq: &'a Arc<Mutex<Option<i64>>>,
+}
+
+struct ReconnectBackoff {
+    base: Duration,
+    cap: Duration,
+    current: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        let base = Duration::from_millis(500);
+        Self {
+            base,
+            cap: Duration::from_secs(30),
+            current: base,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let max_millis = self.current.as_millis().min(u128::from(u64::MAX)) as u64;
+        let jitter = Duration::from_millis(rand::random_range(0..=max_millis));
+        let delay = self.base.saturating_add(jitter).min(self.cap);
+        self.current = self.current.saturating_mul(2).min(self.cap);
+        delay
+    }
+}
+
+fn history_entry_seq(entry: &proto::HistoryEntry) -> Option<i64> {
+    match entry {
+        proto::HistoryEntry::InterruptDecision { seq, .. }
+        | proto::HistoryEntry::User { seq, .. }
+        | proto::HistoryEntry::Assistant { seq, .. } => (*seq > 0).then_some(*seq),
+        proto::HistoryEntry::ToolCall { .. }
+        | proto::HistoryEntry::InferenceError { .. }
+        | proto::HistoryEntry::CompactBoundary { .. }
+        | proto::HistoryEntry::Subagent { .. } => None,
+    }
+}
+
+fn event_persisted_seq(event: &proto::Event) -> Option<i64> {
+    match event {
+        proto::Event::AssistantText { seq, .. }
+        | proto::Event::QueuedUserMessagesFolded { seq, .. }
+        | proto::Event::InterruptResolved { seq, .. } => *seq,
+        proto::Event::UserMessageRecorded { seq, .. } => Some(*seq),
+        proto::Event::HistoryReplay { max_seq, .. } => Some(*max_seq),
+        _ => None,
+    }
+}
+
+fn update_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>, seq: i64) {
+    let mut guard = last_applied_seq
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none_or(|last| seq > last) {
+        *guard = Some(seq);
+    }
+}
+
+fn current_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>) -> Option<i64> {
+    *last_applied_seq
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn is_global_event(event: &proto::Event) -> bool {
     matches!(
         event,
@@ -231,6 +324,7 @@ fn try_spawn_inner(
                 .client
                 .request(Request::Attach {
                     session_id,
+                    since_seq: None,
                     project_root: Some(project_root),
                     no_sandbox,
                     // The TUI can answer interrupts (approval / loop-guard /
@@ -367,16 +461,27 @@ fn try_spawn_inner(
     };
     let active_agent = Arc::new(Mutex::new(initial_active_agent));
     let active_agent_path = Arc::new(Mutex::new(initial_active_agent_path));
+    let last_applied_seq = Arc::new(Mutex::new(
+        history.iter().filter_map(history_entry_seq).max(),
+    ));
+    let current_client = Arc::new(RwLock::new(client));
+    let attach_context = AttachRequestContext {
+        session_id,
+        project_root: cwd.to_string_lossy().into_owned(),
+        no_sandbox,
+        env_snapshot: crate::env_snapshot::capture_tui_shell_env().0.to_wire(),
+    };
     let mut client_tasks = ClientTasks::default();
 
     // Outbound: TUI sends a submission (text + any image parts) → upload image
     // attachments first, then forward refs in SendUserMessage.
     {
-        let client = client.clone();
+        let current_client = current_client.clone();
         let events = events.clone();
         let event_notify = event_notify.clone();
         client_tasks.push(tokio::spawn(async move {
             while let Some(sub) = input_rx.recv().await {
+                let client = current_client.read().await.clone();
                 let refs = match upload_submission_images(&client, &sub.images).await {
                     Ok(refs) => refs,
                     Err(error) => {
@@ -422,7 +527,6 @@ fn try_spawn_inner(
                                 error: e.to_string(),
                             },
                         );
-                        break;
                     }
                 }
             }
@@ -431,9 +535,10 @@ fn try_spawn_inner(
 
     // Outbound: fire-and-forget autocomplete usage records.
     {
-        let client = client.clone();
+        let current_client = current_client.clone();
         client_tasks.push(tokio::spawn(async move {
             while let Some(req) = record_rx.recv().await {
+                let client = current_client.read().await.clone();
                 if let Err(e) = client.request(req).await {
                     tracing::warn!(error = ?e, "record_usage transport failed");
                 }
@@ -445,9 +550,10 @@ fn try_spawn_inner(
     // same daemon client that completed Attach because attachment is stored in
     // per-client daemon state, not in the socket path.
     {
-        let client = client.clone();
+        let current_client = current_client.clone();
         client_tasks.push(tokio::spawn(async move {
             while let Some(attached_request) = attached_request_rx.recv().await {
+                let client = current_client.read().await.clone();
                 let response = client
                     .request_ok(attached_request.request)
                     .await
@@ -464,7 +570,12 @@ fn try_spawn_inner(
         let event_notify = event_notify.clone();
         let active_agent = active_agent.clone();
         let active_agent_path = active_agent_path.clone();
-        let client = client.clone();
+        let current_client = current_client.clone();
+        let last_applied_seq = last_applied_seq.clone();
+        let attach_context = attach_context.clone();
+        let driver = LocalReconnectDriver {
+            socket: socket.clone(),
+        };
         // The current primary (root-frame) agent, tracked so a subagent pop
         // returns the active-agent slot to the right primary after a `/plan`
         // or `/build` swap (not a hardcoded `Build`). Seeded from the
@@ -478,15 +589,64 @@ fn try_spawn_inner(
                 .unwrap_or_else(|| active_agent.lock().unwrap().clone()),
         ));
         client_tasks.push(tokio::spawn(async move {
-            while let Some(event) = client.next_event().await {
-                // Daemon-global events carry no session_id and must reach this
-                // client regardless of which session it's attached to.
-                if !is_global_event(&event) && event_session(&event) != Some(session_id) {
-                    continue;
+            let mut saw_draining = false;
+            loop {
+                let client = current_client.read().await.clone();
+                while let Some(event) = client.next_event().await {
+                    if matches!(event, proto::Event::DaemonDraining { .. }) {
+                        saw_draining = true;
+                    }
+                    let incoming = IncomingEventContext {
+                        session_id,
+                        events: &events,
+                        event_notify: &event_notify,
+                        active_agent: &active_agent,
+                        active_agent_path: &active_agent_path,
+                        primary_agent: &primary_agent,
+                        last_applied_seq: &last_applied_seq,
+                    };
+                    apply_incoming_event(event, &incoming);
                 }
-                update_active_agent(&event, &active_agent, &active_agent_path, &primary_agent);
-                if let Some(translated) = proto_event_to_turn_event(event) {
-                    push_turn_event(&events, &event_notify, translated);
+                if !client.is_socket_backed() {
+                    return;
+                }
+
+                let mut attempt = 1;
+                push_turn_event(
+                    &events,
+                    &event_notify,
+                    TurnEvent::DaemonLinkReconnecting {
+                        restarting: saw_draining,
+                        attempt,
+                    },
+                );
+                let mut backoff = ReconnectBackoff::new();
+                loop {
+                    tokio::time::sleep(backoff.next_delay()).await;
+                    match reconnect_and_attach(&driver, &attach_context, &last_applied_seq).await {
+                        Ok(new_client) => {
+                            *current_client.write().await = new_client;
+                            saw_draining = false;
+                            push_turn_event(
+                                &events,
+                                &event_notify,
+                                TurnEvent::DaemonLinkReconnected,
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::debug!(error = ?error, attempt, "daemon reconnect failed");
+                            attempt = attempt.saturating_add(1);
+                            push_turn_event(
+                                &events,
+                                &event_notify,
+                                TurnEvent::DaemonLinkReconnecting {
+                                    restarting: saw_draining,
+                                    attempt,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }));
@@ -905,6 +1065,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
         | PrimarySwapped { session_id, .. }
@@ -943,6 +1104,77 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     })
 }
 
+async fn reconnect_and_attach(
+    driver: &LocalReconnectDriver,
+    attach_context: &AttachRequestContext,
+    last_applied_seq: &Arc<Mutex<Option<i64>>>,
+) -> Result<DaemonClient, anyhow::Error> {
+    let client = driver.connect().await?;
+    let response = client
+        .request_ok(Request::Attach {
+            session_id: Some(attach_context.session_id),
+            since_seq: current_last_applied_seq(last_applied_seq),
+            project_root: Some(attach_context.project_root.clone()),
+            no_sandbox: attach_context.no_sandbox,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+            env_snapshot: Some(attach_context.env_snapshot.clone()),
+            env_policy: crate::env_snapshot::EnvDriftPolicy::Client,
+        })
+        .await?;
+    match response {
+        Response::Attached { .. } => Ok(client),
+        other => Err(anyhow::anyhow!(
+            "unexpected reconnect attach response: {other:?}"
+        )),
+    }
+}
+
+fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
+    // Daemon-global events carry no session_id and must reach this client
+    // regardless of which session it's attached to.
+    if !is_global_event(&event) && event_session(&event) != Some(ctx.session_id) {
+        return;
+    }
+    let event_session_id = event_session(&event);
+
+    if let proto::Event::HistoryReplay {
+        entries, max_seq, ..
+    } = event
+    {
+        if current_last_applied_seq(ctx.last_applied_seq).is_some_and(|last| max_seq <= last) {
+            return;
+        }
+        update_last_applied_seq(ctx.last_applied_seq, max_seq);
+        push_turn_event(
+            ctx.events,
+            ctx.event_notify,
+            TurnEvent::HistoryReplay { entries },
+        );
+        return;
+    }
+
+    if event_session_id == Some(ctx.session_id)
+        && let Some(seq) = event_persisted_seq(&event)
+    {
+        if current_last_applied_seq(ctx.last_applied_seq).is_some_and(|last| seq <= last) {
+            return;
+        }
+        update_last_applied_seq(ctx.last_applied_seq, seq);
+    }
+
+    update_active_agent(
+        &event,
+        ctx.active_agent,
+        ctx.active_agent_path,
+        ctx.primary_agent,
+    );
+    if let Some(translated) = proto_event_to_turn_event(event) {
+        push_turn_event(ctx.events, ctx.event_notify, translated);
+    }
+}
+
 fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     use proto::Event::*;
     Some(match event {
@@ -961,6 +1193,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             model,
             url,
         },
+        HistoryReplay { entries, .. } => TurnEvent::HistoryReplay { entries },
         InferenceWarning {
             agent,
             provider,
@@ -1889,6 +2122,91 @@ mod tests {
             }
             other => panic!("expected env drift notice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_and_live_events_are_seq_idempotent() {
+        let sid = uuid::Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let primary_agent = Arc::new(Mutex::new("Build".to_string()));
+        let last = Arc::new(Mutex::new(Some(5)));
+        let incoming = IncomingEventContext {
+            session_id: sid,
+            events: &events,
+            event_notify: &notify,
+            active_agent: &active_agent,
+            active_agent_path: &active_agent_path,
+            primary_agent: &primary_agent,
+            last_applied_seq: &last,
+        };
+
+        apply_incoming_event(
+            proto::Event::AssistantText {
+                session_id: sid,
+                agent: "Build".to_string(),
+                text: "duplicate".to_string(),
+                reasoning: String::new(),
+                seq: Some(5),
+            },
+            &incoming,
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(current_last_applied_seq(&last), Some(5));
+
+        apply_incoming_event(
+            proto::Event::HistoryReplay {
+                session_id: sid,
+                max_seq: 7,
+                entries: vec![proto::HistoryEntry::Assistant {
+                    agent: "Build".to_string(),
+                    text: "replayed".to_string(),
+                    reasoning: String::new(),
+                    ts_ms: 0,
+                    seq: 7,
+                }],
+            },
+            &incoming,
+        );
+        assert_eq!(current_last_applied_seq(&last), Some(7));
+
+        apply_incoming_event(
+            proto::Event::AssistantText {
+                session_id: sid,
+                agent: "Build".to_string(),
+                text: "overlap".to_string(),
+                reasoning: String::new(),
+                seq: Some(7),
+            },
+            &incoming,
+        );
+        assert_eq!(events.lock().unwrap().len(), 1);
+
+        apply_incoming_event(
+            proto::Event::AssistantText {
+                session_id: sid,
+                agent: "Build".to_string(),
+                text: "live".to_string(),
+                reasoning: String::new(),
+                seq: Some(8),
+            },
+            &incoming,
+        );
+
+        let drained = drain_turn_events(&events);
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(drained[0], TurnEvent::HistoryReplay { .. }));
+        assert!(matches!(
+            &drained[1],
+            TurnEvent::AssistantText {
+                text,
+                seq: Some(8),
+                ..
+            } if text == "live"
+        ));
+        assert_eq!(current_last_applied_seq(&last), Some(8));
     }
 
     #[tokio::test(flavor = "current_thread")]

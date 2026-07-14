@@ -193,6 +193,7 @@ pub(crate) async fn attach_send_pump(
     let attached = client
         .request_ok(Request::Attach {
             session_id: requested_session,
+            since_seq: None,
             project_root: Some(project_root),
             no_sandbox,
             // A streamed run has no UI to answer an interrupt — a
@@ -728,6 +729,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
         | PrimarySwapped { session_id, .. }

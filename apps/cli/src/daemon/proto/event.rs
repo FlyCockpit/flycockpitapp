@@ -397,6 +397,15 @@ pub enum Event {
         seq: Option<i64>,
     },
 
+    /// Warm reattach replay of persisted timeline entries. `max_seq` is the
+    /// highest session_events seq represented by this batch, including entries
+    /// whose display shape does not carry its own seq field.
+    HistoryReplay {
+        session_id: Uuid,
+        entries: Vec<super::HistoryEntry>,
+        max_seq: i64,
+    },
+
     /// The agent yielded control back to the human: the driver loop
     /// finished the current user message (and any folded queue) and is
     /// now awaiting input. Distinct from the mid-turn gaps where no
@@ -763,6 +772,9 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 url,
             }]
         }
+        TurnEvent::DaemonLinkReconnecting { .. }
+        | TurnEvent::DaemonLinkReconnected
+        | TurnEvent::HistoryReplay { .. } => vec![],
         TurnEvent::AssistantTextDelta { agent, delta } => {
             vec![Event::AssistantTextDelta {
                 session_id,

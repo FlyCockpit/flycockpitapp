@@ -74,6 +74,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let attached = client
         .request_ok(Request::Attach {
             session_id: Some(session_id),
+            since_seq: None,
             project_root: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
             no_sandbox: false,
             interactive: false,

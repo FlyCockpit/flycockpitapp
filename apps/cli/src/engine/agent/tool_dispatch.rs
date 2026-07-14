@@ -607,38 +607,6 @@ pub(crate) async fn execute_ordinary_call(
         }
     }
 
-    if hard_fail {
-        let _ = env
-            .tx
-            .send(TurnEvent::ToolError {
-                agent: env.agent.name.clone(),
-                call_id: tc.id.clone(),
-                tool: resolved_name.to_string(),
-                error: output_str.clone(),
-                kind: fail_kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
-            })
-            .await;
-    } else {
-        let truncated = matches!(
-            &result,
-            Ok(ToolOutput {
-                truncated: true,
-                ..
-            })
-        );
-        let _ = env
-            .tx
-            .send(TurnEvent::ToolEnd {
-                agent: env.agent.name.clone(),
-                call_id: tc.id.clone(),
-                tool: resolved_name.to_string(),
-                output: output_str.clone(),
-                truncated,
-                hint: bash_hint.as_ref().map(|h| h.user_chip.text.clone()),
-            })
-            .await;
-    }
-
     let truncated = matches!(
         &result,
         Ok(ToolOutput {
@@ -713,7 +681,7 @@ pub(crate) async fn execute_ordinary_call(
         "recovery_kind": recovery_kind,
         "recovery_stage": recovery_stage,
         "hard_fail": hard_fail,
-        "output": output_str,
+        "output": output_str.clone(),
         "truncated": truncated,
         "duration_ms": duration_ms,
     });
@@ -767,13 +735,43 @@ pub(crate) async fn execute_ordinary_call(
     {
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
-    if let Err(e) = env.session.record_event(
+    let tool_call_seq = match env.session.record_event(
         crate::db::session_log::SessionEventKind::ToolCall,
         Some(&env.agent.name),
         Some(&tc.id),
         &event_data,
     ) {
-        tracing::warn!(error = %e, tool = %resolved_name, "record tool_call event failed");
+        Ok(seq) => Some(seq),
+        Err(e) => {
+            tracing::warn!(error = %e, tool = %resolved_name, "record tool_call event failed");
+            None
+        }
+    };
+    if hard_fail {
+        let _ = env
+            .tx
+            .send(TurnEvent::ToolError {
+                agent: env.agent.name.clone(),
+                call_id: tc.id.clone(),
+                tool: resolved_name.to_string(),
+                error: event_data["output"].as_str().unwrap_or("").to_string(),
+                kind: fail_kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
+                seq: tool_call_seq,
+            })
+            .await;
+    } else {
+        let _ = env
+            .tx
+            .send(TurnEvent::ToolEnd {
+                agent: env.agent.name.clone(),
+                call_id: tc.id.clone(),
+                tool: resolved_name.to_string(),
+                output: event_data["output"].as_str().unwrap_or("").to_string(),
+                truncated,
+                seq: tool_call_seq,
+                hint: bash_hint.as_ref().map(|h| h.user_chip.text.clone()),
+            })
+            .await;
     }
     if lifecycle_started {
         let lifecycle_status = if repeated_recoverable_tool_call_reject {

@@ -485,6 +485,9 @@ pub enum HistoryEntry {
     /// `original_input` unless §12 repair or §13c cascade rewrite
     /// fired).
     ToolCall {
+        /// `session_events.seq` of this tool-call timeline row.
+        #[serde(default)]
+        seq: i64,
         agent: String,
         call_id: String,
         tool: String,
@@ -505,11 +508,17 @@ pub enum HistoryEntry {
     /// Display-only terminal inference failure restored into attach history.
     /// Never enters model-bound rehydration context.
     InferenceError {
+        /// `session_events.seq` of this inference-failure timeline row.
+        #[serde(default)]
+        seq: i64,
         summary: String,
         #[serde(default)]
         detail: String,
     },
     CompactBoundary {
+        /// `session_events.seq` of this compaction timeline row.
+        #[serde(default)]
+        seq: i64,
         predecessor_short_id: String,
         seed_tool_count: usize,
         seed_tool_tokens: u64,
@@ -517,6 +526,9 @@ pub enum HistoryEntry {
         brief: Option<String>,
     },
     Subagent {
+        /// `session_events.seq` of this subagent-spawn timeline row.
+        #[serde(default)]
+        seq: i64,
         parent: String,
         child: String,
         task_call_id: String,

@@ -869,6 +869,7 @@ mod tests {
                 tool: "bash".into(),
                 error: "boom".into(),
                 kind: crate::engine::tool::ToolFailKind::Execution,
+                seq: None,
             },
             OutputFormat::Default,
             false,

@@ -209,6 +209,9 @@ pub enum Event {
         tool: String,
         output: String,
         truncated: bool,
+        /// `session_events.seq` for the corresponding persisted tool-call row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
         /// Post-result hint text (`engine::bash_hints`, the user-side
         /// `data.hint.text`) when a rule fired on this `bash` call; `None`
         /// otherwise. UI-only (wire-vs-user split, GOALS §14). `#[serde(default)]`
@@ -264,6 +267,9 @@ pub enum Event {
         tool: String,
         error: String,
         kind: crate::engine::tool::ToolFailKind,
+        /// `session_events.seq` for the corresponding persisted tool-call row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
     },
 
     /// An inference call failed terminally (TTFT / idle timeout, connection
@@ -774,6 +780,9 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         }
         TurnEvent::DaemonLinkReconnecting { .. }
         | TurnEvent::DaemonLinkReconnected
+        | TurnEvent::DaemonLinkTerminal { .. }
+        | TurnEvent::PausedWorkAvailable { .. }
+        | TurnEvent::ResumeRepairRequired { .. }
         | TurnEvent::HistoryReplay { .. } => vec![],
         TurnEvent::AssistantTextDelta { agent, delta } => {
             vec![Event::AssistantTextDelta {
@@ -870,6 +879,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             tool,
             output,
             truncated,
+            seq,
             hint,
         } => vec![Event::ToolEnd {
             session_id,
@@ -878,6 +888,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             tool,
             output,
             truncated,
+            seq,
             hint,
         }],
         TurnEvent::ResourceWait {
@@ -932,6 +943,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             tool,
             error,
             kind,
+            seq,
         } => vec![Event::ToolError {
             session_id,
             agent,
@@ -939,6 +951,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             tool,
             error,
             kind,
+            seq,
         }],
         TurnEvent::InferenceFailed {
             agent,

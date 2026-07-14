@@ -64,6 +64,18 @@ pub enum TurnEvent {
     DaemonLinkReconnecting { restarting: bool, attempt: u32 },
     /// The TUI reattached to the daemon after a socket drop.
     DaemonLinkReconnected,
+    /// Reattach reached a terminal attach error and will not retry.
+    DaemonLinkTerminal { error: String },
+    /// Reattach found durable paused work that needs a local decision.
+    PausedWorkAvailable {
+        session_id: uuid::Uuid,
+        items: Vec<crate::daemon::proto::PausedWorkSummary>,
+    },
+    /// Reattach found a read-only resume-repair state that needs a local
+    /// decision before continuing.
+    ResumeRepairRequired {
+        state: crate::daemon::proto::ResumeRepairState,
+    },
     /// Warm daemon reattach replay of persisted history entries.
     HistoryReplay {
         entries: Vec<crate::daemon::proto::HistoryEntry>,
@@ -153,6 +165,10 @@ pub enum TurnEvent {
         tool: String,
         output: String,
         truncated: bool,
+        /// `session_events.seq` for the durable tool-call timeline row when
+        /// the call was persisted. `None` for synthetic/display-only tool
+        /// events or when persistence failed.
+        seq: Option<i64>,
         /// Post-result hint text (`engine::bash_hints`, the user-side
         /// `data.hint.text`) when a rule fired on this `bash` call; `None`
         /// otherwise. UI-only — the model's copy carries the separate wire
@@ -195,6 +211,10 @@ pub enum TurnEvent {
         tool: String,
         error: String,
         kind: crate::engine::tool::ToolFailKind,
+        /// `session_events.seq` for the durable tool-call timeline row when
+        /// the call was persisted. `None` for synthetic/display-only tool
+        /// events or when persistence failed.
+        seq: Option<i64>,
     },
     /// An inference call failed terminally — a TTFT / idle timeout, a
     /// connection error, or a non-retryable HTTP response

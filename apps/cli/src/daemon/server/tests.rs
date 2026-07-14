@@ -278,6 +278,7 @@ mod tests {
     fn attach_history_is_scrubbed_only_for_non_owner() {
         let table = table_for("history-secret");
         let history = vec![proto::HistoryEntry::ToolCall {
+            seq: 1,
             agent: "Build".to_string(),
             call_id: "call-1".to_string(),
             tool: "bash".to_string(),
@@ -2834,6 +2835,100 @@ mod tests {
                 event: proto::Event::DaemonDraining { forced },
             } => assert!(!forced),
             other => panic!("expected DaemonDraining replay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empty() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", tmp.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let seq1 = ctx
+            .db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "already applied"}),
+            )
+            .unwrap();
+        let seq2 = ctx
+            .db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "missed while disconnected"}),
+            )
+            .unwrap();
+        let live_session = Arc::new(
+            Session::resume(ctx.db.clone(), session.session_id)
+                .unwrap()
+                .expect("session row"),
+        );
+        let (handle, _work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        ctx.registry.insert_test_worker(handle, join);
+
+        let mut state = ClientState::detached_for_test();
+        let response = handle_request(
+            Request::Attach {
+                session_id: Some(session.session_id),
+                since_seq: Some(seq1),
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                no_sandbox: false,
+                interactive: true,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("since_seq attach succeeds");
+
+        let Response::Attached { history, .. } = response else {
+            panic!("expected Attached response");
+        };
+        assert!(
+            history.is_empty(),
+            "since_seq attach flushes replay after Attached, not inside response history"
+        );
+        assert_eq!(state.pending_replay.len(), 1);
+        match state.pending_replay.pop().expect("pending replay") {
+            proto::Event::HistoryReplay {
+                session_id,
+                entries,
+                max_seq,
+            } => {
+                assert_eq!(session_id, session.session_id);
+                assert_eq!(max_seq, seq2);
+                assert_eq!(entries.len(), 1);
+                match &entries[0] {
+                    proto::HistoryEntry::User { text, seq, .. } => {
+                        assert_eq!(text, "missed while disconnected");
+                        assert_eq!(*seq, seq2);
+                    }
+                    other => panic!("expected replayed user message, got {other:?}"),
+                }
+            }
+            other => panic!("expected HistoryReplay, got {other:?}"),
         }
     }
 

@@ -12028,6 +12028,7 @@ mod keys_overlay_tests {
             tool: "read".into(),
             output: "orphan result\nsecond line".into(),
             truncated: false,
+            seq: None,
             hint: None,
         });
 
@@ -12066,6 +12067,7 @@ mod keys_overlay_tests {
                 tool: tool.into(),
                 output: output.into(),
                 truncated: false,
+                seq: None,
                 hint: None,
             });
         }
@@ -14610,6 +14612,7 @@ mod resume_history_conversion_tests {
                 seq: 2,
             },
             Wire::ToolCall {
+                seq: 3,
                 agent: "Build".into(),
                 call_id: "tc-1".into(),
                 tool: "read".into(),
@@ -14691,6 +14694,7 @@ mod resume_history_conversion_tests {
     #[test]
     fn consecutive_tool_calls_coalesce_into_one_box() {
         let tc = |id: &str| Wire::ToolCall {
+            seq: 1,
             agent: "Build".into(),
             call_id: id.into(),
             tool: "bash".into(),
@@ -14730,6 +14734,7 @@ mod resume_history_conversion_tests {
                 origin_principal: None,
             },
             Wire::InferenceError {
+                seq: 2,
                 summary: "Inference failed (p/m): network: first line".into(),
                 detail: "first line\nsecond line".into(),
             },
@@ -14786,6 +14791,7 @@ mod resume_history_conversion_tests {
                 origin_principal: None,
             },
             Wire::Subagent {
+                seq: 2,
                 parent: "Build".into(),
                 child: "builder".into(),
                 task_call_id: "task-1".into(),

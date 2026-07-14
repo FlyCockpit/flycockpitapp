@@ -191,24 +191,41 @@ impl App {
             TurnEvent::DaemonLinkReconnecting {
                 restarting,
                 attempt,
-            } => match &mut self.daemon_link {
-                Some(status) => {
-                    status.restarting = restarting;
-                    status.attempt = attempt;
+            } => {
+                self.finalize_pending();
+                match &mut self.daemon_link {
+                    Some(status) => {
+                        status.restarting = restarting;
+                        status.attempt = attempt;
+                    }
+                    None => {
+                        self.daemon_link = Some(super::DaemonLinkStatus {
+                            restarting,
+                            attempt,
+                            started_at: Instant::now(),
+                        });
+                    }
                 }
-                None => {
-                    self.daemon_link = Some(super::DaemonLinkStatus {
-                        restarting,
-                        attempt,
-                        started_at: Instant::now(),
-                    });
-                }
-            },
+            }
             TurnEvent::DaemonLinkReconnected => {
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                     self.show_toast("daemon reconnected", ToastKind::Success);
                 }
+            }
+            TurnEvent::DaemonLinkTerminal { error } => {
+                self.daemon_link = None;
+                self.daemon_draining = false;
+                self.finalize_pending();
+                self.end_working_span();
+                self.history
+                    .push(HistoryEntry::CommandError { line: error });
+            }
+            TurnEvent::PausedWorkAvailable { session_id, items } => {
+                self.maybe_prompt_paused_work(session_id, items);
+            }
+            TurnEvent::ResumeRepairRequired { state } => {
+                self.maybe_prompt_resume_repair(state);
             }
             TurnEvent::HistoryReplay { entries } => {
                 self.history.extend(wire_history_to_entries(entries));
@@ -1748,7 +1765,9 @@ pub(super) fn wire_history_to_entries(
                     });
                 }
             }
-            Wire::InferenceError { summary, detail } => out.push(HistoryEntry::InferenceError {
+            Wire::InferenceError {
+                summary, detail, ..
+            } => out.push(HistoryEntry::InferenceError {
                 summary,
                 detail,
                 expanded: false,
@@ -1758,6 +1777,7 @@ pub(super) fn wire_history_to_entries(
                 seed_tool_count,
                 seed_tool_tokens,
                 brief,
+                ..
             } => out.push(HistoryEntry::CompactBoundary {
                 predecessor_short_id,
                 seed_tool_count,
@@ -1770,6 +1790,7 @@ pub(super) fn wire_history_to_entries(
                 child,
                 task_call_id,
                 label,
+                ..
             } => out.push(HistoryEntry::Subagent {
                 parent,
                 child,

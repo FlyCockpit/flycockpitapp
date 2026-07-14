@@ -397,6 +397,7 @@ fn history_snapshot_from_events_conn(
                     Some(tc) => {
                         let (recovery_kind, recovery_stage) = tc.recovery.raw_db_fields();
                         proto::HistoryEntry::ToolCall {
+                            seq: ev.seq,
                             agent: tc.agent.clone(),
                             call_id: call_id.to_string(),
                             tool: tc.tool.clone(),
@@ -437,6 +438,7 @@ fn history_snapshot_from_events_conn(
                             .unwrap_or("")
                             .to_string();
                         proto::HistoryEntry::ToolCall {
+                            seq: ev.seq,
                             agent: ev.agent.clone().unwrap_or_default(),
                             call_id: call_id.to_string(),
                             tool,
@@ -467,7 +469,11 @@ fn history_snapshot_from_events_conn(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                snapshot.push(proto::HistoryEntry::InferenceError { summary, detail });
+                snapshot.push(proto::HistoryEntry::InferenceError {
+                    seq: ev.seq,
+                    summary,
+                    detail,
+                });
             }
             "subagent_spawned" => {
                 let Some(active) = active_subagent else {
@@ -491,6 +497,7 @@ fn history_snapshot_from_events_conn(
                     && label == active.label
                 {
                     snapshot.push(proto::HistoryEntry::Subagent {
+                        seq: ev.seq,
                         parent: parent.to_string(),
                         child: child.to_string(),
                         task_call_id: task_call_id.to_string(),
@@ -516,6 +523,7 @@ fn history_snapshot_from_events_conn(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 snapshot.push(proto::HistoryEntry::CompactBoundary {
+                    seq: ev.seq,
                     predecessor_short_id,
                     seed_tool_count,
                     seed_tool_tokens: 0,
@@ -599,6 +607,7 @@ pub fn subagent_history_snapshot_conn(
                     Some(tc) => {
                         let (recovery_kind, recovery_stage) = tc.recovery.raw_db_fields();
                         proto::HistoryEntry::ToolCall {
+                            seq: ev.seq,
                             agent: tc.agent.clone(),
                             call_id: call_id.to_string(),
                             tool: tc.tool.clone(),
@@ -637,6 +646,7 @@ pub fn subagent_history_snapshot_conn(
                             .unwrap_or("")
                             .to_string();
                         proto::HistoryEntry::ToolCall {
+                            seq: ev.seq,
                             agent: ev.agent.clone().unwrap_or_default(),
                             call_id: call_id.to_string(),
                             tool,
@@ -665,7 +675,11 @@ pub fn subagent_history_snapshot_conn(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                snapshot.push(proto::HistoryEntry::InferenceError { summary, detail });
+                snapshot.push(proto::HistoryEntry::InferenceError {
+                    seq: ev.seq,
+                    summary,
+                    detail,
+                });
             }
             "subagent_spawned" => {
                 let parent = ev.data.get("parent").and_then(|v| v.as_str()).unwrap_or("");
@@ -686,6 +700,7 @@ pub fn subagent_history_snapshot_conn(
                     .or_else(|| ev.data.get("task_call_id").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 snapshot.push(proto::HistoryEntry::Subagent {
+                    seq: ev.seq,
                     parent: parent.to_string(),
                     child: child.to_string(),
                     task_call_id: child_task_call_id.to_string(),
@@ -2027,7 +2042,9 @@ mod tests {
         assert_eq!(snapshot.len(), 3);
         assert!(matches!(snapshot[0], proto::HistoryEntry::User { .. }));
         match &snapshot[1] {
-            proto::HistoryEntry::InferenceError { summary, detail } => {
+            proto::HistoryEntry::InferenceError {
+                summary, detail, ..
+            } => {
                 assert_eq!(summary, "Inference failed (local/bad): network: first line");
                 assert_eq!(detail, "first line\nsecond line");
             }
@@ -2051,7 +2068,9 @@ mod tests {
         let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
         assert_eq!(snapshot.len(), 1);
         match &snapshot[0] {
-            proto::HistoryEntry::InferenceError { summary, detail } => {
+            proto::HistoryEntry::InferenceError {
+                summary, detail, ..
+            } => {
                 assert_eq!(
                     summary,
                     "Inference failed (local/slow): no first token within the timeout"
@@ -4009,6 +4028,7 @@ mod tests {
                 child,
                 task_call_id,
                 label,
+                ..
             } => {
                 assert_eq!(parent, "Build");
                 assert_eq!(child, "builder");

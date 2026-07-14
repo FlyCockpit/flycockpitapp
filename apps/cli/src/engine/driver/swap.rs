@@ -400,6 +400,7 @@ impl Driver {
                 tool: "handoff".to_string(),
                 output: display.clone(),
                 truncated: false,
+                seq: None,
                 // The hint layer is `bash`-only.
                 hint: None,
             })

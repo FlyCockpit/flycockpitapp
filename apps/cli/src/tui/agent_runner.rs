@@ -188,25 +188,57 @@ struct IncomingEventContext<'a> {
     last_applied_seq: &'a Arc<Mutex<Option<i64>>>,
 }
 
-struct ReconnectBackoff {
+trait JitterSource {
+    fn next_millis(&mut self, inclusive_upper: u64) -> u64;
+}
+
+struct RandomJitter;
+
+impl JitterSource for RandomJitter {
+    fn next_millis(&mut self, inclusive_upper: u64) -> u64 {
+        rand::random_range(0..=inclusive_upper)
+    }
+}
+
+struct ReconnectBackoff<J = RandomJitter> {
     base: Duration,
     cap: Duration,
     current: Duration,
+    jitter: J,
 }
 
-impl ReconnectBackoff {
+struct ReconnectAttach {
+    client: DaemonClient,
+    history: Vec<proto::HistoryEntry>,
+    paused_work: Vec<proto::PausedWorkSummary>,
+    repair_required: Option<proto::ResumeRepairState>,
+}
+
+enum ReconnectAttachError {
+    Retriable(anyhow::Error),
+    Terminal(String),
+}
+
+impl ReconnectBackoff<RandomJitter> {
     fn new() -> Self {
+        Self::with_jitter(RandomJitter)
+    }
+}
+
+impl<J: JitterSource> ReconnectBackoff<J> {
+    fn with_jitter(jitter: J) -> Self {
         let base = Duration::from_millis(500);
         Self {
             base,
             cap: Duration::from_secs(30),
             current: base,
+            jitter,
         }
     }
 
     fn next_delay(&mut self) -> Duration {
         let max_millis = self.current.as_millis().min(u128::from(u64::MAX)) as u64;
-        let jitter = Duration::from_millis(rand::random_range(0..=max_millis));
+        let jitter = Duration::from_millis(self.jitter.next_millis(max_millis));
         let delay = self.base.saturating_add(jitter).min(self.cap);
         self.current = self.current.saturating_mul(2).min(self.cap);
         delay
@@ -217,11 +249,11 @@ fn history_entry_seq(entry: &proto::HistoryEntry) -> Option<i64> {
     match entry {
         proto::HistoryEntry::InterruptDecision { seq, .. }
         | proto::HistoryEntry::User { seq, .. }
-        | proto::HistoryEntry::Assistant { seq, .. } => (*seq > 0).then_some(*seq),
-        proto::HistoryEntry::ToolCall { .. }
-        | proto::HistoryEntry::InferenceError { .. }
-        | proto::HistoryEntry::CompactBoundary { .. }
-        | proto::HistoryEntry::Subagent { .. } => None,
+        | proto::HistoryEntry::Assistant { seq, .. }
+        | proto::HistoryEntry::ToolCall { seq, .. }
+        | proto::HistoryEntry::InferenceError { seq, .. }
+        | proto::HistoryEntry::CompactBoundary { seq, .. }
+        | proto::HistoryEntry::Subagent { seq, .. } => (*seq > 0).then_some(*seq),
     }
 }
 
@@ -229,7 +261,9 @@ fn event_persisted_seq(event: &proto::Event) -> Option<i64> {
     match event {
         proto::Event::AssistantText { seq, .. }
         | proto::Event::QueuedUserMessagesFolded { seq, .. }
-        | proto::Event::InterruptResolved { seq, .. } => *seq,
+        | proto::Event::InterruptResolved { seq, .. }
+        | proto::Event::ToolEnd { seq, .. }
+        | proto::Event::ToolError { seq, .. } => *seq,
         proto::Event::UserMessageRecorded { seq, .. } => Some(*seq),
         proto::Event::HistoryReplay { max_seq, .. } => Some(*max_seq),
         _ => None,
@@ -595,6 +629,8 @@ fn try_spawn_inner(
                 while let Some(event) = client.next_event().await {
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
+                    } else if saw_draining {
+                        saw_draining = false;
                     }
                     let incoming = IncomingEventContext {
                         session_id,
@@ -624,7 +660,17 @@ fn try_spawn_inner(
                 loop {
                     tokio::time::sleep(backoff.next_delay()).await;
                     match reconnect_and_attach(&driver, &attach_context, &last_applied_seq).await {
-                        Ok(new_client) => {
+                        Ok(attached) => {
+                            let incoming = IncomingEventContext {
+                                session_id,
+                                events: &events,
+                                event_notify: &event_notify,
+                                active_agent: &active_agent,
+                                active_agent_path: &active_agent_path,
+                                primary_agent: &primary_agent,
+                                last_applied_seq: &last_applied_seq,
+                            };
+                            let new_client = apply_reconnect_attached(attached, &incoming);
                             *current_client.write().await = new_client;
                             saw_draining = false;
                             push_turn_event(
@@ -634,7 +680,7 @@ fn try_spawn_inner(
                             );
                             break;
                         }
-                        Err(error) => {
+                        Err(ReconnectAttachError::Retriable(error)) => {
                             tracing::debug!(error = ?error, attempt, "daemon reconnect failed");
                             attempt = attempt.saturating_add(1);
                             push_turn_event(
@@ -645,6 +691,15 @@ fn try_spawn_inner(
                                     attempt,
                                 },
                             );
+                        }
+                        Err(ReconnectAttachError::Terminal(error)) => {
+                            tracing::warn!(%error, "daemon reconnect attach stopped");
+                            push_turn_event(
+                                &events,
+                                &event_notify,
+                                TurnEvent::DaemonLinkTerminal { error },
+                            );
+                            return;
                         }
                     }
                 }
@@ -1129,10 +1184,13 @@ async fn reconnect_and_attach(
     driver: &LocalReconnectDriver,
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
-) -> Result<DaemonClient, anyhow::Error> {
-    let client = driver.connect().await?;
+) -> Result<ReconnectAttach, ReconnectAttachError> {
+    let client = driver
+        .connect()
+        .await
+        .map_err(ReconnectAttachError::Retriable)?;
     let response = client
-        .request_ok(Request::Attach {
+        .request(Request::Attach {
             session_id: Some(attach_context.session_id),
             since_seq: current_last_applied_seq(last_applied_seq),
             project_root: Some(attach_context.project_root.clone()),
@@ -1143,13 +1201,77 @@ async fn reconnect_and_attach(
             env_snapshot: Some(attach_context.env_snapshot.clone()),
             env_policy: crate::env_snapshot::EnvDriftPolicy::Client,
         })
-        .await?;
+        .await
+        .map_err(ReconnectAttachError::Retriable)?;
     match response {
-        Response::Attached { .. } => Ok(client),
-        other => Err(anyhow::anyhow!(
-            "unexpected reconnect attach response: {other:?}"
-        )),
+        Ok(Response::Attached {
+            history,
+            paused_work,
+            repair_required,
+            ..
+        }) => Ok(ReconnectAttach {
+            client,
+            history,
+            paused_work,
+            repair_required: repair_required.map(|repair| *repair),
+        }),
+        Ok(other) => Err(ReconnectAttachError::Terminal(format!(
+            "reconnect attach returned unexpected response: {other:?}"
+        ))),
+        Err(error) => {
+            let prefix = if error.code == ErrorCode::UnknownSession {
+                "session no longer exists"
+            } else {
+                "daemon rejected reconnect attach"
+            };
+            Err(ReconnectAttachError::Terminal(format!("{prefix}: {error}")))
+        }
     }
+}
+
+fn apply_reconnect_attached(
+    attached: ReconnectAttach,
+    ctx: &IncomingEventContext<'_>,
+) -> DaemonClient {
+    if let Some(repair) = attached.repair_required {
+        push_turn_event(
+            ctx.events,
+            ctx.event_notify,
+            TurnEvent::ResumeRepairRequired { state: repair },
+        );
+    }
+    if !attached.paused_work.is_empty() {
+        push_turn_event(
+            ctx.events,
+            ctx.event_notify,
+            TurnEvent::PausedWorkAvailable {
+                session_id: ctx.session_id,
+                items: attached.paused_work,
+            },
+        );
+    }
+    if !attached.history.is_empty() {
+        let max_seq = attached.history.iter().filter_map(history_entry_seq).max();
+        if let Some(max_seq) = max_seq {
+            apply_incoming_event(
+                proto::Event::HistoryReplay {
+                    session_id: ctx.session_id,
+                    entries: attached.history,
+                    max_seq,
+                },
+                ctx,
+            );
+        } else {
+            push_turn_event(
+                ctx.events,
+                ctx.event_notify,
+                TurnEvent::HistoryReplay {
+                    entries: attached.history,
+                },
+            );
+        }
+    }
+    attached.client
 }
 
 fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
@@ -1164,10 +1286,25 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
         entries, max_seq, ..
     } = event
     {
-        if current_last_applied_seq(ctx.last_applied_seq).is_some_and(|last| max_seq <= last) {
+        let last = current_last_applied_seq(ctx.last_applied_seq);
+        if last.is_some_and(|last| max_seq <= last) {
             return;
         }
-        update_last_applied_seq(ctx.last_applied_seq, max_seq);
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| {
+                history_entry_seq(entry).is_none_or(|seq| last.is_none_or(|last| seq > last))
+            })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let applied_max_seq = entries
+            .iter()
+            .filter_map(history_entry_seq)
+            .max()
+            .unwrap_or(max_seq);
+        update_last_applied_seq(ctx.last_applied_seq, applied_max_seq);
         push_turn_event(
             ctx.events,
             ctx.event_notify,
@@ -1298,6 +1435,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             tool,
             output,
             truncated,
+            seq,
             hint,
             ..
         } => TurnEvent::ToolEnd {
@@ -1306,6 +1444,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             tool,
             output,
             truncated,
+            seq,
             hint,
         },
         ResourceWait {
@@ -1360,6 +1499,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             tool,
             error,
             kind,
+            seq,
             ..
         } => TurnEvent::ToolError {
             agent,
@@ -1367,6 +1507,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             tool,
             error,
             kind,
+            seq,
         },
         InferenceFailed {
             agent,
@@ -1470,7 +1611,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         AgentIdle {
             turn_id, reason, ..
         } => TurnEvent::AgentIdle { turn_id, reason },
-        PausedWorkAvailable { .. } => return None,
+        PausedWorkAvailable {
+            session_id, items, ..
+        } => TurnEvent::PausedWorkAvailable { session_id, items },
         ScheduleStarted {
             session_id,
             job_id,
@@ -2146,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_and_live_events_are_seq_idempotent() {
+    fn since_seq_replay_and_live_tool_events_are_seq_idempotent() {
         let sid = uuid::Uuid::new_v4();
         let events = Arc::new(Mutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
@@ -2181,37 +2324,59 @@ mod tests {
             proto::Event::HistoryReplay {
                 session_id: sid,
                 max_seq: 7,
-                entries: vec![proto::HistoryEntry::Assistant {
-                    agent: "Build".to_string(),
-                    text: "replayed".to_string(),
-                    reasoning: String::new(),
-                    ts_ms: 0,
-                    seq: 7,
-                }],
+                entries: vec![
+                    proto::HistoryEntry::ToolCall {
+                        seq: 6,
+                        agent: "Build".to_string(),
+                        call_id: "tool-1".to_string(),
+                        tool: "read".to_string(),
+                        original_input: serde_json::json!({"path": "src/lib.rs"}),
+                        wire_input: serde_json::json!({"path": "src/lib.rs"}),
+                        recovery_kind: None,
+                        recovery_stage: None,
+                        output: "body".to_string(),
+                        hard_fail: false,
+                        truncated: false,
+                        hint: None,
+                    },
+                    proto::HistoryEntry::Assistant {
+                        agent: "Build".to_string(),
+                        text: "replayed".to_string(),
+                        reasoning: String::new(),
+                        ts_ms: 0,
+                        seq: 7,
+                    },
+                ],
             },
             &incoming,
         );
         assert_eq!(current_last_applied_seq(&last), Some(7));
 
         apply_incoming_event(
-            proto::Event::AssistantText {
+            proto::Event::ToolEnd {
                 session_id: sid,
                 agent: "Build".to_string(),
-                text: "overlap".to_string(),
-                reasoning: String::new(),
+                call_id: "tool-1".to_string(),
+                tool: "read".to_string(),
+                output: "overlap".to_string(),
+                truncated: false,
                 seq: Some(7),
+                hint: None,
             },
             &incoming,
         );
         assert_eq!(events.lock().unwrap().len(), 1);
 
         apply_incoming_event(
-            proto::Event::AssistantText {
+            proto::Event::ToolEnd {
                 session_id: sid,
                 agent: "Build".to_string(),
-                text: "live".to_string(),
-                reasoning: String::new(),
+                call_id: "tool-2".to_string(),
+                tool: "bash".to_string(),
+                output: "live".to_string(),
+                truncated: false,
                 seq: Some(8),
+                hint: None,
             },
             &incoming,
         );
@@ -2221,13 +2386,43 @@ mod tests {
         assert!(matches!(drained[0], TurnEvent::HistoryReplay { .. }));
         assert!(matches!(
             &drained[1],
-            TurnEvent::AssistantText {
-                text,
+            TurnEvent::ToolEnd {
+                output,
                 seq: Some(8),
                 ..
-            } if text == "live"
+            } if output == "live"
         ));
         assert_eq!(current_last_applied_seq(&last), Some(8));
+    }
+
+    struct FixedJitter {
+        values: std::collections::VecDeque<u64>,
+        seen_upper_bounds: Vec<u64>,
+    }
+
+    impl JitterSource for FixedJitter {
+        fn next_millis(&mut self, inclusive_upper: u64) -> u64 {
+            self.seen_upper_bounds.push(inclusive_upper);
+            self.values.pop_front().unwrap_or(inclusive_upper)
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_uses_injected_jitter_rising_floor_and_cap() {
+        let jitter = FixedJitter {
+            values: [0, 500, 1_500, 60_000].into(),
+            seen_upper_bounds: Vec::new(),
+        };
+        let mut backoff = ReconnectBackoff::with_jitter(jitter);
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(1_000));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(2_000));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+        assert_eq!(
+            backoff.jitter.seen_upper_bounds,
+            vec![500, 1_000, 2_000, 4_000]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

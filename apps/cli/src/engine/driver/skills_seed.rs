@@ -222,6 +222,7 @@ impl Driver {
                     tool: seed.tool.clone(),
                     output: body.clone(),
                     truncated: false,
+                    seq: None,
                     // The hint layer is `bash`-only.
                     hint: None,
                 })
@@ -333,6 +334,7 @@ impl Driver {
                         tool: seed.tool.clone(),
                         output: body.clone(),
                         truncated: false,
+                        seq: None,
                         // The hint layer is `bash`-only.
                         hint: None,
                     })
@@ -760,6 +762,7 @@ impl Driver {
                 tool: "skill".to_string(),
                 output: body.clone(),
                 truncated: false,
+                seq: None,
                 // The hint layer is `bash`-only.
                 hint: None,
             })

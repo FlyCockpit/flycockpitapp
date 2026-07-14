@@ -5067,6 +5067,7 @@ impl Driver {
                             tool: "spawn".to_string(),
                             output: output.clone(),
                             truncated: false,
+                            seq: None,
                             // The hint layer is `bash`-only.
                             hint: None,
                         })
@@ -5161,6 +5162,7 @@ impl Driver {
                                 tool: "schedule".to_string(),
                                 error: output.clone(),
                                 kind: kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
+                                seq: None,
                             })
                             .await;
                     } else {
@@ -5171,6 +5173,7 @@ impl Driver {
                                 tool: "schedule".to_string(),
                                 output: output.clone(),
                                 truncated: false,
+                                seq: None,
                                 // The hint layer is `bash`-only.
                                 hint: None,
                             })

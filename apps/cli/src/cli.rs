@@ -414,6 +414,21 @@ pub enum DaemonCommand {
         #[arg(long, value_name = "SECS")]
         grace: Option<u64>,
     },
+    /// Gracefully restart the daemon, resuming active sessions by default.
+    #[command(
+        after_help = "There is no --sandbox flag; to force sandboxing back on, run `cockpit daemon stop` then `cockpit daemon start --detach`."
+    )]
+    Restart {
+        /// Grace period, in seconds, before forcing in-flight work to stop.
+        #[arg(long, value_name = "SECS")]
+        grace: Option<u64>,
+        /// Start the replacement daemon without resuming paused work.
+        #[arg(long)]
+        no_resume: bool,
+        /// Disable filesystem sandboxing for the replacement daemon.
+        #[arg(long)]
+        no_sandbox: bool,
+    },
     /// Print whether the daemon is running.
     Status,
 }
@@ -1006,6 +1021,47 @@ mod tests {
             }
             other => panic!("expected daemon stop command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn daemon_restart_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "cockpit",
+            "daemon",
+            "restart",
+            "--grace",
+            "0",
+            "--no-resume",
+            "--no-sandbox",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Daemon(DaemonCommand::Restart {
+                grace,
+                no_resume,
+                no_sandbox,
+            })) => {
+                assert_eq!(grace, Some(0));
+                assert!(no_resume);
+                assert!(no_sandbox);
+            }
+            other => panic!("expected daemon restart command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_restart_help_documents_sandbox_parity_note() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("daemon")
+            .unwrap()
+            .find_subcommand_mut("restart")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("There is no --sandbox flag"), "{help}");
+        assert!(help.contains("--no-resume"), "{help}");
+        assert!(help.contains("--grace"), "{help}");
     }
 
     #[test]

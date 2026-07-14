@@ -594,6 +594,67 @@ pub fn spawn_detached_with_resume(no_sandbox: bool, resume_all_sessions: bool) -
     spawn_detached_inner(None, no_sandbox, resume_all_sessions)
 }
 
+pub fn restart_no_sandbox_from_argv(args: &[String], explicit_no_sandbox: bool) -> bool {
+    explicit_no_sandbox
+        || (cmdline_is_cockpit_daemon(args) && args.iter().any(|arg| arg == "--no-sandbox"))
+}
+
+pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool) -> bool {
+    if explicit_no_sandbox {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let Some(pid) = read_pid(paths) else {
+            return false;
+        };
+        read_process_cmdline(pid)
+            .map(|args| restart_no_sandbox_from_argv(&args, false))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        false
+    }
+}
+
+pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
+    read_pid(paths)
+}
+
+pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
+    let drain = grace_secs
+        .map(Duration::from_secs)
+        .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
+    drain.saturating_add(Duration::from_secs(2))
+}
+
+pub async fn wait_for_restart_release(
+    paths: &DaemonPaths,
+    expected_pid: Option<u32>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if restart_metadata_released(paths, expected_pid) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(pid) = expected_pid {
+                remove_metadata_if_pid_matches(paths, pid);
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
+    let pid_released = expected_pid.is_none_or(|pid| read_pid(paths) != Some(pid));
+    pid_released && !paths.pid_file.exists() && !paths.socket.exists()
+}
+
 /// Spawn a detached *ephemeral* daemon bound to `paths` (a unique
 /// `cockpit-eph-<pid>-<nonce>` path set).
 /// The child binds the exact path the parent chose by reading the
@@ -1181,7 +1242,6 @@ fn parse_macos_procargs2(bytes: &[u8]) -> std::io::Result<Vec<String>> {
     Ok(args)
 }
 
-#[cfg(unix)]
 fn cmdline_is_cockpit_daemon(args: &[String]) -> bool {
     let Some(program) = args.first() else {
         return false;
@@ -1980,6 +2040,57 @@ mod tests {
 
         assert!(err.to_string().contains("could not be verified"));
         assert!(paths.pid_file.exists());
+    }
+
+    #[test]
+    fn restart_no_sandbox_derives_from_old_daemon_argv_and_explicit_override() {
+        let sandboxed = vec![
+            "/usr/bin/cockpit".to_string(),
+            "daemon".to_string(),
+            "start".to_string(),
+            "--foreground".to_string(),
+        ];
+        let unsandboxed = vec![
+            "/usr/bin/cockpit".to_string(),
+            "daemon".to_string(),
+            "start".to_string(),
+            "--foreground".to_string(),
+            "--no-sandbox".to_string(),
+        ];
+        let unrelated = vec![
+            "/usr/bin/cockpit".to_string(),
+            "session".to_string(),
+            "list".to_string(),
+            "--no-sandbox".to_string(),
+        ];
+
+        assert!(!restart_no_sandbox_from_argv(&sandboxed, false));
+        assert!(restart_no_sandbox_from_argv(&unsandboxed, false));
+        assert!(!restart_no_sandbox_from_argv(&unrelated, false));
+        assert!(restart_no_sandbox_from_argv(&sandboxed, true));
+    }
+
+    #[test]
+    fn restart_release_timeout_uses_default_drain_plus_cleanup_window() {
+        assert_eq!(
+            restart_release_timeout(None),
+            shutdown::SHUTDOWN_DRAIN_GRACE + Duration::from_secs(2)
+        );
+        assert_eq!(restart_release_timeout(Some(0)), Duration::from_secs(2));
+        assert_eq!(restart_release_timeout(Some(7)), Duration::from_secs(9));
+    }
+
+    #[tokio::test]
+    async fn restart_release_wait_cleans_matching_metadata_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::write(&paths.pid_file, "123").unwrap();
+        std::fs::write(&paths.socket, "").unwrap();
+
+        wait_for_restart_release(&paths, Some(123), Duration::ZERO).await;
+
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.socket.exists());
     }
 
     #[cfg(unix)]

@@ -52,11 +52,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
         }
         DaemonCommand::Stop { grace } => {
-            if let Some(secs) = grace
-                && secs > MAX_STOP_GRACE_SECS
-            {
-                bail!("--grace must be <= {MAX_STOP_GRACE_SECS} seconds");
-            }
+            validate_grace(grace)?;
             if let Ok(client) = DaemonClient::connect(&paths.socket).await {
                 client
                     .request_ok(Request::StopDaemon { grace_secs: grace })
@@ -75,6 +71,53 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 }
             } else {
                 println!("daemon: not running (no pid file)");
+            }
+            Ok(())
+        }
+        DaemonCommand::Restart {
+            grace,
+            no_resume,
+            no_sandbox,
+        } => {
+            validate_grace(grace)?;
+            let old_pid = daemon::daemon_pid(&paths);
+            let discovered = daemon::discover().await;
+            let should_stop =
+                old_pid.is_some() || !matches!(discovered.status, DaemonStatus::NotRunning);
+            let replacement_no_sandbox = if should_stop {
+                daemon::derive_restart_no_sandbox(&paths, no_sandbox)
+            } else {
+                no_sandbox
+            };
+            let resume = !no_resume;
+
+            if should_stop {
+                if let Ok(client) = DaemonClient::connect(&paths.socket).await {
+                    client
+                        .request_ok(Request::StopDaemon { grace_secs: grace })
+                        .await?;
+                } else {
+                    let _ = daemon::stop(&paths)?;
+                }
+                daemon::wait_for_restart_release(
+                    &paths,
+                    old_pid,
+                    daemon::restart_release_timeout(grace),
+                )
+                .await;
+            }
+
+            let pid = daemon::spawn_detached_with_resume(replacement_no_sandbox, resume)?;
+            if should_stop {
+                println!(
+                    "daemon: restarted (pid {pid})\n  socket: {}",
+                    paths.socket.display()
+                );
+            } else {
+                println!(
+                    "daemon: was not running; started (pid {pid})\n  socket: {}",
+                    paths.socket.display()
+                );
             }
             Ok(())
         }
@@ -112,9 +155,18 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
     }
 }
 
+fn validate_grace(grace: Option<u64>) -> Result<()> {
+    if let Some(secs) = grace
+        && secs > MAX_STOP_GRACE_SECS
+    {
+        bail!("--grace must be <= {MAX_STOP_GRACE_SECS} seconds");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::EPHEMERAL_TUI_NOTE;
+    use super::{EPHEMERAL_TUI_NOTE, validate_grace};
 
     #[test]
     fn stale_and_not_running_note_mentions_ephemeral_tui_without_discovery() {
@@ -122,5 +174,13 @@ mod tests {
         assert!(EPHEMERAL_TUI_NOTE.contains("separate ephemeral daemon"));
         assert!(!EPHEMERAL_TUI_NOTE.contains("pid"));
         assert!(!EPHEMERAL_TUI_NOTE.contains("socket"));
+    }
+
+    #[test]
+    fn grace_validation_allows_zero_and_rejects_absurd_values() {
+        assert!(validate_grace(Some(0)).is_ok());
+        assert!(validate_grace(Some(24 * 60 * 60)).is_ok());
+        let err = validate_grace(Some(24 * 60 * 60 + 1)).unwrap_err();
+        assert!(err.to_string().contains("--grace"));
     }
 }

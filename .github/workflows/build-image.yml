@@ -30,10 +30,10 @@ jobs:
             dockerfile: ./Dockerfile.worker
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
 
       # Build the image defined by the repo-root Dockerfile but do NOT push it.
       # The consumer of this template should add a push step (or a follow-up
@@ -41,7 +41,7 @@ jobs:
       # `load: true` puts the built image in the local Docker daemon so the
       # subsequent Trivy step can scan it by tag.
       - name: Build ${{ matrix.name }} image
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -59,7 +59,7 @@ jobs:
       # no patch available so we don't fail builds on advisories the user
       # cannot resolve. Drop that flag if you want to fail on those too.
       - name: Scan ${{ matrix.name }} image with Trivy
-        uses: aquasecurity/trivy-action@314ff8b43182423b84c50b1670b0e10f858f2d98  # v0.36.0
+        uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8  # v0.36.0
         with:
           image-ref: ${{ github.event.repository.name }}-${{ matrix.name }}:${{ github.sha }}
           severity: HIGH,CRITICAL

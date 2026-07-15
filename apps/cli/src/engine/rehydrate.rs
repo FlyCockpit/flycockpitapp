@@ -539,6 +539,16 @@ fn history_snapshot_from_events_conn(
     Ok(snapshot)
 }
 
+#[cfg(test)]
+pub(crate) fn history_snapshot_from_event_rows_for_test(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+    events: Vec<SessionEventRow>,
+) -> Result<Vec<proto::HistoryEntry>> {
+    history_snapshot_from_events_conn(conn, session_id, root_agent, None, events)
+}
+
 pub fn subagent_history_snapshot_conn(
     conn: &Connection,
     session_id: Uuid,

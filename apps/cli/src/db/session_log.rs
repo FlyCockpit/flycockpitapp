@@ -346,13 +346,13 @@ impl Db {
             )
             .context("preparing list_session_events")?;
         let rows = stmt
-            .query_map([session_id.to_string()], decode_event_row)
+            .query_map([session_id.to_string()], raw_event_row)
             .context("querying session_events")?;
-        let mut out = Vec::new();
+        let mut raw = Vec::new();
         for r in rows {
-            out.push(r.context("decoding session_event row")??);
+            raw.push(r.context("reading session_event row")?);
         }
-        Ok(out)
+        decode_event_rows(raw)
     }
 
     pub fn list_session_events_since_conn(
@@ -369,13 +369,13 @@ impl Db {
             )
             .context("preparing list_session_events_since")?;
         let rows = stmt
-            .query_map(params![session_id.to_string(), since_seq], decode_event_row)
+            .query_map(params![session_id.to_string(), since_seq], raw_event_row)
             .context("querying session_events since seq")?;
-        let mut out = Vec::new();
+        let mut raw = Vec::new();
         for r in rows {
-            out.push(r.context("decoding session_event row")??);
+            raw.push(r.context("reading session_event row")?);
         }
-        Ok(out)
+        decode_event_rows(raw)
     }
 
     pub fn read_session_messages(
@@ -464,27 +464,75 @@ impl Db {
     }
 }
 
-type DecodeResult<T> = rusqlite::Result<Result<T>>;
+struct RawSessionEventRow {
+    seq: i64,
+    session_id: String,
+    ts_ms: i64,
+    kind: String,
+    agent: Option<String>,
+    call_id: Option<String>,
+    task_call_id: Option<String>,
+    label: Option<String>,
+    origin_principal: Option<String>,
+    data_json: String,
+}
 
-fn decode_event_row(row: &rusqlite::Row<'_>) -> DecodeResult<SessionEventRow> {
-    let sid: String = row.get("session_id")?;
-    let data_json: String = row.get("data_json")?;
-    Ok((|| {
-        let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
-        let data: Value = serde_json::from_str(&data_json).context("deserializing data_json")?;
-        Ok(SessionEventRow {
-            seq: row.get("seq").map_err(anyhow::Error::from)?,
-            session_id,
-            ts_ms: row.get("ts_ms").map_err(anyhow::Error::from)?,
-            kind: row.get("type").map_err(anyhow::Error::from)?,
-            agent: row.get("agent").map_err(anyhow::Error::from)?,
-            call_id: row.get("call_id").map_err(anyhow::Error::from)?,
-            task_call_id: row.get("task_call_id").map_err(anyhow::Error::from)?,
-            label: row.get("label").map_err(anyhow::Error::from)?,
-            origin_principal: row.get("origin_principal").map_err(anyhow::Error::from)?,
-            data,
-        })
-    })())
+fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionEventRow> {
+    Ok(RawSessionEventRow {
+        seq: row.get("seq")?,
+        session_id: row.get("session_id")?,
+        ts_ms: row.get("ts_ms")?,
+        kind: row.get("type")?,
+        agent: row.get("agent")?,
+        call_id: row.get("call_id")?,
+        task_call_id: row.get("task_call_id")?,
+        label: row.get("label")?,
+        origin_principal: row.get("origin_principal")?,
+        data_json: row.get("data_json")?,
+    })
+}
+
+fn decode_event_rows(rows: Vec<RawSessionEventRow>) -> Result<Vec<SessionEventRow>> {
+    let last = rows.len().saturating_sub(1);
+    let mut out = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        match decode_event_row(row) {
+            Ok(row) => out.push(row),
+            Err(err) if index == last && is_truncated_tail_error(&err) => {
+                tracing::warn!(error = %err, "ignoring truncated session_event tail row");
+                break;
+            }
+            Err(err) => return Err(err).context("decoding session_event row"),
+        }
+    }
+    Ok(out)
+}
+
+fn decode_event_row(row: RawSessionEventRow) -> Result<SessionEventRow> {
+    let session_id = Uuid::parse_str(&row.session_id)
+        .with_context(|| format!("session_id `{}`", row.session_id))?;
+    let data: Value = serde_json::from_str(&row.data_json).context("deserializing data_json")?;
+    anyhow::ensure!(
+        data.is_object(),
+        "deserializing data_json: expected object payload"
+    );
+    Ok(SessionEventRow {
+        seq: row.seq,
+        session_id,
+        ts_ms: row.ts_ms,
+        kind: row.kind,
+        agent: row.agent,
+        call_id: row.call_id,
+        task_call_id: row.task_call_id,
+        label: row.label,
+        origin_principal: row.origin_principal,
+        data,
+    })
+}
+
+fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("deserializing data_json"))
 }
 
 #[cfg(test)]
@@ -725,6 +773,188 @@ mod tests {
         assert_eq!(b_events.len(), 1);
         assert_eq!(b_events[0].kind, "assistant_message");
         assert_eq!(b_events[0].data, json!({"text": "second"}));
+    }
+
+    #[test]
+    fn concurrent_session_event_writers_assign_unique_monotonic_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cockpit.db");
+        let db = Db::open(&path).unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+
+        let mut threads = Vec::new();
+        for worker in 0..8 {
+            let db = db.clone();
+            let session_id = session.session_id;
+            threads.push(std::thread::spawn(move || {
+                let mut seqs = Vec::new();
+                for index in 0..10 {
+                    seqs.push(
+                        db.insert_session_event(
+                            session_id,
+                            SessionEventKind::UserMessage,
+                            Some("builder"),
+                            None,
+                            &json!({ "worker": worker, "index": index }),
+                        )
+                        .unwrap(),
+                    );
+                }
+                seqs
+            }));
+        }
+
+        let mut seqs = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(seqs.len(), 80);
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 80, "each concurrent append gets one seq");
+
+        let events = db.list_session_events(session.session_id).unwrap();
+        assert_eq!(events.len(), 80);
+        assert!(
+            events.windows(2).all(|pair| pair[0].seq < pair[1].seq),
+            "readback order must stay strictly monotonic"
+        );
+    }
+
+    #[test]
+    fn crash_mid_append_rolls_back_uncommitted_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cockpit.db");
+        let db = Db::open(&path).unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let committed = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "committed"}),
+            )
+            .unwrap();
+        drop(db);
+
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO session_events
+                 (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, ?5)",
+                params![
+                    session.session_id.to_string(),
+                    now_ms(),
+                    SessionEventKind::AssistantMessage.as_str(),
+                    "builder",
+                    serde_json::to_string(&json!({"text": "uncommitted"})).unwrap(),
+                ],
+            )
+            .unwrap();
+            drop(tx);
+        }
+
+        let reopened = Db::open(&path).unwrap();
+        let events = reopened.list_session_events(session.session_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, committed);
+        assert_eq!(events[0].data, json!({"text": "committed"}));
+    }
+
+    #[test]
+    fn truncated_tail_is_ignored_when_rehydrating_committed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cockpit.db");
+        let db = Db::open(&path).unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let user_seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "before"}),
+            )
+            .unwrap();
+        let assistant_seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "still committed"}),
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        let events = decode_event_rows(vec![
+            RawSessionEventRow {
+                seq: user_seq,
+                session_id: session.session_id.to_string(),
+                ts_ms: now_ms(),
+                kind: SessionEventKind::UserMessage.as_str().to_string(),
+                agent: Some("builder".to_string()),
+                call_id: None,
+                task_call_id: None,
+                label: None,
+                origin_principal: None,
+                data_json: serde_json::to_string(&json!({"text": "before"})).unwrap(),
+            },
+            RawSessionEventRow {
+                seq: assistant_seq,
+                session_id: session.session_id.to_string(),
+                ts_ms: now_ms(),
+                kind: SessionEventKind::AssistantMessage.as_str().to_string(),
+                agent: Some("builder".to_string()),
+                call_id: None,
+                task_call_id: None,
+                label: None,
+                origin_principal: None,
+                data_json: serde_json::to_string(&json!({"text": "still committed"})).unwrap(),
+            },
+            RawSessionEventRow {
+                seq: assistant_seq + 1,
+                session_id: session.session_id.to_string(),
+                ts_ms: now_ms(),
+                kind: SessionEventKind::AssistantMessage.as_str().to_string(),
+                agent: Some("builder".to_string()),
+                call_id: None,
+                task_call_id: None,
+                label: None,
+                origin_principal: None,
+                data_json: "{\"text\":".to_string(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            events.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![user_seq, assistant_seq]
+        );
+
+        let history = reopened
+            .read_blocking(|conn| {
+                crate::engine::rehydrate::history_snapshot_from_event_rows_for_test(
+                    conn,
+                    session.session_id,
+                    "builder",
+                    events,
+                )
+            })
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[0],
+            crate::daemon::proto::HistoryEntry::User { text, .. } if text == "before"
+        ));
+        assert!(matches!(
+            &history[1],
+            crate::daemon::proto::HistoryEntry::Assistant { text, .. }
+                if text == "still committed"
+        ));
     }
 
     #[test]

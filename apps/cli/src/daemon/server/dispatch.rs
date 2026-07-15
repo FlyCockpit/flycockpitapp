@@ -779,6 +779,9 @@ async fn handle_request(
             key,
             project_id,
         } => {
+            if key.trim().is_empty() {
+                return Err(bad_request("usage key cannot be empty"));
+            }
             // Global tally — no attached session required.
             ctx.db
                 .record_usage(

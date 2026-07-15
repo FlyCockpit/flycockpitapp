@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::session_worker::SessionWorkerHandle;
+    use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
     use crate::daemon::shutdown::ShutdownPhase;
     use crate::session::Session;
     use std::collections::{BTreeSet, HashMap, HashSet};
@@ -953,7 +953,11 @@ mod tests {
             ("attach_terminal", "terminal", false)
             | ("terminal_input", "terminal", false)
             | ("terminal_resize", "terminal", false)
-            | ("list_models", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+            | ("subagent_transcript", "custom", false)
+            | ("resource_snapshot", "owner_only", false)
+            | ("list_agents", "owner_only", false)
+            | ("list_models", "owner_only", false)
+            | ("get_usage_counts", "owner_only", false) => DispatchMatrixClass::AccessControlled,
             (_, _, true) => DispatchMatrixClass::Mutating,
             other => panic!("dispatch matrix request kind is unclassified: {other:?}"),
         }
@@ -1037,6 +1041,87 @@ mod tests {
         ]
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DispatchEffectClass {
+        Durable,
+        InMemory,
+        DriverForwarded,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct MutatingDispatchCase {
+        kind: &'static str,
+        effect_class: DispatchEffectClass,
+        observation: &'static str,
+    }
+
+    fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
+        mutating_dispatch_case_list()
+    }
+
+    fn mutating_dispatch_malformed_cases() -> Vec<MutatingDispatchCase> {
+        mutating_dispatch_case_list()
+    }
+
+    fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
+        use DispatchEffectClass::{DriverForwarded, Durable, InMemory};
+        vec![
+            MutatingDispatchCase { kind: "attach", effect_class: Durable, observation: "attached response plus live session registration" },
+            MutatingDispatchCase { kind: "send_user_message", effect_class: DriverForwarded, observation: "SessionWork::UserMessage delivered to attached worker" },
+            MutatingDispatchCase { kind: "steer_delegation", effect_class: DriverForwarded, observation: "SessionWork::SteerDelegation delivered to live target worker" },
+            MutatingDispatchCase { kind: "begin_attachment_upload", effect_class: InMemory, observation: "upload id accepted by later chunk request on same connection" },
+            MutatingDispatchCase { kind: "upload_attachment_chunk", effect_class: InMemory, observation: "chunk advances upload so finish succeeds" },
+            MutatingDispatchCase { kind: "finish_attachment_upload", effect_class: InMemory, observation: "ready image ref can be consumed by a later user message request" },
+            MutatingDispatchCase { kind: "cancel_attachment_upload", effect_class: InMemory, observation: "cancelled upload id cannot be finished" },
+            MutatingDispatchCase { kind: "remove_queued_user_message", effect_class: DriverForwarded, observation: "SessionWork::RemoveQueuedUserMessage delivered to attached worker" },
+            MutatingDispatchCase { kind: "remove_newest_queued_user_message", effect_class: DriverForwarded, observation: "SessionWork::RemoveNewestQueuedUserMessage delivered to attached worker" },
+            MutatingDispatchCase { kind: "remove_editable_queued_user_messages", effect_class: DriverForwarded, observation: "SessionWork::RemoveEditableQueuedUserMessages delivered to attached worker" },
+            MutatingDispatchCase { kind: "resume_paused_work", effect_class: Durable, observation: "paused_session_work status becomes resumed" },
+            MutatingDispatchCase { kind: "cancel_paused_work", effect_class: Durable, observation: "paused_session_work status becomes cancelled" },
+            MutatingDispatchCase { kind: "repair_resume", effect_class: DriverForwarded, observation: "SessionWork::RepairResume delivered to attached worker" },
+            MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
+            MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
+            MutatingDispatchCase { kind: "fs_create_dir", effect_class: Durable, observation: "directory created under project root" },
+            MutatingDispatchCase { kind: "fs_rename", effect_class: Durable, observation: "file moves from source path to destination path" },
+            MutatingDispatchCase { kind: "fs_delete", effect_class: Durable, observation: "file removed under project root" },
+            MutatingDispatchCase { kind: "open_terminal", effect_class: InMemory, observation: "terminal id can be closed on same connection" },
+            MutatingDispatchCase { kind: "close_terminal", effect_class: InMemory, observation: "closed terminal rejects later attachment" },
+            MutatingDispatchCase { kind: "lsp_control", effect_class: InMemory, observation: "typed result and notice event emitted for attached session" },
+            MutatingDispatchCase { kind: "resolve_interrupt", effect_class: DriverForwarded, observation: "SessionWork::ResolveInterrupt delivered to attached worker" },
+            MutatingDispatchCase { kind: "archive_session", effect_class: Durable, observation: "session archived_at becomes set" },
+            MutatingDispatchCase { kind: "unarchive_session", effect_class: Durable, observation: "session archived_at is cleared" },
+            MutatingDispatchCase { kind: "fork_session", effect_class: Durable, observation: "fork session row references parent session" },
+            MutatingDispatchCase { kind: "discard_session", effect_class: Durable, observation: "ephemeral session row is deleted" },
+            MutatingDispatchCase { kind: "rename_session", effect_class: Durable, observation: "session title is updated" },
+            MutatingDispatchCase { kind: "share_session", effect_class: Durable, observation: "shared_with_collaborators flag changes" },
+            MutatingDispatchCase { kind: "record_session_note", effect_class: Durable, observation: "user_note session event is persisted" },
+            MutatingDispatchCase { kind: "delete_session", effect_class: Durable, observation: "session row is deleted" },
+            MutatingDispatchCase { kind: "promote_resource", effect_class: InMemory, observation: "queued resource request status changes to promoted response" },
+            MutatingDispatchCase { kind: "set_active_model", effect_class: DriverForwarded, observation: "SessionWork::SetActiveModel delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_agent", effect_class: DriverForwarded, observation: "SessionWork::SetAgent delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_llm_mode", effect_class: DriverForwarded, observation: "SessionWork::SetLlmMode delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_session_llm_mode", effect_class: DriverForwarded, observation: "SessionWork::SetSessionLlmMode delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_approval_mode", effect_class: InMemory, observation: "approval mode response and broadcast event reflect new mode" },
+            MutatingDispatchCase { kind: "set_delegation_recursion", effect_class: DriverForwarded, observation: "SessionWork::SetDelegationRecursion delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_sandbox", effect_class: InMemory, observation: "sandbox state response and broadcast event reflect new mode" },
+            MutatingDispatchCase { kind: "set_sandbox_escalation", effect_class: InMemory, observation: "sandbox escalation response and broadcast event reflect new state" },
+            MutatingDispatchCase { kind: "set_preflight", effect_class: DriverForwarded, observation: "SessionWork::SetPreflight delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_trusted_only", effect_class: DriverForwarded, observation: "SessionWork::SetTrustedOnly delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_redaction", effect_class: DriverForwarded, observation: "SessionWork::SetRedaction delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_tandem_models", effect_class: DriverForwarded, observation: "SessionWork::SetTandemModels delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_caffeinate", effect_class: InMemory, observation: "caffeinate response plus global state event" },
+            MutatingDispatchCase { kind: "cancel_schedule", effect_class: DriverForwarded, observation: "SessionWork::CancelSchedule delivered to attached worker" },
+            MutatingDispatchCase { kind: "prune", effect_class: DriverForwarded, observation: "SessionWork::Prune delivered to attached worker" },
+            MutatingDispatchCase { kind: "compact", effect_class: DriverForwarded, observation: "SessionWork::Compact delivered to attached worker" },
+            MutatingDispatchCase { kind: "pin", effect_class: DriverForwarded, observation: "SessionWork::Pin delivered to attached worker" },
+            MutatingDispatchCase { kind: "store_flycockpit_credential", effect_class: Durable, observation: "credential file is written" },
+            MutatingDispatchCase { kind: "clear_flycockpit_credential", effect_class: Durable, observation: "credential store no longer loads a credential" },
+            MutatingDispatchCase { kind: "refresh_env", effect_class: InMemory, observation: "attached worker env overlay changes" },
+            MutatingDispatchCase { kind: "record_usage", effect_class: Durable, observation: "usage count appears in subsequent usage_counts query" },
+            MutatingDispatchCase { kind: "stop_daemon", effect_class: InMemory, observation: "shutdown context enters draining phase" },
+        ]
+    }
+
     #[cfg(unix)]
     async fn dispatch_matrix_request(
         ctx: &Arc<DaemonContext>,
@@ -1085,6 +1170,77 @@ mod tests {
             .expect("server task joins")
             .expect("server task succeeds");
         result
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_matrix_request_after_collect_events(
+        ctx: &Arc<DaemonContext>,
+        prelude: Vec<Request>,
+        request: Request,
+    ) -> (std::result::Result<Response, ErrorPayload>, Vec<proto::Event>) {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let mut client = ProtoStream::new(client_stream);
+        let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+        match recv_body(&mut client).await {
+            Body::Response { id, response } => {
+                assert_eq!(id, Uuid::nil());
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+            }
+            other => panic!("expected daemon hello, got {other:?}"),
+        }
+
+        for prelude_request in prelude {
+            let prelude_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(prelude_id, prelude_request))
+                .await
+                .expect("send prelude request");
+            recv_dispatch_matrix_response(&mut client, prelude_id)
+                .await
+                .expect("prelude request succeeds");
+        }
+
+        let id = Uuid::new_v4();
+        client
+            .send(&Envelope::request(id, request))
+            .await
+            .expect("send dispatch request");
+
+        let mut events = Vec::new();
+        let result = loop {
+            match recv_body(&mut client).await {
+                Body::Response { id: got, response } => {
+                    assert_eq!(got, id);
+                    break Ok(*response);
+                }
+                Body::Error {
+                    id: Some(got),
+                    error,
+                } => {
+                    assert_eq!(got, id);
+                    break Err(error);
+                }
+                Body::Event { event } => events.push(event),
+                other => panic!("expected dispatch response/error/event, got {other:?}"),
+            }
+        };
+
+        while let Ok(body) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), recv_body(&mut client))
+                .await
+        {
+            match body {
+                Body::Event { event } => events.push(event),
+                other => panic!("unexpected post-response dispatch body: {other:?}"),
+            }
+        }
+
+        drop(client);
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+        (result, events)
     }
 
     #[cfg(unix)]
@@ -1146,11 +1302,31 @@ mod tests {
             .filter(|row| row.class == DispatchMatrixClass::Readonly)
             .map(|row| row.kind)
             .collect();
+        let mutating: BTreeSet<_> = dispatch_matrix_rows()
+            .into_iter()
+            .filter(|row| row.class == DispatchMatrixClass::Mutating)
+            .map(|row| row.kind)
+            .collect();
         let happy: BTreeSet<_> = readonly_dispatch_happy_cases()
             .into_iter()
             .map(|case| case.kind)
             .collect();
         let malformed: BTreeSet<_> = readonly_dispatch_malformed_cases()
+            .into_iter()
+            .map(|case| case.kind)
+            .collect();
+        let mutating_happy: BTreeSet<_> = mutating_dispatch_happy_cases()
+            .into_iter()
+            .map(|case| {
+                assert!(
+                    !case.observation.is_empty(),
+                    "{} needs an observation channel",
+                    case.kind
+                );
+                case.kind
+            })
+            .collect();
+        let mutating_malformed: BTreeSet<_> = mutating_dispatch_malformed_cases()
             .into_iter()
             .map(|case| case.kind)
             .collect();
@@ -1163,8 +1339,16 @@ mod tests {
             readonly, malformed,
             "every readonly dispatch kind needs a malformed/invalid-state socket case"
         );
+        assert_eq!(
+            mutating, mutating_happy,
+            "every mutating dispatch kind needs a happy socket case"
+        );
+        assert_eq!(
+            mutating, mutating_malformed,
+            "every mutating dispatch kind needs a malformed/invalid-state socket case"
+        );
         assert!(
-            readonly.len() >= 10,
+            readonly.len() >= 10 && mutating.len() >= 40,
             "dispatch_matrix coverage must be non-vacuous"
         );
     }
@@ -1183,6 +1367,18 @@ mod tests {
         }
         for case in readonly_dispatch_malformed_cases() {
             case.case.assert_malformed_socket_case().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_matrix_mutating_cases_traverse_socket_path() {
+        assert_dispatch_matrix_coverage_complete();
+        for case in mutating_dispatch_happy_cases() {
+            assert_mutating_happy_socket_case(case).await;
+        }
+        for case in mutating_dispatch_malformed_cases() {
+            assert_mutating_malformed_socket_case(case).await;
         }
     }
 
@@ -1607,6 +1803,1603 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
+        match case.effect_class {
+            DispatchEffectClass::Durable
+            | DispatchEffectClass::InMemory
+            | DispatchEffectClass::DriverForwarded => {}
+        }
+        match case.kind {
+            "attach" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                ctx.db
+                    .set_workspace_trust(
+                        tmp.path(),
+                        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                    )
+                    .unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::Attach {
+                        session_id: None,
+                        since_seq: None,
+                        project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                        no_sandbox: false,
+                        interactive: true,
+                        model_override: None,
+                        client_protocol_version: proto::PROTOCOL_VERSION,
+                        env_snapshot: None,
+                        env_policy: EnvDriftPolicy::Daemon,
+                    },
+                )
+                .await
+                .expect("attach happy");
+                let Response::Attached { session_id, .. } = response else {
+                    panic!("expected Attached");
+                };
+                assert!(ctx.registry.live_handle(session_id).is_some());
+            }
+            "begin_attachment_upload"
+            | "upload_attachment_chunk"
+            | "finish_attachment_upload"
+            | "cancel_attachment_upload" => {
+                assert_attachment_mutating_happy(case.kind).await;
+            }
+            "fs_write" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::FsWrite {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        path: "file.txt".into(),
+                        content: "written".into(),
+                        base_hash: None,
+                    },
+                )
+                .await
+                .expect("fs_write happy");
+                assert!(matches!(response, Response::FsWrite { .. }));
+                assert_eq!(std::fs::read_to_string(tmp.path().join("file.txt")).unwrap(), "written");
+            }
+            "fs_create_dir" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::FsCreateDir {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        path: "new-dir".into(),
+                    },
+                )
+                .await
+                .expect("fs_create_dir happy");
+                assert!(matches!(response, Response::Ack));
+                assert!(tmp.path().join("new-dir").is_dir());
+            }
+            "fs_rename" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("old.txt"), "move").unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::FsRename {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        from_path: "old.txt".into(),
+                        to_path: "new.txt".into(),
+                    },
+                )
+                .await
+                .expect("fs_rename happy");
+                assert!(matches!(response, Response::Ack));
+                assert!(!tmp.path().join("old.txt").exists());
+                assert_eq!(std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(), "move");
+            }
+            "fs_delete" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("gone.txt"), "delete").unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::FsDelete {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        path: "gone.txt".into(),
+                    },
+                )
+                .await
+                .expect("fs_delete happy");
+                assert!(matches!(response, Response::Ack));
+                assert!(!tmp.path().join("gone.txt").exists());
+            }
+            "open_terminal" | "close_terminal" => assert_terminal_mutating_happy(case.kind).await,
+            "resume_paused_work" | "cancel_paused_work" => {
+                assert_paused_work_mutating_happy(case.kind).await;
+            }
+            "archive_session"
+            | "unarchive_session"
+            | "fork_session"
+            | "discard_session"
+            | "rename_session"
+            | "share_session"
+            | "record_session_note"
+            | "delete_session" => assert_session_db_mutating_happy(case.kind).await,
+            "promote_resource" => assert_promote_resource_happy().await,
+            "set_approval_mode"
+            | "set_sandbox"
+            | "set_sandbox_escalation"
+            | "set_caffeinate"
+            | "refresh_env"
+            | "record_usage"
+            | "store_flycockpit_credential"
+            | "clear_flycockpit_credential"
+            | "stop_daemon"
+            | "lsp_control" => assert_in_memory_or_global_mutating_happy(case.kind).await,
+            "send_user_message"
+            | "steer_delegation"
+            | "remove_queued_user_message"
+            | "remove_newest_queued_user_message"
+            | "remove_editable_queued_user_messages"
+            | "repair_resume"
+            | "cancel_turn"
+            | "resolve_interrupt"
+            | "set_active_model"
+            | "set_agent"
+            | "set_llm_mode"
+            | "set_session_llm_mode"
+            | "set_delegation_recursion"
+            | "set_preflight"
+            | "set_trusted_only"
+            | "set_redaction"
+            | "set_tandem_models"
+            | "cancel_schedule"
+            | "prune"
+            | "compact"
+            | "pin" => assert_worker_delivery_happy(case.kind).await,
+            other => panic!("unhandled mutating happy case {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
+        match case.kind {
+            "attach" => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::Attach {
+                        session_id: Some(Uuid::new_v4()),
+                        since_seq: None,
+                        project_root: None,
+                        no_sandbox: false,
+                        interactive: true,
+                        model_override: None,
+                        client_protocol_version: proto::PROTOCOL_VERSION,
+                        env_snapshot: None,
+                        env_policy: EnvDriftPolicy::Daemon,
+                    },
+                )
+                .await
+                .expect_err("unknown attach session");
+                assert_eq!(err.code, ErrorCode::UnknownSession);
+                assert!(ctx.registry.active_session_ids().is_empty());
+            }
+            "begin_attachment_upload"
+            | "upload_attachment_chunk"
+            | "finish_attachment_upload"
+            | "cancel_attachment_upload" => {
+                assert_attachment_mutating_malformed(case.kind).await;
+            }
+            "fs_write" | "fs_create_dir" | "fs_rename" | "fs_delete" => {
+                assert_fs_mutating_malformed(case.kind).await;
+            }
+            "open_terminal" | "close_terminal" => {
+                assert_terminal_mutating_malformed(case.kind).await;
+            }
+            "resume_paused_work" | "cancel_paused_work" => {
+                let ctx = test_ctx();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    match case.kind {
+                        "resume_paused_work" => Request::ResumePausedWork {
+                            session_id: Uuid::new_v4(),
+                        },
+                        "cancel_paused_work" => Request::CancelPausedWork {
+                            session_id: Uuid::new_v4(),
+                        },
+                        _ => unreachable!(),
+                    },
+                )
+                .await
+                .expect("unknown paused work is typed no-op");
+                assert!(matches!(response, Response::Ack));
+                assert!(ctx.db.paused_session_work_all().unwrap().is_empty());
+            }
+            "archive_session"
+            | "unarchive_session"
+            | "fork_session"
+            | "discard_session"
+            | "rename_session"
+            | "share_session"
+            | "record_session_note"
+            | "delete_session" => assert_session_db_mutating_malformed(case.kind).await,
+            "promote_resource" => {
+                let ctx = persistent_test_ctx();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::PromoteResource {
+                        request_id: "missing".into(),
+                        session_id: None,
+                    },
+                )
+                .await
+                .expect("missing resource request is typed non-applied response");
+                let Response::PromoteResourceResult { status, .. } = response else {
+                    panic!("expected PromoteResourceResult");
+                };
+                assert_eq!(status, proto::ResourcePromoteStatus::NotFound);
+            }
+            "set_approval_mode"
+            | "set_sandbox"
+            | "set_sandbox_escalation"
+            | "refresh_env"
+            | "lsp_control"
+            | "send_user_message"
+            | "remove_queued_user_message"
+            | "remove_newest_queued_user_message"
+            | "remove_editable_queued_user_messages"
+            | "repair_resume"
+            | "cancel_turn"
+            | "resolve_interrupt"
+            | "set_active_model"
+            | "set_agent"
+            | "set_llm_mode"
+            | "set_session_llm_mode"
+            | "set_delegation_recursion"
+            | "set_preflight"
+            | "set_trusted_only"
+            | "set_redaction"
+            | "set_tandem_models"
+            | "cancel_schedule"
+            | "prune"
+            | "compact"
+            | "pin" => assert_attached_required_malformed(case.kind).await,
+            "steer_delegation" => assert_steer_delegation_malformed().await,
+            "set_caffeinate" => {
+                let ctx = test_ctx();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::SetCaffeinate {
+                        mode: crate::daemon::caffeinate::CaffeinateMode::Off,
+                    },
+                )
+                .await
+                .expect("caffeinate off is typed no-op when already off");
+                let Response::CaffeinateState { active, .. } = response else {
+                    panic!("expected CaffeinateState");
+                };
+                assert!(!active);
+            }
+            "record_usage" => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::RecordUsage {
+                        kind: proto::UsageKind::Slash,
+                        key: "   ".into(),
+                        project_id: None,
+                    },
+                )
+                .await
+                .expect_err("empty usage key is rejected");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+                let counts = ctx.db.usage_counts("slash", None, 0).unwrap();
+                assert!(counts.is_empty());
+            }
+            "store_flycockpit_credential" | "clear_flycockpit_credential" => {
+                let ctx = test_ctx();
+                let request = if case.kind == "store_flycockpit_credential" {
+                    Request::StoreFlycockpitCredential {
+                        credential: flycockpit_credential(),
+                    }
+                } else {
+                    Request::ClearFlycockpitCredential
+                };
+                let err = dispatch_matrix_request(&ctx, request)
+                    .await
+                    .expect_err("ephemeral credential writes rejected");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
+            "stop_daemon" => {
+                let ctx = test_ctx();
+                let response =
+                    dispatch_matrix_request(&ctx, Request::StopDaemon { grace_secs: Some(1) })
+                        .await
+                        .expect("first stop starts drain");
+                assert!(matches!(response, Response::Ack));
+                let response =
+                    dispatch_matrix_request(&ctx, Request::StopDaemon { grace_secs: Some(0) })
+                        .await
+                        .expect("second stop forces drain");
+                assert!(matches!(response, Response::Ack));
+                assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
+            }
+            other => panic!("unhandled mutating malformed case {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn live_worker_with_receiver(
+        ctx: &Arc<DaemonContext>,
+        project_root: &Path,
+    ) -> (Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
+        ctx.db
+            .set_workspace_trust(
+                project_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let row = ctx
+            .db
+            .create_session("p", project_root.to_str().unwrap(), "Build")
+            .unwrap();
+        let session = Arc::new(
+            Session::resume(ctx.db.clone(), row.session_id)
+                .unwrap()
+                .expect("session row"),
+        );
+        let (handle, work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(session, ctx.registry.locks());
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        ctx.registry.insert_test_worker(handle, join);
+        (row.session_id, work_rx)
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_attached_worker_request(
+        ctx: &Arc<DaemonContext>,
+        project_root: &Path,
+        session_id: Uuid,
+        mut work_rx: tokio::sync::mpsc::Receiver<SessionWork>,
+        request: Request,
+        observe: impl FnOnce(SessionWork),
+    ) -> std::result::Result<Response, ErrorPayload> {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let mut client = ProtoStream::new(client_stream);
+        let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+        match recv_body(&mut client).await {
+            Body::Response { id, response } => {
+                assert_eq!(id, Uuid::nil());
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+            }
+            other => panic!("expected daemon hello, got {other:?}"),
+        }
+        let attach_id = Uuid::new_v4();
+        client
+            .send(&Envelope::request(
+                attach_id,
+                Request::Attach {
+                    session_id: Some(session_id),
+                    since_seq: None,
+                    project_root: Some(project_root.to_string_lossy().into_owned()),
+                    no_sandbox: false,
+                    interactive: true,
+                    model_override: None,
+                    client_protocol_version: proto::PROTOCOL_VERSION,
+                    env_snapshot: None,
+                    env_policy: EnvDriftPolicy::Daemon,
+                },
+            ))
+            .await
+            .expect("send attach");
+        recv_dispatch_matrix_response(&mut client, attach_id)
+            .await
+            .expect("attach succeeds");
+
+        let id = Uuid::new_v4();
+        client
+            .send(&Envelope::request(id, request))
+            .await
+            .expect("send worker request");
+        let work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
+            .await
+            .expect("worker command delivered")
+            .expect("worker command present");
+        observe(work);
+        let result = recv_dispatch_matrix_response(&mut client, id).await;
+        drop(client);
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+        result
+    }
+
+    #[cfg(unix)]
+    fn proto_queue_item(text: &str) -> proto::QueueItem {
+        proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: text.to_string(),
+            target: proto::QueueTarget::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_worker_delivery_happy(kind: &str) {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+        let request = match kind {
+            "send_user_message" => Request::SendUserMessage {
+                text: "hello worker".into(),
+                image_refs: Vec::new(),
+                forced_skill: None,
+            },
+            "steer_delegation" => Request::SteerDelegation {
+                session_id,
+                task_call_id: "task-1".into(),
+                label: "child".into(),
+                message: "steer".into(),
+            },
+            "remove_queued_user_message" => Request::RemoveQueuedUserMessage {
+                queue_item_id: Uuid::from_u128(1),
+            },
+            "remove_newest_queued_user_message" => Request::RemoveNewestQueuedUserMessage {
+                target_id: Some("root".into()),
+            },
+            "remove_editable_queued_user_messages" => Request::RemoveEditableQueuedUserMessages {
+                target_id: Some("root".into()),
+            },
+            "repair_resume" => Request::RepairResume { session_id },
+            "cancel_turn" => Request::CancelTurn,
+            "resolve_interrupt" => Request::ResolveInterrupt {
+                interrupt_id: Uuid::from_u128(2),
+                response: proto::ResolveResponse::Cancel,
+            },
+            "set_active_model" => Request::SetActiveModel {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            },
+            "set_agent" => Request::SetAgent {
+                name: "Build".into(),
+            },
+            "set_llm_mode" => Request::SetLlmMode {
+                mode: Some(crate::config::extended::LlmMode::Defensive),
+            },
+            "set_session_llm_mode" => Request::SetSessionLlmMode {
+                mode: crate::config::extended::LlmMode::Normal,
+            },
+            "set_delegation_recursion" => Request::SetDelegationRecursion {
+                enabled: true,
+                default_depth: 3,
+            },
+            "set_preflight" => Request::SetPreflight {
+                enabled: Some(true),
+            },
+            "set_trusted_only" => Request::SetTrustedOnly {
+                enabled: Some(true),
+            },
+            "set_redaction" => Request::SetRedaction {
+                scan_environment: Some(false),
+                scan_dotenv: Some(true),
+                scan_ssh_keys: None,
+            },
+            "set_tandem_models" => Request::SetTandemModels {
+                models: vec![("openai".into(), "gpt-5".into())],
+            },
+            "cancel_schedule" => Request::CancelSchedule {
+                job_id: "job-1".into(),
+            },
+            "prune" => Request::Prune,
+            "compact" => Request::Compact,
+            "pin" => Request::Pin {
+                text: "remember this".into(),
+            },
+            other => panic!("unexpected worker case {other}"),
+        };
+        let response =
+            dispatch_attached_worker_request(&ctx, tmp.path(), session_id, work_rx, request, |work| {
+                match (kind, work) {
+                    (
+                        "send_user_message",
+                        SessionWork::UserMessage {
+                            submission,
+                            respond_to,
+                        },
+                    ) => {
+                        assert_eq!(submission.text, "hello worker");
+                        let item = proto_queue_item(&submission.text);
+                        respond_to.send((item.clone(), vec![item])).unwrap();
+                    }
+                    (
+                        "steer_delegation",
+                        SessionWork::SteerDelegation {
+                            task_call_id,
+                            label,
+                            message,
+                            respond_to,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(task_call_id, "task-1");
+                        assert_eq!(label, "child");
+                        assert_eq!(message, "steer");
+                        respond_to
+                            .send(proto::DelegationSteerResult::queued(
+                                task_call_id,
+                                label,
+                                1,
+                                "owner".into(),
+                                false,
+                            ))
+                            .unwrap();
+                    }
+                    (
+                        "remove_queued_user_message",
+                        SessionWork::RemoveQueuedUserMessage {
+                            queue_item_id,
+                            respond_to,
+                        },
+                    ) => {
+                        assert_eq!(queue_item_id, Uuid::from_u128(1));
+                        respond_to
+                            .send(proto::RemoveQueuedUserMessageResult {
+                                applied: true,
+                                reason: proto::RemoveQueuedUserMessageReason::Removed,
+                                removed_item: Some(proto_queue_item("removed")),
+                                queue: Vec::new(),
+                            })
+                            .unwrap();
+                    }
+                    (
+                        "remove_newest_queued_user_message",
+                        SessionWork::RemoveNewestQueuedUserMessage {
+                            target_id,
+                            respond_to,
+                        },
+                    ) => {
+                        assert_eq!(target_id.as_deref(), Some("root"));
+                        respond_to
+                            .send(proto::RemoveQueuedUserMessageResult {
+                                applied: false,
+                                reason: proto::RemoveQueuedUserMessageReason::NotFound,
+                                removed_item: None,
+                                queue: Vec::new(),
+                            })
+                            .unwrap();
+                    }
+                    (
+                        "remove_editable_queued_user_messages",
+                        SessionWork::RemoveEditableQueuedUserMessages {
+                            target_id,
+                            respond_to,
+                        },
+                    ) => {
+                        assert_eq!(target_id.as_deref(), Some("root"));
+                        respond_to
+                            .send(proto::RemoveQueuedUserMessagesResult {
+                                applied: true,
+                                reason: proto::RemoveQueuedUserMessageReason::Removed,
+                                removed_items: vec![proto_queue_item("removed")],
+                                queue: Vec::new(),
+                            })
+                            .unwrap();
+                    }
+                    ("repair_resume", SessionWork::RepairResume { respond_to }) => {
+                        respond_to.send(Ok(())).unwrap();
+                    }
+                    ("cancel_turn", SessionWork::Cancel) => {}
+                    (
+                        "resolve_interrupt",
+                        SessionWork::ResolveInterrupt {
+                            interrupt_id,
+                            response,
+                        },
+                    ) => {
+                        assert_eq!(interrupt_id, Uuid::from_u128(2));
+                        assert!(matches!(response, proto::ResolveResponse::Cancel));
+                    }
+                    ("set_active_model", SessionWork::SetActiveModel { provider, model }) => {
+                        assert_eq!(provider, "openai");
+                        assert_eq!(model, "gpt-5");
+                    }
+                    ("set_agent", SessionWork::SetAgent { name }) => {
+                        assert_eq!(name, "Build");
+                    }
+                    ("set_llm_mode", SessionWork::SetLlmMode { mode }) => {
+                        assert_eq!(mode, Some(crate::config::extended::LlmMode::Defensive));
+                    }
+                    ("set_session_llm_mode", SessionWork::SetSessionLlmMode { mode }) => {
+                        assert_eq!(mode, crate::config::extended::LlmMode::Normal);
+                    }
+                    (
+                        "set_delegation_recursion",
+                        SessionWork::SetDelegationRecursion {
+                            enabled,
+                            default_depth,
+                        },
+                    ) => {
+                        assert!(enabled);
+                        assert_eq!(default_depth, 3);
+                    }
+                    ("set_preflight", SessionWork::SetPreflight { enabled }) => {
+                        assert_eq!(enabled, Some(true));
+                    }
+                    ("set_trusted_only", SessionWork::SetTrustedOnly { enabled }) => {
+                        assert_eq!(enabled, Some(true));
+                    }
+                    (
+                        "set_redaction",
+                        SessionWork::SetRedaction {
+                            scan_environment,
+                            scan_dotenv,
+                            scan_ssh_keys,
+                        },
+                    ) => {
+                        assert_eq!(scan_environment, Some(false));
+                        assert_eq!(scan_dotenv, Some(true));
+                        assert_eq!(scan_ssh_keys, None);
+                    }
+                    ("set_tandem_models", SessionWork::SetTandemModels { models }) => {
+                        assert_eq!(models, vec![("openai".to_string(), "gpt-5".to_string())]);
+                    }
+                    ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
+                        assert_eq!(job_id, "job-1");
+                    }
+                    ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
+                    ("pin", SessionWork::Pin { text }) => {
+                        assert_eq!(text, "remember this");
+                    }
+                    (kind, work) => panic!("unexpected worker delivery for {kind}: {work:?}"),
+                }
+            })
+            .await
+            .expect("worker dispatch succeeds");
+        match kind {
+            "send_user_message" => assert!(matches!(response, Response::UserMessageQueued { .. })),
+            "steer_delegation" => assert!(matches!(response, Response::DelegationSteer { .. })),
+            "remove_queued_user_message" | "remove_newest_queued_user_message" => {
+                assert!(matches!(response, Response::RemoveQueuedUserMessageResult { .. }));
+            }
+            "remove_editable_queued_user_messages" => {
+                assert!(matches!(response, Response::RemoveQueuedUserMessagesResult { .. }));
+            }
+            "set_delegation_recursion" => {
+                assert!(matches!(response, Response::DelegationRecursionState { .. }));
+            }
+            _ => assert!(matches!(response, Response::Ack), "{kind}: {response:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_attached_required_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let request = match kind {
+            "send_user_message" => Request::SendUserMessage {
+                text: "detached".into(),
+                image_refs: Vec::new(),
+                forced_skill: None,
+            },
+            "remove_queued_user_message" => Request::RemoveQueuedUserMessage {
+                queue_item_id: Uuid::new_v4(),
+            },
+            "remove_newest_queued_user_message" => {
+                Request::RemoveNewestQueuedUserMessage { target_id: None }
+            }
+            "remove_editable_queued_user_messages" => {
+                Request::RemoveEditableQueuedUserMessages { target_id: None }
+            }
+            "repair_resume" => Request::RepairResume {
+                session_id: Uuid::new_v4(),
+            },
+            "cancel_turn" => Request::CancelTurn,
+            "resolve_interrupt" => Request::ResolveInterrupt {
+                interrupt_id: Uuid::new_v4(),
+                response: proto::ResolveResponse::Cancel,
+            },
+            "set_active_model" => Request::SetActiveModel {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            },
+            "set_agent" => Request::SetAgent {
+                name: "Build".into(),
+            },
+            "set_llm_mode" => Request::SetLlmMode { mode: None },
+            "set_session_llm_mode" => Request::SetSessionLlmMode {
+                mode: crate::config::extended::LlmMode::Normal,
+            },
+            "set_approval_mode" => Request::SetApprovalMode {
+                mode: crate::config::extended::ApprovalMode::Manual,
+            },
+            "set_delegation_recursion" => Request::SetDelegationRecursion {
+                enabled: false,
+                default_depth: 1,
+            },
+            "set_sandbox" => Request::SetSandbox {
+                mode: Some(crate::tools::sandbox_mode::SandboxMode::Sandbox),
+                container_network_enabled: None,
+            },
+            "set_sandbox_escalation" => Request::SetSandboxEscalation { enabled: false },
+            "set_preflight" => Request::SetPreflight { enabled: None },
+            "set_trusted_only" => Request::SetTrustedOnly { enabled: None },
+            "set_redaction" => Request::SetRedaction {
+                scan_environment: Some(false),
+                scan_dotenv: None,
+                scan_ssh_keys: None,
+            },
+            "set_tandem_models" => Request::SetTandemModels { models: Vec::new() },
+            "cancel_schedule" => Request::CancelSchedule {
+                job_id: "job-1".into(),
+            },
+            "prune" => Request::Prune,
+            "compact" => Request::Compact,
+            "pin" => Request::Pin { text: "x".into() },
+            "refresh_env" => Request::RefreshEnv {
+                vars: HashMap::from([("PATH".into(), "/bin".into())]),
+            },
+            "lsp_control" => Request::LspControl {
+                project_root: std::env::temp_dir().to_string_lossy().into_owned(),
+                server_id: "rust-analyzer".into(),
+                action: proto::LspControlAction::Check,
+            },
+            other => panic!("unexpected attached-required malformed case {other}"),
+        };
+        let err = dispatch_matrix_request(&ctx, request)
+            .await
+            .expect_err("detached request fails before worker delivery");
+        assert_eq!(err.code, ErrorCode::NotAttached);
+    }
+
+    #[cfg(unix)]
+    async fn assert_steer_delegation_malformed() {
+        let ctx = test_ctx();
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::SteerDelegation {
+                session_id: Uuid::new_v4(),
+                task_call_id: "task-1".into(),
+                label: "child".into(),
+                message: "steer".into(),
+            },
+        )
+        .await
+        .expect("unknown steer target is typed non-applied response");
+        let Response::DelegationSteer { result } = response else {
+            panic!("expected DelegationSteer");
+        };
+        assert_eq!(result.status, proto::DelegationSteerStatus::NotSteerable);
+    }
+
+    #[cfg(unix)]
+    async fn assert_fs_mutating_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let request = match kind {
+            "fs_write" => Request::FsWrite {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                path: "../outside.txt".into(),
+                content: "bad".into(),
+                base_hash: None,
+            },
+            "fs_create_dir" => Request::FsCreateDir {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                path: "../outside".into(),
+            },
+            "fs_rename" => Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "../outside".into(),
+                to_path: "new".into(),
+            },
+            "fs_delete" => Request::FsDelete {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                path: "../outside".into(),
+            },
+            _ => unreachable!(),
+        };
+        let err = dispatch_matrix_request(&ctx, request)
+            .await
+            .expect_err("fs traversal is rejected");
+        assert_eq!(err.code, ErrorCode::PathOutsideRoot);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    async fn assert_attachment_mutating_happy(kind: &str) {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+        let png = sample_png();
+        let sha = sha256_hex(&png);
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let mut client = ProtoStream::new(client_stream);
+        let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+        match recv_body(&mut client).await {
+            Body::Response { id, response } => {
+                assert_eq!(id, Uuid::nil());
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+            }
+            other => panic!("expected daemon hello, got {other:?}"),
+        }
+        let attach_id = Uuid::new_v4();
+        client
+            .send(&Envelope::request(
+                attach_id,
+                attach_existing_request(session_id, tmp.path()),
+            ))
+            .await
+            .expect("send attachment attach");
+        recv_dispatch_matrix_response(&mut client, attach_id)
+            .await
+            .expect("attach for attachment upload");
+        let begin_id = Uuid::new_v4();
+        client
+            .send(&Envelope::request(
+                begin_id,
+                Request::BeginAttachmentUpload {
+                    mime: proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+                    byte_len: png.len(),
+                    sha256: sha,
+                    purpose: proto::AttachmentPurpose::UserMessageImage,
+                },
+            ))
+            .await
+            .expect("send begin upload");
+        let Response::AttachmentUploadStarted { upload_id, .. } =
+            recv_dispatch_matrix_response(&mut client, begin_id)
+                .await
+                .expect("begin upload")
+        else {
+            panic!("expected AttachmentUploadStarted");
+        };
+
+        if kind == "begin_attachment_upload" {
+            let chunk_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    chunk_id,
+                    Request::UploadAttachmentChunk {
+                        upload_id,
+                        offset: 0,
+                        data_base64: data,
+                    },
+                ))
+                .await
+                .expect("send chunk");
+            assert!(matches!(
+                recv_dispatch_matrix_response(&mut client, chunk_id)
+                    .await
+                    .expect("chunk after begin"),
+                Response::AttachmentChunkAccepted { .. }
+            ));
+        } else if kind == "cancel_attachment_upload" {
+            let cancel_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    cancel_id,
+                    Request::CancelAttachmentUpload { upload_id },
+                ))
+                .await
+                .expect("send cancel");
+            assert!(matches!(
+                recv_dispatch_matrix_response(&mut client, cancel_id)
+                    .await
+                    .expect("cancel upload"),
+                Response::Ack
+            ));
+            let finish_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    finish_id,
+                    Request::FinishAttachmentUpload { upload_id },
+                ))
+                .await
+                .expect("send finish after cancel");
+            let err = recv_dispatch_matrix_response(&mut client, finish_id)
+                .await
+                .expect_err("cancel removes pending upload");
+            assert_eq!(err.code, ErrorCode::BadRequest);
+        } else {
+            let chunk_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    chunk_id,
+                    Request::UploadAttachmentChunk {
+                        upload_id,
+                        offset: 0,
+                        data_base64: data,
+                    },
+                ))
+                .await
+                .expect("send chunk");
+            assert!(matches!(
+                recv_dispatch_matrix_response(&mut client, chunk_id)
+                    .await
+                    .expect("chunk upload"),
+                Response::AttachmentChunkAccepted { .. }
+            ));
+            let finish_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    finish_id,
+                    Request::FinishAttachmentUpload { upload_id },
+                ))
+                .await
+                .expect("send finish");
+            assert!(matches!(
+                recv_dispatch_matrix_response(&mut client, finish_id)
+                    .await
+                    .expect("finish upload"),
+                Response::AttachmentUploaded { .. }
+            ));
+        }
+        drop(client);
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+    }
+
+    #[cfg(unix)]
+    async fn assert_attachment_mutating_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+        let prelude = vec![attach_existing_request(session_id, tmp.path())];
+        let err = match kind {
+            "begin_attachment_upload" => {
+                dispatch_matrix_request_after(
+                    &ctx,
+                    prelude,
+                    Request::BeginAttachmentUpload {
+                        mime: "text/plain".into(),
+                        byte_len: 1,
+                        sha256: "0".repeat(64),
+                        purpose: proto::AttachmentPurpose::UserMessageImage,
+                    },
+                )
+                .await
+                .expect_err("unsupported attachment mime")
+            }
+            "upload_attachment_chunk" => {
+                dispatch_matrix_request_after(
+                    &ctx,
+                    prelude,
+                    Request::UploadAttachmentChunk {
+                        upload_id: Uuid::new_v4(),
+                        offset: 0,
+                        data_base64: String::new(),
+                    },
+                )
+                .await
+                .expect_err("unknown upload chunk")
+            }
+            "finish_attachment_upload" => {
+                dispatch_matrix_request_after(
+                    &ctx,
+                    prelude,
+                    Request::FinishAttachmentUpload {
+                        upload_id: Uuid::new_v4(),
+                    },
+                )
+                .await
+                .expect_err("unknown upload finish")
+            }
+            "cancel_attachment_upload" => {
+                let response = dispatch_matrix_request_after(
+                    &ctx,
+                    prelude,
+                    Request::CancelAttachmentUpload {
+                        upload_id: Uuid::new_v4(),
+                    },
+                )
+                .await
+                .expect("unknown upload cancel is typed idempotent ack");
+                assert!(matches!(response, Response::Ack));
+                return;
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    #[cfg(unix)]
+    async fn assert_terminal_mutating_happy(kind: &str) {
+        let ctx = test_ctx();
+        match kind {
+            "open_terminal" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::OpenTerminal {
+                        cwd: None,
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .await
+                .expect("open terminal");
+                let Response::TerminalOpened { terminal_id, .. } = response else {
+                    panic!("expected TerminalOpened");
+                };
+                let response =
+                    dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id })
+                        .await
+                        .expect("close opened terminal");
+                assert!(matches!(response, Response::Ack));
+            }
+            "close_terminal" => {
+                let Response::TerminalOpened { terminal_id, .. } = dispatch_matrix_request(
+                    &ctx,
+                    Request::OpenTerminal {
+                        cwd: None,
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .await
+                .expect("open terminal")
+                else {
+                    panic!("expected TerminalOpened");
+                };
+                let response =
+                    dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id })
+                        .await
+                        .expect("close terminal");
+                assert!(matches!(response, Response::Ack));
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::AttachTerminal {
+                        terminal_id,
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .await
+                .expect_err("closed terminal is absent");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_terminal_mutating_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let request = match kind {
+            "open_terminal" => Request::OpenTerminal {
+                cwd: Some("/definitely/missing/cockpit-terminal-cwd".into()),
+                cols: 80,
+                rows: 24,
+            },
+            "close_terminal" => Request::CloseTerminal {
+                terminal_id: Uuid::new_v4(),
+            },
+            _ => unreachable!(),
+        };
+        let err = dispatch_matrix_request(&ctx, request)
+            .await
+            .expect_err("terminal invalid state rejected");
+        assert!(matches!(err.code, ErrorCode::BadRequest | ErrorCode::RootMissing));
+    }
+
+    #[cfg(unix)]
+    async fn assert_paused_work_mutating_happy(kind: &str) {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        ctx.db
+            .upsert_paused_session_work(
+                session.session_id,
+                "Build",
+                "/repo",
+                "test pause",
+                1,
+                "test-version",
+            )
+            .unwrap();
+        let request = match kind {
+            "resume_paused_work" => Request::ResumePausedWork {
+                session_id: session.session_id,
+            },
+            "cancel_paused_work" => Request::CancelPausedWork {
+                session_id: session.session_id,
+            },
+            _ => unreachable!(),
+        };
+        let response = dispatch_matrix_request(&ctx, request)
+            .await
+            .expect("paused work mutation");
+        assert!(matches!(response, Response::Ack));
+        match kind {
+            "resume_paused_work" | "cancel_paused_work" => assert!(
+                ctx.db
+                    .paused_session_work(session.session_id)
+                    .unwrap()
+                    .is_none()
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_session_db_mutating_happy(kind: &str) {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let session = ctx
+            .db
+            .create_session("p", tmp.path().to_str().unwrap(), "Build")
+            .unwrap();
+        match kind {
+            "archive_session" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ArchiveSession {
+                        session_id: session.session_id,
+                        cascade: false,
+                    },
+                )
+                .await
+                .expect("archive session");
+                assert!(matches!(response, Response::Ack));
+                assert!(
+                    ctx.db
+                        .get_session(session.session_id)
+                        .unwrap()
+                        .unwrap()
+                        .archived_at
+                        .is_some()
+                );
+            }
+            "unarchive_session" => {
+                ctx.db.archive_session(session.session_id, false).unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::UnarchiveSession {
+                        session_id: session.session_id,
+                    },
+                )
+                .await
+                .expect("unarchive session");
+                assert!(matches!(response, Response::Ack));
+                assert!(
+                    ctx.db
+                        .get_session(session.session_id)
+                        .unwrap()
+                        .unwrap()
+                        .archived_at
+                        .is_none()
+                );
+            }
+            "fork_session" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ForkSession {
+                        parent_session_id: session.session_id,
+                        fork_point_turn_id: None,
+                        ephemeral: false,
+                    },
+                )
+                .await
+                .expect("fork session");
+                let Response::Forked {
+                    session_id: fork_id,
+                    parent_session_id,
+                    ..
+                } = response
+                else {
+                    panic!("expected Forked");
+                };
+                assert_eq!(parent_session_id, session.session_id);
+                assert_eq!(
+                    ctx.db
+                        .get_session(fork_id)
+                        .unwrap()
+                        .unwrap()
+                        .parent_session_id,
+                    Some(session.session_id)
+                );
+            }
+            "discard_session" => {
+                let fork = ctx
+                    .db
+                    .create_ephemeral_fork(session.session_id, None)
+                    .unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::DiscardSession {
+                        session_id: fork.session_id,
+                    },
+                )
+                .await
+                .expect("discard ephemeral session");
+                assert!(matches!(response, Response::Ack));
+                assert!(ctx.db.get_session(fork.session_id).unwrap().is_none());
+            }
+            "rename_session" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::RenameSession {
+                        session_id: session.session_id,
+                        title: "New title".into(),
+                    },
+                )
+                .await
+                .expect("rename session");
+                assert!(matches!(response, Response::Ack));
+                assert_eq!(
+                    ctx.db.get_session(session.session_id).unwrap().unwrap().title,
+                    Some("New title".into())
+                );
+            }
+            "share_session" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ShareSession {
+                        session_id: session.session_id,
+                        shared: true,
+                    },
+                )
+                .await
+                .expect("share session");
+                assert!(matches!(response, Response::Ack));
+                assert!(
+                    ctx.db
+                        .get_session(session.session_id)
+                        .unwrap()
+                        .unwrap()
+                        .shared_with_collaborators
+                );
+            }
+            "record_session_note" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::RecordSessionNote {
+                        session_id: session.session_id,
+                        text: "note".into(),
+                    },
+                )
+                .await
+                .expect("record note");
+                let Response::NoteRecorded { seq } = response else {
+                    panic!("expected NoteRecorded");
+                };
+                assert!(seq > 0);
+                let events = ctx.db.list_session_events(session.session_id).unwrap();
+                assert!(events.iter().any(|event| {
+                    event.kind == "user_note"
+                        && event.data.get("text").and_then(|v| v.as_str()) == Some("note")
+                }));
+            }
+            "delete_session" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::DeleteSession {
+                        session_id: session.session_id,
+                        cascade: false,
+                    },
+                )
+                .await
+                .expect("delete session");
+                assert!(matches!(response, Response::Ack));
+                assert!(ctx.db.get_session(session.session_id).unwrap().is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_session_db_mutating_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        let missing = Uuid::new_v4();
+        let request = match kind {
+            "archive_session" => Request::ArchiveSession {
+                session_id: missing,
+                cascade: false,
+            },
+            "unarchive_session" => Request::UnarchiveSession {
+                session_id: missing,
+            },
+            "fork_session" => Request::ForkSession {
+                parent_session_id: missing,
+                fork_point_turn_id: None,
+                ephemeral: false,
+            },
+            "discard_session" => Request::DiscardSession {
+                session_id: session.session_id,
+            },
+            "rename_session" => Request::RenameSession {
+                session_id: missing,
+                title: "bad".into(),
+            },
+            "share_session" => Request::ShareSession {
+                session_id: missing,
+                shared: true,
+            },
+            "record_session_note" => Request::RecordSessionNote {
+                session_id: missing,
+                text: "bad".into(),
+            },
+            "delete_session" => Request::DeleteSession {
+                session_id: missing,
+                cascade: false,
+            },
+            _ => unreachable!(),
+        };
+        let result = dispatch_matrix_request(&ctx, request).await;
+        match kind {
+            "discard_session" | "share_session" => {
+                assert!(matches!(result.expect("invalid state is typed no-op"), Response::Ack));
+            }
+            _ => {
+                let err = result.expect_err("invalid session mutation rejected");
+                assert!(matches!(
+                    err.code,
+                    ErrorCode::BadRequest | ErrorCode::UnknownSession
+                ));
+            }
+        }
+        assert!(ctx.db.get_session(session.session_id).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    async fn assert_promote_resource_happy() {
+        let ctx = persistent_test_ctx();
+        let scheduler = ctx
+            .registry
+            .resource_scheduler()
+            .expect("persistent scheduler");
+        let _running = scheduler
+            .submit(
+                crate::engine::resource_scheduler::ResourceAcquireRequest::new(
+                    crate::engine::resource_scheduler::ResourceRequirements::new([("cpu", 1)]),
+                ),
+            )
+            .expect("running ticket");
+        let queued = scheduler
+            .submit(
+                crate::engine::resource_scheduler::ResourceAcquireRequest::new(
+                    crate::engine::resource_scheduler::ResourceRequirements::new([("cpu", 1)]),
+                ),
+            )
+            .expect("queued ticket");
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::PromoteResource {
+                request_id: queued.display_id().to_string(),
+                session_id: None,
+            },
+        )
+        .await
+        .expect("promote resource");
+        let Response::PromoteResourceResult { status, .. } = response else {
+            panic!("expected PromoteResourceResult");
+        };
+        assert_eq!(status, proto::ResourcePromoteStatus::Promoted);
+    }
+
+    #[cfg(unix)]
+    async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
+        match kind {
+            "set_approval_mode" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+                let (response, events) = dispatch_matrix_request_after_collect_events(
+                    &ctx,
+                    vec![attach_existing_request(session_id, tmp.path())],
+                    Request::SetApprovalMode {
+                        mode: crate::config::extended::ApprovalMode::Yolo,
+                    },
+                )
+                .await;
+                let response = response.expect("set approval mode");
+                let Response::ApprovalModeState { mode } = response else {
+                    panic!("expected ApprovalModeState");
+                };
+                assert_eq!(mode, crate::config::extended::ApprovalMode::Yolo);
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    proto::Event::ApprovalModeState {
+                        session_id: got,
+                        mode: crate::config::extended::ApprovalMode::Yolo
+                    } if *got == session_id
+                )));
+            }
+            "set_sandbox" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+                let (response, events) = dispatch_matrix_request_after_collect_events(
+                    &ctx,
+                    vec![attach_existing_request(session_id, tmp.path())],
+                    Request::SetSandbox {
+                        mode: Some(crate::tools::sandbox_mode::SandboxMode::Sandbox),
+                        container_network_enabled: Some(false),
+                    },
+                )
+                .await;
+                let response = response.expect("set sandbox");
+                let Response::SandboxState { enabled, .. } = response else {
+                    panic!("expected SandboxState");
+                };
+                assert!(enabled);
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    proto::Event::SandboxState {
+                        session_id: got,
+                        mode: crate::tools::sandbox_mode::SandboxMode::Sandbox,
+                        enabled: true,
+                        ..
+                    } if *got == session_id
+                )));
+            }
+            "set_sandbox_escalation" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+                let (response, events) = dispatch_matrix_request_after_collect_events(
+                    &ctx,
+                    vec![attach_existing_request(session_id, tmp.path())],
+                    Request::SetSandboxEscalation { enabled: false },
+                )
+                .await;
+                let response = response.expect("set sandbox escalation");
+                assert!(matches!(
+                    response,
+                    Response::SandboxEscalationState { enabled: false }
+                ));
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    proto::Event::SandboxEscalationState {
+                        session_id: got,
+                        enabled: false,
+                    } if *got == session_id
+                )));
+            }
+            "set_caffeinate" => {
+                let ctx = test_ctx();
+                let (response, events) = dispatch_matrix_request_after_collect_events(
+                    &ctx,
+                    Vec::new(),
+                    Request::SetCaffeinate {
+                        mode: crate::daemon::caffeinate::CaffeinateMode::On,
+                    },
+                )
+                .await
+                ;
+                let response = response.expect("set caffeinate");
+                let Response::CaffeinateState { active, .. } = response else {
+                    panic!("expected CaffeinateState");
+                };
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    proto::Event::CaffeinateState {
+                        active: event_active,
+                        ..
+                    } if *event_active == active
+                )));
+            }
+            "refresh_env" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+                let response = dispatch_matrix_request_after(
+                    &ctx,
+                    vec![attach_existing_request(session_id, tmp.path())],
+                    Request::RefreshEnv {
+                        vars: HashMap::from([("COCKPIT_TEST_ENV".into(), "fresh".into())]),
+                    },
+                )
+                .await
+                .expect("refresh env");
+                assert!(matches!(response, Response::Ack));
+                let handle = ctx.registry.live_handle(session_id).expect("live handle");
+                assert_eq!(
+                    handle
+                        .env_overlay()
+                        .read()
+                        .unwrap()
+                        .get("COCKPIT_TEST_ENV")
+                        .map(String::as_str),
+                    Some("fresh")
+                );
+            }
+            "record_usage" => {
+                let ctx = test_ctx();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::RecordUsage {
+                        kind: proto::UsageKind::Slash,
+                        key: "/help".into(),
+                        project_id: None,
+                    },
+                )
+                .await
+                .expect("record usage");
+                assert!(matches!(response, Response::Ack));
+                let counts = ctx.db.usage_counts("slash", None, 0).unwrap();
+                assert_eq!(counts.get("/help"), Some(&1));
+            }
+            "store_flycockpit_credential" | "clear_flycockpit_credential" => {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("credential.json");
+                let ctx = persistent_test_ctx_with_credential_path(path.clone());
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::StoreFlycockpitCredential {
+                        credential: flycockpit_credential(),
+                    },
+                )
+                .await
+                .expect("store credential");
+                assert!(matches!(response, Response::Ack));
+                assert!(path.exists());
+                if kind == "clear_flycockpit_credential" {
+                    let response =
+                        dispatch_matrix_request(&ctx, Request::ClearFlycockpitCredential)
+                            .await
+                            .expect("clear credential");
+                    assert!(matches!(response, Response::Ack));
+                    assert!(crate::auth::flycockpit::load_credential_from_path(path).is_err());
+                }
+            }
+            "stop_daemon" => {
+                let ctx = test_ctx();
+                let response =
+                    dispatch_matrix_request(&ctx, Request::StopDaemon { grace_secs: Some(2) })
+                        .await
+                        .expect("stop daemon");
+                assert!(matches!(response, Response::Ack));
+                assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
+            }
+            "lsp_control" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+                let (response, events) = dispatch_matrix_request_after_collect_events(
+                    &ctx,
+                    vec![attach_existing_request(session_id, tmp.path())],
+                    Request::LspControl {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        server_id: "rust-analyzer".into(),
+                        action: proto::LspControlAction::Check,
+                    },
+                )
+                .await;
+                let response = response.expect("lsp control");
+                let Response::LspControlResult { message } = response else {
+                    panic!("expected LspControlResult");
+                };
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    proto::Event::Notice { session_id: got, text }
+                        if *got == session_id && *text == message
+                )));
+            }
+            other => panic!("unexpected in-memory/global case {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
+        Request::Attach {
+            session_id: Some(session_id),
+            since_seq: None,
+            project_root: Some(project_root.to_string_lossy().into_owned()),
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        }
+    }
+
+
+    #[cfg(unix)]
     fn git_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         run_git(tmp.path(), &["init"]);
@@ -1681,7 +3474,7 @@ mod tests {
                 kind: "subagent_transcript",
                 session_id: Some(transcript_session_id),
                 audit_path: None,
-                mutating: true,
+                mutating: false,
             },
             CommandMetadataCase {
                 request: Request::ReadSessionMessages {
@@ -2086,7 +3879,7 @@ mod tests {
                 kind: "resource_snapshot",
                 session_id: None,
                 audit_path: None,
-                mutating: true,
+                mutating: false,
             },
             CommandMetadataCase {
                 request: Request::PromoteResource {
@@ -2103,7 +3896,7 @@ mod tests {
                 kind: "list_agents",
                 session_id: None,
                 audit_path: None,
-                mutating: true,
+                mutating: false,
             },
             CommandMetadataCase {
                 request: Request::ListModels {
@@ -2309,7 +4102,7 @@ mod tests {
                 kind: "get_usage_counts",
                 session_id: None,
                 audit_path: None,
-                mutating: true,
+                mutating: false,
             },
             CommandMetadataCase {
                 request: Request::GuidanceEstimate {

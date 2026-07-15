@@ -623,7 +623,7 @@ macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
             (Request::Attach { session_id, .. }, "attach", custom(authorize_attach), option_field(session_id), true, none);
-            (Request::SubagentTranscript { session_id, .. }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), true, none);
+            (Request::SubagentTranscript { session_id, .. }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, none);
             (Request::SendUserMessage { .. }, "send_user_message", session_writer, attached, true, none);
             (Request::SteerDelegation { session_id, .. }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, none);
             (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, none);
@@ -665,9 +665,9 @@ macro_rules! command {
             (Request::RecordSessionNote { session_id, .. }, "record_session_note", session_row_writer(session_id), field(session_id), true, none);
             (Request::DeleteSession { session_id, .. }, "delete_session", session_row_writer(session_id), field(session_id), true, none);
             (Request::ListSkills { project_root }, "list_skills", project_read(project_root), none, false, none);
-            (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, true, none);
+            (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, none);
             (Request::PromoteResource { session_id, .. }, "promote_resource", owner_only, option_field(session_id), true, none);
-            (Request::ListAgents, "list_agents", owner_only, none, true, none);
+            (Request::ListAgents, "list_agents", owner_only, none, false, none);
             (Request::ListModels { .. }, "list_models", owner_only, none, false, none);
             (Request::SetActiveModel { .. }, "set_active_model", session_writer, attached, true, none);
             (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, none);
@@ -691,7 +691,7 @@ macro_rules! command {
             (Request::DaemonStatus, "daemon_status", public_read, none, false, none);
             (Request::RefreshEnv { .. }, "refresh_env", session_writer, attached, true, none);
             (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, none);
-            (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, true, none);
+            (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, false, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, none);
         ] }

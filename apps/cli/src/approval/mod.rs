@@ -927,6 +927,93 @@ mod tests {
         assert_eq!(prompt, "Allow read access to /tmp/outside?");
     }
 
+    #[test]
+    fn approval_response_mapping_is_fail_closed_and_scope_exact() {
+        assert_eq!(
+            response_to_approval_choice(
+                &ResolveResponse::Single {
+                    selected_id: ID_APPROVE_PROJECT.to_string(),
+                },
+                false,
+            ),
+            ApprovalChoice::Approve(Scope::Project)
+        );
+        assert_eq!(
+            response_to_approval_choice(
+                &ResolveResponse::Batch {
+                    responses: vec![ResolveResponse::Single {
+                        selected_id: ID_REJECT_SESSION.to_string(),
+                    }],
+                },
+                false,
+            ),
+            ApprovalChoice::Reject(Scope::Session)
+        );
+        assert_eq!(
+            response_to_approval_choice(
+                &ResolveResponse::Single {
+                    selected_id: ID_APPROVE_GLOBAL.to_string(),
+                },
+                true,
+            ),
+            ApprovalChoice::Deny,
+            "wrapper prompts cannot persist broader approval ids"
+        );
+        assert_eq!(
+            response_to_approval_choice(&ResolveResponse::Cancel, false),
+            ApprovalChoice::Deny
+        );
+        assert_eq!(
+            response_to_approval_choice(
+                &ResolveResponse::Single {
+                    selected_id: "unknown".to_string(),
+                },
+                false,
+            ),
+            ApprovalChoice::Deny
+        );
+    }
+
+    #[test]
+    fn repeat_response_mapping_is_fail_closed_and_records_rule_scope() {
+        assert_eq!(
+            response_to_repeat_choice(&ResolveResponse::Single {
+                selected_id: ID_LOOP_ACCEPT_ONCE.to_string(),
+            }),
+            RepeatChoice::AcceptOnce
+        );
+        assert_eq!(
+            response_to_repeat_choice(&ResolveResponse::Single {
+                selected_id: ID_LOOP_REJECT_PROJECT.to_string(),
+            }),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Reject,
+                scope: Scope::Project,
+            }
+        );
+        assert_eq!(
+            response_to_repeat_choice(&ResolveResponse::Batch {
+                responses: vec![ResolveResponse::Single {
+                    selected_id: ID_LOOP_ACCEPT_SESSION.to_string(),
+                }],
+            }),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Accept,
+                scope: Scope::Session,
+            }
+        );
+        assert_eq!(
+            response_to_repeat_choice(&ResolveResponse::Cancel),
+            RepeatChoice::RejectOnce
+        );
+        assert_eq!(
+            response_to_repeat_choice(&ResolveResponse::Single {
+                selected_id: "unknown".to_string(),
+            }),
+            RepeatChoice::RejectOnce
+        );
+    }
+
     /// Spawn a background resolver that answers a sequence of prompts in
     /// order: for each `id` in `ids`, it waits for the next not-yet-seen open
     /// interrupt and resolves it with `Single { selected_id: id }`.

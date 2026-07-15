@@ -1041,6 +1041,151 @@ fn codec_error(err: LinesCodecError) -> io::Error {
     }
 }
 
+#[cfg(test)]
+mod proto_fixture_tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Map, Value};
+
+    use super::*;
+
+    #[test]
+    fn proto_fixture_request_full_shapes_round_trip() {
+        assert_enum_fixture::<Request>(
+            "request",
+            "request.json",
+            enum_variant_kinds(include_str!("proto/request.rs"), "Request"),
+        );
+    }
+
+    #[test]
+    fn proto_fixture_response_full_shapes_round_trip() {
+        assert_enum_fixture::<Response>(
+            "response",
+            "response.json",
+            enum_variant_kinds(include_str!("proto/response.rs"), "Response"),
+        );
+    }
+
+    #[test]
+    fn proto_fixture_event_full_shapes_round_trip() {
+        assert_enum_fixture::<Event>(
+            "event",
+            "event.json",
+            enum_variant_kinds(include_str!("proto/event.rs"), "Event"),
+        );
+    }
+
+    fn assert_enum_fixture<T>(tag: &str, file_name: &str, expected_kinds: Vec<String>)
+    where
+        T: DeserializeOwned + Serialize,
+    {
+        let path = fixture_root().join(file_name);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let fixtures: Map<String, Value> = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let expected = expected_kinds.into_iter().collect::<BTreeSet<_>>();
+        let actual = fixtures.keys().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "{file_name} must contain exactly one full-shape fixture per {tag} variant"
+        );
+
+        for (kind, value) in fixtures {
+            assert_eq!(
+                value.get(tag).and_then(Value::as_str),
+                Some(kind.as_str()),
+                "{file_name}:{kind} must carry its serde tag"
+            );
+            let parsed: T = serde_json::from_value(value.clone())
+                .unwrap_or_else(|error| panic!("deserialize {file_name}:{kind}: {error}"));
+            let serialized = serde_json::to_value(parsed)
+                .unwrap_or_else(|error| panic!("serialize {file_name}:{kind}: {error}"));
+            assert_eq!(
+                canonical(serialized),
+                canonical(value),
+                "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
+            );
+        }
+    }
+
+    fn fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("daemon_proto")
+    }
+
+    fn enum_variant_kinds(source: &str, enum_name: &str) -> Vec<String> {
+        let mut in_enum = false;
+        let mut brace_depth = 0usize;
+        let mut out = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if !in_enum {
+                if trimmed == format!("pub enum {enum_name} {{") {
+                    in_enum = true;
+                    brace_depth = 1;
+                }
+                continue;
+            }
+
+            if brace_depth == 1
+                && let Some(first) = trimmed.chars().next()
+                && first.is_ascii_uppercase()
+            {
+                let name = trimmed
+                    .split(|c: char| c == ' ' || c == '{' || c == ',')
+                    .next()
+                    .expect("variant name");
+                out.push(to_snake_case(name));
+            }
+
+            brace_depth += line.chars().filter(|ch| *ch == '{').count();
+            brace_depth = brace_depth.saturating_sub(line.chars().filter(|ch| *ch == '}').count());
+            if brace_depth == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn to_snake_case(name: &str) -> String {
+        let mut out = String::new();
+        for (index, ch) in name.chars().enumerate() {
+            if ch.is_ascii_uppercase() {
+                if index > 0 {
+                    out.push('_');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn canonical(value: Value) -> Value {
+        match value {
+            Value::Array(items) => Value::Array(items.into_iter().map(canonical).collect()),
+            Value::Object(map) => {
+                let mut sorted = Map::new();
+                let mut keys = map.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                for key in keys {
+                    sorted.insert(key.clone(), canonical(map.get(&key).unwrap().clone()));
+                }
+                Value::Object(sorted)
+            }
+            other => other,
+        }
+    }
+}
+
 // ---- Tests -----------------------------------------------------------------
 
 #[cfg(test)]

@@ -1,0 +1,527 @@
+{
+  "archive_session": {
+    "params": {
+      "cascade": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "archive_session"
+  },
+  "attach": {
+    "params": {
+      "client_protocol_version": 7,
+      "env_policy": "update-daemon",
+      "env_snapshot": {
+        "digest": "digest-fixture",
+        "source": "explicit_cli",
+        "vars": {
+          "PATH": "/usr/bin",
+          "TOKEN": "redacted"
+        }
+      },
+      "interactive": true,
+      "model_override": "model_override-fixture",
+      "no_sandbox": true,
+      "project_root": "project_root-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "since_seq": 7
+    },
+    "request": "attach"
+  },
+  "attach_terminal": {
+    "params": {
+      "cols": 7,
+      "rows": 7,
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "attach_terminal"
+  },
+  "begin_attachment_upload": {
+    "params": {
+      "byte_len": 7,
+      "mime": "mime-fixture",
+      "purpose": {
+        "terminal_paste_image": {
+          "terminal_id": "11111111-1111-4111-8111-111111111111"
+        }
+      },
+      "sha256": "sha256-fixture"
+    },
+    "request": "begin_attachment_upload"
+  },
+  "cancel_attachment_upload": {
+    "params": {
+      "upload_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "cancel_attachment_upload"
+  },
+  "cancel_paused_work": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "cancel_paused_work"
+  },
+  "cancel_schedule": {
+    "params": {
+      "job_id": "job_id-fixture"
+    },
+    "request": "cancel_schedule"
+  },
+  "cancel_turn": {
+    "request": "cancel_turn"
+  },
+  "clear_flycockpit_credential": {
+    "request": "clear_flycockpit_credential"
+  },
+  "close_terminal": {
+    "params": {
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "close_terminal"
+  },
+  "compact": {
+    "request": "compact"
+  },
+  "daemon_status": {
+    "request": "daemon_status"
+  },
+  "delete_session": {
+    "params": {
+      "cascade": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "delete_session"
+  },
+  "discard_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "discard_session"
+  },
+  "finish_attachment_upload": {
+    "params": {
+      "upload_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "finish_attachment_upload"
+  },
+  "fork_session": {
+    "params": {
+      "ephemeral": true,
+      "fork_point_turn_id": "fork_point_turn_id-fixture",
+      "parent_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "fork_session"
+  },
+  "fs_create_dir": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_create_dir"
+  },
+  "fs_delete": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_delete"
+  },
+  "fs_list": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture",
+      "show_hidden": true
+    },
+    "request": "fs_list"
+  },
+  "fs_read": {
+    "params": {
+      "base64": true,
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_read"
+  },
+  "fs_rename": {
+    "params": {
+      "from_path": "from_path-fixture",
+      "project_root": "project_root-fixture",
+      "to_path": "to_path-fixture"
+    },
+    "request": "fs_rename"
+  },
+  "fs_stat": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_stat"
+  },
+  "fs_write": {
+    "params": {
+      "base_hash": "base_hash-fixture",
+      "content": "content-fixture",
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_write"
+  },
+  "get_usage_counts": {
+    "params": {
+      "project_id": "project_id-fixture"
+    },
+    "request": "get_usage_counts"
+  },
+  "git_diff_file": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "git_diff_file"
+  },
+  "git_status": {
+    "params": {
+      "project_root": "project_root-fixture"
+    },
+    "request": "git_status"
+  },
+  "guidance_estimate": {
+    "params": {
+      "model": "model-fixture",
+      "project_root": "project_root-fixture",
+      "provider": "provider-fixture"
+    },
+    "request": "guidance_estimate"
+  },
+  "list_agents": {
+    "request": "list_agents"
+  },
+  "list_models": {
+    "params": {
+      "provider": "provider-fixture"
+    },
+    "request": "list_models"
+  },
+  "list_sessions": {
+    "params": {
+      "parent_session_id": "11111111-1111-4111-8111-111111111111",
+      "project_id": "project_id-fixture"
+    },
+    "request": "list_sessions"
+  },
+  "list_skills": {
+    "params": {
+      "project_root": "project_root-fixture"
+    },
+    "request": "list_skills"
+  },
+  "lsp_control": {
+    "params": {
+      "action": "restart",
+      "project_root": "project_root-fixture",
+      "server_id": "server_id-fixture"
+    },
+    "request": "lsp_control"
+  },
+  "open_terminal": {
+    "params": {
+      "cols": 7,
+      "cwd": "cwd-fixture",
+      "rows": 7
+    },
+    "request": "open_terminal"
+  },
+  "pin": {
+    "params": {
+      "text": "text-fixture"
+    },
+    "request": "pin"
+  },
+  "promote_resource": {
+    "params": {
+      "request_id": "request_id-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "promote_resource"
+  },
+  "prune": {
+    "request": "prune"
+  },
+  "read_session_messages": {
+    "params": {
+      "before_seq": 7,
+      "limit": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "read_session_messages"
+  },
+  "record_session_note": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "request": "record_session_note"
+  },
+  "record_usage": {
+    "params": {
+      "key": "key-fixture",
+      "kind": "model",
+      "project_id": "project_id-fixture"
+    },
+    "request": "record_usage"
+  },
+  "refresh_env": {
+    "params": {
+      "vars": {
+        "KEY": "VALUE"
+      }
+    },
+    "request": "refresh_env"
+  },
+  "remove_editable_queued_user_messages": {
+    "params": {
+      "target_id": "target_id-fixture"
+    },
+    "request": "remove_editable_queued_user_messages"
+  },
+  "remove_newest_queued_user_message": {
+    "params": {
+      "target_id": "target_id-fixture"
+    },
+    "request": "remove_newest_queued_user_message"
+  },
+  "remove_queued_user_message": {
+    "params": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "remove_queued_user_message"
+  },
+  "rename_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "title": "title-fixture"
+    },
+    "request": "rename_session"
+  },
+  "repair_resume": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "repair_resume"
+  },
+  "resolve_interrupt": {
+    "params": {
+      "interrupt_id": "11111111-1111-4111-8111-111111111111",
+      "response": {
+        "data": {
+          "responses": [
+            {
+              "data": {
+                "selected_id": "approve_once"
+              },
+              "kind": "single"
+            },
+            {
+              "data": {
+                "text": "because"
+              },
+              "kind": "freetext"
+            }
+          ]
+        },
+        "kind": "batch"
+      }
+    },
+    "request": "resolve_interrupt"
+  },
+  "resource_snapshot": {
+    "request": "resource_snapshot"
+  },
+  "resume_paused_work": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "resume_paused_work"
+  },
+  "send_user_message": {
+    "params": {
+      "forced_skill": "forced_skill-fixture",
+      "image_refs": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "text": "text-fixture"
+    },
+    "request": "send_user_message"
+  },
+  "session_live_status": {
+    "params": {
+      "session_ids": ["11111111-1111-4111-8111-111111111111"]
+    },
+    "request": "session_live_status"
+  },
+  "set_active_model": {
+    "params": {
+      "model": "model-fixture",
+      "provider": "provider-fixture"
+    },
+    "request": "set_active_model"
+  },
+  "set_agent": {
+    "params": {
+      "name": "name-fixture"
+    },
+    "request": "set_agent"
+  },
+  "set_approval_mode": {
+    "params": {
+      "mode": "auto"
+    },
+    "request": "set_approval_mode"
+  },
+  "set_caffeinate": {
+    "params": {
+      "mode": "until_idle"
+    },
+    "request": "set_caffeinate"
+  },
+  "set_delegation_recursion": {
+    "params": {
+      "default_depth": 7,
+      "enabled": true
+    },
+    "request": "set_delegation_recursion"
+  },
+  "set_llm_mode": {
+    "params": {
+      "mode": "normal"
+    },
+    "request": "set_llm_mode"
+  },
+  "set_preflight": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_preflight"
+  },
+  "set_redaction": {
+    "params": {
+      "scan_dotenv": true,
+      "scan_environment": true,
+      "scan_ssh_keys": true
+    },
+    "request": "set_redaction"
+  },
+  "set_sandbox": {
+    "params": {
+      "container_network_enabled": true,
+      "mode": "container"
+    },
+    "request": "set_sandbox"
+  },
+  "set_sandbox_escalation": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_sandbox_escalation"
+  },
+  "set_session_llm_mode": {
+    "params": {
+      "mode": "normal"
+    },
+    "request": "set_session_llm_mode"
+  },
+  "set_tandem_models": {
+    "params": {
+      "models": [["fixture", "model"]]
+    },
+    "request": "set_tandem_models"
+  },
+  "set_trusted_only": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_trusted_only"
+  },
+  "share_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "shared": true
+    },
+    "request": "share_session"
+  },
+  "steer_delegation": {
+    "params": {
+      "label": "label-fixture",
+      "message": "message-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "request": "steer_delegation"
+  },
+  "stop_daemon": {
+    "params": {
+      "grace_secs": 7
+    },
+    "request": "stop_daemon"
+  },
+  "store_flycockpit_credential": {
+    "params": {
+      "credential": {
+        "account": {
+          "email": "user@example.test",
+          "user_id": "user"
+        },
+        "display_name": "Example",
+        "instance_id": "inst",
+        "instance_token": "token",
+        "relay_choice": {
+          "chosenAt": 1700000000000,
+          "region": "iad",
+          "relayId": "relay",
+          "rttMs": 42,
+          "wsUrl": "wss://relay.example.test"
+        },
+        "server_url": "https://example.test"
+      }
+    },
+    "request": "store_flycockpit_credential"
+  },
+  "subagent_transcript": {
+    "params": {
+      "label": "label-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "request": "subagent_transcript"
+  },
+  "terminal_input": {
+    "params": {
+      "bytes": [65, 66, 67],
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_input"
+  },
+  "terminal_resize": {
+    "params": {
+      "cols": 7,
+      "rows": 7,
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_resize"
+  },
+  "unarchive_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "unarchive_session"
+  },
+  "upload_attachment_chunk": {
+    "params": {
+      "data_base64": "data_base64-fixture",
+      "offset": 7,
+      "upload_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "upload_attachment_chunk"
+  }
+}

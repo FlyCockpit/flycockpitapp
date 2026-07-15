@@ -1175,13 +1175,6 @@ mod tests {
         actual: AuthzAllowedOutcome,
     }
 
-    const KNOWN_HOLE_CROSS_SESSION_PAUSED_WORK_AUTHZ: &[AuthzKnownHole] = &[AuthzKnownHole {
-        marker: "KNOWN_HOLE: cross-session paused work authorizes attached session but mutates field session_id",
-        level: AuthzLevel::Writer,
-        expected: ErrorCode::Authorization,
-        actual: AuthzAllowedOutcome::Response,
-    }];
-
     impl AuthzDispatchCase {
         fn expectation(self, level: AuthzLevel) -> AuthzExpectation {
             match level {
@@ -1358,14 +1351,8 @@ mod tests {
             authz_session_writer("remove_queued_user_message"),
             authz_session_writer("remove_newest_queued_user_message"),
             authz_session_writer("remove_editable_queued_user_messages"),
-            authz_session_writer_with_known_holes(
-                "resume_paused_work",
-                KNOWN_HOLE_CROSS_SESSION_PAUSED_WORK_AUTHZ,
-            ),
-            authz_session_writer_with_known_holes(
-                "cancel_paused_work",
-                KNOWN_HOLE_CROSS_SESSION_PAUSED_WORK_AUTHZ,
-            ),
+            authz_session_writer("resume_paused_work"),
+            authz_session_writer("cancel_paused_work"),
             authz_session_writer("repair_resume"),
             authz_session_writer("cancel_turn"),
             authz_project_files("fs_list"),

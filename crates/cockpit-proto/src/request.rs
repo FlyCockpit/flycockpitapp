@@ -634,8 +634,8 @@ macro_rules! command {
             (Request::RemoveQueuedUserMessage { .. }, "remove_queued_user_message", session_writer, attached, true, none);
             (Request::RemoveNewestQueuedUserMessage { .. }, "remove_newest_queued_user_message", session_writer, attached, true, none);
             (Request::RemoveEditableQueuedUserMessages { .. }, "remove_editable_queued_user_messages", session_writer, attached, true, none);
-            (Request::ResumePausedWork { session_id }, "resume_paused_work", session_writer, field(session_id), true, none);
-            (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_writer, field(session_id), true, none);
+            (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, none);
+            (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, none);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, none);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, none);

@@ -913,6 +913,7 @@ mod tests {
     struct DispatchMatrixRow {
         kind: &'static str,
         class: DispatchMatrixClass,
+        authz: &'static str,
     }
 
     macro_rules! dispatch_matrix_rows_from_command_table {
@@ -921,6 +922,7 @@ mod tests {
                 DispatchMatrixRow {
                     kind: $kind,
                     class: dispatch_matrix_class_for_command($kind, stringify!($authz), $mutating),
+                    authz: stringify!($authz),
                 },
             )+]
         }};
@@ -1122,6 +1124,307 @@ mod tests {
         ]
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AuthzExpectation {
+        Allow(AuthzAllowedOutcome),
+        Deny(ErrorCode),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AuthzAllowedOutcome {
+        Response,
+        Error(ErrorCode),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AuthzLevel {
+        Owner,
+        Writer,
+        Readonly,
+        NoAccess,
+    }
+
+    impl AuthzLevel {
+        const ALL: [Self; 4] = [Self::Owner, Self::Writer, Self::Readonly, Self::NoAccess];
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Owner => "owner",
+                Self::Writer => "writer",
+                Self::Readonly => "readonly",
+                Self::NoAccess => "no_access",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct AuthzDispatchCase {
+        kind: &'static str,
+        owner: AuthzExpectation,
+        writer: AuthzExpectation,
+        readonly: AuthzExpectation,
+        no_access: AuthzExpectation,
+        known_holes: &'static [AuthzKnownHole],
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct AuthzKnownHole {
+        marker: &'static str,
+        level: AuthzLevel,
+        expected: ErrorCode,
+        actual: AuthzAllowedOutcome,
+    }
+
+    const KNOWN_HOLE_CROSS_SESSION_PAUSED_WORK_AUTHZ: &[AuthzKnownHole] = &[AuthzKnownHole {
+        marker: "KNOWN_HOLE: cross-session paused work authorizes attached session but mutates field session_id",
+        level: AuthzLevel::Writer,
+        expected: ErrorCode::Authorization,
+        actual: AuthzAllowedOutcome::Response,
+    }];
+
+    impl AuthzDispatchCase {
+        fn expectation(self, level: AuthzLevel) -> AuthzExpectation {
+            match level {
+                AuthzLevel::Owner => self.owner,
+                AuthzLevel::Writer => self.writer,
+                AuthzLevel::Readonly => self.readonly,
+                AuthzLevel::NoAccess => self.no_access,
+            }
+        }
+    }
+
+    fn authz_owner_only(kind: &'static str) -> AuthzDispatchCase {
+        AuthzDispatchCase {
+            kind,
+            owner: authz_allow(kind),
+            writer: AuthzExpectation::Deny(ErrorCode::Authorization),
+            readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+            no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+            known_holes: &[],
+        }
+    }
+
+    fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
+        authz_session_writer_with_known_holes(kind, &[])
+    }
+
+    fn authz_session_writer_with_known_holes(
+        kind: &'static str,
+        known_holes: &'static [AuthzKnownHole],
+    ) -> AuthzDispatchCase {
+        AuthzDispatchCase {
+            kind,
+            owner: authz_allow(kind),
+            writer: authz_allow(kind),
+            readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+            no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+            known_holes,
+        }
+    }
+
+    fn authz_session_reader(kind: &'static str) -> AuthzDispatchCase {
+        AuthzDispatchCase {
+            kind,
+            owner: authz_allow(kind),
+            writer: authz_allow(kind),
+            readonly: authz_allow(kind),
+            no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+            known_holes: &[],
+        }
+    }
+
+    fn authz_project_files(kind: &'static str) -> AuthzDispatchCase {
+        AuthzDispatchCase {
+            kind,
+            owner: authz_allow(kind),
+            writer: authz_allow(kind),
+            readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+            no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+            known_holes: &[],
+        }
+    }
+
+    fn authz_project_read(kind: &'static str) -> AuthzDispatchCase {
+        AuthzDispatchCase {
+            kind,
+            owner: authz_allow(kind),
+            writer: authz_allow(kind),
+            readonly: authz_allow(kind),
+            no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+            known_holes: &[],
+        }
+    }
+
+    fn authz_terminal(kind: &'static str) -> AuthzDispatchCase {
+        AuthzDispatchCase {
+            kind,
+            owner: authz_allow(kind),
+            writer: authz_allow(kind),
+            readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+            no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+            known_holes: &[],
+        }
+    }
+
+    fn authz_allow(kind: &'static str) -> AuthzExpectation {
+        AuthzExpectation::Allow(authz_allowed_outcome(kind))
+    }
+
+    fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
+        match kind {
+            "attach"
+            | "subagent_transcript"
+            | "cancel_attachment_upload"
+            | "resume_paused_work"
+            | "cancel_paused_work"
+            | "fs_list"
+            | "fs_write"
+            | "fs_create_dir"
+            | "lsp_control"
+            | "read_session_messages"
+            | "unarchive_session"
+            | "fork_session"
+            | "rename_session"
+            | "share_session"
+            | "record_session_note"
+            | "list_skills"
+            | "resource_snapshot"
+            | "promote_resource"
+            | "set_approval_mode"
+            | "set_sandbox"
+            | "set_sandbox_escalation"
+            | "set_caffeinate"
+            | "refresh_env"
+            | "record_usage"
+            | "get_usage_counts"
+            | "guidance_estimate"
+            | "stop_daemon" => AuthzAllowedOutcome::Response,
+            "begin_attachment_upload"
+            | "upload_attachment_chunk"
+            | "finish_attachment_upload"
+            | "fs_stat"
+            | "fs_read"
+            | "fs_rename"
+            | "fs_delete"
+            | "git_status"
+            | "git_diff_file"
+            | "attach_terminal"
+            | "terminal_input"
+            | "terminal_resize"
+            | "close_terminal"
+            | "store_flycockpit_credential"
+            | "clear_flycockpit_credential" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+            "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
+            "send_user_message"
+            | "steer_delegation"
+            | "remove_queued_user_message"
+            | "remove_newest_queued_user_message"
+            | "remove_editable_queued_user_messages"
+            | "repair_resume"
+            | "cancel_turn"
+            | "resolve_interrupt"
+            | "archive_session"
+            | "discard_session"
+            | "delete_session"
+            | "list_agents"
+            | "list_models"
+            | "set_active_model"
+            | "set_agent"
+            | "set_llm_mode"
+            | "set_session_llm_mode"
+            | "set_delegation_recursion"
+            | "set_preflight"
+            | "set_trusted_only"
+            | "set_redaction"
+            | "set_tandem_models"
+            | "cancel_schedule"
+            | "prune"
+            | "compact"
+            | "pin" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+            other => panic!("unhandled authz allowed outcome for {other}"),
+        }
+    }
+
+    fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
+        vec![
+            authz_session_reader("attach"),
+            authz_session_reader("subagent_transcript"),
+            authz_session_writer("send_user_message"),
+            authz_session_writer("steer_delegation"),
+            authz_session_writer("begin_attachment_upload"),
+            authz_session_writer("upload_attachment_chunk"),
+            authz_session_writer("finish_attachment_upload"),
+            authz_session_writer("cancel_attachment_upload"),
+            authz_session_writer("remove_queued_user_message"),
+            authz_session_writer("remove_newest_queued_user_message"),
+            authz_session_writer("remove_editable_queued_user_messages"),
+            authz_session_writer_with_known_holes(
+                "resume_paused_work",
+                KNOWN_HOLE_CROSS_SESSION_PAUSED_WORK_AUTHZ,
+            ),
+            authz_session_writer_with_known_holes(
+                "cancel_paused_work",
+                KNOWN_HOLE_CROSS_SESSION_PAUSED_WORK_AUTHZ,
+            ),
+            authz_session_writer("repair_resume"),
+            authz_session_writer("cancel_turn"),
+            authz_project_files("fs_list"),
+            authz_project_files("fs_stat"),
+            authz_project_files("fs_read"),
+            authz_project_files("fs_write"),
+            authz_project_files("fs_create_dir"),
+            authz_project_files("fs_rename"),
+            authz_owner_only("fs_delete"),
+            authz_project_files("git_status"),
+            authz_project_files("git_diff_file"),
+            authz_terminal("open_terminal"),
+            authz_terminal("attach_terminal"),
+            authz_terminal("terminal_input"),
+            authz_terminal("terminal_resize"),
+            authz_terminal("close_terminal"),
+            authz_terminal("lsp_control"),
+            authz_session_writer("resolve_interrupt"),
+            authz_session_reader("read_session_messages"),
+            authz_session_writer("archive_session"),
+            authz_session_writer("unarchive_session"),
+            authz_session_writer("fork_session"),
+            authz_session_writer("discard_session"),
+            authz_session_writer("rename_session"),
+            authz_owner_only("share_session"),
+            authz_session_writer("record_session_note"),
+            authz_session_writer("delete_session"),
+            authz_project_read("list_skills"),
+            authz_owner_only("resource_snapshot"),
+            authz_owner_only("promote_resource"),
+            authz_owner_only("list_agents"),
+            authz_owner_only("list_models"),
+            authz_session_writer("set_active_model"),
+            authz_session_writer("set_agent"),
+            authz_session_writer("set_llm_mode"),
+            authz_session_writer("set_session_llm_mode"),
+            authz_session_writer("set_approval_mode"),
+            authz_session_writer("set_delegation_recursion"),
+            authz_session_writer("set_sandbox"),
+            authz_session_writer("set_sandbox_escalation"),
+            authz_session_writer("set_preflight"),
+            authz_session_writer("set_trusted_only"),
+            authz_session_writer("set_redaction"),
+            authz_session_writer("set_tandem_models"),
+            authz_owner_only("set_caffeinate"),
+            authz_session_writer("cancel_schedule"),
+            authz_session_writer("prune"),
+            authz_session_writer("compact"),
+            authz_session_writer("pin"),
+            authz_owner_only("store_flycockpit_credential"),
+            authz_owner_only("clear_flycockpit_credential"),
+            authz_session_writer("refresh_env"),
+            authz_owner_only("record_usage"),
+            authz_owner_only("get_usage_counts"),
+            authz_project_read("guidance_estimate"),
+            authz_owner_only("stop_daemon"),
+        ]
+    }
+
     #[cfg(unix)]
     async fn dispatch_matrix_request(
         ctx: &Arc<DaemonContext>,
@@ -1136,9 +1439,26 @@ mod tests {
         prelude: Vec<Request>,
         request: Request,
     ) -> std::result::Result<Response, ErrorPayload> {
+        dispatch_authz_request_after(ctx, ClientPrincipal::owner(), prelude, None, None, request)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_authz_request_after(
+        ctx: &Arc<DaemonContext>,
+        principal: ClientPrincipal,
+        prelude: Vec<Request>,
+        unshare_session_after_prelude: Option<Uuid>,
+        worker_rx_to_drop_after_prelude: Option<tokio::sync::mpsc::Receiver<SessionWork>>,
+        request: Request,
+    ) -> std::result::Result<Response, ErrorPayload> {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let mut client = ProtoStream::new(client_stream);
-        let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+        let server = tokio::spawn(handle_client_transport_as(
+            server_stream,
+            ctx.clone(),
+            principal,
+        ));
         match recv_body(&mut client).await {
             Body::Response { id, response } => {
                 assert_eq!(id, Uuid::nil());
@@ -1156,6 +1476,14 @@ mod tests {
             recv_dispatch_matrix_response(&mut client, prelude_id)
                 .await
                 .expect("prelude request succeeds");
+        }
+
+        drop(worker_rx_to_drop_after_prelude);
+
+        if let Some(session_id) = unshare_session_after_prelude {
+            ctx.db
+                .set_session_shared_with_collaborators(session_id, false)
+                .expect("revoke shared session before authz matrix request");
         }
 
         let id = Uuid::new_v4();
@@ -1307,6 +1635,11 @@ mod tests {
             .filter(|row| row.class == DispatchMatrixClass::Mutating)
             .map(|row| row.kind)
             .collect();
+        let controlled: BTreeSet<_> = dispatch_matrix_rows()
+            .into_iter()
+            .filter(|row| row.authz != "public_read")
+            .map(|row| row.kind)
+            .collect();
         let happy: BTreeSet<_> = readonly_dispatch_happy_cases()
             .into_iter()
             .map(|case| case.kind)
@@ -1330,6 +1663,8 @@ mod tests {
             .into_iter()
             .map(|case| case.kind)
             .collect();
+        let authz_declared: BTreeSet<_> =
+            authz_dispatch_cases().into_iter().map(|case| case.kind).collect();
 
         assert_eq!(
             readonly, happy,
@@ -1347,8 +1682,12 @@ mod tests {
             mutating, mutating_malformed,
             "every mutating dispatch kind needs a malformed/invalid-state socket case"
         );
+        assert_eq!(
+            controlled, authz_declared,
+            "every non-public dispatch kind needs an authz matrix declaration"
+        );
         assert!(
-            readonly.len() >= 10 && mutating.len() >= 40,
+            readonly.len() >= 10 && mutating.len() >= 40 && authz_declared.len() >= 60,
             "dispatch_matrix coverage must be non-vacuous"
         );
     }
@@ -1379,6 +1718,564 @@ mod tests {
         }
         for case in mutating_dispatch_malformed_cases() {
             assert_mutating_malformed_socket_case(case).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authz_dispatch_matrix_covers_every_controlled_kind() {
+        assert_dispatch_matrix_coverage_complete();
+        for case in authz_dispatch_cases() {
+            for level in AuthzLevel::ALL {
+                let scenario = authz_socket_scenario(case.kind, level);
+                let result = dispatch_authz_request_after(
+                    &scenario.ctx,
+                    scenario.principal,
+                    scenario.prelude,
+                    scenario.unshare_session_after_prelude,
+                    scenario.worker_rx_to_drop_after_prelude,
+                    scenario.request,
+                )
+                .await;
+                assert_authz_matrix_result(case, level, result);
+            }
+            for known_hole in case.known_holes {
+                assert_authz_known_hole_socket_case(case.kind, *known_hole).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct AuthzSocketScenario {
+        ctx: Arc<DaemonContext>,
+        principal: ClientPrincipal,
+        prelude: Vec<Request>,
+        unshare_session_after_prelude: Option<Uuid>,
+        worker_rx_to_drop_after_prelude: Option<tokio::sync::mpsc::Receiver<SessionWork>>,
+        request: Request,
+        target_session_id: Uuid,
+        _tmp: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    fn assert_authz_matrix_result(
+        case: AuthzDispatchCase,
+        level: AuthzLevel,
+        result: std::result::Result<Response, ErrorPayload>,
+    ) {
+        match case.expectation(level) {
+            AuthzExpectation::Allow(expected) => {
+                assert_authz_allowed_outcome(case.kind, level, expected, result);
+            }
+            AuthzExpectation::Deny(expected) => {
+                let error = match result {
+                    Ok(response) => panic!(
+                        "{} unexpectedly allowed {} with response {response:?}",
+                        case.kind,
+                        level.label()
+                    ),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.code,
+                    expected,
+                    "{} denied {} with wrong code: {}",
+                    case.kind,
+                    level.label(),
+                    error.message
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_authz_allowed_outcome(
+        kind: &str,
+        level: AuthzLevel,
+        expected: AuthzAllowedOutcome,
+        result: std::result::Result<Response, ErrorPayload>,
+    ) {
+        match (expected, result) {
+            (AuthzAllowedOutcome::Response, Ok(_)) => {}
+            (AuthzAllowedOutcome::Response, Err(error)) => panic!(
+                "{kind} unexpectedly failed allowed {} cell with {:?}: {}",
+                level.label(),
+                error.code,
+                error.message
+            ),
+            (AuthzAllowedOutcome::Error(expected), Err(error)) => assert_eq!(
+                error.code,
+                expected,
+                "{kind} allowed {} cell reached wrong post-auth error: {}",
+                level.label(),
+                error.message
+            ),
+            (AuthzAllowedOutcome::Error(expected), Ok(response)) => panic!(
+                "{kind} allowed {} cell expected post-auth {expected:?}, got response {response:?}",
+                level.label()
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: AuthzKnownHole) {
+        let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level);
+        let result = dispatch_authz_request_after(
+            &scenario.ctx,
+            scenario.principal,
+            scenario.prelude,
+            scenario.unshare_session_after_prelude,
+            scenario.worker_rx_to_drop_after_prelude,
+            scenario.request,
+        )
+        .await;
+        match result {
+            Ok(response) => {
+                assert_eq!(
+                    known_hole.actual,
+                    AuthzAllowedOutcome::Response,
+                    "{} changed actual behavior for {} to response {response:?}",
+                    known_hole.marker,
+                    kind
+                );
+                assert!(matches!(response, Response::Ack), "{kind}: {response:?}");
+                assert!(
+                    scenario.ctx.db.paused_session_work(scenario.target_session_id).unwrap().is_none(),
+                    "{} did not mutate the inaccessible paused-work target for {}",
+                    known_hole.marker,
+                    kind
+                );
+            }
+            Err(error) if error.code == known_hole.expected => panic!(
+                "{} appears fixed for {}; remove the KNOWN_HOLE marker and update the matrix",
+                known_hole.marker, kind
+            ),
+            Err(error) => panic!(
+                "{} changed actual behavior for {} to {:?}: {}",
+                known_hole.marker, kind, error.code, error.message
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "authz matrix"}),
+            )
+            .unwrap();
+
+        let needs_attached = authz_kind_needs_attached_state(kind, level);
+        let revokes_session_access = needs_attached && level == AuthzLevel::NoAccess;
+        let principal_level = if revokes_session_access {
+            AuthzLevel::Writer
+        } else {
+            level
+        };
+        let principal = authz_matrix_principal(principal_level, tmp.path(), kind);
+        let prelude = if needs_attached {
+            vec![attach_existing_request(session_id, tmp.path())]
+        } else {
+            Vec::new()
+        };
+        let worker_rx_to_drop_after_prelude = if needs_attached {
+            Some(work_rx)
+        } else {
+            drop(work_rx);
+            None
+        };
+        let unshare_session_after_prelude = revokes_session_access.then_some(session_id);
+
+        AuthzSocketScenario {
+            ctx,
+            principal,
+            prelude,
+            unshare_session_after_prelude,
+            worker_rx_to_drop_after_prelude,
+            request: authz_matrix_request(kind, session_id, tmp.path()),
+            target_session_id: session_id,
+            _tmp: tmp,
+        }
+    }
+
+    #[cfg(unix)]
+    fn authz_cross_session_paused_work_scenario(
+        kind: &'static str,
+        level: AuthzLevel,
+    ) -> AuthzSocketScenario {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let accessible_root = tmp.path().join("accessible");
+        let target_root = tmp.path().join("target");
+        std::fs::create_dir_all(&accessible_root).unwrap();
+        std::fs::create_dir_all(&target_root).unwrap();
+
+        let (attached_session_id, work_rx) = live_worker_with_receiver(&ctx, &accessible_root);
+        ctx.db
+            .set_session_shared_with_collaborators(attached_session_id, true)
+            .unwrap();
+        let target_session = ctx
+            .db
+            .create_session("target", target_root.to_str().unwrap(), "Build")
+            .unwrap();
+        ctx.db
+            .upsert_paused_session_work(
+                target_session.session_id,
+                "Build",
+                target_root.to_str().unwrap(),
+                "cross-session authz hole",
+                1,
+                "test-version",
+            )
+            .unwrap();
+
+        AuthzSocketScenario {
+            ctx,
+            principal: authz_matrix_principal(level, &accessible_root, kind),
+            prelude: vec![attach_existing_request(attached_session_id, &accessible_root)],
+            unshare_session_after_prelude: None,
+            worker_rx_to_drop_after_prelude: Some(work_rx),
+            request: authz_matrix_request(kind, target_session.session_id, &target_root),
+            target_session_id: target_session.session_id,
+            _tmp: tmp,
+        }
+    }
+
+    #[cfg(unix)]
+    fn authz_matrix_principal(
+        level: AuthzLevel,
+        project_root: &Path,
+        kind: &str,
+    ) -> ClientPrincipal {
+        let project_root = project_root.to_string_lossy().into_owned();
+        match level {
+            AuthzLevel::Owner => ClientPrincipal::owner(),
+            AuthzLevel::Writer => {
+                let grants = match kind {
+                    "fs_list" | "fs_stat" | "fs_read" | "fs_write" | "fs_create_dir"
+                    | "fs_rename" | "git_status" | "git_diff_file" => {
+                        vec![principal::PrincipalGrant {
+                            scope: principal::PrincipalScope::ProjectFiles,
+                            project_root: Some(project_root),
+                        }]
+                    }
+                    "open_terminal" | "attach_terminal" | "terminal_input"
+                    | "terminal_resize" | "close_terminal" => {
+                        vec![principal::PrincipalGrant {
+                            scope: principal::PrincipalScope::Terminal,
+                            project_root: None,
+                        }]
+                    }
+                    "lsp_control" => vec![
+                        principal::PrincipalGrant {
+                            scope: principal::PrincipalScope::Terminal,
+                            project_root: None,
+                        },
+                        principal::PrincipalGrant {
+                            scope: principal::PrincipalScope::Agent,
+                            project_root: Some(project_root),
+                        },
+                    ],
+                    "list_skills" | "guidance_estimate" => vec![principal::PrincipalGrant {
+                        scope: principal::PrincipalScope::Agent,
+                        project_root: Some(project_root),
+                    }],
+                    _ => vec![principal::PrincipalGrant {
+                        scope: principal::PrincipalScope::Agent,
+                        project_root: Some(project_root),
+                    }],
+                };
+                ClientPrincipal::Remote(principal::RemotePrincipal {
+                    user_id: "authz-writer".into(),
+                    grants,
+                })
+            }
+            AuthzLevel::Readonly => ClientPrincipal::Remote(principal::RemotePrincipal {
+                user_id: "authz-readonly".into(),
+                grants: vec![principal::PrincipalGrant {
+                    scope: principal::PrincipalScope::AgentReadonly,
+                    project_root: Some(project_root),
+                }],
+            }),
+            AuthzLevel::NoAccess => ClientPrincipal::Remote(principal::RemotePrincipal {
+                user_id: "authz-none".into(),
+                grants: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
+        matches!(
+            kind,
+            "send_user_message"
+                | "begin_attachment_upload"
+                | "upload_attachment_chunk"
+                | "finish_attachment_upload"
+                | "cancel_attachment_upload"
+                | "remove_queued_user_message"
+                | "remove_newest_queued_user_message"
+                | "remove_editable_queued_user_messages"
+                | "resume_paused_work"
+                | "cancel_paused_work"
+                | "repair_resume"
+                | "cancel_turn"
+                | "resolve_interrupt"
+                | "set_active_model"
+                | "set_agent"
+                | "set_llm_mode"
+                | "set_session_llm_mode"
+                | "set_approval_mode"
+                | "set_delegation_recursion"
+                | "set_sandbox"
+                | "set_sandbox_escalation"
+                | "set_preflight"
+                | "set_trusted_only"
+                | "set_redaction"
+                | "set_tandem_models"
+                | "cancel_schedule"
+                | "prune"
+                | "compact"
+                | "pin"
+                | "refresh_env"
+        ) || (kind == "list_skills" && level != AuthzLevel::NoAccess)
+            || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
+    }
+
+    #[cfg(unix)]
+    fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
+        let root = project_root.to_string_lossy().into_owned();
+        match kind {
+            "attach" => attach_existing_request(session_id, project_root),
+            "subagent_transcript" => Request::SubagentTranscript {
+                session_id,
+                task_call_id: "task-1".into(),
+                label: "child".into(),
+            },
+            "send_user_message" => Request::SendUserMessage {
+                text: "authz".into(),
+                image_refs: Vec::new(),
+                forced_skill: None,
+            },
+            "steer_delegation" => Request::SteerDelegation {
+                session_id,
+                task_call_id: "task-1".into(),
+                label: "child".into(),
+                message: "go".into(),
+            },
+            "begin_attachment_upload" => Request::BeginAttachmentUpload {
+                mime: "text/plain".into(),
+                byte_len: 1,
+                sha256: "0".repeat(64),
+                purpose: proto::AttachmentPurpose::UserMessageImage,
+            },
+            "upload_attachment_chunk" => Request::UploadAttachmentChunk {
+                upload_id: Uuid::new_v4(),
+                offset: 0,
+                data_base64: String::new(),
+            },
+            "finish_attachment_upload" => Request::FinishAttachmentUpload {
+                upload_id: Uuid::new_v4(),
+            },
+            "cancel_attachment_upload" => Request::CancelAttachmentUpload {
+                upload_id: Uuid::new_v4(),
+            },
+            "remove_queued_user_message" => Request::RemoveQueuedUserMessage {
+                queue_item_id: Uuid::new_v4(),
+            },
+            "remove_newest_queued_user_message" => {
+                Request::RemoveNewestQueuedUserMessage { target_id: None }
+            }
+            "remove_editable_queued_user_messages" => {
+                Request::RemoveEditableQueuedUserMessages { target_id: None }
+            }
+            "resume_paused_work" => Request::ResumePausedWork { session_id },
+            "cancel_paused_work" => Request::CancelPausedWork { session_id },
+            "repair_resume" => Request::RepairResume { session_id },
+            "cancel_turn" => Request::CancelTurn,
+            "fs_list" => Request::FsList {
+                project_root: root,
+                path: ".".into(),
+                show_hidden: false,
+            },
+            "fs_stat" => Request::FsStat {
+                project_root: root,
+                path: "missing.txt".into(),
+            },
+            "fs_read" => Request::FsRead {
+                project_root: root,
+                path: "missing.txt".into(),
+                base64: false,
+            },
+            "fs_write" => Request::FsWrite {
+                project_root: root,
+                path: "authz.txt".into(),
+                content: "authz".into(),
+                base_hash: None,
+            },
+            "fs_create_dir" => Request::FsCreateDir {
+                project_root: root,
+                path: "authz-dir".into(),
+            },
+            "fs_rename" => Request::FsRename {
+                project_root: root,
+                from_path: "missing.txt".into(),
+                to_path: "renamed.txt".into(),
+            },
+            "fs_delete" => Request::FsDelete {
+                project_root: root,
+                path: "missing.txt".into(),
+            },
+            "git_status" => Request::GitStatus { project_root: root },
+            "git_diff_file" => Request::GitDiffFile {
+                project_root: root,
+                path: "missing.txt".into(),
+            },
+            "open_terminal" => Request::OpenTerminal {
+                cwd: Some(project_root.join("missing-cwd").to_string_lossy().into_owned()),
+                cols: 80,
+                rows: 24,
+            },
+            "attach_terminal" => Request::AttachTerminal {
+                terminal_id: Uuid::new_v4(),
+                cols: 80,
+                rows: 24,
+            },
+            "terminal_input" => Request::TerminalInput {
+                terminal_id: Uuid::new_v4(),
+                bytes: b"x".to_vec(),
+            },
+            "terminal_resize" => Request::TerminalResize {
+                terminal_id: Uuid::new_v4(),
+                cols: 80,
+                rows: 24,
+            },
+            "close_terminal" => Request::CloseTerminal {
+                terminal_id: Uuid::new_v4(),
+            },
+            "lsp_control" => Request::LspControl {
+                project_root: root,
+                server_id: "rust-analyzer".into(),
+                action: proto::LspControlAction::Check,
+            },
+            "resolve_interrupt" => Request::ResolveInterrupt {
+                interrupt_id: Uuid::new_v4(),
+                response: proto::ResolveResponse::Cancel,
+            },
+            "read_session_messages" => Request::ReadSessionMessages {
+                session_id,
+                before_seq: None,
+                limit: 20,
+            },
+            "archive_session" => Request::ArchiveSession {
+                session_id,
+                cascade: false,
+            },
+            "unarchive_session" => Request::UnarchiveSession { session_id },
+            "fork_session" => Request::ForkSession {
+                parent_session_id: session_id,
+                fork_point_turn_id: None,
+                ephemeral: false,
+            },
+            "discard_session" => Request::DiscardSession { session_id },
+            "rename_session" => Request::RenameSession {
+                session_id,
+                title: "authz".into(),
+            },
+            "share_session" => Request::ShareSession {
+                session_id,
+                shared: false,
+            },
+            "record_session_note" => Request::RecordSessionNote {
+                session_id,
+                text: "authz".into(),
+            },
+            "delete_session" => Request::DeleteSession {
+                session_id,
+                cascade: false,
+            },
+            "list_skills" => Request::ListSkills { project_root: root },
+            "resource_snapshot" => Request::ResourceSnapshot,
+            "promote_resource" => Request::PromoteResource {
+                request_id: "missing".into(),
+                session_id: None,
+            },
+            "list_agents" => Request::ListAgents,
+            "list_models" => Request::ListModels { provider: None },
+            "set_active_model" => Request::SetActiveModel {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            },
+            "set_agent" => Request::SetAgent {
+                name: "Build".into(),
+            },
+            "set_llm_mode" => Request::SetLlmMode { mode: None },
+            "set_session_llm_mode" => Request::SetSessionLlmMode {
+                mode: crate::config::extended::LlmMode::Normal,
+            },
+            "set_approval_mode" => Request::SetApprovalMode {
+                mode: crate::config::extended::ApprovalMode::Manual,
+            },
+            "set_delegation_recursion" => Request::SetDelegationRecursion {
+                enabled: false,
+                default_depth: 1,
+            },
+            "set_sandbox" => Request::SetSandbox {
+                mode: Some(crate::tools::sandbox_mode::SandboxMode::Sandbox),
+                container_network_enabled: None,
+            },
+            "set_sandbox_escalation" => Request::SetSandboxEscalation { enabled: false },
+            "set_preflight" => Request::SetPreflight { enabled: None },
+            "set_trusted_only" => Request::SetTrustedOnly { enabled: None },
+            "set_redaction" => Request::SetRedaction {
+                scan_environment: Some(false),
+                scan_dotenv: None,
+                scan_ssh_keys: None,
+            },
+            "set_tandem_models" => Request::SetTandemModels { models: Vec::new() },
+            "set_caffeinate" => Request::SetCaffeinate {
+                mode: crate::daemon::caffeinate::CaffeinateMode::Off,
+            },
+            "cancel_schedule" => Request::CancelSchedule {
+                job_id: "job-1".into(),
+            },
+            "prune" => Request::Prune,
+            "compact" => Request::Compact,
+            "pin" => Request::Pin {
+                text: "remember".into(),
+            },
+            "store_flycockpit_credential" => Request::StoreFlycockpitCredential {
+                credential: flycockpit_credential(),
+            },
+            "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
+            "refresh_env" => Request::RefreshEnv {
+                vars: HashMap::from([("COCKPIT_AUTHZ_MATRIX".into(), "1".into())]),
+            },
+            "record_usage" => Request::RecordUsage {
+                kind: proto::UsageKind::Slash,
+                key: "/authz".into(),
+                project_id: None,
+            },
+            "get_usage_counts" => Request::GetUsageCounts { project_id: None },
+            "guidance_estimate" => Request::GuidanceEstimate {
+                project_root: root,
+                provider: None,
+                model: None,
+            },
+            "stop_daemon" => Request::StopDaemon {
+                grace_secs: Some(1),
+            },
+            other => panic!("unhandled authz matrix request kind {other}"),
         }
     }
 

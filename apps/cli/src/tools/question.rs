@@ -178,7 +178,7 @@ impl Tool for QuestionTool {
             "question tool",
         )
         .await
-        .into_response_or_cancel();
+        .into_response()?;
         let answers = response.into_batch(n);
 
         Ok(ToolOutput::text(render_answers(&set, &answers)))

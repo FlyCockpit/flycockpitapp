@@ -23,7 +23,7 @@ impl Approver {
             "approval prompt",
         )
         .await
-        .into_response_or_cancel())
+        .into_response()?)
     }
 
     /// Decide a back-to-back identical tool call (the loop guard, GOALS
@@ -137,7 +137,7 @@ impl Approver {
             "loop-guard prompt",
         )
         .await
-        .into_response_or_cancel();
+        .into_response()?;
         Ok(response_to_repeat_choice(&response))
     }
 

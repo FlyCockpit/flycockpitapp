@@ -724,7 +724,7 @@ pub(crate) async fn run_turn(
                                     sandbox_escalation: None,
                                 }],
                             };
-                            let response = crate::engine::interrupt::raise_and_wait(
+                            let outcome = crate::engine::interrupt::raise_and_wait(
                                 &session.db,
                                 &interrupts,
                                 session.id,
@@ -733,8 +733,15 @@ pub(crate) async fn run_turn(
                                 set,
                                 "endpoint recovery",
                             )
-                            .await
-                            .into_response_or_cancel();
+                            .await;
+                            let crate::engine::interrupt::InterruptOutcome::Resolved(response) =
+                                outcome
+                            else {
+                                // This endpoint-recovery prompt runs before a tool dispatch
+                                // result exists. Parking just declines this optional retry;
+                                // it must not fabricate a ResolveResponse::Cancel.
+                                return false;
+                            };
                             crate::engine::interrupt::selected_id_of(&response).as_deref()
                                 == Some(ID_TRY)
                         })

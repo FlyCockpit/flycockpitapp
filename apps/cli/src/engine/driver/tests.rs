@@ -1425,7 +1425,12 @@ async fn primary_round_ceiling_zero_is_disabled() {
     let (driver, _tmp) = test_driver(1);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
 
-    assert!(driver.primary_round_ceiling_allows_more(99, 0, &tx).await);
+    assert!(
+        driver
+            .primary_round_ceiling_allows_more(99, 0, &tx)
+            .await
+            .unwrap()
+    );
     assert!(rx.try_recv().is_err(), "disabled ceiling emits no notice");
 }
 
@@ -1434,7 +1439,12 @@ async fn primary_round_ceiling_headless_stops_with_notice() {
     let (driver, _tmp) = test_driver(1);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
 
-    assert!(!driver.primary_round_ceiling_allows_more(3, 3, &tx).await);
+    assert!(
+        !driver
+            .primary_round_ceiling_allows_more(3, 3, &tx)
+            .await
+            .unwrap()
+    );
     match rx.recv().await {
         Some(TurnEvent::Notice { text }) => {
             assert!(text.contains("configured limit of 3"), "{text}");
@@ -5166,7 +5176,8 @@ async fn background_single_completion_does_not_apply_stale_shrink() {
             &tx,
             false,
         )
-        .await;
+        .await
+        .unwrap();
     drop(tx);
     while rx.recv().await.is_some() {}
 
@@ -5315,7 +5326,8 @@ async fn noninteractive_single_inline_result_shape_is_unchanged() {
             &tx,
             true,
         )
-        .await;
+        .await
+        .unwrap();
     drop(tx);
     while rx.recv().await.is_some() {}
 
@@ -5346,7 +5358,8 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
             &tx,
             true,
         )
-        .await;
+        .await
+        .unwrap();
     drop(tx);
 
     let mut live_report = None;
@@ -5430,7 +5443,8 @@ async fn noninteractive_single_result_includes_task_repair_notes() {
             &tx,
             true,
         )
-        .await;
+        .await
+        .unwrap();
     drop(tx);
     while rx.recv().await.is_some() {}
 

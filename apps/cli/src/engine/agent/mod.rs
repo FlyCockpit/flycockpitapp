@@ -571,7 +571,7 @@ async fn result_injection_override(
     output: &str,
     ctx: &ResultRecheckCtx,
     tx: &mpsc::Sender<TurnEvent>,
-) -> String {
+) -> Result<String> {
     use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 
     if !ctx.interrupts.is_interactive_attached() {
@@ -582,7 +582,7 @@ async fn result_injection_override(
                     .to_string(),
             })
             .await;
-        return RESULT_WITHHELD.to_string();
+        return Ok(RESULT_WITHHELD.to_string());
     }
 
     let description =
@@ -622,7 +622,7 @@ async fn result_injection_override(
         questions: vec![question],
     };
 
-    let response = raise_and_wait_in_turn(ctx, &description, set).await;
+    let response = raise_and_wait_in_turn(ctx, &description, set).await?;
     match selected_id_of(&response).as_deref() {
         Some(ID_RESULT_ALLOW) => {
             let _ = tx
@@ -630,7 +630,7 @@ async fn result_injection_override(
                     text: "high-risk tool result allowed through".to_string(),
                 })
                 .await;
-            output.to_string()
+            Ok(output.to_string())
         }
         Some(ID_RESULT_EDIT) => {
             let edit_set = InterruptQuestionSet {
@@ -640,7 +640,7 @@ async fn result_injection_override(
                     masked: false,
                 }],
             };
-            let resp = raise_and_wait_in_turn(ctx, "Edit the tool result", edit_set).await;
+            let resp = raise_and_wait_in_turn(ctx, "Edit the tool result", edit_set).await?;
             match freetext_of(&resp) {
                 Some(text) if !text.trim().is_empty() => {
                     let _ = tx
@@ -648,7 +648,7 @@ async fn result_injection_override(
                             text: "high-risk tool result replaced with your edit".to_string(),
                         })
                         .await;
-                    text
+                    Ok(text)
                 }
                 _ => {
                     let _ = tx
@@ -657,7 +657,7 @@ async fn result_injection_override(
                                 .to_string(),
                         })
                         .await;
-                    RESULT_WITHHELD.to_string()
+                    Ok(RESULT_WITHHELD.to_string())
                 }
             }
         }
@@ -668,7 +668,7 @@ async fn result_injection_override(
                     text: "high-risk tool result dropped".to_string(),
                 })
                 .await;
-            RESULT_WITHHELD.to_string()
+            Ok(RESULT_WITHHELD.to_string())
         }
     }
 }
@@ -680,7 +680,7 @@ async fn result_injection_ask(
     output: &str,
     ctx: &ResultRecheckCtx,
     tx: &mpsc::Sender<TurnEvent>,
-) -> String {
+) -> Result<String> {
     use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 
     if !ctx.interrupts.is_interactive_attached() {
@@ -691,7 +691,7 @@ async fn result_injection_ask(
                     .to_string(),
             })
             .await;
-        return RESULT_WITHHELD.to_string();
+        return Ok(RESULT_WITHHELD.to_string());
     }
 
     let description = "A tool result matched the configured prompt-injection result threshold. \
@@ -722,10 +722,10 @@ async fn result_injection_ask(
         questions: vec![question],
     };
 
-    let response = raise_and_wait_in_turn(ctx, &description, set).await;
+    let response = raise_and_wait_in_turn(ctx, &description, set).await?;
     match selected_id_of(&response).as_deref() {
-        Some(ID_RESULT_ASK_ALLOW) => output.to_string(),
-        _ => RESULT_WITHHELD.to_string(),
+        Some(ID_RESULT_ASK_ALLOW) => Ok(output.to_string()),
+        _ => Ok(RESULT_WITHHELD.to_string()),
     }
 }
 
@@ -738,8 +738,8 @@ async fn raise_and_wait_in_turn(
     ctx: &ResultRecheckCtx,
     description: &str,
     set: crate::daemon::proto::InterruptQuestionSet,
-) -> crate::daemon::proto::ResolveResponse {
-    crate::engine::interrupt::raise_and_wait(
+) -> Result<crate::daemon::proto::ResolveResponse> {
+    Ok(crate::engine::interrupt::raise_and_wait(
         &ctx.session.db,
         &ctx.interrupts,
         ctx.session.id,
@@ -749,7 +749,7 @@ async fn raise_and_wait_in_turn(
         "result injection override",
     )
     .await
-    .into_response_or_cancel()
+    .into_response()?)
 }
 
 async fn dispatch_one(

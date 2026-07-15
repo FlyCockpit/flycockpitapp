@@ -1158,7 +1158,7 @@ impl Driver {
         completion: SingleNoninteractiveCompletion,
         tx: &mpsc::Sender<TurnEvent>,
         apply_shrink: bool,
-    ) -> Message {
+    ) -> Result<Message> {
         let SingleNoninteractiveCompletion {
             child_agent,
             task_call_id,
@@ -1176,7 +1176,9 @@ impl Driver {
         let emit_report_event = shrink.is_some();
         if !emit_report_event {
             let report = prepend_task_repair_notes(report, &repair_notes);
-            let report = self.maybe_scan_task_report(&child_agent, report, tx).await;
+            let report = self
+                .maybe_scan_task_report(&child_agent, report, tx)
+                .await?;
             let result = Message::tool_result_with_call_id(
                 task_call_id.clone(),
                 task_function_call_id,
@@ -1203,7 +1205,7 @@ impl Driver {
             let _ = self
                 .noninteractive_delegations
                 .mark_delivered(&task_call_id, "default");
-            return result;
+            return Ok(result);
         }
         if apply_shrink {
             if let Some(PendingDelegationShrink { tracker, handle }) = shrink {
@@ -1232,7 +1234,9 @@ impl Driver {
             None => report,
         };
         let report = prepend_task_repair_notes(report, &repair_notes);
-        let report = self.maybe_scan_task_report(&child_agent, report, tx).await;
+        let report = self
+            .maybe_scan_task_report(&child_agent, report, tx)
+            .await?;
 
         if let Err(e) = self.session.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -1308,7 +1312,7 @@ impl Driver {
                 Some(&result),
             );
         }
-        result
+        Ok(result)
     }
 
     pub(in crate::engine::driver) async fn maybe_scan_task_report(
@@ -1316,7 +1320,7 @@ impl Driver {
         child_agent: &str,
         report: String,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> String {
+    ) -> Result<String> {
         let guard = crate::config::extended::resolve_injection_guard(&self.cwd);
         let scan = crate::agents::resolve(&self.cwd, child_agent)
             .ok()
@@ -1333,7 +1337,7 @@ impl Driver {
             self.session.approval_mode(),
             guard.threshold,
         ) {
-            return report;
+            return Ok(report);
         }
         let ctx = crate::engine::agent::ResultRecheckCtx {
             agent_id: child_agent.to_string(),
@@ -1440,7 +1444,7 @@ impl Driver {
                     }
                     let result = self
                         .finalize_single_noninteractive_task(completion, tx, !was_backgrounded)
-                        .await;
+                        .await?;
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)

@@ -264,7 +264,7 @@ impl Tool for WebSearchTool {
         Ok(match out {
             Ok(results) => capped_text(render_search_results(&results)),
             Err(err) => {
-                if maybe_capture_web_key(ctx, &err, WEBSEARCH).await {
+                if maybe_capture_web_key(ctx, &err, WEBSEARCH).await? {
                     let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
                     let selected = select_backend(&cfg.web, ctx);
                     let retry = match selected.kind {
@@ -339,7 +339,7 @@ impl Tool for WebFetchTool {
         Ok(match out {
             Ok(page) => capped_text(page.markdown),
             Err(err) => {
-                if maybe_capture_web_key(ctx, &err, WEBFETCH).await {
+                if maybe_capture_web_key(ctx, &err, WEBFETCH).await? {
                     let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
                     let selected = select_backend(&cfg.web, ctx);
                     let retry = match selected.kind {
@@ -634,9 +634,9 @@ fn suppress_web_key_prompt(ctx: &ToolCtx, provider: WebProviderRuntime) {
     guard.insert((ctx.session.id, provider));
 }
 
-async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) -> bool {
+async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) -> Result<bool> {
     if !web_key_prompt_should_raise(ctx, err) {
-        return false;
+        return Ok(false);
     }
     let env_name = provider_key_env(err.provider);
     let url = provider_url(err.provider);
@@ -653,7 +653,7 @@ async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) ->
                 err.provider.label()
             )
         }
-        WebToolErrorKind::General => return false,
+        WebToolErrorKind::General => return Ok(false),
     };
     let prompt = format!(
         "{failure}\nPaste a {} API key to save it and retry once. Set {env_name} for the durable env-var path; env vars override stored keys. Provider site: {url}",
@@ -675,16 +675,16 @@ async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) ->
         "web key prompt",
     )
     .await
-    .into_response_or_cancel();
+    .into_response()?;
     if ctx.cancel.is_cancelled() {
-        return false;
+        return Ok(false);
     }
     let Some(key) = crate::engine::interrupt::freetext_of(&response)
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
     else {
         suppress_web_key_prompt(ctx, err.provider);
-        return false;
+        return Ok(false);
     };
     let saved = crate::credentials::CredentialStore::open_default()
         .and_then(|store| {
@@ -695,10 +695,10 @@ async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) ->
         })
         .is_ok();
     if saved {
-        true
+        Ok(true)
     } else {
         suppress_web_key_prompt(ctx, err.provider);
-        false
+        Ok(false)
     }
 }
 

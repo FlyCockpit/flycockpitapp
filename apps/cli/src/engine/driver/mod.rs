@@ -1616,7 +1616,14 @@ impl Driver {
             CheckOutcome::Rated(rating) => {
                 if guard_threshold.blocks(rating) {
                     // At/above threshold → block + offer the override.
-                    self.injection_override(rating, tx).await
+                    match self.injection_override(rating, tx).await {
+                        Ok(allowed) => allowed,
+                        Err(e) if crate::engine::interrupt::is_parked(&e) => false,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "prompt-injection override failed");
+                            false
+                        }
+                    }
                 } else {
                     // Below threshold → surface the flag, proceed.
                     let _ = tx
@@ -1645,8 +1652,8 @@ impl Driver {
         agent: &str,
         description: &str,
         set: crate::daemon::proto::InterruptQuestionSet,
-    ) -> crate::daemon::proto::ResolveResponse {
-        crate::engine::interrupt::raise_and_wait(
+    ) -> Result<crate::daemon::proto::ResolveResponse> {
+        Ok(crate::engine::interrupt::raise_and_wait(
             &self.session.db,
             &self.interrupts,
             self.session.id,
@@ -1656,7 +1663,7 @@ impl Driver {
             "injection override",
         )
         .await
-        .into_response_or_cancel()
+        .into_response()?)
     }
 
     async fn primary_round_ceiling_allows_more(
@@ -1664,9 +1671,9 @@ impl Driver {
         rounds: u32,
         limit: u32,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> bool {
+    ) -> Result<bool> {
         if limit == 0 || rounds < limit {
-            return true;
+            return Ok(true);
         }
 
         let message =
@@ -1680,7 +1687,7 @@ impl Driver {
                     ),
                 })
                 .await;
-            return false;
+            return Ok(false);
         }
 
         use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
@@ -1711,14 +1718,14 @@ impl Driver {
         };
         let response = self
             .raise_and_wait(self.active_agent(), "Primary tool-round limit reached", set)
-            .await;
+            .await?;
         if selected_id_of(&response).as_deref() == Some(ID_PRIMARY_ROUNDS_CONTINUE) {
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!("Continuing for up to {limit} more tool round(s)."),
                 })
                 .await;
-            true
+            Ok(true)
         } else {
             let _ = tx
                 .send(TurnEvent::Notice {
@@ -1726,7 +1733,7 @@ impl Driver {
                         .to_string(),
                 })
                 .await;
-            false
+            Ok(false)
         }
     }
 
@@ -1968,6 +1975,13 @@ impl Driver {
             };
             let outcome = match turn_result {
                 Ok(outcome) => outcome,
+                Err(e) if crate::engine::interrupt::is_parked(&e) => {
+                    tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "parked_interrupt".to_string(),
+                    });
+                    return Ok(());
+                }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
                     self.unwind_stack_to_root_and_discard_pending_input(
@@ -2030,7 +2044,7 @@ impl Driver {
                                 max_primary_rounds,
                                 tx,
                             )
-                            .await
+                            .await?
                         {
                             self.acknowledge_interrupted_turns_after_progress();
                             return Ok(());
@@ -3987,10 +4001,9 @@ impl Driver {
             set,
             "schedule unbounded loop approval",
         )
-        .await;
-        if crate::engine::interrupt::selected_id_of(&resp.into_response_or_cancel()).as_deref()
-            == Some("approve")
-        {
+        .await
+        .into_response()?;
+        if crate::engine::interrupt::selected_id_of(&resp).as_deref() == Some("approve") {
             self.unbounded_schedule_loops_approved = true;
             Ok(())
         } else {
@@ -4622,6 +4635,13 @@ impl Driver {
             // clears its mirror of the queue on the same ctrl+c.
             let outcome = match turn_result {
                 Ok(outcome) => outcome,
+                Err(e) if crate::engine::interrupt::is_parked(&e) => {
+                    tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "parked_interrupt".to_string(),
+                    });
+                    return Ok(());
+                }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
                     self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
@@ -4716,7 +4736,7 @@ impl Driver {
                                 max_primary_rounds,
                                 tx,
                             )
-                            .await
+                            .await?
                         {
                             return Ok(());
                         }

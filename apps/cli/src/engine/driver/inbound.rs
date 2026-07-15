@@ -227,7 +227,7 @@ impl Driver {
         &mut self,
         rating: crate::config::extended::InjectionThreshold,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> bool {
+    ) -> Result<bool> {
         use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 
         if !self.interrupts.is_interactive_attached() {
@@ -240,7 +240,7 @@ impl Driver {
                     ),
                 })
                 .await;
-            return false;
+            return Ok(false);
         }
 
         let agent = self.active_agent().to_string();
@@ -282,7 +282,7 @@ impl Driver {
             questions: vec![question],
         };
 
-        let choice = self.raise_and_wait(&agent, &description, set).await;
+        let choice = self.raise_and_wait(&agent, &description, set).await?;
         let id = selected_id_of(&choice);
         match id.as_deref() {
             Some(ID_INJECTION_SEND_ONCE) => {
@@ -291,7 +291,7 @@ impl Driver {
                         text: "prompt-injection block overridden (sent once)".to_string(),
                     })
                     .await;
-                true
+                Ok(true)
             }
             Some(ID_INJECTION_LOWER) => {
                 let msg = match self.lower_injection_threshold() {
@@ -305,7 +305,7 @@ impl Driver {
                     ),
                 };
                 let _ = tx.send(TurnEvent::Notice { text: msg }).await;
-                true
+                Ok(true)
             }
             Some(ID_INJECTION_EDIT) => {
                 // Follow-up free-text interrupt for the new check-prompt.
@@ -319,7 +319,7 @@ impl Driver {
                 };
                 let resp = self
                     .raise_and_wait(&agent, "Edit the injection-check prompt", edit_set)
-                    .await;
+                    .await?;
                 let new_prompt = freetext_of(&resp);
                 let msg = match new_prompt {
                     Some(text) if !text.trim().is_empty() => {
@@ -337,7 +337,7 @@ impl Driver {
                         .to_string(),
                 };
                 let _ = tx.send(TurnEvent::Notice { text: msg }).await;
-                true
+                Ok(true)
             }
             _ => {
                 // Dismissed → the block stands.
@@ -346,7 +346,7 @@ impl Driver {
                         text: "prompt-injection block kept — prompt dropped".to_string(),
                     })
                     .await;
-                false
+                Ok(false)
             }
         }
     }

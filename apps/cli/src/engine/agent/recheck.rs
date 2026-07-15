@@ -76,7 +76,7 @@ pub(crate) async fn result_recheck(
     output: &str,
     ctx: &ResultRecheckCtx,
     tx: &mpsc::Sender<TurnEvent>,
-) -> String {
+) -> Result<String> {
     use crate::config::extended::resolve_injection_guard;
     use crate::engine::injection_check::check;
 
@@ -85,7 +85,7 @@ pub(crate) async fn result_recheck(
     if guard.threshold == crate::config::extended::InjectionThreshold::Off
         || ctx.session.approval_mode() == crate::config::extended::ApprovalMode::Yolo
     {
-        return output.to_string();
+        return Ok(output.to_string());
     }
     let model_ref = extended.guard_model_ref();
 
@@ -109,9 +109,9 @@ pub(crate) async fn result_recheck(
                             .to_string(),
                 })
                 .await;
-            output.to_string()
+            Ok(output.to_string())
         }
-        RecheckAction::Pass => output.to_string(),
+        RecheckAction::Pass => Ok(output.to_string()),
         RecheckAction::Unavailable => {
             let _ = tx
                 .send(TurnEvent::Notice {
@@ -120,7 +120,7 @@ pub(crate) async fn result_recheck(
                         .to_string(),
                 })
                 .await;
-            output.to_string()
+            Ok(output.to_string())
         }
     }
 }

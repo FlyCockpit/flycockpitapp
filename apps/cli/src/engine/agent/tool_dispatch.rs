@@ -376,6 +376,15 @@ pub(crate) async fn execute_ordinary_call(
             .unwrap_or_else(|| format!("`{resolved_name}` arguments failed schema validation"));
         (Err(invalid_input(msg)), 0)
     };
+    if result
+        .as_ref()
+        .is_err_and(crate::engine::interrupt::is_parked)
+    {
+        let Err(err) = result else {
+            unreachable!("checked error branch above");
+        };
+        return Err(err);
+    }
 
     // Defensive bash-routing nudge self-suppression
     // (implementation note): a SUCCESSFUL
@@ -566,7 +575,7 @@ pub(crate) async fn execute_ordinary_call(
     // user, GOALS §14). Only fires on a successful, flagged call.
     if recheck_result && !hard_fail {
         let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
-        output_str = result_recheck(&output_str, &recheck_ctx, env.tx).await;
+        output_str = result_recheck(&output_str, &recheck_ctx, env.tx).await?;
     }
 
     if !hard_fail
@@ -988,6 +997,53 @@ mod tests {
         }
     }
 
+    struct InterruptWaitTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for InterruptWaitTool {
+        fn name(&self) -> &str {
+            "interrupt_wait"
+        }
+
+        fn description(&self) -> &str {
+            "Wait on an interrupt for dispatch parking tests."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            let set = crate::daemon::proto::InterruptQuestionSet {
+                questions: vec![crate::daemon::proto::InterruptQuestion::Single {
+                    prompt: "Allow?".to_string(),
+                    options: vec![crate::daemon::proto::InterruptOption {
+                        id: "allow".to_string(),
+                        label: "Allow".to_string(),
+                        description: None,
+                        secondary: false,
+                    }],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: true,
+                    sandbox_escalation: None,
+                }],
+            };
+            let response = crate::engine::interrupt::raise_and_wait(
+                &ctx.session.db,
+                &ctx.interrupts,
+                ctx.session.id,
+                &ctx.agent_id,
+                "interrupt wait",
+                set,
+                "interrupt wait test",
+            )
+            .await
+            .into_response()?;
+            Ok(ToolOutput::text(format!("{response:?}")))
+        }
+    }
+
     struct NeverCalledTool {
         name: &'static str,
         called: Arc<AtomicBool>,
@@ -1123,6 +1179,29 @@ mod tests {
         }
     }
 
+    fn attached_interrupt_hub(session: &Session) -> Arc<crate::engine::interrupt::InterruptHub> {
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            session.db.clone(),
+            session.id,
+        ))
+    }
+
+    fn tool_ctx_with_interrupts(
+        session: Arc<Session>,
+        root: &std::path::Path,
+        tx: &mpsc::Sender<TurnEvent>,
+        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    ) -> ToolCtx {
+        let mut ctx = tool_ctx(session, root, tx);
+        ctx.interrupts = interrupts;
+        ctx
+    }
+
     fn tool_ctx_with_approver(
         session: Arc<Session>,
         root: &std::path::Path,
@@ -1170,6 +1249,87 @@ mod tests {
                 _ => None,
             })
             .expect("tool result text")
+    }
+
+    fn history_has_tool_result(history: &[Message], call_id: &str) -> bool {
+        history.iter().any(|message| match message {
+            Message::User { content } => content.iter().any(|part| match part {
+                UserContent::ToolResult(result) => result.id == call_id,
+                _ => false,
+            }),
+            _ => false,
+        })
+    }
+
+    async fn park_next_interrupt(
+        db: crate::db::Db,
+        session_id: Uuid,
+        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    ) {
+        for _ in 0..100 {
+            if let Some(row) = db
+                .list_open_interrupts(session_id)
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                assert!(interrupts.park(row.interrupt_id));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for interrupt to park");
+    }
+
+    fn assert_parked_call_has_no_result(session: &Session, history: &[Message], call_id: &str) {
+        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        assert!(rows.is_empty(), "parked call recorded audit rows: {rows:?}");
+
+        let events = session.db.list_session_events(session.id).unwrap();
+        let tool_result_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.call_id.as_deref() == Some(call_id)
+                    && matches!(event.kind.as_str(), "tool_call" | "tool_call_completed")
+            })
+            .collect();
+        assert!(
+            tool_result_events.is_empty(),
+            "parked call recorded result events: {tool_result_events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.call_id.as_deref() == Some(call_id) && event.kind == "tool_call_started"
+            }),
+            "parked call should keep its pre-dispatch start event"
+        );
+        assert!(
+            !history_has_tool_result(history, call_id),
+            "parked call wrote a tool_result into history: {history:?}"
+        );
+
+        let open = session.db.list_open_interrupts(session.id).unwrap();
+        assert_eq!(open.len(), 1);
+        let row = &open[0];
+        assert_eq!(
+            row.state,
+            crate::db::needs_attention::InterruptState::Parked
+        );
+        assert_eq!(
+            row.parked.as_ref().map(|payload| payload.call_id.as_str()),
+            Some(call_id)
+        );
+    }
+
+    fn parked_interrupt_id(session: &Session) -> Uuid {
+        session
+            .db
+            .list_open_interrupts(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.state == crate::db::needs_attention::InterruptState::Parked)
+            .map(|row| row.interrupt_id)
+            .expect("parked interrupt row")
     }
 
     fn assistant_call_args(history: &[Message]) -> Value {
@@ -1230,6 +1390,164 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[tokio::test]
+    async fn park_interrupt_wait_tool_records_no_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let interrupts = attached_interrupt_hub(&session);
+        let tools = ToolBox::new().with(Arc::new(InterruptWaitTool));
+        let agent = test_agent(tools.clone());
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let ctx = tool_ctx_with_interrupts(session.clone(), tmp.path(), &tx, interrupts.clone());
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &agent.model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("interrupt_wait", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let parker = tokio::spawn(park_next_interrupt(
+            session.db.clone(),
+            session.id,
+            interrupts,
+        ));
+
+        let err = execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "interrupt_wait",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .expect_err("parked interrupt should abort dispatch");
+        parker.await.unwrap();
+
+        assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
+        assert_eq!(history.len(), 1);
+        assert_parked_call_has_no_result(&session, &history, &call.id);
+
+        let interrupt_id = parked_interrupt_id(&session);
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: "allow".to_string(),
+        };
+        assert!(
+            session
+                .db
+                .begin_parked_interrupt_execution(interrupt_id, &response)
+                .unwrap()
+        );
+        assert!(
+            !session
+                .db
+                .begin_parked_interrupt_execution(interrupt_id, &response)
+                .unwrap(),
+            "duplicate parked answer must not claim execution twice"
+        );
+        crate::engine::interrupt::with_pre_resolved_interrupt(interrupt_id, response, async {
+            execute_ordinary_call(
+                &env,
+                &mut history,
+                &call,
+                "interrupt_wait",
+                Recovery::Clean,
+                None,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(history.len(), 2);
+        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, call.id);
+    }
+
+    #[tokio::test]
+    async fn park_question_tool_records_no_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let interrupts = attached_interrupt_hub(&session);
+        let tools = ToolBox::new().with(Arc::new(crate::tools::question::QuestionTool));
+        let agent = test_agent(tools.clone());
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let ctx = tool_ctx_with_interrupts(session.clone(), tmp.path(), &tx, interrupts.clone());
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &agent.model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "question",
+            serde_json::json!({
+                "questions": [{
+                    "type": "text",
+                    "prompt": "What should happen next?"
+                }]
+            }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let parker = tokio::spawn(park_next_interrupt(
+            session.db.clone(),
+            session.id,
+            interrupts,
+        ));
+
+        let err =
+            execute_ordinary_call(&env, &mut history, &call, "question", Recovery::Clean, None)
+                .await
+                .expect_err("parked question should abort dispatch");
+        parker.await.unwrap();
+
+        assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
+        assert_eq!(history.len(), 1);
+        assert_parked_call_has_no_result(&session, &history, &call.id);
+
+        let interrupt_id = parked_interrupt_id(&session);
+        let response = crate::daemon::proto::ResolveResponse::Freetext {
+            text: "continue".to_string(),
+        };
+        assert!(
+            session
+                .db
+                .begin_parked_interrupt_execution(interrupt_id, &response)
+                .unwrap()
+        );
+        assert!(
+            !session
+                .db
+                .begin_parked_interrupt_execution(interrupt_id, &response)
+                .unwrap(),
+            "duplicate parked answer must not claim execution twice"
+        );
+        crate::engine::interrupt::with_pre_resolved_interrupt(interrupt_id, response, async {
+            execute_ordinary_call(&env, &mut history, &call, "question", Recovery::Clean, None)
+                .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(last_tool_result_text(&history).contains("continue"));
+        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, call.id);
     }
 
     #[tokio::test]

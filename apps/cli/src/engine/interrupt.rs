@@ -94,12 +94,22 @@ pub enum InterruptOutcome {
 }
 
 impl InterruptOutcome {
-    pub fn into_response_or_cancel(self) -> ResolveResponse {
+    pub fn into_response(self) -> std::result::Result<ResolveResponse, InterruptParked> {
         match self {
-            Self::Resolved(response) => response,
-            Self::Parked => ResolveResponse::Cancel,
+            Self::Resolved(response) => Ok(response),
+            Self::Parked => Err(InterruptParked),
         }
     }
+}
+
+/// Sentinel for a parked interrupt. Downstream dispatch code must stop the
+/// turn without fabricating a user answer or a tool result.
+#[derive(Debug, thiserror::Error)]
+#[error("interrupt parked")]
+pub struct InterruptParked;
+
+pub fn is_parked(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<InterruptParked>().is_some()
 }
 
 /// Shared interrupt rendezvous. Cheap to clone via `Arc`.

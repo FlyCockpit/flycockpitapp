@@ -21,21 +21,7 @@ use serde_json::Value;
 
 use crate::engine::message::ToolDefinition;
 
-/// Why a tool call failed. Surfaced to the TUI so it can tell a bad
-/// *call* (the model's fault) from a bad *outcome* (the tool's fault).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolFailKind {
-    /// The model constructed the call badly — a missing / wrong-type
-    /// required argument, or a value the tool can't satisfy (e.g. an
-    /// `old_string` that isn't in the file) — and the §12 repair layer
-    /// couldn't fix it. The model is at fault.
-    Invocation,
-    /// The tool ran but failed for an environmental reason: an I/O
-    /// error, a non-zero command exit surfaced as an error, a lock
-    /// conflict, etc.
-    Execution,
-}
+pub use crate::daemon::proto::ToolFailKind;
 
 /// Marker error a tool returns when the *arguments* were the problem
 /// (see [`ToolFailKind::Invocation`]). The dispatcher downcasts to this

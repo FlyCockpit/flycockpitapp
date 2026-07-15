@@ -12,6 +12,10 @@ use crate::tools::command_resource_profiles::CommandResourcePlan;
 use crate::tools::sandbox_mode::SandboxMode;
 use crate::tools::shell_sandbox::SandboxPathAccess;
 
+pub use crate::daemon::proto::{
+    ContainerAvailability, ContainerRuntimeKind, ContainerUnavailableReason,
+};
+
 pub const DEFAULT_DOCKERFILE: &str = r#"# Cockpit default sandbox image. Edit freely — Cockpit rebuilds when this changes.
 # Cockpit runs commands as your host user (uid/gid mapping) so files created in
 # the mounted working directory stay owned by you. Do not add a fixed USER.
@@ -27,74 +31,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 "#;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContainerRuntimeKind {
-    Docker,
-    Podman,
-}
-
-impl ContainerRuntimeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Docker => "docker",
-            Self::Podman => "podman",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerRuntime {
     pub kind: ContainerRuntimeKind,
     pub binary: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContainerUnavailableReason {
-    NoRuntime,
-    HarnessInContainer,
-}
-
-impl ContainerUnavailableReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NoRuntime => "no_runtime",
-            Self::HarnessInContainer => "harness_in_container",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ContainerAvailability {
-    pub runtime: Option<ContainerRuntimeKind>,
-    pub harness_in_container: bool,
-    pub available: bool,
-    pub reason: Option<ContainerUnavailableReason>,
-}
-
-impl Default for ContainerAvailability {
-    fn default() -> Self {
-        Self {
-            runtime: None,
-            harness_in_container: false,
-            available: false,
-            reason: Some(ContainerUnavailableReason::NoRuntime),
-        }
-    }
-}
-
-impl ContainerAvailability {
-    pub fn unavailable_reason_text(&self) -> Option<String> {
-        self.reason.map(|reason| match reason {
-            ContainerUnavailableReason::NoRuntime => {
-                "no docker or podman executable found on PATH".to_string()
-            }
-            ContainerUnavailableReason::HarnessInContainer => {
-                "cockpit is already running inside a container".to_string()
-            }
-        })
-    }
 }
 
 #[cfg(test)]

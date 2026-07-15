@@ -87,13 +87,13 @@ pub enum Response {
         #[serde(default)]
         compatible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        env_baseline: Option<crate::env_snapshot::EnvSnapshotMeta>,
+        env_baseline: Option<EnvSnapshotMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        env_session: Option<crate::env_snapshot::EnvSnapshotMeta>,
+        env_session: Option<EnvSnapshotMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        env_drift: Option<Box<crate::env_snapshot::EnvDiffSummary>>,
+        env_drift: Option<Box<EnvDiffSummary>>,
         #[serde(default)]
-        env_policy_applied: crate::env_snapshot::EnvDriftPolicy,
+        env_policy_applied: EnvDriftPolicy,
     },
 
     SubagentTranscript {
@@ -142,14 +142,14 @@ pub enum Response {
 
     /// Answer to [`Request::ResourceSnapshot`].
     ResourceSnapshot {
-        snapshot: crate::engine::resource_scheduler::ResourceSchedulerSnapshot,
+        snapshot: ResourceSchedulerSnapshot,
     },
 
     /// Answer to [`Request::PromoteResource`].
     PromoteResourceResult {
         status: ResourcePromoteStatus,
         message: String,
-        snapshot: crate::engine::resource_scheduler::ResourceSchedulerSnapshot,
+        snapshot: ResourceSchedulerSnapshot,
     },
 
     Agents {
@@ -240,11 +240,11 @@ pub enum Response {
 
     /// The resulting sandbox mode after a [`Request::SetSandbox`].
     SandboxState {
-        mode: crate::tools::sandbox_mode::SandboxMode,
+        mode: SandboxMode,
         enabled: bool,
         #[serde(default)]
         container_network_enabled: bool,
-        container_availability: crate::container::ContainerAvailability,
+        container_availability: ContainerAvailability,
     },
 
     /// The resulting sandbox-escalation availability after
@@ -277,7 +277,7 @@ pub enum Response {
     /// The resulting command-approval mode after
     /// [`Request::SetApprovalMode`]. Session-only — not persisted.
     ApprovalModeState {
-        mode: crate::config::extended::ApprovalMode,
+        mode: ApprovalMode,
     },
 
     /// The resulting delegation-recursion override after

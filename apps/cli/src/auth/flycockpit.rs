@@ -1,15 +1,16 @@
 //! Flycockpit account device authorization and instance credentials.
 
-use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::{StatusCode, Url};
+use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::credentials::CredentialStore;
+
+pub use crate::daemon::proto::{AccountInfo, RelayChoice, StoredFlycockpitCredential};
 
 pub const CREDENTIAL_KEY: &str = "flycockpit";
 pub const CLIENT_ID: &str = "cockpit-cli";
@@ -20,61 +21,11 @@ const MIN_POLL_INTERVAL_SECS: u64 = 1;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const MAX_POLL_INTERVAL_SECS: u64 = 30;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AccountInfo {
-    pub user_id: String,
-    pub email: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StoredFlycockpitCredential {
-    pub server_url: String,
-    pub instance_id: String,
-    pub instance_token: String,
-    pub account: AccountInfo,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay_choice: Option<RelayChoice>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RelayChoice {
-    pub relay_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-    pub ws_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtt_ms: Option<u64>,
-    pub chosen_at: i64,
-}
-
-impl RelayChoice {
-    pub fn is_fresh_at(&self, now_ms: i64) -> bool {
-        const TTL_MS: i64 = 30 * 60 * 1000;
-        now_ms.saturating_sub(self.chosen_at) < TTL_MS
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayCandidate {
     pub relay_id: String,
     pub region: Option<String>,
     pub ws_url: String,
-}
-
-impl fmt::Debug for StoredFlycockpitCredential {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StoredFlycockpitCredential")
-            .field("server_url", &self.server_url)
-            .field("instance_id", &self.instance_id)
-            .field("instance_token", &"<redacted>")
-            .field("account", &self.account)
-            .field("display_name", &self.display_name)
-            .field("relay_choice", &self.relay_choice)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

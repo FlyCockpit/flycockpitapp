@@ -715,7 +715,7 @@ impl PasteRegistry {
 /// the caller can interleave text and image content parts in order. Chosen
 /// to be vanishingly unlikely in user text and inert if it somehow leaks
 /// through (it reads as a tagged placeholder).
-pub const IMAGE_PART_SENTINEL: &str = "\u{0}<cockpit-image-part>\u{0}";
+pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
 
 #[cfg(test)]
 mod tests {

@@ -3,32 +3,11 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnvSnapshotSource {
-    DaemonStart,
-    TuiShell,
-    TuiProcessFallback,
-    ExplicitCli,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvSnapshotMeta {
-    pub source: EnvSnapshotSource,
-    pub digest: String,
-    pub key_count: usize,
-    pub path_entry_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvSnapshotWire {
-    pub source: EnvSnapshotSource,
-    pub digest: String,
-    pub vars: HashMap<String, String>,
-}
+pub use crate::daemon::proto::{
+    EnvDiffSummary, EnvDriftPolicy, EnvSnapshotMeta, EnvSnapshotSource, EnvSnapshotWire,
+};
 
 #[derive(Debug, Clone)]
 pub struct EnvSnapshot {
@@ -90,38 +69,6 @@ impl EnvSnapshot {
 
     pub fn digest(&self) -> &str {
         &self.digest
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum EnvDriftPolicy {
-    #[default]
-    Daemon,
-    Client,
-    UpdateDaemon,
-    ErrorOnDrift,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvDiffSummary {
-    pub baseline_digest: String,
-    pub candidate_digest: String,
-    pub added_keys: usize,
-    pub removed_keys: usize,
-    pub changed_keys: usize,
-    pub changed_secret_keys: Vec<String>,
-    pub path_added: Vec<String>,
-    pub path_removed: Vec<String>,
-}
-
-impl EnvDiffSummary {
-    pub fn meaningful(&self) -> bool {
-        self.added_keys > 0
-            || self.removed_keys > 0
-            || self.changed_keys > 0
-            || !self.path_added.is_empty()
-            || !self.path_removed.is_empty()
     }
 }
 

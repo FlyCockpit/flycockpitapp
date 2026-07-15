@@ -1,17 +1,6 @@
 use super::*;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum IdleReason {
-    Completed,
-    GoalComplete,
-    NeedsIntervention { code: String },
-    BudgetLimited,
-    UsageLimited,
-    Error { class: String },
-    Interrupted,
-}
+pub use crate::daemon::proto::IdleReason;
 
 /// Events the agent emits during a turn. The driver forwards these to
 /// the TUI for display; the persistence layer can subscribe to the

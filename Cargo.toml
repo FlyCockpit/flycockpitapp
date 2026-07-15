@@ -1,5 +1,12 @@
 [workspace]
-members = ["apps/cli", "apps/relay-rs", "crates/cockpit-config", "crates/cockpit-db", "crates/relay-protocol"]
+members = [
+    "apps/cli",
+    "apps/relay-rs",
+    "crates/cockpit-config",
+    "crates/cockpit-db",
+    "crates/cockpit-proto",
+    "crates/relay-protocol",
+]
 resolver = "3"
 
 [workspace.dependencies]

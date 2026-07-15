@@ -53,14 +53,14 @@ pub enum Request {
         /// Full client-side environment snapshot for sessions this attach
         /// creates or cold-resumes after daemon restart. Raw values are used
         /// only in memory and never persisted; responses/events carry only
-        /// [`crate::env_snapshot::EnvSnapshotMeta`] and safe diff summaries.
+        /// [`EnvSnapshotMeta`] and safe diff summaries.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        env_snapshot: Option<crate::env_snapshot::EnvSnapshotWire>,
+        env_snapshot: Option<EnvSnapshotWire>,
         /// Non-interactive drift policy. Interactive clients may still choose
         /// client/update-daemon explicitly before attach; the daemon default
         /// is conservative and keeps its baseline.
         #[serde(default)]
-        env_policy: crate::env_snapshot::EnvDriftPolicy,
+        env_policy: EnvDriftPolicy,
     },
 
     /// Fetch one noninteractive child run's persisted transcript. This is
@@ -422,20 +422,20 @@ pub enum Request {
     /// [`Event::LlmModeChanged`].
     SetLlmMode {
         #[serde(default)]
-        mode: Option<crate::config::extended::LlmMode>,
+        mode: Option<LlmMode>,
     },
 
     /// Switch the active `llm_mode` for the attached session without writing
     /// the config default. Used by `/quick`; acknowledged with
     /// [`Event::LlmModeChanged`].
     SetSessionLlmMode {
-        mode: crate::config::extended::LlmMode,
+        mode: LlmMode,
     },
 
     /// Set the attached session's live command-approval mode. Session-only;
     /// does not write `defaultApprovalMode`.
     SetApprovalMode {
-        mode: crate::config::extended::ApprovalMode,
+        mode: ApprovalMode,
     },
 
     /// Set a live session override for root delegation recursion. Session-only;
@@ -452,7 +452,7 @@ pub enum Request {
     /// per-session container network flag when present.
     SetSandbox {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        mode: Option<crate::tools::sandbox_mode::SandboxMode>,
+        mode: Option<SandboxMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         container_network_enabled: Option<bool>,
     },
@@ -525,7 +525,7 @@ pub enum Request {
     /// auto-off is decided by the daemon once no agent is running. Acked
     /// with [`Response::CaffeinateState`].
     SetCaffeinate {
-        mode: crate::daemon::caffeinate::CaffeinateMode,
+        mode: CaffeinateMode,
     },
 
     /// Cancel a live async job (loop / timer / background, GOALS §22) by
@@ -553,7 +553,7 @@ pub enum Request {
     /// and wake the relay connector immediately. Owner-only; ephemeral daemons
     /// reject it because they must not own persistent credentials.
     StoreFlycockpitCredential {
-        credential: crate::auth::flycockpit::StoredFlycockpitCredential,
+        credential: StoredFlycockpitCredential,
     },
 
     /// Clear Flycockpit instance credentials from the daemon-owned credential
@@ -619,6 +619,7 @@ pub enum Request {
 // Keep daemon command metadata centralized. Callers provide a local callback
 // macro so each module can expand the same exhaustive Request table into the
 // shape it needs without changing Request's serde representation.
+#[macro_export]
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
@@ -697,8 +698,6 @@ macro_rules! command {
         ] }
     };
 }
-
-pub(crate) use command;
 
 /// Which autocomplete surface a [`Request::RecordUsage`] belongs to.
 /// Serializes to the `kind` column verbatim (`model` / `slash` / `tag`).

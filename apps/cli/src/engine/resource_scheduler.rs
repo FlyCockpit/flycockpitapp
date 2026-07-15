@@ -8,44 +8,16 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::extended::ResourceSchedulerConfig;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceRequirements {
-    pub pools: BTreeMap<String, u32>,
-}
-
-impl ResourceRequirements {
-    pub fn new(pools: impl IntoIterator<Item = (impl Into<String>, u32)>) -> Self {
-        Self {
-            pools: pools
-                .into_iter()
-                .filter_map(|(name, count)| (count > 0).then(|| (name.into(), count)))
-                .collect(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pools.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceRequestMetadata {
-    pub session_id: Option<Uuid>,
-    pub agent_id: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub command_label: Option<String>,
-    pub declared_requirements: ResourceRequirements,
-    pub policy_requirements: ResourceRequirements,
-    pub reviewer_requirements: ResourceRequirements,
-    pub effective_requirements: ResourceRequirements,
-}
+pub use crate::daemon::proto::{
+    ResourcePoolSnapshot, ResourceQueuedSnapshot, ResourceQueuedState, ResourceRequestMetadata,
+    ResourceRequirements, ResourceRunningSnapshot, ResourceSchedulerSnapshot,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceAcquireRequest {
@@ -300,56 +272,6 @@ impl Drop for ResourceLease {
     fn drop(&mut self) {
         self.release_inner();
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceSchedulerSnapshot {
-    pub enabled: bool,
-    pub pools: Vec<ResourcePoolSnapshot>,
-    pub running: Vec<ResourceRunningSnapshot>,
-    pub queued: Vec<ResourceQueuedSnapshot>,
-    pub max_queued: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourcePoolSnapshot {
-    pub name: String,
-    pub capacity: u32,
-    pub used: u32,
-    pub available: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceRunningSnapshot {
-    pub id: Uuid,
-    pub display_id: String,
-    pub resources: ResourceRequirements,
-    pub metadata: ResourceRequestMetadata,
-    pub queued_at_ms: i64,
-    pub started_at_ms: i64,
-    pub wait_ms: u64,
-    pub promoted_by: Option<String>,
-    pub promoted_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceQueuedSnapshot {
-    pub id: Uuid,
-    pub display_id: String,
-    pub resources: ResourceRequirements,
-    pub metadata: ResourceRequestMetadata,
-    pub queued_at_ms: i64,
-    pub wait_ms: u64,
-    pub state: ResourceQueuedState,
-    pub promoted_by: Option<String>,
-    pub promoted_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceQueuedState {
-    Queued,
-    Promoted,
 }
 
 impl ResourceScheduler {

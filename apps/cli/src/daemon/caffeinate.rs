@@ -77,36 +77,7 @@ impl From<SleepScope> for InhibitScope {
     }
 }
 
-/// The mode argument carried by `/caffeinate [toggle|on|off|until-idle]`
-/// and the `SetCaffeinate` proto request. Serializes for the wire
-/// protocol (`toggle` / `on` / `off` / `until_idle`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaffeinateMode {
-    /// Bare `/caffeinate` — flip on↔off.
-    Toggle,
-    /// Force on; stays active until off or app exit.
-    On,
-    /// Force off.
-    Off,
-    /// On, then auto-disable once no agent is running anywhere.
-    UntilIdle,
-}
-
-impl CaffeinateMode {
-    /// Parse the slash-command / request argument. Empty (bare command)
-    /// is `Toggle`. Returns `Err(arg)` for anything unrecognized so the
-    /// caller can name the offending token.
-    pub fn parse(arg: &str) -> Result<Self, String> {
-        match arg.trim() {
-            "" | "toggle" => Ok(Self::Toggle),
-            "on" => Ok(Self::On),
-            "off" => Ok(Self::Off),
-            "until-idle" | "until_idle" | "untilidle" => Ok(Self::UntilIdle),
-            other => Err(other.to_string()),
-        }
-    }
-}
+pub use crate::daemon::proto::CaffeinateMode;
 
 /// The two pieces of caffeination state: whether the assertion is held,
 /// and whether it is in `until-idle` auto-off mode. A pure value so the

@@ -22,6 +22,7 @@ pub struct IsolatedHome {
     runtime_dir: PathBuf,
     cache_home: PathBuf,
     project: PathBuf,
+    extra_env: Vec<(String, String)>,
 }
 
 impl IsolatedHome {
@@ -51,6 +52,7 @@ impl IsolatedHome {
             runtime_dir,
             cache_home,
             project,
+            extra_env: Vec::new(),
         }
     }
 
@@ -73,8 +75,60 @@ impl IsolatedHome {
         self.cache_home.join("cockpit").join("cockpit.log")
     }
 
+    pub fn db_path(&self) -> PathBuf {
+        self.data_home.join("cockpit").join("cockpit.db")
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self._root.path().join(".config").join("cockpit")
+    }
+
     pub fn project_path(&self) -> &std::path::Path {
         &self.project
+    }
+
+    pub fn write_local_provider_config(&self, base_url: &str) {
+        let config_dir = self.config_dir();
+        let providers_dir = config_dir.join("providers");
+        std::fs::create_dir_all(&providers_dir).expect("create providers config dir");
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{"active_model":{"provider":"local","model":"scripted"}}"#,
+        )
+        .expect("write integration config.json");
+        std::fs::write(
+            providers_dir.join("local.json"),
+            format!(
+                r#"{{
+  "url": "{}",
+  "auth": "none",
+  "wire_api": "completions",
+  "allow_insecure_http": true,
+  "models": [{{"id": "scripted", "manual": true}}]
+}}"#,
+                base_url
+            ),
+        )
+        .expect("write integration provider config");
+    }
+
+    pub fn trust_project(&self) {
+        let output = self
+            .cockpit()
+            .args([
+                "trust",
+                "set",
+                &self.project.display().to_string(),
+                "--mode",
+                "trust",
+            ])
+            .output()
+            .expect("trust integration project");
+        assert_success("cockpit trust set", &output, self);
+    }
+
+    pub fn set_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.extra_env.push((key.into(), value.into()));
     }
 
     fn apply_env(&self, cmd: &mut Command) {
@@ -86,6 +140,9 @@ impl IsolatedHome {
             .env("HOME", self._root.path())
             .env_remove("COCKPIT_CONFIG")
             .env_remove("COCKPIT_LOG");
+        for (key, value) in &self.extra_env {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -96,6 +153,10 @@ pub struct SpawnedDaemon {
 impl SpawnedDaemon {
     pub async fn start() -> Self {
         Self::start_in(IsolatedHome::new()).await
+    }
+
+    pub async fn start_with_home(home: IsolatedHome) -> Self {
+        Self::start_in(home).await
     }
 
     async fn start_in(home: IsolatedHome) -> Self {
@@ -126,6 +187,14 @@ impl SpawnedDaemon {
 
     pub fn command(&self) -> Command {
         self.home.cockpit()
+    }
+
+    pub fn project_path(&self) -> &std::path::Path {
+        self.home.project_path()
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.home.db_path()
     }
 
     pub fn pid(&self) -> u32 {

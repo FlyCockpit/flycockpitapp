@@ -1839,8 +1839,12 @@ impl Driver {
             bail!("parked interrupt tool `{}` is not registered", payload.tool);
         }
         {
-            let history = &self.stack.last().context("driver stack is empty")?.history;
-            ensure_unpaired_tool_call(history, &payload.call_id, &payload.tool)?;
+            let history = &mut self
+                .stack
+                .last_mut()
+                .context("driver stack is empty")?
+                .history;
+            ensure_or_restore_parked_tool_call(history, &payload)?;
         }
 
         let ctx = crate::engine::tool::ToolCtx {
@@ -5986,7 +5990,44 @@ fn skill_pair_call_ids_in_history(history: &[Message]) -> std::collections::Hash
     skill_calls.intersection(&skill_results).cloned().collect()
 }
 
-fn ensure_unpaired_tool_call(history: &[Message], call_id: &str, tool: &str) -> Result<()> {
+fn ensure_or_restore_parked_tool_call(
+    history: &mut Vec<Message>,
+    payload: &crate::db::needs_attention::InterruptParkPayload,
+) -> Result<()> {
+    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use rig::message::ToolFunction;
+
+    match inspect_unpaired_tool_call(history, &payload.call_id, &payload.tool)? {
+        ToolCallAnchorState::Present => Ok(()),
+        ToolCallAnchorState::Missing => {
+            history.push(Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                    id: payload.call_id.clone(),
+                    call_id: payload.resume.provider_call_id.clone(),
+                    function: ToolFunction {
+                        name: payload.tool.clone(),
+                        arguments: payload.args.clone(),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })),
+            });
+            Ok(())
+        }
+    }
+}
+
+enum ToolCallAnchorState {
+    Present,
+    Missing,
+}
+
+fn inspect_unpaired_tool_call(
+    history: &[Message],
+    call_id: &str,
+    tool: &str,
+) -> Result<ToolCallAnchorState> {
     use crate::engine::message::AssistantContent;
     use rig::message::UserContent;
 
@@ -6022,12 +6063,12 @@ fn ensure_unpaired_tool_call(history: &[Message], call_id: &str, tool: &str) -> 
         }
     }
     if !found_call {
-        bail!("parked call `{call_id}` is missing from the transcript");
+        return Ok(ToolCallAnchorState::Missing);
     }
     if found_result {
         bail!("parked call `{call_id}` already has a tool result");
     }
-    Ok(())
+    Ok(ToolCallAnchorState::Present)
 }
 
 /// Opening of the cross-agent tool-call attribution note

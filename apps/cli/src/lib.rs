@@ -62,6 +62,7 @@ pub mod integration {
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
+    use uuid::Uuid;
 
     /// Typed socket client for the integration harness.
     #[derive(Clone)]
@@ -86,11 +87,158 @@ pub mod integration {
         pub message: Option<String>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AttachedSession {
+        pub session_id: Uuid,
+        pub history_len: usize,
+        pub paused_work_len: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ReplayEntry {
+        pub seq: i64,
+        pub kind: &'static str,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DaemonEvent {
+        InterruptRaised {
+            session_id: Uuid,
+            interrupt_id: Uuid,
+            reason: &'static str,
+        },
+        InterruptResolved {
+            session_id: Uuid,
+            interrupt_id: Uuid,
+        },
+        AgentIdle {
+            session_id: Uuid,
+            reason: String,
+        },
+        HistoryReplay {
+            session_id: Uuid,
+            max_seq: i64,
+            entries: Vec<ReplayEntry>,
+        },
+        ToolStart {
+            session_id: Uuid,
+            call_id: String,
+            tool: String,
+        },
+        ToolEnd {
+            session_id: Uuid,
+            call_id: String,
+        },
+        AssistantText {
+            session_id: Uuid,
+            text: String,
+        },
+        Notice {
+            session_id: Uuid,
+            text: String,
+        },
+        PausedWorkAvailable {
+            session_id: Uuid,
+            count: usize,
+        },
+        Other,
+    }
+
     impl DaemonClient {
         pub async fn connect(socket: &Path) -> Result<Self> {
             Ok(Self {
                 inner: crate::daemon::client::DaemonClient::connect(socket).await?,
             })
+        }
+
+        pub async fn attach(
+            &self,
+            project_root: &Path,
+            session_id: Option<Uuid>,
+            since_seq: Option<i64>,
+            interactive: bool,
+        ) -> Result<AttachedSession> {
+            match self
+                .inner
+                .request_ok(crate::daemon::proto::Request::Attach {
+                    session_id,
+                    since_seq,
+                    project_root: Some(project_root.display().to_string()),
+                    no_sandbox: false,
+                    interactive,
+                    model_override: None,
+                    client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+                    env_snapshot: None,
+                    env_policy: crate::env_snapshot::EnvDriftPolicy::default(),
+                })
+                .await?
+            {
+                crate::daemon::proto::Response::Attached {
+                    session_id,
+                    history,
+                    paused_work,
+                    ..
+                } => Ok(AttachedSession {
+                    session_id,
+                    history_len: history.len(),
+                    paused_work_len: paused_work.len(),
+                }),
+                other => Err(anyhow!("unexpected attach response: {other:?}")),
+            }
+        }
+
+        pub async fn send_user_message(&self, text: impl Into<String>) -> Result<()> {
+            match self
+                .inner
+                .request_ok(crate::daemon::proto::Request::SendUserMessage {
+                    text: text.into(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                })
+                .await?
+            {
+                crate::daemon::proto::Response::Ack
+                | crate::daemon::proto::Response::UserMessageQueued { .. } => Ok(()),
+                other => Err(anyhow!("unexpected send_user_message response: {other:?}")),
+            }
+        }
+
+        pub async fn approve_interrupt_once(&self, interrupt_id: Uuid) -> Result<()> {
+            self.resolve_interrupt(
+                interrupt_id,
+                crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+                },
+            )
+            .await
+        }
+
+        pub async fn deny_interrupt(&self, interrupt_id: Uuid) -> Result<()> {
+            self.resolve_interrupt(
+                interrupt_id,
+                crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: crate::approval::ID_REJECT.to_string(),
+                },
+            )
+            .await
+        }
+
+        async fn resolve_interrupt(
+            &self,
+            interrupt_id: Uuid,
+            response: crate::daemon::proto::ResolveResponse,
+        ) -> Result<()> {
+            match self
+                .inner
+                .request_ok(crate::daemon::proto::Request::ResolveInterrupt {
+                    interrupt_id,
+                    response,
+                })
+                .await?
+            {
+                crate::daemon::proto::Response::Ack => Ok(()),
+                other => Err(anyhow!("unexpected resolve_interrupt response: {other:?}")),
+            }
         }
 
         pub async fn status(&self) -> Result<DaemonStatus> {
@@ -160,8 +308,133 @@ pub mod integration {
             }
         }
 
+        pub async fn next_event(&self, timeout: Duration) -> Result<DaemonEvent> {
+            let event = tokio::time::timeout(timeout, self.inner.next_event())
+                .await
+                .map_err(|_| anyhow!("timed out waiting for daemon event"))?
+                .ok_or_else(|| anyhow!("daemon event stream closed"))?;
+            Ok(map_event(event))
+        }
+
         pub fn is_socket_backed(&self) -> bool {
             self.inner.is_socket_backed()
+        }
+    }
+
+    fn map_event(event: crate::daemon::proto::Event) -> DaemonEvent {
+        match event {
+            crate::daemon::proto::Event::InterruptRaised {
+                session_id,
+                interrupt_id,
+                reason,
+                ..
+            } => DaemonEvent::InterruptRaised {
+                session_id,
+                interrupt_id,
+                reason: match reason {
+                    crate::daemon::proto::InterruptRaiseReason::Initial => "initial",
+                    crate::daemon::proto::InterruptRaiseReason::Advance => "advance",
+                    crate::daemon::proto::InterruptRaiseReason::Rehydration => "rehydration",
+                },
+            },
+            crate::daemon::proto::Event::InterruptResolved {
+                session_id,
+                interrupt_id,
+                ..
+            } => DaemonEvent::InterruptResolved {
+                session_id,
+                interrupt_id,
+            },
+            crate::daemon::proto::Event::AgentIdle {
+                session_id, reason, ..
+            } => DaemonEvent::AgentIdle {
+                session_id,
+                reason: idle_reason_string(reason),
+            },
+            crate::daemon::proto::Event::HistoryReplay {
+                session_id,
+                entries,
+                max_seq,
+            } => DaemonEvent::HistoryReplay {
+                session_id,
+                max_seq,
+                entries: entries
+                    .iter()
+                    .map(|entry| ReplayEntry {
+                        seq: history_entry_seq(entry),
+                        kind: history_entry_kind(entry),
+                    })
+                    .collect(),
+            },
+            crate::daemon::proto::Event::ToolStart {
+                session_id,
+                call_id,
+                tool,
+                ..
+            } => DaemonEvent::ToolStart {
+                session_id,
+                call_id,
+                tool,
+            },
+            crate::daemon::proto::Event::ToolEnd {
+                session_id,
+                call_id,
+                ..
+            } => DaemonEvent::ToolEnd {
+                session_id,
+                call_id,
+            },
+            crate::daemon::proto::Event::AssistantText {
+                session_id, text, ..
+            } => DaemonEvent::AssistantText { session_id, text },
+            crate::daemon::proto::Event::Notice { session_id, text } => {
+                DaemonEvent::Notice { session_id, text }
+            }
+            crate::daemon::proto::Event::PausedWorkAvailable { session_id, items } => {
+                DaemonEvent::PausedWorkAvailable {
+                    session_id,
+                    count: items.len(),
+                }
+            }
+            _ => DaemonEvent::Other,
+        }
+    }
+
+    fn idle_reason_string(reason: crate::engine::IdleReason) -> String {
+        match reason {
+            crate::engine::IdleReason::Completed => "completed".to_string(),
+            crate::engine::IdleReason::GoalComplete => "goal_complete".to_string(),
+            crate::engine::IdleReason::NeedsIntervention { code } => {
+                format!("needs_intervention:{code}")
+            }
+            crate::engine::IdleReason::BudgetLimited => "budget_limited".to_string(),
+            crate::engine::IdleReason::UsageLimited => "usage_limited".to_string(),
+            crate::engine::IdleReason::Error { class } => format!("error:{class}"),
+            crate::engine::IdleReason::Interrupted => "interrupted".to_string(),
+        }
+    }
+
+    fn history_entry_seq(entry: &crate::daemon::proto::HistoryEntry) -> i64 {
+        match entry {
+            crate::daemon::proto::HistoryEntry::InterruptDecision { seq, .. }
+            | crate::daemon::proto::HistoryEntry::User { seq, .. }
+            | crate::daemon::proto::HistoryEntry::Assistant { seq, .. }
+            | crate::daemon::proto::HistoryEntry::ToolCall { seq, .. }
+            | crate::daemon::proto::HistoryEntry::InferenceError { seq, .. }
+            | crate::daemon::proto::HistoryEntry::CompactBoundary { seq, .. }
+            | crate::daemon::proto::HistoryEntry::Subagent { seq, .. } => *seq,
+        }
+    }
+
+    fn history_entry_kind(entry: &crate::daemon::proto::HistoryEntry) -> &'static str {
+        match entry {
+            crate::daemon::proto::HistoryEntry::InterruptDecision { .. } => "interrupt_decision",
+            crate::daemon::proto::HistoryEntry::User { .. } => "user",
+            crate::daemon::proto::HistoryEntry::Assistant { .. } => "assistant",
+            crate::daemon::proto::HistoryEntry::ToolCall { .. } => "tool_call",
+            crate::daemon::proto::HistoryEntry::InferenceError { .. } => "inference_error",
+            crate::daemon::proto::HistoryEntry::CompactBoundary { .. } => "compact_boundary",
+            crate::daemon::proto::HistoryEntry::Subagent { .. } => "subagent",
         }
     }
 }

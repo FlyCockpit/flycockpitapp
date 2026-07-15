@@ -1082,6 +1082,18 @@ async fn run_worker(
                         interrupts.emit_queue_state();
                         continue;
                     }
+                    // Process-boundary lifecycle tests kill the daemon while
+                    // a parked replay is durably `executing`. The hook is
+                    // debug-build + env-gated, so release production binaries
+                    // cannot enter this pause.
+                    if cfg!(debug_assertions)
+                        && std::env::var_os("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING")
+                            .is_some()
+                    {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    }
                     let Some(payload) = row.parked.clone() else {
                         let _ = session.db.mark_interrupt_interrupted(interrupt_id);
                         send_current_event(

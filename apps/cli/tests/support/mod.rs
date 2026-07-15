@@ -93,7 +93,7 @@ impl IsolatedHome {
         std::fs::create_dir_all(&providers_dir).expect("create providers config dir");
         std::fs::write(
             config_dir.join("config.json"),
-            r#"{"active_model":{"provider":"local","model":"scripted"}}"#,
+            r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":false}"#,
         )
         .expect("write integration config.json");
         std::fs::write(

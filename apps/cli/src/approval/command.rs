@@ -72,6 +72,7 @@ impl Approver {
         confined_exit: i32,
         confined_stderr: String,
         grant_offer: Option<&SandboxEscalationGrantOffer>,
+        command_detail: Option<CommandDetail>,
     ) -> Result<SandboxEscalationApproval> {
         let offered_scopes = grant_offer
             .map(|_| self.store.recordable_path_scopes())
@@ -128,7 +129,7 @@ impl Approver {
             prompt,
             options,
             allow_freetext: false,
-            command_detail: None,
+            command_detail: command_detail.map(Box::new),
             permission: true,
             sandbox_escalation: Some(escalation),
         };

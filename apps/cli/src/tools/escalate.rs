@@ -185,12 +185,15 @@ enum EscalationApproval {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EscalationRoute {
+pub(crate) enum EscalationRoute {
     RunUnconfinedOnce,
     PromptHuman,
 }
 
-fn escalation_route(mode: ApprovalMode, safety_outcome: Option<SafetyOutcome>) -> EscalationRoute {
+pub(crate) fn escalation_route(
+    mode: ApprovalMode,
+    safety_outcome: Option<SafetyOutcome>,
+) -> EscalationRoute {
     match mode {
         ApprovalMode::Yolo => EscalationRoute::RunUnconfinedOnce,
         ApprovalMode::Manual => EscalationRoute::PromptHuman,
@@ -282,7 +285,7 @@ async fn prompt_user(
         row.output.clone()
     };
     match approver
-        .approve_sandbox_escalation(command, confined_exit, confined_detail, grant_offer)
+        .approve_sandbox_escalation(command, confined_exit, confined_detail, grant_offer, None)
         .await?
     {
         crate::approval::SandboxEscalationApproval::GrantAndRetryConfined { .. } => {

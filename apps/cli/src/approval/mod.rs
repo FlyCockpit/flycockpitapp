@@ -1162,6 +1162,7 @@ mod tests {
                 13,
                 "cat: Permission denied".into(),
                 Some(&offer),
+                None,
             )
             .await
             .unwrap();
@@ -1215,7 +1216,7 @@ mod tests {
             resolve_sequence_collecting_questions(&approver, &[ID_ESCALATE_RUN_UNCONFINED_ONCE]);
 
         let decision = approver
-            .approve_sandbox_escalation("cat cache/data", 13, "denied".into(), Some(&offer))
+            .approve_sandbox_escalation("cat cache/data", 13, "denied".into(), Some(&offer), None)
             .await
             .unwrap();
         assert_eq!(decision, SandboxEscalationApproval::RunUnconfinedOnce);

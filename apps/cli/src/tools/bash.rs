@@ -385,6 +385,21 @@ async fn call_bash_inner(
             unavailable_reason: Some(reason.clone()),
             resource_profiles: command_resource_plan.metas.clone(),
         };
+        if !options.escalated
+            && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+            && ctx.session.sandbox_escalation_enabled()
+            && let Some(output) = defensive_human_escalation_offer(
+                args.clone(),
+                command,
+                &cwd,
+                1,
+                format!("sandbox unavailable: {reason}"),
+                ctx,
+            )
+            .await?
+        {
+            return Ok(output);
+        }
         return Ok(ToolOutput::text(format!(
                 "Error: the shell sandbox cannot start here ({reason}); `bash` will fail for the rest of the session until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
             ))
@@ -545,6 +560,26 @@ async fn call_bash_inner(
                 RunOutcome::Done(o) => final_outcome = o,
             }
         }
+    }
+
+    if confine
+        && !options.escalated
+        && !final_outcome.success
+        && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+        && ctx.session.sandbox_escalation_enabled()
+        && let Some(output) = defensive_human_escalation_offer(
+            args.clone(),
+            command,
+            &cwd,
+            final_outcome.exit,
+            String::from_utf8_lossy(&final_outcome.stderr)
+                .trim_end()
+                .to_string(),
+            ctx,
+        )
+        .await?
+    {
+        return Ok(output);
     }
 
     if confine
@@ -1304,6 +1339,64 @@ async fn command_granted_broad(ctx: &ToolCtx, command: &str) -> bool {
     simple
         .iter()
         .all(|info| crate::approval::command_grant_allowed_by_policy(approver.store(), info))
+}
+
+async fn defensive_human_escalation_offer(
+    args: Value,
+    command: &str,
+    cwd: &Path,
+    confined_exit: i32,
+    confined_stderr: String,
+    ctx: &ToolCtx,
+) -> Result<Option<ToolOutput>> {
+    if matches!(
+        crate::tools::escalate::escalation_route(
+            ctx.session.approval_mode(),
+            None, // Defensive human offers force Auto through the user.
+        ),
+        crate::tools::escalate::EscalationRoute::RunUnconfinedOnce
+    ) {
+        return Box::pin(crate::tools::bash::rerun_escalated_bash(args, ctx, None))
+            .await
+            .map(Some);
+    }
+    if !matches!(
+        ctx.session.approval_mode(),
+        crate::config::extended::ApprovalMode::Manual | crate::config::extended::ApprovalMode::Auto
+    ) {
+        return Ok(None);
+    }
+
+    let Some(approver) = ctx.approver.as_ref() else {
+        return Ok(None);
+    };
+    let detail = crate::daemon::proto::CommandDetail {
+        full_command: command.to_string(),
+        highlight: None,
+        step: 1,
+        step_count: 1,
+        cwd: Some(cwd.display().to_string()),
+        remembered_key: None,
+        write_content: None,
+        risk_tier: None,
+        risk_reasons: Vec::new(),
+        affected_targets: Vec::new(),
+        native_tool_hints: Vec::new(),
+        offered_scopes: vec![crate::approval::store::Scope::Once.as_str().to_string()],
+        policy_cap: Some(crate::approval::store::Scope::Once.as_str().to_string()),
+    };
+    match approver
+        .approve_sandbox_escalation(command, confined_exit, confined_stderr, None, Some(detail))
+        .await?
+    {
+        crate::approval::SandboxEscalationApproval::RunUnconfinedOnce => {
+            Box::pin(crate::tools::bash::rerun_escalated_bash(args, ctx, None))
+                .await
+                .map(Some)
+        }
+        crate::approval::SandboxEscalationApproval::Deny
+        | crate::approval::SandboxEscalationApproval::GrantAndRetryConfined { .. } => Ok(None),
+    }
 }
 
 /// The combined outcome of one shell run.
@@ -3649,6 +3742,157 @@ mod tests {
             } => sandbox_escalation.clone(),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_store(tmp.path());
+        ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+        ctx.session.set_sandbox_escalation_enabled(true);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+
+        let db = ctx.session.db.clone();
+        let sid = ctx.session.id;
+        let hub = ctx.interrupts.clone();
+        let cwd = tmp.path().display().to_string();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(sid).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            let open = db.list_open_interrupts(sid).unwrap();
+            let row = open
+                .iter()
+                .find(|row| row.interrupt_id == iid)
+                .expect("open interrupt row");
+            let set = row.questions.as_ref().expect("questions present");
+            let InterruptQuestion::Single {
+                options,
+                command_detail,
+                sandbox_escalation,
+                ..
+            } = &set.questions[0]
+            else {
+                panic!("expected single escalation question");
+            };
+            let ids = options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids,
+                vec![
+                    crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE,
+                    crate::approval::ID_REJECT,
+                ]
+            );
+            let detail = command_detail.as_ref().expect("command detail");
+            assert_eq!(detail.full_command, "printf confined");
+            assert_eq!(detail.cwd.as_deref(), Some(cwd.as_str()));
+            assert_eq!(detail.offered_scopes, vec!["once"]);
+            assert_eq!(detail.policy_cap.as_deref(), Some("once"));
+            let esc = sandbox_escalation.as_ref().expect("escalation detail");
+            assert_eq!(esc.confined_exit, 17);
+            assert_eq!(esc.confined_stderr, "permission denied");
+            assert!(esc.suggested_paths.is_empty());
+            assert!(esc.suggested_access.is_none());
+            assert!(hub.resolve(
+                iid,
+                crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: crate::approval::ID_REJECT.into(),
+                }
+            ));
+        });
+
+        let decision = defensive_human_escalation_offer(
+            serde_json::json!({ "command": "printf confined" }),
+            "printf confined",
+            tmp.path(),
+            17,
+            "permission denied".to_string(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        resolver.await.unwrap();
+        assert!(decision.is_none(), "deny leaves original failure in place");
+    }
+
+    #[tokio::test]
+    async fn defensive_human_escalation_offer_yolo_runs_unconfined_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_store(tmp.path());
+        ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+        ctx.session.set_sandbox_escalation_enabled(true);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+        ctx.approver = None;
+
+        let out = defensive_human_escalation_offer(
+            serde_json::json!({ "command": "printf yolo" }),
+            "printf yolo",
+            tmp.path(),
+            1,
+            "sandbox unavailable".to_string(),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .expect("yolo reruns");
+        assert!(out.content.contains("yolo"), "got: {}", out.content);
+        let meta = out.sandbox.expect("sandbox meta");
+        assert!(meta.enabled);
+        assert!(!meta.confined);
+        assert!(meta.escalated);
+    }
+
+    #[tokio::test]
+    async fn defensive_human_escalation_offer_auto_prompts_human() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_store(tmp.path());
+        ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+        ctx.session.set_sandbox_escalation_enabled(true);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
+
+        let db = ctx.session.db.clone();
+        let sid = ctx.session.id;
+        let hub = ctx.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(sid).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(hub.resolve(
+                iid,
+                crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE.into(),
+                }
+            ));
+        });
+
+        let out = defensive_human_escalation_offer(
+            serde_json::json!({ "command": "printf auto" }),
+            "printf auto",
+            tmp.path(),
+            1,
+            "sandbox unavailable".to_string(),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .expect("auto prompts and approval reruns");
+        resolver.await.unwrap();
+        assert!(out.content.contains("auto"), "got: {}", out.content);
+        assert!(out.sandbox.expect("sandbox meta").escalated);
     }
 
     /// escalate→APPROVE (session scope): the escalation prompt is the

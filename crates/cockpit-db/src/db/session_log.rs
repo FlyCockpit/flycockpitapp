@@ -383,7 +383,7 @@ impl Db {
         session_id: Uuid,
         before_seq: Option<i64>,
         limit: u32,
-    ) -> Result<(Vec<crate::daemon::proto::SessionMessage>, bool)> {
+    ) -> Result<(Vec<crate::db::wire::SessionMessage>, bool)> {
         self.read_blocking(|conn| {
             Self::read_session_messages_conn(conn, session_id, before_seq, limit)
         })
@@ -394,7 +394,7 @@ impl Db {
         session_id: Uuid,
         before_seq: Option<i64>,
         limit: u32,
-    ) -> Result<(Vec<crate::daemon::proto::SessionMessage>, bool)> {
+    ) -> Result<(Vec<crate::db::wire::SessionMessage>, bool)> {
         let limit = limit.clamp(1, READ_SESSION_MESSAGES_MAX_LIMIT);
         let fetch_limit = i64::from(limit) + 1;
         let mut stmt = conn
@@ -414,11 +414,11 @@ impl Db {
                 |row| {
                     let kind: String = row.get("type")?;
                     let role = match kind.as_str() {
-                        "assistant_message" => crate::daemon::proto::MessageRole::Agent,
-                        _ => crate::daemon::proto::MessageRole::User,
+                        "assistant_message" => crate::db::wire::MessageRole::Agent,
+                        _ => crate::db::wire::MessageRole::User,
                     };
                     let text: Option<String> = row.get("text")?;
-                    Ok(crate::daemon::proto::SessionMessage {
+                    Ok(crate::db::wire::SessionMessage {
                         seq: row.get("seq")?,
                         ts_ms: row.get("ts_ms")?,
                         role,
@@ -890,7 +890,7 @@ mod tests {
             .unwrap();
         drop(db);
 
-        let reopened = Db::open(&path).unwrap();
+        let _reopened = Db::open(&path).unwrap();
         let events = decode_event_rows(vec![
             RawSessionEventRow {
                 seq: user_seq,
@@ -935,26 +935,8 @@ mod tests {
             vec![user_seq, assistant_seq]
         );
 
-        let history = reopened
-            .read_blocking(|conn| {
-                crate::engine::rehydrate::history_snapshot_from_event_rows_for_test(
-                    conn,
-                    session.session_id,
-                    "builder",
-                    events,
-                )
-            })
-            .unwrap();
-        assert_eq!(history.len(), 2);
-        assert!(matches!(
-            &history[0],
-            crate::daemon::proto::HistoryEntry::User { text, .. } if text == "before"
-        ));
-        assert!(matches!(
-            &history[1],
-            crate::daemon::proto::HistoryEntry::Assistant { text, .. }
-                if text == "still committed"
-        ));
+        assert_eq!(events[0].data["text"], "before");
+        assert_eq!(events[1].data["text"], "still committed");
     }
 
     #[test]
@@ -1053,9 +1035,9 @@ mod tests {
             page.iter().map(|message| message.seq).collect::<Vec<_>>(),
             vec![agent_two, user_three]
         );
-        assert_eq!(page[0].role, crate::daemon::proto::MessageRole::Agent);
+        assert_eq!(page[0].role, crate::db::wire::MessageRole::Agent);
         assert_eq!(page[0].text, "two");
-        assert_eq!(page[1].role, crate::daemon::proto::MessageRole::User);
+        assert_eq!(page[1].role, crate::db::wire::MessageRole::User);
         assert_eq!(page[1].text, "three");
 
         let (older, has_more) = db

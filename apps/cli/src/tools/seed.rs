@@ -18,7 +18,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::engine::compact::{SeedTool, is_read_only_seed_tool};
+use crate::db::seed_tools::SeedTool;
+use crate::engine::compact::is_read_only_seed_tool;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
 pub struct SeedEmitTool;

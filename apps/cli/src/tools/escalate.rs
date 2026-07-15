@@ -192,7 +192,7 @@ mod tests {
                 path: None,
                 original_input_json: json!({ "command": "printf escalated" }),
                 wire_input_json: json!({ "command": "printf escalated" }),
-                recovery: crate::engine::repair::Recovery::Clean,
+                recovery: crate::db::tool_calls::Recovery::Clean,
                 hard_fail: false,
                 exit_code,
                 sandbox_enabled: true,

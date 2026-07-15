@@ -18,6 +18,8 @@ use tiktoken_rs::{
     r50k_base_singleton,
 };
 
+pub use crate::db::tokenizer_calibration::TokenizerStrategy;
+
 #[cfg(test)]
 thread_local! {
     static COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -46,18 +48,6 @@ pub fn count(text: &str) -> usize {
     count_with(text, TokenizerStrategy::Cl100k)
 }
 
-/// A tiktoken encoding strategy. Per-`(provider, model)` calibration
-/// picks whichever of these best matches the provider's reported
-/// counts; `Cl100k` is the floor when nothing is calibrated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenizerStrategy {
-    R50k,
-    P50k,
-    P50kEdit,
-    Cl100k,
-    O200k,
-}
-
 /// Every strategy, in a fixed order — the calibration loop tries each.
 pub const STRATEGIES: [TokenizerStrategy; 5] = [
     TokenizerStrategy::R50k,
@@ -66,31 +56,6 @@ pub const STRATEGIES: [TokenizerStrategy; 5] = [
     TokenizerStrategy::Cl100k,
     TokenizerStrategy::O200k,
 ];
-
-impl TokenizerStrategy {
-    /// The string persisted in `tokenizer_calibration.strategy`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::R50k => "r50k_base",
-            Self::P50k => "p50k_base",
-            Self::P50kEdit => "p50k_edit",
-            Self::Cl100k => "cl100k_base",
-            Self::O200k => "o200k_base",
-        }
-    }
-
-    /// Parse a persisted strategy name; unknown names fall back to the
-    /// cl100k_base floor rather than erroring.
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "r50k_base" => Self::R50k,
-            "p50k_base" => Self::P50k,
-            "p50k_edit" => Self::P50kEdit,
-            "o200k_base" => Self::O200k,
-            _ => Self::Cl100k,
-        }
-    }
-}
 
 /// Count tokens in `text` with a specific [`TokenizerStrategy`].
 pub fn count_with(text: &str, strategy: TokenizerStrategy) -> usize {

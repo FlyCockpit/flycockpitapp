@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::session_log::SessionEventKind;
+use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
-use crate::engine::repair::Recovery;
 use crate::engine::tool::Tool;
 use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 use std::io::Read;

@@ -40,6 +40,8 @@
 //! args carry semantic content), and `hot` (a ranking, not a snapshot
 //! of a single addressable resource).
 
+pub use crate::db::prune_ledger::{LedgerEntry, PruneLedger};
+
 use crate::config::providers::{CacheConfig, CacheMode};
 use crate::engine::message::{AssistantContent, Message};
 use crate::tools::shell_compress;
@@ -574,38 +576,6 @@ pub fn current_elided_ids(history: &[Message]) -> Vec<String> {
 /// Serialized to JSON for the `prune_ledger` table. Single source of
 /// truth stays `session_events` + `tool_calls`; this is the small delta
 /// that re-derives the *pruned* form, not a second copy of the wire list.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PruneLedger {
-    /// The currently-elided bodies, in history order, each reproducing one
-    /// [`Elision`]. The id is the tool-result `id` (== originating tool
-    /// call `id`).
-    pub elided: Vec<LedgerEntry>,
-    /// Foreground root history length at the last prune (the depth-1
-    /// `prune_watermark`). `0` when no prune has run.
-    pub watermark: usize,
-}
-
-/// One elided body in a [`PruneLedger`] — the persistable form of an
-/// [`Elision`]. `reason` is stored as an owned `String` (the live
-/// [`Elision::reason`] is `&'static str`); on re-apply it is matched back
-/// to the canonical static reason so the marker text is identical.
-///
-/// `partial_body` is `None` for a whole-body exact-identity elision (the
-/// marker re-renders deterministically from `original_event_id` + `reason`);
-/// for an overlap-merge partial elision it carries the exact pre-rendered
-/// partial body (non-overlapping remainder + embedded marker line(s)) so the
-/// pruned form reproduces byte-identically on resume without re-deriving the
-/// overlap geometry from a possibly-shifted file. `original_event_id` then
-/// holds the rewritten body's own tool-result id (the row to write onto),
-/// matching the live [`ElisionTarget::target_call_id`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LedgerEntry {
-    pub original_event_id: String,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partial_body: Option<String>,
-}
-
 /// The single canonical elision reason today (`apply_plan` writes only
 /// this). Stored as `&'static str` on [`Elision`]; the ledger round-trips
 /// through this so a persisted reason re-binds to the static form and the
@@ -624,131 +594,127 @@ fn static_reason(reason: &str) -> &'static str {
     }
 }
 
-impl PruneLedger {
-    /// Capture the current prune state of a wire history + the driver's
-    /// foreground watermark into a durable ledger. Walks the history for
-    /// the currently-elided bodies (the same scan [`current_elided_ids`]
-    /// does) and records each as a [`LedgerEntry`] carrying the canonical
-    /// reason, so re-apply reproduces the exact marker. `watermark` is the
-    /// depth-1 `prune_watermark` (root history length at the last prune).
-    pub fn capture(history: &[Message], watermark: usize) -> Self {
-        let tools = tool_names_by_call_id(history);
-        let mut elided = Vec::new();
-        for msg in history {
-            if let Message::User { content } = msg {
-                for c in content.iter() {
-                    if let UserContent::ToolResult(tr) = c {
-                        let body = tool_result_body(&tr.content);
-                        let tool = tools.get(&tr.id).map(String::as_str);
-                        if tool.is_some_and(is_snapshot_tool)
-                            && exact_snapshot_marker(&body, &tr.id)
-                        {
-                            // Whole-body exact-identity marker: re-renders from
-                            // id + reason, no body to store.
-                            elided.push(LedgerEntry {
-                                original_event_id: tr.id.clone(),
-                                reason: REASON_SNAPSHOT_SUPERSEDED.to_string(),
-                                partial_body: None,
-                            });
-                        } else if tool.is_some_and(is_snapshot_tool)
-                            && contains_overlap_marker(&body)
-                        {
-                            // Overlap-merge partial body: store it verbatim so
-                            // resume reproduces it byte-identically (the overlap
-                            // geometry is not re-derived from a possibly-shifted
-                            // file).
-                            elided.push(LedgerEntry {
-                                original_event_id: tr.id.clone(),
-                                reason: overlap::OVERLAP_REASON.to_string(),
-                                partial_body: Some(body),
-                            });
-                        } else if tool.is_some_and(is_prune_boundary_condense_tool)
-                            && body
-                                .lines()
-                                .next()
-                                .is_some_and(is_compressed_tool_result_marker_line)
-                        {
-                            // Prune-boundary tool condensation: store the
-                            // model-bound condensed body verbatim so resume
-                            // reproduces the pruned context exactly. The exact
-                            // full body lives in compressed_tool_results.
-                            elided.push(LedgerEntry {
-                                original_event_id: tr.id.clone(),
-                                reason: REASON_TOOL_RESULT_CONDENSED.to_string(),
-                                partial_body: Some(body),
-                            });
-                        }
+/// Capture the current prune state of a wire history + the driver's
+/// foreground watermark into a durable ledger. Walks the history for the
+/// currently-elided bodies (the same scan [`current_elided_ids`] does) and
+/// records each as a [`LedgerEntry`] carrying the canonical reason, so re-apply
+/// reproduces the exact marker. `watermark` is the depth-1 `prune_watermark`
+/// (root history length at the last prune).
+pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
+    let tools = tool_names_by_call_id(history);
+    let mut elided = Vec::new();
+    for msg in history {
+        if let Message::User { content } = msg {
+            for c in content.iter() {
+                if let UserContent::ToolResult(tr) = c {
+                    let body = tool_result_body(&tr.content);
+                    let tool = tools.get(&tr.id).map(String::as_str);
+                    if tool.is_some_and(is_snapshot_tool) && exact_snapshot_marker(&body, &tr.id) {
+                        // Whole-body exact-identity marker: re-renders from
+                        // id + reason, no body to store.
+                        elided.push(LedgerEntry {
+                            original_event_id: tr.id.clone(),
+                            reason: REASON_SNAPSHOT_SUPERSEDED.to_string(),
+                            partial_body: None,
+                        });
+                    } else if tool.is_some_and(is_snapshot_tool) && contains_overlap_marker(&body) {
+                        // Overlap-merge partial body: store it verbatim so
+                        // resume reproduces it byte-identically (the overlap
+                        // geometry is not re-derived from a possibly-shifted
+                        // file).
+                        elided.push(LedgerEntry {
+                            original_event_id: tr.id.clone(),
+                            reason: overlap::OVERLAP_REASON.to_string(),
+                            partial_body: Some(body),
+                        });
+                    } else if tool.is_some_and(is_prune_boundary_condense_tool)
+                        && body
+                            .lines()
+                            .next()
+                            .is_some_and(is_compressed_tool_result_marker_line)
+                    {
+                        // Prune-boundary tool condensation: store the
+                        // model-bound condensed body verbatim so resume
+                        // reproduces the pruned context exactly. The exact
+                        // full body lives in compressed_tool_results.
+                        elided.push(LedgerEntry {
+                            original_event_id: tr.id.clone(),
+                            reason: REASON_TOOL_RESULT_CONDENSED.to_string(),
+                            partial_body: Some(body),
+                        });
                     }
                 }
             }
         }
-        PruneLedger { elided, watermark }
     }
+    PruneLedger { elided, watermark }
+}
 
-    /// True when the ledger records no elisions — the rebuilt transcript
-    /// is already in its final (unpruned) form and re-apply is a no-op.
-    pub fn is_empty(&self) -> bool {
-        self.elided.is_empty()
-    }
+/// True when the ledger records no elisions — the rebuilt transcript is already
+/// in its final (unpruned) form and re-apply is a no-op.
+pub fn ledger_is_empty(ledger: &PruneLedger) -> bool {
+    ledger.elided.is_empty()
+}
 
-    /// Re-apply the ledger to a freshly-rebuilt `history`, eliding every
-    /// reconstructed tool-result body whose id is recorded, with the
-    /// identical marker. Reuses [`apply_plan`] (and thus the one marker
-    /// format) by building a [`DedupPlan`] whose targets point at the
-    /// matching reconstructed indices.
-    ///
-    /// Returns `Err(missing)` listing any ledger ids that have **no**
-    /// matching full (un-elided) tool-result in the rebuilt history — an
-    /// inconsistent ledger. The caller then falls back to the full
-    /// unpruned reconstruction and warns (priority #1: never a malformed
-    /// or silently-fresh context). On `Ok(n)`, `n` bodies were elided.
-    pub fn reapply(&self, history: &mut [Message]) -> std::result::Result<usize, Vec<String>> {
-        // Index the rebuilt history: id → (history_index, current_body),
-        // for every full tool-result body present.
-        let mut by_id: std::collections::HashMap<&str, (usize, String)> =
-            std::collections::HashMap::new();
-        for (idx, msg) in history.iter().enumerate() {
-            if let Message::User { content } = msg {
-                for c in content.iter() {
-                    if let UserContent::ToolResult(tr) = c {
-                        by_id.insert(tr.id.as_str(), (idx, tool_result_body(&tr.content)));
-                    }
+/// Re-apply the ledger to a freshly-rebuilt `history`, eliding every
+/// reconstructed tool-result body whose id is recorded, with the identical
+/// marker. Reuses [`apply_plan`] (and thus the one marker format) by building a
+/// [`DedupPlan`] whose targets point at the matching reconstructed indices.
+///
+/// Returns `Err(missing)` listing any ledger ids that have **no** matching full
+/// (un-elided) tool-result in the rebuilt history — an inconsistent ledger. The
+/// caller then falls back to the full unpruned reconstruction and warns
+/// (priority #1: never a malformed or silently-fresh context). On `Ok(n)`, `n`
+/// bodies were elided.
+pub fn reapply_ledger(
+    ledger: &PruneLedger,
+    history: &mut [Message],
+) -> std::result::Result<usize, Vec<String>> {
+    // Index the rebuilt history: id → (history_index, current_body),
+    // for every full tool-result body present.
+    let mut by_id: std::collections::HashMap<&str, (usize, String)> =
+        std::collections::HashMap::new();
+    for (idx, msg) in history.iter().enumerate() {
+        if let Message::User { content } = msg {
+            for c in content.iter() {
+                if let UserContent::ToolResult(tr) = c {
+                    by_id.insert(tr.id.as_str(), (idx, tool_result_body(&tr.content)));
                 }
             }
         }
-
-        let mut targets = Vec::new();
-        let mut missing = Vec::new();
-        for entry in &self.elided {
-            match by_id.get(entry.original_event_id.as_str()) {
-                Some((idx, body)) => targets.push(ElisionTarget {
-                    history_index: *idx,
-                    current_body: body.clone(),
-                    elision: Elision {
-                        original_event_id: entry.original_event_id.clone(),
-                        reason: static_reason(&entry.reason),
-                    },
-                    // An overlap-merge entry carries its pre-rendered partial
-                    // body, written verbatim; a whole-body entry has `None` and
-                    // re-renders the marker. Either way the row to write onto is
-                    // the entry's own id.
-                    partial_body: entry.partial_body.clone(),
-                    tokens_saved: 0,
-                    target_call_id: entry.original_event_id.clone(),
-                }),
-                None => missing.push(entry.original_event_id.clone()),
-            }
-        }
-        if !missing.is_empty() {
-            return Err(missing);
-        }
-        targets.sort_by_key(|t| t.history_index);
-        for target in &mut targets {
-            target.tokens_saved = cached_tokens_saved(target);
-        }
-        let plan = DedupPlan { targets };
-        Ok(apply_plan(history, &plan))
     }
+
+    let mut targets = Vec::new();
+    let mut missing = Vec::new();
+    for entry in &ledger.elided {
+        match by_id.get(entry.original_event_id.as_str()) {
+            Some((idx, body)) => targets.push(ElisionTarget {
+                history_index: *idx,
+                current_body: body.clone(),
+                elision: Elision {
+                    original_event_id: entry.original_event_id.clone(),
+                    reason: static_reason(&entry.reason),
+                },
+                // An overlap-merge entry carries its pre-rendered partial
+                // body, written verbatim; a whole-body entry has `None` and
+                // re-renders the marker. Either way the row to write onto is
+                // the entry's own id.
+                partial_body: entry.partial_body.clone(),
+                tokens_saved: 0,
+                target_call_id: entry.original_event_id.clone(),
+            }),
+            None => missing.push(entry.original_event_id.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    targets.sort_by_key(|t| t.history_index);
+    for target in &mut targets {
+        target.tokens_saved = cached_tokens_saved(target);
+    }
+    let plan = DedupPlan { targets };
+    Ok(apply_plan(history, &plan))
 }
 
 /// The cache-cold predicate (GOALS §10 / `plan.md` T6.f): "expected
@@ -1172,7 +1138,7 @@ mod tests {
         apply_condensed_tool_result(&mut pruned, &candidates[0], "0123456789abcdefabcdef12");
         let condensed = body_at(&pruned, 1);
 
-        let ledger = PruneLedger::capture(&pruned, 2);
+        let ledger = capture_ledger(&pruned, 2);
         assert_eq!(ledger.elided.len(), 1);
         assert_eq!(ledger.elided[0].reason, REASON_TOOL_RESULT_CONDENSED);
         assert_eq!(
@@ -1184,7 +1150,7 @@ mod tests {
             assistant_call("c1", "bash", json!({ "command": "cargo test" })),
             tool_result("c1", &original),
         ];
-        assert_eq!(ledger.reapply(&mut rebuilt).unwrap(), 1);
+        assert_eq!(reapply_ledger(&ledger, &mut rebuilt).unwrap(), 1);
         assert_eq!(body_at(&rebuilt, 1), condensed);
     }
 
@@ -1268,9 +1234,9 @@ mod tests {
                 Vec::<String>::new(),
                 "{call_id}"
             );
-            let ledger = PruneLedger::capture(&history, history.len());
+            let ledger = capture_ledger(&history, history.len());
             assert!(ledger.elided.is_empty(), "{call_id} captured: {ledger:?}");
-            assert_eq!(ledger.reapply(&mut history).unwrap(), 0);
+            assert_eq!(reapply_ledger(&ledger, &mut history).unwrap(), 0);
             assert_eq!(body_at(&history, 1), body, "{call_id} body changed");
         }
     }
@@ -1286,7 +1252,7 @@ mod tests {
         ];
         prune_history(&mut history);
         assert_eq!(current_elided_ids(&history), vec!["c1".to_string()]);
-        let ledger = PruneLedger::capture(&history, history.len());
+        let ledger = capture_ledger(&history, history.len());
         assert_eq!(ledger.elided.len(), 1);
 
         let mut rebuilt = vec![
@@ -1295,7 +1261,7 @@ mod tests {
             assistant_call("c2", "read", args),
             tool_result("c2", "FULL BODY TWO with lots of content here"),
         ];
-        assert_eq!(ledger.reapply(&mut rebuilt).unwrap(), 1);
+        assert_eq!(reapply_ledger(&ledger, &mut rebuilt).unwrap(), 1);
         assert_eq!(body_at(&rebuilt, 1), body_at(&history, 1));
         assert_eq!(body_at(&rebuilt, 3), body_at(&history, 3));
     }
@@ -1335,7 +1301,7 @@ mod tests {
         ];
         // Prune in place, then capture the ledger from the pruned state.
         prune_history(&mut history);
-        let ledger = PruneLedger::capture(&history, history.len());
+        let ledger = capture_ledger(&history, history.len());
         assert_eq!(ledger.elided.len(), 1);
         assert_eq!(ledger.elided[0].original_event_id, "c1");
         assert_eq!(ledger.watermark, history.len());
@@ -1347,7 +1313,7 @@ mod tests {
             assistant_call("c2", "read", args.clone()),
             tool_result("c2", "FULL BODY TWO with lots of content here"),
         ];
-        let n = ledger.reapply(&mut rebuilt).expect("clean re-apply");
+        let n = reapply_ledger(&ledger, &mut rebuilt).expect("clean re-apply");
         assert_eq!(n, 1);
         // Byte-identical to the in-place-pruned history.
         assert_eq!(body_at(&rebuilt, 1), body_at(&history, 1));
@@ -1377,7 +1343,7 @@ mod tests {
             }],
             watermark: 2,
         };
-        let err = ledger.reapply(&mut rebuilt).unwrap_err();
+        let err = reapply_ledger(&ledger, &mut rebuilt).unwrap_err();
         assert_eq!(err, vec!["ghost".to_string()]);
         // The history was NOT mutated (no partial elision on inconsistency).
         assert_eq!(body_at(&rebuilt, 1), "only body padding padding");
@@ -1392,8 +1358,8 @@ mod tests {
             tool_result("c1", "body padding padding"),
         ];
         let ledger = PruneLedger::default();
-        assert!(ledger.is_empty());
-        assert_eq!(ledger.reapply(&mut rebuilt).unwrap(), 0);
+        assert!(ledger_is_empty(&ledger));
+        assert_eq!(reapply_ledger(&ledger, &mut rebuilt).unwrap(), 0);
         assert_eq!(body_at(&rebuilt, 1), "body padding padding");
     }
 
@@ -1589,14 +1555,14 @@ mod tests {
         };
         let mut history = build();
         prune_history(&mut history);
-        let ledger = PruneLedger::capture(&history, history.len());
+        let ledger = capture_ledger(&history, history.len());
         assert_eq!(ledger.elided.len(), 1);
         assert!(ledger.elided[0].partial_body.is_some());
         assert_eq!(ledger.elided[0].reason, OVERLAP_REASON);
 
         // A fresh full rebuild re-pruned via the ledger is byte-identical.
         let mut rebuilt = build();
-        let n = ledger.reapply(&mut rebuilt).expect("clean re-apply");
+        let n = reapply_ledger(&ledger, &mut rebuilt).expect("clean re-apply");
         assert_eq!(n, 1);
         assert_eq!(body_at(&rebuilt, 1), body_at(&history, 1));
         assert_eq!(body_at(&rebuilt, 3), body_at(&history, 3));

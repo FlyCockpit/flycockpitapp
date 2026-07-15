@@ -1906,7 +1906,7 @@ fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, output: &s
             path: None,
             original_input_json: serde_json::json!({ "name": "x" }),
             wire_input_json: serde_json::json!({ "name": "x" }),
-            recovery: crate::engine::repair::Recovery::Clean,
+            recovery: crate::db::tool_calls::Recovery::Clean,
             hard_fail: false,
             exit_code: None,
             sandbox_enabled: false,
@@ -2544,7 +2544,7 @@ fn fresh_driver_rehydrates_persisted_pruned_context() {
                 path: Some("/f".into()),
                 original_input_json: serde_json::json!({ "path": "/f" }),
                 wire_input_json: serde_json::json!({ "path": "/f" }),
-                recovery: crate::engine::repair::Recovery::Clean,
+                recovery: crate::db::tool_calls::Recovery::Clean,
                 hard_fail: false,
                 exit_code: None,
                 sandbox_enabled: false,
@@ -3715,7 +3715,7 @@ async fn auto_compact_fires_at_threshold_once() {
             path: Some("seed.txt".into()),
             original_input_json: serde_json::json!({ "path": "seed.txt" }),
             wire_input_json: serde_json::json!({ "path": "seed.txt" }),
-            recovery: crate::engine::repair::Recovery::Clean,
+            recovery: crate::db::tool_calls::Recovery::Clean,
             hard_fail: false,
             exit_code: None,
             sandbox_enabled: false,
@@ -4081,7 +4081,7 @@ async fn dispatch_loop_start_coerces_stringified_numerics_e2e() {
     // its recovery, and the repaired `wire_args` show the coerced int.
     assert!(matches!(
         dispatch.recovery,
-        crate::engine::repair::Recovery::ShapeRepair {
+        crate::db::tool_calls::Recovery::ShapeRepair {
             stage: "parse_stringified_number",
             ..
         }
@@ -4141,7 +4141,7 @@ async fn schedule_subarg_repair_record_round_trips_recovery_and_wire() {
     // recovery_kind/recovery_stage round-trip the shape repair.
     assert!(matches!(
         row.recovery,
-        crate::engine::repair::Recovery::ShapeRepair {
+        crate::db::tool_calls::Recovery::ShapeRepair {
             stage: "parse_stringified_number",
             ..
         }
@@ -4223,7 +4223,7 @@ fn schedule_tool_call_record_persists_wire_and_original() {
         call_id: "call-sched-1".to_string(),
         original_input_json: original.clone(),
         wire_input_json: wire.clone(),
-        recovery: crate::engine::repair::Recovery::Clean,
+        recovery: crate::db::tool_calls::Recovery::Clean,
         hard_fail: false,
         output: "{\"scheduled\":[],\"swarm\":{\"running\":0,\"queued\":0}}".to_string(),
         duration_ms: 3,
@@ -4258,7 +4258,7 @@ fn schedule_dispatch_emits_tool_call_session_event() {
         call_id: "call-sched-evt".to_string(),
         original_input_json: serde_json::json!({ "action": "list" }),
         wire_input_json: serde_json::json!({ "action": "list", "args": {} }),
-        recovery: crate::engine::repair::Recovery::Clean,
+        recovery: crate::db::tool_calls::Recovery::Clean,
         hard_fail: false,
         output: "{\"scheduled\":[],\"swarm\":{\"running\":0,\"queued\":0}}".to_string(),
         duration_ms: 3,
@@ -4416,7 +4416,7 @@ async fn begin_delegation_shrink_eager_on_no_cache() {
 
 // ---- re-queryable subagents + seeding (GOALS §3c) --------------------
 
-use crate::engine::compact::SeedTool;
+use crate::db::seed_tools::SeedTool;
 
 /// Persist a transcript under a handle, then rehydrate it: the round trip
 /// returns the same messages, so a follow-up resumes with prior context.
@@ -6215,7 +6215,7 @@ async fn inject_seeds_caps_under_budget_and_injects_pairs() {
             r.wire_input_json, r.original_input_json,
             "a seed is verbatim: wire == original (GOALS §14)"
         );
-        assert_eq!(r.recovery, crate::engine::repair::Recovery::Clean);
+        assert_eq!(r.recovery, crate::db::tool_calls::Recovery::Clean);
     }
 }
 
@@ -6616,7 +6616,7 @@ async fn seed_forced_skill_records_and_folds_a_real_skill_call() {
         row.wire_input_json, row.original_input_json,
         "synthesized call is verbatim: wire == original (GOALS §14)"
     );
-    assert_eq!(row.recovery, crate::engine::repair::Recovery::Clean);
+    assert_eq!(row.recovery, crate::db::tool_calls::Recovery::Clean);
     assert_eq!(
         row.original_input_json,
         serde_json::json!({ "name": skill_name }),

@@ -4,7 +4,54 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::{config::extended::RetentionConfig, db::Db};
+use crate::db::Db;
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Payload-row retention window in days.
+    #[serde(default = "default_retention_payload_window_days")]
+    pub payload_window_days: u32,
+    /// Whole-session retention window in days.
+    #[serde(default)]
+    pub session_window_days: u32,
+    /// Periodic retention sweep interval in hours.
+    #[serde(default = "default_retention_sweep_interval_hours")]
+    pub sweep_interval_hours: u32,
+    /// Deleted-row threshold for vacuum.
+    #[serde(default = "default_retention_vacuum_min_deletions")]
+    pub vacuum_min_deletions: u64,
+    /// Vacuum interval in days.
+    #[serde(default = "default_retention_vacuum_interval_days")]
+    pub vacuum_interval_days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            payload_window_days: default_retention_payload_window_days(),
+            session_window_days: 0,
+            sweep_interval_hours: default_retention_sweep_interval_hours(),
+            vacuum_min_deletions: default_retention_vacuum_min_deletions(),
+            vacuum_interval_days: default_retention_vacuum_interval_days(),
+        }
+    }
+}
+
+fn default_retention_payload_window_days() -> u32 {
+    30
+}
+
+fn default_retention_sweep_interval_hours() -> u32 {
+    6
+}
+
+fn default_retention_vacuum_min_deletions() -> u64 {
+    1000
+}
+
+fn default_retention_vacuum_interval_days() -> u32 {
+    7
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetentionOutcome {

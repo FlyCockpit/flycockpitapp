@@ -8,10 +8,20 @@
 
 use anyhow::{Context, Result};
 use rusqlite::params;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::engine::compact::SeedTool;
+
+/// One seed-tool to re-execute at the start of a compacted session.
+///
+/// Carries the tool name + the canonical args from the prior call; the new
+/// session dispatches it fresh and never replays the old output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeedTool {
+    pub tool: String,
+    pub args: Value,
+}
 
 impl Db {
     /// Persist the seed-tool plan for a (new) session, in order. Replaces

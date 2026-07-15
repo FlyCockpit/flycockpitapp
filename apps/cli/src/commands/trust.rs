@@ -20,7 +20,7 @@ async fn status(args: TrustStatusArgs) -> Result<()> {
     let path = path_or_current_dir(args.path)?;
     let trust_root = crate::config::trust::resolve_trust_root(&path)?;
     let db = Db::open_default()?;
-    let decision = db.workspace_trust_for_path(&path)?;
+    let decision = db.workspace_trust_by_root(&trust_root.root)?;
     print!("{}", render_status(&trust_root, decision.as_ref()));
     Ok(())
 }

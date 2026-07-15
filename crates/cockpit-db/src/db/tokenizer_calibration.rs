@@ -12,7 +12,41 @@ use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, params};
 
 use crate::db::Db;
-use crate::tokens::TokenizerStrategy;
+
+/// A tiktoken encoding strategy persisted by tokenizer calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerStrategy {
+    R50k,
+    P50k,
+    P50kEdit,
+    Cl100k,
+    O200k,
+}
+
+impl TokenizerStrategy {
+    /// The string persisted in `tokenizer_calibration.strategy`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::R50k => "r50k_base",
+            Self::P50k => "p50k_base",
+            Self::P50kEdit => "p50k_edit",
+            Self::Cl100k => "cl100k_base",
+            Self::O200k => "o200k_base",
+        }
+    }
+
+    /// Parse a persisted strategy name; unknown names fall back to the
+    /// cl100k_base floor rather than erroring.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "r50k_base" => Self::R50k,
+            "p50k_base" => Self::P50k,
+            "p50k_edit" => Self::P50kEdit,
+            "o200k_base" => Self::O200k,
+            _ => Self::Cl100k,
+        }
+    }
+}
 
 /// Calibration lifetime: 90 days in seconds.
 pub const CALIBRATION_TTL_SECS: i64 = 90 * 24 * 60 * 60;

@@ -107,32 +107,6 @@ pub fn repair_private_file(_path: &Path, _label: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub fn create_private_file_if_missing(path: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true).mode(0o600);
-    match opts.open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
-    }
-}
-
-#[cfg(not(unix))]
-pub fn create_private_file_if_missing(path: &Path) -> Result<()> {
-    // Non-Unix platforms do not expose POSIX mode bits; protection follows
-    // the platform filesystem defaults.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    match opts.open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
-    }
-}
-
-#[cfg(unix)]
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};

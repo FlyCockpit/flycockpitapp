@@ -146,7 +146,10 @@ fn workspace_trust_mode(cwd: &Path) -> String {
     let Ok(db) = crate::db::Db::open_default() else {
         return "unresolved".to_string();
     };
-    db.workspace_trust_for_path(cwd)
+    let Ok(root) = crate::config::trust::resolve_trust_root(cwd) else {
+        return "unresolved".to_string();
+    };
+    db.workspace_trust_by_root(&root.root)
         .ok()
         .flatten()
         .map(|decision| decision.mode.as_str().to_string())

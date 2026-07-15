@@ -19,6 +19,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::convert::Infallible;
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -40,16 +42,20 @@ impl SourceType {
             SourceType::Local => "local",
         }
     }
+}
+
+impl FromStr for SourceType {
+    type Err = Infallible;
 
     /// Parse a stored `source_type` string. Anything that isn't `git`
     /// is treated as `local` — kcl only emits `git`/`local`, and a
     /// non-clone row is the safe default.
-    pub fn from_str(s: &str) -> Self {
-        if s.eq_ignore_ascii_case("git") {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(if s.eq_ignore_ascii_case("git") {
             SourceType::Git
         } else {
             SourceType::Local
-        }
+        })
     }
 }
 
@@ -86,7 +92,7 @@ impl PackageRow {
             id,
             identifier: row.get("identifier")?,
             display_name: row.get("display_name")?,
-            source_type: SourceType::from_str(&source_type),
+            source_type: source_type.parse().unwrap_or(SourceType::Local),
             source_url: row.get("source_url")?,
             source_branch: row.get("source_branch")?,
             path: row.get("path")?,

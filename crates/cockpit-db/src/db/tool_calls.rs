@@ -4,6 +4,8 @@
 //! (`original_input_json`, `wire_input_json`) live on the same row
 //! per GOALS §14a.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -14,7 +16,107 @@ use crate::db::{
     lang::language_for_path,
     sql::{PredicateBuilder, SqlColumn},
 };
-use crate::engine::repair::Recovery;
+
+/// What a tool-input repair pass did. One row per dispatched tool call,
+/// persisted to `tool_call_events.recovery_kind` + `recovery_stage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recovery {
+    /// Args were already valid; no repair needed.
+    Clean,
+    /// A shape repair fired. `stage` is the catalog name; `path` names the
+    /// top-level argument rewritten. `hint` is in-memory only.
+    ShapeRepair {
+        stage: &'static str,
+        path: String,
+        hint: Option<String>,
+    },
+    /// The `edit` cascade matched at a stage past `exact`.
+    EditCascade { stage: &'static str, path: String },
+    /// A session-resume rehydration heal stubbed or dropped an unpairable row.
+    ResumeHeal { kind: &'static str, id: String },
+    /// The emitted tool name was repaired before dispatch.
+    NameRepair {
+        stage: &'static str,
+        original: String,
+    },
+    /// A tool call emitted as text was recovered into a real call.
+    TextEmbedded {
+        stage: &'static str,
+        original: String,
+        dropped_trailing: bool,
+    },
+    /// A persisted recovery kind/stage from a newer, renamed, or downgraded
+    /// build that this binary does not recognize.
+    Unknown { kind: String, stage: Option<String> },
+}
+
+impl Recovery {
+    /// `(recovery_kind, recovery_stage)` for the session-DB row.
+    pub fn db_fields(&self) -> (Option<&'static str>, Option<&'static str>) {
+        match self {
+            Recovery::Clean => (None, None),
+            Recovery::ShapeRepair { stage, .. } => (Some("shape_repair"), Some(stage)),
+            Recovery::EditCascade { stage, .. } => (Some("edit_cascade"), Some(stage)),
+            Recovery::ResumeHeal { kind, .. } => (Some("resume_heal"), Some(kind)),
+            Recovery::NameRepair { stage, .. } => (Some("name_repair"), Some(stage)),
+            Recovery::TextEmbedded { stage, .. } => (Some("text_embedded"), Some(stage)),
+            Recovery::Unknown { .. } => (None, None),
+        }
+    }
+
+    /// Dynamic `(recovery_kind, recovery_stage)` for display/export paths that
+    /// may need to surface unknown persisted values.
+    pub fn raw_db_fields(&self) -> (Option<Cow<'_, str>>, Option<Cow<'_, str>>) {
+        match self {
+            Recovery::Unknown { kind, stage } => (
+                Some(Cow::Borrowed(kind.as_str())),
+                stage.as_deref().map(Cow::Borrowed),
+            ),
+            _ => {
+                let (kind, stage) = self.db_fields();
+                (kind.map(Cow::Borrowed), stage.map(Cow::Borrowed))
+            }
+        }
+    }
+}
+
+/// Text-embedded recovery stage names.
+pub const TEXT_RECOVERY_STAGES: &[&str] = &["openai", "agent_keyed"];
+
+/// Name-repair stages.
+pub const NAME_REPAIR_STAGES: &[&str] = &["rebind", "sanitize"];
+
+/// Resume-heal kinds.
+pub const RESUME_HEAL_KINDS: &[&str] = &[
+    "stub_orphan_tool_call",
+    "drop_orphan_tool_result",
+    "stub_missing_subagent_report",
+];
+
+/// Known cascade stage names.
+pub const EDIT_CASCADE_STAGES: &[&str] = &[
+    "exact",
+    "line_trim",
+    "block_anchor",
+    "whitespace_normalized",
+    "indent_flexible",
+    "escape_normalized",
+    "trimmed_boundary",
+    "context_aware",
+];
+
+/// Known shape-repair stage names, in catalog order.
+pub const SHAPE_REPAIR_STAGES: &[&str] = &[
+    "wrap_root_string_as_object",
+    "parse_root_string_as_object",
+    "rename_aliased_field",
+    "null_for_optional",
+    "parse_stringified_number",
+    "parse_stringified_array",
+    "wrap_bare_string",
+    "markdown_autolink_unwrap",
+    "absolute_prefix_rewrite",
+];
 
 #[derive(Debug, Clone)]
 pub struct ToolCallEvent {
@@ -453,17 +555,11 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
     }
 }
 
-/// Inverse of [`Recovery::db_fields`]. Stages live in a fixed catalog
-/// (see [`crate::engine::repair::EDIT_CASCADE_STAGES`] /
-/// [`crate::engine::repair::SHAPE_REPAIR_STAGES`]); we round-trip by
-/// matching the stored stage name against the catalog so we can hand the
-/// `&'static str` back without leaking. Unknown persisted values stay visible
-/// as [`Recovery::Unknown`] instead of being misclassified as clean.
+/// Inverse of [`Recovery::db_fields`]. Stages live in fixed catalogs; we
+/// round-trip by matching the stored stage name against the catalog so we can
+/// hand the `&'static str` back without leaking. Unknown persisted values stay
+/// visible as [`Recovery::Unknown`] instead of being misclassified as clean.
 fn decode_recovery(kind: &Option<String>, stage: &Option<String>) -> Recovery {
-    use crate::engine::repair::{
-        EDIT_CASCADE_STAGES, NAME_REPAIR_STAGES, RESUME_HEAL_KINDS, SHAPE_REPAIR_STAGES,
-        TEXT_RECOVERY_STAGES,
-    };
     let stage_str = stage.as_deref().unwrap_or("");
     match kind.as_deref() {
         None => Recovery::Clean,

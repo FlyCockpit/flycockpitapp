@@ -196,7 +196,7 @@ pub struct ToolOutput {
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
-    pub recovery: Option<crate::engine::repair::Recovery>,
+    pub recovery: Option<crate::db::tool_calls::Recovery>,
     /// Optional canonical args. When `Some`, the dispatcher uses this
     /// as `wire_input_json` for the audit row and as the rewritten
     /// arguments in the assistant message's `ToolCall` in history.
@@ -415,7 +415,7 @@ impl ToolOutput {
     /// struct docs for the contract.
     pub fn with_recovery(
         mut self,
-        recovery: crate::engine::repair::Recovery,
+        recovery: crate::db::tool_calls::Recovery,
         canonical_args: serde_json::Value,
     ) -> Self {
         self.recovery = Some(recovery);

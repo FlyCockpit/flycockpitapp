@@ -1353,7 +1353,7 @@ impl Db {
         project_id: Option<&str>,
         parent_session_id: Option<Uuid>,
         limit: u32,
-    ) -> Result<Vec<crate::daemon::proto::SessionSummary>> {
+    ) -> Result<Vec<crate::db::wire::SessionSummary>> {
         self.read_blocking(|conn| {
             Self::list_session_summaries_conn(conn, project_id, parent_session_id, limit)
         })
@@ -1364,7 +1364,7 @@ impl Db {
         project_id: Option<&str>,
         parent_session_id: Option<Uuid>,
         limit: u32,
-    ) -> Result<Vec<crate::daemon::proto::SessionSummary>> {
+    ) -> Result<Vec<crate::db::wire::SessionSummary>> {
         let rows = match (project_id, parent_session_id) {
             (_, Some(parent)) => Self::list_forks_conn(conn, parent)?,
             (Some(pid), None) => Self::list_root_sessions_conn(conn, pid, limit)?,
@@ -1405,7 +1405,7 @@ impl Db {
                 row.session_id,
                 Self::pin_count_conn(conn, row.session_id),
             );
-            summaries.push(crate::daemon::proto::SessionSummary {
+            summaries.push(crate::db::wire::SessionSummary {
                 session_id: row.session_id,
                 short_id: row.short_id,
                 project_root: row.project_root,
@@ -1446,7 +1446,7 @@ impl Db {
     fn interrupt_activity_state_conn(
         conn: &Connection,
         session_id: Uuid,
-    ) -> Result<Option<crate::daemon::proto::SessionActivityState>> {
+    ) -> Result<Option<crate::db::wire::SessionActivityState>> {
         let mut stmt = conn
             .prepare(
                 "SELECT state, question_json, questions_json
@@ -1466,17 +1466,15 @@ impl Db {
         };
         let state: String = row.get(0).context("reading interrupt state")?;
         if state == "interrupted" {
-            return Ok(Some(
-                crate::daemon::proto::SessionActivityState::Interrupted,
-            ));
+            return Ok(Some(crate::db::wire::SessionActivityState::Interrupted));
         }
         let question_json: Option<String> = row.get(1).context("reading question_json")?;
         let questions_json: Option<String> = row.get(2).context("reading questions_json")?;
         let permission = interrupt_payload_has_permission(question_json, questions_json);
         Ok(Some(if permission || state == "parked" {
-            crate::daemon::proto::SessionActivityState::Parked
+            crate::db::wire::SessionActivityState::Parked
         } else {
-            crate::daemon::proto::SessionActivityState::PendingQuestion
+            crate::db::wire::SessionActivityState::PendingQuestion
         }))
     }
 
@@ -1561,8 +1559,8 @@ fn summary_open_interrupt_count_or_zero<T>(session_id: Uuid, result: Result<Vec<
 
 fn summary_activity_state_or_none(
     session_id: Uuid,
-    result: Result<Option<crate::daemon::proto::SessionActivityState>>,
-) -> Option<crate::daemon::proto::SessionActivityState> {
+    result: Result<Option<crate::db::wire::SessionActivityState>>,
+) -> Option<crate::db::wire::SessionActivityState> {
     match result {
         Ok(state) => state,
         Err(error) => {
@@ -1581,7 +1579,7 @@ fn interrupt_payload_has_permission(
     question_json: Option<String>,
     questions_json: Option<String>,
 ) -> bool {
-    use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet};
+    use crate::db::wire::{InterruptQuestion, InterruptQuestionSet};
 
     fn question_permission(question: &InterruptQuestion) -> bool {
         matches!(
@@ -1742,7 +1740,7 @@ mod tests {
             agent: "Build".to_string(),
             tool: "read".to_string(),
             path: Some("src/lib.rs".to_string()),
-            recovery: crate::engine::repair::Recovery::Clean,
+            recovery: crate::db::tool_calls::Recovery::Clean,
             hard_fail: false,
             exit_code: None,
             sandbox_enabled: false,
@@ -1867,33 +1865,14 @@ mod tests {
     fn insert_session_row_round_trips_redaction_table_json() {
         let db = Db::open_in_memory().unwrap();
         let mut row = db.new_session_row("p", "/x", "builder").unwrap();
-        let cfg = crate::config::extended::RedactConfig {
-            enabled: true,
-            scan_environment: true,
-            scan_dotenv: false,
-            scan_ssh_keys: false,
-            min_secret_length: 4,
-            ..crate::config::extended::RedactConfig::default()
-        };
-        let env = std::collections::HashMap::from([(
-            "SESSION_SECRET".to_string(),
-            "persisted-secret-value".to_string(),
-        )]);
-        let table =
-            crate::redact::RedactionTable::build_with_env(&cfg, std::path::Path::new("."), &env)
-                .unwrap();
-        row.redaction_table_json = Some(table.to_persisted_json().unwrap());
+        row.redaction_table_json =
+            Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#.to_string());
         db.insert_session_row(&row).unwrap();
 
         let got = db.get_session(row.session_id).unwrap().unwrap();
-        let restored = crate::redact::RedactionTable::from_persisted_json(
-            got.redaction_table_json.as_deref().unwrap(),
-        )
-        .unwrap();
-        assert!(
-            !restored
-                .scrub("persisted-secret-value")
-                .contains("persisted-secret-value")
+        assert_eq!(
+            got.redaction_table_json.as_deref(),
+            Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#)
         );
     }
 
@@ -2623,7 +2602,7 @@ mod tests {
 
     #[test]
     fn list_session_summaries_populates_interrupt_activity_state() {
-        use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
+        use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
 
         let db = Db::open_in_memory().unwrap();
         let pending = db.create_session("pid", "/proj", "builder").unwrap();
@@ -2701,7 +2680,7 @@ mod tests {
 
     #[test]
     fn list_session_summaries_prefers_actionable_interrupt_over_stale_interrupted_marker() {
-        use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
+        use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
 
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("pid", "/proj", "builder").unwrap();

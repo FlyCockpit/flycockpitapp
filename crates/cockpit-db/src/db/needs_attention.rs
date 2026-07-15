@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::daemon::proto::{
+use crate::db::Db;
+use crate::db::wire::{
     InterruptDecision, InterruptDecisionLine, InterruptQuestion, InterruptQuestionSet,
     ResolveResponse,
 };
-use crate::db::Db;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -573,7 +573,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::proto::{
+    use crate::db::wire::{
         InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
     };
 

@@ -431,22 +431,35 @@ mod tests {
     #[test]
     fn complete_requires_get_goal_after_latest_update() {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
-            db.clone(),
-            std::path::PathBuf::from("/tmp/goal-test"),
-            "Build",
+        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "ship feature",
+            None,
+            None,
         )
         .unwrap();
-        db.create_session_goal(session.id, &session.project_id, "ship feature", None, None)
-            .unwrap();
         let err = db
-            .update_session_goal(session.id, GoalStatus::Complete, Some("done"), None, None)
+            .update_session_goal(
+                session.session_id,
+                GoalStatus::Complete,
+                Some("done"),
+                None,
+                None,
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("get_goal"));
-        db.current_session_goal(session.id, true).unwrap();
+        db.current_session_goal(session.session_id, true).unwrap();
         let out = db
-            .update_session_goal(session.id, GoalStatus::Complete, Some("done"), None, None)
+            .update_session_goal(
+                session.session_id,
+                GoalStatus::Complete,
+                Some("done"),
+                None,
+                None,
+            )
             .unwrap();
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Complete));
     }
@@ -454,24 +467,37 @@ mod tests {
     #[test]
     fn blocked_requires_three_attempts() {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
-            db.clone(),
-            std::path::PathBuf::from("/tmp/goal-test"),
-            "Build",
+        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "ship feature",
+            None,
+            None,
         )
         .unwrap();
-        db.create_session_goal(session.id, &session.project_id, "ship feature", None, None)
-            .unwrap();
         for expected in 1..BLOCK_ATTEMPTS_REQUIRED {
             let out = db
-                .update_session_goal(session.id, GoalStatus::Blocked, None, Some("waiting"), None)
+                .update_session_goal(
+                    session.session_id,
+                    GoalStatus::Blocked,
+                    None,
+                    Some("waiting"),
+                    None,
+                )
                 .unwrap();
             assert!(
                 matches!(out, GoalUpdateOutcome::BlockAttempt { attempts, .. } if attempts == expected)
             );
         }
         let out = db
-            .update_session_goal(session.id, GoalStatus::Blocked, None, Some("waiting"), None)
+            .update_session_goal(
+                session.session_id,
+                GoalStatus::Blocked,
+                None,
+                Some("waiting"),
+                None,
+            )
             .unwrap();
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Blocked));
     }
@@ -479,20 +505,27 @@ mod tests {
     #[test]
     fn current_session_goal_ignores_terminal_goals() {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
-            db.clone(),
-            std::path::PathBuf::from("/tmp/goal-test"),
-            "Build",
+        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "ship feature",
+            None,
+            None,
         )
         .unwrap();
-        db.create_session_goal(session.id, &session.project_id, "ship feature", None, None)
-            .unwrap();
-        db.current_session_goal(session.id, true).unwrap();
-        db.update_session_goal(session.id, GoalStatus::Complete, Some("done"), None, None)
-            .unwrap();
+        db.current_session_goal(session.session_id, true).unwrap();
+        db.update_session_goal(
+            session.session_id,
+            GoalStatus::Complete,
+            Some("done"),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(
-            db.current_session_goal(session.id, false)
+            db.current_session_goal(session.session_id, false)
                 .unwrap()
                 .is_none()
         );
@@ -501,20 +534,33 @@ mod tests {
     #[test]
     fn new_goal_can_be_created_after_completion() {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
-            db.clone(),
-            std::path::PathBuf::from("/tmp/goal-test"),
-            "Build",
+        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "first goal",
+            None,
+            None,
         )
         .unwrap();
-        db.create_session_goal(session.id, &session.project_id, "first goal", None, None)
-            .unwrap();
-        db.current_session_goal(session.id, true).unwrap();
-        db.update_session_goal(session.id, GoalStatus::Complete, Some("done"), None, None)
-            .unwrap();
+        db.current_session_goal(session.session_id, true).unwrap();
+        db.update_session_goal(
+            session.session_id,
+            GoalStatus::Complete,
+            Some("done"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let next = db
-            .create_session_goal(session.id, &session.project_id, "second goal", None, None)
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "second goal",
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(next.objective, "second goal");
         assert_eq!(next.status, GoalStatus::Active);
@@ -523,17 +569,24 @@ mod tests {
     #[test]
     fn second_open_goal_is_rejected() {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
-            db.clone(),
-            std::path::PathBuf::from("/tmp/goal-test"),
-            "Build",
+        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "first goal",
+            None,
+            None,
         )
         .unwrap();
-        db.create_session_goal(session.id, &session.project_id, "first goal", None, None)
-            .unwrap();
 
         let err = db
-            .create_session_goal(session.id, &session.project_id, "second goal", None, None)
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "second goal",
+                None,
+                None,
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("open goal"));

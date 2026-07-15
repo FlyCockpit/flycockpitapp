@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::engine::compact::SeedTool;
+use crate::db::seed_tools::SeedTool;
 
 /// A thread-safe, frame-scoped append buffer of seed entries.
 #[derive(Clone, Default)]

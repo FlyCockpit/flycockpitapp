@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::db::Db;
 use crate::db::sessions::SessionRow;
+use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
-use crate::engine::repair::Recovery;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
 mod gitignore;

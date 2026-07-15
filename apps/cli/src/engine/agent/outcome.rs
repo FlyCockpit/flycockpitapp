@@ -28,7 +28,7 @@ pub enum TurnOutcome {
         /// driver re-executes in the CHILD's cwd and injects into the child's
         /// initial history as native tool-call/result pairs, before its first
         /// turn. Empty when the parent seeded nothing.
-        seeds: Vec<crate::engine::compact::SeedTool>,
+        seeds: Vec<crate::db::seed_tools::SeedTool>,
         todo_ids: Vec<uuid::Uuid>,
         /// Parent→child skill seeds (`task.skill_seed`,
         /// implementation note): names of skills the parent
@@ -80,7 +80,7 @@ pub enum TurnOutcome {
         /// driver re-executes in the CHILD's cwd and injects into the child's
         /// initial history as native tool-call/result pairs, before its first
         /// turn. Empty when the parent seeded nothing.
-        seeds: Vec<crate::engine::compact::SeedTool>,
+        seeds: Vec<crate::db::seed_tools::SeedTool>,
         todo_ids: Vec<uuid::Uuid>,
         /// Parent→child skill seeds (`task.skill_seed`,
         /// implementation note): names of skills the parent
@@ -193,7 +193,7 @@ pub struct BatchTaskEntry {
     pub resume_handle: Option<String>,
     pub cwd: Option<String>,
     pub granted_tools: Vec<String>,
-    pub seeds: Vec<crate::engine::compact::SeedTool>,
+    pub seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub todo_ids: Vec<uuid::Uuid>,
     pub skill_seed: Vec<String>,
     pub output_dir: Option<String>,
@@ -276,7 +276,7 @@ pub(super) fn task_string_array(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(super) fn task_seed_array(args: &Value) -> Vec<crate::engine::compact::SeedTool> {
+pub(super) fn task_seed_array(args: &Value) -> Vec<crate::db::seed_tools::SeedTool> {
     args.get("seed")
         .and_then(Value::as_array)
         .map(|a| {
@@ -296,7 +296,7 @@ pub(super) fn task_seed_array(args: &Value) -> Vec<crate::engine::compact::SeedT
                 let Some(args) = entry.get("args").cloned().filter(Value::is_object) else {
                     continue;
                 };
-                out.push(crate::engine::compact::SeedTool {
+                out.push(crate::db::seed_tools::SeedTool {
                     tool: name.to_string(),
                     args,
                 });

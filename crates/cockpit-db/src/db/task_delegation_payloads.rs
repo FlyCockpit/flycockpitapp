@@ -57,7 +57,17 @@ pub struct LoadedTaskDelegationPayload {
 pub fn delegation_payload_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(content.as_bytes());
-    crate::intel::hex_lower(&digest)
+    hex_lower(&digest)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 impl Db {
@@ -267,7 +277,7 @@ impl Db {
         };
         let rel = delegation_payload_relative_path(session_id, hash);
         let abs = self.delegation_payload_base_dir()?.join(&rel);
-        crate::private_fs::ensure_parent_dir_private(&abs)?;
+        crate::db::files::ensure_parent_dir_private(&abs)?;
         if abs.exists() {
             let existing = std::fs::read_to_string(&abs).with_context(|| {
                 format!("reading existing delegation payload {}", abs.display())
@@ -280,7 +290,7 @@ impl Db {
                 );
             }
         } else {
-            crate::private_fs::write_private_file(&abs, body.as_bytes())
+            crate::db::files::write_private_file(&abs, body.as_bytes())
                 .with_context(|| format!("writing delegation payload {}", abs.display()))?;
         }
         Ok((None, Some(rel_to_string(&rel))))
@@ -313,7 +323,7 @@ impl Db {
         {
             return Ok(parent.to_path_buf());
         }
-        crate::config::resolve::cockpit_data_dir()
+        crate::db::files::cockpit_data_dir()
     }
 }
 

@@ -17,7 +17,7 @@ mod config;
 mod container;
 mod credentials;
 mod daemon;
-mod db;
+pub use cockpit_db as db;
 mod diagnostics;
 mod engine;
 mod env_snapshot;

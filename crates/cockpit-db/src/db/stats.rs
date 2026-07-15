@@ -738,8 +738,8 @@ mod tests {
     use super::*;
     use crate::db::Db;
     use crate::db::inference_calls::InferenceCallRow;
+    use crate::db::tool_calls::Recovery;
     use crate::db::tool_calls::ToolCallEvent;
-    use crate::engine::repair::Recovery;
     use serde_json::json;
     use uuid::Uuid;
 

@@ -183,18 +183,16 @@ fn decode_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CompressedToolResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::Session;
-    use std::path::PathBuf;
 
     #[test]
     fn stores_retrieves_and_rejects_collision() {
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let session = db.create_session("p", "/x", "Build").unwrap();
         let hash = "0123456789abcdefabcdef12";
         db.insert_compressed_tool_result(
             hash,
             NewCompressedToolResult {
-                session_id: session.id,
+                session_id: session.session_id,
                 agent_id: "Build",
                 tool: "bash",
                 call_id: "call-1",
@@ -209,7 +207,7 @@ mod tests {
         db.insert_compressed_tool_result(
             hash,
             NewCompressedToolResult {
-                session_id: session.id,
+                session_id: session.session_id,
                 agent_id: "Build",
                 tool: "bash",
                 call_id: "call-1",
@@ -223,17 +221,20 @@ mod tests {
         .unwrap();
 
         let row = db
-            .compressed_tool_result(session.id, hash)
+            .compressed_tool_result(session.session_id, hash)
             .unwrap()
             .expect("stored");
         assert_eq!(row.content, "redacted\n");
-        assert!(db.session_has_compressed_tool_results(session.id).unwrap());
+        assert!(
+            db.session_has_compressed_tool_results(session.session_id)
+                .unwrap()
+        );
 
         let err = db
             .insert_compressed_tool_result(
                 hash,
                 NewCompressedToolResult {
-                    session_id: session.id,
+                    session_id: session.session_id,
                     agent_id: "Build",
                     tool: "bash",
                     call_id: "call-2",

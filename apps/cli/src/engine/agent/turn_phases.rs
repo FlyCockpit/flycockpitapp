@@ -657,7 +657,7 @@ pub(crate) async fn run_turn(
     // (which records each real call's own result), so it must not enter the
     // session log lest it pollute rehydration's pairing rebuild.
     for heal in crate::engine::rehydrate::heal_live_history(history, &prompt) {
-        if let crate::engine::repair::Recovery::ResumeHeal { kind, id } = heal {
+        if let crate::db::tool_calls::Recovery::ResumeHeal { kind, id } = heal {
             tracing::warn!(
                 agent = %agent.name,
                 kind = %kind,

@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::ops::Range;
 
-use crate::engine::repair::Recovery;
+use crate::db::tool_calls::Recovery;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 

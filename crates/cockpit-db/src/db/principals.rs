@@ -73,7 +73,6 @@ impl Db {
         })
     }
 
-    #[cfg(test)]
     #[allow(dead_code)]
     pub fn list_remote_audit(&self) -> Result<Vec<RemoteAuditRow>> {
         self.read_blocking(|conn| {

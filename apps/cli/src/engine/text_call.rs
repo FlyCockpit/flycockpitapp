@@ -91,11 +91,6 @@ impl Convention {
     }
 }
 
-/// The text-recovery stage names, in convention order. Used by the audit-row
-/// reader to round-trip `Recovery::TextEmbedded` the same way the shape /
-/// cascade / name-repair stage lists are (implementation note).
-pub const TEXT_RECOVERY_STAGES: &[&str] = &["openai", "agent_keyed"];
-
 /// Run the structural gate over `content` (an assistant message's text) and, if
 /// it passes, extract the tool-call candidate. Returns `None` when the content
 /// is NOT a recovery candidate — either prose surrounds the payload (the
@@ -436,6 +431,8 @@ mod tests {
 
     #[test]
     fn convention_stage_names_match_catalog() {
+        use crate::db::tool_calls::TEXT_RECOVERY_STAGES;
+
         assert_eq!(Convention::OpenAI.stage(), "openai");
         assert_eq!(Convention::AgentKeyed.stage(), "agent_keyed");
         assert!(TEXT_RECOVERY_STAGES.contains(&"openai"));

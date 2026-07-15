@@ -30,6 +30,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::db::seed_tools::SeedTool;
 use crate::db::tool_calls::ToolCallEvent;
 
 /// Read-only / idempotent tools eligible to be re-executed as seed-tools
@@ -60,15 +61,6 @@ fn is_seed_tool(name: &str) -> bool {
 /// the hard gate (it only dispatches a seed the *caller* actually holds).
 pub fn is_read_only_seed_tool(name: &str) -> bool {
     is_seed_tool(name) || matches!(name, "grep" | "glob")
-}
-
-/// One seed-tool to re-execute at the start of the new thread. Carries
-/// the tool name + the canonical args from the prior call; the new
-/// session dispatches it fresh (never replays the old output).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SeedTool {
-    pub tool: String,
-    pub args: Value,
 }
 
 /// The deterministic state appendix. Built from the runtime ledger, not
@@ -438,7 +430,7 @@ mod tests {
             agent: "builder".into(),
             tool: tool.into(),
             path: path.map(str::to_string),
-            recovery: crate::engine::repair::Recovery::Clean,
+            recovery: crate::db::tool_calls::Recovery::Clean,
             hard_fail: failed,
             exit_code: None,
             sandbox_enabled: false,

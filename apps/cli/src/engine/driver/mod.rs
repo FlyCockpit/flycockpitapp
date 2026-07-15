@@ -230,7 +230,7 @@ struct PrimarySwapContext<'a> {
 /// `original_input` keeps what the model emitted).
 struct ScheduleDispatch {
     output: String,
-    recovery: crate::engine::repair::Recovery,
+    recovery: crate::db::tool_calls::Recovery,
     wire_args: serde_json::Value,
 }
 
@@ -240,7 +240,7 @@ struct ScheduleToolCallRecord {
     call_id: String,
     original_input_json: serde_json::Value,
     wire_input_json: serde_json::Value,
-    recovery: crate::engine::repair::Recovery,
+    recovery: crate::db::tool_calls::Recovery,
     hard_fail: bool,
     output: String,
     duration_ms: u64,
@@ -1433,7 +1433,7 @@ impl Driver {
     /// unclean daemon kill. Best-effort: a DB failure is logged, never
     /// propagated — auditing/continuity must not break a live turn.
     ///
-    /// Reuses [`prune::PruneLedger::capture`], which derives the elided-id
+    /// Reuses [`prune::capture_ledger`], which derives the elided-id
     /// set from the live wire history the same way [`prune::current_elided_ids`]
     /// does (single marker format), so the ledger is always in lockstep
     /// with what the model last saw.
@@ -1441,7 +1441,7 @@ impl Driver {
         // Only the root frame's history is the resumable context.
         let history = &self.stack[0].history;
         let watermark = self.prune_watermark.get(&1).copied().unwrap_or(0);
-        let ledger = prune::PruneLedger::capture(history, watermark);
+        let ledger = prune::capture_ledger(history, watermark);
         if let Err(e) = self.session.db.save_prune_ledger(self.session.id, &ledger) {
             tracing::warn!(error = %e, "persisting prune ledger failed");
         }
@@ -1902,7 +1902,7 @@ impl Driver {
                 &mut frame.history,
                 &call,
                 &payload.tool,
-                crate::engine::repair::Recovery::Clean,
+                crate::db::tool_calls::Recovery::Clean,
                 None,
             )
             .await
@@ -5359,7 +5359,7 @@ impl Driver {
                                     wire_args,
                                 } = dispatch;
                                 let recorded =
-                                    if matches!(recovery, crate::engine::repair::Recovery::Clean) {
+                                    if matches!(recovery, crate::db::tool_calls::Recovery::Clean) {
                                         sub_recovery
                                     } else {
                                         recovery

@@ -54,6 +54,12 @@ impl PredicateBuilder {
     }
 }
 
+impl Default for PredicateBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlColumn {
     ToolCallTimestamp,

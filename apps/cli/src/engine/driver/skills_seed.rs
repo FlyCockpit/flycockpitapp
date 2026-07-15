@@ -161,7 +161,7 @@ impl Driver {
     /// visible on the new agent's first turn.
     pub async fn run_seed_tools(
         &mut self,
-        seeds: &[crate::engine::compact::SeedTool],
+        seeds: &[crate::db::seed_tools::SeedTool],
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         let agent = self.stack.last().expect("stack never empty").agent.clone();
@@ -268,7 +268,7 @@ impl Driver {
     #[allow(clippy::type_complexity)]
     pub(in crate::engine::driver) async fn execute_seeds_into_pairs(
         &self,
-        seeds: &[crate::engine::compact::SeedTool],
+        seeds: &[crate::db::seed_tools::SeedTool],
         agent: &Agent,
         ctx: &crate::engine::tool::ToolCtx,
         budget: &mut crate::intel::budget::BudgetedWriter,
@@ -355,7 +355,7 @@ impl Driver {
                 path: None,
                 original_input_json: seed.args.clone(),
                 wire_input_json: seed.args.clone(),
-                recovery: crate::engine::repair::Recovery::Clean,
+                recovery: crate::db::tool_calls::Recovery::Clean,
                 hard_fail,
                 exit_code: None,
                 sandbox_enabled: false,
@@ -437,7 +437,7 @@ impl Driver {
     /// model-visible note to the child's brief).
     pub(in crate::engine::driver) async fn prefill_child_seeds(
         &self,
-        seeds: &[crate::engine::compact::SeedTool],
+        seeds: &[crate::db::seed_tools::SeedTool],
         child: &Agent,
         child_cwd: &std::path::Path,
         tx: Option<&mpsc::Sender<TurnEvent>>,
@@ -508,7 +508,7 @@ impl Driver {
     /// redaction-scrubbed before entering context.
     pub(in crate::engine::driver) async fn inject_seeds(
         &mut self,
-        seeds: &[crate::engine::compact::SeedTool],
+        seeds: &[crate::db::seed_tools::SeedTool],
         task_call_id: &str,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
@@ -781,7 +781,7 @@ impl Driver {
             path: None,
             original_input_json: args.clone(),
             wire_input_json: args.clone(),
-            recovery: crate::engine::repair::Recovery::Clean,
+            recovery: crate::db::tool_calls::Recovery::Clean,
             hard_fail,
             exit_code: None,
             sandbox_enabled: false,

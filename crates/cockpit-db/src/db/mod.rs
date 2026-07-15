@@ -22,6 +22,7 @@
 
 pub mod compressed_results;
 pub mod connector;
+mod files;
 pub mod guidance;
 pub mod inference_calls;
 pub mod lang;
@@ -53,6 +54,7 @@ pub mod task_todos;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod usage_events;
+pub mod wire;
 pub mod workspace_trust;
 
 use std::any::Any;
@@ -67,18 +69,15 @@ use rusqlite::{Connection, OpenFlags};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_open_default_call_count() {
+pub fn reset_open_default_call_count() {
     OPEN_DEFAULT_CALLS.with(|calls| calls.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn open_default_call_count() -> usize {
+pub fn open_default_call_count() -> usize {
     OPEN_DEFAULT_CALLS.with(std::cell::Cell::get)
 }
 
@@ -294,21 +293,19 @@ impl Db {
     /// Open the canonical cockpit database, creating parent directories
     /// as needed. Runs every pending migration before returning.
     pub fn open_default() -> Result<Self> {
-        #[cfg(test)]
         OPEN_DEFAULT_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-        let dir = crate::config::resolve::cockpit_data_dir()?;
-        crate::private_fs::ensure_private_dir(&dir)
-            .with_context(|| format!("securing {}", dir.display()))?;
+        let dir = files::cockpit_data_dir()?;
+        files::ensure_private_dir(&dir).with_context(|| format!("securing {}", dir.display()))?;
         Self::open(&dir.join("cockpit.db"))
     }
 
     /// Open a database at an arbitrary path.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut timer = crate::startup::PhaseTimer::start("Db::open");
-        crate::private_fs::ensure_parent_dir_private(path)
+        let mut timer = files::PhaseTimer::start("Db::open");
+        files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
-        crate::private_fs::create_private_file_if_missing(path)?;
+        files::create_private_file_if_missing(path)?;
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
         apply_connection_pragmas(&conn, true)
@@ -329,9 +326,8 @@ impl Db {
         Ok(db)
     }
 
-    /// In-memory database. Used by tests; not exposed for production
-    /// because every restart would lose state.
-    #[cfg(test)]
+    /// In-memory database for tests and ephemeral callers; durable state
+    /// should use [`Db::open`] or [`Db::open_default`].
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         apply_connection_pragmas(&conn, false).context("setting pragmas on in-memory db")?;
@@ -470,7 +466,7 @@ fn repair_db_file_permissions(path: &Path) {
         PathBuf::from(format!("{}-shm", path.display())),
     ] {
         if sidecar.exists()
-            && let Err(e) = crate::private_fs::repair_private_file(&sidecar, "sqlite")
+            && let Err(e) = files::repair_private_file(&sidecar, "sqlite")
         {
             tracing::warn!(
                 error = %e,

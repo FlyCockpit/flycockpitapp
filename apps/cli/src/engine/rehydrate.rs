@@ -53,9 +53,9 @@ use uuid::Uuid;
 use crate::daemon::proto;
 use crate::db::Db;
 use crate::db::session_log::SessionEventRow;
+use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
-use crate::engine::prune::PruneLedger;
-use crate::engine::repair::Recovery;
+use crate::engine::prune::{PruneLedger, ledger_is_empty, reapply_ledger};
 
 /// Honest stub body for an assistant tool call whose result never landed in
 /// the durable transcript (an interrupted/aborted call). The model sees that
@@ -215,7 +215,7 @@ pub fn rehydrate_session_with_policy(
     // form. A missing/corrupt/inconsistent ledger falls back to the full
     // unpruned form with a warning — never a silent fresh context.
     let (watermark, ledger_fallback) = match load_ledger(db, session_id) {
-        Some(ledger) if !ledger.is_empty() => match ledger.reapply(&mut history) {
+        Some(ledger) if !ledger_is_empty(&ledger) => match reapply_ledger(&ledger, &mut history) {
             Ok(_) => (ledger.watermark, false),
             Err(missing) => {
                 tracing::warn!(
@@ -537,16 +537,6 @@ fn history_snapshot_from_events_conn(
     }
 
     Ok(snapshot)
-}
-
-#[cfg(test)]
-pub(crate) fn history_snapshot_from_event_rows_for_test(
-    conn: &Connection,
-    session_id: Uuid,
-    root_agent: &str,
-    events: Vec<SessionEventRow>,
-) -> Result<Vec<proto::HistoryEntry>> {
-    history_snapshot_from_events_conn(conn, session_id, root_agent, None, events)
 }
 
 pub fn subagent_history_snapshot_conn(
@@ -1744,8 +1734,8 @@ fn validate_pairing(history: &[Message]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::tool_calls::Recovery;
     use crate::engine::prune::{Elision, LedgerEntry};
-    use crate::engine::repair::Recovery;
     use crate::session::{Session, ToolCallRow};
     use serde_json::json;
     use std::path::PathBuf;

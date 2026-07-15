@@ -1,6 +1,7 @@
 //! Workspace trust decisions (migration 0045).
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,7 +57,7 @@ pub struct WorkspaceTrustDecision {
 impl Db {
     pub fn set_workspace_trust(
         &self,
-        root_path: &std::path::Path,
+        root_path: &Path,
         mode: WorkspaceTrustMode,
     ) -> Result<WorkspaceTrustDecision> {
         let root = normalize_trust_root(root_path)?;
@@ -79,26 +80,31 @@ impl Db {
 
     pub fn workspace_trust_by_root(
         &self,
-        root_path: &std::path::Path,
+        root_path: &Path,
     ) -> Result<Option<WorkspaceTrustDecision>> {
         let root = normalize_trust_root(root_path)?;
         self.read_blocking(|conn| query_decision_by_root(conn, &root))
     }
-
-    pub fn workspace_trust_for_path(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<Option<WorkspaceTrustDecision>> {
-        let resolved = crate::config::trust::resolve_trust_root(path)?;
-        self.workspace_trust_by_root(&resolved.root)
-    }
 }
 
-fn normalize_trust_root(root_path: &std::path::Path) -> Result<String> {
-    Ok(crate::config::trust::resolve_trust_root(root_path)?
-        .root
+fn normalize_trust_root(root_path: &Path) -> Result<String> {
+    Ok(canonical_dir_path(root_path)?
         .to_string_lossy()
         .into_owned())
+}
+
+fn canonical_dir_path(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    if canonical.is_dir() {
+        return Ok(canonical);
+    }
+
+    canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .context("path has no parent directory")
 }
 
 fn query_decision_by_root(conn: &Connection, root: &str) -> Result<Option<WorkspaceTrustDecision>> {
@@ -169,14 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn set_workspace_trust_stores_resolved_root_identity() {
+    fn set_workspace_trust_stores_canonical_root_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(tmp.path())
-            .status()
-            .expect("run git init");
-        assert!(status.success());
         let subdir = tmp.path().join("subdir");
         std::fs::create_dir(&subdir).unwrap();
         let lexical_variant = subdir.join("..");
@@ -195,24 +195,11 @@ mod tests {
                 .root_path,
             stored.root_path
         );
-        assert_eq!(
-            db.workspace_trust_for_path(&subdir)
-                .unwrap()
-                .expect("stored")
-                .mode,
-            WorkspaceTrustMode::Trust
-        );
     }
 
     #[test]
-    fn lookup_by_subdir_uses_resolved_trust_root() {
+    fn lookup_by_root_uses_canonical_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(tmp.path())
-            .status()
-            .expect("run git init");
-        assert!(status.success());
         let subdir = tmp.path().join("subdir");
         std::fs::create_dir(&subdir).unwrap();
 
@@ -221,7 +208,7 @@ mod tests {
             .unwrap();
 
         let loaded = db
-            .workspace_trust_for_path(&subdir)
+            .workspace_trust_by_root(&subdir.join(".."))
             .unwrap()
             .expect("stored");
         assert_eq!(

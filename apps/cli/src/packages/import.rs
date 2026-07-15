@@ -377,7 +377,10 @@ pub(super) fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
             Ok(NewPackage {
                 identifier: row.get(0)?,
                 display_name: row.get(1)?,
-                source_type: SourceType::from_str(&row.get::<_, String>(2)?),
+                source_type: row
+                    .get::<_, String>(2)?
+                    .parse()
+                    .unwrap_or(SourceType::Local),
                 source_url: row.get(3)?,
                 source_branch: row.get(4)?,
                 path: row.get(5)?,

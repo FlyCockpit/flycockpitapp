@@ -468,7 +468,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) resume_handle: Option<String>,
     pub(in crate::engine::driver) child_cwd: ChildCwd,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
-    pub(in crate::engine::driver) prefill_seeds: Vec<crate::engine::compact::SeedTool>,
+    pub(in crate::engine::driver) prefill_seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
     pub(in crate::engine::driver) skill_seed: Vec<String>,
     pub(in crate::engine::driver) child_recursion:
@@ -485,7 +485,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) report: String,
     pub(in crate::engine::driver) failed: bool,
     pub(in crate::engine::driver) partial_progress: DelegationPartialProgress,
-    pub(in crate::engine::driver) seeds: Vec<crate::engine::compact::SeedTool>,
+    pub(in crate::engine::driver) seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub(in crate::engine::driver) new_handle: Option<String>,
     pub(in crate::engine::driver) snapshot: NoninteractiveDelegationSnapshot,
     pub(in crate::engine::driver) shrink: Option<PendingDelegationShrink>,
@@ -938,7 +938,7 @@ impl Driver {
         } else {
             format!("{skill_block}{composed_brief}")
         };
-        let mut seeds: Vec<crate::engine::compact::SeedTool> = Vec::new();
+        let mut seeds: Vec<crate::db::seed_tools::SeedTool> = Vec::new();
         let mut new_handle: Option<String> = None;
         let mut snapshot = NoninteractiveDelegationSnapshot::empty();
         let composed_brief = self.assign_todos_to_task(

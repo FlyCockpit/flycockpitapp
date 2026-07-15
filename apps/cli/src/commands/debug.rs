@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 
 use crate::cli::{DebugCommand, FailedCallsArgs};
 use crate::db::Db;
+use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::{FailedCallsFilter, ToolCallEvent};
-use crate::engine::repair::Recovery;
 use crate::session::project_id_for;
 
 pub async fn run(cmd: DebugCommand) -> Result<()> {

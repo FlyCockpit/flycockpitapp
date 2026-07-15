@@ -940,6 +940,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "cockpit-db",
  "crossterm",
  "csv",
  "dirs",
@@ -1005,6 +1006,26 @@ dependencies = [
  "zbus",
  "zerobox",
  "zip",
+]
+
+[[package]]
+name = "cockpit-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "libc",
+ "rand 0.10.2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

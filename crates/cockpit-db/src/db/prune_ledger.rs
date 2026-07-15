@@ -2,7 +2,7 @@
 //! (implementation note).
 //!
 //! One row per session holding the JSON-serialized
-//! [`crate::engine::prune::PruneLedger`] — the durable twin of the
+//! [`PruneLedger`] — the durable twin of the
 //! in-memory prune state (`current_elided_ids` + the driver's
 //! `prune_watermark`). Persisted at every inference boundary and on every
 //! `/prune` (migration `0026`) so a resumed session can rebuild its
@@ -16,7 +16,20 @@ use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::engine::prune::PruneLedger;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PruneLedger {
+    pub elided: Vec<LedgerEntry>,
+    pub watermark: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LedgerEntry {
+    pub original_event_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_body: Option<String>,
+}
 
 impl Db {
     /// Persist (upsert) the prune ledger for `session_id`. Idempotent on
@@ -71,7 +84,6 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::prune::{LedgerEntry, PruneLedger};
 
     #[test]
     fn save_load_round_trip() {

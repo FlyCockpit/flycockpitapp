@@ -17,7 +17,8 @@ use super::spec::{
     ScheduleAction, parse_background_cancel, parse_background_start, parse_background_tail,
     parse_loop_cancel, parse_loop_start,
 };
-use crate::engine::repair::{Recovery, repair};
+use crate::db::tool_calls::Recovery;
+use crate::engine::repair::repair;
 
 /// Run the production per-action repair pass: validate `args` against the
 /// hidden schema for `action`, repair on failure, re-validate. Returns the

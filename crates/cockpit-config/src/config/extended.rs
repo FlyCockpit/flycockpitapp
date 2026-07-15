@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub(crate) use crate::config::merge::deep_merge_value;
+pub use crate::config::merge::deep_merge_value;
 
 use crate::config::dirs::{ConfigDirKind, config_file_paths_for_load, discover_config_dirs};
 
@@ -25,7 +25,7 @@ mod guards;
 mod harness;
 mod lsp;
 mod resource_scheduler;
-mod tui;
+pub mod tui;
 
 #[allow(unused_imports)]
 pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
@@ -576,7 +576,7 @@ impl CommandResourceProfilesConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxConfig {
     #[serde(rename = "defaultMode", default)]
-    pub default_mode: crate::tools::sandbox_mode::SandboxMode,
+    pub default_mode: crate::config::sandbox_mode::SandboxMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<PathBuf>,
 }
@@ -584,7 +584,7 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            default_mode: crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            default_mode: crate::config::sandbox_mode::SandboxMode::Sandbox,
             dockerfile: None,
         }
     }
@@ -1000,10 +1000,12 @@ impl Default for ScheduleConfig {
     }
 }
 
+pub const DEFAULT_MAX_CONCURRENT_SCHEDULES: usize = 8;
+
 default_const!(
     default_max_concurrent_schedules,
     usize,
-    crate::engine::schedule::DEFAULT_MAX_CONCURRENT_SCHEDULES
+    DEFAULT_MAX_CONCURRENT_SCHEDULES
 );
 
 /// Resolve the effective `gitignore_allow` list for `cwd`: the **union** of
@@ -1344,18 +1346,15 @@ fn default_agent_guidance_files() -> Vec<String> {
     vec!["AGENTS.md".into()]
 }
 
-#[cfg(test)]
 thread_local! {
     static LOAD_FOR_CWD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_load_for_cwd_call_count() {
+pub fn reset_load_for_cwd_call_count() {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn load_for_cwd_call_count() -> usize {
+pub fn load_for_cwd_call_count() -> usize {
     LOAD_FOR_CWD_CALLS.with(std::cell::Cell::get)
 }
 
@@ -1372,7 +1371,6 @@ pub(crate) fn load_for_cwd_call_count() -> usize {
 /// on-disk config whose `scan_dirs` is absent/empty (clean break: scan
 /// nothing).
 pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
-    #[cfg(test)]
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
     if let Some(mut cfg) = load_merged_from_paths(&paths) {
@@ -1464,7 +1462,7 @@ impl ExtendedConfigDoc {
         self.config_with_warnings().0
     }
 
-    pub(crate) fn raw_field(&self, key: &str) -> Option<&Value> {
+    pub fn raw_field(&self, key: &str) -> Option<&Value> {
         self.raw.get(key)
     }
 
@@ -1619,18 +1617,18 @@ impl ExtendedConfigDoc {
         self.raw.get(key).is_some()
     }
 
-    pub(crate) fn raw_has_path(&self, path: &[&str]) -> bool {
+    pub fn raw_has_path(&self, path: &[&str]) -> bool {
         raw_get_path(&self.raw, path).is_some()
     }
 
-    pub(crate) fn remove_raw_path(&mut self, path: &[&str]) -> bool {
+    pub fn remove_raw_path(&mut self, path: &[&str]) -> bool {
         remove_raw_path(&mut self.raw, path)
     }
 
-    pub(crate) fn save_raw(&self) -> Result<()> {
+    pub fn save_raw(&self) -> Result<()> {
         let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
-        crate::private_fs::ensure_parent_dir_private(&self.path)?;
-        crate::private_fs::write_private_file(&self.path, format!("{pretty}\n").as_bytes())
+        crate::config::files::ensure_parent_dir_private(&self.path)?;
+        crate::config::files::write_private_file(&self.path, format!("{pretty}\n").as_bytes())
             .with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())
     }

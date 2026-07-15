@@ -71,7 +71,35 @@ pub struct TuiConfig {
     /// (implementation note): in-TUI toast (default on),
     /// optional terminal bell, optional desktop notification.
     #[serde(default)]
-    pub attention: crate::tui::attention::AttentionConfig,
+    pub attention: AttentionConfig,
+}
+
+/// User-tunable attention settings (persisted under `tui.attention`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionConfig {
+    /// In-TUI toast/status notifications. Default on.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Terminal bell for action-required events. Default off.
+    #[serde(default)]
+    pub bell: bool,
+    /// Desktop notification (best-effort, non-fatal). Default off.
+    #[serde(default)]
+    pub desktop: bool,
+    /// Terminal-title marker while an interrupt is waiting. Default on.
+    #[serde(default = "default_true")]
+    pub title: bool,
+}
+
+impl Default for AttentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bell: false,
+            desktop: false,
+            title: true,
+        }
+    }
 }
 
 /// Sleep scope `/caffeinate` keeps awake — derived from the
@@ -248,7 +276,7 @@ impl Default for TuiConfig {
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,
             caffeinate_display_awake: false,
-            attention: crate::tui::attention::AttentionConfig::default(),
+            attention: AttentionConfig::default(),
         }
     }
 }

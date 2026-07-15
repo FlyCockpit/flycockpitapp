@@ -16,6 +16,8 @@
 
 use std::time::{Duration, Instant};
 
+pub use crate::config::extended::tui::AttentionConfig;
+
 /// The narrow attention-event vocabulary. The TUI's event handler
 //  classifies the relevant daemon events into exactly these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,38 +115,6 @@ impl AttentionEvent {
             AttentionEvent::TurnDone { .. } => 2,
             AttentionEvent::TurnError => 3,
             AttentionEvent::ScheduleDone => 4,
-        }
-    }
-}
-
-/// User-tunable attention settings (persisted under `tui.attention`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AttentionConfig {
-    /// In-TUI toast/status notifications. Default on.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Terminal bell for action-required events. Default off.
-    #[serde(default)]
-    pub bell: bool,
-    /// Desktop notification (best-effort, non-fatal). Default off.
-    #[serde(default)]
-    pub desktop: bool,
-    /// Terminal-title marker while an interrupt is waiting. Default on.
-    #[serde(default = "default_true")]
-    pub title: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for AttentionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            bell: false,
-            desktop: false,
-            title: true,
         }
     }
 }

@@ -1209,3 +1209,17 @@ fn is_pem_private_key_matches_headers_only() {
     assert!(!is_pem_private_key("ssh-rsa AAAA..."));
     assert!(!is_pem_private_key("not a key at all"));
 }
+
+#[test]
+fn configured_denylist_scrubs_multiple_layer_values() {
+    let mut cfg = enabled_cfg();
+    cfg.placeholder = "[redacted]".to_string();
+    cfg.denylist = vec!["home-secret".to_string(), "project-secret".to_string()];
+    let dir = TempDir::new().unwrap();
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+    let scrubbed = table.scrub("home-secret and project-secret");
+    assert!(!scrubbed.contains("home-secret"));
+    assert!(!scrubbed.contains("project-secret"));
+    assert_eq!(scrubbed.matches("[redacted]").count(), 2);
+}

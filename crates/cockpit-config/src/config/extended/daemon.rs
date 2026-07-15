@@ -36,6 +36,8 @@ impl Default for DaemonUploadLimitsConfig {
     }
 }
 
+pub const MAX_SINGLE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
 default_const!(default_daemon_uploads_per_client, usize, 4);
 
 default_const!(default_daemon_uploads_global, usize, 32);
@@ -43,7 +45,7 @@ default_const!(default_daemon_uploads_global, usize, 32);
 default_const!(
     default_daemon_uploads_per_upload_bytes,
     usize,
-    crate::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+    MAX_SINGLE_IMAGE_BYTES
 );
 
 default_const!(

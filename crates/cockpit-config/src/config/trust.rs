@@ -1,6 +1,7 @@
 //! Workspace trust root resolution and runtime enforcement.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -34,7 +35,7 @@ impl TrustRootKind {
 
 pub fn resolve_trust_root(path: &Path) -> Result<TrustRoot> {
     let opened_path = canonical_dir_path(path)?;
-    if let Some(root) = crate::git::find_worktree_root(&opened_path) {
+    if let Some(root) = find_worktree_root(&opened_path) {
         return Ok(TrustRoot {
             opened_path,
             root: root
@@ -49,6 +50,26 @@ pub fn resolve_trust_root(path: &Path) -> Result<TrustRoot> {
         opened_path,
         kind: TrustRootKind::Directory,
     })
+}
+
+fn find_worktree_root(path: &Path) -> Option<PathBuf> {
+    let cwd = if path.is_dir() { path } else { path.parent()? };
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,8 +103,6 @@ pub fn set_runtime_policy(root: TrustRoot, mode: WorkspaceTrustMode) {
     *guard = Some(WorkspaceTrustPolicy { root, mode });
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 pub fn clear_runtime_policy_for_tests() {
     let mut guard = runtime_policy_cell()
         .lock()

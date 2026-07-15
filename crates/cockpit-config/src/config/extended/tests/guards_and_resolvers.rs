@@ -614,34 +614,6 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     );
 }
 
-#[test]
-fn load_for_cwd_redact_denylist_union_reaches_redaction_table() {
-    let tmp = TempDir::new().unwrap();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
-    let home_cfg = tmp.path().join("home/.config/cockpit/config.json");
-    std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
-    std::fs::write(
-        &home_cfg,
-        r#"{"redact":{"scan_environment":false,"scan_dotenv":false,"denylist":["home-secret"]}}"#,
-    )
-    .unwrap();
-    let project = tmp.path().join("repo");
-    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
-    std::fs::write(
-        project.join(".cockpit/config.json"),
-        r#"{"redact":{"denylist":["project-secret"]}}"#,
-    )
-    .unwrap();
-
-    let cfg = load_for_cwd(&project);
-    let table = crate::redact::RedactionTable::build(&cfg.redact, &project).unwrap();
-
-    let scrubbed = table.scrub("home-secret and project-secret");
-    assert!(!scrubbed.contains("home-secret"));
-    assert!(!scrubbed.contains("project-secret"));
-    assert!(scrubbed.contains(&cfg.redact.placeholder));
-}
-
 /// Round-trips `gitignore_allow` through the doc, and clearing the list
 /// persists (the field is always serialized, like the other editable
 /// string-lists).

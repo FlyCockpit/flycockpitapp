@@ -335,19 +335,18 @@ pub fn walk_up_to_stops(cwd: &Path) -> Vec<PathBuf> {
     out
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env::lock()
     }
 
-    pub(crate) struct CockpitConfigOverride {
+    pub struct CockpitConfigOverride {
         _guard: std::sync::MutexGuard<'static, ()>,
         old_cockpit_config: Option<std::ffi::OsString>,
     }
 
     impl CockpitConfigOverride {
-        pub(crate) fn new(path: &std::path::Path) -> Self {
+        pub fn new(path: &std::path::Path) -> Self {
             let guard = env_lock();
             let old_cockpit_config = std::env::var_os(super::COCKPIT_CONFIG_ENV);
             // SAFETY: protected by the shared process-global test env lock.
@@ -373,7 +372,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) struct IsolatedCockpitHome {
+    pub struct IsolatedCockpitHome {
         _guard: std::sync::MutexGuard<'static, ()>,
         old_home: Option<std::ffi::OsString>,
         old_xdg_data_home: Option<std::ffi::OsString>,
@@ -381,12 +380,12 @@ pub(crate) mod test_support {
         old_cockpit_config: Option<std::ffi::OsString>,
     }
 
-    pub(crate) struct IsolatedCockpitConfigOverride {
+    pub struct IsolatedCockpitConfigOverride {
         old_cockpit_config: Option<std::ffi::OsString>,
     }
 
     impl IsolatedCockpitHome {
-        pub(crate) fn new(root: &std::path::Path) -> Self {
+        pub fn new(root: &std::path::Path) -> Self {
             let guard = env_lock();
             let home = root.join("home");
             let data = root.join("data");
@@ -415,7 +414,7 @@ pub(crate) mod test_support {
             }
         }
 
-        pub(crate) fn override_cockpit_config(
+        pub fn override_cockpit_config(
             &self,
             path: &std::path::Path,
         ) -> IsolatedCockpitConfigOverride {

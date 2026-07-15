@@ -27,10 +27,12 @@ macro_rules! default_const {
 
 pub mod dirs;
 pub mod extended;
+mod files;
 pub(crate) mod merge;
 pub mod model_defaults;
 pub mod model_policy;
 pub mod provider;
 pub mod providers;
 pub mod resolve;
+pub mod sandbox_mode;
 pub mod trust;

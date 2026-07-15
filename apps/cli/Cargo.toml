@@ -82,6 +82,7 @@ rig = { version = "0.38", package = "rig-core", features = ["image"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 
 # Storage
+cockpit-config = { path = "../../crates/cockpit-config" }
 cockpit-db = { path = "../../crates/cockpit-db" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 

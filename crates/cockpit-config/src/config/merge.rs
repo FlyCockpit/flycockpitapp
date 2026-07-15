@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-pub(crate) fn deep_merge_value(base: &mut Value, overlay: &Value) {
+pub fn deep_merge_value(base: &mut Value, overlay: &Value) {
     deep_merge_value_at(base, overlay, &mut Vec::new());
 }
 

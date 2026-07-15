@@ -52,7 +52,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::config::extended::{LlmMode, TextEmbeddedRecovery};
 use crate::config::merge::deep_merge_value;
@@ -84,6 +84,44 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "provider_metadata",
     "last_model_fetch",
 ];
+
+const KNOWN_PROVIDER_TEMPLATE_IDS: &[&str] = &[
+    "openai-compatible",
+    "openai",
+    "codex-oauth",
+    "grok",
+    "grok-oauth",
+    "z-ai",
+    "minimax",
+    "opencode-zen",
+    "copilot",
+    "openrouter",
+    "deepseek",
+    "anthropic",
+    "xiaomi-mimo",
+];
+
+fn known_provider_template_id(id: &str) -> bool {
+    KNOWN_PROVIDER_TEMPLATE_IDS.contains(&id)
+}
+
+fn builtin_thinking_params(provider: &str, mode: ThinkingMode) -> Option<Value> {
+    match provider {
+        "deepseek" => Some(match mode {
+            ThinkingMode::Off => json!({ "thinking": { "type": "disabled" } }),
+            ThinkingMode::Low => {
+                json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "low" })
+            }
+            ThinkingMode::Medium => {
+                json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "medium" })
+            }
+            ThinkingMode::High => {
+                json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "high" })
+            }
+        }),
+        _ => None,
+    }
+}
 
 pub const XAI_MULTI_AGENT_TOOLS_ENTITLEMENT: &str = "xai_multi_agent_tools_beta";
 pub const MODEL_SYSTEM_PROMPT_MAX_BYTES: usize = 1024 * 1024;
@@ -172,10 +210,7 @@ pub use fetch_status::{
 };
 pub use io::{ConfigDoc, is_xai_grok_provider};
 
-#[cfg(test)]
-pub(crate) use io::{
-    load_effective_call_count, load_provider_raw_file, reset_load_effective_call_count,
-};
+pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effective_call_count};
 
 /// Effective provider config. Global fields are read from layer
 /// `config.json`; provider entries are read from sibling `providers/*.json`
@@ -1435,7 +1470,7 @@ impl ProviderEntry {
     pub fn effective_template<'a>(&'a self, key: &'a str) -> Option<&'a str> {
         match self.template.as_deref() {
             Some(t) => Some(t),
-            None if crate::providers::template_by_id(key).is_some() => Some(key),
+            None if known_provider_template_id(key) => Some(key),
             None => None,
         }
     }
@@ -1875,7 +1910,7 @@ impl ProvidersConfig {
             return e.thinking_params.get(mode).cloned();
         }
         // Bottom tier: the built-in default keyed by provider id.
-        crate::providers::builtin_thinking_params(provider, mode)
+        builtin_thinking_params(provider, mode)
     }
 
     /// Resolve the typed model-level reasoning-effort mapping for `(provider,

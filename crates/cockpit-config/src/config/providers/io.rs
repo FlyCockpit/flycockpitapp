@@ -8,18 +8,15 @@ pub struct ConfigDoc {
     pub(crate) raw: Value,
 }
 
-#[cfg(test)]
 thread_local! {
     static LOAD_EFFECTIVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_load_effective_call_count() {
+pub fn reset_load_effective_call_count() {
     LOAD_EFFECTIVE_CALLS.with(|calls| calls.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn load_effective_call_count() -> usize {
+pub fn load_effective_call_count() -> usize {
     LOAD_EFFECTIVE_CALLS.with(std::cell::Cell::get)
 }
 
@@ -29,13 +26,12 @@ impl ConfigDoc {
     /// `COCKPIT_CONFIG` supplies the only config.json path when set; provider
     /// files live beside that file under `providers/`.
     pub fn load_effective(cwd: &Path) -> ProvidersConfig {
-        #[cfg(test)]
         LOAD_EFFECTIVE_CALLS.with(|calls| calls.set(calls.get() + 1));
         let paths = crate::config::dirs::config_file_paths_for_load(cwd);
         Self::providers_from_paths(&paths)
     }
 
-    pub(crate) fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {
+    pub fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {
         let mut merged = Value::Object(Map::new());
         for path in paths {
             if !path.exists() {
@@ -529,7 +525,7 @@ fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig
     }
 }
 
-pub(crate) fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
+pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading provider config at {}", path.display()))?;
     let value: Value = if raw.trim().is_empty() {

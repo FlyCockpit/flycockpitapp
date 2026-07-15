@@ -1315,11 +1315,6 @@ fn load_for_cwd_seeds_default_skill_scan_dirs_when_no_config_exists() {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
     );
-    let found = crate::skills::discover(&cwd, &cfg.skills).unwrap();
-    assert!(
-        found.iter().any(|s| s.frontmatter.name == "fresh-skill"),
-        "fresh/default config path should discover ./.agents/skills"
-    );
 }
 
 #[test]

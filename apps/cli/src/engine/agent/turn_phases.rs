@@ -607,7 +607,8 @@ pub(crate) async fn run_turn(
     let active_tools = turn_toolbox(agent, &session);
     let tools = active_tools.definitions(agent.llm_mode);
 
-    if let Some(notice) = session.sandbox_escalation_turn_notice() {
+    let sandbox_escalate_present = active_tools.names().contains(&"escalate");
+    if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
         history.push(Message::System { content: notice });
     }
 

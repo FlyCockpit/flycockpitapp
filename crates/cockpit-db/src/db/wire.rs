@@ -151,6 +151,10 @@ pub struct CharSpan {
 pub struct SandboxEscalation {
     pub confined_exit: i32,
     pub confined_stderr: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_access: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

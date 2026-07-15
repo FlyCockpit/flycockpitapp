@@ -205,6 +205,24 @@ pub(crate) async fn rerun_escalated_bash(
     .await
 }
 
+pub(crate) async fn rerun_escalated_bash_confined(
+    args: Value,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    let tool = BashTool::new();
+    call_bash_inner(
+        &tool.prelude,
+        args,
+        ctx,
+        BashRunOptions {
+            force_unconfined: false,
+            escalated: true,
+            approval_scope_recorded: None,
+        },
+    )
+    .await
+}
+
 async fn call_bash_inner(
     prelude: &str,
     args: Value,

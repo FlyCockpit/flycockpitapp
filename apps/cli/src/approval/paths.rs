@@ -64,6 +64,7 @@ impl Approver {
         let decision = match choice {
             ApprovalChoice::Deny => Decision::Deny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::GrantPaths(_) => Decision::Deny,
             ApprovalChoice::Approve(scope) => {
                 self.store.record_path(path, scope, required)?;
                 Decision::Allow { scope }

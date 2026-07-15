@@ -89,7 +89,7 @@ pub struct Agent {
 }
 
 pub(crate) fn turn_toolbox(agent: &Agent, session: &Session) -> ToolBox {
-    toolbox_with_retrieval_if_needed(agent.tools.clone(), session)
+    toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode)
 }
 
 fn guidance_user_message(body: &str, label: Option<&str>) -> Message {
@@ -250,8 +250,14 @@ async fn inject_live_project_guidance_change(
     ));
 }
 
-fn toolbox_with_retrieval_if_needed(mut tools: ToolBox, session: &Session) -> ToolBox {
-    if session.sandbox_escalation_enabled() {
+fn toolbox_with_retrieval_if_needed(
+    mut tools: ToolBox,
+    session: &Session,
+    llm_mode: crate::config::extended::LlmMode,
+) -> ToolBox {
+    if session.sandbox_escalation_enabled()
+        && crate::engine::tool::Capability::SandboxEscalate.enabled(llm_mode)
+    {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {
         tools = tools.without("escalate");
@@ -899,9 +905,13 @@ mod compressed_tool_result_tests {
         session.set_sandbox_escalation_enabled(false);
         let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
         assert!(
-            !toolbox_with_retrieval_if_needed(tools.clone(), &session)
-                .names()
-                .contains(&"tool_result_retrieve")
+            !toolbox_with_retrieval_if_needed(
+                tools.clone(),
+                &session,
+                crate::config::extended::LlmMode::Normal
+            )
+            .names()
+            .contains(&"tool_result_retrieve")
         );
         store_compressed_tool_result(
             &session,
@@ -914,9 +924,13 @@ mod compressed_tool_result_tests {
         )
         .unwrap();
         assert!(
-            toolbox_with_retrieval_if_needed(tools, &session)
-                .names()
-                .contains(&"tool_result_retrieve")
+            toolbox_with_retrieval_if_needed(
+                tools,
+                &session,
+                crate::config::extended::LlmMode::Normal
+            )
+            .names()
+            .contains(&"tool_result_retrieve")
         );
     }
 
@@ -930,27 +944,57 @@ mod compressed_tool_result_tests {
 
         session.set_sandbox_escalation_enabled(false);
         assert!(
-            !toolbox_with_retrieval_if_needed(tools.clone(), &session)
-                .names()
-                .contains(&"escalate")
+            !toolbox_with_retrieval_if_needed(
+                tools.clone(),
+                &session,
+                crate::config::extended::LlmMode::Normal
+            )
+            .names()
+            .contains(&"escalate")
         );
         let disabled = session
-            .sandbox_escalation_turn_notice()
-            .expect("disabled notice");
-        assert!(disabled.contains("now disabled"));
-        assert!(session.sandbox_escalation_turn_notice().is_none());
+            .sandbox_escalation_turn_notice(false)
+            .expect("unavailable notice");
+        assert!(disabled.contains("now unavailable"));
+        assert!(session.sandbox_escalation_turn_notice(false).is_none());
 
         session.set_sandbox_escalation_enabled(true);
         assert!(
-            toolbox_with_retrieval_if_needed(tools, &session)
-                .names()
-                .contains(&"escalate")
+            toolbox_with_retrieval_if_needed(
+                tools.clone(),
+                &session,
+                crate::config::extended::LlmMode::Normal
+            )
+            .names()
+            .contains(&"escalate")
+        );
+        assert!(
+            toolbox_with_retrieval_if_needed(
+                tools.clone(),
+                &session,
+                crate::config::extended::LlmMode::Frontier
+            )
+            .names()
+            .contains(&"escalate")
+        );
+        assert!(
+            !toolbox_with_retrieval_if_needed(
+                tools,
+                &session,
+                crate::config::extended::LlmMode::Defensive
+            )
+            .names()
+            .contains(&"escalate")
         );
         let enabled = session
-            .sandbox_escalation_turn_notice()
-            .expect("enabled notice");
-        assert!(enabled.contains("now enabled"));
-        assert!(session.sandbox_escalation_turn_notice().is_none());
+            .sandbox_escalation_turn_notice(true)
+            .expect("available notice");
+        assert!(enabled.contains("now available"));
+        assert!(session.sandbox_escalation_turn_notice(true).is_none());
+        let removed_by_mode = session
+            .sandbox_escalation_turn_notice(false)
+            .expect("mode removal notice");
+        assert!(removed_by_mode.contains("now unavailable"));
     }
 }
 

@@ -56,8 +56,110 @@ impl Approver {
         let escalation = SandboxEscalation {
             confined_exit,
             confined_stderr,
+            suggested_paths: Vec::new(),
+            suggested_access: None,
         };
         self.approve_command_inner(command, Some(escalation)).await
+    }
+
+    /// Decide the explicit `escalate` tool's human prompt. When the agent
+    /// suggested blocked paths, the user can grant those paths durably and
+    /// retry confined. Without suggested paths, the prompt is a one-off
+    /// unconfined rerun or deny; it never records command grants.
+    pub async fn approve_sandbox_escalation(
+        &self,
+        command: &str,
+        confined_exit: i32,
+        confined_stderr: String,
+        grant_offer: Option<&SandboxEscalationGrantOffer>,
+    ) -> Result<SandboxEscalationApproval> {
+        let offered_scopes = grant_offer
+            .map(|_| self.store.recordable_path_scopes())
+            .unwrap_or_default();
+        let suggested_paths = grant_offer
+            .map(|offer| {
+                offer
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let suggested_access = grant_offer.map(|offer| offer.access.storage_str().to_string());
+        let escalation = SandboxEscalation {
+            confined_exit,
+            confined_stderr,
+            suggested_paths,
+            suggested_access,
+        };
+
+        let options = if grant_offer.is_some() && !offered_scopes.is_empty() {
+            let mut options = Vec::new();
+            for scope in &offered_scopes {
+                let id = match scope {
+                    Scope::Session => ID_ESCALATE_GRANT_SESSION,
+                    Scope::Project => ID_ESCALATE_GRANT_PROJECT,
+                    Scope::Global => ID_ESCALATE_GRANT_GLOBAL,
+                    Scope::Once => continue,
+                };
+                options.push(opt(id, &format!("Grant paths for {}", scope_label(*scope))));
+            }
+            options.push(opt(
+                ID_ESCALATE_RUN_UNCONFINED_ONCE,
+                "Run once without sandbox",
+            ));
+            options.push(opt(ID_REJECT, "Deny"));
+            options
+        } else {
+            vec![
+                opt(ID_ESCALATE_RUN_UNCONFINED_ONCE, "Run once without sandbox"),
+                opt(ID_REJECT, "Deny"),
+            ]
+        };
+
+        let prompt = if grant_offer.is_some() {
+            format!(
+                "`{command}` failed while sandboxed. Grant the suggested paths and retry inside the sandbox?"
+            )
+        } else {
+            format!("`{command}` failed while sandboxed. Re-run it without the sandbox?")
+        };
+        let question = InterruptQuestion::Single {
+            prompt,
+            options,
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            sandbox_escalation: Some(escalation),
+        };
+        let response = self
+            .raise_and_wait("Sandboxed command failed — choose a remedy", question)
+            .await?;
+        match response_to_approval_choice(&response, false) {
+            ApprovalChoice::GrantPaths(scope) => {
+                let Some(offer) = grant_offer else {
+                    return Ok(SandboxEscalationApproval::Deny);
+                };
+                if !offered_scopes.contains(&scope) {
+                    return Ok(SandboxEscalationApproval::Deny);
+                }
+                for path in &offer.paths {
+                    self.store.record_path(path, scope, offer.access)?;
+                    self.record_permission_decision(
+                        "path",
+                        &path.display().to_string(),
+                        &offered_scopes,
+                        Decision::Allow { scope },
+                        DecisionSource::UserPrompt,
+                    );
+                }
+                Ok(SandboxEscalationApproval::GrantAndRetryConfined { scope })
+            }
+            ApprovalChoice::Approve(Scope::Once) => {
+                Ok(SandboxEscalationApproval::RunUnconfinedOnce)
+            }
+            _ => Ok(SandboxEscalationApproval::Deny),
+        }
     }
 
     /// The shared command-approval core. `escalation` is `Some` only on the
@@ -327,6 +429,7 @@ impl Approver {
         match choice {
             ApprovalChoice::ApproveAllOnce => Ok(CommandStepDecision::ApproveAllOnce),
             ApprovalChoice::Deny => Ok(CommandStepDecision::Decision(Decision::Deny)),
+            ApprovalChoice::GrantPaths(_) => Ok(CommandStepDecision::Decision(Decision::Deny)),
             ApprovalChoice::Approve(Scope::Once) => {
                 Ok(CommandStepDecision::Decision(Decision::Allow {
                     scope: Scope::Once,

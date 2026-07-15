@@ -64,21 +64,21 @@ impl Session {
         enabled
     }
 
-    /// Return the agent-facing sandbox-escalation availability notice when
-    /// the flag has changed since the last model turn saw it. Toggling back
-    /// before the next turn is a net no-op and emits nothing.
-    pub fn sandbox_escalation_turn_notice(&self) -> Option<String> {
-        let enabled = self.sandbox_escalation_enabled();
+    /// Return the agent-facing sandbox-escalation tool-availability notice
+    /// when actual tool presence has changed since the last model turn saw
+    /// it. Toggling back before the next turn is a net no-op and emits
+    /// nothing.
+    pub fn sandbox_escalation_turn_notice(&self, tool_present: bool) -> Option<String> {
         let previous = self
             .sandbox_escalation_notice_state
-            .swap(enabled, Ordering::Relaxed);
-        if previous == enabled {
+            .swap(tool_present, Ordering::Relaxed);
+        if previous == tool_present {
             return None;
         }
-        Some(if enabled {
-            "Sandbox escalation is now enabled; you may use the `escalate` tool to re-run a sandbox-failed command outside the sandbox (subject to approval).".to_string()
+        Some(if tool_present {
+            "Sandbox escalation is now available; you may use the `escalate` tool to re-run a sandbox-failed command after approval.".to_string()
         } else {
-            "Sandbox escalation is now disabled; the `escalate` tool is unavailable.".to_string()
+            "Sandbox escalation is now unavailable; the `escalate` tool is not present.".to_string()
         })
     }
 

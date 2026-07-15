@@ -268,6 +268,19 @@ impl GrantStore {
         &self.approval_policy
     }
 
+    /// Durable scopes where a path grant can actually be recorded for this
+    /// store. `Once` is intentionally absent: path grants are durable policy.
+    pub fn recordable_path_scopes(&self) -> Vec<Scope> {
+        let mut scopes = vec![Scope::Session];
+        if self.project_root.is_some() && self.project_approvals_dir.is_some() {
+            scopes.push(Scope::Project);
+        }
+        if self.global_dir.is_some() {
+            scopes.push(Scope::Global);
+        }
+        scopes
+    }
+
     /// Whether a command key is already **allowed** at *any* scope that
     /// applies to this session (Session, Project, or Global). `Once`
     /// grants are never stored, so they never show up here.

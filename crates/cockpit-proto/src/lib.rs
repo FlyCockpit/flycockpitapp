@@ -1650,11 +1650,21 @@ mod tests {
             sandbox_escalation: Some(SandboxEscalation {
                 confined_exit: 101,
                 confined_stderr: "permission denied".into(),
+                suggested_paths: vec!["/var/cache/tool".into()],
+                suggested_access: Some("read-write".into()),
             }),
         };
         let s = serde_json::to_string(&q).unwrap();
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["data"]["sandbox_escalation"]["confined_exit"], json!(101));
+        assert_eq!(
+            v["data"]["sandbox_escalation"]["suggested_paths"],
+            json!(["/var/cache/tool"])
+        );
+        assert_eq!(
+            v["data"]["sandbox_escalation"]["suggested_access"],
+            json!("read-write")
+        );
         let back: InterruptQuestion = serde_json::from_str(&s).unwrap();
         match back {
             InterruptQuestion::Single {
@@ -1663,6 +1673,8 @@ mod tests {
                 let esc = sandbox_escalation.expect("sandbox_escalation survives");
                 assert_eq!(esc.confined_exit, 101);
                 assert_eq!(esc.confined_stderr, "permission denied");
+                assert_eq!(esc.suggested_paths, vec!["/var/cache/tool"]);
+                assert_eq!(esc.suggested_access.as_deref(), Some("read-write"));
             }
             other => panic!("expected Single, got {other:?}"),
         }

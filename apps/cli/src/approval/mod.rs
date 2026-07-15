@@ -70,6 +70,10 @@ pub const ID_REJECT_PROJECT: &str = "reject_project";
 pub const ID_REJECT_GLOBAL: &str = "reject_global";
 pub const ID_MORE_OPTIONS: &str = "more_options";
 pub const ID_APPROVE_ALL_ONCE: &str = "approve_all_once";
+pub const ID_ESCALATE_GRANT_SESSION: &str = "escalate_grant_session";
+pub const ID_ESCALATE_GRANT_PROJECT: &str = "escalate_grant_project";
+pub const ID_ESCALATE_GRANT_GLOBAL: &str = "escalate_grant_global";
+pub const ID_ESCALATE_RUN_UNCONFINED_ONCE: &str = "escalate_run_unconfined_once";
 pub const ID_ONCE: &str = "once";
 pub const ID_SESSION: &str = "session";
 pub const ID_PROJECT: &str = "project";
@@ -173,7 +177,21 @@ impl Approver {}
 enum ApprovalChoice {
     Approve(Scope),
     ApproveAllOnce,
+    GrantPaths(Scope),
     Reject(Scope),
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxEscalationGrantOffer {
+    pub paths: Vec<std::path::PathBuf>,
+    pub access: crate::tools::shell_sandbox::SandboxPathAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxEscalationApproval {
+    GrantAndRetryConfined { scope: Scope },
+    RunUnconfinedOnce,
     Deny,
 }
 
@@ -614,6 +632,10 @@ fn response_to_approval_choice(response: &ResolveResponse, wrapper: bool) -> App
         ID_APPROVE_PROJECT => ApprovalChoice::Approve(Scope::Project),
         ID_APPROVE_GLOBAL => ApprovalChoice::Approve(Scope::Global),
         ID_APPROVE_ALL_ONCE => ApprovalChoice::ApproveAllOnce,
+        ID_ESCALATE_GRANT_SESSION => ApprovalChoice::GrantPaths(Scope::Session),
+        ID_ESCALATE_GRANT_PROJECT => ApprovalChoice::GrantPaths(Scope::Project),
+        ID_ESCALATE_GRANT_GLOBAL => ApprovalChoice::GrantPaths(Scope::Global),
+        ID_ESCALATE_RUN_UNCONFINED_ONCE => ApprovalChoice::Approve(Scope::Once),
         ID_REJECT => ApprovalChoice::Deny,
         ID_REJECT_SESSION => ApprovalChoice::Reject(Scope::Session),
         ID_REJECT_PROJECT => ApprovalChoice::Reject(Scope::Project),
@@ -1082,6 +1104,129 @@ mod tests {
             }
             prompts
         })
+    }
+
+    fn resolve_sequence_collecting_questions(
+        approver: &Approver,
+        ids: &[&'static str],
+    ) -> tokio::task::JoinHandle<Vec<InterruptQuestion>> {
+        let db = approver.db.clone();
+        let session_id = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let ids: Vec<&'static str> = ids.to_vec();
+        tokio::spawn(async move {
+            let mut seen: Vec<uuid::Uuid> = Vec::new();
+            let mut questions = Vec::new();
+            for id in ids {
+                let (iid, question) = loop {
+                    let open = db.list_open_interrupts(session_id).unwrap();
+                    if let Some(row) = open.iter().find(|r| !seen.contains(&r.interrupt_id)) {
+                        let question = row
+                            .questions
+                            .as_ref()
+                            .and_then(|set| set.questions.first())
+                            .cloned()
+                            .expect("question recorded");
+                        break (row.interrupt_id, question);
+                    }
+                    tokio::task::yield_now().await;
+                };
+                seen.push(iid);
+                questions.push(question);
+                assert!(hub.resolve(
+                    iid,
+                    ResolveResponse::Single {
+                        selected_id: id.to_string(),
+                    }
+                ));
+            }
+            questions
+        })
+    }
+
+    #[tokio::test]
+    async fn sandbox_escalation_grant_prompt_records_path_and_retries_confined_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let path = tmp.path().join("cache");
+        let offer = SandboxEscalationGrantOffer {
+            paths: vec![path.clone()],
+            access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        };
+        let resolver =
+            resolve_sequence_collecting_questions(&approver, &[ID_ESCALATE_GRANT_SESSION]);
+
+        let decision = approver
+            .approve_sandbox_escalation(
+                "cat cache/data",
+                13,
+                "cat: Permission denied".into(),
+                Some(&offer),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            SandboxEscalationApproval::GrantAndRetryConfined {
+                scope: Scope::Session
+            }
+        );
+        let questions = resolver.await.unwrap();
+        let InterruptQuestion::Single {
+            options,
+            sandbox_escalation,
+            ..
+        } = &questions[0]
+        else {
+            panic!("expected single question");
+        };
+        let ids: Vec<_> = options.iter().map(|option| option.id.as_str()).collect();
+        assert!(ids.starts_with(&[ID_ESCALATE_GRANT_SESSION]));
+        assert!(ids.contains(&ID_ESCALATE_RUN_UNCONFINED_ONCE));
+        assert!(ids.contains(&ID_REJECT));
+        let esc = sandbox_escalation.as_ref().expect("escalation detail");
+        assert_eq!(esc.suggested_paths, vec![path.display().to_string()]);
+        assert_eq!(esc.suggested_access.as_deref(), Some("read"));
+        assert!(
+            approver
+                .store
+                .is_path_granted_for(&path, crate::tools::shell_sandbox::SandboxPathAccess::Read),
+            "session path grant recorded"
+        );
+        assert!(
+            !approver.store.is_path_granted_for(
+                &path,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+            ),
+            "read grant must not imply write"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_escalation_run_once_records_no_path_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let path = tmp.path().join("cache");
+        let offer = SandboxEscalationGrantOffer {
+            paths: vec![path.clone()],
+            access: crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        };
+        let resolver =
+            resolve_sequence_collecting_questions(&approver, &[ID_ESCALATE_RUN_UNCONFINED_ONCE]);
+
+        let decision = approver
+            .approve_sandbox_escalation("cat cache/data", 13, "denied".into(), Some(&offer))
+            .await
+            .unwrap();
+        assert_eq!(decision, SandboxEscalationApproval::RunUnconfinedOnce);
+        resolver.await.unwrap();
+        assert!(
+            !approver.store.is_path_granted_for(
+                &path,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+            ),
+            "run-once must not record durable path grants"
+        );
     }
 
     #[tokio::test]
@@ -1905,6 +2050,8 @@ mod tests {
         let esc = SandboxEscalation {
             confined_exit: 101,
             confined_stderr: "cat: /etc/secret: Permission denied".into(),
+            suggested_paths: Vec::new(),
+            suggested_access: None,
         };
         let desc = prompt_description("cat", false, None, Some(&esc));
         assert!(

@@ -111,9 +111,10 @@ impl Approver {
         let decision = match choice {
             // Wrapper mode: reject-once is mapped to `Deny` upstream, so a
             // `Reject` never reaches here; treat it as a deny defensively.
-            ApprovalChoice::Deny | ApprovalChoice::Reject(_) | ApprovalChoice::ApproveAllOnce => {
-                Decision::Deny
-            }
+            ApprovalChoice::Deny
+            | ApprovalChoice::Reject(_)
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
             ApprovalChoice::Approve(_) => Decision::Allow { scope: Scope::Once },
         };
         // Once-only per-call approval → the only offered scope is `Once`.

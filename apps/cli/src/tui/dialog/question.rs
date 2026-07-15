@@ -857,10 +857,23 @@ impl QuestionDialog {
                 out.push(Line::from(Span::styled(format!("  {line}"), muted)));
             }
         }
+        if !esc.suggested_paths.is_empty() {
+            out.push(Line::default());
+            let access = esc.suggested_access.as_deref().unwrap_or("read-write");
+            out.push(Line::from(Span::styled(
+                format!("suggested {access} grants:"),
+                muted.add_modifier(Modifier::ITALIC),
+            )));
+            for path in &esc.suggested_paths {
+                out.push(Line::from(Span::styled(format!("  {path}"), muted)));
+            }
+        }
 
         // Cascade warning.
         out.push(Line::default());
-        let warning = if rememberable {
+        let warning = if !esc.suggested_paths.is_empty() {
+            "Granting paths records durable path access at the selected scope, then retries the command inside the sandbox. Run-once re-runs WITHOUT the sandbox now and records no grant."
+        } else if rememberable {
             "Approving re-runs it WITHOUT the sandbox now. \"Once\" applies this time only; \
              a remembered scope (session/project/global) makes future runs of this command \
              skip the sandbox silently, with no prompt."
@@ -3326,6 +3339,8 @@ mod tests {
             SandboxEscalation {
                 confined_exit: 13,
                 confined_stderr: "cat: /etc/secret: Permission denied".into(),
+                suggested_paths: Vec::new(),
+                suggested_access: None,
             },
             true,
         );
@@ -3358,6 +3373,8 @@ mod tests {
             SandboxEscalation {
                 confined_exit: 1,
                 confined_stderr: String::new(),
+                suggested_paths: Vec::new(),
+                suggested_access: None,
             },
             false,
         );
@@ -3368,6 +3385,28 @@ mod tests {
             "wrapper cascade note: {text}"
         );
         assert!(text.contains("once only"), "once-only for wrapper: {text}");
+    }
+
+    #[test]
+    fn escalation_variant_renders_suggested_path_grants() {
+        let d = escalation_dialog(
+            SandboxEscalation {
+                confined_exit: 13,
+                confined_stderr: "cat: Permission denied".into(),
+                suggested_paths: vec!["/var/cache/tool".into()],
+                suggested_access: Some("read".into()),
+            },
+            true,
+        );
+        let area = Rect::new(0, 0, 80, 30);
+        let text = render_text(&d, area);
+        assert!(
+            text.contains("suggested read grants"),
+            "access shown: {text}"
+        );
+        assert!(text.contains("/var/cache/tool"), "path shown: {text}");
+        assert!(text.contains("retries the command inside the sandbox"));
+        assert!(text.contains("records no grant"));
     }
 
     #[test]

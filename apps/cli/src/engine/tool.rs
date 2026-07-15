@@ -132,6 +132,12 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Optional expanded description for the strongest model tier. `None`
+    /// falls back to the normal terse description.
+    fn frontier_description(&self) -> Option<String> {
+        None
+    }
+
     /// JSON Schema for the arguments. Returning `Value::Null` means "no
     /// arguments." See plan.md §12 for the conventions the schema must
     /// follow for the repair catalog to fire. This is the **normal**
@@ -581,7 +587,12 @@ pub fn definition_of(
             tool.defensive_parameters()
                 .unwrap_or_else(|| tool.parameters()),
         ),
-        LlmMode::Normal | LlmMode::Frontier => (tool.description().to_string(), tool.parameters()),
+        LlmMode::Normal => (tool.description().to_string(), tool.parameters()),
+        LlmMode::Frontier => (
+            tool.frontier_description()
+                .unwrap_or_else(|| tool.description().to_string()),
+            tool.parameters(),
+        ),
     };
     // Per-agent axis: an override for the active mode wins over the base
     // description. Schema is intentionally untouched.
@@ -614,6 +625,9 @@ pub enum Capability {
     /// (GOALS §3c): the follow-up handle, `resume_handle` rehydration, and
     /// `seed` injection. Available outside defensive mode.
     FollowupSeed,
+    /// Explicit sandbox escalation reruns. Available only to stronger modes;
+    /// defensive mode gets the separate human-offer path instead.
+    SandboxEscalate,
 }
 
 impl Capability {
@@ -625,7 +639,9 @@ impl Capability {
         match self {
             // Follow-up/seed is a stronger-model affordance: the weak-model
             // (defensive) target re-spawns cold instead (GOALS §3c).
-            Capability::FollowupSeed => matches!(mode, LlmMode::Normal | LlmMode::Frontier),
+            Capability::FollowupSeed | Capability::SandboxEscalate => {
+                matches!(mode, LlmMode::Normal | LlmMode::Frontier)
+            }
         }
     }
 }

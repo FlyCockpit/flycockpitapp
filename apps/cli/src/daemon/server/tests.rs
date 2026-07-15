@@ -4,7 +4,7 @@ mod tests {
     use crate::daemon::session_worker::SessionWorkerHandle;
     use crate::daemon::shutdown::ShutdownPhase;
     use crate::session::Session;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::io;
     use std::sync::Mutex as StdMutex;
     use tracing::Level;
@@ -900,6 +900,732 @@ mod tests {
             },
             session_row.session_id,
         )
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DispatchMatrixClass {
+        Readonly,
+        Mutating,
+        AccessControlled,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct DispatchMatrixRow {
+        kind: &'static str,
+        class: DispatchMatrixClass,
+    }
+
+    macro_rules! dispatch_matrix_rows_from_command_table {
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+            vec![$(
+                DispatchMatrixRow {
+                    kind: $kind,
+                    class: dispatch_matrix_class_for_command($kind, stringify!($authz), $mutating),
+                },
+            )+]
+        }};
+    }
+
+    /// Shared daemon-dispatch matrix declaration. Successor prompts extend
+    /// this same table's coverage cases for mutating and authz-specific
+    /// requests instead of creating a second request-kind list.
+    fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
+        proto::command!(dispatch_matrix_rows_from_command_table)
+    }
+
+    fn dispatch_matrix_class_for_command(
+        kind: &'static str,
+        authz: &'static str,
+        mutating: bool,
+    ) -> DispatchMatrixClass {
+        match (kind, authz, mutating) {
+            ("fs_list", "project_files", false)
+            | ("fs_stat", "project_files", false)
+            | ("fs_read", "project_files", false)
+            | ("git_status", "project_files", false)
+            | ("git_diff_file", "project_files", false)
+            | ("list_sessions", "public_read", false)
+            | ("read_session_messages", "custom", false)
+            | ("session_live_status", "public_read", false)
+            | ("list_skills", "project_read", false)
+            | ("daemon_status", "public_read", false)
+            | ("guidance_estimate", "project_read", false) => DispatchMatrixClass::Readonly,
+            ("attach_terminal", "terminal", false)
+            | ("terminal_input", "terminal", false)
+            | ("terminal_resize", "terminal", false)
+            | ("list_models", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+            (_, _, true) => DispatchMatrixClass::Mutating,
+            other => panic!("dispatch matrix request kind is unclassified: {other:?}"),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ReadonlyDispatchCase {
+        kind: &'static str,
+        case: ReadonlyDispatchCaseKind,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ReadonlyDispatchCaseKind {
+        FsList,
+        FsStat,
+        FsRead,
+        GitStatus,
+        GitDiffFile,
+        ListSessions,
+        ReadSessionMessages,
+        SessionLiveStatus,
+        ListSkills,
+        DaemonStatus,
+        GuidanceEstimate,
+    }
+
+    fn readonly_dispatch_happy_cases() -> Vec<ReadonlyDispatchCase> {
+        readonly_dispatch_case_list()
+    }
+
+    fn readonly_dispatch_malformed_cases() -> Vec<ReadonlyDispatchCase> {
+        readonly_dispatch_case_list()
+    }
+
+    fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
+        vec![
+            ReadonlyDispatchCase {
+                kind: "fs_list",
+                case: ReadonlyDispatchCaseKind::FsList,
+            },
+            ReadonlyDispatchCase {
+                kind: "fs_stat",
+                case: ReadonlyDispatchCaseKind::FsStat,
+            },
+            ReadonlyDispatchCase {
+                kind: "fs_read",
+                case: ReadonlyDispatchCaseKind::FsRead,
+            },
+            ReadonlyDispatchCase {
+                kind: "git_status",
+                case: ReadonlyDispatchCaseKind::GitStatus,
+            },
+            ReadonlyDispatchCase {
+                kind: "git_diff_file",
+                case: ReadonlyDispatchCaseKind::GitDiffFile,
+            },
+            ReadonlyDispatchCase {
+                kind: "list_sessions",
+                case: ReadonlyDispatchCaseKind::ListSessions,
+            },
+            ReadonlyDispatchCase {
+                kind: "read_session_messages",
+                case: ReadonlyDispatchCaseKind::ReadSessionMessages,
+            },
+            ReadonlyDispatchCase {
+                kind: "session_live_status",
+                case: ReadonlyDispatchCaseKind::SessionLiveStatus,
+            },
+            ReadonlyDispatchCase {
+                kind: "list_skills",
+                case: ReadonlyDispatchCaseKind::ListSkills,
+            },
+            ReadonlyDispatchCase {
+                kind: "daemon_status",
+                case: ReadonlyDispatchCaseKind::DaemonStatus,
+            },
+            ReadonlyDispatchCase {
+                kind: "guidance_estimate",
+                case: ReadonlyDispatchCaseKind::GuidanceEstimate,
+            },
+        ]
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_matrix_request(
+        ctx: &Arc<DaemonContext>,
+        request: Request,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        dispatch_matrix_request_after(ctx, Vec::new(), request).await
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_matrix_request_after(
+        ctx: &Arc<DaemonContext>,
+        prelude: Vec<Request>,
+        request: Request,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let mut client = ProtoStream::new(client_stream);
+        let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+        match recv_body(&mut client).await {
+            Body::Response { id, response } => {
+                assert_eq!(id, Uuid::nil());
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+            }
+            other => panic!("expected daemon hello, got {other:?}"),
+        }
+
+        for prelude_request in prelude {
+            let prelude_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(prelude_id, prelude_request))
+                .await
+                .expect("send prelude request");
+            recv_dispatch_matrix_response(&mut client, prelude_id)
+                .await
+                .expect("prelude request succeeds");
+        }
+
+        let id = Uuid::new_v4();
+        client
+            .send(&Envelope::request(id, request))
+            .await
+            .expect("send dispatch request");
+        let result = recv_dispatch_matrix_response(&mut client, id).await;
+        drop(client);
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+        result
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_matrix_raw_line(
+        ctx: &Arc<DaemonContext>,
+        request_id: Uuid,
+        line: String,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let mut client = ProtoStream::new(client_stream);
+        let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+        match recv_body(&mut client).await {
+            Body::Response { id, response } => {
+                assert_eq!(id, Uuid::nil());
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+            }
+            other => panic!("expected daemon hello, got {other:?}"),
+        }
+        client
+            .send_raw_line(line)
+            .await
+            .expect("send raw dispatch request");
+        let result = recv_dispatch_matrix_response(&mut client, request_id).await;
+        drop(client);
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+        result
+    }
+
+    #[cfg(unix)]
+    async fn recv_dispatch_matrix_response<S>(
+        proto: &mut ProtoStream<S>,
+        request_id: Uuid,
+    ) -> std::result::Result<Response, ErrorPayload>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        loop {
+            match recv_body(proto).await {
+                Body::Response { id, response } => {
+                    assert_eq!(id, request_id);
+                    return Ok(*response);
+                }
+                Body::Error { id, error } => {
+                    assert_eq!(id, Some(request_id));
+                    return Err(error);
+                }
+                Body::Event { .. } => continue,
+                other => panic!("expected dispatch response/error, got {other:?}"),
+            }
+        }
+    }
+
+    fn assert_dispatch_matrix_coverage_complete() {
+        let readonly: BTreeSet<_> = dispatch_matrix_rows()
+            .into_iter()
+            .filter(|row| row.class == DispatchMatrixClass::Readonly)
+            .map(|row| row.kind)
+            .collect();
+        let happy: BTreeSet<_> = readonly_dispatch_happy_cases()
+            .into_iter()
+            .map(|case| case.kind)
+            .collect();
+        let malformed: BTreeSet<_> = readonly_dispatch_malformed_cases()
+            .into_iter()
+            .map(|case| case.kind)
+            .collect();
+
+        assert_eq!(
+            readonly, happy,
+            "every readonly dispatch kind needs a happy socket case"
+        );
+        assert_eq!(
+            readonly, malformed,
+            "every readonly dispatch kind needs a malformed/invalid-state socket case"
+        );
+        assert!(
+            readonly.len() >= 10,
+            "dispatch_matrix coverage must be non-vacuous"
+        );
+    }
+
+    #[test]
+    fn dispatch_matrix_readonly_coverage_is_complete() {
+        assert_dispatch_matrix_coverage_complete();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_matrix_readonly_cases_traverse_socket_path() {
+        assert_dispatch_matrix_coverage_complete();
+        for case in readonly_dispatch_happy_cases() {
+            case.case.assert_happy_socket_case().await;
+        }
+        for case in readonly_dispatch_malformed_cases() {
+            case.case.assert_malformed_socket_case().await;
+        }
+    }
+
+    #[cfg(unix)]
+    impl ReadonlyDispatchCaseKind {
+        async fn assert_happy_socket_case(self) {
+            match self {
+                Self::FsList => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    std::fs::write(tmp.path().join("visible.txt"), "hello").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::FsList {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: ".".into(),
+                            show_hidden: false,
+                        },
+                    )
+                    .await
+                    .expect("fs_list happy");
+                    let Response::FsList { entries, truncated } = response else {
+                        panic!("expected FsList");
+                    };
+                    assert!(!truncated);
+                    assert!(entries.iter().any(|entry| entry.name == "visible.txt"));
+                }
+                Self::FsStat => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    std::fs::write(tmp.path().join("file.txt"), "hello").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::FsStat {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "file.txt".into(),
+                        },
+                    )
+                    .await
+                    .expect("fs_stat happy");
+                    let Response::FsStat { entry } = response else {
+                        panic!("expected FsStat");
+                    };
+                    assert_eq!(entry.name, "file.txt");
+                }
+                Self::FsRead => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    std::fs::write(tmp.path().join("file.txt"), "hello").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::FsRead {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "file.txt".into(),
+                            base64: false,
+                        },
+                    )
+                    .await
+                    .expect("fs_read happy");
+                    let Response::FsRead { content, .. } = response else {
+                        panic!("expected FsRead");
+                    };
+                    assert_eq!(content.as_deref(), Some("hello"));
+                }
+                Self::GitStatus => {
+                    let ctx = test_ctx();
+                    let tmp = git_repo();
+                    std::fs::write(tmp.path().join("new.txt"), "hello").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GitStatus {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                        },
+                    )
+                    .await
+                    .expect("git_status happy");
+                    let Response::GitStatus { entries } = response else {
+                        panic!("expected GitStatus");
+                    };
+                    assert!(entries.iter().any(|entry| entry.raw.contains("new.txt")));
+                }
+                Self::GitDiffFile => {
+                    let ctx = test_ctx();
+                    let tmp = git_repo();
+                    std::fs::write(tmp.path().join("tracked.txt"), "new\n").unwrap();
+                    run_git(tmp.path(), &["add", "-N", "tracked.txt"]);
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GitDiffFile {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "tracked.txt".into(),
+                        },
+                    )
+                    .await
+                    .expect("git_diff_file happy");
+                    let Response::GitDiffFile { diff, truncated } = response else {
+                        panic!("expected GitDiffFile");
+                    };
+                    assert!(!truncated);
+                    assert!(diff.contains("+new"));
+                }
+                Self::ListSessions => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::ListSessions {
+                            project_id: None,
+                            parent_session_id: None,
+                        },
+                    )
+                    .await
+                    .expect("list_sessions happy");
+                    let Response::Sessions { sessions } = response else {
+                        panic!("expected Sessions");
+                    };
+                    assert!(
+                        sessions
+                            .iter()
+                            .any(|summary| summary.session_id == session.session_id)
+                    );
+                }
+                Self::ReadSessionMessages => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    let seq = ctx
+                        .db
+                        .insert_session_event(
+                            session.session_id,
+                            crate::db::session_log::SessionEventKind::UserMessage,
+                            Some("Build"),
+                            None,
+                            &serde_json::json!({"text": "hello"}),
+                        )
+                        .unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::ReadSessionMessages {
+                            session_id: session.session_id,
+                            before_seq: None,
+                            limit: 20,
+                        },
+                    )
+                    .await
+                    .expect("read_session_messages happy");
+                    let Response::SessionMessages { messages, .. } = response else {
+                        panic!("expected SessionMessages");
+                    };
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0].seq, seq);
+                }
+                Self::SessionLiveStatus => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    insert_hung_worker(&ctx, session.session_id);
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::SessionLiveStatus {
+                            session_ids: vec![session.session_id],
+                        },
+                    )
+                    .await
+                    .expect("session_live_status happy");
+                    let Response::SessionLiveStatus { statuses } = response else {
+                        panic!("expected SessionLiveStatus");
+                    };
+                    assert_eq!(statuses.len(), 1);
+                    assert_eq!(statuses[0].session_id, session.session_id);
+                }
+                Self::ListSkills => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    ctx.db
+                        .set_workspace_trust(
+                            tmp.path(),
+                            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                        )
+                        .unwrap();
+                    let response = dispatch_matrix_request_after(
+                        &ctx,
+                        vec![Request::Attach {
+                            session_id: None,
+                            since_seq: None,
+                            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                            no_sandbox: false,
+                            interactive: true,
+                            model_override: None,
+                            client_protocol_version: proto::PROTOCOL_VERSION,
+                            env_snapshot: None,
+                            env_policy: EnvDriftPolicy::Daemon,
+                        }],
+                        Request::ListSkills {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                        },
+                    )
+                    .await
+                    .expect("list_skills happy");
+                    let Response::Skills { skills } = response else {
+                        panic!("expected Skills");
+                    };
+                    assert!(skills.is_empty());
+                }
+                Self::DaemonStatus => {
+                    let ctx = test_ctx();
+                    let response = dispatch_matrix_request(&ctx, Request::DaemonStatus)
+                        .await
+                        .expect("daemon_status happy");
+                    let Response::DaemonStatus {
+                        pid,
+                        protocol_version,
+                        ..
+                    } = response
+                    else {
+                        panic!("expected DaemonStatus");
+                    };
+                    assert_eq!(pid, std::process::id());
+                    assert_eq!(protocol_version, proto::PROTOCOL_VERSION);
+                }
+                Self::GuidanceEstimate => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GuidanceEstimate {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            provider: None,
+                            model: None,
+                        },
+                    )
+                    .await
+                    .expect("guidance_estimate happy");
+                    let Response::GuidanceEstimate {
+                        file,
+                        tokens,
+                        system_tokens,
+                        ..
+                    } = response
+                    else {
+                        panic!("expected GuidanceEstimate");
+                    };
+                    assert_eq!(file, None);
+                    assert_eq!(tokens, 0);
+                    assert!(system_tokens > 0);
+                }
+            }
+        }
+
+        async fn assert_malformed_socket_case(self) {
+            match self {
+                Self::FsList => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let err = dispatch_matrix_request(
+                        &ctx,
+                        Request::FsList {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "missing".into(),
+                            show_hidden: false,
+                        },
+                    )
+                    .await
+                    .expect_err("fs_list missing path");
+                    assert_eq!(err.code, ErrorCode::BadRequest);
+                }
+                Self::FsStat | Self::FsRead => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let request = match self {
+                        Self::FsStat => Request::FsStat {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "../outside".into(),
+                        },
+                        Self::FsRead => Request::FsRead {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "../outside".into(),
+                            base64: false,
+                        },
+                        _ => unreachable!(),
+                    };
+                    let err = dispatch_matrix_request(&ctx, request)
+                        .await
+                        .expect_err("fs traversal is rejected");
+                    assert_eq!(err.code, ErrorCode::PathOutsideRoot);
+                }
+                Self::GitStatus => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let err = dispatch_matrix_request(
+                        &ctx,
+                        Request::GitStatus {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                        },
+                    )
+                    .await
+                    .expect_err("git_status outside a repository");
+                    assert_eq!(err.code, ErrorCode::BadRequest);
+                }
+                Self::GitDiffFile => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let err = dispatch_matrix_request(
+                        &ctx,
+                        Request::GitDiffFile {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                            path: "../outside".into(),
+                        },
+                    )
+                    .await
+                    .expect_err("git_diff_file traversal is rejected");
+                    assert_eq!(err.code, ErrorCode::PathOutsideRoot);
+                }
+                Self::ListSessions => {
+                    let ctx = test_ctx();
+                    ctx.db.create_session("visible", "/repo", "Build").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::ListSessions {
+                            project_id: Some("missing-project".into()),
+                            parent_session_id: None,
+                        },
+                    )
+                    .await
+                    .expect("list_sessions invalid filter is typed empty response");
+                    let Response::Sessions { sessions } = response else {
+                        panic!("expected Sessions");
+                    };
+                    assert!(sessions.is_empty());
+                }
+                Self::ReadSessionMessages => {
+                    let ctx = test_ctx();
+                    let unknown_session_id = Uuid::new_v4();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::ReadSessionMessages {
+                            session_id: unknown_session_id,
+                            before_seq: None,
+                            limit: 20,
+                        },
+                    )
+                    .await
+                    .expect("unknown session messages return an empty typed page");
+                    let Response::SessionMessages {
+                        session_id,
+                        messages,
+                        has_more,
+                    } = response
+                    else {
+                        panic!("expected SessionMessages");
+                    };
+                    assert_eq!(session_id, unknown_session_id);
+                    assert!(messages.is_empty());
+                    assert!(!has_more);
+                }
+                Self::SessionLiveStatus => {
+                    let ctx = test_ctx();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::SessionLiveStatus {
+                            session_ids: vec![Uuid::new_v4()],
+                        },
+                    )
+                    .await
+                    .expect("unknown live status is typed empty response");
+                    let Response::SessionLiveStatus { statuses } = response else {
+                        panic!("expected SessionLiveStatus");
+                    };
+                    assert!(statuses.is_empty());
+                }
+                Self::ListSkills => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let err = dispatch_matrix_request(
+                        &ctx,
+                        Request::ListSkills {
+                            project_root: tmp.path().to_string_lossy().into_owned(),
+                        },
+                    )
+                    .await
+                    .expect_err("list_skills requires attachment");
+                    assert_eq!(err.code, ErrorCode::NotAttached);
+                }
+                Self::DaemonStatus => {
+                    let ctx = test_ctx();
+                    let request_id = Uuid::new_v4();
+                    let err = dispatch_matrix_raw_line(
+                        &ctx,
+                        request_id,
+                        serde_json::json!({
+                            "v": proto::PROTOCOL_VERSION + 1,
+                            "kind": "req",
+                            "id": request_id,
+                            "request": "daemon_status",
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .expect_err("daemon_status malformed protocol version");
+                    assert_eq!(err.code, ErrorCode::ProtocolVersion);
+                }
+                Self::GuidanceEstimate => {
+                    let ctx = test_ctx();
+                    let tmp = tempfile::tempdir().unwrap();
+                    let missing = tmp.path().join("missing");
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GuidanceEstimate {
+                            project_root: missing.to_string_lossy().into_owned(),
+                            provider: Some("missing-provider".into()),
+                            model: Some("missing-model".into()),
+                        },
+                    )
+                    .await
+                    .expect("guidance estimate tolerates absent guidance roots");
+                    let Response::GuidanceEstimate { file, tokens, .. } = response else {
+                        panic!("expected GuidanceEstimate");
+                    };
+                    assert_eq!(file, None);
+                    assert_eq!(tokens, 0);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init"]);
+        tmp
+    }
+
+    #[cfg(unix)]
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

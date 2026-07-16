@@ -185,6 +185,8 @@ impl Driver {
             // re-seeds.
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: true,
+            context_usage: Some(self.context_usage_snapshot()),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -461,6 +463,8 @@ impl Driver {
             approver: self.approver.clone(),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: false,
+            context_usage: None,
             has_tree: child.tools.get("tree").is_some(),
             has_bash: child.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -527,6 +531,8 @@ impl Driver {
             approver: self.approver.clone(),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: true,
+            context_usage: Some(self.context_usage_snapshot()),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -712,6 +718,8 @@ impl Driver {
             approver: self.approver.clone(),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: true,
+            context_usage: Some(self.context_usage_snapshot()),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this

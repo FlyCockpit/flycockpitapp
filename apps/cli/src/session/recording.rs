@@ -414,6 +414,7 @@ impl Session {
     /// one. Modeled as a session boundary (predecessor → successor short
     /// ids) the export follows like the fork tree, so both sessions land
     /// in one unified `events.json`. Not a `context_pruned` event.
+    #[allow(dead_code)]
     pub fn record_session_compacted(
         &self,
         agent: &str,
@@ -421,6 +422,25 @@ impl Session {
         successor_short_id: &str,
         seed_tool_count: usize,
         brief_text: &str,
+    ) -> Result<i64> {
+        self.record_session_compacted_with_source(
+            agent,
+            successor_session_id,
+            successor_short_id,
+            seed_tool_count,
+            brief_text,
+            "manual",
+        )
+    }
+
+    pub fn record_session_compacted_with_source(
+        &self,
+        agent: &str,
+        successor_session_id: Uuid,
+        successor_short_id: &str,
+        seed_tool_count: usize,
+        brief_text: &str,
+        source: &str,
     ) -> Result<i64> {
         self.record_event(
             crate::db::session_log::SessionEventKind::SessionCompacted,
@@ -434,6 +454,7 @@ impl Session {
                 "successor_short_id": successor_short_id,
                 "seed_tool_count": seed_tool_count,
                 "brief_text": brief_text,
+                "source": source,
             }),
         )
     }

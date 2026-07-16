@@ -382,17 +382,23 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
-        // One-shot: `/compact` hands off to a fresh session, so firing again
-        // on this (now-abandoned) session would loop.
-        if self.auto_compacted {
-            return false;
-        }
         if !self.at_safe_boundary() {
             return false;
         }
         // Only the foreground root frame is compactable at the boundary; a
         // deeper interactive subagent frame is never auto-compacted.
         if self.stack.len() != 1 {
+            return false;
+        }
+        if self.session.take_agent_compact_request() {
+            self.do_compact_with_source(tx, "agent_requested").await;
+            return true;
+        }
+        // One-shot: `/compact` hands off to a fresh session, so firing again
+        // on this (now-abandoned) session would loop. Agent-requested compact
+        // above intentionally bypasses this auto-trigger latch, matching manual
+        // `/compact` semantics.
+        if self.auto_compacted {
             return false;
         }
         let ctx_cfg = self.resolve_context_config();
@@ -417,7 +423,7 @@ impl Driver {
             return false;
         }
         self.auto_compacted = true;
-        self.do_compact(tx).await;
+        self.do_compact_with_source(tx, "auto").await;
         true
     }
 
@@ -426,6 +432,14 @@ impl Driver {
     /// deterministic appendix, derive seed-tools, then reset the foreground
     /// context window in this same session.
     pub(in crate::engine::driver) async fn do_compact(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        self.do_compact_with_source(tx, "manual").await;
+    }
+
+    pub(in crate::engine::driver) async fn do_compact_with_source(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        source: &'static str,
+    ) {
         use crate::engine::compact;
 
         // 0. Prune-first (lossless; denser transcript → tighter brief).
@@ -487,12 +501,13 @@ impl Driver {
         }
 
         // Timeline boundary: `/compact` reset this session in place.
-        if let Err(e) = self.session.record_session_compacted(
+        if let Err(e) = self.session.record_session_compacted_with_source(
             self.active_agent(),
             self.session.id,
             &self.session.short_id,
             seeds.len(),
             &brief,
+            source,
         ) {
             tracing::warn!(error = %e, "record session_compacted event failed");
         }

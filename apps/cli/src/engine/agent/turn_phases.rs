@@ -17,6 +17,7 @@ pub(crate) struct TurnCtx<'a> {
         Option<&'a Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     pub(crate) loop_guard_threshold: u32,
     pub(crate) is_root: bool,
+    pub(crate) context_usage: crate::engine::tool::ContextUsageSnapshot,
     pub(crate) deferred_log: crate::engine::deferred::DeferredLog,
     pub(crate) seeds: crate::engine::seed_collector::SeedCollector,
     pub(crate) emit_inference_error_ui: bool,
@@ -586,6 +587,7 @@ pub(crate) async fn run_turn(
     let resource_scheduler = ctx.resource_scheduler.cloned();
     let loop_guard_threshold = ctx.loop_guard_threshold;
     let is_root = ctx.is_root;
+    let context_usage = ctx.context_usage;
     let deferred_log = ctx.deferred_log;
     let seeds = ctx.seeds;
     let emit_inference_error_ui = ctx.emit_inference_error_ui;
@@ -604,7 +606,7 @@ pub(crate) async fn run_turn(
     phase_08_text_embedded_tool_call_recovery();
     phase_09_terminal_text_emit();
 
-    let active_tools = turn_toolbox(agent, &session);
+    let active_tools = turn_toolbox(agent, &session, &cwd);
     let tools = active_tools.definitions(agent.llm_mode);
 
     let sandbox_escalate_present = active_tools.names().contains(&"escalate");
@@ -1296,6 +1298,8 @@ pub(crate) async fn run_turn(
         approver,
         deferred_log,
         seeds,
+        root_agent_frame: is_root,
+        context_usage: Some(context_usage),
         has_tree: agent.tools.get("tree").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         // The blocked-`readlock` waiting indicator routes its

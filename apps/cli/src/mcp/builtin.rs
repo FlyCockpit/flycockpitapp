@@ -8,15 +8,17 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::engine::tool::ToolCtx;
+use crate::engine::tool::{ContextUsageSnapshot, ToolCtx};
 use crate::mcp::catalog::SearchHit;
 use crate::mcp::protocol::{
     ToolDescriptor, sanitize_tool_description, sanitize_tool_descriptor, sanitize_tool_name,
 };
+use crate::session::Session;
 
 pub const BUILTIN_SERVER_ID: &str = "cockpit";
 
@@ -28,6 +30,9 @@ pub struct HostContext {
     pub session_id: Option<uuid::Uuid>,
     #[allow(dead_code)]
     pub cwd: PathBuf,
+    pub session: Option<Arc<Session>>,
+    pub root_agent_frame: bool,
+    pub context_usage: Option<ContextUsageSnapshot>,
     #[cfg(test)]
     test_builtin_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -38,6 +43,9 @@ impl HostContext {
             db: Some(ctx.session.db.clone()),
             session_id: Some(ctx.session.id),
             cwd: ctx.cwd.clone(),
+            session: Some(ctx.session.clone()),
+            root_agent_frame: ctx.root_agent_frame,
+            context_usage: ctx.context_usage,
             #[cfg(test)]
             test_builtin_gate: None,
         }
@@ -49,6 +57,9 @@ impl HostContext {
             db: None,
             session_id: None,
             cwd: PathBuf::new(),
+            session: None,
+            root_agent_frame: true,
+            context_usage: None,
             #[cfg(test)]
             test_builtin_gate: None,
         }
@@ -171,9 +182,163 @@ fn ensure_available(ctx: &HostContext, func: &BuiltinFunction) -> Result<()> {
 }
 
 fn registry() -> Vec<BuiltinFunction> {
-    let mut funcs = Vec::new();
+    let mut funcs = vec![
+        BuiltinFunction {
+            name: "rename_session",
+            description: "Set an auto-generated session title when auto-titling is disabled",
+            input_schema: rename_session_schema,
+            availability: rename_session_availability,
+            handler: rename_session,
+        },
+        BuiltinFunction {
+            name: "request_compact",
+            description: "Schedule compaction of the root context at the next safe boundary",
+            input_schema: empty_object_schema,
+            availability: |_ctx| Availability::available(),
+            handler: request_compact,
+        },
+        BuiltinFunction {
+            name: "context_usage",
+            description: "Return the turn-start context-pressure snapshot for this agent frame",
+            input_schema: empty_object_schema,
+            availability: |_ctx| Availability::available(),
+            handler: context_usage,
+        },
+    ];
     register_test_builtin(&mut funcs);
     funcs
+}
+
+fn empty_object_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
+fn rename_session_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Auto-generated session title, 1 to 200 characters after trimming"
+            }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn rename_session_availability(ctx: &HostContext) -> Availability {
+    if auto_title_model_configured(ctx) {
+        return Availability::unavailable(
+            "session auto-titling is configured; the utility model owns titles",
+        );
+    }
+    Availability::available()
+}
+
+fn auto_title_model_configured(ctx: &HostContext) -> bool {
+    crate::config::extended::load_for_cwd(&ctx.cwd)
+        .auto_title_model_ref()
+        .is_some()
+}
+
+fn rename_session<'a>(
+    ctx: &'a HostContext,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let raw = args
+            .get("name")
+            .and_then(Value::as_str)
+            .context("`cockpit.rename_session` requires `name` as a string")?;
+        let name = raw.trim();
+        if name.is_empty() {
+            bail!("`cockpit.rename_session` requires a non-empty title");
+        }
+        if name.chars().count() > 200 {
+            bail!("`cockpit.rename_session` title must be 200 characters or fewer");
+        }
+        if auto_title_model_configured(ctx) {
+            bail!(
+                "`cockpit.rename_session` is unavailable: session auto-titling is configured; the utility model owns titles"
+            );
+        }
+        let session = ctx
+            .session
+            .as_ref()
+            .context("`cockpit.rename_session` requires a live session")?;
+        let row = session
+            .db
+            .get_session(session.id)
+            .context("loading session before rename")?
+            .context("session row is missing")?;
+        if row.user_renamed {
+            bail!(
+                "`cockpit.rename_session` is unavailable: the user has manually named this session"
+            );
+        }
+        if row.ephemeral {
+            bail!("`cockpit.rename_session` is unavailable: ephemeral sessions are never titled");
+        }
+        let updated = session.set_explicit_auto_title(name)?;
+        if !updated {
+            bail!("`cockpit.rename_session` did not update the session title");
+        }
+        Ok(serde_json::json!({
+            "renamed": true,
+            "title": name
+        }))
+    })
+}
+
+fn request_compact<'a>(
+    ctx: &'a HostContext,
+    _args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        if !ctx.root_agent_frame {
+            bail!(
+                "`cockpit.request_compact` is unavailable: compaction can only be requested from the root agent frame"
+            );
+        }
+        let session = ctx
+            .session
+            .as_ref()
+            .context("`cockpit.request_compact` requires a live session")?;
+        session.request_agent_compact();
+        Ok(serde_json::json!({
+            "scheduled": true,
+            "message": "Compaction is scheduled for the next safe boundary."
+        }))
+    })
+}
+
+fn context_usage<'a>(
+    ctx: &'a HostContext,
+    _args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let Some(snapshot) = ctx.context_usage else {
+            return Ok(serde_json::json!({
+                "ctx_pct": null,
+                "used_tokens": null,
+                "total_tokens": null,
+                "auto_compact_pct": null,
+                "snapshot": "unavailable"
+            }));
+        };
+        Ok(serde_json::json!({
+            "ctx_pct": snapshot.ctx_pct,
+            "used_tokens": snapshot.used_tokens,
+            "total_tokens": snapshot.total_tokens,
+            "auto_compact_pct": snapshot.auto_compact_pct,
+            "snapshot": "turn_start"
+        }))
+    })
 }
 
 #[cfg(test)]
@@ -240,5 +405,222 @@ impl ValueTypeName for Value {
             Value::Array(_) => "array",
             Value::Object(_) => "object",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config(root: &std::path::Path, body: &str) {
+        let dir = root.join(".cockpit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), body).unwrap();
+    }
+
+    fn host(root: &std::path::Path) -> HostContext {
+        let ctx = crate::tools::common::test_ctx(root);
+        HostContext::from_tool_ctx(&ctx)
+    }
+
+    #[tokio::test]
+    async fn rename_session_gated_on_auto_title_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{ "utility_model": null, "auto_title": null }"#,
+        );
+        let host = host(tmp.path());
+        assert!(
+            search(&host, "rename_session")
+                .iter()
+                .any(|hit| hit.tool == "rename_session")
+        );
+        let desc = describe(&host, "rename_session").unwrap();
+        assert_eq!(desc.name, "rename_session");
+
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        assert!(
+            !search(&host, "rename_session")
+                .iter()
+                .any(|hit| hit.tool == "rename_session")
+        );
+        let err = describe(&host, "rename_session").unwrap_err();
+        assert!(err.to_string().contains("auto-titling is configured"));
+        let err = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": "A title" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("auto-titling is configured"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_writes_explicit_auto_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{ "utility_model": null, "auto_title": null }"#,
+        );
+        let host = host(tmp.path());
+        let session = host.session.as_ref().unwrap();
+
+        let out = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": "  agent title  " }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["title"], "agent title");
+        let row = session.db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("agent title"));
+        assert!(!row.user_renamed);
+
+        session
+            .db
+            .rename_session(session.id, "manual title")
+            .unwrap();
+        let row = session.db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("manual title"));
+        assert!(row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn rename_session_refuses_user_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{ "utility_model": null, "auto_title": null }"#,
+        );
+        let host = host(tmp.path());
+        let session = host.session.as_ref().unwrap();
+        session.db.rename_session(session.id, "manual").unwrap();
+
+        let err = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": "agent" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("manually named"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_refuses_ephemeral() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{ "utility_model": null, "auto_title": null }"#,
+        );
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent =
+            crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let side = db.create_ephemeral_fork(parent.id, None).unwrap();
+        let session = Arc::new(
+            crate::session::Session::resume(db, side.session_id)
+                .unwrap()
+                .unwrap(),
+        );
+        let host = HostContext {
+            db: Some(session.db.clone()),
+            session_id: Some(session.id),
+            cwd: tmp.path().to_path_buf(),
+            session: Some(session),
+            root_agent_frame: true,
+            context_usage: None,
+            test_builtin_gate: None,
+        };
+
+        let err = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": "agent" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("ephemeral"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_validates_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{ "utility_model": null, "auto_title": null }"#,
+        );
+        let host = host(tmp.path());
+
+        let err = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": "   " }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
+
+        let too_long = "x".repeat(201);
+        let err = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": too_long }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("200 characters"));
+    }
+
+    #[tokio::test]
+    async fn request_compact_refused_in_subagent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host(tmp.path());
+        host.root_agent_frame = false;
+        let session = host.session.as_ref().unwrap();
+
+        let err = invoke(&host, "request_compact", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("root agent"));
+        assert!(!session.agent_compact_requested());
+    }
+
+    #[tokio::test]
+    async fn request_compact_sets_one_shot_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = host(tmp.path());
+        let session = host.session.as_ref().unwrap();
+
+        let out = invoke(&host, "request_compact", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["scheduled"], true);
+        assert!(session.agent_compact_requested());
+        assert!(session.take_agent_compact_request());
+        assert!(!session.take_agent_compact_request());
+    }
+
+    #[tokio::test]
+    async fn context_usage_reports_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host(tmp.path());
+        host.context_usage = Some(ContextUsageSnapshot {
+            ctx_pct: Some(42.5),
+            used_tokens: Some(425),
+            total_tokens: Some(1000),
+            auto_compact_pct: 80,
+        });
+
+        let out = invoke(&host, "context_usage", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["ctx_pct"], 42.5);
+        assert_eq!(out["used_tokens"], 425);
+        assert_eq!(out["total_tokens"], 1000);
+        assert_eq!(out["auto_compact_pct"], 80);
+        assert_eq!(out["snapshot"], "turn_start");
     }
 }

@@ -381,19 +381,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_with_no_servers_returns_empty_list() {
+    async fn search_with_no_configured_servers_returns_builtin_hits() {
         let cfg = McpConfig::default();
         let out = run("mcp.search('x')", &cfg).await.unwrap();
-        assert_eq!(out, "[]");
+        let hits: Vec<Value> = serde_json::from_str(&out).unwrap();
+        let mut tools = hits
+            .iter()
+            .filter(|hit| hit["server"] == "cockpit")
+            .filter_map(|hit| hit["tool"].as_str())
+            .collect::<Vec<_>>();
+        tools.sort_unstable();
+        assert_eq!(tools, ["context_usage", "request_compact"]);
+        assert!(hits.iter().all(|hit| hit["server"] == "cockpit"), "{out}");
     }
 
     #[tokio::test]
-    async fn printed_search_with_no_servers_returns_empty_list() {
+    async fn printed_search_with_no_configured_servers_returns_builtin_hits() {
         let cfg = McpConfig::default();
         let out = run("result = mcp.search('x')\nprint(result)", &cfg)
             .await
             .unwrap();
-        assert_eq!(out, "[]");
+        let hits: Vec<Value> = serde_json::from_str(&out).unwrap();
+        let mut tools = hits
+            .iter()
+            .filter(|hit| hit["server"] == "cockpit")
+            .filter_map(|hit| hit["tool"].as_str())
+            .collect::<Vec<_>>();
+        tools.sort_unstable();
+        assert_eq!(tools, ["context_usage", "request_compact"]);
+        assert!(hits.iter().all(|hit| hit["server"] == "cockpit"), "{out}");
     }
 
     #[tokio::test]
@@ -736,10 +752,15 @@ for line in sys.stdin:
             .await
             .unwrap();
         let json: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(json[0]["server"], "fake");
-        assert_eq!(json[0]["tool"], "count");
-        assert_eq!(json[0]["description"], "Count numbers");
-        assert!(json[0].get("input_schema").is_none(), "{out}");
+        let fake = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["server"] == "fake")
+            .expect("fake server hit");
+        assert_eq!(fake["tool"], "count");
+        assert_eq!(fake["description"], "Count numbers");
+        assert!(fake.get("input_schema").is_none(), "{out}");
     }
 
     #[tokio::test]

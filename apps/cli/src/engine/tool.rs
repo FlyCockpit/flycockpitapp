@@ -333,6 +333,25 @@ pub struct ResourceMeta {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ContextUsageSnapshot {
+    pub ctx_pct: Option<f64>,
+    pub used_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub auto_compact_pct: u8,
+}
+
+impl ContextUsageSnapshot {
+    pub fn unavailable() -> Self {
+        Self {
+            ctx_pct: None,
+            used_tokens: None,
+            total_tokens: None,
+            auto_compact_pct: crate::config::providers::ContextConfig::default().auto_compact_pct,
+        }
+    }
+}
+
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
@@ -482,6 +501,11 @@ pub struct ToolCtx {
     /// interactive path, and contexts with no subagent (tests, seed-tool
     /// re-exec) — `seed` there is a no-op drain nobody reads.
     pub seeds: crate::engine::seed_collector::SeedCollector,
+    /// Whether this tool call belongs to the foreground root frame. Driver-level
+    /// controls such as agent-requested compaction are only valid there.
+    pub root_agent_frame: bool,
+    /// Turn-start context-pressure snapshot for model-facing introspection.
+    pub context_usage: Option<ContextUsageSnapshot>,
     /// Whether the calling agent holds the `tree` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests `tree` only when the agent can use it) rather than

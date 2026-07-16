@@ -176,6 +176,7 @@ impl Session {
             sandbox_escalation_enabled: AtomicBool::new(true),
             sandbox_escalation_notice_state: AtomicBool::new(true),
             mcp_reserved_cockpit_notice_sent: AtomicBool::new(false),
+            agent_compact_requested: AtomicBool::new(false),
             // Default `manual` until the spawn path applies the config default.
             approval_mode: AtomicU8::new(approval_mode_to_u8(
                 crate::config::extended::ApprovalMode::Manual,

@@ -1171,6 +1171,8 @@ mod tests {
             approver: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: true,
+            context_usage: None,
             has_tree: false,
             has_bash: false,
             events: Some(tx.clone()),

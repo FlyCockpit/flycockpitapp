@@ -88,10 +88,10 @@ pub struct Agent {
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
-pub(crate) fn turn_toolbox(agent: &Agent, session: &Session) -> ToolBox {
+pub(crate) fn turn_toolbox(agent: &Agent, session: &Session, cwd: &std::path::Path) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode);
-    let adverts = crate::tools::mcp_tool::current_mcp_description_adverts();
+    let adverts = crate::tools::mcp_tool::current_mcp_description_adverts(session, cwd);
     crate::tools::mcp_tool::apply_mcp_description_adverts(&mut toolbox, &adverts);
     toolbox
 }
@@ -377,6 +377,7 @@ pub async fn turn(
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     loop_guard_threshold: u32,
     is_root: bool,
+    context_usage: crate::engine::tool::ContextUsageSnapshot,
     deferred_log: crate::engine::deferred::DeferredLog,
     seeds: crate::engine::seed_collector::SeedCollector,
     emit_inference_error_ui: bool,
@@ -411,6 +412,7 @@ pub async fn turn(
         resource_scheduler: resource_scheduler.as_ref(),
         loop_guard_threshold,
         is_root,
+        context_usage,
         deferred_log,
         seeds,
         emit_inference_error_ui,

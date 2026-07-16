@@ -95,6 +95,19 @@ impl Session {
         )
     }
 
+    pub fn request_agent_compact(&self) {
+        self.agent_compact_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_agent_compact_request(&self) -> bool {
+        self.agent_compact_requested.swap(false, Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn agent_compact_requested(&self) -> bool {
+        self.agent_compact_requested.load(Ordering::Relaxed)
+    }
+
     /// The session's current command-approval mode
     /// (implementation note). Read per gated tool call.
     pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {

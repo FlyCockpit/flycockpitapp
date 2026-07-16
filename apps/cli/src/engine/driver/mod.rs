@@ -1834,7 +1834,7 @@ impl Driver {
                 agent.name
             );
         }
-        let active_tools = crate::engine::agent::turn_toolbox(&agent, &self.session);
+        let active_tools = crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd);
         if active_tools.get(&payload.tool).is_none() {
             bail!("parked interrupt tool `{}` is not registered", payload.tool);
         }
@@ -1864,6 +1864,8 @@ impl Driver {
                 .deferred_log
                 .clone(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: self.stack.len() == 1,
+            context_usage: Some(self.context_usage_snapshot()),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             events: Some(tx.clone()),
@@ -1945,6 +1947,7 @@ impl Driver {
             let is_root = self.stack.len() == 1;
             let backup_model = self.resolve_backup_model(&agent.model);
             let call_id = uuid::Uuid::new_v4();
+            let context_usage = self.context_usage_snapshot();
             let tandem = self
                 .tandem_set
                 .is_enabled()
@@ -1968,6 +1971,7 @@ impl Driver {
                     self.resource_scheduler.clone(),
                     self.loop_guard_threshold,
                     is_root,
+                    context_usage,
                     deferred_log,
                     crate::engine::seed_collector::SeedCollector::new(),
                     call_id,
@@ -3635,6 +3639,22 @@ impl Driver {
         Self::context_config_from(self.active_providers_config().as_ref())
     }
 
+    fn context_usage_snapshot(&self) -> crate::engine::tool::ContextUsageSnapshot {
+        let ctx_cfg = self.resolve_context_config();
+        let total_tokens = self.active_model_context_length().map(u64::from);
+        let used_tokens = self.session.last_usage().map(|usage| usage.input_tokens);
+        let ctx_pct = match (used_tokens, total_tokens) {
+            (Some(used), Some(total)) if total > 0 => Some(used as f64 / total as f64 * 100.0),
+            _ => None,
+        };
+        crate::engine::tool::ContextUsageSnapshot {
+            ctx_pct,
+            used_tokens,
+            total_tokens,
+            auto_compact_pct: ctx_cfg.auto_compact_pct,
+        }
+    }
+
     /// [`Self::resolve_context_config`] against a pre-loaded providers config
     /// (from one [`Self::active_providers_config`] call shared across
     /// several resolves).
@@ -4572,6 +4592,7 @@ impl Driver {
             // call's records and this turn's tandem (shadow) records to the same
             // call (implementation note).
             let call_id = uuid::Uuid::new_v4();
+            let context_usage = self.context_usage_snapshot();
 
             // Model-comparison tandem (shadow) set for this turn. Cloned out of
             // `self` (cheap — Arc-of-models) so the borrow doesn't conflict with
@@ -4607,6 +4628,7 @@ impl Driver {
                     self.resource_scheduler.clone(),
                     self.loop_guard_threshold,
                     is_root,
+                    context_usage,
                     deferred_log,
                     // The main/interactive frames never register the `seed`
                     // tool (it's a read-only-noninteractive-subagent + normal-

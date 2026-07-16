@@ -3792,6 +3792,63 @@ async fn auto_compact_fires_at_threshold_once() {
     );
 }
 
+#[tokio::test]
+async fn request_compact_honored_at_safe_boundary() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    driver.auto_compacted = true;
+    driver.session.request_agent_compact();
+
+    assert!(
+        driver.maybe_auto_compact(&tx).await,
+        "agent-requested compaction bypasses the auto latch"
+    );
+    assert!(!driver.session.agent_compact_requested());
+    assert_eq!(driver.stack[0].history.len(), 1, "history reset to handoff");
+    drop(tx);
+    let mut saw_compact_ready = false;
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, TurnEvent::CompactReady { .. }) {
+            saw_compact_ready = true;
+        }
+    }
+    assert!(saw_compact_ready, "compaction emits CompactReady");
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    let compact_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "session_compacted")
+        .collect();
+    assert_eq!(compact_events.len(), 1);
+    assert_eq!(compact_events[0].data["source"], "agent_requested");
+}
+
+#[tokio::test]
+async fn request_compact_coalesces() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    driver.session.request_agent_compact();
+    driver.session.request_agent_compact();
+
+    assert!(driver.maybe_auto_compact(&tx).await);
+    assert!(!driver.maybe_auto_compact(&tx).await);
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    let compact_count = events
+        .iter()
+        .filter(|event| event.kind == "session_compacted")
+        .count();
+    assert_eq!(compact_count, 1);
+}
+
 /// `classify_prune_reason` reports the telemetry reason from a plan's
 /// targets (Part D).
 #[test]

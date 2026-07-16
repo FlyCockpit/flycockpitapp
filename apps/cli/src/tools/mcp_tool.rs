@@ -50,8 +50,35 @@ pub(crate) fn apply_mcp_description_adverts(toolbox: &mut ToolBox, adverts: &[St
     toolbox.set_override_if_changed("mcp", override_text)
 }
 
-pub(crate) fn current_mcp_description_adverts() -> Vec<String> {
-    Vec::new()
+pub(crate) fn current_mcp_description_adverts(
+    session: &crate::session::Session,
+    cwd: &std::path::Path,
+) -> Vec<String> {
+    let mut adverts = Vec::new();
+    let auto_title_disabled = crate::config::extended::load_for_cwd(cwd)
+        .auto_title_model_ref()
+        .is_none();
+    let session_row = session.db.get_session(session.id).ok().flatten();
+    let ephemeral = session_row.as_ref().is_some_and(|row| row.ephemeral);
+    if auto_title_disabled && !session.user_renamed() && !ephemeral {
+        adverts.push(
+            "Session auto-titling is disabled; you may name this session via mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": ...})."
+                .to_string(),
+        );
+    }
+    if session
+        .db
+        .current_session_goal(session.id, false)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        adverts.push(
+            "A goal is active; if context pressure builds (check mcp.invoke(\"cockpit\", \"context_usage\", {})), you may schedule compaction via mcp.invoke(\"cockpit\", \"request_compact\", {})."
+                .to_string(),
+        );
+    }
+    adverts
 }
 
 #[async_trait]
@@ -145,6 +172,21 @@ mod tests {
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
             Ok(ToolOutput::text("ok"))
         }
+    }
+
+    fn write_config(root: &std::path::Path, body: &str) {
+        let dir = root.join(".cockpit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), body).unwrap();
+    }
+
+    fn mcp_description(toolbox: &ToolBox) -> String {
+        toolbox
+            .definitions(LlmMode::Normal)
+            .into_iter()
+            .find(|definition| definition.name == "mcp")
+            .unwrap()
+            .description
     }
 
     #[test]
@@ -246,6 +288,57 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
+    #[test]
+    fn advert_rename_follows_auto_title_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{ "utility_model": null, "auto_title": null }"#,
+        );
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
+
+        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
+        let desc = mcp_description(&toolbox);
+        assert!(desc.contains("rename_session"), "{desc}");
+
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
+        let desc = mcp_description(&toolbox);
+        assert!(!desc.contains("rename_session"), "{desc}");
+    }
+
+    #[test]
+    fn advert_compact_follows_goal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
+
+        ctx.session
+            .db
+            .create_session_goal(
+                ctx.session.id,
+                &ctx.session.project_id,
+                "ship feature",
+                None,
+                None,
+            )
+            .unwrap();
+        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
+        let desc = mcp_description(&toolbox);
+        assert!(desc.contains("request_compact"), "{desc}");
+        assert!(desc.contains("context_usage"), "{desc}");
+
+        ctx.session.db.clear_session_goal(ctx.session.id).unwrap();
+        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
+        let desc = mcp_description(&toolbox);
+        assert!(!desc.contains("request_compact"), "{desc}");
+    }
+
     #[tokio::test]
     async fn config_cockpit_server_id_is_reserved() {
         let tmp = tempfile::tempdir().unwrap();
@@ -274,14 +367,7 @@ mod tests {
             .await
             .unwrap();
         let hits: Value = serde_json::from_str(&output.content).unwrap();
-        assert!(
-            hits.as_array()
-                .unwrap()
-                .iter()
-                .all(|hit| hit["server"] != "cockpit"),
-            "{}",
-            output.content
-        );
+        assert_no_configured_cockpit_hits(&hits, &output.content);
         let notice = rx.try_recv().expect("expected reserved-id notice");
         assert!(
             matches!(notice, TurnEvent::Notice { ref text } if text.contains("reserved")),
@@ -293,14 +379,23 @@ mod tests {
             .await
             .unwrap();
         let hits: Value = serde_json::from_str(&output.content).unwrap();
-        assert!(
-            hits.as_array()
-                .unwrap()
-                .iter()
-                .all(|hit| hit["server"] != "cockpit"),
-            "{}",
-            output.content
-        );
+        assert_no_configured_cockpit_hits(&hits, &output.content);
         assert!(rx.try_recv().is_err(), "notice should be once per session");
+    }
+
+    fn assert_no_configured_cockpit_hits(hits: &Value, output: &str) {
+        let configured_cockpit_hits = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|hit| hit["server"] == "cockpit")
+            .filter(|hit| {
+                !matches!(
+                    hit["tool"].as_str(),
+                    Some("rename_session" | "request_compact" | "context_usage")
+                )
+            })
+            .count();
+        assert_eq!(configured_cockpit_hits, 0, "{output}");
     }
 }

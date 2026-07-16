@@ -958,9 +958,13 @@ fn run_diff(app: &mut App, args: &str) -> bool {
 }
 
 fn run_sessions(app: &mut App, _: &str) -> bool {
+    let daemon_socket = app
+        .sessions_daemon_socket()
+        .map(std::path::Path::to_path_buf);
     app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
         &app.launch.cwd,
         app.daemon_connected,
+        daemon_socket,
     ));
     if app.daemon_connected {
         app.start_sessions_list_action();

@@ -990,28 +990,36 @@ pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result
 /// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
 /// forks of `s`; both `None` → every open session (all-projects scope).
 pub fn list_sessions_blocking(
+    socket: &Path,
     project_id: Option<String>,
     parent_session_id: Option<uuid::Uuid>,
 ) -> Result<Vec<proto::SessionSummary>, String> {
-    match daemon_request_blocking(Request::ListSessions {
-        project_id,
-        parent_session_id,
-    })? {
+    match daemon_request_at_blocking(
+        socket,
+        Request::ListSessions {
+            project_id,
+            parent_session_id,
+        },
+    )? {
         Response::Sessions { sessions } => Ok(sessions),
         other => Err(format!("unexpected list_sessions response: {other:?}")),
     }
 }
 
 pub fn read_session_messages_blocking(
+    socket: &Path,
     session_id: uuid::Uuid,
     before_seq: Option<i64>,
     limit: u32,
 ) -> Result<(Vec<proto::SessionMessage>, bool), String> {
-    match daemon_request_blocking(Request::ReadSessionMessages {
-        session_id,
-        before_seq,
-        limit,
-    })? {
+    match daemon_request_at_blocking(
+        socket,
+        Request::ReadSessionMessages {
+            session_id,
+            before_seq,
+            limit,
+        },
+    )? {
         Response::SessionMessages {
             session_id: got,
             messages,
@@ -1047,9 +1055,10 @@ pub fn promote_resource_blocking(
 /// session ids. Daemon down / no live worker → empty map; callers treat
 /// absent ids as not-processing / no-jobs.
 pub fn session_live_status_blocking(
+    socket: &Path,
     session_ids: Vec<uuid::Uuid>,
 ) -> std::collections::HashMap<uuid::Uuid, (bool, bool)> {
-    match daemon_request_blocking(Request::SessionLiveStatus { session_ids }) {
+    match daemon_request_at_blocking(socket, Request::SessionLiveStatus { session_ids }) {
         Ok(Response::SessionLiveStatus { statuses }) => statuses
             .into_iter()
             .map(|s| (s.session_id, (s.has_active_schedules, s.processing)))

@@ -332,6 +332,10 @@ pub struct SessionsPane {
     /// RPC path (live status intact). `false` daemonless: it reads
     /// [`Self::db`] directly and disables resume/archive/delete.
     daemon_connected: bool,
+    /// Socket for the daemon this pane is attached to. Present only for the
+    /// daemon-connected RPC path, including ephemeral daemons that are not
+    /// discoverable through the canonical daemon location.
+    daemon_socket: Option<std::path::PathBuf>,
     use_emojis: bool,
     /// Read-only session DB handle, opened only in the daemonless case so
     /// the browser can list without a daemon. `None` when daemon-connected
@@ -407,7 +411,11 @@ impl SessionsPane {
     /// ([`Db::open_default`], same as `/stats`), with resume / archive /
     /// delete disabled. A daemonless DB-open failure surfaces as an inline
     /// error, not a crash, and the pane still opens (empty list).
-    pub fn open(cwd: &std::path::Path, daemon_connected: bool) -> Self {
+    pub fn open(
+        cwd: &std::path::Path,
+        daemon_connected: bool,
+        daemon_socket: Option<std::path::PathBuf>,
+    ) -> Self {
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
             Scope::Project
@@ -434,6 +442,7 @@ impl SessionsPane {
             notice: None,
             loading: None,
             daemon_connected,
+            daemon_socket,
             use_emojis,
             db,
             last_body_height: 0,
@@ -564,7 +573,10 @@ impl SessionsPane {
         parent: Option<Uuid>,
     ) -> Vec<(SessionSummary, Tier)> {
         let listed = if self.daemon_connected {
-            agent_runner::list_sessions_blocking(project_id, parent)
+            match self.daemon_socket.as_deref() {
+                Some(socket) => agent_runner::list_sessions_blocking(socket, project_id, parent),
+                None => Err("daemon socket unavailable for sessions.list".to_string()),
+            }
         } else {
             self.list_sessions_daemonless(project_id.as_deref(), parent)
         };
@@ -580,7 +592,10 @@ impl SessionsPane {
                 // `classify` handles without error.
                 let live = if self.daemon_connected {
                     let ids: Vec<Uuid> = sessions.iter().map(|s| s.session_id).collect();
-                    agent_runner::session_live_status_blocking(ids)
+                    self.daemon_socket
+                        .as_deref()
+                        .map(|socket| agent_runner::session_live_status_blocking(socket, ids))
+                        .unwrap_or_default()
                 } else {
                     std::collections::HashMap::new()
                 };
@@ -989,7 +1004,11 @@ impl SessionsPane {
         // without an extra round-trip.
         let descendants = s.descendant_count;
         // Live status drives the interrupt-first warning.
-        let live_map = agent_runner::session_live_status_blocking(vec![s.session_id]);
+        let live_map = self
+            .daemon_socket
+            .as_deref()
+            .map(|socket| agent_runner::session_live_status_blocking(socket, vec![s.session_id]))
+            .unwrap_or_default();
         let live = live_map
             .get(&s.session_id)
             .map(|(j, p)| *j || *p)
@@ -2721,6 +2740,8 @@ mod tests {
             notice: None,
             loading: None,
             daemon_connected,
+            daemon_socket: daemon_connected
+                .then(|| std::path::PathBuf::from("/tmp/cockpit-test.sock")),
             use_emojis: true,
             db: None,
             last_body_height: 100,
@@ -2826,7 +2847,11 @@ mod tests {
     #[test]
     fn daemon_connected_open_starts_loading_without_blocking() {
         let tmp = tempfile::tempdir().unwrap();
-        let pane = SessionsPane::open(tmp.path(), true);
+        let pane = SessionsPane::open(
+            tmp.path(),
+            true,
+            Some(tmp.path().join("missing-daemon.sock")),
+        );
 
         assert_eq!(pane.loading, Some("Loading sessions..."));
         assert!(pane.current().cards.is_empty());

@@ -4531,28 +4531,41 @@ impl App {
         }
     }
 
+    fn sessions_daemon_socket(&self) -> Option<&Path> {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok().map(|runner| runner.socket.as_path()))
+            .or(self.startup_background.daemon_socket.as_deref())
+    }
+
     pub(super) fn start_sessions_list_action(&mut self) {
         let Overlay::Sessions(pane) = &self.overlay else {
             return;
         };
         let (project_id, parent) = pane.root_request();
+        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.list")),
             move || {
-                crate::tui::agent_runner::list_sessions_blocking(project_id, parent)
+                let socket = socket
+                    .ok_or_else(|| "daemon socket unavailable for sessions.list".to_string())?;
+                crate::tui::agent_runner::list_sessions_blocking(&socket, project_id, parent)
                     .map(AsyncActionPayload::Sessions)
             },
         );
     }
 
     fn start_sessions_live_status_action(&mut self, ids: Vec<uuid::Uuid>) {
+        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.live"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.live")),
             move || {
+                let socket = socket
+                    .ok_or_else(|| "daemon socket unavailable for sessions.live".to_string())?;
                 Ok(AsyncActionPayload::SessionLiveStatus(
-                    crate::tui::agent_runner::session_live_status_blocking(ids),
+                    crate::tui::agent_runner::session_live_status_blocking(&socket, ids),
                 ))
             },
         );
@@ -4563,13 +4576,16 @@ impl App {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
     ) {
+        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.preview"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.preview")),
             move || {
+                let socket = socket
+                    .ok_or_else(|| "daemon socket unavailable for sessions.preview".to_string())?;
                 let (messages, has_more) =
                     crate::tui::agent_runner::read_session_messages_blocking(
-                        session_id, before_seq, 50,
+                        &socket, session_id, before_seq, 50,
                     )?;
                 Ok(AsyncActionPayload::SessionMessages {
                     session_id,
@@ -11806,6 +11822,7 @@ mod keys_overlay_tests {
     use crate::daemon::proto::{
         InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary,
     };
+    use crate::tui::async_action::AsyncActionKind;
     use crate::tui::keys_overlay::KeyContext;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
@@ -11929,6 +11946,35 @@ mod keys_overlay_tests {
         )
     }
 
+    fn app_with_sessions_preview_pane(tmp: &tempfile::TempDir) -> App {
+        let mut app = configured_app(tmp);
+        let dead_socket = tmp.path().join("no-daemon.sock");
+        app.daemon_prompt = None;
+        app.daemon_connected = true;
+        app.startup_background.daemon_socket = Some(dead_socket.clone());
+        let session_id = Uuid::new_v4();
+        let mut pane =
+            crate::tui::sessions_pane::SessionsPane::open(&app.launch.cwd, true, Some(dead_socket));
+        pane.apply_sessions_result(Ok(vec![session_summary(
+            session_id,
+            app.launch.cwd.display().to_string(),
+        )]));
+        app.overlay = Overlay::Sessions(pane);
+        app
+    }
+
+    async fn drain_async_actions_until_idle(app: &mut App) {
+        for _ in 0..100 {
+            app.drain_async_actions();
+            if app.async_actions.pending_count() == 0 {
+                app.drain_async_actions();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("async actions did not finish");
+    }
+
     #[test]
     fn question_dialog_shadows_and_resumes_an_open_overlay() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11936,6 +11982,7 @@ mod keys_overlay_tests {
         app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
             &app.launch.cwd,
             false,
+            None,
         ));
 
         assert_eq!(app.key_context(), KeyContext::Sessions);
@@ -11947,34 +11994,55 @@ mod keys_overlay_tests {
         assert!(matches!(app.overlay, Overlay::Sessions(_)));
     }
 
-    #[tokio::test]
-    async fn sessions_resize_to_split_render_starts_preview_rpc() {
+    #[test]
+    fn sessions_preview_action_enqueued_on_split_render() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
-        app.daemon_prompt = None;
-        let session_id = Uuid::new_v4();
-        let mut pane = crate::tui::sessions_pane::SessionsPane::open(&app.launch.cwd, true);
-        pane.apply_sessions_result(Ok(vec![session_summary(
-            session_id,
-            app.launch.cwd.display().to_string(),
-        )]));
-        app.overlay = Overlay::Sessions(pane);
+        let mut app = app_with_sessions_preview_pane(&tmp);
         assert_eq!(app.async_actions.pending_count(), 0);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(
+            app.async_actions.pending_kinds(),
+            vec![AsyncActionKind::DaemonRpc("sessions.preview")]
+        );
+        let pending_ids = app.async_actions.pending_ids();
+        assert_eq!(pending_ids.len(), 1);
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(
+            app.async_actions.pending_kinds(),
+            vec![AsyncActionKind::DaemonRpc("sessions.preview")]
+        );
+        assert_eq!(app.async_actions.pending_ids(), pending_ids);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_preview_rpc_failure_sets_preview_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_sessions_preview_pane(&tmp);
 
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
+        drain_async_actions_until_idle(&mut app).await;
 
-        for _ in 0..50 {
-            app.drain_async_actions();
-            if let Overlay::Sessions(pane) = &app.overlay
-                && pane.preview_error().is_some()
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("split-layout render did not start and apply the daemon preview RPC failure");
+        let Overlay::Sessions(pane) = &app.overlay else {
+            panic!("sessions pane should still be open");
+        };
+        let error = pane
+            .preview_error()
+            .expect("failed preview RPC should set a preview error");
+        assert!(
+            error.contains("daemon connect"),
+            "unexpected preview error: {error}"
+        );
     }
 
     /// The leader (`Ctrl+K`) in the main chat opens the overlay in the
@@ -12012,6 +12080,7 @@ mod keys_overlay_tests {
         app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
             &app.launch.cwd,
             false,
+            None,
         ));
         app.handle_key(ctrl('k'));
         let overlay = app.keys_overlay.as_ref().expect("leader opens over a pane");

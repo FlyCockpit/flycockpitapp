@@ -183,6 +183,21 @@ impl AsyncActionRunner {
         self.pending.len()
     }
 
+    #[cfg(test)]
+    pub fn pending_kinds(&self) -> Vec<AsyncActionKind> {
+        self.pending
+            .values()
+            .map(|pending| pending.kind.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn pending_ids(&self) -> Vec<AsyncActionId> {
+        let mut ids: Vec<_> = self.pending.keys().copied().collect();
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
+
     pub fn notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.notify)
     }

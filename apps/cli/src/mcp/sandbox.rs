@@ -33,6 +33,7 @@ use monty::{
 };
 use serde_json::Value;
 
+use super::builtin::HostContext;
 use super::config::McpConfig;
 
 const STDOUT_FALLBACK_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
@@ -53,7 +54,13 @@ fn limits() -> ResourceLimits {
 /// script's final value rendered as JSON text (the only thing that enters
 /// model context), except that printed stdout is returned as a bounded
 /// fallback when the final value is `None`.
+#[allow(dead_code)]
 pub async fn run(script: &str, cfg: &McpConfig) -> Result<String> {
+    let host = HostContext::empty_for_tests();
+    run_with_host(script, cfg, &host).await
+}
+
+pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) -> Result<String> {
     let runner = MontyRun::new(script.to_owned(), "mcp.py", vec!["mcp".to_owned()])
         .map_err(|e| anyhow::anyhow!("Python compile error: {}", exc_msg(&e)))?;
 
@@ -84,7 +91,8 @@ pub async fn run(script: &str, cfg: &McpConfig) -> Result<String> {
                 return render_complete_value(&value, &stdout);
             }
             RunProgress::FunctionCall(call) => {
-                let result = dispatch(cfg, &call.function_name, call.method_call, &call.args).await;
+                let result =
+                    dispatch(cfg, host, &call.function_name, call.method_call, &call.args).await;
                 let ext = match result {
                     Ok(obj) => ExtFunctionResult::Return(obj),
                     Err(msg) => ExtFunctionResult::Error(MontyException::new(
@@ -163,6 +171,7 @@ fn exc_msg(e: &MontyException) -> String {
 /// `describe`, `invoke`.
 async fn dispatch(
     cfg: &McpConfig,
+    host: &HostContext,
     name: &str,
     method_call: bool,
     args: &[MontyObject],
@@ -182,13 +191,13 @@ async fn dispatch(
                     return Err(format!("mcp.search(query) expects a string, got {other:?}"));
                 }
             };
-            let hits = super::catalog::search(cfg, &query).await;
+            let hits = super::catalog::search(cfg, host, &query).await;
             Ok(hits_to_monty(&hits))
         }
         "describe" => {
             let server = str_arg(args, 0, "server", "mcp.describe")?;
             let tool = str_arg(args, 1, "tool", "mcp.describe")?;
-            match super::catalog::describe(cfg, &server, &tool).await {
+            match super::catalog::describe(cfg, host, &server, &tool).await {
                 Ok(desc) => Ok(descriptor_to_monty(&server, &desc)),
                 Err(e) => Err(format!("mcp.describe failed: {e}")),
             }
@@ -200,7 +209,24 @@ async fn dispatch(
                 None | Some(MontyObject::None) => Value::Object(Default::default()),
                 Some(obj) => monty_to_json(obj),
             };
-            if let Some(server_cfg) = cfg.servers.get(&server) {
+            if super::builtin::is_builtin_server(&server) {
+                let tools = super::builtin::available_descriptors(host);
+                match crate::mcp::invoke_prep::repair_invoke_args_from_tools(
+                    &tools,
+                    None,
+                    &server,
+                    &tool,
+                    call_args,
+                    "mcp.invoke",
+                ) {
+                    crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => {
+                        call_args = args;
+                    }
+                    crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
+                        return Err(format!("mcp.invoke failed: {message}"));
+                    }
+                }
+            } else if let Some(server_cfg) = cfg.servers.get(&server) {
                 match crate::mcp::invoke_prep::prepare_invoke_args(
                     &server,
                     server_cfg,
@@ -219,7 +245,7 @@ async fn dispatch(
                     }
                 }
             }
-            match super::catalog::invoke(cfg, &server, &tool, call_args).await {
+            match super::catalog::invoke(cfg, host, &server, &tool, call_args).await {
                 Ok(v) => Ok(json_to_monty(&v)),
                 Err(e) => Err(format!("mcp.invoke failed: {e}")),
             }
@@ -329,6 +355,16 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_builtin_host(open: bool) -> (HostContext, Arc<AtomicBool>) {
+        let gate = Arc::new(AtomicBool::new(open));
+        (
+            HostContext::empty_for_tests().with_test_builtin_gate(gate.clone()),
+            gate,
+        )
+    }
 
     #[tokio::test]
     async fn runs_trivial_script_and_returns_value() {
@@ -358,6 +394,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "[]");
+    }
+
+    #[tokio::test]
+    async fn builtin_search_respects_gate() {
+        let cfg = McpConfig::default();
+        let (host, gate) = test_builtin_host(true);
+        let out = run_with_host("mcp.search('test_count')", &cfg, &host)
+            .await
+            .unwrap();
+        assert!(out.contains("\"server\":\"cockpit\""), "{out}");
+        assert!(out.contains("\"tool\":\"test_count\""), "{out}");
+
+        gate.store(false, Ordering::SeqCst);
+        let out = run_with_host("mcp.search('test_count')", &cfg, &host)
+            .await
+            .unwrap();
+        assert_eq!(out, "[]");
+    }
+
+    #[tokio::test]
+    async fn builtin_describe_gated_on_and_off() {
+        let cfg = McpConfig::default();
+        let (host, gate) = test_builtin_host(true);
+        let out = run_with_host("mcp.describe('cockpit', 'test_count')", &cfg, &host)
+            .await
+            .unwrap();
+        assert!(out.contains("\"server\":\"cockpit\""), "{out}");
+        assert!(out.contains("\"tool\":\"test_count\""), "{out}");
+        assert!(out.contains("\"input_schema\""), "{out}");
+
+        gate.store(false, Ordering::SeqCst);
+        let err = run_with_host("mcp.describe('cockpit', 'test_count')", &cfg, &host)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn builtin_invoke_gate_closed_between_search_and_invoke() {
+        let cfg = McpConfig::default();
+        let (host, gate) = test_builtin_host(true);
+        let out = run_with_host("mcp.search('test_count')", &cfg, &host)
+            .await
+            .unwrap();
+        assert!(out.contains("\"tool\":\"test_count\""), "{out}");
+
+        gate.store(false, Ordering::SeqCst);
+        let err = run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': 1})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn builtin_invoke_repairs_stringified_args() {
+        let cfg = McpConfig::default();
+        let (host, _gate) = test_builtin_host(true);
+        let out = run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': '3'})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("\"count\":3"), "{out}");
+        assert!(out.contains("\"count_type\":\"int\""), "{out}");
     }
 
     #[tokio::test]

@@ -299,9 +299,16 @@ impl McpConfig {
     pub fn enabled_servers(&self) -> Vec<(&str, &ServerConfig)> {
         self.servers
             .iter()
-            .filter(|(_, s)| s.enabled)
+            .filter(|(name, s)| {
+                s.enabled && name.as_str() != crate::mcp::builtin::BUILTIN_SERVER_ID
+            })
             .map(|(n, s)| (n.as_str(), s))
             .collect()
+    }
+
+    pub fn has_reserved_builtin_server_config(&self) -> bool {
+        self.servers
+            .contains_key(crate::mcp::builtin::BUILTIN_SERVER_ID)
     }
 }
 

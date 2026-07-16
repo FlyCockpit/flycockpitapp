@@ -89,7 +89,11 @@ pub struct Agent {
 }
 
 pub(crate) fn turn_toolbox(agent: &Agent, session: &Session) -> ToolBox {
-    toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode)
+    let mut toolbox =
+        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode);
+    let adverts = crate::tools::mcp_tool::current_mcp_description_adverts();
+    crate::tools::mcp_tool::apply_mcp_description_adverts(&mut toolbox, &adverts);
+    toolbox
 }
 
 fn guidance_user_message(body: &str, label: Option<&str>) -> Message {

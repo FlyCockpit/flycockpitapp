@@ -10,6 +10,7 @@
 //! [`catalog`] operations (search / describe / invoke) make up the host side.
 
 pub mod auth;
+pub mod builtin;
 pub mod cache;
 pub mod catalog;
 pub mod client;

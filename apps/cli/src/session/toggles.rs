@@ -82,6 +82,19 @@ impl Session {
         })
     }
 
+    pub fn mcp_reserved_cockpit_server_notice(&self) -> Option<String> {
+        if self
+            .mcp_reserved_cockpit_notice_sent
+            .swap(true, Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(
+            "Ignoring configured MCP server `cockpit`; that server id is reserved for built-in cockpit functions."
+                .to_string(),
+        )
+    }
+
     /// The session's current command-approval mode
     /// (implementation note). Read per gated tool call.
     pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {

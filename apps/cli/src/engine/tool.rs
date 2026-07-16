@@ -695,13 +695,23 @@ impl ToolBox {
     /// the box's serialized form is unaffected. Called by the built-in agent
     /// factories and by the markdown-agent builder to author per-agent intent.
     pub fn with_override(mut self, name: &str, ov: ToolDescOverride) -> Self {
-        if ov.is_empty() {
-            self.overrides.remove(name);
+        self.set_override_if_changed(name, ov);
+        self
+    }
+
+    pub fn set_override_if_changed(&mut self, name: &str, ov: ToolDescOverride) -> bool {
+        let changed = if ov.is_empty() {
+            self.overrides.remove(name).is_some()
+        } else if self.overrides.get(name) == Some(&ov) {
+            false
         } else {
             self.overrides.insert(name.to_string(), ov);
+            true
+        };
+        if changed {
+            self.definition_cache.lock().unwrap().clear();
         }
-        self.definition_cache.lock().unwrap().clear();
-        self
+        changed
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {

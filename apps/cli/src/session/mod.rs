@@ -117,6 +117,7 @@ pub struct Session {
     /// any allowed escalation.
     sandbox_escalation_enabled: AtomicBool,
     sandbox_escalation_notice_state: AtomicBool,
+    mcp_reserved_cockpit_notice_sent: AtomicBool,
     /// Command-approval mode for this session right now
     /// (implementation note), encoded by
     /// [`approval_mode_to_u8`] / [`approval_mode_from_u8`]. Resolved at

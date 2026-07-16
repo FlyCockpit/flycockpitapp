@@ -9,6 +9,7 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 
+use super::builtin::{self, HostContext};
 use super::cache;
 use super::client;
 use super::config::{McpConfig, ServerConfig};
@@ -43,9 +44,9 @@ pub async fn list_tools_cached(name: &str, cfg: &ServerConfig) -> Result<Vec<Too
 /// available?”). Matching is case-insensitive substring over the tool
 /// name + description + server name. Servers that fail to list are
 /// skipped (best-effort), consistent with on-demand discovery.
-pub async fn search(cfg: &McpConfig, query: &str) -> Vec<SearchHit> {
+pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
-    let mut hits = Vec::new();
+    let mut hits = builtin::search(host, query);
     for (name, server) in cfg.enabled_servers() {
         let tools = match list_tools_cached(name, server).await {
             Ok(t) => t,
@@ -66,7 +67,15 @@ pub async fn search(cfg: &McpConfig, query: &str) -> Vec<SearchHit> {
 
 /// Load one tool descriptor for an enabled server. Used by monty
 /// `mcp.describe` and lazy schema fetch before invocation.
-pub async fn describe(cfg: &McpConfig, server: &str, tool: &str) -> Result<ToolDescriptor> {
+pub async fn describe(
+    cfg: &McpConfig,
+    host: &HostContext,
+    server: &str,
+    tool: &str,
+) -> Result<ToolDescriptor> {
+    if builtin::is_builtin_server(server) {
+        return builtin::describe(host, tool);
+    }
     let Some(server_cfg) = cfg.servers.get(server) else {
         bail!("unknown MCP server `{server}`");
     };
@@ -89,7 +98,16 @@ fn matches(q: &str, server: &str, tool: &ToolDescriptor) -> bool {
 /// Invoke a tool on a named server (host side). Used by the Monty
 /// `mcp.invoke` external function. Validates that the server is enabled and
 /// configured.
-pub async fn invoke(cfg: &McpConfig, server: &str, tool: &str, args: Value) -> Result<Value> {
+pub async fn invoke(
+    cfg: &McpConfig,
+    host: &HostContext,
+    server: &str,
+    tool: &str,
+    args: Value,
+) -> Result<Value> {
+    if builtin::is_builtin_server(server) {
+        return builtin::invoke(host, tool, args).await;
+    }
     let Some(server_cfg) = cfg.servers.get(server) else {
         bail!("unknown MCP server `{server}`");
     };
@@ -193,19 +211,25 @@ for line in sys.stdin:
     #[tokio::test]
     async fn invoke_rejects_unknown_and_disabled_servers() {
         let mut cfg = McpConfig::default();
-        let err = invoke(&cfg, "nope", "t", Value::Null).await.unwrap_err();
+        let host = HostContext::empty_for_tests();
+        let err = invoke(&cfg, &host, "nope", "t", Value::Null)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unknown MCP server"));
         let mut s = server(DisclosureMode::Monty);
         s.enabled = false;
         cfg.servers.insert("off".into(), s);
-        let err = invoke(&cfg, "off", "t", Value::Null).await.unwrap_err();
+        let err = invoke(&cfg, &host, "off", "t", Value::Null)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("disabled"));
     }
 
     #[tokio::test]
     async fn search_empty_with_no_servers() {
         let cfg = McpConfig::default();
-        assert!(search(&cfg, "anything").await.is_empty());
+        let host = HostContext::empty_for_tests();
+        assert!(search(&cfg, &host, "anything").await.is_empty());
     }
 
     #[tokio::test]
@@ -231,7 +255,8 @@ for line in sys.stdin:
             },
         );
 
-        let hits = search(&cfg, "count").await;
+        let host = HostContext::empty_for_tests();
+        let hits = search(&cfg, &host, "count").await;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].server, "legacy");
         assert_eq!(hits[0].tool, "count");
@@ -259,7 +284,8 @@ for line in sys.stdin:
                 timeout_secs: None,
             },
         );
-        let err = describe(&cfg, "gh", "missing").await.unwrap_err();
+        let host = HostContext::empty_for_tests();
+        let err = describe(&cfg, &host, "gh", "missing").await.unwrap_err();
         assert!(err.to_string().contains("unknown MCP tool"), "{err}");
     }
 

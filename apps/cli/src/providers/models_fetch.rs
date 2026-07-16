@@ -680,6 +680,8 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 quality_rank: None,
                 cost_rank: None,
                 subagent_invokable: None,
+                embeddings: None,
+                embedding_dimensions: None,
                 availability: Default::default(),
                 cache: None,
                 shrink: None,
@@ -714,6 +716,8 @@ fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> ModelCapabiliti
             &["tools", "tool_choice", "functions", "function_calling"],
         ),
         images: images_from_metadata(obj),
+        embeddings: embeddings_from_metadata(obj),
+        embedding_dimensions: embedding_dimensions_from_metadata(obj),
         context_tokens: context_tokens_from_metadata(obj),
         max_output_tokens: max_output_tokens_from_metadata(obj),
         reasoning: capability_status_from_metadata(
@@ -769,6 +773,35 @@ fn u32_from_value(value: &Value) -> Option<u32> {
         Value::String(s) => s.trim().parse::<u32>().ok(),
         _ => None,
     }
+}
+
+fn embeddings_from_metadata(obj: &Map<String, Value>) -> Option<bool> {
+    obj.get("embeddings")
+        .and_then(Value::as_bool)
+        .or_else(|| obj.get("embedding").and_then(Value::as_bool))
+        .or_else(|| {
+            obj.get("capabilities")
+                .and_then(Value::as_object)
+                .and_then(|capabilities| capabilities.get("embeddings"))
+                .and_then(Value::as_bool)
+        })
+}
+
+fn embedding_dimensions_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
+    numeric_field(obj, "embedding_dimensions")
+        .or_else(|| numeric_field(obj, "embedding_dimension"))
+        .or_else(|| numeric_field(obj, "dimensions"))
+        .or_else(|| {
+            obj.get("capabilities")
+                .and_then(Value::as_object)
+                .and_then(|capabilities| {
+                    capabilities
+                        .get("embedding_dimensions")
+                        .or_else(|| capabilities.get("embedding_dimension"))
+                        .or_else(|| capabilities.get("dimensions"))
+                })
+                .and_then(u32_from_value)
+        })
 }
 
 fn images_from_metadata(obj: &Map<String, Value>) -> Option<bool> {

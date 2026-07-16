@@ -605,6 +605,7 @@ fn selector_json(
                                 RequiredModelCapability::Images => "images",
                                 RequiredModelCapability::Reasoning => "reasoning",
                                 RequiredModelCapability::StructuredOutputs => "structured_outputs",
+                                RequiredModelCapability::Embeddings => "embeddings",
                             }
                             .to_string(),
                         )

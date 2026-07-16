@@ -71,6 +71,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "quality_rank",
     "cost_rank",
     "subagent_invokable",
+    "embeddings",
     "availability",
     "wire_api",
     "backup",
@@ -218,8 +219,9 @@ pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effec
 /// about the split on-disk layout.
 #[allow(unused_imports)]
 pub use crate::config::model_policy::{
-    EffectiveModelCapabilities, ModelOptimization, ModelPolicyError, ModelPolicyRequest,
-    ModelPolicySelector, RequiredModelCapability, ResolvedModelPolicy,
+    EffectiveModelCapabilities, EmbeddingModelResolutionError, ModelOptimization, ModelPolicyError,
+    ModelPolicyRequest, ModelPolicySelector, RequiredModelCapability, ResolvedEmbeddingModel,
+    ResolvedModelPolicy,
 };
 
 #[allow(unused_imports)]
@@ -400,6 +402,11 @@ pub struct ProviderEntry {
     /// Missing resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_invokable: Option<bool>,
+
+    /// Provider default for whether models support OpenAI-compatible embeddings.
+    /// Missing resolves to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings: Option<bool>,
 
     /// Optional provider-wide availability restrictions. Empty means no
     /// restriction.
@@ -833,6 +840,14 @@ pub struct ModelEntry {
     /// default, then resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_invokable: Option<bool>,
+    /// Model-level embeddings support override. Missing inherits provider
+    /// default, then resolves to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings: Option<bool>,
+    /// Expected embedding vector dimensions for this model. When set, the
+    /// OpenAI-compatible embedder rejects mismatched responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimensions: Option<u32>,
     /// Optional model-specific availability restrictions. Empty means no
     /// restriction.
     #[serde(default, skip_serializing_if = "ModelAvailability::is_empty")]
@@ -1043,6 +1058,10 @@ pub struct ModelCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimensions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
@@ -1060,6 +1079,8 @@ impl ModelCapabilities {
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_unknown()
             && self.images.is_none()
+            && self.embeddings.is_none()
+            && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
             && self.max_output_tokens.is_none()
             && self.reasoning.is_unknown()
@@ -1079,6 +1100,10 @@ pub struct ModelCapabilityOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimensions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
@@ -1092,6 +1117,8 @@ impl ModelCapabilityOverrides {
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_none()
             && self.images.is_none()
+            && self.embeddings.is_none()
+            && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
             && self.max_output_tokens.is_none()
             && self.reasoning.is_none()
@@ -1105,6 +1132,10 @@ pub struct ProviderCapabilities {
     pub tool_calling: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimensions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1121,6 +1152,8 @@ impl ProviderCapabilities {
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_unknown()
             && self.images.is_none()
+            && self.embeddings.is_none()
+            && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
             && self.max_output_tokens.is_none()
             && self.reasoning.is_unknown()
@@ -1357,6 +1390,12 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     }
     if existing.subagent_invokable.is_some() {
         fetched.subagent_invokable = existing.subagent_invokable;
+    }
+    if existing.embeddings.is_some() {
+        fetched.embeddings = existing.embeddings;
+    }
+    if existing.embedding_dimensions.is_some() {
+        fetched.embedding_dimensions = existing.embedding_dimensions;
     }
     if !existing.availability.is_empty() {
         fetched.availability = existing.availability.clone();

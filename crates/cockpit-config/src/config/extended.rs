@@ -187,6 +187,11 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_model: Option<String>,
 
+    /// Dedicated embedding model selector (`provider:model` or `provider/model`).
+    /// Missing means no embedding role is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+
     /// Full override for the `/compact` handoff-brief instruction
     /// (implementation note). When set and
     /// non-empty it **fully replaces** the default brief prompt text; the
@@ -1276,6 +1281,13 @@ impl ExtendedConfig {
             .filter(|s| !s.is_empty())
             .or(self.utility_model.as_deref())
     }
+
+    pub fn embedding_model_ref(&self) -> Option<&str> {
+        self.embedding_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 impl Default for ExtendedConfig {
@@ -1305,6 +1317,7 @@ impl Default for ExtendedConfig {
             predict_next_message_model: None,
             harness_report_summarization: None,
             compact_model: None,
+            embedding_model: None,
             compact_prompt: None,
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
             preflight: PreflightConfig::default(),
@@ -1519,6 +1532,7 @@ impl ExtendedConfigDoc {
         parse_field!("predict_next_message_model", predict_next_message_model);
         parse_field!("harness_report_summarization", harness_report_summarization);
         parse_field!("compact_model", compact_model);
+        parse_field!("embedding_model", embedding_model);
         parse_field!("compact_prompt", compact_prompt);
         parse_field!("prompt_injection_guard", prompt_injection_guard);
         parse_field!("preflight", preflight);
@@ -1667,6 +1681,7 @@ impl ExtendedConfigDoc {
             "predict_next_message_model",
             "harness_report_summarization",
             "compact_model",
+            "embedding_model",
             "commandResourceProfiles",
             "sandbox",
         ] {

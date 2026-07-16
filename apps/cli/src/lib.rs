@@ -19,6 +19,7 @@ mod credentials;
 mod daemon;
 pub use cockpit_db as db;
 mod diagnostics;
+pub mod embeddings;
 mod engine;
 mod env_snapshot;
 mod envref;

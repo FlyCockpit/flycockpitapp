@@ -1634,3 +1634,94 @@ fn merge_preserves_existing_capabilities_and_provider_metadata() {
     );
     assert_eq!(model.extra.get("upstream"), Some(&serde_json::json!(true)));
 }
+
+#[test]
+fn embeddings_capability_roundtrip() {
+    let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+        "id": "embed-small",
+        "embeddings": true,
+        "embedding_dimensions": 1536,
+        "capabilities": { "embeddings": true, "embedding_dimensions": 1536 }
+    }))
+    .unwrap();
+    assert_eq!(entry.embeddings, Some(true));
+    assert_eq!(entry.embedding_dimensions, Some(1536));
+    assert_eq!(entry.capabilities.embeddings, Some(true));
+    assert_eq!(entry.capabilities.embedding_dimensions, Some(1536));
+
+    let encoded = serde_json::to_value(&entry).unwrap();
+    assert_eq!(encoded["embeddings"], true);
+    assert_eq!(encoded["embedding_dimensions"], 1536);
+}
+
+#[test]
+fn fetch_merge_preserves_embeddings() {
+    let mut existing = model("embed-small", false);
+    existing.embeddings = Some(true);
+    existing.embedding_dimensions = Some(1536);
+    existing.capability_overrides.embeddings = Some(true);
+    existing.capability_overrides.embedding_dimensions = Some(1536);
+
+    let fetched = model("embed-small", false);
+    let merged = merge_fetched_models_with_policy(
+        Some("openai"),
+        &[existing],
+        vec![fetched],
+        ModelMergePolicy::KeepUnlisted,
+    );
+
+    assert_eq!(merged[0].embeddings, Some(true));
+    assert_eq!(merged[0].embedding_dimensions, Some(1536));
+    assert_eq!(merged[0].capability_overrides.embeddings, Some(true));
+    assert_eq!(
+        merged[0].capability_overrides.embedding_dimensions,
+        Some(1536)
+    );
+}
+
+#[test]
+fn resolve_embedding_model_two_level() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "openai".into(),
+        ProviderEntry {
+            embeddings: Some(false),
+            models: vec![
+                ModelEntry {
+                    id: "chat".into(),
+                    embeddings: Some(false),
+                    ..ModelEntry::default()
+                },
+                ModelEntry {
+                    id: "embed".into(),
+                    embeddings: Some(true),
+                    embedding_dimensions: Some(1536),
+                    quality_rank: Some(7),
+                    ..ModelEntry::default()
+                },
+            ],
+            ..ProviderEntry::default()
+        },
+    );
+    let extended = crate::config::extended::ExtendedConfig {
+        embedding_model: Some("openai/embed".into()),
+        ..Default::default()
+    };
+
+    let resolved = cfg.resolve_embedding_model(&extended).unwrap();
+    assert_eq!(resolved.provider, "openai");
+    assert_eq!(resolved.model, "embed");
+    assert_eq!(resolved.embedding_dimensions, Some(1536));
+}
+
+#[test]
+fn embedding_model_unresolvable_is_loud() {
+    let cfg = ProvidersConfig::default();
+    let extended = crate::config::extended::ExtendedConfig {
+        embedding_model: Some("missing/embed".into()),
+        ..Default::default()
+    };
+
+    let err = cfg.resolve_embedding_model(&extended).unwrap_err();
+    assert!(err.to_string().contains("unknown provider `missing`"));
+}

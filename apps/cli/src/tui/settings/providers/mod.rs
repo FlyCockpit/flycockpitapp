@@ -783,6 +783,7 @@ fn provider_entry_from_add(
         quality_rank: None,
         cost_rank: None,
         subagent_invokable: None,
+        embeddings: None,
         availability: Default::default(),
         cache: Default::default(),
         shrink: Default::default(),

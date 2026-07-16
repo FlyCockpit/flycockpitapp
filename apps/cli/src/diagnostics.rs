@@ -108,7 +108,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             format!("false ({container_reason})")
         },
         approval_mode: extended.default_approval_mode.as_str().to_string(),
-        providers: provider_lines(&providers, extended.trusted_only),
+        providers: provider_lines(&providers, &extended),
         harnesses: harness_lines(&harnesses, trust_resolved),
         delegation: delegation_lines(
             &input.active_agent,
@@ -158,9 +158,22 @@ fn workspace_trust_mode(cwd: &Path) -> String {
 
 fn provider_lines(
     cfg: &crate::config::providers::ProvidersConfig,
-    trusted_only: bool,
+    extended: &crate::config::extended::ExtendedConfig,
 ) -> Vec<String> {
+    let trusted_only = extended.trusted_only;
     let mut out = Vec::new();
+    match cfg.resolve_embedding_model(extended) {
+        Ok(resolved) => out.push(format!(
+            "embedding_model: resolved {}/{}{}",
+            resolved.provider,
+            resolved.model,
+            resolved
+                .embedding_dimensions
+                .map(|dims| format!(" ({dims} dims)"))
+                .unwrap_or_default()
+        )),
+        Err(err) => out.push(format!("embedding_model: unresolved ({err})")),
+    }
     for (id, provider) in &cfg.providers {
         let fetch = provider
             .last_model_fetch
@@ -178,6 +191,11 @@ fn provider_lines(
             .iter()
             .filter(|model| cfg.resolve_subagent_invokable(id, &model.id))
             .count();
+        let embedding_count = provider
+            .models
+            .iter()
+            .filter(|model| cfg.resolve_capabilities(id, &model.id).embeddings == Some(true))
+            .count();
         let hidden_count = model_count.saturating_sub(subagent_count);
         let ranked_count = provider
             .models
@@ -190,6 +208,7 @@ fn provider_lines(
         let mut notes = vec![
             format!("trusted {trusted_count}/{model_count}"),
             format!("subagent-invokable {subagent_count}/{model_count}"),
+            format!("embedding-capable {embedding_count}/{model_count}"),
             format!("ranked {ranked_count}/{model_count}"),
         ];
         if hidden_count > 0 {
@@ -428,5 +447,39 @@ mod tests {
             rendered.contains("swarm recursion: max depth 4, max concurrency 5"),
             "{rendered}"
         );
+    }
+    #[test]
+    fn embedding_doctor_reports_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(cockpit.join("providers")).unwrap();
+        let config_path = cockpit.join("config.json");
+        std::fs::write(&config_path, r#"{"embedding_model":"openai/embed"}"#).unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "openai")
+                .unwrap();
+        std::fs::write(
+            provider_path,
+            r#"{
+                "url": "https://openai.example/v1",
+                "models": [
+                    { "id": "embed", "embeddings": true, "embedding_dimensions": 1536 },
+                    { "id": "chat" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let rendered = render(&build_snapshot(base_input(tmp.path())).unwrap());
+
+        assert!(
+            rendered.contains("embedding_model: resolved openai/embed (1536 dims)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("openai: 2 model(s), fetch not fetched"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("embedding-capable 1/2"), "{rendered}");
     }
 }

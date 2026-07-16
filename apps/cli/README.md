@@ -151,7 +151,8 @@ cockpit packages prune --dry-run
 | `cockpit trust set [path] --mode trust` | Store a workspace trust decision. |
 | `cockpit mcp add ...` | Add an MCP server to layered `.cockpit/mcp.json`. |
 | `cockpit mcp list` | List configured MCP servers. |
-| `cockpit completion <shell>` | Generate shell completions. |
+| `cockpit completion <shell>` | Generate shell completions; release installers also ship bash, zsh, and fish completions. Homebrew installs them into its standard completion directories, and the shell installer best-effort copies them under `$XDG_DATA_HOME`/`~/.local/share` without failing the install if a layout is unsupported. PowerShell users can add `cockpit completion powershell` output to their profile. |
+| Man pages | Release artifacts include generated `cockpit.1` and subcommand man pages. Homebrew installs them to `man1`; the shell installer best-effort copies them under `$XDG_DATA_HOME/man/man1` or `~/.local/share/man/man1`. |
 
 ## Configuration
 

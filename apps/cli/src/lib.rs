@@ -52,6 +52,57 @@ use std::process::ExitCode;
 
 use crate::cli::{Cli, Command};
 
+pub mod manpages {
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use clap::{Command, CommandFactory};
+
+    use crate::cli::Cli;
+
+    pub fn generate_manpages(output_dir: impl AsRef<Path>) -> io::Result<()> {
+        let output_dir = output_dir.as_ref();
+        fs::create_dir_all(output_dir)?;
+
+        let mut command = Cli::command();
+        generate_command_page(&mut command, output_dir, &[String::from("cockpit")])
+    }
+
+    fn generate_command_page(
+        command: &mut Command,
+        output_dir: &Path,
+        path: &[String],
+    ) -> io::Result<()> {
+        let page_name = path.join("-");
+        command.set_bin_name(page_name.clone());
+
+        let mut page = Vec::new();
+        clap_mangen::Man::new(command.clone()).render(&mut page)?;
+        fs::write(page_path(output_dir, &page_name), page)?;
+
+        let subcommands: Vec<String> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name().to_owned())
+            .collect();
+
+        for subcommand_name in subcommands {
+            if let Some(subcommand) = command.find_subcommand_mut(&subcommand_name) {
+                let mut subcommand_path = path.to_vec();
+                subcommand_path.push(subcommand_name);
+                generate_command_page(subcommand, output_dir, &subcommand_path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn page_path(output_dir: &Path, page_name: &str) -> PathBuf {
+        output_dir.join(format!("{page_name}.1"))
+    }
+}
+
 /// Narrow daemon API used by process-boundary integration tests.
 ///
 /// This facade intentionally exposes typed operations instead of the daemon's

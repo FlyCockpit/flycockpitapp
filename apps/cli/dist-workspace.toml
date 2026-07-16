@@ -16,6 +16,10 @@ installers = ["shell", "powershell", "homebrew"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+# Generated release assets are copied into archives/installers alongside the binary.
+# cargo-dist 0.32 `include` only copies pre-existing files, so the release workflow
+# runs `scripts/generate-release-assets.sh` before `dist build`.
+include = ["target/dist/completions", "target/dist/man", "scripts/install-shell-assets.sh"]
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program

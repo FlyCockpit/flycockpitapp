@@ -160,6 +160,11 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
 
+      - name: Generate completions and man pages
+        working-directory: apps/cli
+        shell: bash
+        run: ./scripts/generate-release-assets.sh
+
       - name: Build artifacts
         working-directory: apps/cli
         run: |
@@ -220,6 +225,11 @@ jobs:
           path: apps/cli/target/distrib/
           merge-multiple: true
 
+      - name: Generate completions and man pages
+        working-directory: apps/cli
+        shell: bash
+        run: ./scripts/generate-release-assets.sh
+
       - id: cargo-dist
         shell: bash
         working-directory: apps/cli
@@ -227,6 +237,7 @@ jobs:
           dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
+          ./scripts/patch-dist-assets.py
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"

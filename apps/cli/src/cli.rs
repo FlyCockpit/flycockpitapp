@@ -73,6 +73,10 @@ pub enum Command {
     #[command(subcommand)]
     Agent(AgentCommand),
 
+    /// User-facing assistant workflows.
+    #[command(subcommand)]
+    Assistant(AssistantCommand),
+
     /// Manage AI providers and credentials.
     #[command(subcommand, alias = "auth")]
     Providers(ProvidersCommand),
@@ -174,6 +178,22 @@ pub enum Command {
 pub enum BashHintsCommand {
     /// List the built-in `bash` post-result hint rules (id + description).
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssistantCommand {
+    /// Turn local paths, URLs, text, or a recent workflow into a reusable skill.
+    Learn(LearnArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LearnArgs {
+    /// Source request. Multiple words and sources are forwarded together.
+    #[arg(required = true, num_args = 1..)]
+    pub sources: Vec<String>,
+    /// Force a fresh ephemeral daemon instead of attaching to a long-running one.
+    #[arg(long)]
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Subcommand)]

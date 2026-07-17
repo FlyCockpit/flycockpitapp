@@ -1661,6 +1661,9 @@ pub fn swarm(args: &SpawnArgs) -> Agent {
     .with(Arc::new(crate::tools::schedule::ScheduleTool))
     .with(Arc::new(crate::tools::question::QuestionTool))
     .with(Arc::new(crate::tools::skill::SkillTool))
+    // Swarm is itself write-capable, so `/learn` can persist through the
+    // same guarded skill mutation service without an impossible handoff.
+    .with(Arc::new(crate::tools::skill_manage::SkillManageTool))
     .with(Arc::new(crate::tools::harness::HarnessListTool))
     .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
     // MCP (GOALS §18a): Monty Python sandbox.
@@ -2307,6 +2310,14 @@ mod tests {
             ),
             "FRONTIER BODY"
         );
+    }
+
+    #[test]
+    fn learn_is_reachable_from_write_capable_swarm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = swarm(&args);
+        assert!(agent.tools.names().contains(&"skill_manage"));
     }
 
     #[test]

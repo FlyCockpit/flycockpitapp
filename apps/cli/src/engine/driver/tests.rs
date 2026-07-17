@@ -196,6 +196,304 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
     (driver, tmp)
 }
 
+fn learn_tool_args(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "action": "create",
+        "name": name,
+        "description": "Repeat a verified setup workflow",
+        "content": "## When to Use\n\nUse for the verified setup.\n\n## Procedure\n\n1. Run the verified command.\n\n## Pitfalls\n\nDo not invent flags.\n\n## Verification\n\nConfirm the expected output."
+    })
+}
+
+fn scripted_learn_provider(
+    args: serde_json::Value,
+    request_count: usize,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for request_index in 0..request_count {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|index| index + 4)
+                .unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[header_end..]).to_string())
+                .unwrap();
+
+            let body = if request_index == 0 {
+                let start = serde_json::json!({
+                    "id": "learn-1",
+                    "model": "local",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "learn-save",
+                                "type": "function",
+                                "function": {
+                                    "name": "skill_manage",
+                                    "arguments": args.to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }],
+                    "usage": null
+                });
+                let finish = serde_json::json!({
+                    "id": "learn-1",
+                    "model": "local",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": []},
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    }
+                });
+                format!("data: {start}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
+            } else {
+                let text = serde_json::json!({
+                    "id": "learn-2",
+                    "model": "local",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "Saved the reusable skill."},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    }
+                });
+                format!("data: {text}\n\ndata: [DONE]\n\n")
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        }
+    });
+    (format!("http://{addr}/v1"), request_rx)
+}
+
+fn learn_driver(
+    approval: bool,
+    skill_name: &str,
+    request_count: usize,
+) -> (
+    Driver,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::sync::mpsc::Receiver<String>,
+) {
+    use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
+    use std::collections::BTreeMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("skills");
+    let config_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "skills": {
+                "scan_dirs": [root.to_string_lossy()],
+                "write_approval": approval
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (provider_url, requests) =
+        scripted_learn_provider(learn_tool_args(skill_name), request_count);
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "scripted".to_string(),
+        ProviderEntry {
+            url: provider_url,
+            wire_api: WireApi::Completions,
+            ..ProviderEntry::default()
+        },
+    );
+    let provider_config = ProvidersConfig {
+        providers,
+        active_model: Some(ActiveModelRef {
+            provider: "scripted".into(),
+            model: "local".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        }),
+        ..ProvidersConfig::default()
+    };
+    let model = Arc::new(
+        crate::engine::model::Model::from_config(
+            &provider_config,
+            Arc::new(crate::redact::RedactionTable::empty()),
+        )
+        .unwrap(),
+    );
+    let agent = Arc::new(Agent {
+        name: "Build".into(),
+        system: "Author reusable skills from verified evidence.".into(),
+        role_prompt: "Author reusable skills from verified evidence.".into(),
+        tools: crate::engine::tool::ToolBox::new()
+            .with(Arc::new(crate::tools::skill_manage::SkillManageTool)),
+        model,
+        params: crate::engine::model::ModelParams::default(),
+        scan_tool_results: false,
+        llm_mode: crate::config::extended::LlmMode::default(),
+        delegated: false,
+        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+    });
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
+    let redact = Arc::new(RedactionTable::empty());
+    let mut driver =
+        Driver::with_max_schedules(session, locks, redact, tmp.path().to_path_buf(), agent, 1);
+    driver.stack[0].history.push(Message::user(
+        "We verified the setup with cockpit verify --local.",
+    ));
+    driver.stack[0].history.push(Message::Assistant {
+        id: Some("prior-assistant".into()),
+        content: crate::engine::message::OneOrMany::one(
+            crate::engine::message::AssistantContent::text(
+                "The local verification completed successfully.",
+            ),
+        ),
+    });
+    (driver, tmp, root, requests)
+}
+
+#[tokio::test]
+async fn learn_saves_conformant_foreground_skill() {
+    let (mut driver, tmp, root, requests) = learn_driver(false, "learned-workflow", 2);
+    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (turn_tx, _turn_rx) = mpsc::channel(64);
+    let prompt = crate::commands::learn::build_learn_prompt("");
+
+    driver
+        .run_user_input(UserSubmission::text(prompt.clone()), &queue, &turn_tx)
+        .await
+        .unwrap();
+
+    let first_request = requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(first_request.contains("cockpit verify --local"));
+    assert!(first_request.contains("local verification completed successfully"));
+    assert!(first_request.contains("Create a reusable Agent Skill"));
+    assert!(first_request.contains("skill_manage"));
+    requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+
+    let config = crate::config::extended::load_for_cwd(tmp.path());
+    let skills = crate::skills::discover(tmp.path(), &config.skills).unwrap();
+    let skill = crate::skills::find_by_name(&skills, "learned-workflow").unwrap();
+    crate::skills::validate_conformant_package(skill).unwrap();
+    let provenance: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("learned-workflow/.cockpit-provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(provenance["created_origin"], "foreground");
+}
+
+#[tokio::test]
+async fn learn_respects_write_gate() {
+    let (mut driver, _tmp, root, requests) = learn_driver(true, "gated-learn", 1);
+    let db = driver.session.db.clone();
+    let session_id = driver.session.id;
+    let (events, _event_rx) = tokio::sync::broadcast::channel(8);
+    let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+        events,
+        Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        ))),
+        Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        db.clone(),
+        session_id,
+    ));
+    driver.set_interrupt_hub(hub.clone());
+    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (turn_tx, _turn_rx) = mpsc::channel(64);
+    let task = tokio::spawn(async move {
+        driver
+            .run_user_input(
+                UserSubmission::text(crate::commands::learn::build_learn_prompt(
+                    "our verified workflow",
+                )),
+                &queue,
+                &turn_tx,
+            )
+            .await
+    });
+
+    loop {
+        if !db.list_open_interrupts(session_id).unwrap().is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(hub.park_all_registered(), 1);
+    task.await.unwrap().unwrap();
+    assert!(!root.join("gated-learn/SKILL.md").exists());
+    let row = db.list_open_interrupts(session_id).unwrap().remove(0);
+    let parked = row.parked.unwrap();
+    assert_eq!(parked.tool, "skill_manage");
+    assert_eq!(parked.call_id, "learn-save");
+    assert_eq!(parked.args, learn_tool_args("gated-learn"));
+    assert_eq!(
+        parked.resume.call_origin,
+        crate::db::needs_attention::InterruptCallOrigin::Foreground
+    );
+    let first_request = requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(first_request.contains("cockpit verify --local"));
+    assert!(first_request.contains("our verified workflow"));
+}
+
 fn set_active_delegated_recursion(
     driver: &mut Driver,
     ctx: crate::engine::builtin::DelegationRecursionContext,

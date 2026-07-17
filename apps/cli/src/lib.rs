@@ -576,6 +576,9 @@ async fn async_main() -> anyhow::Result<()> {
             commands::run::run(args, cli.no_sandbox, cli.project.as_deref()).await
         }
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
+        Some(Command::Assistant(crate::cli::AssistantCommand::Learn(args))) => {
+            commands::learn::run(args, cli.no_sandbox).await
+        }
         Some(Command::Providers(sub)) => commands::providers::run(sub).await,
         Some(Command::Models(args)) => commands::models::run(args).await,
         Some(Command::ProviderCatalogStatus(args)) => {

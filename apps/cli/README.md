@@ -126,6 +126,12 @@ Generate or refresh a project instruction file:
 cockpit init
 ```
 
+Turn local docs, URLs, pasted steps, or a recent workflow into a reusable skill:
+
+```sh
+cockpit assistant learn ./sdk-docs
+```
+
 Ask questions against a registered dependency package's source:
 
 ```sh

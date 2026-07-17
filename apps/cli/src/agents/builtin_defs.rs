@@ -375,6 +375,7 @@ fn swarm_def() -> AgentDef {
             "schedule",
             "question",
             "skill",
+            "skill_manage",
             "task",
             "spawn",
             "mcp",

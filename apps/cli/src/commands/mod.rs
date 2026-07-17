@@ -44,6 +44,7 @@ pub mod flycockpit;
 pub mod import;
 pub mod init;
 pub mod kcl;
+pub mod learn;
 pub mod mcp;
 pub mod meta;
 pub mod models;

@@ -395,6 +395,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "learn",
+        description: "Turn paths, URLs, text, or the recent workflow into a reusable skill",
+        takes_args: true,
+        run: run_learn,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "llm-mode",
         description: "Switch LLM steering mode (arg: toggle/defend/normal; bare = toggle)",
         takes_args: true,
@@ -829,6 +837,11 @@ fn run_init(app: &mut App, args: &str) -> bool {
     false
 }
 
+fn run_learn(app: &mut App, args: &str) -> bool {
+    app.handle_learn_command(args);
+    false
+}
+
 fn run_schedule(app: &mut App, args: &str) -> bool {
     app.handle_schedule_command(args);
     false
@@ -1166,6 +1179,30 @@ impl App {
             crate::commands::init::InitMode::Create,
         );
         self.dispatch_init_turn(&display, prompt);
+    }
+
+    pub(super) fn handle_learn_command(&mut self, args: &str) {
+        if self.busy {
+            self.push_plain(
+                "/learn: a turn is already running — wait for it to finish".to_string(),
+            );
+            return;
+        }
+        let subject = crate::commands::learn::subject_from_parts(&[args.to_string()]);
+        let prompt = crate::commands::learn::build_learn_prompt(&subject);
+        self.chat_scroll_offset = 0;
+        self.begin_working_span();
+        self.dispatch_optimistic_user_submission(
+            if args.trim().is_empty() {
+                "/learn".to_string()
+            } else {
+                format!("/learn {}", args.trim())
+            },
+            crate::engine::message::UserSubmission::text(prompt),
+            "/learn",
+            true,
+            &[],
+        );
     }
 
     fn handle_goal_command(&mut self, args: &str) {
@@ -2304,6 +2341,17 @@ pub(super) fn resolve_skill_dispatch(args: &str, names: &[&str]) -> SkillDispatc
 mod table_tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn learn_slash_is_registered_as_arg_taking_normal_turn() {
+        let learn = slash_command_by_name("learn").expect("/learn registry row");
+        assert!(learn.takes_args);
+        assert!(std::ptr::fn_addr_eq(
+            learn.run,
+            run_learn as fn(&mut App, &str) -> bool
+        ));
+        assert!(builtin_slash_name_taken("learn"));
+    }
 
     #[test]
     fn every_row_dispatches_and_every_alias_resolves() {

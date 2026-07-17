@@ -85,8 +85,6 @@ pub enum AsyncActionPayload {
     },
     OAuthGrokBegin {
         login: crate::auth::xai_oauth::ManualLogin,
-        auto_attempted: bool,
-        browser_error: Option<String>,
     },
     OAuthGrokComplete {
         logged_in: bool,

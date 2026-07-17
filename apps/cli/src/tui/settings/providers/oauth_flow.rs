@@ -149,7 +149,21 @@ pub(crate) enum OAuthFlowOp {
 #[derive(Debug, Clone)]
 pub(crate) enum OAuthBeginResult {
     Device(Result<codex_oauth::DeviceLogin, String>),
-    Browser(Result<(xai_oauth::ManualLogin, bool, Option<String>), String>),
+    Browser(Result<OAuthBrowserBegin, String>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthBrowserBegin {
+    pub(crate) login: xai_oauth::ManualLogin,
+    listening: bool,
+    browser_error: Option<String>,
+    listener_error: Option<String>,
+    ssh: bool,
+}
+
+pub(crate) struct GrokBrowserStart {
+    pub(crate) begin: OAuthBrowserBegin,
+    pub(crate) listener: Option<tokio::net::TcpListener>,
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +171,7 @@ pub(crate) struct OAuthEffects {
     pub(super) copy: fn(&str) -> Result<crate::clipboard::CopyOutcome, crate::clipboard::CopyError>,
     pub(super) is_ssh: fn() -> bool,
     pub(super) open: fn(&str) -> anyhow::Result<()>,
+    pub(super) bind: fn(u16) -> anyhow::Result<tokio::net::TcpListener>,
 }
 
 impl OAuthEffects {
@@ -165,7 +180,48 @@ impl OAuthEffects {
             copy: crate::clipboard::copy_plain,
             is_ssh: crate::clipboard::is_ssh,
             open: crate::browser::open,
+            bind: crate::auth::xai_oauth::bind_callback_listener,
         }
+    }
+}
+
+pub(crate) fn prepare_grok_browser_start(
+    login: xai_oauth::ManualLogin,
+    effects: OAuthEffects,
+    port: u16,
+) -> GrokBrowserStart {
+    let ssh = (effects.is_ssh)();
+    if ssh {
+        return GrokBrowserStart {
+            begin: OAuthBrowserBegin {
+                login,
+                listening: false,
+                browser_error: None,
+                listener_error: None,
+                ssh: true,
+            },
+            listener: None,
+        };
+    }
+
+    // The loopback socket must exist before opening the browser: an already
+    // authorized xAI session can redirect immediately.
+    let (listener, listener_error) = match (effects.bind)(port) {
+        Ok(listener) => (Some(listener), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let browser_error = (effects.open)(&login.authorize_url)
+        .err()
+        .map(|error| error.to_string());
+    GrokBrowserStart {
+        begin: OAuthBrowserBegin {
+            login,
+            listening: listener.is_some(),
+            browser_error,
+            listener_error,
+            ssh: false,
+        },
+        listener,
     }
 }
 
@@ -212,6 +268,14 @@ impl OAuthFlowState {
             authorize_url: authorize_url.to_string(),
             login,
         };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browser_state_for_test(&self) -> Option<&str> {
+        match &self.session {
+            OAuthSession::Browser { login, .. } => Some(login.state_for_test()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -321,25 +385,36 @@ impl OAuthFlowState {
                 self.status = Some(Err(e));
                 None
             }
-            (
-                OAuthProvider::Grok,
-                OAuthBeginResult::Browser(Ok((login, auto_attempted, browser_error))),
-            ) => {
+            (OAuthProvider::Grok, OAuthBeginResult::Browser(Ok(begin))) => {
+                let OAuthBrowserBegin {
+                    login,
+                    listening,
+                    browser_error,
+                    listener_error,
+                    ssh,
+                } = begin;
                 self.session = OAuthSession::Browser {
                     authorize_url: login.authorize_url.clone(),
                     login,
                 };
+                self.ssh = ssh;
                 self.paste_focused = false;
-                self.pending = auto_attempted && browser_error.is_none();
-                self.status = Some(Ok(match browser_error {
-                    Some(e) => format!("Could not open browser ({e}); paste callback URL or code."),
-                    None if auto_attempted => {
+                self.pending = listening;
+                self.status = Some(Ok(match (listener_error, browser_error, ssh) {
+                    (Some(listener), Some(browser), _) => format!(
+                        "Could not listen for callback ({listener}); could not open browser ({browser}). Open the URL manually and paste callback URL or code."
+                    ),
+                    (Some(listener), None, _) => format!(
+                        "Could not listen for callback ({listener}). Complete authorization and paste callback URL or code."
+                    ),
+                    (None, Some(browser), false) => format!(
+                        "Could not open browser ({browser}); open the URL manually. Waiting for callback; paste callback/code here if needed."
+                    ),
+                    (None, None, false) if listening => {
                         "Opened browser; waiting for callback. Paste callback/code here if needed."
                             .to_string()
                     }
-                    None => {
-                        "SSH detected; open the URL manually and paste callback/code.".to_string()
-                    }
+                    _ => "SSH detected; open the URL manually and paste callback/code.".to_string(),
                 }));
                 None
             }
@@ -576,6 +651,11 @@ fn handle_oauth_enter(s: &mut OAuthFlowState) -> (bool, Option<OAuthFlowRequest>
                     s.paste_focused = true;
                     s.manual_input.set("");
                 }
+                return (false, None);
+            }
+            if s.cursor == 1 && s.has_browser_session() {
+                s.paste_focused = true;
+                s.manual_input.set("");
                 return (false, None);
             }
             if s.cursor == 0 || s.cursor == 1 {

@@ -29,7 +29,8 @@ pub(super) use fetch::{
 #[cfg(test)]
 use oauth_flow::handle_oauth_flow_key_with;
 pub(crate) use oauth_flow::{
-    OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthProvider,
+    GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest,
+    OAuthFlowState, OAuthProvider, prepare_grok_browser_start,
 };
 use oauth_flow::{
     OAuthFlowView, handle_oauth_flow_key, oauth_setup_lines, render_oauth_body, render_oauth_setup,

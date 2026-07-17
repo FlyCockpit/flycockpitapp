@@ -4567,19 +4567,22 @@ impl App {
             }
             AsyncActionKind::Internal("oauth.grok.begin") => {
                 let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthGrokBegin {
-                        login,
-                        auto_attempted,
-                        browser_error,
-                    }) => {
-                        if auto_attempted && browser_error.is_none() {
-                            let listener_login = login.clone();
+                    Ok(AsyncActionPayload::OAuthGrokBegin { login }) => {
+                        let settings::GrokBrowserStart { begin, listener } =
+                            settings::prepare_grok_browser_start(
+                                login,
+                                settings::OAuthEffects::production(),
+                                crate::auth::xai_oauth::CALLBACK_PORT,
+                            );
+                        if let Some(listener) = listener {
+                            let listener_login = begin.login.clone();
                             self.async_actions.start(
                                 AsyncActionKind::Internal("oauth.grok.complete"),
                                 AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
                                 async move {
                                     crate::auth::xai_oauth::complete_local_callback_login(
                                         listener_login,
+                                        listener,
                                     )
                                     .await
                                     .map(|_| AsyncActionPayload::OAuthGrokComplete {
@@ -4589,7 +4592,7 @@ impl App {
                                 },
                             );
                         }
-                        Ok((login, auto_attempted, browser_error))
+                        Ok(begin)
                     }
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
@@ -4649,21 +4652,7 @@ impl App {
                             let login = crate::auth::xai_oauth::begin_manual_login()
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            if crate::clipboard::is_ssh() {
-                                return Ok(AsyncActionPayload::OAuthGrokBegin {
-                                    login,
-                                    auto_attempted: false,
-                                    browser_error: None,
-                                });
-                            }
-                            let browser_error = crate::browser::open(&login.authorize_url)
-                                .err()
-                                .map(|e| e.to_string());
-                            Ok(AsyncActionPayload::OAuthGrokBegin {
-                                login,
-                                auto_attempted: browser_error.is_none(),
-                                browser_error,
-                            })
+                            Ok(AsyncActionPayload::OAuthGrokBegin { login })
                         },
                     );
                 }

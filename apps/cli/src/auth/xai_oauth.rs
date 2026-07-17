@@ -3,8 +3,6 @@
 //! This flow is provider auth, not harness auth: tokens are stored under the
 //! provider credential key and read by the daemon before each request.
 
-use std::io::{BufRead, Write};
-use std::net::TcpListener;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,15 +15,27 @@ use sha2::{Digest, Sha256};
 use crate::credentials::CredentialStore;
 
 pub const CREDENTIAL_KEY: &str = "grok-oauth";
-#[allow(dead_code)]
-pub const ISSUER: &str = "https://auth.x.ai";
 pub const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 pub const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access";
+pub const CALLBACK_PORT: u16 = 56121;
+pub const CALLBACK_PATH: &str = "/callback";
 pub const REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
 pub const REFRESH_SKEW_SECS: i64 = 120;
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const CALLBACK_OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CALLBACK_REQUEST_LINE_LIMIT: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackSource {
+    /// Arrived on loopback, where any local process could have sent it. State
+    /// is therefore load-bearing and must be present and equal.
+    LocalListener,
+    /// Pasted by the user into this pending login and also bound by PKCE. An
+    /// absent state is allowed, but an affirmatively different state is not.
+    ManualPaste,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
@@ -64,6 +74,10 @@ impl ManualLogin {
             token_endpoint: "https://auth.x.ai/oauth/token".to_string(),
         }
     }
+
+    pub(crate) fn state_for_test(&self) -> &str {
+        &self.state
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,32 +87,6 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
-}
-
-#[allow(dead_code)]
-pub async fn run_login_flow(manual_paste: bool) -> Result<StoredTokens> {
-    let login = begin_manual_login().await?;
-    if manual_paste {
-        eprintln!("Open this xAI OAuth URL, then paste the callback URL or code:");
-        eprintln!("{}", login.authorize_url);
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .context("reading OAuth callback/code from stdin")?;
-        return complete_manual_login(login, line.trim()).await;
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:56121").context(
-        "binding xAI OAuth callback on 127.0.0.1:56121; use manual paste if the port is busy",
-    )?;
-    eprintln!("Opening browser for xAI Grok subscription OAuth...");
-    if let Err(e) = crate::browser::open(&login.authorize_url) {
-        eprintln!("Could not open browser ({e}). Open this URL manually:");
-        eprintln!("{}", login.authorize_url);
-    }
-    let callback = wait_for_callback(listener)?;
-    complete_manual_login(login, &callback).await
 }
 
 pub async fn begin_manual_login() -> Result<ManualLogin> {
@@ -115,7 +103,15 @@ pub async fn begin_manual_login() -> Result<ManualLogin> {
 }
 
 pub async fn complete_manual_login(login: ManualLogin, input: &str) -> Result<StoredTokens> {
-    let code = parse_callback_input(input, Some(&login.state))?;
+    complete_login(login, input, CallbackSource::ManualPaste).await
+}
+
+async fn complete_login(
+    login: ManualLogin,
+    input: &str,
+    source: CallbackSource,
+) -> Result<StoredTokens> {
+    let code = parse_callback_input(input, &login.state, source)?;
     let tokens = exchange_code(&login.token_endpoint, &code, &login.verifier).await?;
     store_tokens(&tokens)?;
     Ok(tokens)
@@ -305,71 +301,153 @@ fn store_tokens(tokens: &StoredTokens) -> Result<()> {
     store.save()
 }
 
-#[allow(dead_code)]
-fn wait_for_callback(listener: TcpListener) -> Result<String> {
-    let (mut stream, _) = listener
-        .accept()
-        .context("waiting for xAI OAuth callback")?;
-    let mut reader = std::io::BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("reading xAI OAuth callback request")?;
-    let path = line
-        .split_whitespace()
-        .nth(1)
-        .context("malformed xAI OAuth callback request")?
-        .to_string();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 41\r\n\r\nxAI OAuth complete. You can close this tab."
-    );
-    Ok(path)
-}
-
-pub async fn wait_for_callback_async() -> Result<String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:56121")
-        .await
-        .context(
-            "binding xAI OAuth callback on 127.0.0.1:56121; use manual paste if the port is busy",
-        )?;
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .context("waiting for xAI OAuth callback")?;
-    let mut reader = tokio::io::BufReader::new(&mut stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("reading xAI OAuth callback request")?;
-    let path = line
-        .split_whitespace()
-        .nth(1)
-        .context("malformed xAI OAuth callback request")?
-        .to_string();
-    let _ = stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 41\r\n\r\nxAI OAuth complete. You can close this tab.",
+pub fn bind_callback_listener(port: u16) -> Result<tokio::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+        format!(
+            "binding xAI OAuth callback on 127.0.0.1:{port}; use manual paste if the port is busy"
         )
-        .await;
-    Ok(path)
+    })?;
+    listener
+        .set_nonblocking(true)
+        .context("configuring xAI OAuth callback listener")?;
+    tokio::net::TcpListener::from_std(listener).context("registering xAI OAuth callback listener")
 }
 
-pub async fn complete_local_callback_login(login: ManualLogin) -> Result<StoredTokens> {
-    let callback = wait_for_callback_async().await?;
-    complete_manual_login(login, &callback).await
+pub async fn wait_for_callback_async(listener: &tokio::net::TcpListener) -> Result<String> {
+    tokio::time::timeout(CALLBACK_OVERALL_TIMEOUT, wait_for_callback_loop(listener))
+        .await
+        .context("timed out waiting for xAI OAuth callback")?
 }
 
-fn parse_callback_input(input: &str, expected_state: Option<&str>) -> Result<String> {
+async fn wait_for_callback_loop(listener: &tokio::net::TcpListener) -> Result<String> {
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .context("waiting for xAI OAuth callback")?;
+        match read_callback_request_line(&mut stream).await {
+            CallbackRequest::Callback(path) => {
+                write_callback_response(&mut stream, 200, success_page()).await;
+                return Ok(path);
+            }
+            CallbackRequest::Noise => {
+                write_callback_response(&mut stream, 404, not_found_page()).await;
+            }
+            CallbackRequest::Malformed => {
+                write_callback_response(&mut stream, 400, bad_request_page()).await;
+            }
+        }
+    }
+}
+
+enum CallbackRequest {
+    Callback(String),
+    Noise,
+    Malformed,
+}
+
+async fn read_callback_request_line(stream: &mut tokio::net::TcpStream) -> CallbackRequest {
+    use tokio::io::AsyncReadExt;
+
+    let mut line = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = match stream.read(&mut chunk).await {
+            Ok(read) => read,
+            Err(_) => return CallbackRequest::Malformed,
+        };
+        if read == 0 {
+            break;
+        }
+        line.extend_from_slice(&chunk[..read]);
+        if line.len() > CALLBACK_REQUEST_LINE_LIMIT {
+            return CallbackRequest::Malformed;
+        }
+        if !b"GET ".starts_with(&line[..line.len().min(4)]) && !line.starts_with(b"GET ") {
+            return CallbackRequest::Malformed;
+        }
+        if let Some(newline) = line.iter().position(|byte| *byte == b'\n') {
+            line.truncate(newline + 1);
+            break;
+        }
+    }
+    let Ok(line) = std::str::from_utf8(&line) else {
+        return CallbackRequest::Malformed;
+    };
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("GET") {
+        return CallbackRequest::Malformed;
+    }
+    let Some(path) = parts.next() else {
+        return CallbackRequest::Malformed;
+    };
+    let (request_path, query) = path.split_once('?').unwrap_or((path, ""));
+    if request_path != CALLBACK_PATH {
+        return CallbackRequest::Noise;
+    }
+    if query.split('&').any(|pair| {
+        matches!(
+            pair.split_once('=').map(|(name, _)| name),
+            Some("code" | "error")
+        )
+    }) {
+        CallbackRequest::Callback(path.to_string())
+    } else {
+        CallbackRequest::Noise
+    }
+}
+
+async fn write_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &'static str,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+fn success_page() -> &'static str {
+    "<!doctype html><meta charset=\"utf-8\"><title>OAuth complete</title><p>xAI OAuth complete. You can close this tab.</p>"
+}
+
+fn not_found_page() -> &'static str {
+    "<!doctype html><meta charset=\"utf-8\"><title>Not found</title><p>Not found.</p>"
+}
+
+fn bad_request_page() -> &'static str {
+    "<!doctype html><meta charset=\"utf-8\"><title>Bad request</title><p>Bad request.</p>"
+}
+
+pub async fn complete_local_callback_login(
+    login: ManualLogin,
+    listener: tokio::net::TcpListener,
+) -> Result<StoredTokens> {
+    let callback = wait_for_callback_async(&listener).await?;
+    complete_login(login, &callback, CallbackSource::LocalListener).await
+}
+
+fn parse_callback_input(
+    input: &str,
+    expected_state: &str,
+    source: CallbackSource,
+) -> Result<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         bail!("OAuth callback/code is empty");
     }
     if !trimmed.contains('=') && !trimmed.contains('?') && !trimmed.contains('/') {
-        if expected_state.is_some() {
+        if source == CallbackSource::LocalListener {
             bail!("OAuth callback missing `state` (paste the full callback URL for this login)");
         }
         return Ok(trimmed.to_string());
@@ -384,6 +462,8 @@ fn parse_callback_input(input: &str, expected_state: Option<&str>) -> Result<Str
     let query = query.split('#').next().unwrap_or(query);
     let mut code = None;
     let mut state = None;
+    let mut error = None;
+    let mut error_description = None;
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         let Some(name) = parts.next() else {
@@ -396,16 +476,25 @@ fn parse_callback_input(input: &str, expected_state: Option<&str>) -> Result<Str
         match name {
             "code" => code = Some(value),
             "state" => state = Some(value),
+            "error" => error = Some(value),
+            "error_description" => error_description = Some(value),
             _ => {}
         }
     }
-    if let Some(expected) = expected_state {
-        let actual = state
-            .as_deref()
-            .context("OAuth callback missing `state` (possible CSRF)")?;
-        if actual != expected {
+    match state.as_deref() {
+        Some(actual) if actual != expected_state => {
             bail!("OAuth state mismatch (possible CSRF)");
         }
+        None if source == CallbackSource::LocalListener => {
+            bail!("OAuth callback missing `state` (possible CSRF)");
+        }
+        _ => {}
+    }
+    if let Some(error) = error {
+        if let Some(description) = error_description.filter(|text| !text.is_empty()) {
+            bail!("xAI OAuth returned `{error}`: {description}");
+        }
+        bail!("xAI OAuth returned `{error}`");
     }
     code.context("OAuth callback missing `code`")
 }
@@ -441,32 +530,259 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn parse_callback_url_checks_state() {
-        let code = parse_callback_input(
-            "http://127.0.0.1:56121/callback?code=abc&state=state-1",
-            Some("state-1"),
+    fn parse_callback_bare_code_manual_paste_accepted() {
+        assert_eq!(
+            parse_callback_input("abc123", "state-1", CallbackSource::ManualPaste).unwrap(),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn parse_callback_bare_code_listener_rejected() {
+        let err =
+            parse_callback_input("abc123", "state-1", CallbackSource::LocalListener).unwrap_err();
+        assert!(err.to_string().contains("missing `state`"));
+    }
+
+    #[test]
+    fn parse_callback_matching_state_manual_paste_accepted() {
+        assert_eq!(
+            parse_callback_input(
+                "/callback?code=abc&state=state-1",
+                "state-1",
+                CallbackSource::ManualPaste,
+            )
+            .unwrap(),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn parse_callback_matching_state_listener_accepted() {
+        assert_eq!(
+            parse_callback_input(
+                "http://127.0.0.1:56121/callback?code=abc&state=state-1",
+                "state-1",
+                CallbackSource::LocalListener,
+            )
+            .unwrap(),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn parse_callback_mismatched_state_manual_paste_rejected() {
+        let err = parse_callback_input(
+            "/callback?code=abc&state=wrong",
+            "state-1",
+            CallbackSource::ManualPaste,
         )
-        .unwrap();
-        assert_eq!(code, "abc");
+        .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"));
     }
 
     #[test]
-    fn parse_callback_rejects_bare_code_when_state_expected() {
-        let err = parse_callback_input("abc123", Some("state-1")).unwrap_err();
+    fn parse_callback_mismatched_state_listener_rejected() {
+        let err = parse_callback_input(
+            "/callback?code=abc&state=wrong",
+            "state-1",
+            CallbackSource::LocalListener,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"));
+    }
+
+    #[test]
+    fn parse_callback_absent_state_manual_paste_accepted() {
+        assert_eq!(
+            parse_callback_input("/callback?code=abc", "state-1", CallbackSource::ManualPaste,)
+                .unwrap(),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn parse_callback_absent_state_listener_rejected() {
+        let err = parse_callback_input(
+            "/callback?code=abc",
+            "state-1",
+            CallbackSource::LocalListener,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("missing `state`"));
     }
 
     #[test]
-    fn parse_callback_accepts_bare_code_without_stateful_flow() {
-        assert_eq!(parse_callback_input("abc123", None).unwrap(), "abc123");
+    fn parse_callback_error_param_manual_paste_reports_denial() {
+        let err = parse_callback_input(
+            "/callback?error=access_denied&error_description=You%20denied%20access",
+            "state-1",
+            CallbackSource::ManualPaste,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("access_denied"), "{err}");
+        assert!(err.contains("You denied access"), "{err}");
     }
 
     #[test]
-    fn parse_callback_rejects_missing_state_when_expected() {
-        let err = parse_callback_input("/callback?code=abc", Some("state-1")).unwrap_err();
-        assert!(err.to_string().contains("missing `state`"));
+    fn parse_callback_error_param_listener_reports_denial() {
+        let err = parse_callback_input(
+            "/callback?error=access_denied&error_description=You%20denied%20access&state=state-1",
+            "state-1",
+            CallbackSource::LocalListener,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("access_denied"), "{err}");
+        assert!(err.contains("You denied access"), "{err}");
+    }
+
+    #[test]
+    fn parse_callback_no_code_no_error_manual_paste_rejected() {
+        let err = parse_callback_input(
+            "/callback?state=state-1",
+            "state-1",
+            CallbackSource::ManualPaste,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing `code`"));
+    }
+
+    #[test]
+    fn parse_callback_no_code_no_error_listener_rejected() {
+        let err = parse_callback_input(
+            "/callback?state=state-1",
+            "state-1",
+            CallbackSource::LocalListener,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing `code`"));
+    }
+
+    #[test]
+    fn redirect_uri_matches_callback_port_and_path() {
+        assert_eq!(
+            REDIRECT_URI,
+            format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}")
+        );
+    }
+
+    async fn callback_server() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<String>>,
+    ) {
+        let listener = bind_callback_listener(0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { wait_for_callback_async(&listener).await });
+        (addr, task)
+    }
+
+    async fn request(addr: std::net::SocketAddr, bytes: &[u8]) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn callback_server_ignores_favicon_then_returns_callback() {
+        let (addr, task) = callback_server().await;
+        let response = request(
+            addr,
+            b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 404"));
+        assert!(!task.is_finished());
+        request(
+            addr,
+            b"GET /callback?code=abc&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(task.await.unwrap().unwrap(), "/callback?code=abc&state=s");
+    }
+
+    #[tokio::test]
+    async fn callback_server_ignores_non_http_payload_then_returns_callback() {
+        let (addr, task) = callback_server().await;
+        let response = request(addr, &[0x16, 0x03, 0x01, 0x00, 0x2f]).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400"));
+        assert!(!task.is_finished());
+        request(
+            addr,
+            b"GET /callback?code=abc&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(task.await.unwrap().unwrap(), "/callback?code=abc&state=s");
+    }
+
+    #[tokio::test]
+    async fn callback_server_returns_full_callback_path() {
+        let (addr, task) = callback_server().await;
+        request(
+            addr,
+            b"GET /callback?code=abc%20123&state=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            "/callback?code=abc%20123&state=state-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_server_response_content_length_matches_body_and_closes() {
+        let (addr, task) = callback_server().await;
+        let response = request(
+            addr,
+            b"GET /callback?code=abc&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        task.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let declared = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(declared, body.len());
+        assert!(headers.lines().any(|line| line == "connection: close"));
+    }
+
+    #[tokio::test]
+    async fn callback_server_caps_oversized_request_line() {
+        let (addr, task) = callback_server().await;
+        let oversized = format!("GET /{} HTTP/1.1\r\n\r\n", "x".repeat(9 * 1024));
+        let response = request(addr, oversized.as_bytes()).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400"));
+        assert!(!task.is_finished());
+        request(
+            addr,
+            b"GET /callback?code=abc&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(task.await.unwrap().unwrap(), "/callback?code=abc&state=s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oauth_grok_callback_overall_timeout() {
+        let listener = bind_callback_listener(0).unwrap();
+        let task = tokio::spawn(async move { wait_for_callback_async(&listener).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(CALLBACK_OVERALL_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = task.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[test]
@@ -476,12 +792,6 @@ mod tests {
             (Duration::from_secs(5), Duration::from_secs(30))
         );
         let _ = oauth_http_client().unwrap();
-    }
-
-    #[test]
-    fn parse_callback_rejects_state_mismatch() {
-        let err = parse_callback_input("/callback?code=abc&state=bad", Some("good")).unwrap_err();
-        assert!(err.to_string().contains("state mismatch"));
     }
 
     #[test]

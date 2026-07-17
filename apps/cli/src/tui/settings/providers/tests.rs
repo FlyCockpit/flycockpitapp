@@ -1240,10 +1240,14 @@ fn copy_oauth_url_reports_success_error_and_missing_url() {
 
 static OAUTH_EFFECTS_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static OAUTH_EFFECTS_SSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OAUTH_EFFECTS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static OAUTH_BOUND_ADDR: std::sync::Mutex<Option<std::net::SocketAddr>> =
+    std::sync::Mutex::new(None);
 
 fn reset_oauth_effects(ssh: bool) {
     OAUTH_EFFECTS_SSH.store(ssh, std::sync::atomic::Ordering::SeqCst);
     OAUTH_EFFECTS_LOG.lock().unwrap().clear();
+    *OAUTH_BOUND_ADDR.lock().unwrap() = None;
 }
 
 fn oauth_effects_log() -> Vec<String> {
@@ -1273,16 +1277,171 @@ fn fake_is_ssh() -> bool {
     OAUTH_EFFECTS_SSH.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+fn fake_bind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    OAUTH_EFFECTS_LOG.lock().unwrap().push("bind".to_string());
+    let listener = crate::auth::xai_oauth::bind_callback_listener(port)?;
+    *OAUTH_BOUND_ADDR.lock().unwrap() = Some(listener.local_addr()?);
+    Ok(listener)
+}
+
+fn failing_bind(_port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    OAUTH_EFFECTS_LOG.lock().unwrap().push("bind".to_string());
+    anyhow::bail!("callback port busy")
+}
+
+fn connecting_open(value: &str) -> anyhow::Result<()> {
+    OAUTH_EFFECTS_LOG
+        .lock()
+        .unwrap()
+        .push(format!("open:{value}"));
+    let addr = OAUTH_BOUND_ADDR
+        .lock()
+        .unwrap()
+        .expect("listener must be bound before open");
+    std::net::TcpStream::connect(addr)?;
+    Ok(())
+}
+
+fn failing_open(value: &str) -> anyhow::Result<()> {
+    OAUTH_EFFECTS_LOG
+        .lock()
+        .unwrap()
+        .push(format!("open:{value}"));
+    anyhow::bail!("browser unavailable")
+}
+
 fn fake_oauth_effects() -> OAuthEffects {
     OAuthEffects {
         copy: fake_copy,
         is_ssh: fake_is_ssh,
         open: fake_open,
+        bind: fake_bind,
     }
+}
+
+#[tokio::test]
+async fn oauth_grok_binds_before_opening_browser() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
+    let effects = OAuthEffects {
+        open: connecting_open,
+        ..fake_oauth_effects()
+    };
+    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+
+    let start = prepare_grok_browser_start(login, effects, 0);
+
+    assert!(start.listener.is_some());
+    assert_eq!(
+        oauth_effects_log(),
+        vec![
+            "bind".to_string(),
+            "open:https://example.test/oauth".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn oauth_grok_browser_open_failure_still_listens() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
+    let effects = OAuthEffects {
+        open: failing_open,
+        ..fake_oauth_effects()
+    };
+    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let start = prepare_grok_browser_start(login, effects, 0);
+    assert!(start.listener.is_some());
+
+    let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
+    state.apply_begin(OAuthBeginResult::Browser(Ok(start.begin)), effects);
+    assert!(state.pending);
+    assert!(state.has_browser_session());
+    let status = state.status.unwrap().unwrap();
+    assert!(status.contains("Could not open browser"), "{status}");
+    assert!(status.contains("Waiting for callback"), "{status}");
+}
+
+#[tokio::test]
+async fn oauth_grok_bind_failure_offers_manual_paste() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
+    let effects = OAuthEffects {
+        bind: failing_bind,
+        ..fake_oauth_effects()
+    };
+    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let start = prepare_grok_browser_start(login, effects, 0);
+    assert!(start.listener.is_none());
+
+    let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
+    state.apply_begin(OAuthBeginResult::Browser(Ok(start.begin)), effects);
+    assert!(!state.pending);
+    assert!(!state.ssh);
+    assert!(state.has_browser_session());
+    let status = state.status.as_ref().unwrap().as_ref().unwrap();
+    assert!(status.contains("callback port busy"), "{status}");
+    state.cursor = 1;
+    let (_, action) = handle_oauth_flow_key_with(press(KeyCode::Enter), &mut state, effects);
+    assert!(action.is_none());
+    assert!(state.paste_focused);
+}
+
+#[tokio::test]
+async fn oauth_grok_ssh_begin_binds_no_listener() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(true);
+    let effects = fake_oauth_effects();
+    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let start = prepare_grok_browser_start(login, effects, 0);
+    assert!(start.listener.is_none());
+    assert!(oauth_effects_log().is_empty());
+
+    let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
+    state.apply_begin(OAuthBeginResult::Browser(Ok(start.begin)), effects);
+    assert!(!state.pending);
+    assert!(state.ssh);
+    assert!(state.has_browser_session());
+    state.cursor = 1;
+    let (_, action) = handle_oauth_flow_key_with(press(KeyCode::Enter), &mut state, effects);
+    assert!(action.is_none());
+    assert!(state.paste_focused);
+    assert!(oauth_effects_log().is_empty());
+}
+
+#[test]
+fn oauth_grok_manual_paste_option_focuses_without_rebeginning_state() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
+    let effects = fake_oauth_effects();
+    let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
+    state.set_browser_session_for_test("https://example.test/oauth");
+    state.pending = false;
+    state.cursor = 1;
+    let before = state.browser_state_for_test().unwrap().to_string();
+
+    let (_, action) = handle_oauth_flow_key_with(press(KeyCode::Enter), &mut state, effects);
+
+    assert!(action.is_none());
+    assert!(state.paste_focused);
+    assert_eq!(state.browser_state_for_test(), Some(before.as_str()));
 }
 
 #[test]
 fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_oauth_effects(false);
     let login =
         crate::auth::codex_oauth::DeviceLogin::for_test("https://example.test/device", "CODE-123");
@@ -1311,6 +1470,9 @@ fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
 
 #[test]
 fn codex_copy_keys_are_ssh_aware() {
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let login =
         crate::auth::codex_oauth::DeviceLogin::for_test("https://example.test/device", "CODE-123");
 
@@ -1504,7 +1666,7 @@ fn logged_in_oauth_navigation_clamps_to_single_continue_row() {
 }
 
 #[test]
-fn grok_oauth_logged_out_enter_still_begins_login() {
+fn oauth_grok_login_option_still_begins() {
     let mut state = OAuthFlowState::new(OAuthProvider::Grok);
     state.logged_in = false;
     state.ssh = false;

@@ -403,7 +403,10 @@ use harnesses_page::HarnessesPage;
 use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
 use providers::{AddState, AddStep, EditState, ProvidersPage};
-pub(crate) use providers::{OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthProvider};
+pub(crate) use providers::{
+    GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthProvider,
+    prepare_grok_browser_start,
+};
 use reset::{ResetButton, ResetOutcome};
 use skills_page::SkillsPage;
 use string_list::StringListPage;

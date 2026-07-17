@@ -363,6 +363,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "help",
+        description: "Open getting-started help and the slash command reference",
+        takes_args: false,
+        run: run_help,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "init",
         description: "Explore the project and write its instructions file (arg: target path)",
         takes_args: true,
@@ -707,6 +715,10 @@ struct HiddenSlashAlias {
 
 const HIDDEN_SLASH_ALIASES: &[HiddenSlashAlias] = &[
     HiddenSlashAlias {
+        alias: "?",
+        canonical: "help",
+    },
+    HiddenSlashAlias {
         alias: "modelsettings",
         canonical: "model-settings",
     },
@@ -926,6 +938,11 @@ fn run_pins(app: &mut App, _: &str) -> bool {
 
 fn run_keys(app: &mut App, _: &str) -> bool {
     app.toggle_keys_overlay();
+    false
+}
+
+fn run_help(app: &mut App, _: &str) -> bool {
+    app.overlay = Overlay::Help(super::help_overlay::HelpOverlay::open());
     false
 }
 
@@ -2361,7 +2378,12 @@ pub(super) fn resolve_skill_dispatch(args: &str, names: &[&str]) -> SkillDispatc
 #[cfg(test)]
 mod table_tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::BTreeSet;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     #[test]
     fn setup_slash_opens_wizard_menu_and_provider() {
@@ -2382,6 +2404,43 @@ mod table_tests {
         app.execute_slash(cmd);
         assert_eq!(app.dialog.test_page_name(), Some("Providers"));
         assert_eq!(app.dialog.test_provider_surface(), Some("other"));
+    }
+
+    #[test]
+    fn help_command_registered() {
+        let help = slash_command_by_name("help").expect("/help registry row");
+
+        assert!(!help.takes_args);
+        assert!(std::ptr::fn_addr_eq(
+            help.run,
+            run_help as fn(&mut App, &str) -> bool
+        ));
+        assert_eq!(
+            hidden_slash_alias("?").expect("/? hidden alias").name,
+            "help"
+        );
+    }
+
+    #[test]
+    fn help_overlay_opens_and_closes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmd = *slash_command_by_name("help").expect("/help registry row");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.dialog = Dialog::None;
+        app.daemon_prompt = None;
+        app.question_dialog = None;
+
+        app.composer.set("/help".to_string());
+        app.execute_slash(cmd);
+        assert!(matches!(app.overlay, Overlay::Help(_)));
+
+        assert!(!app.handle_key(press(KeyCode::Esc)));
+        assert!(matches!(app.overlay, Overlay::None));
+
+        let alias = hidden_slash_alias("?").expect("/? hidden alias");
+        app.composer.set("/?".to_string());
+        app.execute_slash(alias);
+        assert!(matches!(app.overlay, Overlay::Help(_)));
     }
 
     #[test]

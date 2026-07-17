@@ -48,6 +48,7 @@ const STATUS_GRACE: Duration = Duration::from_secs(2);
 /// A reasoning block must last at least this long before the indicator
 /// flips from the working line to the yellow `Thinking` override.
 const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
+const COMPOSER_PLACEHOLDER: &str = "Message FlyCockpit — / commands · Ctrl+K keys · /setup";
 
 /// The per-row render slices computed by the chat-layout pass: visible
 /// lines plus one authoritative metadata record per visible row.
@@ -1155,6 +1156,10 @@ impl App {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Diff(pane);
                 }
+                Overlay::Help(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Help(pane);
+                }
                 Overlay::None => {
                     // Carve the body for an embedded pane (GOALS §1i) when one
                     // is open: fullscreen fills the body, splits divide it. The
@@ -2108,6 +2113,23 @@ impl App {
                 }
             }
         }
+        let placeholder_displayed = text.is_empty() && ghost_display.is_none();
+        if placeholder_displayed {
+            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+            let chunks = wrap_ghost_line_chunks(COMPOSER_PLACEHOLDER, budget, first_row_budget);
+            for (ci, (start, end, _, _)) in chunks.iter().enumerate() {
+                let chunk_text = COMPOSER_PLACEHOLDER[*start..*end].to_string();
+                let pre = if ci == 0 {
+                    INPUT_PREFIX
+                } else {
+                    indent.as_str()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(pre.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(chunk_text, muted),
+                ]));
+            }
+        }
         // Byte offset of the start of the current logical line within the
         // full buffer — used to map a wrapped chunk back to absolute byte
         // ranges so paste-block placeholders render with a distinct style
@@ -2118,7 +2140,7 @@ impl App {
             // When a ghost is rendered the empty real-buffer line is
             // already represented by the ghost's first row (the cursor
             // sits on it); don't also push a blank white line.
-            if ghost_display.is_some() {
+            if ghost_display.is_some() || placeholder_displayed {
                 break;
             }
             let chunks = wrap_display_chunks(line, budget);
@@ -5903,7 +5925,9 @@ mod render_history_spacing_tests {
 
 #[cfg(test)]
 mod prediction_ghost_context_indicator_tests {
-    use super::{App, first_line_truncated, input_visual_rows, wrap_ghost_line_chunks};
+    use super::{
+        App, COMPOSER_PLACEHOLDER, first_line_truncated, input_visual_rows, wrap_ghost_line_chunks,
+    };
     use crate::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
     use crate::tui::theme::MUTED_TEXT;
@@ -6197,6 +6221,53 @@ mod prediction_ghost_context_indicator_tests {
         let row = render_input_row(&mut app, 40);
 
         assert!(row.contains(&label), "context indicator visible:\n{row}");
+    }
+
+    #[test]
+    fn composer_placeholder_empty_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+
+        let empty_row = render_input_row(&mut app, 80);
+        assert!(
+            empty_row.contains(COMPOSER_PLACEHOLDER),
+            "empty composer renders the placeholder:\n{empty_row}"
+        );
+
+        app.composer.insert_str("x");
+        let typed_row = render_input_row(&mut app, 80);
+        assert!(
+            !typed_row.contains(COMPOSER_PLACEHOLDER),
+            "typed text removes the placeholder:\n{typed_row}"
+        );
+        assert!(
+            typed_row.contains("x"),
+            "typed text still renders:\n{typed_row}"
+        );
+    }
+
+    #[test]
+    fn ghost_suppresses_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.prediction_state.begin_turn();
+        app.prediction_state.on_result(
+            app.prediction_state.turn(),
+            Some("suggested text".to_string()),
+            false,
+            true,
+        );
+
+        let row = render_input_row(&mut app, 80);
+
+        assert!(
+            !row.contains(COMPOSER_PLACEHOLDER),
+            "prediction ghost suppresses the placeholder:\n{row}"
+        );
+        assert!(
+            row.contains("suggested text"),
+            "ghost still renders:\n{row}"
+        );
     }
 
     #[test]

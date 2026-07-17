@@ -155,7 +155,8 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
         _ => vec![None, Some(title), Some(provider), Some(path), None, None],
     };
 
-    art.into_iter()
+    let mut lines: Vec<Line<'static>> = art
+        .into_iter()
         .zip(texts)
         .map(|(art_row, text)| {
             let mut spans = art_row;
@@ -165,7 +166,16 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
             }
             Line::from(spans)
         })
-        .collect()
+        .collect();
+    lines.push(Line::from(vec![
+        Span::styled("Tip: ", Style::default().fg(GREY)),
+        Span::styled(
+            "/help",
+            Style::default().fg(GREY).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" gets you oriented", Style::default().fg(GREY)),
+    ]));
+    lines
 }
 
 #[cfg(test)]
@@ -206,8 +216,8 @@ mod tests {
     #[test]
     fn box_is_rectangular_and_bordered() {
         let lines = build_box(&sample(true, Some("Ada")), 200, 50).expect("fits a roomy pane");
-        // 6 content rows + top/bottom border.
-        assert_eq!(lines.len(), 8);
+        // 7 content rows + top/bottom border.
+        assert_eq!(lines.len(), 9);
         // Every row renders to the same display width (centered box with
         // a shared left pad), so the right rail stays flush.
         let w0 = lines[0].width();
@@ -215,7 +225,7 @@ mod tests {
             assert_eq!(l.width(), w0, "ragged box edge");
         }
         let top = joined(&lines[0]);
-        let bottom = joined(&lines[7]);
+        let bottom = joined(&lines[8]);
         assert!(top.trim_start().starts_with('╭') && top.trim_end().ends_with('╮'));
         assert!(bottom.trim_start().starts_with('╰') && bottom.trim_end().ends_with('╯'));
     }
@@ -255,6 +265,17 @@ mod tests {
         let vpos = title_row.find("v9.9.9").unwrap();
         let ipos = title_row.find(short_id).unwrap();
         assert!(vpos < ipos, "version should precede the session short id");
+    }
+
+    #[test]
+    fn banner_includes_help_tip() {
+        let lines = build_box(&sample(true, None), 200, 50).unwrap();
+        let joined_all: String = lines.iter().map(joined).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            joined_all.contains("Tip: /help gets you oriented"),
+            "banner should advertise /help:\n{joined_all}"
+        );
     }
 
     #[test]

@@ -244,6 +244,14 @@ impl App {
                 }
                 return;
             }
+            Overlay::Help(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
+            }
             Overlay::ModelPicker(_)
             | Overlay::Multireview(_)
             | Overlay::Usage(_)

@@ -518,6 +518,12 @@ impl App {
                 }
                 return false;
             }
+            Overlay::Help(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::Help(pane);
+                }
+                return false;
+            }
         }
 
         if self.transcript_find.is_some() {

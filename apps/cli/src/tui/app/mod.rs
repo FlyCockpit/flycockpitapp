@@ -11,6 +11,7 @@
 //! fallback in the composer.
 
 mod events;
+pub(in crate::tui) mod help_overlay;
 mod input;
 mod mouse;
 mod pins;
@@ -1137,6 +1138,7 @@ pub(super) enum Overlay {
     Context(crate::tui::context_pane::ContextPane),
     Notes(crate::tui::notes_pane::NotesPane),
     Diff(crate::tui::diff_pane::DiffPane),
+    Help(help_overlay::HelpOverlay),
 }
 
 impl Overlay {
@@ -1165,7 +1167,11 @@ impl Overlay {
             Self::Quick(_) => Some(KeyContext::QuickSettings),
             Self::Notes(_) => Some(KeyContext::Scratchpad),
             Self::Diff(_) => Some(KeyContext::Diff),
-            Self::Stats(_) | Self::Usage(_) | Self::Skills(_) | Self::Context(_) => None,
+            Self::Stats(_)
+            | Self::Usage(_)
+            | Self::Skills(_)
+            | Self::Context(_)
+            | Self::Help(_) => None,
         }
     }
 }

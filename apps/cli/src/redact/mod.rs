@@ -797,4 +797,192 @@ mod scrub_fast_path_tests {
 }
 
 #[cfg(test)]
+mod scrub_inventory_tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const DOC_REL: &str = "apps/cli/docs/redaction-scrub-sites.md";
+    const INVENTORY_START: &str = "<!-- scrub-inventory:start -->";
+    const INVENTORY_END: &str = "<!-- scrub-inventory:end -->";
+    const EXPECTED_SCRUB_FILES: &[&str] = &[
+        "apps/cli/src/commands/export/mod.rs",
+        "apps/cli/src/daemon/org_sync.rs",
+        "apps/cli/src/daemon/remote_audit_upload.rs",
+        "apps/cli/src/daemon/server/dispatch.rs",
+        "apps/cli/src/daemon/server/mod.rs",
+        "apps/cli/src/daemon/session_worker/run.rs",
+        "apps/cli/src/embeddings.rs",
+        "apps/cli/src/engine/driver/mod.rs",
+        "apps/cli/src/engine/model/dispatch.rs",
+        "apps/cli/src/engine/model/outbound_guard.rs",
+        "apps/cli/src/engine/model/redact.rs",
+        "apps/cli/src/harness/run.rs",
+        "apps/cli/src/redact/mod.rs",
+    ];
+
+    #[test]
+    fn scrub_inventory_doc_matches_source_tree() {
+        let root = repo_root();
+        let expected = set(EXPECTED_SCRUB_FILES);
+        let actual = production_scrub_files(&root);
+        assert_eq!(
+            actual, expected,
+            "production scrub file set changed; update {DOC_REL}"
+        );
+
+        let doc_paths = doc_inventory_paths(&root.join(DOC_REL));
+        assert_eq!(
+            doc_paths, expected,
+            "{DOC_REL} machine-checked manifest must match the enforced scrub file set"
+        );
+
+        for rel in &expected {
+            assert!(
+                root.join(rel).exists(),
+                "{DOC_REL} lists missing path `{rel}`"
+            );
+        }
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("apps/cli has a repo root two levels up")
+            .to_path_buf()
+    }
+
+    fn production_scrub_files(root: &Path) -> BTreeSet<String> {
+        let mut files = Vec::new();
+        collect_rust_files(&root.join("apps/cli/src"), &mut files);
+        collect_rust_files(&root.join("crates"), &mut files);
+        files
+            .into_iter()
+            .filter(|path| !is_test_path(path))
+            .filter_map(|path| {
+                let source = fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("reading `{}`: {err}", path.display()));
+                source_has_scrub_entrypoint(&strip_cfg_test_blocks(&source)).then(|| {
+                    path.strip_prefix(root)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "normalizing `{}` relative to repo root: {err}",
+                                path.display()
+                            )
+                        })
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+            })
+            .collect()
+    }
+
+    fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("reading directory `{}`: {err}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|err| {
+                    panic!("reading directory entry in `{}`: {err}", dir.display())
+                })
+                .path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn is_test_path(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| name == "tests.rs")
+            || path
+                .components()
+                .any(|component| component.as_os_str() == "tests")
+    }
+
+    fn source_has_scrub_entrypoint(source: &str) -> bool {
+        [
+            ".scrub(",
+            "scrub_many(",
+            "scrub_cow(",
+            "scrub_json_strings(",
+            "scrub_event_for_principal(",
+            "scrub_history_for_principal(",
+        ]
+        .iter()
+        .any(|needle| source.contains(needle))
+    }
+
+    fn strip_cfg_test_blocks(source: &str) -> String {
+        let mut kept = String::new();
+        let mut pending_cfg_test = false;
+        let mut skip_depth: Option<i32> = None;
+
+        for line in source.lines() {
+            if let Some(depth) = skip_depth.as_mut() {
+                *depth += brace_delta(line);
+                if *depth <= 0 {
+                    skip_depth = None;
+                }
+                continue;
+            }
+
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[cfg(test)]") {
+                pending_cfg_test = true;
+                continue;
+            }
+
+            if pending_cfg_test {
+                pending_cfg_test = false;
+                if trimmed.ends_with(';') {
+                    continue;
+                }
+                let depth = brace_delta(line);
+                if depth > 0 {
+                    skip_depth = Some(depth);
+                    continue;
+                }
+                continue;
+            }
+
+            kept.push_str(line);
+            kept.push('\n');
+        }
+
+        kept
+    }
+
+    fn brace_delta(line: &str) -> i32 {
+        line.chars().fold(0, |delta, ch| match ch {
+            '{' => delta + 1,
+            '}' => delta - 1,
+            _ => delta,
+        })
+    }
+
+    fn doc_inventory_paths(path: &Path) -> BTreeSet<String> {
+        let doc = fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("reading `{}`: {err}", path.display()));
+        let manifest = doc
+            .split_once(INVENTORY_START)
+            .and_then(|(_, rest)| rest.split_once(INVENTORY_END).map(|(body, _)| body))
+            .unwrap_or_else(|| panic!("{DOC_REL} is missing scrub inventory markers"));
+        let mut paths = BTreeSet::new();
+        for part in manifest.split('`').skip(1).step_by(2) {
+            if part.ends_with(".rs") {
+                paths.insert(part.to_string());
+            }
+        }
+        paths
+    }
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_string()).collect()
+    }
+}
+
+#[cfg(test)]
 mod tests;

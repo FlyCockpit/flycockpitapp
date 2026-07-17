@@ -150,7 +150,7 @@ impl OrgSyncHttpClient {
             .get(endpoint(&self.server_url, POLICY_PATH)?)
             .bearer_auth(&credential.instance_token)
             .header("x-flycockpit-instance-id", &credential.instance_id)
-            .header("x-csrf-token", "cockpit-cli")
+            .header("x-csrf-token", crate::auth::flycockpit::CLIENT_ID)
             .send()
             .await
             .context("fetching Flycockpit org policy")?;
@@ -181,7 +181,7 @@ impl OrgSyncHttpClient {
                 .bearer_auth(&credential.instance_token)
                 .header("x-flycockpit-instance-id", &credential.instance_id)
                 .header("x-flycockpit-org-id", &policy.org_id)
-                .header("x-csrf-token", "cockpit-cli")
+                .header("x-csrf-token", crate::auth::flycockpit::CLIENT_ID)
                 .json(payload)
                 .send()
                 .await

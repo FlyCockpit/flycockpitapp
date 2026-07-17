@@ -382,7 +382,17 @@ pub(super) fn build_anthropic_model(
         // The 1h extended cache requires the beta header on the client.
         builder = builder.anthropic_beta("extended-cache-ttl-2025-04-11");
     }
+    let extra_headers = resolved
+        .headers
+        .iter()
+        .filter(|h| {
+            h.name
+                .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+        })
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
     let client = builder
+        .http_client(UsageAliasHttpClient::new(extra_headers))
         .build()
         .with_context(|| format!("building anthropic client for `{provider_id}`"))?;
 
@@ -466,7 +476,11 @@ pub(super) fn build_chatgpt_model(
     let extra_headers = resolved
         .headers
         .iter()
-        .filter(|h| h.name.eq_ignore_ascii_case("OpenAI-Beta"))
+        .filter(|h| {
+            h.name.eq_ignore_ascii_case("OpenAI-Beta")
+                || h.name
+                    .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+        })
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
@@ -476,7 +490,7 @@ pub(super) fn build_chatgpt_model(
             account_id: Some(account_id),
         })
         .base_url(&resolved.base_url)
-        .originator("codex_cli_rs")
+        .originator("cockpit")
         // Avoid rig's built-in "You are ChatGPT..." default so Cockpit's
         // system prompt is the only instruction source. An empty default is
         // a no-op when a real preamble is present.
@@ -747,11 +761,11 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
 /// (OpenAI-only) is intentionally **not** forwarded here — Anthropic uses
 /// provider-concrete per-block caching, not a top-level key.
 pub(super) fn build_anthropic_agent(
-    model: anthropic::completion::CompletionModel,
+    model: AnthropicCompletionModel,
     system: &str,
     tools: &[ToolDefinition],
     params: &ModelParams,
-) -> rig::agent::Agent<anthropic::completion::CompletionModel> {
+) -> rig::agent::Agent<AnthropicCompletionModel> {
     let boxed: Vec<Box<dyn rig::tool::ToolDyn>> = tools
         .iter()
         .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)

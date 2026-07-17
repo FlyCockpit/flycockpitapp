@@ -366,7 +366,7 @@ fn resolve_provider_request_inner_with_sources(
             });
             headers.push(ResolvedHeader {
                 name: "originator".to_string(),
-                value: "codex_cli_rs".to_string(),
+                value: "cockpit".to_string(),
             });
             headers.push(ResolvedHeader {
                 name: "OpenAI-Beta".to_string(),
@@ -546,8 +546,24 @@ async fn send_models_request_with_retries(
 ) -> Result<reqwest::Response> {
     let mut attempt = 0;
     loop {
-        let mut req = client.get(url).header("Accept", "application/json");
+        let user_agent = headers
+            .iter()
+            .find(|h| {
+                h.name
+                    .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+            })
+            .map(|h| h.value.clone())
+            .unwrap_or_else(|| crate::user_agent::user_agent().to_string());
+        let mut req = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::USER_AGENT, user_agent);
         for h in headers {
+            if h.name
+                .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+            {
+                continue;
+            }
             req = req.header(&h.name, &h.value);
         }
         match req.send().await {
@@ -2089,7 +2105,7 @@ mod tests {
             resolved
                 .headers
                 .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("originator") && h.value == "codex_cli_rs")
+                .any(|h| h.name.eq_ignore_ascii_case("originator") && h.value == "cockpit")
         );
         assert!(
             resolved
@@ -2247,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_oauth_model_list_request_uses_codex_cli_shape() {
+    fn codex_oauth_model_list_request_uses_codex_shape() {
         let entry = ProviderEntry {
             url: crate::auth::codex_oauth::DEFAULT_BASE_URL.into(),
             credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.to_string()),
@@ -2359,7 +2375,10 @@ mod tests {
             assert!(request_header_value(&request, "originator").is_none());
             assert!(request_header_value(&request, "session_id").is_none());
             assert!(request_header_value(&request, "version").is_none());
-            assert!(request_header_value(&request, "user-agent").is_none());
+            assert_eq!(
+                request_header_value(&request, "user-agent"),
+                Some(crate::user_agent::user_agent())
+            );
 
             match outcome {
                 FetchOutcome::FallbackAvailable {
@@ -2397,7 +2416,11 @@ mod tests {
         let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
             .await
             .unwrap();
-        let _ = request_handle.await.unwrap();
+        let request = request_handle.await.unwrap();
+        assert_eq!(
+            request_header_value(&request, "user-agent"),
+            Some(crate::user_agent::user_agent())
+        );
 
         match outcome {
             FetchOutcome::Models { models, catalog } => {

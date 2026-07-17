@@ -35,7 +35,7 @@ pub enum RepoResolution {
 pub async fn resolve_repo_url(eco: Ecosystem, name: &str) -> Result<RepoResolution> {
     let client = reqwest::Client::builder()
         .timeout(LOOKUP_TIMEOUT)
-        .user_agent("cockpit-cli")
+        .user_agent(crate::user_agent::user_agent())
         .build()
         .context("building reqwest client")?;
     match eco {

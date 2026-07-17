@@ -47,6 +47,7 @@ mod text;
 mod tokens;
 mod tools;
 mod tui;
+pub mod user_agent;
 mod welcome;
 pub mod wizard;
 

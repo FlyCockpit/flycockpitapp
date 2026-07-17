@@ -121,6 +121,7 @@ pub(crate) struct PreparedCompletionRequest {
 // endpoint 404s on the wrong path.
 type OpenAiCompatClient = openai::CompletionsClient<UsageAliasHttpClient>;
 type ChatGptResponsesModel = chatgpt::ResponsesCompletionModel<UsageAliasHttpClient>;
+type AnthropicCompletionModel = anthropic::completion::CompletionModel<UsageAliasHttpClient>;
 
 #[derive(Clone, Default)]
 pub(crate) struct UsageAliasHttpClient {
@@ -138,11 +139,25 @@ impl fmt::Debug for UsageAliasHttpClient {
 
 impl UsageAliasHttpClient {
     fn new(extra_headers: Vec<(String, String)>) -> Self {
+        let extra_headers = with_canonical_user_agent(extra_headers);
         Self {
             client: reqwest::Client::new(),
             extra_headers,
         }
     }
+}
+
+fn with_canonical_user_agent(mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str()))
+    {
+        headers.push((
+            reqwest::header::USER_AGENT.as_str().to_string(),
+            crate::user_agent::user_agent().to_string(),
+        ));
+    }
+    headers
 }
 
 fn apply_extra_headers<T>(
@@ -425,7 +440,7 @@ pub enum Model {
     /// builds a fresh caching-enabled agent each turn, which re-applies the
     /// last-message cache marker over the grown history.
     Anthropic {
-        model: anthropic::completion::CompletionModel,
+        model: AnthropicCompletionModel,
         model_id: String,
         /// The configured provider id this model was built from. Same role as
         /// on [`Model::OpenAi`] — exact per-`(provider, model)` backup
@@ -3252,6 +3267,16 @@ mod tests {
         (String::from_utf8_lossy(&buf).to_string(), String::new())
     }
 
+    fn request_header_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("{}:", name.to_ascii_lowercase());
+        header.lines().find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .starts_with(&needle)
+                .then(|| line.split_once(':').map(|(_, value)| value.trim()))?
+        })
+    }
+
     /// A local server that captures the **first** request body and replies
     /// with a minimal non-streaming chat-completions JSON (for the
     /// `text_completion` / `text_completion_with_system` / `tool_completion`
@@ -3359,6 +3384,27 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let body = read_http_body(&mut stream).await;
                 let _ = tx.send(body);
+                let payload = r#"{"type":"error","error":{"type":"invalid_request_error","message":"capture complete"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
+    async fn anthropic_header_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let (header, _body) = read_http_request(&mut stream).await;
+                let _ = tx.send(header);
                 let payload = r#"{"type":"error","error":{"type":"invalid_request_error","message":"capture complete"}}"#;
                 let resp = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4268,6 +4314,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_anthropic_dispatch_sends_canonical_user_agent() {
+        use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
+
+        let (url, rx) = anthropic_header_capture_server().await;
+        let resolved = ResolvedRequest {
+            base_url: url,
+            headers: vec![ResolvedHeader {
+                name: "x-api-key".to_string(),
+                value: "anthropic-key".to_string(),
+            }],
+        };
+        let model = build_anthropic_model(
+            "anthropic",
+            &resolved,
+            "claude-haiku",
+            128,
+            &crate::config::providers::CacheConfig::default(),
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .expect("native Anthropic model must build");
+
+        let _ = model.text_completion("hi").await;
+        let headers = rx.await.unwrap();
+        assert_eq!(
+            request_header_value(&headers, "user-agent"),
+            Some(crate::user_agent::user_agent())
+        );
+    }
+
+    #[tokio::test]
     async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
         use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
@@ -4285,7 +4370,7 @@ mod tests {
                 },
                 ResolvedHeader {
                     name: "originator".to_string(),
-                    value: "codex_cli_rs".to_string(),
+                    value: "cockpit".to_string(),
                 },
                 ResolvedHeader {
                     name: "OpenAI-Beta".to_string(),
@@ -4341,7 +4426,11 @@ mod tests {
         );
         assert!(header_lc.contains("authorization: bearer codex-access-token"));
         assert!(header_lc.contains("chatgpt-account-id: acc_123"));
-        assert!(header_lc.contains("originator: codex_cli_rs"));
+        assert_eq!(request_header_value(&header, "originator"), Some("cockpit"));
+        assert_eq!(
+            request_header_value(&header, "user-agent"),
+            Some(crate::user_agent::user_agent())
+        );
         assert!(header_lc.contains("openai-beta: responses=experimental"));
         assert!(header_lc.contains("accept: text/event-stream"));
         assert!(header_lc.contains("content-type: application/json"));
@@ -4411,7 +4500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_compatible_dispatch_sends_resolved_extra_headers() {
+    async fn openai_compatible_dispatch_sends_canonical_user_agent_and_resolved_extra_headers() {
         use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
         let (url, rx) = header_capture_server().await;
@@ -4428,7 +4517,7 @@ mod tests {
                 },
                 ResolvedHeader {
                     name: "originator".to_string(),
-                    value: "codex_cli_rs".to_string(),
+                    value: "cockpit".to_string(),
                 },
             ],
         };
@@ -4453,10 +4542,52 @@ mod tests {
         .expect("model must build");
 
         let _ = model.text_completion("hi").await;
-        let headers = rx.await.unwrap().to_ascii_lowercase();
-        assert!(headers.contains("authorization: bearer access-token"));
-        assert!(headers.contains("chatgpt-account-id: acc_123"));
-        assert!(headers.contains("originator: codex_cli_rs"));
+        let headers = rx.await.unwrap();
+        let headers_lc = headers.to_ascii_lowercase();
+        assert!(headers_lc.contains("authorization: bearer access-token"));
+        assert!(headers_lc.contains("chatgpt-account-id: acc_123"));
+        assert_eq!(
+            request_header_value(&headers, "originator"),
+            Some("cockpit")
+        );
+        assert_eq!(
+            request_header_value(&headers, "user-agent"),
+            Some(crate::user_agent::user_agent())
+        );
+    }
+
+    #[tokio::test]
+    async fn user_configured_user_agent_wins() {
+        let (url, rx) = header_capture_server().await;
+        let entry = ProviderEntry {
+            url,
+            headers: vec![
+                crate::config::providers::HeaderSpec {
+                    name: "Authorization".to_string(),
+                    value: "Bearer access-token".to_string(),
+                },
+                crate::config::providers::HeaderSpec {
+                    name: "User-Agent".to_string(),
+                    value: "custom-client/9.9".to_string(),
+                },
+            ],
+            allow_insecure_http: true,
+            ..ProviderEntry::default()
+        };
+        let model = build_openai_model(
+            "openai-compatible",
+            &entry,
+            "m",
+            TestArc::new(RedactionTable::empty()),
+        )
+        .expect("model must build");
+
+        let _ = model.text_completion("hi").await;
+        let headers = rx.await.unwrap();
+        assert_eq!(
+            request_header_value(&headers, "user-agent"),
+            Some("custom-client/9.9")
+        );
     }
 
     /// The `text_completion` path (auto-title, translation, prediction,

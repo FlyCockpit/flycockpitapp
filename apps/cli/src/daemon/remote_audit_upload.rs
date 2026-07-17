@@ -134,7 +134,7 @@ impl RemoteAuditUploadHttpClient {
             let resp = self
                 .http
                 .post(endpoint(&self.server_url, INGEST_PATH)?)
-                .header("x-csrf-token", "cockpit-cli")
+                .header("x-csrf-token", crate::auth::flycockpit::CLIENT_ID)
                 .json(payload)
                 .send()
                 .await

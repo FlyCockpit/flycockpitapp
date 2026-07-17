@@ -142,11 +142,25 @@ async fn send_codex_usage_request_with_retries(
 ) -> Result<reqwest::Response> {
     let mut attempt = 0;
     loop {
+        let user_agent = headers
+            .iter()
+            .find(|h| {
+                h.name
+                    .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+            })
+            .map(|h| h.value.clone())
+            .unwrap_or_else(|| crate::user_agent::user_agent().to_string());
         let mut req = client
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, "codex-cli");
+            .header(reqwest::header::USER_AGENT, user_agent);
         for header in headers {
+            if header
+                .name
+                .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+            {
+                continue;
+            }
             req = req.header(&header.name, &header.value);
         }
         match req.send().await {

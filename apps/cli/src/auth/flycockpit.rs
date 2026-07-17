@@ -13,7 +13,7 @@ use crate::credentials::CredentialStore;
 pub use crate::daemon::proto::{AccountInfo, RelayChoice, StoredFlycockpitCredential};
 
 pub const CREDENTIAL_KEY: &str = "flycockpit";
-pub const CLIENT_ID: &str = "cockpit-cli";
+pub const CLIENT_ID: &str = concat!("cockpit", "-cli");
 pub const DEVICE_SCOPE: &str = "account:instance";
 pub const DEFAULT_SERVER_URL: &str = "https://app.flycockpit.dev";
 const MAX_POLL_SECS: u64 = 30 * 60;
@@ -338,7 +338,7 @@ impl FlycockpitClient {
             .http
             .post(url)
             .bearer_auth(access_token)
-            .header("x-csrf-token", "cockpit-cli")
+            .header("x-csrf-token", CLIENT_ID)
             .json(&json!({ "json": payload }))
             .send()
             .await
@@ -356,7 +356,7 @@ impl FlycockpitClient {
         let resp = self
             .http
             .post(url)
-            .header("x-csrf-token", "cockpit-cli")
+            .header("x-csrf-token", CLIENT_ID)
             .json(&json!({ "json": { "instanceId": credential.instance_id } }))
             .send()
             .await
@@ -377,7 +377,7 @@ impl FlycockpitClient {
         let resp = self
             .http
             .post(url)
-            .header("x-csrf-token", "cockpit-cli")
+            .header("x-csrf-token", CLIENT_ID)
             .json(&json!({
                 "json": {
                     "instanceId": credential.instance_id,
@@ -414,7 +414,7 @@ impl FlycockpitClient {
         let resp = self
             .http
             .post(url)
-            .header("x-csrf-token", "cockpit-cli")
+            .header("x-csrf-token", CLIENT_ID)
             .json(&json!({
                 "json": {
                     "instanceId": credential.instance_id,
@@ -781,7 +781,7 @@ fn hostname() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "cockpit-cli".to_string())
+        .unwrap_or_else(|| CLIENT_ID.to_string())
 }
 
 #[cfg(test)]

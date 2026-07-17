@@ -6580,6 +6580,214 @@ fn response_redaction_scrubs_queue_display_metadata() {
 }
 
 #[test]
+fn redaction_preserves_uuid_when_secret_overlaps() {
+    crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+        let id = Uuid::parse_str("88c0e13f-486b-4cfc-8c8f-31dd49b4d39f").unwrap();
+        let item = proto::QueueItem {
+            id,
+            status: proto::QueueItemStatus::Queued,
+            text: "wire 88c0e13f".to_string(),
+            display_text: Some("review @88c0e13f".to_string()),
+            target: proto::QueueTarget::default(),
+        };
+
+        let scrubbed = scrub_proto_response(
+            Response::UserMessageQueued {
+                item: item.clone(),
+                queue: vec![item],
+            },
+            &table,
+        )
+        .expect("overlap redaction must not drop response");
+
+        let Response::UserMessageQueued { item, queue } = scrubbed else {
+            panic!("expected queued response");
+        };
+        assert_eq!(item.id, id);
+        assert_eq!(queue[0].id, id);
+        assert!(!item.text.contains("88c0e13f"), "{item:?}");
+        assert!(
+            !item
+                .display_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("88c0e13f"),
+            "{item:?}"
+        );
+        let encoded = serde_json::to_string(&Response::UserMessageQueued { item, queue }).unwrap();
+        assert!(!encoded.contains("88c0e13f\""), "{encoded}");
+        assert!(encoded.contains("REDACT"), "{encoded}");
+    });
+}
+
+#[test]
+fn event_redaction_preserves_typed_fields() {
+    crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+        let session_id = Uuid::parse_str("88c0e13f-486b-4cfc-8c8f-31dd49b4d39f").unwrap();
+        let item_id = Uuid::parse_str("99c0e13f-486b-4cfc-8c8f-31dd49b4d399").unwrap();
+        let event = proto::Event::QueueUpdated {
+            session_id,
+            queue: vec![proto::QueueItem {
+                id: item_id,
+                status: proto::QueueItemStatus::Queued,
+                text: "wire 88c0e13f".to_string(),
+                display_text: Some("review @88c0e13f".to_string()),
+                target: proto::QueueTarget::default(),
+            }],
+        };
+
+        let scrubbed = scrub_proto_event(event, &table).expect("overlap redaction must not drop event");
+        let proto::Event::QueueUpdated { session_id: got, queue } = scrubbed else {
+            panic!("expected queue event");
+        };
+        assert_eq!(got, session_id);
+        assert_eq!(queue[0].id, item_id);
+        let encoded = serde_json::to_string(&proto::Event::QueueUpdated { session_id: got, queue }).unwrap();
+        assert!(!encoded.contains("wire 88c0e13f"), "{encoded}");
+        assert!(!encoded.contains("review @88c0e13f"), "{encoded}");
+        assert!(encoded.contains("REDACT"), "{encoded}");
+    });
+}
+
+#[test]
+fn redaction_preserves_structural_string_fields() {
+    crate::auth::flycockpit::with_redaction_token_override("secret-struct", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+
+        let turn_id = "turn-secret-struct-123".to_string();
+        let event = scrub_proto_event(
+            proto::Event::ThinkingStarted {
+                session_id: Uuid::new_v4(),
+                agent: "Build-secret-struct".to_string(),
+                turn_id: Some(turn_id.clone()),
+            },
+            &table,
+        )
+        .expect("structural event strings must not drop event");
+        let proto::Event::ThinkingStarted {
+            agent,
+            turn_id: got_turn_id,
+            ..
+        } = event
+        else {
+            panic!("expected thinking event");
+        };
+        assert_eq!(agent, "Build-secret-struct");
+        assert_eq!(got_turn_id.as_deref(), Some(turn_id.as_str()));
+
+        let fork_point_turn_id = "fork-secret-struct-456".to_string();
+        let forked = scrub_proto_response(
+            Response::Forked {
+                session_id: Uuid::new_v4(),
+                short_id: "abc123".to_string(),
+                parent_session_id: Uuid::new_v4(),
+                fork_point_turn_id: Some(fork_point_turn_id.clone()),
+            },
+            &table,
+        )
+        .expect("structural response strings must not drop response");
+        let Response::Forked {
+            fork_point_turn_id: got_fork_point_turn_id,
+            ..
+        } = forked
+        else {
+            panic!("expected forked response");
+        };
+        assert_eq!(
+            got_fork_point_turn_id.as_deref(),
+            Some(fork_point_turn_id.as_str())
+        );
+
+        let models = scrub_proto_response(
+            Response::Models {
+                models: vec![proto::ModelSummary {
+                    provider: "provider-secret-struct".to_string(),
+                    id: "model-secret-struct".to_string(),
+                    display_name: Some("Secret model secret-struct".to_string()),
+                    favorite: false,
+                }],
+            },
+            &table,
+        )
+        .expect("catalog model response must not drop response");
+        let Response::Models { models } = models else {
+            panic!("expected models response");
+        };
+        assert_eq!(models[0].provider, "provider-secret-struct");
+        assert_eq!(models[0].id, "model-secret-struct");
+        assert!(
+            !models[0]
+                .display_name
+                .as_deref()
+                .unwrap_or_default()
+                .contains("secret-struct"),
+            "{models:?}"
+        );
+    });
+}
+
+#[test]
+fn history_redaction_preserves_typed_fields() {
+    crate::auth::flycockpit::with_redaction_token_override("call-secret-123", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+        let call_id = "call-secret-123-structural-id".to_string();
+        let entry = proto::HistoryEntry::ToolCall {
+            seq: 9,
+            agent: "Build".to_string(),
+            call_id: call_id.clone(),
+            tool: "bash".to_string(),
+            original_input: serde_json::json!({"cmd": "echo call-secret-123"}),
+            wire_input: serde_json::json!({"cmd": "echo call-secret-123"}),
+            recovery_kind: None,
+            recovery_stage: None,
+            output: "result call-secret-123".to_string(),
+            hard_fail: false,
+            truncated: false,
+            hint: Some("hint call-secret-123".to_string()),
+        };
+
+        let scrubbed = scrub_history_entry(entry, &table).expect("overlap redaction must not drop history");
+        let proto::HistoryEntry::ToolCall {
+            call_id: got,
+            output,
+            hint,
+            original_input,
+            wire_input,
+            ..
+        } = scrubbed
+        else {
+            panic!("expected tool-call history");
+        };
+        assert_eq!(got, call_id);
+        let encoded = serde_json::to_string(&(output, hint, original_input, wire_input)).unwrap();
+        assert!(!encoded.contains("call-secret-123"), "{encoded}");
+        assert!(encoded.contains("REDACT"), "{encoded}");
+    });
+}
+
+#[test]
 fn history_redaction_scrubs_display_text_and_tag_expansions() {
     crate::auth::flycockpit::with_redaction_token_override("fci_history_secret_12345", || {
         let tmp = tempfile::tempdir().unwrap();

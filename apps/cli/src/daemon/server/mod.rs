@@ -105,42 +105,18 @@ fn scrub_event_for_principal(
 }
 
 fn scrub_proto_event(event: proto::Event, redact: &RedactionTable) -> Option<proto::Event> {
-    let mut value = match serde_json::to_value(&event) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(error = %error, "serializing event for redaction failed; dropping event");
-            return None;
-        }
-    };
-    scrub_json_strings(&mut value, redact);
-    match serde_json::from_value(value) {
-        Ok(event) => Some(event),
-        Err(error) => {
-            tracing::warn!(error = %error, "deserializing redacted event failed; dropping event");
-            None
-        }
-    }
+    let mut event = event;
+    scrub_event_free_text(&mut event, redact);
+    Some(event)
 }
 
 fn scrub_proto_response(
     response: proto::Response,
     redact: &RedactionTable,
 ) -> Option<proto::Response> {
-    let mut value = match serde_json::to_value(&response) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(error = %error, "serializing response for redaction failed; dropping response");
-            return None;
-        }
-    };
-    scrub_json_strings(&mut value, redact);
-    match serde_json::from_value(value) {
-        Ok(response) => Some(response),
-        Err(error) => {
-            tracing::warn!(error = %error, "deserializing redacted response failed; dropping response");
-            None
-        }
-    }
+    let mut response = response;
+    scrub_response_free_text(&mut response, redact);
+    Some(response)
 }
 
 fn scrub_history_for_principal(
@@ -161,20 +137,1150 @@ fn scrub_history_entry(
     entry: proto::HistoryEntry,
     redact: &RedactionTable,
 ) -> Option<proto::HistoryEntry> {
-    let mut value = match serde_json::to_value(&entry) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(error = %error, "serializing history entry for redaction failed; dropping entry");
-            return None;
+    let mut entry = entry;
+    scrub_history_entry_free_text(&mut entry, redact);
+    Some(entry)
+}
+
+fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
+    match response {
+        proto::Response::Ack => {}
+        proto::Response::UserMessageQueued { item, queue } => {
+            scrub_queue_item(item, redact);
+            scrub_queue(queue, redact);
         }
-    };
-    scrub_json_strings(&mut value, redact);
-    match serde_json::from_value(value) {
-        Ok(entry) => Some(entry),
-        Err(error) => {
-            tracing::warn!(error = %error, "deserializing redacted history entry failed; dropping entry");
-            None
+        proto::Response::DelegationSteer { result } => {
+            scrub_delegation_steer_result(result, redact)
         }
+        proto::Response::AttachmentUploadStarted {
+            upload_id: _,
+            max_chunk_base64_bytes: _,
+        }
+        | proto::Response::AttachmentChunkAccepted {
+            upload_id: _,
+            next_offset: _,
+        }
+        | proto::Response::AttachmentUploaded { image_ref: _ }
+        | proto::Response::NoteRecorded { seq: _ }
+        | proto::Response::SessionLiveStatus { statuses: _ }
+        | proto::Response::TerminalOpened {
+            terminal_id: _,
+            viewer_count: _,
+            recording: _,
+        }
+        | proto::Response::FsWrite { hash: _ }
+        | proto::Response::UsageCounts {
+            models: _,
+            slash: _,
+            tags: _,
+        }
+        | proto::Response::SandboxState {
+            mode: _,
+            enabled: _,
+            container_network_enabled: _,
+            container_availability: _,
+        }
+        | proto::Response::SandboxEscalationState { enabled: _ }
+        | proto::Response::RedactionState {
+            scan_environment: _,
+            scan_dotenv: _,
+            scan_ssh_keys: _,
+        }
+        | proto::Response::PreflightState { enabled: _ }
+        | proto::Response::TrustedOnlyState { enabled: _ }
+        | proto::Response::ApprovalModeState { mode: _ }
+        | proto::Response::DelegationRecursionState {
+            enabled: _,
+            default_depth: _,
+        } => {}
+        proto::Response::TerminalPasteImage {
+            terminal_id: _,
+            path,
+        } => scrub_string(path, redact),
+        proto::Response::RemoveQueuedUserMessageResult {
+            applied: _,
+            reason: _,
+            removed_item,
+            queue,
+        } => {
+            if let Some(item) = removed_item {
+                scrub_queue_item(item, redact);
+            }
+            scrub_queue(queue, redact);
+        }
+        proto::Response::RemoveQueuedUserMessagesResult {
+            applied: _,
+            reason: _,
+            removed_items,
+            queue,
+        } => {
+            scrub_queue(removed_items, redact);
+            scrub_queue(queue, redact);
+        }
+        proto::Response::Attached {
+            session_id: _,
+            short_id: _,
+            project_root,
+            project_id: _,
+            active_agent: _,
+            active_agent_path: _,
+            foreground_target: _,
+            active_subagent,
+            history,
+            paused_work,
+            repair_required,
+            daemon_version: _,
+            compatible: _,
+            env_baseline: _,
+            env_session: _,
+            env_drift,
+            env_policy_applied: _,
+        } => {
+            scrub_string(project_root, redact);
+            if let Some(active) = active_subagent {
+                scrub_active_subagent(active, redact);
+            }
+            scrub_history_entries(history, redact);
+            scrub_paused_work(paused_work, redact);
+            if let Some(repair) = repair_required {
+                scrub_resume_repair_state(repair, redact);
+            }
+            if let Some(drift) = env_drift {
+                scrub_env_diff_summary(drift, redact);
+            }
+        }
+        proto::Response::SubagentTranscript {
+            session_id: _,
+            task_call_id: _,
+            label,
+            history,
+        } => {
+            scrub_string(label, redact);
+            scrub_history_entries(history, redact);
+        }
+        proto::Response::Sessions { sessions } => {
+            for session in sessions {
+                scrub_session_summary(session, redact);
+            }
+        }
+        proto::Response::SessionMessages {
+            session_id: _,
+            messages,
+            has_more: _,
+        } => {
+            for message in messages {
+                scrub_session_message(message, redact);
+            }
+        }
+        proto::Response::Forked {
+            session_id: _,
+            short_id: _,
+            parent_session_id: _,
+            fork_point_turn_id: _,
+        } => {}
+        proto::Response::Skills { skills } => {
+            for skill in skills {
+                scrub_skill_summary(skill, redact);
+            }
+        }
+        proto::Response::ResourceSnapshot { snapshot } => {
+            scrub_resource_scheduler_snapshot(snapshot, redact);
+        }
+        proto::Response::PromoteResourceResult {
+            status: _,
+            message,
+            snapshot,
+        } => {
+            scrub_string(message, redact);
+            scrub_resource_scheduler_snapshot(snapshot, redact);
+        }
+        proto::Response::Agents { agents } => {
+            for agent in agents {
+                scrub_agent_summary(agent, redact);
+            }
+        }
+        proto::Response::Models { models } => {
+            for model in models {
+                scrub_model_summary(model, redact);
+            }
+        }
+        proto::Response::FsList {
+            entries,
+            truncated: _,
+        } => {
+            for entry in entries {
+                scrub_fs_entry(entry, redact);
+            }
+        }
+        proto::Response::FsStat { entry } => scrub_fs_entry(entry, redact),
+        proto::Response::FsRead {
+            content,
+            hash: _,
+            truncated: _,
+            kind: _,
+        } => scrub_option_string(content, redact),
+        proto::Response::GitStatus { entries } => {
+            for entry in entries {
+                scrub_string(&mut entry.raw, redact);
+            }
+        }
+        proto::Response::GitDiffFile { diff, truncated: _ } => scrub_string(diff, redact),
+        proto::Response::LspControlResult { message } => scrub_string(message, redact),
+        proto::Response::DaemonStatus {
+            pid: _,
+            uptime_secs: _,
+            active_sessions: _,
+            socket_path,
+            daemon_version: _,
+            protocol_version: _,
+            paused_sessions: _,
+            database_path,
+            schema_version: _,
+        } => {
+            scrub_string(socket_path, redact);
+            scrub_string(database_path, redact);
+        }
+        proto::Response::GuidanceEstimate {
+            file,
+            tokens: _,
+            system_tokens: _,
+            model_instruction_tokens: _,
+        } => scrub_option_string(file, redact),
+        proto::Response::CaffeinateState {
+            active: _,
+            lid_close_guaranteed: _,
+            message,
+        } => scrub_string(message, redact),
+        proto::Response::PausedWork { items } => scrub_paused_work(items, redact),
+    }
+}
+
+fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
+    match event {
+        proto::Event::EnvDriftWarning {
+            baseline: _,
+            candidate: _,
+            diff,
+            policy: _,
+        } => scrub_env_diff_summary(diff, redact),
+        proto::Event::QueueUpdated {
+            session_id: _,
+            queue,
+        } => scrub_queue(queue, redact),
+        proto::Event::ForegroundInputTarget {
+            session_id: _,
+            target: _,
+        }
+        | proto::Event::PreflightStarted { session_id: _ }
+        | proto::Event::UserMessageRetracted { session_id: _ }
+        | proto::Event::Usage {
+            session_id: _,
+            agent: _,
+            input_tokens: _,
+            output_tokens: _,
+            cached_input_tokens: _,
+            cache_creation_input_tokens: _,
+        }
+        | proto::Event::InterruptQueueChanged {
+            session_id: _,
+            active_interrupt_id: _,
+            pending_count: _,
+        }
+        | proto::Event::InterruptResolved {
+            session_id: _,
+            interrupt_id: _,
+            decision: _,
+            seq: _,
+        }
+        | proto::Event::AgentIdle {
+            session_id: _,
+            turn_id: _,
+            reason: _,
+        }
+        | proto::Event::LlmModeChanged {
+            session_id: _,
+            mode: _,
+        }
+        | proto::Event::ContextProjection {
+            session_id: _,
+            prunable_tokens: _,
+            cache_cold: _,
+        }
+        | proto::Event::SandboxState {
+            session_id: _,
+            mode: _,
+            enabled: _,
+            container_network_enabled: _,
+            container_availability: _,
+        }
+        | proto::Event::SandboxEscalationState {
+            session_id: _,
+            enabled: _,
+        }
+        | proto::Event::RedactionState {
+            session_id: _,
+            scan_environment: _,
+            scan_dotenv: _,
+            scan_ssh_keys: _,
+        }
+        | proto::Event::TrustedOnlyState {
+            session_id: _,
+            enabled: _,
+        }
+        | proto::Event::ApprovalModeState {
+            session_id: _,
+            mode: _,
+        }
+        | proto::Event::DelegationRecursionState {
+            session_id: _,
+            enabled: _,
+            default_depth: _,
+        }
+        | proto::Event::GitignoreAllow {
+            session_id: _,
+            allow: _,
+        }
+        | proto::Event::TerminalOutput {
+            terminal_id: _,
+            bytes: _,
+        }
+        | proto::Event::TerminalViewers {
+            terminal_id: _,
+            count: _,
+        }
+        | proto::Event::DaemonDraining { forced: _ } => {}
+        proto::Event::ThinkingStarted {
+            session_id: _,
+            agent: _,
+            turn_id: _,
+        } => {}
+        proto::Event::Reconnecting {
+            session_id: _,
+            agent: _,
+            attempt: _,
+            provider: _,
+            model: _,
+            url,
+        } => scrub_string(url, redact),
+        proto::Event::InferenceWarning {
+            session_id: _,
+            agent: _,
+            provider: _,
+            model: _,
+            phase: _,
+            waited_secs: _,
+        } => {}
+        proto::Event::AssistantTextDelta {
+            session_id: _,
+            agent: _,
+            delta,
+        }
+        | proto::Event::ReasoningDelta {
+            session_id: _,
+            agent: _,
+            delta,
+        } => scrub_string(delta, redact),
+        proto::Event::AssistantText {
+            session_id: _,
+            agent: _,
+            text,
+            reasoning,
+            seq: _,
+        } => {
+            scrub_string(text, redact);
+            scrub_string(reasoning, redact);
+        }
+        proto::Event::UserMessageRecorded {
+            session_id: _,
+            seq: _,
+            preflight_cleaned,
+        } => scrub_option_string(preflight_cleaned, redact),
+        proto::Event::QueuedUserMessagesFolded {
+            session_id: _,
+            text,
+            display_text,
+            tag_expansions,
+            queue_item_ids: _,
+            target: _,
+            seq: _,
+            preflight_cleaned,
+        } => {
+            scrub_string(text, redact);
+            scrub_option_string(display_text, redact);
+            scrub_tag_expansions(tag_expansions, redact);
+            scrub_option_string(preflight_cleaned, redact);
+        }
+        proto::Event::SessionPersistFailed {
+            session_id: _,
+            error,
+        }
+        | proto::Event::SessionDriverFailed {
+            session_id: _,
+            error,
+        } => scrub_string(error, redact),
+        proto::Event::Notice {
+            session_id: _,
+            text,
+        }
+        | proto::Event::LspNotice { text }
+        | proto::Event::ScheduleNote {
+            session_id: _,
+            job_id: _,
+            text,
+        }
+        | proto::Event::TerminalClipboard {
+            terminal_id: _,
+            text,
+        } => scrub_string(text, redact),
+        proto::Event::SkillAutoInjected {
+            session_id: _,
+            name: _,
+            reason,
+        } => scrub_option_string(reason, redact),
+        proto::Event::ToolStart {
+            session_id: _,
+            agent: _,
+            call_id: _,
+            tool: _,
+            args,
+        } => scrub_json_strings(args, redact),
+        proto::Event::ToolEnd {
+            session_id: _,
+            agent: _,
+            call_id: _,
+            tool: _,
+            output,
+            truncated: _,
+            seq: _,
+            hint,
+        } => {
+            scrub_string(output, redact);
+            scrub_option_string(hint, redact);
+        }
+        proto::Event::ResourceWait {
+            session_id: _,
+            agent: _,
+            request_id: _,
+            display_id: _,
+            resources: _,
+            queue_position: _,
+            command_label,
+        }
+        | proto::Event::ResourceStart {
+            session_id: _,
+            agent: _,
+            request_id: _,
+            display_id: _,
+            resources: _,
+            wait_ms: _,
+            command_label,
+        }
+        | proto::Event::ResourceClear {
+            session_id: _,
+            agent: _,
+            request_id: _,
+            display_id: _,
+            resources: _,
+            command_label,
+        } => scrub_option_string(command_label, redact),
+        proto::Event::ToolError {
+            session_id: _,
+            agent: _,
+            call_id: _,
+            tool: _,
+            error,
+            kind: _,
+            seq: _,
+        } => scrub_string(error, redact),
+        proto::Event::InferenceFailed {
+            session_id: _,
+            agent: _,
+            provider: _,
+            model: _,
+            error_class: _,
+            detail,
+            auth_failure,
+        } => {
+            scrub_string(detail, redact);
+            if let Some(auth) = auth_failure {
+                scrub_auth_failure(auth, redact);
+            }
+        }
+        proto::Event::InferenceSucceeded {
+            session_id: _,
+            provider: _,
+            model: _,
+        } => {}
+        proto::Event::BackupUsed {
+            session_id: _,
+            agent: _,
+            primary_model: _,
+            error_class: _,
+            backup_model: _,
+        } => {}
+        proto::Event::SubagentSpawned {
+            session_id: _,
+            parent: _,
+            child: _,
+            task_call_id: _,
+            label,
+            prompt,
+            requested_cwd,
+            resolved_cwd,
+            trusted_only: _,
+            model_trusted: _,
+            routing,
+        } => {
+            scrub_string(label, redact);
+            scrub_string(prompt, redact);
+            scrub_option_string(requested_cwd, redact);
+            scrub_option_string(resolved_cwd, redact);
+            scrub_json_strings(routing, redact);
+        }
+        proto::Event::SubagentReport {
+            session_id: _,
+            agent: _,
+            task_call_id: _,
+            label,
+            report,
+            trusted_only: _,
+            model_trusted: _,
+            routing,
+        } => {
+            scrub_string(label, redact);
+            scrub_string(report, redact);
+            scrub_json_strings(routing, redact);
+        }
+        proto::Event::NestedTurn {
+            session_id: _,
+            task_call_id: _,
+            label,
+            parent_task_call_id: _,
+            inner,
+        } => {
+            scrub_string(label, redact);
+            scrub_event_free_text(inner, redact);
+        }
+        proto::Event::InterruptRaised {
+            session_id: _,
+            interrupt_id: _,
+            agent: _,
+            description,
+            question,
+            questions,
+            pending_count: _,
+            reason: _,
+        } => {
+            scrub_string(description, redact);
+            if let Some(question) = question {
+                scrub_interrupt_question(question, redact);
+            }
+            if let Some(questions) = questions {
+                scrub_interrupt_question_set(questions, redact);
+            }
+        }
+        proto::Event::HistoryReplay {
+            session_id: _,
+            entries,
+            max_seq: _,
+        } => scrub_history_entries(entries, redact),
+        proto::Event::PrimarySwapped {
+            session_id: _,
+            name: _,
+        } => {}
+        proto::Event::SessionEnded {
+            session_id: _,
+            reason,
+        } => scrub_string(reason, redact),
+        proto::Event::ScheduleStarted {
+            session_id: _,
+            job_id: _,
+            label,
+            kind: _,
+        }
+        | proto::Event::ScheduleCompleted {
+            session_id: _,
+            job_id: _,
+            label,
+            kind: _,
+            failed: _,
+        } => scrub_string(label, redact),
+        proto::Event::ScheduleProgress {
+            session_id: _,
+            job_id: _,
+        } => {}
+        proto::Event::Pruned {
+            session_id: _,
+            auto: _,
+            bodies: _,
+            tokens_saved: _,
+            elided: _,
+            trigger_reason: _,
+            cache_break: _,
+        } => {}
+        proto::Event::CompactReady {
+            session_id: _,
+            new_session_id: _,
+            handoff,
+            brief,
+            source: _,
+            trigger_ctx_pct: _,
+            tokens_before: _,
+            tokens_after: _,
+            turns_summarized: _,
+            tail_kept: _,
+            tail_trimmed: _,
+            seed_tool_count: _,
+            seed_tool_tokens: _,
+        } => {
+            scrub_string(handoff, redact);
+            scrub_string(brief, redact);
+        }
+        proto::Event::SandboxUnavailable {
+            session_id: _,
+            remedy,
+            fix_command,
+        } => {
+            scrub_string(remedy, redact);
+            scrub_option_string(fix_command, redact);
+        }
+        proto::Event::PreflightState {
+            session_id: _,
+            enabled: _,
+        } => {}
+        proto::Event::TandemState {
+            session_id: _,
+            models: _,
+            warning,
+        } => scrub_option_string(warning, redact),
+        proto::Event::CaffeinateState {
+            active: _,
+            lid_close_guaranteed: _,
+            message,
+        } => scrub_option_string(message, redact),
+        proto::Event::ConnectorStatus {
+            enabled: _,
+            status: _,
+            relay_url: _,
+            relay_id: _,
+            relay_region: _,
+            last_error,
+        } => scrub_option_string(last_error, redact),
+        proto::Event::TerminalClosed {
+            terminal_id: _,
+            reason,
+            exit_code: _,
+        } => scrub_string(reason, redact),
+        proto::Event::PausedWorkAvailable {
+            session_id: _,
+            items,
+        } => scrub_paused_work(items, redact),
+        proto::Event::WaitingForLock {
+            session_id: _,
+            path,
+            holder_agent: _,
+            waiting: _,
+        } => scrub_string(path, redact),
+    }
+}
+
+fn scrub_history_entries(entries: &mut [proto::HistoryEntry], redact: &RedactionTable) {
+    for entry in entries {
+        scrub_history_entry_free_text(entry, redact);
+    }
+}
+
+fn scrub_history_entry_free_text(entry: &mut proto::HistoryEntry, redact: &RedactionTable) {
+    match entry {
+        proto::HistoryEntry::InterruptDecision { decision, seq: _ } => {
+            scrub_interrupt_decision(decision, redact);
+        }
+        proto::HistoryEntry::User {
+            text,
+            display_text,
+            tag_expansions,
+            ts_ms: _,
+            seq: _,
+            origin_principal: _,
+        } => {
+            scrub_string(text, redact);
+            scrub_option_string(display_text, redact);
+            scrub_tag_expansions(tag_expansions, redact);
+        }
+        proto::HistoryEntry::Assistant {
+            agent: _,
+            text,
+            reasoning,
+            ts_ms: _,
+            seq: _,
+        } => {
+            scrub_string(text, redact);
+            scrub_string(reasoning, redact);
+        }
+        proto::HistoryEntry::ToolCall {
+            seq: _,
+            agent: _,
+            call_id: _,
+            tool: _,
+            original_input,
+            wire_input,
+            recovery_kind: _,
+            recovery_stage: _,
+            output,
+            hard_fail: _,
+            truncated: _,
+            hint,
+        } => {
+            scrub_json_strings(original_input, redact);
+            scrub_json_strings(wire_input, redact);
+            scrub_string(output, redact);
+            scrub_option_string(hint, redact);
+        }
+        proto::HistoryEntry::InferenceError {
+            seq: _,
+            summary,
+            detail,
+        } => {
+            scrub_string(summary, redact);
+            scrub_string(detail, redact);
+        }
+        proto::HistoryEntry::CompactBoundary {
+            seq: _,
+            predecessor_short_id: _,
+            seed_tool_count: _,
+            seed_tool_tokens: _,
+            source: _,
+            trigger_ctx_pct: _,
+            tokens_before: _,
+            tokens_after: _,
+            turns_summarized: _,
+            tail_kept: _,
+            tail_trimmed: _,
+            brief,
+            handoff,
+        } => {
+            scrub_option_string(brief, redact);
+            scrub_option_string(handoff, redact);
+        }
+        proto::HistoryEntry::Subagent {
+            seq: _,
+            parent: _,
+            child: _,
+            task_call_id: _,
+            label,
+        } => scrub_string(label, redact),
+    }
+}
+
+fn scrub_queue(queue: &mut [proto::QueueItem], redact: &RedactionTable) {
+    for item in queue {
+        scrub_queue_item(item, redact);
+    }
+}
+
+fn scrub_queue_item(item: &mut proto::QueueItem, redact: &RedactionTable) {
+    let proto::QueueItem {
+        id: _,
+        status: _,
+        text,
+        display_text,
+        target: _,
+    } = item;
+    scrub_string(text, redact);
+    scrub_option_string(display_text, redact);
+}
+
+fn scrub_tag_expansions(items: &mut [proto::TagExpansionMeta], redact: &RedactionTable) {
+    for item in items {
+        let proto::TagExpansionMeta {
+            tool,
+            path,
+            detail,
+            ok: _,
+        } = item;
+        scrub_string(tool, redact);
+        scrub_string(path, redact);
+        scrub_string(detail, redact);
+    }
+}
+
+fn scrub_delegation_steer_result(
+    result: &mut proto::DelegationSteerResult,
+    redact: &RedactionTable,
+) {
+    let proto::DelegationSteerResult {
+        status: _,
+        task_call_id: _,
+        label,
+        message,
+        pending_steers: _,
+        origin_principal: _,
+        scrubbed: _,
+    } = result;
+    scrub_option_string(label, redact);
+    scrub_string(message, redact);
+}
+
+fn scrub_active_subagent(active: &mut proto::ActiveSubagent, redact: &RedactionTable) {
+    let proto::ActiveSubagent {
+        parent: _,
+        child: _,
+        task_call_id: _,
+        label,
+    } = active;
+    scrub_string(label, redact);
+}
+
+fn scrub_paused_work(items: &mut [proto::PausedWorkSummary], redact: &RedactionTable) {
+    for item in items {
+        let proto::PausedWorkSummary {
+            session_id: _,
+            active_agent: _,
+            project_root,
+            reason,
+            pending_tool_count: _,
+            daemon_version: _,
+            client_version: _,
+            updated_at: _,
+        } = item;
+        scrub_string(project_root, redact);
+        scrub_string(reason, redact);
+    }
+}
+
+fn scrub_resume_repair_state(state: &mut proto::ResumeRepairState, redact: &RedactionTable) {
+    let proto::ResumeRepairState {
+        session_id: _,
+        short_id: _,
+        provider: _,
+        model: _,
+        wire_api: _,
+        failure_kind: _,
+        failing_tool_call_ids: _,
+        safe_last_turn_seq: _,
+        suggested_actions: _,
+        detail,
+    } = state;
+    scrub_string(detail, redact);
+}
+
+fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &RedactionTable) {
+    let proto::SessionSummary {
+        session_id: _,
+        short_id: _,
+        project_root,
+        project_id: _,
+        started_at: _,
+        last_active_at: _,
+        turns: _,
+        active_agent: _,
+        title,
+        parent_session_id: _,
+        created_by_principal: _,
+        shared_with_collaborators: _,
+        fork_count: _,
+        descendant_count: _,
+        last_viewed_at: _,
+        latest_activity_at: _,
+        open_interrupts: _,
+        activity_state: _,
+        archived_at: _,
+        pin_count: _,
+    } = summary;
+    scrub_string(project_root, redact);
+    scrub_option_string(title, redact);
+}
+
+fn scrub_session_message(message: &mut proto::SessionMessage, redact: &RedactionTable) {
+    let proto::SessionMessage {
+        seq: _,
+        ts_ms: _,
+        role: _,
+        text,
+    } = message;
+    scrub_string(text, redact);
+}
+
+fn scrub_skill_summary(skill: &mut proto::SkillSummary, redact: &RedactionTable) {
+    let proto::SkillSummary {
+        name: _,
+        description,
+        source,
+    } = skill;
+    scrub_string(description, redact);
+    scrub_string(source, redact);
+}
+
+fn scrub_agent_summary(agent: &mut proto::AgentSummary, redact: &RedactionTable) {
+    let proto::AgentSummary {
+        name: _,
+        description,
+        mode: _,
+        source,
+        builtin: _,
+    } = agent;
+    scrub_string(description, redact);
+    scrub_string(source, redact);
+}
+
+fn scrub_model_summary(model: &mut proto::ModelSummary, redact: &RedactionTable) {
+    let proto::ModelSummary {
+        provider: _,
+        id: _,
+        display_name,
+        favorite: _,
+    } = model;
+    scrub_option_string(display_name, redact);
+}
+
+fn scrub_fs_entry(entry: &mut proto::FsEntry, redact: &RedactionTable) {
+    let proto::FsEntry {
+        name,
+        path,
+        kind: _,
+        size: _,
+        mtime_ms: _,
+        gitignored: _,
+        blocked: _,
+        symlink_target,
+    } = entry;
+    scrub_string(name, redact);
+    scrub_string(path, redact);
+    scrub_option_string(symlink_target, redact);
+}
+
+fn scrub_resource_scheduler_snapshot(
+    snapshot: &mut proto::ResourceSchedulerSnapshot,
+    redact: &RedactionTable,
+) {
+    let proto::ResourceSchedulerSnapshot {
+        enabled: _,
+        pools,
+        running,
+        queued,
+        max_queued: _,
+    } = snapshot;
+    for pool in pools {
+        let proto::ResourcePoolSnapshot {
+            name: _,
+            capacity: _,
+            used: _,
+            available: _,
+        } = pool;
+    }
+    for item in running {
+        let proto::ResourceRunningSnapshot {
+            id: _,
+            display_id: _,
+            resources,
+            metadata,
+            queued_at_ms: _,
+            started_at_ms: _,
+            wait_ms: _,
+            promoted_by: _,
+            promoted_at_ms: _,
+        } = item;
+        scrub_resource_requirements(resources, redact);
+        scrub_resource_request_metadata(metadata, redact);
+    }
+    for item in queued {
+        let proto::ResourceQueuedSnapshot {
+            id: _,
+            display_id: _,
+            resources,
+            metadata,
+            queued_at_ms: _,
+            wait_ms: _,
+            promoted_by: _,
+            promoted_at_ms: _,
+            state: _,
+        } = item;
+        scrub_resource_requirements(resources, redact);
+        scrub_resource_request_metadata(metadata, redact);
+    }
+}
+
+fn scrub_resource_requirements(
+    requirements: &mut proto::ResourceRequirements,
+    _redact: &RedactionTable,
+) {
+    let proto::ResourceRequirements { pools: _ } = requirements;
+}
+
+fn scrub_resource_request_metadata(
+    metadata: &mut proto::ResourceRequestMetadata,
+    redact: &RedactionTable,
+) {
+    let proto::ResourceRequestMetadata {
+        session_id: _,
+        agent_id: _,
+        tool_call_id: _,
+        command_label,
+        declared_requirements,
+        policy_requirements,
+        reviewer_requirements,
+        effective_requirements,
+    } = metadata;
+    scrub_option_string(command_label, redact);
+    scrub_resource_requirements(declared_requirements, redact);
+    scrub_resource_requirements(policy_requirements, redact);
+    scrub_resource_requirements(reviewer_requirements, redact);
+    scrub_resource_requirements(effective_requirements, redact);
+}
+
+fn scrub_env_diff_summary(diff: &mut EnvDiffSummary, redact: &RedactionTable) {
+    let EnvDiffSummary {
+        baseline_digest: _,
+        candidate_digest: _,
+        added_keys: _,
+        removed_keys: _,
+        changed_keys: _,
+        changed_secret_keys,
+        path_added,
+        path_removed,
+    } = diff;
+    scrub_strings(changed_secret_keys, redact);
+    scrub_strings(path_added, redact);
+    scrub_strings(path_removed, redact);
+}
+
+fn scrub_auth_failure(auth: &mut proto::AuthFailureKind, _redact: &RedactionTable) {
+    match auth {
+        proto::AuthFailureKind::CredentialsRejected { status: _ }
+        | proto::AuthFailureKind::MissingEntitlement { feature: _ }
+        | proto::AuthFailureKind::OAuthExpired { provider: _ }
+        | proto::AuthFailureKind::ProviderNotConfigured => {}
+    }
+}
+
+fn scrub_interrupt_question_set(set: &mut proto::InterruptQuestionSet, redact: &RedactionTable) {
+    let proto::InterruptQuestionSet { questions } = set;
+    for question in questions {
+        scrub_interrupt_question(question, redact);
+    }
+}
+
+fn scrub_interrupt_question(question: &mut proto::InterruptQuestion, redact: &RedactionTable) {
+    match question {
+        proto::InterruptQuestion::Single {
+            prompt,
+            options,
+            allow_freetext: _,
+            command_detail,
+            permission: _,
+            approval_class: _,
+            sandbox_escalation,
+        } => {
+            scrub_string(prompt, redact);
+            scrub_interrupt_options(options, redact);
+            if let Some(detail) = command_detail {
+                scrub_command_detail(detail, redact);
+            }
+            if let Some(escalation) = sandbox_escalation {
+                scrub_sandbox_escalation(escalation, redact);
+            }
+        }
+        proto::InterruptQuestion::Multi {
+            prompt,
+            options,
+            allow_freetext: _,
+        } => {
+            scrub_string(prompt, redact);
+            scrub_interrupt_options(options, redact);
+        }
+        proto::InterruptQuestion::Freetext { prompt, masked: _ } => scrub_string(prompt, redact),
+    }
+}
+
+fn scrub_interrupt_options(options: &mut [proto::InterruptOption], redact: &RedactionTable) {
+    for option in options {
+        let proto::InterruptOption {
+            id: _,
+            label,
+            description,
+            secondary: _,
+        } = option;
+        scrub_string(label, redact);
+        scrub_option_string(description, redact);
+    }
+}
+
+fn scrub_command_detail(detail: &mut proto::CommandDetail, redact: &RedactionTable) {
+    let proto::CommandDetail {
+        full_command,
+        highlight: _,
+        step: _,
+        step_count: _,
+        cwd,
+        remembered_key,
+        write_content,
+        risk_tier,
+        risk_reasons,
+        affected_targets,
+        native_tool_hints,
+        offered_scopes,
+        policy_cap,
+    } = detail;
+    scrub_string(full_command, redact);
+    scrub_option_string(cwd, redact);
+    scrub_option_string(remembered_key, redact);
+    if let Some(write_content) = write_content {
+        scrub_write_content_preview(write_content, redact);
+    }
+    scrub_option_string(risk_tier, redact);
+    scrub_strings(risk_reasons, redact);
+    scrub_strings(affected_targets, redact);
+    scrub_strings(native_tool_hints, redact);
+    scrub_strings(offered_scopes, redact);
+    scrub_option_string(policy_cap, redact);
+}
+
+fn scrub_write_content_preview(preview: &mut proto::WriteContentPreview, redact: &RedactionTable) {
+    let proto::WriteContentPreview {
+        content,
+        dynamic: _,
+    } = preview;
+    scrub_string(content, redact);
+}
+
+fn scrub_sandbox_escalation(escalation: &mut proto::SandboxEscalation, redact: &RedactionTable) {
+    let proto::SandboxEscalation {
+        confined_exit: _,
+        confined_stderr,
+        suggested_paths,
+        suggested_access,
+    } = escalation;
+    scrub_string(confined_stderr, redact);
+    scrub_strings(suggested_paths, redact);
+    scrub_option_string(suggested_access, redact);
+}
+
+fn scrub_interrupt_decision(decision: &mut proto::InterruptDecision, redact: &RedactionTable) {
+    let proto::InterruptDecision {
+        permission: _,
+        cancelled: _,
+        lines,
+    } = decision;
+    for line in lines {
+        let proto::InterruptDecisionLine { prompt, answer } = line;
+        scrub_string(prompt, redact);
+        scrub_string(answer, redact);
+    }
+}
+
+fn scrub_string(value: &mut String, redact: &RedactionTable) {
+    *value = redact.scrub(value);
+}
+
+fn scrub_option_string(value: &mut Option<String>, redact: &RedactionTable) {
+    if let Some(value) = value {
+        scrub_string(value, redact);
+    }
+}
+
+fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
+    for value in values {
+        scrub_string(value, redact);
     }
 }
 

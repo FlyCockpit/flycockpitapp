@@ -24,12 +24,16 @@ impl Model {
             Model::OpenAi {
                 client, model_id, ..
             } => {
-                let agent = client.agent(model_id).build();
-                let response = agent
-                    .prompt(prompt)
-                    .await
-                    .context("text_completion: prompt failed")?;
-                Ok(response.trim().to_string())
+                let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                openai_text_completion(
+                    client,
+                    model_id,
+                    wire_api,
+                    None,
+                    prompt,
+                    "text_completion: prompt failed",
+                )
+                .await
             }
             Model::ChatGpt { model, .. } => {
                 let agent = rig::agent::AgentBuilder::new(model.clone()).build();
@@ -78,12 +82,16 @@ impl Model {
             Model::OpenAi {
                 client, model_id, ..
             } => {
-                let agent = client.agent(model_id).preamble(system).build();
-                let response = agent
-                    .prompt(prompt)
-                    .await
-                    .context("text_completion_with_system: prompt failed")?;
-                Ok(response.trim().to_string())
+                let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                openai_text_completion(
+                    client,
+                    model_id,
+                    wire_api,
+                    Some(system),
+                    prompt,
+                    "text_completion_with_system: prompt failed",
+                )
+                .await
             }
             Model::ChatGpt { model, .. } => {
                 let agent = rig::agent::AgentBuilder::new(model.clone())
@@ -146,16 +154,8 @@ impl Model {
             Model::OpenAi {
                 client, model_id, ..
             } => {
-                let agent = client.agent(model_id).preamble(system).build();
-                let response = agent
-                    .completion(Message::user(prompt), Vec::<Message>::new())
-                    .await?
-                    .tool(tool.clone())
-                    .tool_choice(ToolChoice::Required)
-                    .send()
-                    .await
-                    .context("tool_completion: send failed")?;
-                Ok(crate::engine::message::collect_tool_calls(&response.choice))
+                let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                openai_tool_completion(client, model_id, wire_api, system, prompt, tool).await
             }
             Model::ChatGpt { model, .. } => {
                 let agent = rig::agent::AgentBuilder::new(model.clone())
@@ -1204,6 +1204,98 @@ impl Model {
                 let r = req.send().await?;
                 Ok(tandem_choice_usage(r.choice, r.usage))
             }
+        }
+    }
+}
+
+async fn openai_text_completion(
+    client: &OpenAiCompatClient,
+    model_id: &str,
+    wire_api: crate::config::providers::WireApi,
+    system: Option<&str>,
+    prompt: &str,
+    context: &'static str,
+) -> Result<String> {
+    use rig::completion::Prompt;
+
+    let response = match wire_api {
+        crate::config::providers::WireApi::Responses => {
+            let responses = client.clone().responses_api();
+            match system {
+                Some(system) => {
+                    responses
+                        .agent(model_id)
+                        .preamble(system)
+                        .build()
+                        .prompt(prompt)
+                        .await
+                }
+                None => responses.agent(model_id).build().prompt(prompt).await,
+            }
+        }
+        crate::config::providers::WireApi::Completions
+        | crate::config::providers::WireApi::Auto => match system {
+            Some(system) => {
+                client
+                    .agent(model_id)
+                    .preamble(system)
+                    .build()
+                    .prompt(prompt)
+                    .await
+            }
+            None => client.agent(model_id).build().prompt(prompt).await,
+        },
+    }
+    .context(context)?;
+
+    Ok(response.trim().to_string())
+}
+
+async fn openai_tool_completion(
+    client: &OpenAiCompatClient,
+    model_id: &str,
+    wire_api: crate::config::providers::WireApi,
+    system: &str,
+    prompt: &str,
+    tool: &ToolDefinition,
+) -> Result<Vec<crate::engine::message::ToolCall>> {
+    use rig::completion::Completion;
+
+    let wire_tool = wire_schema::definitions_for_wire(wire_api, std::slice::from_ref(tool))
+        .as_ref()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| tool.clone());
+    match wire_api {
+        crate::config::providers::WireApi::Responses => {
+            let responses = client.clone().responses_api();
+            let response = responses
+                .agent(model_id)
+                .preamble(system)
+                .build()
+                .completion(Message::user(prompt), Vec::<Message>::new())
+                .await?
+                .tool(wire_tool)
+                .tool_choice(ToolChoice::Required)
+                .send()
+                .await
+                .context("tool_completion: send failed")?;
+            Ok(crate::engine::message::collect_tool_calls(&response.choice))
+        }
+        crate::config::providers::WireApi::Completions
+        | crate::config::providers::WireApi::Auto => {
+            let response = client
+                .agent(model_id)
+                .preamble(system)
+                .build()
+                .completion(Message::user(prompt), Vec::<Message>::new())
+                .await?
+                .tool(wire_tool)
+                .tool_choice(ToolChoice::Required)
+                .send()
+                .await
+                .context("tool_completion: send failed")?;
+            Ok(crate::engine::message::collect_tool_calls(&response.choice))
         }
     }
 }

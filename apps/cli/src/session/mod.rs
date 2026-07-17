@@ -48,6 +48,22 @@ pub struct SessionEventLineage {
     pub label: String,
 }
 
+pub struct SessionCompactionRecord<'a> {
+    pub successor_session_id: Uuid,
+    pub successor_short_id: &'a str,
+    pub seed_tool_count: usize,
+    pub brief_text: &'a str,
+    pub handoff_text: &'a str,
+    pub source: &'a str,
+    pub trigger_ctx_pct: Option<f64>,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub turns_summarized: usize,
+    pub tail_kept: usize,
+    pub tail_trimmed: usize,
+    pub tail_messages: &'a [crate::engine::message::Message],
+}
+
 tokio::task_local! {
     static SESSION_EVENT_LINEAGE: Option<SessionEventLineage>;
 }

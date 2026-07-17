@@ -12,10 +12,84 @@ use crate::db::Db;
 pub async fn run(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Answer(args) => answer(args).await,
+        SessionCommand::Show { session_id, json } => show(&session_id, json),
         SessionCommand::List | SessionCommand::Delete { .. } => anyhow::bail!(
             "cockpit session is not implemented yet (planned; backed by ~/.local/share/cockpit/cockpit.db)"
         ),
     }
+}
+
+fn show(session: &str, json_mode: bool) -> Result<()> {
+    let session_id = Uuid::parse_str(session).context("parsing session id")?;
+    let db = Db::open_default().context("opening cockpit DB")?;
+    db.get_session(session_id)
+        .context("loading session")?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+    let compactions = db
+        .list_session_events(session_id)
+        .context("loading session timeline")?
+        .into_iter()
+        .filter(|event| event.kind == "session_compacted")
+        .collect::<Vec<_>>();
+
+    if json_mode {
+        let values = compactions
+            .iter()
+            .map(|event| {
+                json!({
+                    "seq": event.seq,
+                    "ts_ms": event.ts_ms,
+                    "source": event.data.get("source"),
+                    "trigger_ctx_pct": event.data.get("trigger_ctx_pct"),
+                    "tokens_before": event.data.get("tokens_before"),
+                    "tokens_after": event.data.get("tokens_after"),
+                    "turns_summarized": event.data.get("turns_summarized"),
+                    "tail_kept": event.data.get("tail_kept"),
+                    "tail_trimmed": event.data.get("tail_trimmed"),
+                    "handoff": event.data.get("handoff_text"),
+                })
+            })
+            .collect::<Vec<_>>();
+        return emit_json(&json!({
+            "session_id": session_id,
+            "compactions": values,
+        }));
+    }
+
+    if compactions.is_empty() {
+        println!("no compactions recorded for session {session_id}");
+        return Ok(());
+    }
+    for event in compactions {
+        let source = event
+            .data
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("manual");
+        let before = event
+            .data
+            .get("tokens_before")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let after = event
+            .data
+            .get("tokens_after")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        println!(
+            "compact #{} source={source} tokens={before}→{after}",
+            event.seq
+        );
+        println!(
+            "{}",
+            event
+                .data
+                .get("handoff_text")
+                .and_then(Value::as_str)
+                .unwrap_or("(handoff unavailable)")
+        );
+    }
+    Ok(())
 }
 
 async fn answer(args: SessionAnswerArgs) -> Result<()> {

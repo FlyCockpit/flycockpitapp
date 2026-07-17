@@ -23,7 +23,7 @@
 //!   5. Cost rank
 //!   6. Subagent available
 //!   7. Model instructions (model scope only)
-//!   8. Auto-compact ctx % (default 80)
+//!   8. Auto-compact ctx % (default 60)
 //!   9. Auto-prune (on | off | inherit; default on) — the master switch for
 //!      automatic pruning; off protects the provider prompt cache entirely
 //!   10. Auto-prune ctx % (default 50)
@@ -273,7 +273,7 @@ impl ProviderSettingId {
                 "auto uses fetched/default max-output metadata. Enter an explicit completion limit only when detection is wrong.",
             ),
             Self::AutoCompactPct => Some(
-                "At or above this % of the context window, the conversation is auto-compacted (LLM summarization, same as /compact). Unrelated to the prune thresholds below.",
+                "At or above this % of the context window (60% by default), the conversation is auto-compacted. The most recent compact_keep_recent_turns complete exchanges (4 by default; 0 disables the tail) survive verbatim, subject to the context budget. Unrelated to the prune thresholds below.",
             ),
             Self::AutoPrunePct => Some(
                 "Warm-cache prune threshold: above this ctx% (and the prunable % below), auto-prune fires even though it breaks the warm prompt cache. When the cache is cold or Cache mode is none, auto-prune ignores these thresholds — set Auto-prune off to stop it entirely.",
@@ -1708,6 +1708,7 @@ mod tests {
             url: "https://x".into(),
             context: ContextConfig {
                 auto_compact_pct: 85,
+                compact_keep_recent_turns: 4,
                 auto_prune_pct: 55,
                 auto_prune_prunable_pct: 35,
             },

@@ -42,7 +42,7 @@
 //! rebuilds but whose prune ledger cannot cleanly apply falls back to the
 //! full unpruned form with a warning.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use rig::OneOrMany;
 use rig::message::{
     AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
@@ -169,9 +169,21 @@ pub fn rehydrate_session_with_policy(
     root_agent: &str,
     policy: RehydratePolicy,
 ) -> Result<Option<Rehydrated>> {
-    let events = db
+    let mut events = db
         .list_session_events(session_id)
         .map_err(|e| anyhow!("loading session events for rehydration: {e}"))?;
+    for event in &mut events {
+        if event.kind == "session_compacted"
+            && let Some(reference) = event
+                .data
+                .get("handoff_ref")
+                .and_then(|value| value.as_str())
+            && let Some(payload) = db.compaction_payload(session_id, reference)?
+        {
+            event.data = serde_json::from_str(&payload)
+                .context("decoding stored compaction payload for rehydration")?;
+        }
+    }
     let tool_calls = db
         .list_tool_calls_for_session(session_id)
         .map_err(|e| anyhow!("loading tool calls for rehydration: {e}"))?;
@@ -506,28 +518,64 @@ fn history_snapshot_from_events_conn(
                 }
             }
             "session_compacted" if ev.agent.as_deref() == Some(root_agent) => {
-                let predecessor_short_id = ev
-                    .data
+                let data = match ev.data.get("handoff_ref").and_then(|v| v.as_str()) {
+                    Some(reference) => Db::compaction_payload_conn(conn, session_id, reference)?
+                        .map(|payload| {
+                            serde_json::from_str(&payload)
+                                .context("decoding stored compaction payload for history")
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| ev.data.clone()),
+                    None => ev.data.clone(),
+                };
+                let predecessor_short_id = data
                     .get("predecessor_short_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let seed_tool_count = ev
-                    .data
+                let seed_tool_count = data
                     .get("seed_tool_count")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                let brief = ev
-                    .data
+                let brief = data
                     .get("brief_text")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                let handoff = data
+                    .get("handoff_text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| brief.clone());
                 snapshot.push(proto::HistoryEntry::CompactBoundary {
                     seq: ev.seq,
                     predecessor_short_id,
                     seed_tool_count,
                     seed_tool_tokens: 0,
+                    source: data
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("manual")
+                        .to_string(),
+                    trigger_ctx_pct: data.get("trigger_ctx_pct").and_then(|v| v.as_f64()),
+                    tokens_before: data
+                        .get("tokens_before")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    tokens_after: data
+                        .get("tokens_after")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    turns_summarized: data
+                        .get("turns_summarized")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                    tail_kept: data.get("tail_kept").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    tail_trimmed: data
+                        .get("tail_trimmed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
                     brief,
+                    handoff,
                 });
             }
             // Everything else (subagent frames, notes, prune markers, other
@@ -1079,6 +1127,23 @@ fn rebuild_history(
                     }
                 }
             }
+            "session_compacted" if ev.agent.as_deref() == Some(root_agent) => {
+                std::mem::take(&mut pending).flush(&mut history);
+                let handoff = ev
+                    .data
+                    .get("handoff_text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| ev.data.get("brief_text").and_then(|value| value.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                history.clear();
+                history.push(Message::user(handoff));
+                if let Some(tail) = ev.data.get("tail_messages") {
+                    let tail: Vec<Message> = serde_json::from_value(tail.clone())
+                        .map_err(|error| anyhow!("decoding compacted tail_messages: {error}"))?;
+                    history.extend(tail);
+                }
+            }
             "subagent_spawned" if ev.agent.as_deref() == Some(root_agent) => {
                 let Some(call_id) = ev.call_id.as_deref() else {
                     return Err(anyhow!(
@@ -1255,7 +1320,7 @@ fn rebuild_history(
                 }
             }
             // Everything else (inference_request, context_pruned,
-            // session_compacted, permission_decision, subagent_report,
+            // permission_decision, subagent_report,
             // other agents' turns) is not part of the root model history.
             _ => {}
         }
@@ -3871,6 +3936,183 @@ mod tests {
             }
             other => panic!("snap[1] should be CompactBoundary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_compacted_persists_handoff() {
+        let s = root_session();
+        let handoff = format!("## Decisions\n{}", "durable ".repeat(3_000));
+        let tail = vec![
+            Message::user(format!("recent {}", "tail ".repeat(1_000))),
+            Message::assistant("recent answer"),
+        ];
+        s.record_session_compacted_with_source(
+            "Build",
+            crate::session::SessionCompactionRecord {
+                successor_session_id: s.id,
+                successor_short_id: &s.short_id,
+                seed_tool_count: 2,
+                brief_text: &handoff,
+                handoff_text: &handoff,
+                source: "manual",
+                trigger_ctx_pct: Some(62.0),
+                tokens_before: 9_000,
+                tokens_after: 3_000,
+                turns_summarized: 5,
+                tail_kept: 4,
+                tail_trimmed: 1,
+                tail_messages: &tail,
+            },
+        )
+        .unwrap();
+        let raw_data: String = s
+            .db
+            .read_blocking(|conn| {
+                Ok(conn.query_row(
+                    "SELECT data_json FROM session_events WHERE session_id = ?1 AND type = 'session_compacted'",
+                    [s.id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        let raw_data: serde_json::Value = serde_json::from_str(&raw_data).unwrap();
+        assert!(raw_data["handoff_ref"].as_str().is_some());
+        assert!(raw_data.get("brief_text").is_none());
+        assert!(raw_data.get("tail_messages").is_none());
+        assert!(raw_data.to_string().len() < 16 * 1024);
+        assert_eq!(raw_data["tail_trimmed"], 1);
+
+        let event =
+            s.db.list_session_events(s.id)
+                .unwrap()
+                .into_iter()
+                .find(|event| event.kind == "session_compacted")
+                .unwrap();
+        assert_eq!(event.data["handoff_text"], handoff);
+        assert!(event.data["tail_messages"].is_array());
+
+        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        match &snapshot[0] {
+            proto::HistoryEntry::CompactBoundary {
+                handoff: Some(restored),
+                tokens_before,
+                tokens_after,
+                tail_kept,
+                ..
+            } => {
+                assert_eq!(restored, &handoff);
+                assert_eq!(
+                    (*tokens_before, *tokens_after, *tail_kept),
+                    (9_000, 3_000, 4)
+                );
+            }
+            other => panic!("expected durable compaction entry, got {other:?}"),
+        }
+
+        let preview = s.db.read_session_messages(s.id, None, 10).unwrap().0;
+        assert!(preview.iter().any(|message| message.text == handoff));
+    }
+
+    #[test]
+    fn compaction_payload_refs_are_session_scoped() {
+        let owner = root_session();
+        let other = root_session();
+        let payload_id = Uuid::new_v4();
+        let payload = json!({"handoff_text": "owner secret"}).to_string();
+        owner
+            .db
+            .store_compaction_payload(payload_id, owner.id, &payload)
+            .unwrap();
+
+        assert_eq!(
+            owner
+                .db
+                .compaction_payload(owner.id, &payload_id.to_string())
+                .unwrap()
+                .as_deref(),
+            Some(payload.as_str())
+        );
+        assert!(
+            owner
+                .db
+                .compaction_payload(other.id, &payload_id.to_string())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compaction_entries_survive_replay() {
+        let s = root_session();
+        let seq = s
+            .record_session_compacted_with_source(
+                "Build",
+                crate::session::SessionCompactionRecord {
+                    successor_session_id: s.id,
+                    successor_short_id: &s.short_id,
+                    seed_tool_count: 0,
+                    brief_text: "brief",
+                    handoff_text: "full handoff",
+                    source: "auto",
+                    trigger_ctx_pct: Some(60.0),
+                    tokens_before: 600,
+                    tokens_after: 100,
+                    turns_summarized: 2,
+                    tail_kept: 1,
+                    tail_trimmed: 0,
+                    tail_messages: &[],
+                },
+            )
+            .unwrap();
+        let replay =
+            s.db.read_blocking(|conn| {
+                history_snapshot_since_with_active_subagent_conn(conn, s.id, "Build", None, seq - 1)
+            })
+            .unwrap();
+        assert!(matches!(
+            &replay[..],
+            [proto::HistoryEntry::CompactBoundary {
+                source,
+                handoff: Some(handoff),
+                ..
+            }] if source == "auto" && handoff == "full handoff"
+        ));
+    }
+
+    #[test]
+    fn compacted_model_history_rehydrates_handoff_and_tail() {
+        let s = root_session();
+        let tail = vec![
+            Message::user("recent user"),
+            Message::assistant("recent answer"),
+        ];
+        s.record_session_compacted_with_source(
+            "Build",
+            crate::session::SessionCompactionRecord {
+                successor_session_id: s.id,
+                successor_short_id: &s.short_id,
+                seed_tool_count: 0,
+                brief_text: "brief",
+                handoff_text: "exact handoff",
+                source: "manual",
+                trigger_ctx_pct: None,
+                tokens_before: 500,
+                tokens_after: 100,
+                turns_summarized: 3,
+                tail_kept: 1,
+                tail_trimmed: 0,
+                tail_messages: &tail,
+            },
+        )
+        .unwrap();
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value([vec![Message::user("exact handoff")], tail].concat()).unwrap()
+        );
     }
 
     /// Recovery chip survives into the snapshot for a repaired tool call

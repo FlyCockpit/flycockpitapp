@@ -32,6 +32,7 @@ use serde_json::Value;
 
 use crate::db::seed_tools::SeedTool;
 use crate::db::tool_calls::ToolCallEvent;
+use crate::engine::message::Message;
 
 /// Read-only / idempotent tools eligible to be re-executed as seed-tools
 /// in the new thread. Never `bash`, `write`, `edit` (GOALS §10). `read`
@@ -326,11 +327,17 @@ pub fn brief_prompt(override_prompt: Option<&str>) -> String {
     {
         return custom.to_string();
     }
-    "Write a self-contained handoff brief for a fresh agent with no memory of \
-     this conversation, so it can continue the work from where we left off. \
-     Cover: the goal, what's been done, what's left, and any decisions or \
-     constraints that matter. Be concise and concrete. Do not list files or \
-     commands — a deterministic appendix covers those."
+    "Write a concise, self-contained handoff brief for a fresh agent with no \
+     memory of this conversation. Use exactly these headings:\n\n\
+     ## Decisions\n\
+     ## Plan state\n\
+     ## Unresolved / open questions\n\
+     ## Bugs & gotchas\n\
+     ## Next steps\n\n\
+     Put judgment and continuation guidance under those sections. Do not list \
+     files or commands — a deterministic appendix covers those. Refer to pinned \
+     messages when relevant but do not restate them; they survive verbatim in \
+     the appendix."
         .to_string()
 }
 
@@ -339,6 +346,178 @@ pub fn brief_prompt(override_prompt: Option<&str>) -> String {
 /// aren't part of the prose.)
 pub fn assemble_handoff(brief: &str, appendix: &StateAppendix) -> String {
     format!("{}{}", brief.trim(), appendix.render())
+}
+
+/// One deterministic post-compaction history plan. The handoff remains the
+/// first user message; `tail` contains only whole, recent exchanges.
+#[derive(Debug, Clone)]
+pub struct CompactHistoryPlan {
+    pub history: Vec<Message>,
+    pub tail_message_positions: Vec<usize>,
+    pub turns_summarized: usize,
+    pub tail_kept: usize,
+    pub tail_trimmed: usize,
+    pub tokens_after: u64,
+}
+
+/// A handoff that cannot fit below its own active trigger must not be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactBudgetError {
+    pub handoff_tokens: u64,
+    pub trigger_tokens: u64,
+}
+
+impl std::fmt::Display for CompactBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "compaction handoff is too large ({0} tokens; must be below {1})",
+            self.handoff_tokens, self.trigger_tokens
+        )
+    }
+}
+
+/// Select the last `keep` complete user-to-assistant exchanges. A tool result
+/// is not a new exchange boundary, so assistant tool calls and their following
+/// user tool results can never be split by this selector.
+fn complete_exchange_ranges(history: &[Message]) -> Vec<std::ops::Range<usize>> {
+    use rig::message::UserContent;
+
+    let starts = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            Message::User { content }
+                if !content
+                    .iter()
+                    .any(|part| matches!(part, UserContent::ToolResult(_))) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(position, start)| {
+            let end = starts.get(position + 1).copied().unwrap_or(history.len());
+            history[*start..end]
+                .iter()
+                .any(|message| matches!(message, Message::Assistant { .. }))
+                .then_some(*start..end)
+        })
+        .collect()
+}
+
+fn message_tokens(message: &Message) -> u64 {
+    serde_json::to_string(message)
+        .ok()
+        .map(|wire| crate::tokens::count(&wire) as u64)
+        .unwrap_or(0)
+}
+
+fn exchange_tokens(history: &[Message], range: &std::ops::Range<usize>) -> u64 {
+    history[range.clone()].iter().map(message_tokens).sum()
+}
+
+fn below_trigger(tokens: u64, window: u64, trigger_pct: u8) -> bool {
+    u128::from(tokens) * 100 < u128::from(window) * u128::from(trigger_pct)
+}
+
+/// Produce the exact model history installed at a compaction boundary.
+/// Oldest retained exchanges are removed first until both the 25%-of-window
+/// tail cap and the active trigger invariant hold.
+pub fn plan_compacted_history(
+    history: &[Message],
+    handoff: &str,
+    keep_recent_turns: usize,
+    context_window: Option<u32>,
+    trigger_pct: u8,
+) -> Result<CompactHistoryPlan, CompactBudgetError> {
+    let handoff_message = Message::user(handoff.to_string());
+    let handoff_tokens = message_tokens(&handoff_message);
+    if let Some(window) = context_window.map(u64::from) {
+        let trigger_tokens = window.saturating_mul(u64::from(trigger_pct)) / 100;
+        if !below_trigger(handoff_tokens, window, trigger_pct) {
+            return Err(CompactBudgetError {
+                handoff_tokens,
+                trigger_tokens,
+            });
+        }
+    }
+
+    let all = complete_exchange_ranges(history);
+    let requested = keep_recent_turns.min(all.len());
+    let mut retained = all[all.len().saturating_sub(requested)..].to_vec();
+    let mut trimmed = keep_recent_turns
+        .min(all.len())
+        .saturating_sub(retained.len());
+
+    if let Some(window) = context_window.map(u64::from) {
+        let tail_cap = window / 4;
+        while retained
+            .iter()
+            .map(|range| exchange_tokens(history, range))
+            .sum::<u64>()
+            > tail_cap
+        {
+            retained.remove(0);
+            trimmed += 1;
+        }
+        while !below_trigger(
+            handoff_tokens
+                + retained
+                    .iter()
+                    .map(|range| exchange_tokens(history, range))
+                    .sum::<u64>(),
+            window,
+            trigger_pct,
+        ) {
+            retained.remove(0);
+            trimmed += 1;
+        }
+    }
+
+    let tail_message_positions = retained
+        .iter()
+        .flat_map(|range| range.clone())
+        .collect::<Vec<_>>();
+    let mut planned = Vec::with_capacity(1 + tail_message_positions.len());
+    planned.push(handoff_message);
+    planned.extend(
+        retained
+            .iter()
+            .flat_map(|range| history[range.clone()].iter().cloned()),
+    );
+    let tokens_after = planned.iter().map(message_tokens).sum();
+    let tail_kept = retained.len();
+    Ok(CompactHistoryPlan {
+        history: planned,
+        tail_message_positions,
+        turns_summarized: all.len().saturating_sub(tail_kept),
+        tail_kept,
+        tail_trimmed: trimmed,
+        tokens_after,
+    })
+}
+
+/// Runtime safety suffix for brief drafting. These durable session-event seqs
+/// own messages retained verbatim, so repeating them in the brief would waste
+/// context and make the handoff harder to review.
+pub fn tail_anti_duplication_instruction(message_seqs: &[i64]) -> String {
+    if message_seqs.is_empty() {
+        return String::new();
+    }
+    let seqs = message_seqs
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n\nThe messages owned by these durable session event seqs survive verbatim after \
+         the handoff: [{seqs}]. Do not summarize, paraphrase, or restate those turns in the brief."
+    )
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -403,6 +582,8 @@ fn canonical(args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -570,12 +751,8 @@ mod tests {
     /// Regression guard: a refactor that loses the default must trip this.
     #[test]
     fn brief_prompt_default_when_no_override() {
-        let expected = "Write a self-contained handoff brief for a fresh agent with no memory of \
-             this conversation, so it can continue the work from where we left off. \
-             Cover: the goal, what's been done, what's left, and any decisions or \
-             constraints that matter. Be concise and concrete. Do not list files or \
-             commands — a deterministic appendix covers those.";
-        assert_eq!(brief_prompt(None), expected);
+        let expected = brief_prompt(None);
+        assert!(expected.starts_with("Write a concise, self-contained handoff brief"));
         // An empty / whitespace-only override is treated as unset (the
         // "empty string == unset" edge case): the default is returned.
         assert_eq!(brief_prompt(Some("")), expected);
@@ -589,5 +766,131 @@ mod tests {
         assert_eq!(brief_prompt(Some(custom)), custom);
         // Verbatim — not appended to the default.
         assert!(!brief_prompt(Some(custom)).contains("deterministic appendix"));
+    }
+
+    fn exchanges(count: usize, body: &str) -> Vec<Message> {
+        (0..count)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("user {index} {body}")),
+                    Message::assistant(format!("assistant {index} {body}")),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compact_keeps_recent_tail() {
+        let history = exchanges(6, "body");
+        let plan = plan_compacted_history(&history, "handoff", 4, Some(100_000), 60).unwrap();
+        assert_eq!(plan.tail_kept, 4);
+        assert_eq!(plan.history.len(), 9);
+        assert_eq!(
+            serde_json::to_value(&plan.history[1..]).unwrap(),
+            serde_json::to_value(&history[4..]).unwrap()
+        );
+    }
+
+    #[test]
+    fn tail_never_splits_tool_pairs() {
+        let call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "call-1".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        };
+        let result = Message::User {
+            content: OneOrMany::many(vec![
+                UserContent::ToolResult(ToolResult {
+                    id: "call-1".into(),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::text("result")),
+                }),
+                UserContent::text("and continue with this observation"),
+            ])
+            .unwrap(),
+        };
+        let history = vec![
+            Message::user("first"),
+            call.clone(),
+            result.clone(),
+            Message::assistant("done"),
+            Message::user("second"),
+            Message::assistant("done again"),
+        ];
+        let plan = plan_compacted_history(&history, "handoff", 2, Some(100_000), 60).unwrap();
+        let wire = serde_json::to_value(&plan.history).unwrap().to_string();
+        assert!(wire.contains("call-1"));
+        assert_eq!(wire.matches("call-1").count(), 2);
+        assert_eq!(
+            serde_json::to_value(&plan.history[1..]).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+    }
+
+    #[test]
+    fn compact_keep_zero_is_handoff_only_byte_for_byte() {
+        let plan =
+            plan_compacted_history(&exchanges(3, "body"), "exact handoff", 0, None, 60).unwrap();
+        assert_eq!(plan.history.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&plan.history[0]).unwrap(),
+            serde_json::to_value(Message::user("exact handoff")).unwrap()
+        );
+    }
+
+    #[test]
+    fn tail_capped_at_window_fraction() {
+        let history = exchanges(4, &"word ".repeat(80));
+        let ranges = complete_exchange_ranges(&history);
+        let one_exchange = exchange_tokens(&history, ranges.last().unwrap());
+        let window = u32::try_from(one_exchange.saturating_mul(4).saturating_add(4)).unwrap();
+        let plan = plan_compacted_history(&history, "handoff", 4, Some(window), 100).unwrap();
+        assert!(plan.tail_kept <= 1);
+        assert!(plan.tail_trimmed >= 3);
+    }
+
+    #[test]
+    fn compact_result_below_trigger() {
+        let history = exchanges(4, &"context ".repeat(60));
+        let plan = plan_compacted_history(&history, "short handoff", 4, Some(1_200), 60).unwrap();
+        assert!(u128::from(plan.tokens_after) * 100 < 1_200u128 * 60);
+        assert!(plan.tail_trimmed > 0);
+
+        let error =
+            plan_compacted_history(&history, &"huge ".repeat(1_000), 4, Some(100), 60).unwrap_err();
+        assert!(error.handoff_tokens >= error.trigger_tokens);
+    }
+
+    #[test]
+    fn compact_default_brief_sections() {
+        let prompt = brief_prompt(None);
+        for heading in [
+            "## Decisions",
+            "## Plan state",
+            "## Unresolved / open questions",
+            "## Bugs & gotchas",
+            "## Next steps",
+        ] {
+            assert!(prompt.contains(heading), "missing {heading}: {prompt}");
+        }
+        let custom = "custom only";
+        assert_eq!(brief_prompt(Some(custom)), custom);
+    }
+
+    #[test]
+    fn tail_prompt_names_verbatim_message_seqs_and_forbids_resummarizing() {
+        let prompt = tail_anti_duplication_instruction(&[41, 52, 63]);
+        assert!(prompt.contains("durable session event seqs"));
+        assert!(prompt.contains("[41, 52, 63]"));
+        assert!(prompt.contains("survive verbatim"));
+        assert!(prompt.contains("Do not summarize"));
     }
 }

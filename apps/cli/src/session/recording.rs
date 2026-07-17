@@ -425,37 +425,74 @@ impl Session {
     ) -> Result<i64> {
         self.record_session_compacted_with_source(
             agent,
-            successor_session_id,
-            successor_short_id,
-            seed_tool_count,
-            brief_text,
-            "manual",
+            SessionCompactionRecord {
+                successor_session_id,
+                successor_short_id,
+                seed_tool_count,
+                brief_text,
+                handoff_text: brief_text,
+                source: "manual",
+                trigger_ctx_pct: None,
+                tokens_before: 0,
+                tokens_after: 0,
+                turns_summarized: 0,
+                tail_kept: 0,
+                tail_trimmed: 0,
+                tail_messages: &[],
+            },
         )
     }
 
     pub fn record_session_compacted_with_source(
         &self,
         agent: &str,
-        successor_session_id: Uuid,
-        successor_short_id: &str,
-        seed_tool_count: usize,
-        brief_text: &str,
-        source: &str,
+        record: SessionCompactionRecord<'_>,
     ) -> Result<i64> {
+        const INLINE_HANDOFF_MAX_BYTES: usize = 16 * 1024;
+        let mut data = serde_json::json!({
+            "kind": "compaction",
+            "predecessor_session_id": self.id.to_string(),
+            "predecessor_short_id": self.short_id,
+            "successor_session_id": record.successor_session_id.to_string(),
+            "successor_short_id": record.successor_short_id,
+            "seed_tool_count": record.seed_tool_count,
+            "brief_text": record.brief_text,
+            "handoff_text": record.handoff_text,
+            "source": record.source,
+            "trigger_ctx_pct": record.trigger_ctx_pct,
+            "tokens_before": record.tokens_before,
+            "tokens_after": record.tokens_after,
+            "turns_summarized": record.turns_summarized,
+            "tail_kept": record.tail_kept,
+            "tail_trimmed": record.tail_trimmed,
+            "tail_messages": record.tail_messages,
+        });
+        if data.to_string().len() > INLINE_HANDOFF_MAX_BYTES {
+            let handoff_id = Uuid::new_v4();
+            self.db
+                .store_compaction_payload(handoff_id, self.id, &data.to_string())?;
+            data = serde_json::json!({
+                "kind": "compaction",
+                "predecessor_session_id": self.id.to_string(),
+                "predecessor_short_id": self.short_id,
+                "successor_session_id": record.successor_session_id.to_string(),
+                "successor_short_id": record.successor_short_id,
+                "seed_tool_count": record.seed_tool_count,
+                "source": record.source,
+                "trigger_ctx_pct": record.trigger_ctx_pct,
+                "tokens_before": record.tokens_before,
+                "tokens_after": record.tokens_after,
+                "turns_summarized": record.turns_summarized,
+                "tail_kept": record.tail_kept,
+                "tail_trimmed": record.tail_trimmed,
+                "handoff_ref": handoff_id.to_string(),
+            });
+        }
         self.record_event(
             crate::db::session_log::SessionEventKind::SessionCompacted,
             Some(agent),
             None,
-            &serde_json::json!({
-                "kind": "compaction",
-                "predecessor_session_id": self.id.to_string(),
-                "predecessor_short_id": self.short_id,
-                "successor_session_id": successor_session_id.to_string(),
-                "successor_short_id": successor_short_id,
-                "seed_tool_count": seed_tool_count,
-                "brief_text": brief_text,
-                "source": source,
-            }),
+            &data,
         )
     }
 

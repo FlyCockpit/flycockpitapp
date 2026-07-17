@@ -581,9 +581,13 @@ impl ThinkingParams {
 pub struct ContextConfig {
     /// At or above this ctx% the foreground context is compacted
     /// automatically (the `/compact` machinery runs without a prompt).
-    /// Default 80.
+    /// Default 60.
     #[serde(default = "default_auto_compact_pct")]
     pub auto_compact_pct: u8,
+    /// Number of most-recent complete user/assistant exchanges retained
+    /// verbatim after compaction. `0` keeps only the handoff. Default 4.
+    #[serde(default = "default_compact_keep_recent_turns")]
+    pub compact_keep_recent_turns: usize,
     /// Above this ctx% (and above `auto_prune_prunable_pct` of prunable
     /// tokens) auto-prune fires even on a warm cache, accepting the cache
     /// bust to reclaim context. Default 50.
@@ -599,13 +603,16 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             auto_compact_pct: default_auto_compact_pct(),
+            compact_keep_recent_turns: default_compact_keep_recent_turns(),
             auto_prune_pct: default_auto_prune_pct(),
             auto_prune_prunable_pct: default_auto_prune_prunable_pct(),
         }
     }
 }
 
-default_const!(default_auto_compact_pct, u8, 80);
+default_const!(default_auto_compact_pct, u8, 60);
+
+default_const!(default_compact_keep_recent_turns, usize, 4);
 
 default_const!(default_auto_prune_pct, u8, 50);
 
@@ -1871,7 +1878,7 @@ impl ProvidersConfig {
 
     /// Resolve the effective context-threshold config for
     /// `(provider, model)`: the model-level override if present, else the
-    /// provider-level config, else the built-in defaults (80/50/30). Drives
+    /// provider-level config, else the built-in defaults (60/4/50/30). Drives
     /// the auto-compact + ctx%-threshold auto-prune triggers
     /// (implementation note).
     pub fn resolve_context(&self, provider: &str, model: &str) -> ContextConfig {

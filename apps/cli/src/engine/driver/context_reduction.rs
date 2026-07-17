@@ -26,6 +26,65 @@ impl Driver {
             .collect()
     }
 
+    /// Stable daemon timeline ids owning the recent exchanges that survive a
+    /// compaction. A prior compaction owns its serialized handoff/tail as one
+    /// boundary row, so that boundary's seq represents those messages on a
+    /// later compaction instead of inventing ephemeral wire-history indexes.
+    pub(in crate::engine::driver) fn compact_tail_message_seqs(
+        &self,
+        tail_turns: usize,
+    ) -> Vec<i64> {
+        use crate::daemon::proto::HistoryEntry;
+
+        if tail_turns == 0 {
+            return Vec::new();
+        }
+        let Ok(entries) = crate::engine::rehydrate::history_snapshot(
+            &self.session.db,
+            self.session.id,
+            self.active_agent(),
+        ) else {
+            return Vec::new();
+        };
+        let excluded_skill_calls = self
+            .skill_pairs
+            .iter()
+            .filter(|pair| !pair.intentional_steer)
+            .map(|pair| pair.call_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut remaining = tail_turns;
+        let mut start = 0;
+        for (index, entry) in entries.iter().enumerate().rev() {
+            let represented_turns = match entry {
+                HistoryEntry::User { .. } => 1,
+                HistoryEntry::CompactBoundary { tail_kept, .. } => tail_kept.saturating_add(1),
+                _ => 0,
+            };
+            if represented_turns == 0 {
+                continue;
+            }
+            if represented_turns >= remaining {
+                start = index;
+                break;
+            }
+            remaining -= represented_turns;
+        }
+        entries[start..]
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::User { seq, .. }
+                | HistoryEntry::Assistant { seq, .. }
+                | HistoryEntry::CompactBoundary { seq, .. } => (*seq > 0).then_some(*seq),
+                HistoryEntry::ToolCall { seq, call_id, .. }
+                    if !excluded_skill_calls.contains(call_id.as_str()) =>
+                {
+                    (*seq > 0).then_some(*seq)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Snapshot-dedup the foreground agent's history. `auto` distinguishes
     /// the cache-aware auto-fire from a manual `/prune`. Emits `Pruned` +
     /// a refreshed `ContextProjection`. Never breaks a warm cache (the
@@ -442,12 +501,72 @@ impl Driver {
     ) {
         use crate::engine::compact;
 
-        // 0. Prune-first (lossless; denser transcript → tighter brief).
-        self.do_prune(false, tx).await;
+        let original_history = self
+            .stack
+            .last()
+            .expect("stack never empty")
+            .history
+            .clone();
+        let tokens_before = wire_token_total(&original_history);
+        let context_window = self.active_model_context_length();
+        let ctx_cfg = self.resolve_context_config();
+        let trigger_ctx_pct = match (
+            self.session.last_usage().map(|usage| usage.input_tokens),
+            context_window,
+        ) {
+            (Some(used), Some(window)) if window > 0 => {
+                Some(used as f64 / f64::from(window) * 100.0)
+            }
+            _ => None,
+        };
+
+        // 0. Prune-first (lossless; denser transcript → tighter brief). This
+        // intermediate form is deliberately private to compaction: publishing
+        // a normal prune event/ledger here would leave a false durable trail if
+        // the assembled handoff later proves too large and we roll back.
+        let compact_prune =
+            prune::dedup_plan(&self.stack.last().expect("stack never empty").history);
+        prune::apply_plan(
+            &mut self.stack.last_mut().expect("stack never empty").history,
+            &compact_prune,
+        );
+        let compact_condensations =
+            prune::condense_candidates(&self.stack.last().expect("stack never empty").history)
+                .into_iter()
+                .map(|candidate| {
+                    let hash = crate::db::compressed_results::compressed_result_hash(
+                        &candidate.original_body,
+                    );
+                    prune::apply_condensed_tool_result(
+                        &mut self.stack.last_mut().expect("stack never empty").history,
+                        &candidate,
+                        &hash,
+                    );
+                    (candidate, hash)
+                })
+                .collect::<Vec<_>>();
 
         // 1. Model brief from the foreground agent's current history.
-        let brief = self.draft_brief(tx).await;
-
+        let filtered_history =
+            self.compact_brief_history(&self.stack.last().expect("stack never empty").history);
+        let candidate_tail = match compact::plan_compacted_history(
+            &filtered_history,
+            "",
+            ctx_cfg.compact_keep_recent_turns,
+            context_window,
+            100,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.stack.last_mut().expect("stack never empty").history = original_history;
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!("/compact: {error}; history was left unchanged"),
+                    })
+                    .await;
+                return;
+            }
+        };
         // 2. Deterministic appendix from the runtime ledger.
         let calls = self
             .session
@@ -484,14 +603,85 @@ impl Driver {
             .map(|s| crate::tokens::count(&s.args.to_string()) as u64)
             .sum();
 
-        // 4. Assemble the review-ready handoff.
-        let handoff = compact::assemble_handoff(&brief, &appendix);
+        // 4. Draft + assemble against the exact tail that will survive. The
+        // 25%-cap candidate normally fits immediately. If the produced handoff
+        // forces more oldest-first trimming, redraft with that smaller list so
+        // the anti-duplication instruction never promises a removed turn.
+        let initial_tail_kept = candidate_tail.tail_kept;
+        let initial_tail_trimmed = candidate_tail.tail_trimmed;
+        let mut keep = initial_tail_kept;
+        let mut tail_positions = candidate_tail.tail_message_positions;
+        let (brief, handoff, mut plan) = loop {
+            let tail_message_seqs = self.compact_tail_message_seqs(keep);
+            let brief = self.draft_brief(tx, &tail_message_seqs).await;
+            let handoff = compact::assemble_handoff(&brief, &appendix);
+            let plan = match compact::plan_compacted_history(
+                &filtered_history,
+                &handoff,
+                keep,
+                context_window,
+                ctx_cfg.auto_compact_pct,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    // Prune-first operated only on the live frame, so roll it
+                    // back too: an over-budget handoff must not partially
+                    // mutate history or its durable/UI trail.
+                    self.stack.last_mut().expect("stack never empty").history = original_history;
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: format!("/compact: {error}; history was left unchanged"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            if plan.tail_message_positions == tail_positions {
+                break (brief, handoff, plan);
+            }
+            keep = plan.tail_kept;
+            tail_positions = plan.tail_message_positions;
+        };
+        plan.tail_trimmed = initial_tail_trimmed + initial_tail_kept.saturating_sub(plan.tail_kept);
+
+        // Persist every recoverable original for the private prune transform
+        // atomically, but only after the handoff is proven to fit. A storage
+        // failure aborts before model history or timeline state changes.
+        let compressed_entries = compact_condensations
+            .into_iter()
+            .map(
+                |(candidate, hash)| crate::db::compressed_results::CompressedToolResultEntry {
+                    hash,
+                    session_id: self.session.id,
+                    agent_id: self.active_agent().to_string(),
+                    tool: candidate.tool,
+                    call_id: candidate.call_id,
+                    original_byte_len: candidate.original_body.len(),
+                    compressed_byte_len: Some(candidate.condensed_body.len()),
+                    created_at: chrono::Utc::now().timestamp(),
+                    kind: "prune-boundary".to_string(),
+                    content: candidate.original_body,
+                },
+            )
+            .collect();
+        if let Err(error) = self
+            .session
+            .db
+            .insert_compressed_tool_results(compressed_entries)
+        {
+            self.stack.last_mut().expect("stack never empty").history = original_history;
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "/compact: storing recoverable pruned results failed: {error}; history was left unchanged"
+                    ),
+                })
+                .await;
+            return;
+        }
 
         // 5. Reset the foreground model context in place.
-        if let Some(top) = self.stack.last_mut() {
-            top.history.clear();
-            top.history.push(Message::user(handoff.clone()));
-        }
+        self.stack.last_mut().expect("stack never empty").history = plan.history.clone();
         self.drop_stale_owner_ledgers();
 
         // Persist the seed-tool plan on this session for the follow-up
@@ -503,11 +693,21 @@ impl Driver {
         // Timeline boundary: `/compact` reset this session in place.
         if let Err(e) = self.session.record_session_compacted_with_source(
             self.active_agent(),
-            self.session.id,
-            &self.session.short_id,
-            seeds.len(),
-            &brief,
-            source,
+            crate::session::SessionCompactionRecord {
+                successor_session_id: self.session.id,
+                successor_short_id: &self.session.short_id,
+                seed_tool_count: seeds.len(),
+                brief_text: &brief,
+                handoff_text: &handoff,
+                source,
+                trigger_ctx_pct,
+                tokens_before,
+                tokens_after: plan.tokens_after,
+                turns_summarized: plan.turns_summarized,
+                tail_kept: plan.tail_kept,
+                tail_trimmed: plan.tail_trimmed,
+                tail_messages: &plan.history[1..],
+            },
         ) {
             tracing::warn!(error = %e, "record session_compacted event failed");
         }
@@ -519,6 +719,13 @@ impl Driver {
                 new_session_id: self.session.id,
                 handoff,
                 brief,
+                source: source.to_string(),
+                trigger_ctx_pct,
+                tokens_before,
+                tokens_after: plan.tokens_after,
+                turns_summarized: plan.turns_summarized,
+                tail_kept: plan.tail_kept,
+                tail_trimmed: plan.tail_trimmed,
                 seed_tool_count: seeds.len(),
                 seed_tool_tokens,
             })
@@ -533,6 +740,7 @@ impl Driver {
     pub(in crate::engine::driver) async fn draft_brief(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
+        tail_message_seqs: &[i64],
     ) -> String {
         let top = self.stack.last().expect("stack never empty");
         // Resolve the two `extended.*` compaction knobs from the config
@@ -550,9 +758,12 @@ impl Driver {
         };
         #[cfg(not(test))]
         let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
-        let prompt = Message::user(crate::engine::compact::brief_prompt(
-            extended.compact_prompt.as_deref(),
+        let mut prompt_text =
+            crate::engine::compact::brief_prompt(extended.compact_prompt.as_deref());
+        prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
+            tail_message_seqs,
         ));
+        let prompt = Message::user(prompt_text);
 
         // Two-level model precedence: a configured `compact_model` (when it
         // resolves) drafts the brief; otherwise the active agent's own model.

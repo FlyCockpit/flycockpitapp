@@ -7708,10 +7708,10 @@ impl App {
                 || matches!(
                     e,
                     HistoryEntry::CompactBoundary {
-                        brief: Some(brief),
+                        handoff: Some(handoff),
                         expanded,
                         ..
-                    } if !brief.trim().is_empty() && !*expanded
+                    } if !handoff.trim().is_empty() && !*expanded
                 )
         });
         for entry in self.history.iter_mut() {
@@ -7722,10 +7722,10 @@ impl App {
                     ..
                 } => *expanded = any_hidden,
                 HistoryEntry::CompactBoundary {
-                    brief: Some(brief),
+                    handoff: Some(handoff),
                     expanded,
                     ..
-                } if !brief.trim().is_empty() => *expanded = any_hidden,
+                } if !handoff.trim().is_empty() => *expanded = any_hidden,
                 _ => {}
             }
         }
@@ -8362,17 +8362,22 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
         HistoryEntry::CompactBoundary {
             predecessor_short_id,
             seed_tool_count,
-            brief,
+            source,
+            tokens_before,
+            tokens_after,
+            tail_kept,
+            tail_trimmed,
+            handoff,
             expanded,
             ..
         } => {
             let mut lines = vec![format!(
-                "── compacted from {predecessor_short_id} · {seed_tool_count} seed-tool(s) re-run ──"
+                "compact: source={source} · from {predecessor_short_id} · tokens {tokens_before}→{tokens_after} · tail {tail_kept} kept/{tail_trimmed} trimmed · {seed_tool_count} seed-tool(s)"
             )];
             if *expanded
-                && let Some(brief) = brief.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                && let Some(handoff) = handoff.as_deref().map(str::trim).filter(|s| !s.is_empty())
             {
-                lines.extend(brief.lines().map(|line| format!("  │ {line}")));
+                lines.extend(handoff.lines().map(|line| format!("    {line}")));
             }
             lines
         }

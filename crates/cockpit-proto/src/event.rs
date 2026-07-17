@@ -547,6 +547,20 @@ pub enum Event {
         handoff: String,
         #[serde(default)]
         brief: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        trigger_ctx_pct: Option<f64>,
+        #[serde(default)]
+        tokens_before: u64,
+        #[serde(default)]
+        tokens_after: u64,
+        #[serde(default)]
+        turns_summarized: usize,
+        #[serde(default)]
+        tail_kept: usize,
+        #[serde(default)]
+        tail_trimmed: usize,
         seed_tool_count: usize,
         seed_tool_tokens: u64,
     },

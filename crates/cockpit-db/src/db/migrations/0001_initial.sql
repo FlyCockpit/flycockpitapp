@@ -527,6 +527,19 @@ CREATE INDEX idx_sevents_task_child  ON session_events (session_id, task_call_id
 CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
   WHERE origin_principal IS NOT NULL;
 
+-- Large compaction records spill out of the inline event JSON as one canonical
+-- payload (brief + handoff + serialized tail). The `session_compacted` event
+-- remains authoritative and carries this opaque, session-scoped id.
+CREATE TABLE compaction_handoffs (
+    handoff_id   TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_compaction_handoffs_session ON compaction_handoffs(session_id);
+
 -- ---- approval_grants (sandboxing part 1, §2) -------------------------------------
 -- Session-scope command/path approval grants; a present row skips the
 -- approval prompt. Project- and Global-scope grants persist outside the

@@ -499,9 +499,9 @@ impl App {
                 }
                 Some(HistoryEntry::CompactBoundary {
                     expanded,
-                    brief: Some(brief),
+                    handoff: Some(handoff),
                     ..
-                }) if !brief.trim().is_empty() => {
+                }) if !handoff.trim().is_empty() => {
                     *expanded = !*expanded;
                 }
                 Some(HistoryEntry::InferenceError { expanded, .. }) => {
@@ -916,16 +916,30 @@ impl App {
     }
 
     fn scroll_tool_call_result(&mut self, idx: usize, call_index: usize, up: bool) -> bool {
-        let Some(HistoryEntry::ToolBox { calls, .. }) = self.history.get_mut(idx) else {
-            return false;
+        let (expanded, has_output, offset) = match self.history.get(idx) {
+            Some(HistoryEntry::ToolBox { calls, .. }) => {
+                let Some(call) = calls.get(call_index) else {
+                    return false;
+                };
+                (
+                    call.expanded,
+                    !call.output.is_empty() && crate::tui::history::tool_shows_output(&call.tool),
+                    call.result_offset,
+                )
+            }
+            Some(HistoryEntry::CompactBoundary {
+                expanded,
+                handoff,
+                result_offset,
+                ..
+            }) if call_index == 0 => (
+                *expanded,
+                handoff.as_deref().is_some_and(|s| !s.is_empty()),
+                *result_offset,
+            ),
+            _ => return false,
         };
-        let Some(call) = calls.get_mut(call_index) else {
-            return false;
-        };
-        if !call.expanded
-            || call.output.is_empty()
-            || !crate::tui::history::tool_shows_output(&call.tool)
-        {
+        if !expanded || !has_output {
             return false;
         }
         let max_offset = self
@@ -939,21 +953,23 @@ impl App {
                 _ => None,
             })
             .unwrap_or(0);
-        let cur = call.result_offset.min(max_offset);
-        if up {
-            if cur == 0 {
-                return false;
-            }
-            call.result_offset = cur - 1;
-            true
+        let cur = offset.min(max_offset);
+        let next = if up {
+            cur.checked_sub(1)
+        } else if cur < max_offset {
+            Some(cur + 1)
         } else {
-            if cur >= max_offset {
-                call.result_offset = max_offset;
-                return false;
-            }
-            call.result_offset = cur + 1;
-            true
+            None
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        match self.history.get_mut(idx) {
+            Some(HistoryEntry::ToolBox { calls, .. }) => calls[call_index].result_offset = next,
+            Some(HistoryEntry::CompactBoundary { result_offset, .. }) => *result_offset = next,
+            _ => return false,
         }
+        true
     }
 
     fn scroll_box_target(&mut self, idx: usize, up: bool) -> bool {
@@ -1017,6 +1033,19 @@ impl App {
             if !call.expanded {
                 call.result_offset = 0;
                 *follow = true;
+            }
+            return true;
+        }
+        if call_index == 0
+            && let Some(HistoryEntry::CompactBoundary {
+                expanded,
+                result_offset,
+                ..
+            }) = self.history.get_mut(idx)
+        {
+            *expanded = !*expanded;
+            if !*expanded {
+                *result_offset = 0;
             }
             return true;
         }

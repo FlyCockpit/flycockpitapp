@@ -143,6 +143,7 @@ cockpit packages prune --dry-run
 | `cockpit config export-policy` | Export portable non-secret provider/model policy JSON. |
 | `cockpit config import-policy <file>` | Import portable provider/model policy JSON. |
 | `cockpit session list` | List recorded sessions. |
+| `cockpit session show <session> [--json]` | Show durable compaction handoffs and their token/tail statistics. |
 | `cockpit export <session>` | Export a redacted session/fork tree debug bundle. |
 | `cockpit import <file>` | Import a session export. |
 | `cockpit stats` | Show token and cost statistics. |

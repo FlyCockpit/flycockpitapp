@@ -3544,11 +3544,11 @@ fn context_metrics_compute_and_inert_cases() {
     let low_prunable = context_metrics(Some(100_000), Some(55_000), 10_000).unwrap();
     assert!(!(low_prunable.ctx_pct > 50.0 && low_prunable.prunable_pct > 30.0));
 
-    // The auto-compact line (80%): at/above fires, below doesn't.
-    let hot = context_metrics(Some(100_000), Some(85_000), 0).unwrap();
-    assert!(hot.ctx_pct >= 80.0);
-    let mid = context_metrics(Some(100_000), Some(70_000), 0).unwrap();
-    assert!(mid.ctx_pct < 80.0);
+    // The auto-compact line (60%): at/above fires, below doesn't.
+    let hot = context_metrics(Some(100_000), Some(65_000), 0).unwrap();
+    assert!(hot.ctx_pct >= 60.0);
+    let mid = context_metrics(Some(100_000), Some(55_000), 0).unwrap();
+    assert!(mid.ctx_pct < 60.0);
 }
 
 /// Install a test providers override with the given context thresholds,
@@ -3691,7 +3691,7 @@ async fn auto_prune_threshold_branch_prunes_warm_cache_with_cache_break() {
     );
 }
 
-/// Auto-compact fires at/above the configured ctx% (default 80) and is a
+/// Auto-compact fires at/above the configured ctx% (default 60) and is a
 /// one-shot (the second call no-ops because the session is being handed
 /// off). Below the line it doesn't fire.
 #[tokio::test]
@@ -3732,13 +3732,13 @@ async fn auto_compact_fires_at_threshold_once() {
         })
         .unwrap();
 
-    // 70% < 80 → no compact.
+    // 50% < 60 → no compact.
     driver
         .session
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 70,
+                input_tokens: 50,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -3747,23 +3747,23 @@ async fn auto_compact_fires_at_threshold_once() {
         .unwrap();
     assert!(
         !driver.maybe_auto_compact(&tx).await,
-        "below 80% no compact"
+        "below 60% no compact"
     );
 
-    // 85% ≥ 80 → compact fires once.
+    // 65% ≥ 60 → compact fires once.
     driver
         .session
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 85,
+                input_tokens: 65,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             },
         )
         .unwrap();
-    assert!(driver.maybe_auto_compact(&tx).await, "at/over 80% compacts");
+    assert!(driver.maybe_auto_compact(&tx).await, "at/over 60% compacts");
     // One-shot: a second call no-ops even while still hot.
     assert!(
         !driver.maybe_auto_compact(&tx).await,
@@ -3795,6 +3795,185 @@ async fn auto_compact_fires_at_threshold_once() {
 }
 
 #[tokio::test]
+async fn oversized_compact_handoff_leaves_history_unchanged() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.stack[0].history = vec![
+        Message::user("retain this exact user turn"),
+        Message::assistant("retain this exact assistant turn"),
+    ];
+    let before = serde_json::to_value(&driver.stack[0].history).unwrap();
+    // The empty planning placeholder fits, while the assembled five-section
+    // handoff plus deterministic appendix cannot land below 60% of this tiny
+    // window. This exercises the driver's rollback after prune-first.
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 40);
+
+    driver.do_compact(&tx).await;
+
+    assert_eq!(
+        serde_json::to_value(&driver.stack[0].history).unwrap(),
+        before
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "session_compacted"),
+        "a failed compaction must not record a successful boundary"
+    );
+    drop(tx);
+    let mut saw_unchanged_notice = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, TurnEvent::Notice { text } if text.contains("history was left unchanged"))
+        {
+            saw_unchanged_notice = true;
+        }
+    }
+    assert!(
+        saw_unchanged_notice,
+        "the explicit failure should be surfaced"
+    );
+}
+
+#[tokio::test]
+async fn zero_window_compact_fails_explicitly_without_mutation() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    driver.stack[0].history = vec![Message::user("keep me"), Message::assistant("kept")];
+    let before = serde_json::to_value(&driver.stack[0].history).unwrap();
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 0);
+
+    driver.do_compact(&tx).await;
+
+    assert_eq!(
+        serde_json::to_value(&driver.stack[0].history).unwrap(),
+        before
+    );
+    drop(tx);
+    assert!(
+        matches!(rx.recv().await, Some(TurnEvent::Notice { text }) if text.contains("history was left unchanged"))
+    );
+}
+
+#[tokio::test]
+async fn compact_private_prune_preserves_shell_condensation() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::message::{AssistantContent, OneOrMany};
+    use rig::message::{ToolCall, ToolFunction};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let original = (0..700)
+        .map(|index| format!("noise line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    driver.stack[0].history = vec![
+        Message::user("run the suite"),
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "bash-condense".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        },
+        Message::tool_result_with_call_id("bash-condense".to_string(), None, original.clone()),
+        Message::assistant("suite complete"),
+    ];
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+
+    driver.do_compact(&tx).await;
+
+    let wire = serde_json::to_string(&driver.stack[0].history).unwrap();
+    assert!(wire.contains("compressed tool result"), "{wire}");
+    let stored = driver
+        .session
+        .db
+        .list_compressed_tool_results(driver.session.id)
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].content, original);
+}
+
+#[test]
+fn compact_tail_prompt_uses_durable_session_event_seqs() {
+    let (mut driver, _tmp) = test_driver(8);
+    let agent = driver.active_agent().to_string();
+    let mut recorded = Vec::new();
+    let mut excluded_skill_seq = None;
+    for index in 0..2 {
+        recorded.push(
+            driver
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::UserMessage,
+                    None,
+                    None,
+                    &serde_json::json!({"text": format!("user {index}")}),
+                )
+                .unwrap(),
+        );
+        if index == 1 {
+            excluded_skill_seq = Some(
+                driver
+                    .session
+                    .record_event(
+                        crate::db::session_log::SessionEventKind::ToolCall,
+                        Some(&agent),
+                        Some("skill-nonsteering"),
+                        &serde_json::json!({
+                            "tool": "skill",
+                            "wire_input": {"name": "reference"},
+                            "output": "injected body",
+                        }),
+                    )
+                    .unwrap(),
+            );
+            driver.skill_pairs.push(SkillPair {
+                call_id: "skill-nonsteering".into(),
+                owner: agent.clone(),
+                intentional_steer: false,
+            });
+        }
+        recorded.push(
+            driver
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::AssistantMessage,
+                    Some(&agent),
+                    None,
+                    &serde_json::json!({"text": format!("assistant {index}")}),
+                )
+                .unwrap(),
+        );
+    }
+
+    assert_eq!(driver.compact_tail_message_seqs(1), recorded[2..]);
+    assert!(
+        !driver
+            .compact_tail_message_seqs(1)
+            .contains(&excluded_skill_seq.unwrap())
+    );
+}
+
+#[tokio::test]
 async fn request_compact_honored_at_safe_boundary() {
     let (mut driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
@@ -3806,7 +3985,10 @@ async fn request_compact_honored_at_safe_boundary() {
         "agent-requested compaction bypasses the auto latch"
     );
     assert!(!driver.session.agent_compact_requested());
-    assert_eq!(driver.stack[0].history.len(), 1, "history reset to handoff");
+    assert!(
+        matches!(driver.stack[0].history.first(), Some(Message::User { .. })),
+        "post-compact history starts with the handoff; a configured tail may follow"
+    );
     drop(tx);
     let mut saw_compact_ready = false;
     while let Some(ev) = rx.recv().await {
@@ -3941,7 +4123,7 @@ async fn ineffective_prunes_escalate_to_compaction_below_compact_line() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-    // ctx 60% is below the 80% auto-compact line, so only escalation can
+    // ctx 55% is below the 60% auto-compact line, so only escalation can
     // trigger a compact here.
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
     driver
@@ -3949,7 +4131,7 @@ async fn ineffective_prunes_escalate_to_compaction_below_compact_line() {
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 60,
+                input_tokens: 55,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -3962,7 +4144,7 @@ async fn ineffective_prunes_escalate_to_compaction_below_compact_line() {
         "below the compact line with no ineffective run → no compact"
     );
     // Seed an ineffective run (three small saves, climbing ctx%).
-    for ctx in [40.0, 50.0, 60.0] {
+    for ctx in [35.0, 45.0, 55.0] {
         driver.note_prune_effectiveness(PruneEffectiveness {
             ctx_pct: ctx,
             saved_pct: 0.5,

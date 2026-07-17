@@ -390,14 +390,27 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             predecessor_short_id,
             seed_tool_count,
             seed_tool_tokens,
-            brief,
+            source,
+            tokens_before,
+            tokens_after,
+            tail_kept,
+            tail_trimmed,
+            handoff,
             expanded,
+            result_offset,
+            ..
         } => {
             hash_len(&mut hasher, predecessor_short_id);
             seed_tool_count.hash(&mut hasher);
             seed_tool_tokens.hash(&mut hasher);
-            brief.as_ref().map(|value| value.len()).hash(&mut hasher);
+            hash_len(&mut hasher, source);
+            tokens_before.hash(&mut hasher);
+            tokens_after.hash(&mut hasher);
+            tail_kept.hash(&mut hasher);
+            tail_trimmed.hash(&mut hasher);
+            handoff.as_ref().map(|value| value.len()).hash(&mut hasher);
             expanded.hash(&mut hasher);
+            result_offset.hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -585,7 +598,7 @@ fn copy_target_for_entry(entry: &HistoryEntry, history_index: usize) -> Option<C
 fn row_kind_for_entry(entry: &HistoryEntry) -> ChatRowKind {
     match entry {
         HistoryEntry::User { .. } | HistoryEntry::Agent { .. } => ChatRowKind::Message,
-        HistoryEntry::ToolBox { .. } => ChatRowKind::ToolBox,
+        HistoryEntry::ToolBox { .. } | HistoryEntry::CompactBoundary { .. } => ChatRowKind::ToolBox,
         HistoryEntry::Diff { .. } => ChatRowKind::Diff,
         _ => ChatRowKind::Other,
     }
@@ -932,8 +945,8 @@ impl App {
                 }
                 HistoryEntry::BackupWarning { .. } | HistoryEntry::InferenceWarning { .. } => 1,
                 HistoryEntry::CompactBoundary {
-                    brief, expanded, ..
-                } => compact_boundary_row_estimate(brief.as_deref(), *expanded).saturating_add(1),
+                    handoff, expanded, ..
+                } => compact_boundary_row_estimate(handoff.as_deref(), *expanded).saturating_add(1),
                 HistoryEntry::ToolLine { .. } => 2, // line + trailing gap
                 HistoryEntry::LocalCommand { output, .. } => {
                     // label row + output rows + trailing gap.
@@ -2568,12 +2581,12 @@ impl App {
                 HistoryEntry::LocalCommand { .. } => 0,
                 HistoryEntry::CompactBoundary {
                     predecessor_short_id,
-                    brief,
+                    handoff,
                     expanded,
                     ..
                 } => {
                     predecessor_short_id.len()
-                        + usize::from(*expanded) * brief.as_ref().map_or(0, |b| b.len())
+                        + usize::from(*expanded) * handoff.as_ref().map_or(0, |b| b.len())
                 }
                 HistoryEntry::InferenceError {
                     summary,
@@ -3663,8 +3676,8 @@ fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
         }
         HistoryEntry::BackupWarning { .. } | HistoryEntry::InferenceWarning { .. } => 1,
         HistoryEntry::CompactBoundary {
-            brief, expanded, ..
-        } => compact_boundary_row_estimate(brief.as_deref(), *expanded),
+            handoff, expanded, ..
+        } => compact_boundary_row_estimate(handoff.as_deref(), *expanded),
         HistoryEntry::ToolLine { .. } => 1,
         HistoryEntry::LocalCommand { output, .. } => {
             (output.lines().count() as u16).saturating_add(1)
@@ -3925,10 +3938,12 @@ pub(super) fn diff_row_estimate(old: &str, new: &str) -> u16 {
     old_lines.saturating_add(new_lines).saturating_add(1) // +1 for header
 }
 
-fn compact_boundary_row_estimate(brief: Option<&str>, expanded: bool) -> u16 {
-    let body = brief.map(str::trim).filter(|s| !s.is_empty());
+fn compact_boundary_row_estimate(handoff: Option<&str>, expanded: bool) -> u16 {
+    let body = handoff.map(str::trim).filter(|s| !s.is_empty());
     if expanded {
-        1u16.saturating_add(body.map_or(0, |brief| brief.lines().count() as u16))
+        // One compact call row, five stats/input rows, then the ordinary
+        // tool-result viewport (capped at 20 rows).
+        6u16.saturating_add(body.map_or(0, |text| text.lines().count().min(20) as u16))
     } else {
         1
     }
@@ -4331,8 +4346,16 @@ mod render_history_spacing_tests {
             predecessor_short_id: "abc123".to_string(),
             seed_tool_count: 1,
             seed_tool_tokens: 0,
-            brief: Some(brief.to_string()),
+            source: "manual".to_string(),
+            trigger_ctx_pct: None,
+            tokens_before: 100,
+            tokens_after: 50,
+            turns_summarized: 1,
+            tail_kept: 0,
+            tail_trimmed: 0,
+            handoff: Some(brief.to_string()),
             expanded: false,
+            result_offset: 0,
         }
     }
 
@@ -5185,49 +5208,49 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn compact_boundary_chip_click_expands_and_collapses_brief() {
+    fn compact_tool_call_click_expands_and_collapses_handoff() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.use_emojis = false;
         app.history = vec![compact_boundary("handoff line")];
 
-        render_history(&mut app, 80, 6);
-        let chip_row = find_row(&app, "[compacted]");
+        render_history(&mut app, 80, 20);
+        let call_row = find_row(&app, "compact:");
         assert!(
             !nonblank_rows(&app)
                 .iter()
                 .any(|(_, row)| row.contains("handoff line")),
-            "brief starts collapsed"
+            "handoff starts collapsed"
         );
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 1,
-            row: chip_row as u16,
+            row: call_row as u16,
             modifiers: KeyModifiers::empty(),
         });
-        render_history(&mut app, 80, 6);
+        render_history(&mut app, 80, 20);
         assert!(
             nonblank_rows(&app)
                 .iter()
                 .any(|(_, row)| row.contains("handoff line")),
-            "chip click expands the compact brief"
+            "tool-call click expands the compact handoff"
         );
 
-        let chip_row = find_row(&app, "[compacted]");
+        let call_row = find_row(&app, "compact:");
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 1,
-            row: chip_row as u16,
+            row: call_row as u16,
             modifiers: KeyModifiers::empty(),
         });
-        render_history(&mut app, 80, 6);
+        render_history(&mut app, 80, 20);
         assert!(
             !nonblank_rows(&app)
                 .iter()
                 .any(|(_, row)| row.contains("handoff line")),
-            "second chip click collapses the compact brief"
+            "second tool-call click collapses the compact handoff"
         );
     }
 
@@ -5574,7 +5597,7 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn selection_copy_and_highlight_skip_collapsed_compact_chip() {
+    fn selection_copy_skips_collapsed_compact_handoff() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
@@ -5593,25 +5616,12 @@ mod render_history_spacing_tests {
             active: false,
         });
 
-        let buffer = render_history_buffer(&mut app, 80, 24);
-        let chip_row = app
-            .chat_row_meta
-            .iter()
-            .position(|meta| meta.row_kind == ChatRowKind::Chip)
-            .expect("reasoning chip row");
+        let _buffer = render_history_buffer(&mut app, 80, 24);
         let copied = extract_full_selection(&app, 80, 24);
 
         assert!(copied.contains("before chip"));
         assert!(copied.contains("after chip"));
-        assert!(!copied.contains("[compacted]"));
         assert!(!copied.contains("hidden brief"));
-        assert!(
-            (0..80).all(|col| !buffer[(col, chip_row as u16)]
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)),
-            "chip row should not be highlighted"
-        );
     }
 
     #[test]

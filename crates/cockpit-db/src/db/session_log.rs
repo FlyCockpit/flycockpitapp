@@ -212,6 +212,54 @@ pub fn now_ms() -> i64 {
 }
 
 impl Db {
+    pub fn store_compaction_payload(
+        &self,
+        handoff_id: Uuid,
+        session_id: Uuid,
+        payload_json: &str,
+    ) -> Result<()> {
+        let payload_json = payload_json.to_string();
+        self.write_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO compaction_handoffs (handoff_id, session_id, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    handoff_id.to_string(),
+                    session_id.to_string(),
+                    payload_json,
+                    now_ms(),
+                ],
+            )
+            .context("storing compaction payload")?;
+            Ok(())
+        })
+    }
+
+    pub fn compaction_payload_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        handoff_id: &str,
+    ) -> Result<Option<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM compaction_handoffs
+                  WHERE handoff_id = ?1 AND session_id = ?2",
+            )
+            .context("preparing compaction payload lookup")?;
+        let mut rows = stmt
+            .query(params![handoff_id, session_id.to_string()])
+            .context("querying compaction payload")?;
+        rows.next()
+            .context("reading compaction payload")?
+            .map(|row| row.get(0))
+            .transpose()
+            .context("decoding compaction payload")
+    }
+
+    pub fn compaction_payload(&self, session_id: Uuid, handoff_id: &str) -> Result<Option<String>> {
+        self.read_blocking(|conn| Self::compaction_payload_conn(conn, session_id, handoff_id))
+    }
+
     /// Store the full assembled (post-redaction) request body for one
     /// inference call with its lifecycle `status`. `call_id` must match the
     /// `inference_calls` row's `call_id` so the export can join usage onto the
@@ -352,7 +400,9 @@ impl Db {
         for r in rows {
             raw.push(r.context("reading session_event row")?);
         }
-        decode_event_rows(raw)
+        let mut events = decode_event_rows(raw)?;
+        hydrate_compaction_payloads_conn(conn, session_id, &mut events)?;
+        Ok(events)
     }
 
     pub fn list_session_events_since_conn(
@@ -375,7 +425,9 @@ impl Db {
         for r in rows {
             raw.push(r.context("reading session_event row")?);
         }
-        decode_event_rows(raw)
+        let mut events = decode_event_rows(raw)?;
+        hydrate_compaction_payloads_conn(conn, session_id, &mut events)?;
+        Ok(events)
     }
 
     pub fn read_session_messages(
@@ -399,12 +451,23 @@ impl Db {
         let fetch_limit = i64::from(limit) + 1;
         let mut stmt = conn
             .prepare(
-                "SELECT seq, ts_ms, type, json_extract(data_json, '$.text') AS text
-                   FROM session_events
-                  WHERE session_id = ?1
-                    AND type IN ('user_message', 'assistant_message')
-                    AND (?2 IS NULL OR seq < ?3)
-                  ORDER BY seq DESC
+                "SELECT e.seq, e.ts_ms, e.type,
+                        CASE WHEN e.type = 'session_compacted' THEN
+                          COALESCE(
+                            json_extract(e.data_json, '$.handoff_text'),
+                            json_extract(h.payload_json, '$.handoff_text'),
+                            json_extract(e.data_json, '$.brief_text'),
+                            json_extract(h.payload_json, '$.brief_text')
+                          )
+                        ELSE json_extract(e.data_json, '$.text') END AS text
+                   FROM session_events e
+                   LEFT JOIN compaction_handoffs h
+                     ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
+                    AND h.session_id = e.session_id
+                  WHERE e.session_id = ?1
+                    AND e.type IN ('user_message', 'assistant_message', 'session_compacted')
+                    AND (?2 IS NULL OR e.seq < ?3)
+                  ORDER BY e.seq DESC
                   LIMIT ?4",
             )
             .context("preparing read_session_messages")?;
@@ -506,6 +569,32 @@ fn decode_event_rows(rows: Vec<RawSessionEventRow>) -> Result<Vec<SessionEventRo
         }
     }
     Ok(out)
+}
+
+fn hydrate_compaction_payloads_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    events: &mut [SessionEventRow],
+) -> Result<()> {
+    for event in events {
+        if event.kind != SessionEventKind::SessionCompacted.as_str() {
+            continue;
+        }
+        let Some(reference) = event.data.get("handoff_ref").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(payload) = Db::compaction_payload_conn(conn, session_id, reference)? else {
+            continue;
+        };
+        let data: Value =
+            serde_json::from_str(&payload).context("deserializing stored compaction payload")?;
+        anyhow::ensure!(
+            data.is_object(),
+            "stored compaction payload must be an object"
+        );
+        event.data = data;
+    }
+    Ok(())
 }
 
 fn decode_event_row(row: RawSessionEventRow) -> Result<SessionEventRow> {

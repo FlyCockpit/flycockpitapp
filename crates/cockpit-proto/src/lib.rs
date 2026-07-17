@@ -814,8 +814,25 @@ pub enum HistoryEntry {
         predecessor_short_id: String,
         seed_tool_count: usize,
         seed_tool_tokens: u64,
+        #[serde(default)]
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_ctx_pct: Option<f64>,
+        #[serde(default)]
+        tokens_before: u64,
+        #[serde(default)]
+        tokens_after: u64,
+        #[serde(default)]
+        turns_summarized: usize,
+        #[serde(default)]
+        tail_kept: usize,
+        #[serde(default)]
+        tail_trimmed: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brief: Option<String>,
+        /// Exact handoff (brief + deterministic appendix) installed on wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<String>,
     },
     Subagent {
         /// `session_events.seq` of this subagent-spawn timeline row.

@@ -584,7 +584,10 @@ impl App {
                     HistoryEntry::User {
                         cleaned: Some(_),
                         ..
-                    } | HistoryEntry::CompactBoundary { brief: Some(_), .. }
+                    } | HistoryEntry::CompactBoundary {
+                        handoff: Some(_),
+                        ..
+                    }
                 )
             })
         {

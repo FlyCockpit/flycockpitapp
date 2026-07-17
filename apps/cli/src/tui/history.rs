@@ -279,10 +279,18 @@ pub enum HistoryEntry {
         /// Approx wire tokens the seed-tools + brief cost on the first
         /// turn. Shown only when it reads cleanly (non-zero).
         seed_tool_tokens: u64,
-        /// Model-drafted handoff brief shown by the `[compacted]` chip.
-        brief: Option<String>,
-        /// Click-expanded: show `brief` inline below the boundary.
+        source: String,
+        trigger_ctx_pct: Option<f64>,
+        tokens_before: u64,
+        tokens_after: u64,
+        turns_summarized: usize,
+        tail_kept: usize,
+        tail_trimmed: usize,
+        /// Exact handoff installed on the model wire.
+        handoff: Option<String>,
+        /// Click-expanded through the ordinary tool-call affordance.
         expanded: bool,
+        result_offset: usize,
     },
 }
 
@@ -916,14 +924,28 @@ pub fn export_transcript(history: &[HistoryEntry]) -> serde_json::Value {
                 predecessor_short_id,
                 seed_tool_count,
                 seed_tool_tokens,
-                brief,
+                source,
+                trigger_ctx_pct,
+                tokens_before,
+                tokens_after,
+                turns_summarized,
+                tail_kept,
+                tail_trimmed,
+                handoff,
                 ..
             } => serde_json::json!({
                 "type": "compact_boundary",
                 "predecessor_short_id": predecessor_short_id,
                 "seed_tool_count": seed_tool_count,
                 "seed_tool_tokens": seed_tool_tokens,
-                "brief": brief,
+                "source": source,
+                "trigger_ctx_pct": trigger_ctx_pct,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "turns_summarized": turns_summarized,
+                "tail_kept": tail_kept,
+                "tail_trimmed": tail_trimmed,
+                "handoff": handoff,
             }),
         })
         .collect();
@@ -1250,31 +1272,38 @@ pub fn render_entry(
             predecessor_short_id,
             seed_tool_count,
             seed_tool_tokens,
-            brief,
+            source,
+            trigger_ctx_pct,
+            tokens_before,
+            tokens_after,
+            turns_summarized,
+            tail_kept,
+            tail_trimmed,
+            handoff,
             expanded,
-        } => {
-            let lines = render_compact_boundary(
+            result_offset,
+        } => render_toolbox(
+            &[compact_tool_call(
                 predecessor_short_id,
                 *seed_tool_count,
                 *seed_tool_tokens,
-                brief.as_deref(),
+                source,
+                *trigger_ctx_pct,
+                *tokens_before,
+                *tokens_after,
+                *turns_summarized,
+                *tail_kept,
+                *tail_trimmed,
+                handoff.as_deref(),
                 *expanded,
-                width,
-            );
-            let continuations = vec![false; lines.len()];
-            Rendered {
-                lines,
-                chip_row: brief
-                    .as_deref()
-                    .is_some_and(|brief| !brief.trim().is_empty())
-                    .then_some(0),
-                continuations,
-                tool_call_rows: Vec::new(),
-                tool_result_scroll_regions: Vec::new(),
-                reasoning_scroll_region: None,
-                pin_region: None,
-            }
-        }
+                *result_offset,
+            )],
+            0,
+            true,
+            width,
+            emojis,
+            elided,
+        ),
         HistoryEntry::Agent {
             name,
             text,
@@ -2956,79 +2985,47 @@ fn render_toolbox(
     }
 }
 
-/// Render a [`HistoryEntry::CompactBoundary`]: a single muted rule at the
-/// top of a `/compact`-created session, framed by horizontal lines so it
-/// reads as a divider. Theme-driven (the [`MUTED_COLOR_INDEX`] grey the
-/// rest of the chrome uses for secondary text); degrades to a bare label
-/// on a terminal too narrow to fit the rules.
-fn render_compact_boundary(
+/// Project the daemon-owned compaction record into the ordinary tool-call
+/// renderer. The handoff stays a user message on the model wire; this is
+/// presentation-only synthetic tool chrome.
+#[allow(clippy::too_many_arguments)]
+fn compact_tool_call(
     predecessor_short_id: &str,
     seed_tool_count: usize,
     seed_tool_tokens: u64,
-    brief: Option<&str>,
+    source: &str,
+    trigger_ctx_pct: Option<f64>,
+    tokens_before: u64,
+    tokens_after: u64,
+    turns_summarized: usize,
+    tail_kept: usize,
+    tail_trimmed: usize,
+    handoff: Option<&str>,
     expanded: bool,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let brief = brief.map(str::trim).filter(|s| !s.is_empty());
-    // Build the label; include the seed-tool token cost only when it
-    // reads cleanly (non-zero) — otherwise just note the re-run.
-    let mut label = format!("compacted from {predecessor_short_id}");
-    if seed_tool_count > 0 {
-        let cost = if seed_tool_tokens > 0 {
-            format!(" · {seed_tool_tokens} tok")
-        } else {
-            String::new()
-        };
-        let plural = if seed_tool_count == 1 { "" } else { "s" };
-        label.push_str(&format!(
-            " · {seed_tool_count} seed-tool{plural} re-run{cost}"
-        ));
-    } else {
-        label.push_str(" · seed-tools re-run");
+    result_offset: usize,
+) -> ToolCall {
+    let ctx = trigger_ctx_pct
+        .map(|pct| format!(" · ctx {pct:.1}%"))
+        .unwrap_or_default();
+    let summary = format!("source={source}{ctx} · from {predecessor_short_id}");
+    let full_input = format!(
+        "source={source}{ctx}\n\
+         tokens={tokens_before}→{tokens_after}\n\
+         turns summarized={turns_summarized}\n\
+         tail kept={tail_kept}, trimmed={tail_trimmed}\n\
+         seed tools={seed_tool_count} (~{seed_tool_tokens} tokens)"
+    );
+    ToolCall {
+        call_id: format!("compact-{predecessor_short_id}"),
+        tool: "compact".to_string(),
+        summary,
+        full_input,
+        output: handoff.unwrap_or("").to_string(),
+        expanded,
+        result_offset,
+        state: ToolCallState::Success,
+        hint: None,
     }
-    let chip = brief.map(|_| "[compacted]");
-
-    let area = width as usize;
-    let chip_w = chip.map(str::width).unwrap_or(0);
-    let chip_gap = if chip.is_some() { 1 } else { 0 };
-    let label_w = label.width() + chip_gap + chip_w;
-    // ` ── <label> ── ` — two rule chars + a space on each side of the
-    // label. Fall back to the bare label when the terminal is too narrow
-    // to fit even a single rule cell on each side.
-    let frame = 2 * (1 + 2); // " ── " on the left + " ── " on the right
-    let mut out = Vec::new();
-    if area <= label_w + frame {
-        let mut spans = vec![Span::styled(label, muted)];
-        if let Some(chip) = chip {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(chip.to_string(), muted));
-        }
-        out.push(Line::from(spans));
-    } else {
-        let total_rule = area - label_w - 2; // minus the two flanking spaces
-        let left = total_rule / 2;
-        let right = total_rule - left;
-        let mut spans = vec![
-            Span::styled("─".repeat(left), muted),
-            Span::styled(format!(" {label} "), muted),
-        ];
-        if let Some(chip) = chip {
-            spans.push(Span::styled(chip.to_string(), muted));
-            spans.push(Span::styled(" ".to_string(), muted));
-        }
-        spans.push(Span::styled("─".repeat(right), muted));
-        out.push(Line::from(spans));
-    }
-    if expanded && let Some(brief) = brief {
-        for line in brief.lines() {
-            out.push(Line::from(vec![
-                Span::styled("  │ ".to_string(), muted),
-                Span::styled(line.to_string(), muted),
-            ]));
-        }
-    }
-    out
 }
 
 /// Build a one-line span vec with an HH:MM timestamp right-aligned inside
@@ -4992,82 +4989,49 @@ mod tests {
         );
     }
 
-    // ── compaction boundary ────────────────────────────────────────────
-
-    /// A `/compact`-created session renders a muted boundary marker citing
-    /// the predecessor short-id + seed-tool cost. Drives the renderer with
-    /// a SYNTHETIC compacted-from predecessor.
-    #[test]
-    fn compact_boundary_marker_is_produced_and_muted() {
-        let lines = render_compact_boundary("ab12cd", 3, 1500, Some("brief"), false, 80);
-        assert_eq!(lines.len(), 1);
-        let text = line_text(&lines[0]);
-        assert!(text.contains("compacted from ab12cd"));
-        assert!(text.contains("3 seed-tool"));
-        assert!(text.contains("1500 tok"));
-        assert!(text.contains("[compacted]"));
-        // The whole marker is in the theme muted style.
-        assert!(any_muted(&lines[0]), "boundary marker must be muted");
-        // Framed as a rule.
-        assert!(text.contains('─'));
-    }
-
-    #[test]
-    fn compact_boundary_chip_omitted_without_brief() {
-        let lines = render_compact_boundary("ab12cd", 1, 0, None, false, 80);
-        let text = line_text(&lines[0]);
-        assert!(text.contains("compacted from ab12cd"));
-        assert!(!text.contains("[compacted]"));
-    }
-
-    #[test]
-    fn compact_boundary_expanded_renders_brief_as_muted_quote() {
-        let lines = render_compact_boundary(
-            "ab12cd",
-            1,
-            0,
-            Some("handoff line one\nhandoff line two"),
-            true,
-            80,
-        );
-        assert_eq!(lines.len(), 3);
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("[compacted]"));
-        assert!(text.contains("  │ handoff line one"));
-        assert!(text.contains("  │ handoff line two"));
-        assert!(lines.iter().all(any_muted));
-    }
-
-    #[test]
-    fn compact_boundary_collapsed_hides_brief_body() {
-        let lines = render_compact_boundary("ab12cd", 1, 0, Some("hidden handoff body"), false, 80);
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("[compacted]"));
-        assert!(!text.contains("hidden handoff body"));
-    }
-
-    /// Narrow terminal → degrades to the bare label, no panic, still muted.
-    #[test]
-    fn compact_boundary_degrades_on_narrow_terminal() {
-        let lines = render_compact_boundary("ab12cd", 0, 0, None, false, 4);
-        assert_eq!(lines.len(), 1);
-        assert!(line_text(&lines[0]).contains("compacted from ab12cd"));
-        assert!(any_muted(&lines[0]));
-    }
-
-    /// The full `render_entry` dispatch produces the marker for a
-    /// `CompactBoundary` entry (the path the chat pane actually drives).
-    #[test]
-    fn render_entry_dispatches_compact_boundary() {
-        let entry = HistoryEntry::CompactBoundary {
+    fn compact_entry(source: &str, expanded: bool) -> HistoryEntry {
+        HistoryEntry::CompactBoundary {
             predecessor_short_id: "deadbe".into(),
-            seed_tool_count: 1,
-            seed_tool_tokens: 0,
-            brief: Some("handoff".into()),
-            expanded: false,
-        };
-        let r = render_entry(
-            &entry,
+            seed_tool_count: 2,
+            seed_tool_tokens: 12,
+            source: source.into(),
+            trigger_ctx_pct: Some(61.5),
+            tokens_before: 6_000,
+            tokens_after: 2_000,
+            turns_summarized: 8,
+            tail_kept: 4,
+            tail_trimmed: 1,
+            handoff: Some("## Decisions\nkeep the exact handoff".into()),
+            expanded,
+            result_offset: 0,
+        }
+    }
+
+    #[test]
+    fn compaction_renders_as_tool_call() {
+        for source in ["auto", "manual", "agent_requested"] {
+            let rendered = render_entry(
+                &compact_entry(source, false),
+                80,
+                ThinkingDisplay::Condensed,
+                MarkdownOpts::default(),
+                crate::config::extended::DiffStyle::default(),
+                false,
+                &no_elided(),
+                0,
+                None,
+            );
+            let text = rendered.lines.iter().map(line_text).collect::<String>();
+            assert!(text.contains("compact:"), "{text}");
+            assert!(text.contains(&format!("source={source}")), "{text}");
+            assert_eq!(rendered.tool_call_rows, vec![Some(0)]);
+        }
+    }
+
+    #[test]
+    fn compaction_expand_shows_handoff() {
+        let rendered = render_entry(
+            &compact_entry("manual", true),
             80,
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
@@ -5077,9 +5041,16 @@ mod tests {
             0,
             None,
         );
-        let text = line_text(&r.lines[0]);
-        assert!(text.contains("compacted from deadbe"));
-        assert_eq!(r.chip_row, Some(0));
+        let text = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("tokens=6000→2000"), "{text}");
+        assert!(text.contains("tail kept=4, trimmed=1"), "{text}");
+        assert!(text.contains("keep the exact handoff"), "{text}");
+        assert!(rendered.tool_call_rows.iter().all(|row| *row == Some(0)));
     }
 
     /// The backup-fallback notice (implementation note)

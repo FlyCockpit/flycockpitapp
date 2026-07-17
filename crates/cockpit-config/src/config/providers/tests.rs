@@ -403,15 +403,24 @@ fn cache_ttl_selects_one_hour_mode_at_or_above_3600() {
 }
 
 #[test]
-fn context_defaults_are_80_50_30() {
+fn context_defaults_are_60_4_50_30() {
     let c = ContextConfig::default();
-    assert_eq!(c.auto_compact_pct, 80);
+    assert_eq!(c.auto_compact_pct, 60);
+    assert_eq!(c.compact_keep_recent_turns, 4);
     assert_eq!(c.auto_prune_pct, 50);
     assert_eq!(c.auto_prune_prunable_pct, 30);
     // Older configs (no `context` key) load with the defaults.
     let entry = ProviderEntry::default();
     assert_eq!(entry.context, ContextConfig::default());
     assert!(entry.mode.is_none());
+    let legacy: ContextConfig = serde_json::from_value(serde_json::json!({
+        "auto_compact_pct": 77,
+        "auto_prune_pct": 44,
+        "auto_prune_prunable_pct": 22
+    }))
+    .unwrap();
+    assert_eq!(legacy.auto_compact_pct, 77);
+    assert_eq!(legacy.compact_keep_recent_turns, 4);
 }
 
 #[test]
@@ -421,6 +430,7 @@ fn resolve_context_prefers_model_then_provider_then_default() {
         url: "https://x".into(),
         context: ContextConfig {
             auto_compact_pct: 90,
+            compact_keep_recent_turns: 2,
             auto_prune_pct: 60,
             auto_prune_prunable_pct: 40,
         },
@@ -429,6 +439,7 @@ fn resolve_context_prefers_model_then_provider_then_default() {
     let mut pinned = model("pinned", false);
     pinned.context = Some(ContextConfig {
         auto_compact_pct: 70,
+        compact_keep_recent_turns: 1,
         auto_prune_pct: 55,
         auto_prune_prunable_pct: 25,
     });

@@ -984,6 +984,7 @@ fn merge_preserves_model_override_fields_on_matching_fetched_id() {
     });
     existing.context = Some(ContextConfig {
         auto_compact_pct: 70,
+        compact_keep_recent_turns: 3,
         auto_prune_pct: 45,
         auto_prune_prunable_pct: 20,
     });

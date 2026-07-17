@@ -478,6 +478,14 @@ pub struct FetchModelsArgs {
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     List,
+    /// Show a session's durable compaction handoffs and summary statistics.
+    Show {
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Emit one JSON document instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
     Delete {
         #[arg(value_name = "SESSION_ID")]
         session_id: String,
@@ -1188,6 +1196,21 @@ mod tests {
         let args = parse_answer(&["--choice", "yes", "--json"]);
         assert_eq!(args.choice.as_deref(), Some("yes"));
         assert!(args.json);
+    }
+
+    #[test]
+    fn session_show_json_parses() {
+        let session = uuid::Uuid::new_v4().to_string();
+        match Cli::try_parse_from(["cockpit", "session", "show", &session, "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Session(SessionCommand::Show { session_id, json })) => {
+                assert_eq!(session_id, session);
+                assert!(json);
+            }
+            other => panic!("expected session show command, got {other:?}"),
+        }
     }
 
     #[test]

@@ -81,6 +81,9 @@ pub enum Command {
     #[command(subcommand, alias = "auth")]
     Providers(ProvidersCommand),
 
+    /// Run an interactive setup wizard.
+    Setup(SetupArgs),
+
     /// List locally configured provider models; does not fetch from the network.
     Models(ModelsArgs),
 
@@ -398,6 +401,13 @@ pub struct ProvidersUsageArgs {
     /// Provider id to probe. Omit to probe every configured provider.
     #[arg(long, value_name = "ID")]
     pub provider: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SetupArgs {
+    /// Wizard id to run. Omit to choose from the registered wizard menu.
+    #[arg(value_name = "WIZARD")]
+    pub wizard: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

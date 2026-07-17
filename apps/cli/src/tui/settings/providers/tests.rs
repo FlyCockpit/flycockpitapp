@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::providers::ProvidersConfig;
+use crate::config::providers::{AuthKind, ProvidersConfig};
 use crate::config::providers::{ConfigDoc, ProviderEntry};
 use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 use std::collections::BTreeMap;
@@ -1525,7 +1525,7 @@ fn codex_copy_keys_are_ssh_aware() {
 #[test]
 fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let mut state = AddState::new();
-    state.step = AddStep::OAuthAuth(Box::new(OAuthFlowState::new(OAuthProvider::Grok)));
+    state.enter_oauth_for_test(OAuthFlowState::new(OAuthProvider::Grok));
     let mut page = ProvidersPage::Add(state);
 
     assert!(page.active_text_field().is_none());
@@ -1533,9 +1533,7 @@ fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let ProvidersPage::Add(add) = &mut page else {
         unreachable!();
     };
-    let AddStep::OAuthAuth(grok) = &mut add.step else {
-        unreachable!();
-    };
+    let grok = add.oauth_auth.as_mut().expect("expected OAuth add step");
     grok.paste_focused = true;
 
     let field = page
@@ -1546,9 +1544,7 @@ fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let ProvidersPage::Add(add) = &page else {
         unreachable!();
     };
-    let AddStep::OAuthAuth(grok) = &add.step else {
-        unreachable!();
-    };
+    let grok = add.oauth_auth.as_ref().expect("expected OAuth add step");
     assert_eq!(grok.manual_input.text(), "callback-code");
 }
 
@@ -1692,26 +1688,30 @@ async fn logged_in_oauth_enter_advances_add_wizard() {
         state.template = Some(template);
         state.id_field.set(template_id);
         state.url_field.set(template.url);
-        state.step = match template_id {
+        let oauth = match template_id {
             "codex-oauth" => {
                 let mut oauth = OAuthFlowState::new(OAuthProvider::Codex);
                 oauth.logged_in = true;
                 oauth.cursor = 0;
-                AddStep::OAuthAuth(Box::new(oauth))
+                oauth
             }
             "grok-oauth" => {
                 let mut oauth = OAuthFlowState::new(OAuthProvider::Grok);
                 oauth.logged_in = true;
                 oauth.cursor = 0;
-                AddStep::OAuthAuth(Box::new(oauth))
+                oauth
             }
             _ => unreachable!(),
         };
+        state.enter_oauth_for_test(oauth);
 
         dialog.handle_add_key(press(KeyCode::Enter), &mut state);
 
         assert!(
-            !matches!(state.step, AddStep::OAuthAuth(_)),
+            !matches!(
+                state.run.current_step_id(),
+                Some("grok-oauth" | "codex-oauth")
+            ),
             "{template_id} should advance past the OAuth confirmation step"
         );
     }
@@ -1732,14 +1732,12 @@ fn all_templates_offer_edit_id_step() {
     for t in templates::TEMPLATES {
         let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let mut state = AddState::new();
-        state.step = AddStep::PickTemplate {
-            cursor: template_cursor(t.id),
-        };
+        state.enter_template_for_test(template_cursor(t.id));
 
         dialog.handle_add_key(press(KeyCode::Enter), &mut state);
 
         assert!(
-            matches!(state.step, AddStep::EditId),
+            state.is_step("id"),
             "{} should land on the EditId step",
             t.id
         );
@@ -1764,21 +1762,16 @@ fn second_first_party_connection_under_custom_id_works() {
         ..Default::default()
     });
     let mut state = AddState::new();
-    state.step = AddStep::PickTemplate {
-        cursor: template_cursor("anthropic"),
-    };
+    state.enter_template_for_test(template_cursor("anthropic"));
 
     // Pick the template — lands on EditId with the default `anthropic` id.
     dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-    assert!(matches!(state.step, AddStep::EditId));
+    assert!(state.is_step("id"));
     assert_eq!(state.id_field.text(), "anthropic");
 
     // The default id collides with the existing provider.
     dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-    assert!(
-        matches!(state.step, AddStep::EditId),
-        "collision keeps EditId"
-    );
+    assert!(state.is_step("id"), "collision keeps EditId");
     assert!(
         state
             .error
@@ -1793,7 +1786,7 @@ fn second_first_party_connection_under_custom_id_works() {
     state.id_field.set("anthropic-work");
     dialog.handle_add_key(press(KeyCode::Enter), &mut state);
     assert!(
-        matches!(state.step, AddStep::EditUrl),
+        state.is_step("url"),
         "unique renamed id advances the wizard"
     );
     assert!(state.error.is_none(), "{:?}", state.error);

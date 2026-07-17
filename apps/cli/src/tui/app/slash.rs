@@ -627,6 +627,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "setup",
+        description: "Open setup wizards (arg: wizard id; bare lists registered wizards)",
+        takes_args: true,
+        run: run_setup,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "side",
         description: "Start a throwaway side conversation forked from here (`/side end` to discard)",
         takes_args: false,
@@ -749,6 +757,19 @@ fn run_git(app: &mut App, args: &str) -> bool {
 
 fn run_settings(app: &mut App, _: &str) -> bool {
     app.dialog = Dialog::open(&app.launch.cwd);
+    false
+}
+
+fn run_setup(app: &mut App, args: &str) -> bool {
+    let wizard_id = args.trim();
+    if wizard_id.is_empty() {
+        app.dialog = Dialog::open_setup(&app.launch.cwd);
+        return false;
+    }
+    match Dialog::open_setup_wizard(&app.launch.cwd, wizard_id) {
+        Ok(dialog) => app.dialog = dialog,
+        Err(error) => app.push_plain(format!("/setup: {error}")),
+    }
     false
 }
 
@@ -2341,6 +2362,27 @@ pub(super) fn resolve_skill_dispatch(args: &str, names: &[&str]) -> SkillDispatc
 mod table_tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn setup_slash_opens_wizard_menu_and_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).expect("create .cockpit");
+        std::fs::write(cockpit_dir.join("config.json"), "{}").expect("write config");
+        let cmd = *slash_command_by_name("setup").expect("/setup registry row");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.dialog = Dialog::None;
+
+        app.composer.set("/setup".to_string());
+        app.execute_slash(cmd);
+        assert_eq!(app.dialog.test_page_name(), Some("wizard_menu"));
+
+        app.dialog = Dialog::None;
+        app.composer.set("/setup provider".to_string());
+        app.execute_slash(cmd);
+        assert_eq!(app.dialog.test_page_name(), Some("Providers"));
+        assert_eq!(app.dialog.test_provider_surface(), Some("other"));
+    }
 
     #[test]
     fn learn_slash_is_registered_as_arg_taking_normal_turn() {

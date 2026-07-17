@@ -5,7 +5,7 @@
 //! machine. Owns:
 //!   - the [`ProvidersPage`] state enum (List, Add wizard, Edit page,
 //!     Headers sub-page, FetchAll, CopilotSetup)
-//!   - per-page state types (`AddState` + `AddStep`, `EditState` +
+//!   - per-page state types (`AddState` + descriptor-backed [`WizardRun`], `EditState` +
 //!     `EditField`, `HeaderEditor` + modes, `FetchAllState`,
 //!     `CopilotSetupState`)
 //!   - the corresponding handlers + renderers on [`SettingsDialog`]
@@ -51,8 +51,8 @@ use crate::auth::{
     xai_oauth,
 };
 use crate::config::providers::{
-    AuthKind, HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy,
-    OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
+    HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy, OnUnlistedModelsFetch,
+    ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
     merge_fetched_models_with_policy, provider_model_fetch_display_state,
     provider_model_fetch_reason_display, redact_model_fetch_reason,
 };
@@ -61,6 +61,7 @@ use crate::providers::models_fetch::FetchOutcome;
 use crate::providers::{self as templates, ProviderTemplate};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::wizard::{WizardAnswer, WizardRun};
 
 pub(super) use row_editor::{
     HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
@@ -479,11 +480,16 @@ pub(super) enum ProvidersPage {
 impl ProvidersPage {
     pub(super) fn paste_oauth(&mut self, text: &str) -> bool {
         let state = match self {
-            Self::OAuthSetup { state, .. }
-            | Self::Add(AddState {
-                step: AddStep::OAuthAuth(state),
-                ..
-            }) if state.has_browser_session() => state,
+            Self::OAuthSetup { state, .. } if state.has_browser_session() => state,
+            Self::Add(state)
+                if state.is_step("grok-oauth")
+                    && state
+                        .oauth_auth
+                        .as_ref()
+                        .is_some_and(|oauth| oauth.has_browser_session()) =>
+            {
+                state.oauth_auth.as_mut().expect("guarded OAuth state")
+            }
             _ => return false,
         };
         state.paste_focused = true;
@@ -589,16 +595,15 @@ impl ProvidersPage {
             ProvidersPage::OAuthSetup { state, .. } => {
                 state.paste_focused.then_some(&mut state.manual_input)
             }
-            ProvidersPage::Add(s) => match &mut s.step {
-                AddStep::EditId => Some(&mut s.id_field),
-                AddStep::EditUrl => Some(&mut s.url_field),
-                AddStep::EditHeaders => s.headers.active_text_field(),
-                AddStep::OAuthAuth(state) => state.paste_focused.then_some(&mut state.manual_input),
-                AddStep::PickTemplate { .. }
-                | AddStep::CopilotAuth(_)
-                | AddStep::Saving
-                | AddStep::Fetching
-                | AddStep::Done => None,
+            ProvidersPage::Add(s) => match s.run.current_step_id() {
+                Some("id") => Some(&mut s.id_field),
+                Some("url") => Some(&mut s.url_field),
+                Some("headers") => s.headers.active_text_field(),
+                Some("grok-oauth" | "codex-oauth") => s
+                    .oauth_auth
+                    .as_mut()
+                    .and_then(|state| state.paste_focused.then_some(&mut state.manual_input)),
+                _ => None,
             },
             ProvidersPage::Edit(s) => s.editing_field.is_some().then_some(&mut s.field_buf),
             ProvidersPage::Headers { editor, .. } => editor.active_text_field(),
@@ -690,7 +695,8 @@ fn copy_oauth_url_with(
 }
 
 pub(super) struct AddState {
-    pub(super) step: AddStep,
+    pub(super) run: WizardRun,
+    pub(super) template_cursor: usize,
     pub(super) template: Option<&'static ProviderTemplate>,
     pub(super) id_field: TextField,
     pub(super) url_field: TextField,
@@ -698,32 +704,8 @@ pub(super) struct AddState {
     pub(super) error: Option<String>,
     pub(super) fetch: Option<FetchHandle>,
     pub(super) saved_provider_id: Option<String>,
-}
-
-pub(super) enum AddStep {
-    /// Pick from `templates::TEMPLATES`. The user spec says
-    /// `openai-compatible` is the first/default choice.
-    PickTemplate { cursor: usize },
-    /// Set the provider id (config-map key). Pre-filled from template.
-    EditId,
-    /// Set the base URL.
-    EditUrl,
-    /// Add/remove HTTP headers (`Authorization: Bearer $TOKEN`, etc.).
-    EditHeaders,
-    /// GitHub Copilot's auth-setup step — surfaces the "append
-    /// `export GH_TOKEN=$(gh auth token)` to your shell rc" action (or
-    /// the manual-instructions fallback) before saving. Replaces the
-    /// EditHeaders step for the Copilot template; the canonical
-    /// Authorization header is fixed by the template anyway.
-    CopilotAuth(CopilotSetupState),
-    /// Shared OAuth setup step for provider templates that need browser or device auth.
-    OAuthAuth(Box<OAuthFlowState>),
-    /// Saving config + kicking off /models fetch.
-    Saving,
-    /// Background fetch is in flight.
-    Fetching,
-    /// Fetch finished (success or error); user must press Enter to return.
-    Done,
+    pub(super) copilot_auth: Option<CopilotSetupState>,
+    pub(super) oauth_auth: Option<Box<OAuthFlowState>>,
 }
 
 pub(super) struct EditState {
@@ -746,7 +728,9 @@ pub(super) enum EditField {
 impl AddState {
     pub(super) fn new() -> Self {
         Self {
-            step: AddStep::PickTemplate { cursor: 0 },
+            run: WizardRun::new(crate::wizard::provider_descriptor())
+                .expect("built-in provider wizard descriptor is valid"),
+            template_cursor: 0,
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
@@ -754,7 +738,29 @@ impl AddState {
             error: None,
             fetch: None,
             saved_provider_id: None,
+            copilot_auth: None,
+            oauth_auth: None,
         }
+    }
+
+    pub(super) fn is_step(&self, step: &str) -> bool {
+        self.run.current_step_id() == Some(step)
+    }
+
+    #[cfg(test)]
+    pub(super) fn enter_oauth_for_test(&mut self, state: OAuthFlowState) {
+        let step = match state.provider {
+            OAuthProvider::Grok => "grok-oauth",
+            OAuthProvider::Codex => "codex-oauth",
+        };
+        self.run.return_to(step).unwrap();
+        self.oauth_auth = Some(Box::new(state));
+    }
+
+    #[cfg(test)]
+    pub(super) fn enter_template_for_test(&mut self, cursor: usize) {
+        self.run.return_to("template").unwrap();
+        self.template_cursor = cursor;
     }
 }
 
@@ -763,54 +769,11 @@ fn provider_entry_from_add(
     template: &'static ProviderTemplate,
     headers: Vec<HeaderSpec>,
 ) -> ProviderEntry {
-    let auth =
-        if template.id == xai_oauth::CREDENTIAL_KEY || template.id == codex_oauth::CREDENTIAL_KEY {
-            Some(AuthKind::OAuth)
-        } else {
-            Some(template.auth)
-        };
-    let credential_ref = if template.id == xai_oauth::CREDENTIAL_KEY {
-        Some(xai_oauth::CREDENTIAL_KEY.to_string())
-    } else if template.id == codex_oauth::CREDENTIAL_KEY {
-        Some(codex_oauth::CREDENTIAL_KEY.to_string())
-    } else {
-        None
-    };
-    ProviderEntry {
-        name: Some(template.display.to_string()),
-        template: Some(template.id.to_string()),
-        url: s.url_field.text().trim_end_matches('/').to_string(),
+    crate::wizard::provider_entry_for_template(
+        template,
+        s.url_field.text().trim_end_matches('/').to_string(),
         headers,
-        models_fetched_at: None,
-        model_catalog: ProviderModelCatalog::Live,
-        favorite: None,
-        allow_insecure_http: false,
-        credential_ref,
-        auth,
-        trust: None,
-        location: None,
-        quality_rank: None,
-        cost_rank: None,
-        subagent_invokable: None,
-        embeddings: None,
-        availability: Default::default(),
-        cache: Default::default(),
-        shrink: Default::default(),
-        context: Default::default(),
-        auto_prune: None,
-        timeout: Default::default(),
-        wire_api: template.default_wire_api,
-        backup: None,
-        mode: None,
-        inline_think: None,
-        hint_tool_call_corrections: None,
-        text_embedded_recovery: None,
-        thinking_params: Default::default(),
-        models: vec![],
-        capabilities: Default::default(),
-        provider_metadata: Default::default(),
-        last_model_fetch: None,
-    }
+    )
 }
 
 impl EditState {
@@ -938,7 +901,9 @@ impl SettingsDialog {
                 ProvidersPage::Add(s) => {
                     s.error = Some(message);
                     s.fetch = None;
-                    s.step = AddStep::Done;
+                    if s.is_step("fetching") {
+                        let _ = s.run.submit(WizardAnswer::Acknowledged);
+                    }
                 }
                 ProvidersPage::Edit(s) => {
                     s.status = Some(message);
@@ -1176,6 +1141,8 @@ impl SettingsCx {
             Ok(()) => {
                 s.saved_provider_id = Some(id.clone());
                 let notice = self.last_secret_notice.take();
+                let _ = s.run.submit(WizardAnswer::Acknowledged);
+                let _ = s.run.submit(WizardAnswer::Acknowledged);
                 if !template.supports_models_endpoint {
                     s.error = Some(match notice {
                         Some(notice) => {
@@ -1183,14 +1150,12 @@ impl SettingsCx {
                         }
                         None => "saved. provider has no /models endpoint".into(),
                     });
-                    s.step = AddStep::Done;
                 } else {
                     s.error = Some(match notice {
                         Some(notice) => format!("saved. {notice} Fetching /models…"),
                         None => "saved. Fetching /models…".into(),
                     });
                     s.fetch = Some(FetchHandle::spawn(id, entry));
-                    s.step = AddStep::Fetching;
                 }
             }
             Err(e) => {
@@ -1201,7 +1166,9 @@ impl SettingsCx {
 
     fn handle_add_key(&mut self, key: KeyEvent, s: &mut AddState) -> Nav {
         // Back/escape unconditionally returns to the list.
-        if matches!(key.code, KeyCode::Esc) && !matches!(s.step, AddStep::OAuthAuth(_)) {
+        let oauth_step = matches!(s.run.current_step_id(), Some("grok-oauth" | "codex-oauth"));
+        if matches!(key.code, KeyCode::Esc) && !oauth_step {
+            s.run.abort();
             return Nav::Replace(super::providers_page(ProvidersPage::List {
                 cursor: initial_list_cursor(&self.config),
                 status: None,
@@ -1209,16 +1176,18 @@ impl SettingsCx {
             }));
         }
 
-        match &mut s.step {
-            AddStep::PickTemplate { cursor } => match key.code {
+        match s.run.current_step_id() {
+            Some("template") => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    *cursor = crate::tui::nav::wrap_prev(*cursor, templates::TEMPLATES.len());
+                    s.template_cursor =
+                        crate::tui::nav::wrap_prev(s.template_cursor, templates::TEMPLATES.len());
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *cursor = crate::tui::nav::wrap_next(*cursor, templates::TEMPLATES.len());
+                    s.template_cursor =
+                        crate::tui::nav::wrap_next(s.template_cursor, templates::TEMPLATES.len());
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    let t = &templates::TEMPLATES[*cursor];
+                    let t = &templates::TEMPLATES[s.template_cursor];
                     s.template = Some(t);
                     // Pre-fill id only for templates that map 1:1 to a
                     // single vendor; for `openai-compatible` the user
@@ -1234,11 +1203,13 @@ impl SettingsCx {
                         /* show_continue */ true,
                     );
                     s.error = None;
-                    s.step = AddStep::EditId;
+                    s.run
+                        .submit(WizardAnswer::Select(t.id.to_string()))
+                        .expect("provider template is a valid select answer");
                 }
                 _ => {}
             },
-            AddStep::EditId => match key.code {
+            Some("id") => match key.code {
                 KeyCode::Enter => {
                     let id = s.id_field.text().trim().to_string();
                     if id.is_empty() {
@@ -1249,36 +1220,39 @@ impl SettingsCx {
                         s.error = Some(format!("a provider with id `{id}` already exists"));
                     } else {
                         s.error = None;
-                        s.step = AddStep::EditUrl;
+                        if let Err(error) = s.run.submit(WizardAnswer::Text(id)) {
+                            s.error = Some(error);
+                        }
                     }
                 }
                 _ => {
                     s.id_field.handle_key(key);
                 }
             },
-            AddStep::EditUrl => match key.code {
+            Some("url") => match key.code {
                 KeyCode::Enter => {
                     if !valid_url(s.url_field.text()) {
                         s.error = Some("url must start with http:// or https://".into());
                     } else {
                         s.error = None;
-                        // GitHub Copilot's auth is documented env-var
-                        // tokens, not custom headers — route to the
-                        // dedicated Copilot-auth screen so the
-                        // GH_TOKEN setup button lives next to the
-                        // provider it actually configures.
-                        if matches!(s.template.map(|t| t.id), Some("copilot")) {
-                            s.step = AddStep::CopilotAuth(CopilotSetupState::new());
-                        } else if matches!(s.template.map(|t| t.id), Some("grok-oauth")) {
-                            s.step = AddStep::OAuthAuth(Box::new(OAuthFlowState::new(
-                                OAuthProvider::Grok,
-                            )));
-                        } else if matches!(s.template.map(|t| t.id), Some("codex-oauth")) {
-                            s.step = AddStep::OAuthAuth(Box::new(OAuthFlowState::new(
-                                OAuthProvider::Codex,
-                            )));
+                        let url = s.url_field.text().to_string();
+                        if let Err(error) = s.run.submit(WizardAnswer::Text(url)) {
+                            s.error = Some(error);
                         } else {
-                            s.step = AddStep::EditHeaders;
+                            match s.run.current_step_id() {
+                                Some("copilot-auth") => {
+                                    s.copilot_auth = Some(CopilotSetupState::new());
+                                }
+                                Some("grok-oauth") => {
+                                    s.oauth_auth =
+                                        Some(Box::new(OAuthFlowState::new(OAuthProvider::Grok)));
+                                }
+                                Some("codex-oauth") => {
+                                    s.oauth_auth =
+                                        Some(Box::new(OAuthFlowState::new(OAuthProvider::Codex)));
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -1286,7 +1260,7 @@ impl SettingsCx {
                     s.url_field.handle_key(key);
                 }
             },
-            AddStep::EditHeaders => {
+            Some("headers") => {
                 match s.headers.handle_key(key) {
                     // `Save` is unreachable in the Add wizard (it shows the
                     // `[continue →]` row, never `[save changes]`), but the
@@ -1294,7 +1268,7 @@ impl SettingsCx {
                     HeaderResult::Stay | HeaderResult::Save => return Nav::Stay,
                     HeaderResult::Back => {
                         s.error = None;
-                        s.step = AddStep::EditUrl;
+                        s.run.return_to("url").expect("provider URL step exists");
                         return Nav::Stay;
                     }
                     HeaderResult::Continue => {
@@ -1308,8 +1282,12 @@ impl SettingsCx {
                 let entry = provider_entry_from_add(s, template, headers);
                 self.save_and_fetch_provider(s, id, entry, template);
             }
-            AddStep::CopilotAuth(state) => match key.code {
+            Some("copilot-auth") => match key.code {
                 KeyCode::Enter => {
+                    let state = s
+                        .copilot_auth
+                        .as_mut()
+                        .expect("Copilot descriptor step initializes state");
                     if state.outcome.is_some() {
                         // Outcome already shown — Enter advances to
                         // save + fetch.
@@ -1360,34 +1338,43 @@ impl SettingsCx {
                 }
                 _ => {}
             },
-            AddStep::OAuthAuth(state) => {
-                let (close, action) = handle_oauth_flow_key(key, state);
-                self.pending_oauth_action = action;
+            Some("grok-oauth" | "codex-oauth") => {
+                let (close, should_save) = {
+                    let state = s
+                        .oauth_auth
+                        .as_mut()
+                        .expect("OAuth descriptor step initializes state");
+                    let (close, action) = handle_oauth_flow_key(key, state);
+                    self.pending_oauth_action = action;
+                    let should_save = (matches!(key.code, KeyCode::Char('s'))
+                        && !state.paste_focused)
+                        || (matches!(key.code, KeyCode::Enter)
+                            && OAuthFlowView::OAuth(state).confirming())
+                        || (matches!(key.code, KeyCode::Enter)
+                            && ((state.provider == OAuthProvider::Grok
+                                && state.cursor == 2
+                                && !state.paste_focused)
+                                || (state.provider == OAuthProvider::Codex
+                                    && state.cursor == 1
+                                    && state.device_login().is_none())));
+                    (close, should_save)
+                };
                 if close {
-                    s.step = AddStep::EditUrl;
+                    s.run.return_to("url").expect("provider URL step exists");
+                    s.oauth_auth = None;
                     return Nav::Stay;
                 }
-                if (matches!(key.code, KeyCode::Char('s')) && !state.paste_focused)
-                    || (matches!(key.code, KeyCode::Enter)
-                        && OAuthFlowView::OAuth(state).confirming())
-                    || (matches!(key.code, KeyCode::Enter)
-                        && ((state.provider == OAuthProvider::Grok
-                            && state.cursor == 2
-                            && !state.paste_focused)
-                            || (state.provider == OAuthProvider::Codex
-                                && state.cursor == 1
-                                && state.device_login().is_none())))
-                {
+                if should_save {
                     let template = s.template.expect("template chosen");
                     let id = s.id_field.text().trim().to_string();
                     let entry = provider_entry_from_add(s, template, Vec::new());
                     self.save_and_fetch_provider(s, id, entry, template);
                 }
             }
-            AddStep::Saving | AddStep::Fetching => {
+            Some("saving" | "fetching") => {
                 // Disable input while in-flight, except Esc (handled above).
             }
-            AddStep::Done => {
+            Some("done") | None if s.run.is_complete() || s.is_step("done") => {
                 if matches!(key.code, KeyCode::Enter) {
                     return Nav::Replace(super::providers_page(ProvidersPage::List {
                         cursor: initial_list_cursor(&self.config),
@@ -1396,6 +1383,10 @@ impl SettingsCx {
                     }));
                 }
             }
+            Some(other) => {
+                s.error = Some(format!("unsupported provider wizard step `{other}`"));
+            }
+            None => {}
         }
         Nav::Stay
     }
@@ -2294,16 +2285,16 @@ impl SettingsCx {
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        match &s.step {
-            AddStep::PickTemplate { cursor } => {
+        match s.run.current_step_id() {
+            Some("template") => {
                 lines.push(Line::from(Span::styled(
                     "Which provider would you like to add?".to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::default());
                 for (i, t) in templates::TEMPLATES.iter().enumerate() {
-                    let marker = if i == *cursor { "▸ " } else { "  " };
-                    let style = if i == *cursor {
+                    let marker = if i == s.template_cursor { "▸ " } else { "  " };
+                    let style = if i == s.template_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
@@ -2315,44 +2306,38 @@ impl SettingsCx {
                         Span::styled(format!("({})", t.id), muted),
                     ]));
                 }
-                if let Some(t) = templates::TEMPLATES.get(*cursor)
+                if let Some(t) = templates::TEMPLATES.get(s.template_cursor)
                     && let Some(hint) = t.hint
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
                 }
             }
-            AddStep::EditId | AddStep::EditUrl | AddStep::EditHeaders => {
+            Some("id" | "url" | "headers") => {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                render_field_row(
-                    &mut lines,
-                    "id",
-                    &s.id_field,
-                    matches!(s.step, AddStep::EditId),
-                );
-                render_field_row(
-                    &mut lines,
-                    "url",
-                    &s.url_field,
-                    matches!(s.step, AddStep::EditUrl),
-                );
-                if matches!(s.step, AddStep::EditHeaders) {
+                render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
+                render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                if s.is_step("headers") {
                     lines.push(Line::default());
                     render_header_editor(&mut lines, &s.headers);
                 }
-                if matches!(s.step, AddStep::EditUrl)
+                if s.is_step("url")
                     && let Some(hint) = t.hint
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
                 }
             }
-            AddStep::CopilotAuth(state) => {
+            Some("copilot-auth") => {
+                let state = s
+                    .copilot_auth
+                    .as_ref()
+                    .expect("Copilot descriptor step initializes state");
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
@@ -2384,7 +2369,11 @@ impl SettingsCx {
                     muted,
                 )));
             }
-            AddStep::OAuthAuth(state) => {
+            Some("grok-oauth" | "codex-oauth") => {
+                let state = s
+                    .oauth_auth
+                    .as_ref()
+                    .expect("OAuth descriptor step initializes state");
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
@@ -2393,9 +2382,9 @@ impl SettingsCx {
                 lines.push(Line::default());
                 render_oauth_body(&mut lines, OAuthFlowView::OAuth(state));
             }
-            AddStep::Saving | AddStep::Fetching => {
+            Some("saving" | "fetching") => {
                 lines.push(Line::from(Span::styled(
-                    if matches!(s.step, AddStep::Saving) {
+                    if s.is_step("saving") {
                         "Saving config…"
                     } else {
                         "Fetching /models…"
@@ -2404,10 +2393,16 @@ impl SettingsCx {
                     yellow,
                 )));
             }
-            AddStep::Done => {
+            Some("done") | None => {
                 lines.push(Line::from(Span::styled(
                     "Done.".to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
+                )));
+            }
+            Some(other) => {
+                lines.push(Line::from(Span::styled(
+                    format!("Unsupported wizard step: {other}"),
+                    red,
                 )));
             }
         }
@@ -2422,10 +2417,10 @@ impl SettingsCx {
             };
             lines.push(Line::from(Span::styled(err.clone(), style)));
         }
-        let oauth_flow = match &s.step {
-            AddStep::OAuthAuth(state) => Some(OAuthFlowView::OAuth(state)),
-            _ => None,
-        };
+        let oauth_flow = matches!(s.run.current_step_id(), Some("grok-oauth" | "codex-oauth"))
+            .then(|| s.oauth_auth.as_deref())
+            .flatten()
+            .map(OAuthFlowView::OAuth);
         let link_regions = oauth_flow
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
             .unwrap_or_default();
@@ -2440,7 +2435,7 @@ impl SettingsCx {
                 link_regions,
             );
         }
-        if matches!(s.step, AddStep::EditHeaders) && s.headers.is_editing() {
+        if s.is_step("headers") && s.headers.is_editing() {
             render_header_edit_popup(frame, area, &s.headers);
         }
     }
@@ -3578,19 +3573,25 @@ impl SettingsPage for ProvidersPage {
             ProvidersPage::List { .. } => {
                 "↑/↓/Tab/Shift+Tab  enter: edit/refetch-all  R: refetch all  m: unlisted policy  a: add  d: delete (×2)  esc/h: back  q: close"
             }
-            ProvidersPage::Add(s) => match &s.step {
-                AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
-                AddStep::EditId | AddStep::EditUrl => "type to edit  enter: next  esc: cancel",
-                AddStep::EditHeaders => {
+            ProvidersPage::Add(s) => match s.run.current_step_id() {
+                Some("template") => "↑/↓  enter: choose  esc: cancel",
+                Some("id" | "url") => "type to edit  enter: next  esc: cancel",
+                Some("headers") => {
                     if s.headers.is_editing() {
                         "type to edit  Tab: switch field  enter: save  esc: cancel"
                     } else {
                         "↑/↓  a: add  enter: edit  d: delete (x2)  enter on continue: save  esc: back"
                     }
                 }
-                AddStep::CopilotAuth(_) => "enter: apply  s: skip  esc: cancel",
-                AddStep::OAuthAuth(state) => match state.provider {
+                Some("copilot-auth") => "enter: apply  s: skip  esc: cancel",
+                Some("grok-oauth" | "codex-oauth") => match s
+                    .oauth_auth
+                    .as_ref()
+                    .expect("OAuth descriptor step initializes state")
+                    .provider
+                {
                     OAuthProvider::Grok => {
+                        let state = s.oauth_auth.as_ref().expect("OAuth state");
                         if state.paste_focused {
                             return "type/paste code  enter: submit  esc: options";
                         }
@@ -3600,12 +3601,18 @@ impl SettingsPage for ProvidersPage {
                             state.paste_focused,
                         ))
                     }
-                    OAuthProvider::Codex => oauth_setup_help_text(
-                        oauth_setup_confirming_logged_in(state.logged_in, state.polling, false),
-                    ),
+                    OAuthProvider::Codex => {
+                        let state = s.oauth_auth.as_ref().expect("OAuth state");
+                        oauth_setup_help_text(oauth_setup_confirming_logged_in(
+                            state.logged_in,
+                            state.polling,
+                            false,
+                        ))
+                    }
                 },
-                AddStep::Saving | AddStep::Fetching => "(in progress)  esc: cancel",
-                AddStep::Done => "enter: back to list",
+                Some("saving" | "fetching") => "(in progress)  esc: cancel",
+                Some("done") | None => "enter: back to list",
+                Some(_) => "esc: cancel",
             },
             ProvidersPage::Edit(s) => {
                 if s.editing_field.is_some() {

@@ -48,6 +48,7 @@ mod tokens;
 mod tools;
 mod tui;
 mod welcome;
+pub mod wizard;
 
 use clap::Parser;
 use std::process::ExitCode;
@@ -618,6 +619,7 @@ async fn async_main() -> anyhow::Result<()> {
             commands::learn::run(args, cli.no_sandbox).await
         }
         Some(Command::Providers(sub)) => commands::providers::run(sub).await,
+        Some(Command::Setup(args)) => commands::setup::run(args).await,
         Some(Command::Models(args)) => commands::models::run(args).await,
         Some(Command::ProviderCatalogStatus(args)) => {
             commands::models::run_provider_catalog_status(args).await

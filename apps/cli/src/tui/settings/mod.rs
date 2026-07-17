@@ -105,6 +105,11 @@ pub enum Dialog {
         cursor: usize,
         cwd: PathBuf,
     },
+    WizardMenu {
+        wizards: Vec<crate::wizard::WizardDescriptor>,
+        cursor: usize,
+        cwd: PathBuf,
+    },
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
@@ -402,7 +407,7 @@ use category::{Category, CategoryPage};
 use harnesses_page::HarnessesPage;
 use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
-use providers::{AddState, AddStep, EditState, ProvidersPage};
+use providers::{AddState, EditState, ProvidersPage};
 pub(crate) use providers::{
     GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthProvider,
     prepare_grok_browser_start,
@@ -518,6 +523,7 @@ impl Dialog {
     pub(crate) fn test_page_name(&self) -> Option<&'static str> {
         match self {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
+            Dialog::WizardMenu { .. } => Some("wizard_menu"),
             _ => None,
         }
     }
@@ -637,6 +643,21 @@ impl Dialog {
             d = Dialog::Settings(Box::new(s));
         }
         d
+    }
+
+    pub fn open_setup(cwd: &std::path::Path) -> Self {
+        Dialog::WizardMenu {
+            wizards: crate::wizard::registry(),
+            cursor: 0,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+
+    pub fn open_setup_wizard(cwd: &std::path::Path, wizard_id: &str) -> Result<Self, String> {
+        match wizard_id {
+            crate::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
+            other => Err(format!("unknown setup wizard `{other}`")),
+        }
     }
 
     /// Open directly on one configured provider. OAuth-expired failures for a
@@ -858,6 +879,22 @@ impl Dialog {
                     false
                 }
             },
+            Dialog::WizardMenu {
+                wizards,
+                cursor,
+                cwd,
+            } => match list_key_action(key, cursor, wizards.len()) {
+                ListAction::Stay => false,
+                ListAction::Close => true,
+                ListAction::Select(idx) => {
+                    let wizard_id = wizards[idx].id;
+                    match Self::open_setup_wizard(cwd, wizard_id) {
+                        Ok(dialog) => *self = dialog,
+                        Err(_) => *self = Dialog::open(cwd),
+                    }
+                    false
+                }
+            },
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
                 if close
@@ -954,6 +991,9 @@ impl Dialog {
                 None,
                 "↑/↓  enter: select  esc: back to picker",
             ),
+            Dialog::WizardMenu {
+                wizards, cursor, ..
+            } => render_wizard_menu(frame, area, wizards, *cursor),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -1237,12 +1277,17 @@ impl SettingsDialog {
         self.drain_fetch_all();
         if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
             match page {
-                ProvidersPage::OAuthSetup { state, .. }
-                | ProvidersPage::Add(AddState {
-                    step: AddStep::OAuthAuth(state),
-                    ..
-                }) if state.pending || state.polling => {
+                ProvidersPage::OAuthSetup { state, .. } if state.pending || state.polling => {
                     state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                }
+                ProvidersPage::Add(state)
+                    if state
+                        .oauth_auth
+                        .as_ref()
+                        .is_some_and(|oauth| oauth.pending || oauth.polling) =>
+                {
+                    let oauth = state.oauth_auth.as_mut().expect("guarded OAuth state");
+                    oauth.spinner_tick = oauth.spinner_tick.wrapping_add(1);
                 }
                 _ => {}
             }
@@ -1271,10 +1316,14 @@ impl SettingsDialog {
         let page = self.page.downcast_mut::<ProvidersPage>()?;
         match page {
             ProvidersPage::OAuthSetup { state, .. } if state.provider == provider => Some(state),
-            ProvidersPage::Add(AddState {
-                step: AddStep::OAuthAuth(state),
-                ..
-            }) if state.provider == provider => Some(state),
+            ProvidersPage::Add(add)
+                if add
+                    .oauth_auth
+                    .as_ref()
+                    .is_some_and(|state| state.provider == provider) =>
+            {
+                add.oauth_auth.as_deref_mut()
+            }
             _ => None,
         }
     }
@@ -1289,7 +1338,7 @@ impl SettingsDialog {
         };
         match page {
             ProvidersPage::Headers { .. } | ProvidersPage::Models { .. } => true,
-            ProvidersPage::Add(s) => matches!(s.step, AddStep::EditHeaders),
+            ProvidersPage::Add(s) => s.is_step("headers"),
             _ => false,
         }
     }
@@ -2419,6 +2468,45 @@ fn render_picker(
     frame.render_widget(help_line(help), layout[1]);
 }
 
+fn render_wizard_menu(
+    frame: &mut Frame,
+    area: Rect,
+    wizards: &[crate::wizard::WizardDescriptor],
+    cursor: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Setup — choose a wizard ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let selected = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if wizards.is_empty() {
+        lines.push(Line::from(Span::styled("  (no wizards registered)", muted)));
+    } else {
+        for (index, wizard) in wizards.iter().enumerate() {
+            let marker = if index == cursor { "▸ " } else { "  " };
+            let style = if index == cursor {
+                selected
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(wizard.id.to_string(), style),
+                Span::raw("  "),
+                Span::styled(wizard.description.to_string(), muted),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+    frame.render_widget(help_line("↑/↓  enter: select  esc: close"), layout[1]);
+}
+
 fn help_line(text: &str) -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
         text.to_string(),
@@ -2854,30 +2942,16 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         let mut codex = providers::OAuthFlowState::new(OAuthProvider::Codex);
         codex.logged_in = true;
-        d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
-            step: AddStep::OAuthAuth(Box::new(codex)),
-            template: None,
-            id_field: TextField::default(),
-            url_field: TextField::default(),
-            headers: providers::HeaderEditor::new(Vec::new(), true),
-            error: None,
-            fetch: None,
-            saved_provider_id: None,
-        })));
+        let mut add = providers::AddState::new();
+        add.enter_oauth_for_test(codex);
+        d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
         assert_eq!(d.help_text(), "enter: continue  esc: back");
 
         let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
         grok.logged_in = false;
-        d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
-            step: AddStep::OAuthAuth(Box::new(grok)),
-            template: None,
-            id_field: TextField::default(),
-            url_field: TextField::default(),
-            headers: providers::HeaderEditor::new(Vec::new(), true),
-            error: None,
-            fetch: None,
-            saved_provider_id: None,
-        })));
+        let mut add = providers::AddState::new();
+        add.enter_oauth_for_test(grok);
+        d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
         assert_eq!(
             d.help_text(),
             "↑/↓  enter: choose  s: skip/continue  esc: back"
@@ -2891,25 +2965,16 @@ mod tests {
         let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
         grok.paste_focused = true;
         grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
-        d.set_test_page(Page::Providers(ProvidersPage::Add(providers::AddState {
-            step: AddStep::OAuthAuth(Box::new(grok)),
-            template: None,
-            id_field: TextField::default(),
-            url_field: TextField::default(),
-            headers: providers::HeaderEditor::new(Vec::new(), true),
-            error: None,
-            fetch: None,
-            saved_provider_id: None,
-        })));
+        let mut add = providers::AddState::new();
+        add.enter_oauth_for_test(grok);
+        d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
 
         d.paste("http://127.0.0.1/callback?code=abc123&state=s\nignored");
 
         let TestPageRef::Providers(ProvidersPage::Add(add)) = d.test_page() else {
             panic!("expected Add provider page");
         };
-        let AddStep::OAuthAuth(grok) = &add.step else {
-            panic!("expected OAuth add step");
-        };
+        let grok = add.oauth_auth.as_ref().expect("expected OAuth add step");
         assert_eq!(
             grok.manual_input.text(),
             "http://127.0.0.1/callback?code=abc123&state=s"
@@ -4336,6 +4401,23 @@ mod tests {
             "expected Add page, got {:?}",
             s.page
         );
+    }
+
+    #[test]
+    fn no_providers_auto_opens_wizard() {
+        let tmp = TempDir::new().unwrap();
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+
+        let d = Dialog::open_providers_add(tmp.path());
+        let Dialog::Settings(s) = d else {
+            panic!("expected Settings dialog");
+        };
+        assert!(matches!(
+            s.test_page(),
+            TestPageRef::Providers(ProvidersPage::Add(_))
+        ));
     }
 
     #[test]

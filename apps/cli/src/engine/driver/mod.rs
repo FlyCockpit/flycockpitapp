@@ -1937,6 +1937,7 @@ impl Driver {
                 .clone(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: self.stack.len() == 1,
+            skill_write_origin: payload.resume.call_origin,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 active_tools
@@ -2051,6 +2052,7 @@ impl Driver {
                     self.resource_scheduler.clone(),
                     self.loop_guard_threshold,
                     is_root,
+                    crate::skills::manage::SkillWriteOrigin::Foreground,
                     context_usage,
                     deferred_log,
                     crate::engine::seed_collector::SeedCollector::new(),
@@ -4721,6 +4723,7 @@ impl Driver {
                     self.resource_scheduler.clone(),
                     self.loop_guard_threshold,
                     is_root,
+                    crate::skills::manage::SkillWriteOrigin::Foreground,
                     context_usage,
                     deferred_log,
                     // The main/interactive frames never register the `seed`

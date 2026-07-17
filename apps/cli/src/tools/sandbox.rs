@@ -512,6 +512,7 @@ mod tests {
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             context_usage: None,
             available_tools: Arc::new(std::collections::HashSet::new()),
             has_tree: false,

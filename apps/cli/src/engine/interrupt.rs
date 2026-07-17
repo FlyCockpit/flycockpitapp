@@ -87,6 +87,15 @@ fn take_pre_resolved_interrupt() -> Option<(Uuid, ResolveResponse)> {
         .flatten()
 }
 
+/// Whether the current tool invocation is replaying a previously parked
+/// interrupt. Tools with config-controlled gates must still consume this
+/// decision even if their configuration changed while the call was parked.
+pub fn pre_resolved_interrupt_pending() -> bool {
+    CURRENT_PRE_RESOLVED_INTERRUPT
+        .try_with(|slot| slot.borrow().is_some())
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 pub enum InterruptOutcome {
     Resolved(ResolveResponse),

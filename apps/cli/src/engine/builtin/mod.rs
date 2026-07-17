@@ -320,6 +320,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "change_impact",
         "task",
         "skill",
+        "skill_manage",
         "question",
         "schedule",
         "spawn",
@@ -410,6 +411,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::intel::ImpactTool),
         Arc::new(tools::intel::ChangeImpactTool),
         Arc::new(tools::skill::SkillTool),
+        Arc::new(tools::skill_manage::SkillManageTool),
         Arc::new(tools::question::QuestionTool),
         Arc::new(tools::defer::DeferTool),
         Arc::new(tools::schedule::ScheduleTool),
@@ -466,6 +468,7 @@ fn materialize_tool_by_name(
         "search" => tb.with(Arc::new(tools::intel::SearchTool)),
         "change_impact" => tb.with(Arc::new(tools::intel::ChangeImpactTool)),
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
+        "skill_manage" => tb.with(Arc::new(tools::skill_manage::SkillManageTool)),
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
         "schedule" => tb.with(Arc::new(tools::schedule::ScheduleTool)),
         "mcp" => tb.with(Arc::new(tools::mcp_tool::McpTool)),
@@ -1312,6 +1315,9 @@ pub fn build(args: &SpawnArgs) -> Agent {
     .with(Arc::new(crate::tools::question::QuestionTool))
     // `skill` (GOALS §5): manual on-demand skill loading.
     .with(Arc::new(crate::tools::skill::SkillTool))
+    // Guarded writes to configured skill roots. The mutation service owns
+    // validation, protection, provenance, and atomicity.
+    .with(Arc::new(crate::tools::skill_manage::SkillManageTool))
     // External-harness delegation (GOALS §6,
     // implementation note): list configured
     // harnesses + invoke one as an external leaf subagent.

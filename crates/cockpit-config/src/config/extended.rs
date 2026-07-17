@@ -945,6 +945,13 @@ pub struct SkillsConfig {
     /// Absolute / `~` / `$VAR`-rooted entries are unaffected.
     #[serde(default)]
     pub ancestor_walk: bool,
+
+    /// Require a persisted user decision before any `skill_manage` mutation.
+    /// Disabled by default so explicitly granted skill writers apply changes
+    /// directly; when enabled the ordinary parked-interrupt replay path holds
+    /// the exact tool arguments until approval.
+    #[serde(default)]
+    pub write_approval: bool,
 }
 
 impl SkillsConfig {

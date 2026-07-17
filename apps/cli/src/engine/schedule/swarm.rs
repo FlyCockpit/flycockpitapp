@@ -151,6 +151,7 @@ async fn run_swarm_loop(
             // A noninteractive child recomposes its own fresh system block on
             // spawn; it never needs the live instructions-file diff injection.
             false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             deferred_log.clone(),
             seeds.clone(),

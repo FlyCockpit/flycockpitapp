@@ -17,6 +17,7 @@ pub(crate) struct TurnCtx<'a> {
         Option<&'a Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     pub(crate) loop_guard_threshold: u32,
     pub(crate) is_root: bool,
+    pub(crate) skill_write_origin: crate::skills::manage::SkillWriteOrigin,
     pub(crate) context_usage: crate::engine::tool::ContextUsageSnapshot,
     pub(crate) deferred_log: crate::engine::deferred::DeferredLog,
     pub(crate) seeds: crate::engine::seed_collector::SeedCollector,
@@ -587,6 +588,7 @@ pub(crate) async fn run_turn(
     let resource_scheduler = ctx.resource_scheduler.cloned();
     let loop_guard_threshold = ctx.loop_guard_threshold;
     let is_root = ctx.is_root;
+    let skill_write_origin = ctx.skill_write_origin;
     let context_usage = ctx.context_usage;
     let deferred_log = ctx.deferred_log;
     let seeds = ctx.seeds;
@@ -1307,6 +1309,7 @@ pub(crate) async fn run_turn(
         deferred_log,
         seeds,
         root_agent_frame: is_root,
+        skill_write_origin,
         context_usage: Some(context_usage),
         available_tools: Arc::new(
             active_tools

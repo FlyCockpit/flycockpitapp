@@ -67,6 +67,17 @@ pub struct InterruptResumeAnchor {
     pub provider_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_seq: Option<i64>,
+    /// Trusted frame provenance that must survive parked-call replay. It is
+    /// explicit in every persisted anchor so the replay authority is auditable.
+    pub call_origin: InterruptCallOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptCallOrigin {
+    #[default]
+    Foreground,
+    BackgroundReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -749,6 +760,7 @@ mod tests {
                 call_id: "call-1".into(),
                 provider_call_id: Some("provider-call-1".into()),
                 assistant_seq: Some(42),
+                call_origin: InterruptCallOrigin::BackgroundReview,
             },
         };
         let iid = db
@@ -821,6 +833,7 @@ mod tests {
                 call_id: "call-1".into(),
                 provider_call_id: None,
                 assistant_seq: Some(42),
+                call_origin: InterruptCallOrigin::Foreground,
             },
         };
         let iid = db

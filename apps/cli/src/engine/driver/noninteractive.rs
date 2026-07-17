@@ -3493,6 +3493,7 @@ pub(crate) async fn run_noninteractive_resumable(
             // system prompt on spawn, so it never needs the live
             // instructions-file diff injection.
             false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             deferred_log.clone(),
             seeds.clone(),

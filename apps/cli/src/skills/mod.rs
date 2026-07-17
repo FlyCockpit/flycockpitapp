@@ -38,6 +38,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -46,10 +48,50 @@ use crate::config::extended::SkillsConfig;
 use crate::redact::RedactionTable;
 
 pub mod auto_select;
+pub mod manage;
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_DESCRIPTION_CHARS: usize = 60;
 const SUPPORT_DIRS: [&str; 4] = ["references", "templates", "scripts", "assets"];
+static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CATALOG_CACHE: OnceLock<Mutex<HashMap<Vec<PathBuf>, CatalogCacheEntry>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct CatalogCacheEntry {
+    fingerprint: Vec<ManifestFingerprint>,
+    skills: Vec<Skill>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ManifestFingerprint {
+    path: PathBuf,
+    len: u64,
+    modified_nanos: Option<u128>,
+}
+
+/// Monotonic invalidation generation for consumers that retain a discovered
+/// skill catalog between turns. The loader itself remains filesystem-live;
+/// cached UI/index projections can cheaply detect a successful mutation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn catalog_generation() -> u64 {
+    CATALOG_GENERATION.load(Ordering::Relaxed)
+}
+
+pub fn invalidate_catalog_cache(cwd: &Path, cfg: &SkillsConfig) -> u64 {
+    let generation = CATALOG_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(cache) = CATALOG_CACHE.get() {
+        cache.lock().unwrap().remove(&resolve_scan_dirs(cwd, cfg));
+    }
+    generation
+}
+
+#[cfg(test)]
+fn catalog_cache_contains(cwd: &Path, cfg: &SkillsConfig) -> bool {
+    let dirs = resolve_scan_dirs(cwd, cfg);
+    CATALOG_CACHE
+        .get()
+        .is_some_and(|cache| cache.lock().unwrap().contains_key(&dirs))
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
@@ -232,24 +274,50 @@ fn current_platform() -> &'static str {
 /// scan-dir order is the precedence order.
 pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     let dirs = resolve_scan_dirs(cwd, cfg);
+    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
+    let fingerprint: Vec<ManifestFingerprint> = manifests
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).ok();
+            ManifestFingerprint {
+                path: path.clone(),
+                len: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+                modified_nanos: metadata
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos()),
+            }
+        })
+        .collect();
+    let cache = CATALOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(entry) = cache.lock().unwrap().get(&dirs)
+        && entry.fingerprint == fingerprint
+    {
+        return Ok(entry.skills.clone());
+    }
     let mut skills: Vec<Skill> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for dir in dirs {
-        for manifest in manifests_under(&dir) {
-            match parse_skill(&manifest) {
-                Ok(skill) => {
-                    if seen.insert(skill.frontmatter.name.clone()) {
-                        skills.push(skill);
-                    }
+    for manifest in manifests {
+        match parse_skill(&manifest) {
+            Ok(skill) => {
+                if seen.insert(skill.frontmatter.name.clone()) {
+                    skills.push(skill);
                 }
-                Err(e) => {
-                    tracing::warn!(path = %manifest.display(), error = %e, "skipping malformed SKILL.md");
-                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %manifest.display(), error = %e, "skipping malformed SKILL.md");
             }
         }
     }
 
+    cache.lock().unwrap().insert(
+        dirs,
+        CatalogCacheEntry {
+            fingerprint,
+            skills: skills.clone(),
+        },
+    );
     Ok(skills)
 }
 
@@ -408,6 +476,25 @@ pub fn load_body(skill: &Skill) -> Result<String> {
 /// Only standard package directories are reachable; absolute paths, traversal,
 /// symlink escapes, directories, and non-UTF-8 files are rejected.
 pub fn load_support_file(skill: &Skill, relative: &Path) -> Result<String> {
+    validate_support_relative(relative)?;
+
+    let package = skill
+        .source
+        .parent()
+        .context("SKILL.md has no package directory")?
+        .canonicalize()
+        .context("canonicalizing skill package")?;
+    let canonical = package
+        .join(relative)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing support file {}", relative.display()))?;
+    if !canonical.starts_with(&package) || !canonical.is_file() {
+        anyhow::bail!("support file escapes its skill package or is not a file");
+    }
+    read_markdown_capped(&canonical)
+}
+
+pub(crate) fn validate_support_relative(relative: &Path) -> Result<()> {
     use std::path::Component;
 
     if relative.as_os_str().is_empty() || relative.is_absolute() {
@@ -426,21 +513,55 @@ pub fn load_support_file(skill: &Skill, relative: &Path) -> Result<String> {
     if components.any(|component| !matches!(component, Component::Normal(_))) {
         anyhow::bail!("support file path may not contain traversal components");
     }
+    Ok(())
+}
 
-    let package = skill
-        .source
-        .parent()
-        .context("SKILL.md has no package directory")?
-        .canonicalize()
-        .context("canonicalizing skill package")?;
-    let canonical = package
-        .join(relative)
-        .canonicalize()
-        .with_context(|| format!("canonicalizing support file {}", relative.display()))?;
-    if !canonical.starts_with(&package) || !canonical.is_file() {
-        anyhow::bail!("support file escapes its skill package or is not a file");
+pub(crate) fn validate_managed_skill_contents(
+    raw: &str,
+    expected_name: &str,
+) -> Result<SkillFrontmatter> {
+    const MAX_MANAGED_SKILL_CHARS: usize = 100_000;
+    if raw.chars().count() > MAX_MANAGED_SKILL_CHARS {
+        anyhow::bail!("SKILL.md exceeds {MAX_MANAGED_SKILL_CHARS} character limit");
     }
-    read_markdown_capped(&canonical)
+    let (frontmatter_src, body) =
+        split_frontmatter(raw).context("SKILL.md needs YAML frontmatter")?;
+    let frontmatter: SkillFrontmatter =
+        serde_yaml::from_str(frontmatter_src).context("parsing SKILL.md frontmatter")?;
+    if frontmatter.name != expected_name {
+        anyhow::bail!(
+            "SKILL.md frontmatter name `{}` must remain `{expected_name}`",
+            frontmatter.name
+        );
+    }
+    if !managed_skill_name_valid(&frontmatter.name) {
+        anyhow::bail!(
+            "skill name must match ^[a-z0-9][a-z0-9._-]*$ and contain at most 64 characters"
+        );
+    }
+    let description = frontmatter.description.trim();
+    if description.is_empty() || description.chars().count() > 1024 {
+        anyhow::bail!("skill description must contain 1..=1024 characters");
+    }
+    if body.trim().is_empty() {
+        anyhow::bail!("SKILL.md body must not be empty");
+    }
+    if frontmatter.disable_model_invocation && !frontmatter.user_invocable {
+        anyhow::bail!("skill must be invocable by the model or the user");
+    }
+    Ok(frontmatter)
+}
+
+pub(crate) fn managed_skill_name_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.chars().count() <= 64
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 /// Validate the subset Cockpit's future skill writer must emit. Discovery is
@@ -964,6 +1085,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
+            write_approval: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
@@ -988,6 +1110,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
+            write_approval: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
@@ -1012,6 +1135,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
+            write_approval: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
@@ -1055,6 +1179,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
+            write_approval: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
 
@@ -1073,6 +1198,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
+            write_approval: false,
         };
         let policy = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -1098,6 +1224,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
+            write_approval: false,
         };
         let policy = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -1119,6 +1246,7 @@ mod tests {
             external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk,
+            write_approval: false,
         }
     }
 

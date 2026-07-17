@@ -200,6 +200,7 @@ fn build_def() -> AgentDef {
             "schedule",
             "question",
             "skill",
+            "skill_manage",
             "task",
             "mcp",
         ],

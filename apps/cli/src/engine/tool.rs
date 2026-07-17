@@ -504,6 +504,10 @@ pub struct ToolCtx {
     /// Whether this tool call belongs to the foreground root frame. Driver-level
     /// controls such as agent-requested compaction are only valid there.
     pub root_agent_frame: bool,
+    /// Trusted provenance for skill mutations. Ordinary foreground and test
+    /// calls default to `Foreground`; the isolated self-improvement reviewer
+    /// overrides this on its frame without exposing the field to model args.
+    pub skill_write_origin: crate::skills::manage::SkillWriteOrigin,
     /// Turn-start context-pressure snapshot for model-facing introspection.
     pub context_usage: Option<ContextUsageSnapshot>,
     /// Exact tool names advertised to the calling agent for this turn. Skill

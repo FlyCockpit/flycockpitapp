@@ -237,6 +237,7 @@ mod tests {
                 external_dirs: Vec::new(),
                 auto_bang_commands: auto_bang,
                 ancestor_walk: false,
+                write_approval: false,
             },
             ..Default::default()
         }

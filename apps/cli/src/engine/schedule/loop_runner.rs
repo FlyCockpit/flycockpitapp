@@ -213,6 +213,7 @@ async fn run_iteration(
             // instructions-file diff injection the same as the interactive
             // root conversation (`instructions-file-live-diff.md`).
             true,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             // A loop fork is a leaf with no parent to defer to; it carries a
             // fresh empty deferred-log that nobody reads (`plan.md §3d`).

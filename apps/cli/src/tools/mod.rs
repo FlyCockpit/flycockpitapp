@@ -48,6 +48,7 @@ pub mod session_search;
 pub mod shell_compress;
 pub mod shell_sandbox;
 pub mod skill;
+pub mod skill_manage;
 pub mod spawn;
 pub mod task;
 pub mod task_repair;

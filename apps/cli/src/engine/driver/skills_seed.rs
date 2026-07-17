@@ -186,6 +186,7 @@ impl Driver {
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 agent
@@ -472,6 +473,7 @@ impl Driver {
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: false,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             context_usage: None,
             available_tools: Arc::new(
                 child
@@ -548,6 +550,7 @@ impl Driver {
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 agent
@@ -743,6 +746,7 @@ impl Driver {
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 agent

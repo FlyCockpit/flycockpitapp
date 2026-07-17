@@ -681,6 +681,7 @@ fn already_injected_skill_excluded_before_catalog() {
         external_dirs: Vec::new(),
         auto_bang_commands: false,
         ancestor_walk: false,
+        write_approval: false,
     };
 
     // With firecrawl already injected this session, it is gone from the
@@ -984,6 +985,7 @@ fn disable_model_invocation_excluded_from_catalog() {
         external_dirs: Vec::new(),
         auto_bang_commands: false,
         ancestor_walk: false,
+        write_approval: false,
     };
     let catalog = auto_select_catalog(tmp.path(), &cfg);
     assert!(catalog.contains("plain"), "got {catalog:?}");
@@ -1006,6 +1008,7 @@ fn user_invocable_false_stays_in_catalog() {
         external_dirs: Vec::new(),
         auto_bang_commands: false,
         ancestor_walk: false,
+        write_approval: false,
     };
     let catalog = auto_select_catalog(tmp.path(), &cfg);
     assert!(

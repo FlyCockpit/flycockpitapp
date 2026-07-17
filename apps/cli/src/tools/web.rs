@@ -411,7 +411,7 @@ fn custom_template_for(
     }
     if crate::tools::custom::is_builtin_web_tool(name) {
         return Ok((
-            crate::tui::settings::default_template_for(name),
+            crate::tools::custom_templates::default_template_for(name),
             ToolTemplateProvenance::ShippedDefault,
         ));
     }

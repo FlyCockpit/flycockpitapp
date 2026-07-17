@@ -423,7 +423,6 @@ use reset::{ResetButton, ResetOutcome};
 use skills_page::SkillsPage;
 use string_list::StringListPage;
 use tools_page::ToolsPage;
-pub use tools_page::{builtin_tool_names, default_template_for};
 
 pub(super) struct LspPage {
     cursor: usize,
@@ -2867,6 +2866,7 @@ pub fn fetch_all_unlisted_dialog(
 mod tests {
     use super::*;
     use crate::config::providers::{ModelEntry, ProviderEntry};
+    use crate::tools::custom_templates::{builtin_tool_names, default_template_for};
     use providers::{FetchAllState, valid_url};
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend};

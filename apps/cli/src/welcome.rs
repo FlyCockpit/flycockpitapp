@@ -10,11 +10,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::banner::render_unconditional;
-use crate::git::{self, RepoStatus};
-use crate::tui::chrome::repo_counts;
-use crate::tui::composer::INPUT_PREFIX;
+use crate::git::{self, RepoStatus, repo_counts};
 
 pub const APP_NAME: &str = "Cockpit CLI";
+pub const INPUT_PREFIX: &str = "❯ ";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";

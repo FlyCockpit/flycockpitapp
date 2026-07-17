@@ -534,15 +534,17 @@ async fn load_and_upload_images(
     client: &crate::daemon::client::DaemonClient,
     images: &[Vec<u8>],
 ) -> Result<Vec<proto::ImageAttachmentRef>> {
-    match crate::tui::agent_runner::upload_submission_images(client, images).await {
+    match crate::daemon::image_upload::upload_submission_images(client, images).await {
         Ok(refs) => Ok(refs),
         Err(error) => Err(map_image_upload_error(error)),
     }
 }
 
-fn map_image_upload_error(error: crate::tui::agent_runner::ImageUploadError) -> anyhow::Error {
+fn map_image_upload_error(error: crate::daemon::image_upload::ImageUploadError) -> anyhow::Error {
     match error {
-        crate::tui::agent_runner::ImageUploadError::Usage(message) => RunUsageError(message).into(),
+        crate::daemon::image_upload::ImageUploadError::Usage(message) => {
+            RunUsageError(message).into()
+        }
         error => error.into(),
     }
 }
@@ -1471,14 +1473,14 @@ mod tests {
         assert!(error.downcast_ref::<RunUsageError>().is_some());
         assert!(error.to_string().contains("too many images"));
 
-        let error = map_image_upload_error(crate::tui::agent_runner::ImageUploadError::Usage(
+        let error = map_image_upload_error(crate::daemon::image_upload::ImageUploadError::Usage(
             "configured upload limit rejected the image".into(),
         ));
         assert!(error.downcast_ref::<RunUsageError>().is_some());
 
-        let error = map_image_upload_error(crate::tui::agent_runner::ImageUploadError::Transport(
-            "socket closed".into(),
-        ));
+        let error = map_image_upload_error(
+            crate::daemon::image_upload::ImageUploadError::Transport("socket closed".into()),
+        );
         assert!(error.downcast_ref::<RunUsageError>().is_none());
     }
 

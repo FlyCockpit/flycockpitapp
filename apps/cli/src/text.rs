@@ -47,6 +47,48 @@ pub fn bounded_snippet(detail: &str, max: usize) -> Option<String> {
     Some(cap_chars(trimmed, max).0)
 }
 
+/// One-line summary of a tool call's args for compact display.
+pub fn short_args(v: &serde_json::Value) -> String {
+    if let Some(map) = v.as_object() {
+        let mut out = String::new();
+        for (k, val) in map {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            let rendered = match val {
+                serde_json::Value::String(s) if s.len() <= 40 => format!("{k}=\"{s}\""),
+                serde_json::Value::String(s) => format!("{k}=<{}c>", s.len()),
+                serde_json::Value::Bool(b) => format!("{k}={b}"),
+                serde_json::Value::Number(n) => format!("{k}={n}"),
+                other => format!(
+                    "{k}={}",
+                    other.to_string().chars().take(40).collect::<String>()
+                ),
+            };
+            out.push_str(&rendered);
+            if out.chars().count() > 80 {
+                out.push('…');
+                break;
+            }
+        }
+        out
+    } else {
+        v.to_string()
+    }
+}
+
+/// First non-empty trimmed line of `s`, capped at `max_chars`. Used for
+/// tool-output snippets and subagent prompt previews.
+pub fn first_line(s: &str, max_chars: usize) -> String {
+    let first = s.lines().next().unwrap_or("").trim();
+    if first.chars().count() > max_chars {
+        let truncated: String = first.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    } else {
+        first.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +129,26 @@ mod tests {
     #[test]
     fn no_newline_first_line_uses_whole_input() {
         assert_eq!(first_line_capped("abcdef", 3), "abc...");
+    }
+
+    #[test]
+    fn short_args_summarizes_common_json_values() {
+        let value = serde_json::json!({
+            "path": "src/lib.rs",
+            "limit": 3,
+            "dry_run": true
+        });
+
+        let rendered = short_args(&value);
+
+        assert!(rendered.contains("path=\"src/lib.rs\""));
+        assert!(rendered.contains("limit=3"));
+        assert!(rendered.contains("dry_run=true"));
+    }
+
+    #[test]
+    fn first_line_trims_and_caps() {
+        assert_eq!(first_line("  hello world  \nsecond", 20), "hello world");
+        assert_eq!(first_line("abcdef", 3), "abc…");
     }
 }

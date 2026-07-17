@@ -17,6 +17,22 @@ pub struct RepoStatus {
     pub unpushed: u32,
 }
 
+/// Compact staged/unstaged/unpushed counts for branch chrome and startup
+/// welcome text.
+pub fn repo_counts(repo: &RepoStatus) -> String {
+    let mut parts = Vec::new();
+    if repo.staged > 0 {
+        parts.push(format!("+{}", repo.staged));
+    }
+    if repo.unstaged > 0 {
+        parts.push(format!("~{}", repo.unstaged));
+    }
+    if repo.unpushed > 0 {
+        parts.push(format!("^{}", repo.unpushed));
+    }
+    parts.join(" ")
+}
+
 /// Walk `path` and its ancestors looking for a `.git` directory; return
 /// the worktree root (the parent of `.git`). Returns `None` if not in a
 /// git repo.

@@ -238,7 +238,7 @@ impl Driver {
                     hint: None,
                 })
                 .await;
-            let label = crate::tui::agent_runner::short_args(&seed.args);
+            let label = crate::text::short_args(&seed.args);
             blocks.push(format!(
                 "<seed tool=\"{}\" {}>\n{}\n</seed>",
                 seed.tool, label, body

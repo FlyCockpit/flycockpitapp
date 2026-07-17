@@ -14,7 +14,7 @@ use ratatui::text::Span;
 use crate::config::extended::LlmMode;
 use crate::db::connector::ConnectorDisclosure;
 use crate::db::org_sync::OrgSyncDisclosure;
-use crate::git::RepoStatus;
+use crate::git::repo_counts;
 use crate::tui::theme::{
     FAVORITE_MODEL, MUTED_COLOR_INDEX, PLAN_YELLOW, STATUS_BRANCH_BADGE, WARNING_TEXT,
 };
@@ -314,36 +314,6 @@ pub fn side_glyph_spans(active: bool) -> Vec<Span<'static>> {
         "⑃ side · /side end ".to_string(),
         Style::default().fg(Color::Magenta),
     )]
-}
-
-/// Additive plan-status indicator (`plan-status-chrome-and-resolver.md`).
-/// Rendered **only** when this project has something unfinished — additive to
-/// the fixed chrome (cwd + branch + context + active agent, GOALS §1a), never
-/// displacing a slot, the same pattern as the `☕` caffeinate glyph. Up to
-/// three segments, each omitted when its count is zero; an all-zero state
-/// returns an empty vec so a normal coding session stays uncluttered.
-///
-///   - **ready** `⧖N` — queued (`Pending`) plans.
-///   - **in-progress** `▶N` — the executing plan (≤1 per project).
-///   - **interruptions** `?N` — open `needs_attention` items blocking
-///     progress; the actionable, attention-grabbing segment (rendered last so
-///     it reads as the thing to act on, and bold to stand out).
-///
-/// Driven by daemon-broadcast state, so a reconnecting / late-opened TUI shows
-/// the correct counts. Returns the spans to prepend to the right-hand status
-/// line (a trailing space separates the slot from what follows), or an empty
-pub fn repo_counts(repo: &RepoStatus) -> String {
-    let mut parts = Vec::new();
-    if repo.staged > 0 {
-        parts.push(format!("+{}", repo.staged));
-    }
-    if repo.unstaged > 0 {
-        parts.push(format!("~{}", repo.unstaged));
-    }
-    if repo.unpushed > 0 {
-        parts.push(format!("^{}", repo.unpushed));
-    }
-    parts.join(" ")
 }
 
 #[cfg(test)]

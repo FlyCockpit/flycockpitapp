@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 
 use crate::config::extended::{ToolCommandTemplate, WebProvider as ConfigWebProvider};
 use crate::credentials::CredentialStore;
+use crate::tools::custom_templates::{builtin_tool_names, default_template_for};
 use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
 
@@ -83,42 +84,6 @@ struct WebProviderChoice {
     label: &'static str,
     docs_url: &'static str,
     hint: &'static str,
-}
-
-/// Built-in custom-tool names surfaced on the Tools page. These are
-/// also registered as live tools by the agent runtime (see
-/// `src/tools/custom.rs`).
-pub fn builtin_tool_names() -> &'static [&'static str] {
-    &["webfetch", "websearch"]
-}
-
-/// Default bash command + description for a built-in tool. The defaults
-/// rely only on widely-available CLI utilities (curl, ddgr) so a user
-/// can land a working tool without configuring anything.
-pub fn default_template_for(name: &str) -> ToolCommandTemplate {
-    match name {
-        "webfetch" => ToolCommandTemplate {
-            enabled: true,
-            command:
-                "curl -sSL --max-time 20 --max-filesize 2000000 --user-agent 'cockpit-cli' {url}"
-                    .to_string(),
-            description: Some(
-                "Fetch a URL. Pass `url` (the target). Returns the response body. For dependency API usage, use docs when uncertain; web is for what `docs` can't answer (news, non-package info).".to_string(),
-            ),
-        },
-        "websearch" => ToolCommandTemplate {
-            enabled: true,
-            command: "ddgr --json --num 8 -- {query}".to_string(),
-            description: Some(
-                "Search the web. Pass `query`. Returns JSON results from DuckDuckGo. For dependency API usage, use docs when uncertain; web is for what `docs` can't answer (news, non-package info).".to_string(),
-            ),
-        },
-        _ => ToolCommandTemplate {
-            enabled: true,
-            command: String::new(),
-            description: None,
-        },
-    }
 }
 
 fn agent_browser_fetch_template() -> ToolCommandTemplate {

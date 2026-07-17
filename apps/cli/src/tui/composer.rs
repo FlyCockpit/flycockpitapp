@@ -23,9 +23,7 @@
 //!
 //! Reference implementation: codex's `bottom_pane/textarea.rs`.
 
-/// Prompt glyph shown at the start of the composer input line and in the
-/// submitted-history echo.
-pub const INPUT_PREFIX: &str = "❯ ";
+pub use crate::welcome::INPUT_PREFIX;
 
 /// Display width of [`INPUT_PREFIX`] in terminal columns. Computed via
 /// `unicode-width` so wider glyphs (CJK, emoji) would size correctly if

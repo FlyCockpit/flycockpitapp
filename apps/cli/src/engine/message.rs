@@ -21,7 +21,7 @@ use uuid::Uuid;
 /// [`crate::tui::paste::PasteRegistry::build_wire`] at each real-image
 /// position. We split on it here to interleave text and image content
 /// parts in order when assembling the outbound user [`Message`].
-pub use crate::tui::paste::IMAGE_PART_SENTINEL;
+pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
 
 /// A user submission destined for the agent: scrubbed wire text plus the
 /// ordered PNG payloads for any pasted images sent as real image parts

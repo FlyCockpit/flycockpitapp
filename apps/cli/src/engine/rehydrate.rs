@@ -805,10 +805,7 @@ fn inference_failure_summary(data: &serde_json::Value) -> String {
         "timeout_ttft" => "no first token within the timeout".to_string(),
         "timeout_idle" => "stream stalled past the idle timeout".to_string(),
         other if detail.trim().is_empty() => other.to_string(),
-        other => format!(
-            "{other}: {}",
-            crate::tui::agent_runner::first_line(detail, 200)
-        ),
+        other => format!("{other}: {}", crate::text::first_line(detail, 200)),
     };
     if provider.is_empty() && model.is_empty() {
         format!("Inference failed: {reason}")

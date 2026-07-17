@@ -247,7 +247,7 @@ fn resolve_builtin_web_template(name: &str, cwd: &std::path::Path) -> SelectedTe
         };
     }
     SelectedTemplate {
-        tpl: crate::tui::settings::default_template_for(name),
+        tpl: crate::tools::custom_templates::default_template_for(name),
         provenance: ToolTemplateProvenance::ShippedDefault,
     }
 }
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn web_tool_schema_is_backend_neutral_for_fallback_template() {
-        let tpl = crate::tui::settings::default_template_for("websearch");
+        let tpl = crate::tools::custom_templates::default_template_for("websearch");
         let tool = CustomBashTool::from_template_with_provenance(
             "websearch",
             &tpl,
@@ -467,7 +467,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
-        let default = crate::tui::settings::default_template_for("webfetch");
+        let default = crate::tools::custom_templates::default_template_for("webfetch");
         let tool = CustomBashTool::from_template_with_provenance(
             "webfetch",
             &default,
@@ -533,7 +533,7 @@ mod tests {
             r#"{"tools":{"websearch":{"enabled":true,"command":"cockpit-definitely-missing-websearch {query}","description":"Search using provider"}}}"#,
         )
         .unwrap();
-        let default = crate::tui::settings::default_template_for("websearch");
+        let default = crate::tools::custom_templates::default_template_for("websearch");
         let tool = CustomBashTool::from_template_with_provenance(
             "websearch",
             &default,

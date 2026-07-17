@@ -27,6 +27,7 @@ pub mod client;
 pub mod connector;
 pub mod ephemeral_guard;
 pub mod fs_api;
+pub mod image_upload;
 pub mod lsp;
 pub mod org_sync;
 pub mod principal;

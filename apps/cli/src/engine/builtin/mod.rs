@@ -753,14 +753,14 @@ fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
             },
         )));
     }
-    for name in crate::tui::settings::builtin_tool_names() {
+    for name in crate::tools::custom_templates::builtin_tool_names() {
         if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
             continue;
         }
         if cfg.tools.contains_key(*name) {
             continue;
         }
-        let tpl: ToolCommandTemplate = crate::tui::settings::default_template_for(name);
+        let tpl: ToolCommandTemplate = crate::tools::custom_templates::default_template_for(name);
         if tpl.enabled && !tpl.command.trim().is_empty() {
             tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
                 name,
@@ -2392,7 +2392,7 @@ mod tests {
     #[test]
     fn web_tool_defaults_note_prefer_docs_for_dependency_api() {
         for name in ["webfetch", "websearch"] {
-            let tpl = crate::tui::settings::default_template_for(name);
+            let tpl = crate::tools::custom_templates::default_template_for(name);
             let desc = tpl.description.unwrap_or_default().to_lowercase();
             assert!(
                 desc.contains("docs"),

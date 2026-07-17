@@ -527,7 +527,7 @@ impl App {
                     self.history.push(HistoryEntry::ToolLine {
                         call_id,
                         tool,
-                        summary: agent_runner::first_line(&output, 200),
+                        summary: crate::text::first_line(&output, 200),
                         state: ToolCallState::Success,
                     });
                 }
@@ -600,7 +600,7 @@ impl App {
                     self.history.push(HistoryEntry::ToolLine {
                         call_id,
                         tool,
-                        summary: agent_runner::first_line(&error, 200),
+                        summary: crate::text::first_line(&error, 200),
                         state,
                     });
                 }
@@ -634,7 +634,7 @@ impl App {
                     "timeout_ttft" => "no first token within the timeout".to_string(),
                     "timeout_idle" => "stream stalled past the idle timeout".to_string(),
                     other if detail.is_empty() => other.to_string(),
-                    other => format!("{other}: {}", agent_runner::first_line(&detail, 200)),
+                    other => format!("{other}: {}", crate::text::first_line(&detail, 200)),
                 };
                 let summary = format!("Inference failed ({provider}/{model}): {reason}");
                 self.history.push(HistoryEntry::InferenceError {
@@ -1537,11 +1537,11 @@ pub(super) fn tool_invocation(tool: &str, args: &serde_json::Value) -> (String, 
             (summary, cmd)
         }
         "read" | "readlock" | "unlock" | "write" | "writeunlock" | "edit" | "editunlock" => {
-            let p = field("path").unwrap_or_else(|| agent_runner::short_args(args));
+            let p = field("path").unwrap_or_else(|| crate::text::short_args(args));
             (p.clone(), p)
         }
         "webfetch" => {
-            let u = field("url").unwrap_or_else(|| agent_runner::short_args(args));
+            let u = field("url").unwrap_or_else(|| crate::text::short_args(args));
             (u.clone(), u)
         }
         "websearch" => {

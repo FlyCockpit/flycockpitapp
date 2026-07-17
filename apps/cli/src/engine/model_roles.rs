@@ -474,6 +474,12 @@ pub fn render_model_discovery(caller_agent: &str, providers: &ProvidersConfig) -
             "- none available; configure provider models with `subagent_invokable: true`"
                 .to_string(),
         );
+    } else {
+        lines.insert(
+            1,
+            "models with context_tokens=unknown cannot satisfy an explicit min_context_tokens; omit the constraint unless the task truly requires a minimum context size."
+                .to_string(),
+        );
     }
     lines.join("\n")
 }
@@ -562,6 +568,9 @@ fn parse_min_context_tokens(value: Option<&Value>) -> Result<Option<u32>, String
     let Some(n) = value.as_u64() else {
         return Err("`model.min_context_tokens` must be a positive integer".to_string());
     };
+    if n == 0 {
+        return Err("`model.min_context_tokens` must be at least 1; omit the field (or send null) when context size is not a requirement".to_string());
+    }
     u32::try_from(n)
         .map(Some)
         .map_err(|_| "`model.min_context_tokens` is too large".to_string())
@@ -706,14 +715,14 @@ fn policy_error_message(error: ModelPolicyError) -> String {
             model,
             min,
             actual,
-        } => {
-            format!(
-                "model `{provider}:{model}` context window is too small: need at least {min}, got {}",
-                actual
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )
-        }
+        } => match actual {
+            Some(actual) => format!(
+                "model `{provider}:{model}` context window is too small: need at least {min}, got {actual}"
+            ),
+            None => format!(
+                "model `{provider}:{model}` has an unreported context window and cannot satisfy min_context_tokens={min}; omit `min_context_tokens` (or send null) to allow this model, or use `task` with `intent=models` to list eligible models and known metadata"
+            ),
+        },
         ModelPolicyError::RestrictedByAvailability { provider, model } => {
             format!("model `{provider}:{model}` is hidden by availability policy")
         }
@@ -925,6 +934,118 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn min_context_tokens_zero_rejected() {
+        let error = parse_min_context_tokens(Some(&serde_json::json!(0))).unwrap_err();
+        assert!(error.contains("at least 1"), "got: {error}");
+        assert!(error.contains("omit"), "got: {error}");
+        assert_eq!(
+            parse_min_context_tokens(Some(&serde_json::json!(1))).unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn zero_min_rejected_for_known_context_model_too() {
+        let error = DelegationModelSelector::from_value(Some(&serde_json::json!({
+            "kind": "exact",
+            "selector": "minimax:MiniMax-M2",
+            "min_context_tokens": 0
+        })))
+        .unwrap_err();
+        assert!(error.contains("at least 1"), "got: {error}");
+    }
+
+    #[test]
+    fn context_too_small_unknown_error_carries_recovery_path() {
+        let unknown = policy_error_message(ModelPolicyError::ContextTooSmall {
+            provider: "minimax".to_string(),
+            model: "MiniMax-M2".to_string(),
+            min: 1,
+            actual: None,
+        });
+        for expected in ["min_context_tokens", "omit", "null", "intent=models"] {
+            assert!(
+                unknown.contains(expected),
+                "missing `{expected}` in: {unknown}"
+            );
+        }
+
+        let known = policy_error_message(ModelPolicyError::ContextTooSmall {
+            provider: "minimax".to_string(),
+            model: "MiniMax-M2".to_string(),
+            min: 16_384,
+            actual: Some(8_192),
+        });
+        assert!(known.contains("need at least 16384"), "got: {known}");
+        assert!(known.contains("got 8192"), "got: {known}");
+        assert!(!known.contains("omit"), "got: {known}");
+    }
+
+    #[test]
+    fn explicit_min_with_unknown_context_still_rejects() {
+        let providers = providers();
+        let session = session_model(&providers);
+        let extended = ExtendedConfig {
+            agent_chooses_subagent_model: true,
+            ..ExtendedConfig::default()
+        };
+        let constrained = DelegationModelSelector::from_value(Some(&serde_json::json!({
+            "kind": "exact",
+            "selector": "minimax:MiniMax-M2",
+            "min_context_tokens": 1
+        })))
+        .unwrap()
+        .unwrap();
+        let error = match resolve_delegated_model(
+            "explore",
+            None,
+            Some(&constrained),
+            &extended,
+            &providers,
+            &session,
+        ) {
+            Err(error) => error,
+            Ok(model) => panic!(
+                "constrained unknown-context model unexpectedly resolved to {}",
+                model.model_id_ref()
+            ),
+        };
+        let SelectorResolution::InvalidLiteral(error) = error else {
+            panic!("expected guidance error, got {error:?}");
+        };
+        assert!(error.contains("omit `min_context_tokens`"), "got: {error}");
+
+        let unconstrained = DelegationModelSelector::from_value(Some(&serde_json::json!({
+            "kind": "exact",
+            "selector": "minimax:MiniMax-M2"
+        })))
+        .unwrap()
+        .unwrap();
+        let resolved = resolve_delegated_model(
+            "explore",
+            None,
+            Some(&unconstrained),
+            &extended,
+            &providers,
+            &session,
+        )
+        .unwrap();
+        assert_eq!(resolved.model_id_ref(), "MiniMax-M2");
+    }
+
+    #[test]
+    fn discovery_warns_about_unknown_context_minimums() {
+        let discovery = render_model_discovery("Build", &providers());
+        assert!(discovery.contains("context_tokens=unknown"));
+        assert!(discovery.contains("omit the constraint"));
+        assert_eq!(discovery.matches("cannot satisfy").count(), 1);
+
+        let empty = render_model_discovery("Build", &ProvidersConfig::default());
+        assert!(empty.contains("none available"));
+        assert!(!empty.contains("omit the constraint"));
     }
 
     #[test]

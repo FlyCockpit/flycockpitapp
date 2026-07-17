@@ -147,7 +147,7 @@ impl TaskTool {
                 "min_context_tokens": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Minimum context window required"
+                    "description": "Minimum context tokens; omit unless the task genuinely requires a minimum"
                 }
             },
             "required": ["kind"]
@@ -317,6 +317,13 @@ impl TaskTool {
         defensive_parameters["properties"]["payload"]["description"] = serde_json::json!(
             "Payload selected by `intent`: delegate uses an object with `agent`/`prompt` (for dependency API usage call `docs` first unless exact usage is already in local code); batch uses an array of entries; models/list may omit/null/{}; status/cancel/query/steer use control fields; query/steer require `message`"
         );
+        let defensive_min_context = serde_json::json!(
+            "Minimum context tokens; omit unless genuinely required because models with unknown context metadata are rejected when this field is set"
+        );
+        defensive_parameters["properties"]["payload"]["properties"]["model"]["properties"]["min_context_tokens"]
+            ["description"] = defensive_min_context.clone();
+        defensive_parameters["properties"]["payload"]["items"]["properties"]["model"]["properties"]
+            ["min_context_tokens"]["description"] = defensive_min_context;
         Self {
             description,
             defensive_description,
@@ -529,6 +536,33 @@ mod tests {
                     .contains("Required for query and steer")
             );
             assert!(schema.get("oneOf").is_none(), "schema must not use oneOf");
+        }
+    }
+
+    #[test]
+    fn min_context_tokens_description_steers_omission() {
+        let tool = TaskTool::with_subagents(&["explore", "builder"]);
+        let normal = tool.parameters();
+        let defensive = tool.defensive_parameters().unwrap();
+        let normal_description = normal["properties"]["payload"]["properties"]["model"]
+            ["properties"]["min_context_tokens"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(normal_description.contains("omit"));
+
+        for description in [
+            defensive["properties"]["payload"]["properties"]["model"]["properties"]
+                ["min_context_tokens"]["description"]
+                .as_str()
+                .unwrap(),
+            defensive["properties"]["payload"]["items"]["properties"]["model"]
+                ["properties"]["min_context_tokens"]["description"]
+                .as_str()
+                .unwrap(),
+        ] {
+            assert!(description.contains("omit"));
+            assert!(description.contains("unknown context metadata"));
+            assert!(description.contains("rejected"));
         }
     }
 }

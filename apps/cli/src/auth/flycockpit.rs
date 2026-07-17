@@ -13,7 +13,7 @@ use crate::credentials::CredentialStore;
 pub use crate::daemon::proto::{AccountInfo, RelayChoice, StoredFlycockpitCredential};
 
 pub const CREDENTIAL_KEY: &str = "flycockpit";
-pub const CLIENT_ID: &str = concat!("cockpit", "-cli");
+pub const CLIENT_ID: &str = "cockpit-cli";
 pub const DEVICE_SCOPE: &str = "account:instance";
 pub const DEFAULT_SERVER_URL: &str = "https://app.flycockpit.dev";
 const MAX_POLL_SECS: u64 = 30 * 60;

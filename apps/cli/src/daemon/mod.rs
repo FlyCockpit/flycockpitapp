@@ -69,6 +69,38 @@ pub struct EventEnvelope {
     pub redact: Arc<RedactionTable>,
 }
 
+/// Owns foreground-daemon metadata from pid-file publication through boot and
+/// shutdown. Early startup failures (including schema rejection) must not
+/// leave a dead pid, socket, or endpoint record behind.
+struct ForegroundMetadataGuard {
+    paths: DaemonPaths,
+    pid: u32,
+    armed: bool,
+}
+
+impl ForegroundMetadataGuard {
+    fn new(paths: &DaemonPaths) -> Self {
+        Self {
+            paths: paths.clone(),
+            pid: std::process::id(),
+            armed: true,
+        }
+    }
+
+    fn cleanup(&mut self) {
+        if self.armed && remove_metadata_if_pid_matches(&self.paths, self.pid) {
+            remove_endpoint_record_if_owned(&self.paths);
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for ForegroundMetadataGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 pub type EventSender = broadcast::Sender<EventEnvelope>;
 pub type EventReceiver = broadcast::Receiver<EventEnvelope>;
 pub type SharedRedactionTable = Arc<std::sync::RwLock<Arc<RedactionTable>>>;
@@ -953,6 +985,7 @@ async fn run_foreground_inner_with_boot_db(
     let _ = std::fs::remove_file(&paths.socket);
     std::fs::write(&paths.pid_file, std::process::id().to_string())
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
+    let mut metadata_guard = ForegroundMetadataGuard::new(&paths);
 
     let listener = bind_private_socket(&paths.socket)?;
     if boot_db.is_some() {
@@ -1074,9 +1107,7 @@ async fn run_foreground_inner_with_boot_db(
     // Cleanup on every path, but only while the pid file still names this
     // process. A restart replacement may have taken ownership of the shared
     // canonical paths before the old daemon finishes draining.
-    if remove_metadata_if_pid_matches(&paths, std::process::id()) {
-        remove_endpoint_record_if_owned(&paths);
-    }
+    metadata_guard.cleanup();
 
     signal_task.abort();
     if let Some(watchdog) = watchdog_task {

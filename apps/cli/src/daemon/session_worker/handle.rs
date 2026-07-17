@@ -290,6 +290,13 @@ impl SessionWorkerHandle {
         self.session.set_created_by_principal(principal)
     }
 
+    /// Commit a lazily-created session before an external process is told its
+    /// id. Ephemeral daemon attaches use this so their session namespace is
+    /// durable even if the client disconnects before sending a message.
+    pub fn persist_if_needed(&self) -> anyhow::Result<bool> {
+        self.session.persist_if_needed()
+    }
+
     pub fn set_env_overlay(&self, vars: HashMap<String, String>) {
         let mut overlay = self
             .env_overlay

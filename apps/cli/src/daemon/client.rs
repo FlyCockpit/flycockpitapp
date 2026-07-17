@@ -614,6 +614,8 @@ mod tests {
                 daemon_version: "0.1.test".to_string(),
                 protocol_version: proto::PROTOCOL_VERSION,
                 paused_sessions: 0,
+                database_path: "/tmp/cockpit.db".to_string(),
+                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
             },
         ));
     }
@@ -630,6 +632,8 @@ mod tests {
                 daemon_version: "0.1.test".to_string(),
                 protocol_version: proto::PROTOCOL_VERSION,
                 paused_sessions: 0,
+                database_path: "/tmp/cockpit.db".to_string(),
+                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
             },
         ));
         assert!(!is_nil_daemon_status_hello(Uuid::nil(), &Response::Ack));

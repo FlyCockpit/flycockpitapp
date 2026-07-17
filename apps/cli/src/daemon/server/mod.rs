@@ -1053,6 +1053,12 @@ where
                 .paused_session_work_all()
                 .map(|r| r.len())
                 .unwrap_or(0) as u32,
+            database_path: ctx
+                .db
+                .path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<in-memory>".to_string()),
+            schema_version: ctx.db.schema_version().unwrap_or(0),
         },
     );
     if proto.send(&hello).await.is_err() {

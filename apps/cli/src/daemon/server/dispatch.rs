@@ -766,6 +766,12 @@ async fn handle_request(
             daemon_version: proto::DAEMON_VERSION.to_string(),
             protocol_version: proto::PROTOCOL_VERSION,
             paused_sessions: ctx.db.paused_session_work_all().map_err(internal)?.len() as u32,
+            database_path: ctx
+                .db
+                .path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<in-memory>".to_string()),
+            schema_version: ctx.db.schema_version().map_err(internal)?,
         }),
 
         Request::RefreshEnv { vars } => {
@@ -1097,11 +1103,12 @@ async fn attach(
         && !principal.can_agent_write_project(&cfg_root.to_string_lossy())
         && principal.can_agent_read_project(&cfg_root.to_string_lossy());
     let client_no_sandbox = client_no_sandbox && !remote_readonly_attach;
-    let trust_policy =
-        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cfg_root)
-            .map_err(internal)?;
-    let (providers_cfg, extended_cfg) =
-        load_configs_with_trust(&cfg_root, &trust_policy).map_err(internal)?;
+    // Cross-process freshness invariant: no trust or session lookup may be
+    // cached across requests without an invalidation path. The registry makes
+    // the atomic live-vs-start decision: a live worker keeps its snapshotted
+    // policy, while every newly-created/resumed worker reads through SQLite
+    // after winning its start claim. Thus a trust flip affects the next worker
+    // creation and never retroactively mutates a running session.
     let client_snapshot = env_snapshot.map(EnvSnapshot::from_wire);
     let (session_env, env_baseline_meta, env_session_meta, env_drift, env_policy_applied) =
         select_session_env(ctx, client_snapshot, env_policy)?;
@@ -1111,14 +1118,17 @@ async fn attach(
         .attach(
             session_id,
             project_root,
-            &providers_cfg,
-            &extended_cfg,
             client_no_sandbox,
             model_override.as_deref(),
-            trust_policy,
             session_env,
         )
         .await
+        .map_err(workspace_trust_error)?;
+    // Attach-only projections use the policy snapshot of the handle that the
+    // registry actually returned. This is safe for both branches: live
+    // workers retain their original policy, while newly-started workers have
+    // already performed the post-claim DB read-through.
+    let (_, extended_cfg) = load_configs_with_trust(&handle.project_root, &handle.trust_policy)
         .map_err(internal)?;
 
     if session_id.is_none()
@@ -1127,6 +1137,12 @@ async fn attach(
         handle
             .set_created_by_principal(Some(tag))
             .map_err(internal)?;
+    }
+    // A per-run daemon can disappear as soon as its client exits. Make the
+    // session row durable before returning its id so another daemon process
+    // can always find it through the normal DB-backed resume path.
+    if session_id.is_none() && ctx.paths.ephemeral {
+        handle.persist_if_needed().map_err(internal)?;
     }
     if remote_readonly_attach {
         let _ = handle.set_sandbox(Some(crate::tools::sandbox_mode::SandboxMode::Sandbox), None);

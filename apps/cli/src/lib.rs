@@ -129,6 +129,8 @@ pub mod integration {
         pub socket_path: String,
         pub protocol_version: u32,
         pub paused_sessions: u32,
+        pub database_path: String,
+        pub schema_version: i64,
     }
 
     /// Stable subset of the global caffeinate state broadcast.
@@ -308,14 +310,29 @@ pub mod integration {
                     socket_path,
                     protocol_version,
                     paused_sessions,
+                    database_path,
+                    schema_version,
                     ..
                 } => Ok(DaemonStatus {
                     pid,
                     socket_path,
                     protocol_version,
                     paused_sessions,
+                    database_path,
+                    schema_version,
                 }),
                 other => Err(anyhow!("unexpected daemon status response: {other:?}")),
+            }
+        }
+
+        pub async fn stop(&self) -> Result<()> {
+            match self
+                .inner
+                .request_ok(crate::daemon::proto::Request::StopDaemon { grace_secs: None })
+                .await?
+            {
+                crate::daemon::proto::Response::Ack => Ok(()),
+                other => Err(anyhow!("unexpected stop response: {other:?}")),
             }
         }
 

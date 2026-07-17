@@ -459,6 +459,20 @@ fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     }
 }
 
+fn workspace_trust_error(err: anyhow::Error) -> ErrorPayload {
+    if err
+        .downcast_ref::<crate::config::trust::WorkspaceTrustError>()
+        .is_some()
+    {
+        ErrorPayload {
+            code: ErrorCode::WorkspaceTrust,
+            message: err.to_string(),
+        }
+    } else {
+        internal(err)
+    }
+}
+
 fn not_implemented(what: &str) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Internal,
@@ -533,7 +547,7 @@ fn load_configs(cwd: &Path) -> Result<(ProvidersConfig, ExtendedConfig)> {
     Ok((providers, extended))
 }
 
-fn load_configs_with_trust(
+pub(crate) fn load_configs_with_trust(
     cwd: &Path,
     policy: &WorkspaceTrustPolicy,
 ) -> Result<(ProvidersConfig, ExtendedConfig)> {

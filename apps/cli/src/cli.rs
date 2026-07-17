@@ -430,7 +430,11 @@ pub enum DaemonCommand {
         no_sandbox: bool,
     },
     /// Print whether the daemon is running.
-    Status,
+    Status {
+        /// Emit one JSON document with daemon, DB-path, and schema diagnostics.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -1210,6 +1214,17 @@ mod tests {
                 assert!(json);
             }
             other => panic!("expected session show command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_status_json_parses() {
+        match Cli::try_parse_from(["cockpit", "daemon", "status", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Daemon(DaemonCommand::Status { json })) => assert!(json),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 

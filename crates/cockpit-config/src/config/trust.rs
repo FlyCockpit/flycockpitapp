@@ -78,6 +78,36 @@ pub struct WorkspaceTrustPolicy {
     pub mode: WorkspaceTrustMode,
 }
 
+/// A fail-closed workspace-trust decision refusal. Keeping this distinct from
+/// path-resolution and database failures lets daemon clients branch on trust
+/// without mislabeling storage faults as user decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceTrustError {
+    Unset { root: PathBuf },
+    Untrusted { root: PathBuf },
+}
+
+impl std::fmt::Display for WorkspaceTrustError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unset { root } => write!(
+                f,
+                "workspace trust is not set for {}. Open the TUI once or run `cockpit trust set {} --mode trust|ignore-config|untrusted`.",
+                root.display(),
+                root.display()
+            ),
+            Self::Untrusted { root } => write!(
+                f,
+                "workspace {} is untrusted and cannot be opened. Change it with `cockpit trust set {} --mode trust|ignore-config`.",
+                root.display(),
+                root.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceTrustError {}
+
 static RUNTIME_POLICY: OnceLock<Mutex<Option<WorkspaceTrustPolicy>>> = OnceLock::new();
 tokio::task_local! {
     static TASK_POLICY: WorkspaceTrustPolicy;
@@ -184,18 +214,16 @@ pub fn resolve_workspace_trust_policy_from_db(
 ) -> Result<WorkspaceTrustPolicy> {
     let root = resolve_trust_root(path)?;
     let Some(decision) = db.workspace_trust_by_root(&root.root)? else {
-        bail!(
-            "workspace trust is not set for {}. Open the TUI once or run `cockpit trust set {} --mode trust|ignore-config|untrusted`.",
-            root.root.display(),
-            root.root.display()
-        );
+        return Err(WorkspaceTrustError::Unset {
+            root: root.root.clone(),
+        }
+        .into());
     };
     match decision.mode {
-        WorkspaceTrustMode::Untrusted => bail!(
-            "workspace {} is untrusted and cannot be opened. Change it with `cockpit trust set {} --mode trust|ignore-config`.",
-            root.root.display(),
-            root.root.display()
-        ),
+        WorkspaceTrustMode::Untrusted => Err(WorkspaceTrustError::Untrusted {
+            root: root.root.clone(),
+        }
+        .into()),
         mode => Ok(WorkspaceTrustPolicy { root, mode }),
     }
 }

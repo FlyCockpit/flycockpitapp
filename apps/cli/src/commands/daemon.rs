@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::cli::DaemonCommand;
 use crate::daemon::client::DaemonClient;
-use crate::daemon::proto::Request;
+use crate::daemon::proto::{Request, Response};
 use crate::daemon::{self, DaemonPaths, DaemonStatus};
 
 const EPHEMERAL_TUI_NOTE: &str =
@@ -117,8 +117,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             );
             Ok(())
         }
-        DaemonCommand::Status => {
+        DaemonCommand::Status { json } => {
             let probe = daemon::discover().await;
+            if json {
+                return print_json_status(&probe).await;
+            }
             match probe.status {
                 DaemonStatus::Running => {
                     println!(
@@ -156,6 +159,62 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
+    let resolved_database_path = crate::db::Db::default_path()?.display().to_string();
+    let mut value = serde_json::json!({
+        "status": daemon_status_name(probe.status),
+        "socket_path": probe.paths.socket.display().to_string(),
+        "database_path": resolved_database_path,
+        "schema_version": serde_json::Value::Null,
+    });
+
+    if probe.status == DaemonStatus::Running {
+        let response = DaemonClient::connect(&probe.paths.socket)
+            .await?
+            .request_ok(Request::DaemonStatus)
+            .await?;
+        let Response::DaemonStatus {
+            pid,
+            uptime_secs,
+            active_sessions,
+            socket_path,
+            daemon_version,
+            protocol_version,
+            paused_sessions,
+            database_path,
+            schema_version,
+        } = response
+        else {
+            bail!("unexpected daemon status response: {response:?}");
+        };
+        value = serde_json::json!({
+            "status": "running",
+            "pid": pid,
+            "uptime_secs": uptime_secs,
+            "active_sessions": active_sessions,
+            "paused_sessions": paused_sessions,
+            "socket_path": socket_path,
+            "daemon_version": daemon_version,
+            "protocol_version": protocol_version,
+            "database_path": database_path,
+            "schema_version": schema_version,
+        });
+    }
+
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn daemon_status_name(status: DaemonStatus) -> &'static str {
+    match status {
+        DaemonStatus::Running => "running",
+        DaemonStatus::LivePidSocketUnreachable => "live_pid_socket_unreachable",
+        DaemonStatus::UnverifiedPid => "unverified_pid",
+        DaemonStatus::Stale => "stale",
+        DaemonStatus::NotRunning => "not_running",
     }
 }
 

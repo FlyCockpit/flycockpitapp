@@ -700,6 +700,8 @@ pub enum ErrorCode {
     HashMismatch,
     /// Requested path is locked by another writer.
     LockConflict,
+    /// Workspace trust is unset or explicitly refuses access.
+    WorkspaceTrust,
     /// Anything else.
     Internal,
 }
@@ -719,6 +721,7 @@ impl std::fmt::Display for ErrorCode {
             Self::PathOutsideRoot => "path_outside_root",
             Self::HashMismatch => "hash_mismatch",
             Self::LockConflict => "lock_conflict",
+            Self::WorkspaceTrust => "workspace_trust",
             Self::Internal => "internal",
         };
         f.write_str(s)

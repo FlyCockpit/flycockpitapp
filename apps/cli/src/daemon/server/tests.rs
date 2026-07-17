@@ -6494,8 +6494,15 @@ mod tests {
         .await
         .expect_err("daemon attach must fail closed without a trust row");
 
-        assert_eq!(err.code, ErrorCode::Internal);
-        assert!(err.message.contains("workspace trust is not set"));
+        assert_eq!(err.code, ErrorCode::WorkspaceTrust);
+        assert_eq!(
+            err.message,
+            crate::config::trust::WorkspaceTrustError::Unset {
+                root: tmp.path().canonicalize().unwrap(),
+            }
+            .to_string()
+        );
+        assert!(!err.to_string().contains("internal:"));
         assert!(state.attached.is_none());
     }
 

@@ -137,9 +137,11 @@
     "data": {
       "active_sessions": 7,
       "daemon_version": "daemon_version-fixture",
+      "database_path": "database_path-fixture",
       "paused_sessions": 7,
       "pid": 7,
       "protocol_version": 7,
+      "schema_version": 7,
       "socket_path": "socket_path-fixture",
       "uptime_secs": 7
     },

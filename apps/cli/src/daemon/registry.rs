@@ -24,7 +24,9 @@ use uuid::Uuid;
 
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
-use crate::config::trust::WorkspaceTrustPolicy;
+use crate::config::trust::{
+    WorkspaceTrustError, WorkspaceTrustPolicy, resolve_workspace_trust_policy_from_db,
+};
 use crate::daemon::EventSender;
 use crate::daemon::session_worker::{self, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownSignal;
@@ -94,12 +96,35 @@ struct WorkerJoin {
 
 struct StartSlot {
     generation: WorkerGeneration,
-    result: Mutex<Option<std::result::Result<SessionWorkerHandle, String>>>,
+    result: Mutex<Option<std::result::Result<SessionWorkerHandle, StartFailure>>>,
     ready: watch::Sender<()>,
 }
 
+#[derive(Clone)]
+enum StartFailure {
+    WorkspaceTrust(WorkspaceTrustError),
+    Other(String),
+}
+
+impl StartFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        error
+            .downcast_ref::<WorkspaceTrustError>()
+            .cloned()
+            .map(Self::WorkspaceTrust)
+            .unwrap_or_else(|| Self::Other(error.to_string()))
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::WorkspaceTrust(error) => anyhow::Error::new(error),
+            Self::Other(message) => anyhow::Error::msg(message),
+        }
+    }
+}
+
 impl StartSlot {
-    fn finish(&self, result: std::result::Result<SessionWorkerHandle, String>) {
+    fn finish(&self, result: std::result::Result<SessionWorkerHandle, StartFailure>) {
         let mut slot_result = crate::sync::lock_or_recover(&self.result);
         if slot_result.is_none() {
             *slot_result = Some(result);
@@ -124,7 +149,7 @@ impl StartTicket {
         remove_start_slot(&self.inner, self.session_id, &self.slot);
         self.slot.finish(match result {
             Ok(handle) => Ok(handle.clone()),
-            Err(e) => Err(e.to_string()),
+            Err(error) => Err(StartFailure::from_error(error)),
         });
         self.completed = true;
     }
@@ -136,10 +161,10 @@ impl Drop for StartTicket {
             return;
         }
         remove_start_slot(&self.inner, self.session_id, &self.slot);
-        self.slot.finish(Err(format!(
+        self.slot.finish(Err(StartFailure::Other(format!(
             "session worker {} start abandoned before completion",
             self.session_id
-        )));
+        ))));
     }
 }
 
@@ -153,7 +178,7 @@ async fn wait_for_start(slot: Arc<StartSlot>) -> Result<SessionWorkerHandle> {
     let mut ready = slot.ready.subscribe();
     loop {
         if let Some(result) = crate::sync::lock_or_recover(&slot.result).clone() {
-            return result.clone().map_err(anyhow::Error::msg);
+            return result.clone().map_err(StartFailure::into_error);
         }
         match tokio::time::timeout(START_WAIT_TIMEOUT, ready.changed()).await {
             Ok(Ok(())) => {}
@@ -252,22 +277,18 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.global_bus) = Some(tx);
     }
 
-    /// Spawn (or look up) the worker for a session. The caller
-    /// supplies the resolved provider + extended configs so the
-    /// registry can build the model and redaction table without
-    /// re-walking the layered config every attach. (Wiring the
-    /// resolver inside the daemon lands with the daemon-side `/config`
-    /// payload.)
+    /// Spawn (or look up) the worker for a session. Live workers retain their
+    /// immutable trust/config snapshot. Every path that actually starts a new
+    /// worker resolves trust and config only after winning the atomic start
+    /// claim, so a handle that closes during attach cannot turn a formerly-live
+    /// policy snapshot into a newly-started worker.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         &self,
         session_id: Option<Uuid>,
         project_root: Option<PathBuf>,
-        providers_cfg: &ProvidersConfig,
-        extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
         model_override: Option<&str>,
-        trust_policy: WorkspaceTrustPolicy,
         env_snapshot: EnvSnapshot,
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
@@ -292,15 +313,8 @@ impl SessionRegistry {
                 }
                 AttachClaim::Start(ticket) => {
                     let generation = ticket.generation();
-                    let result = self.start_resumed_worker(
-                        id,
-                        providers_cfg,
-                        extended_cfg,
-                        client_no_sandbox,
-                        trust_policy,
-                        env_snapshot,
-                        generation,
-                    );
+                    let result =
+                        self.start_resumed_worker(id, client_no_sandbox, env_snapshot, generation);
                     self.finish_attach_start(ticket, &result);
                     let handle = result?;
                     self.resume_session_locks(id);
@@ -313,13 +327,16 @@ impl SessionRegistry {
         let Some(project_root) = project_root else {
             bail!("attach requires either session_id or project_root");
         };
+        let trust_policy = resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root)?;
+        let (providers_cfg, extended_cfg) =
+            crate::daemon::server::load_configs_with_trust(&project_root, &trust_policy)?;
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written. The worker persists it on the first user message.
         let session = Session::create_deferred(
             self.inner.db.clone(),
             project_root,
-            session_worker::initial_active_agent(extended_cfg),
+            session_worker::initial_active_agent(&extended_cfg),
         )
         .context("creating session")?;
         if let Some(active) = &providers_cfg.active_model {
@@ -333,8 +350,8 @@ impl SessionRegistry {
         };
         self.start_worker(
             session,
-            providers_cfg,
-            extended_cfg,
+            &providers_cfg,
+            &extended_cfg,
             client_no_sandbox,
             model_override,
             trust_policy,
@@ -347,23 +364,24 @@ impl SessionRegistry {
     fn start_resumed_worker(
         &self,
         id: Uuid,
-        providers_cfg: &ProvidersConfig,
-        extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
-        trust_policy: WorkspaceTrustPolicy,
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
         let session = Session::resume(self.inner.db.clone(), id)
             .context("resuming session")?
             .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
+        let trust_policy =
+            resolve_workspace_trust_policy_from_db(&self.inner.db, &session.project_root)?;
+        let (providers_cfg, extended_cfg) =
+            crate::daemon::server::load_configs_with_trust(&session.project_root, &trust_policy)?;
         // Resume keeps the running worker's model; an override only seeds
         // a newly-created session (matched by the server's gating). Plan
         // attribution is likewise create-only.
         self.start_worker(
             session,
-            providers_cfg,
-            extended_cfg,
+            &providers_cfg,
+            &extended_cfg,
             client_no_sandbox,
             None,
             trust_policy,
@@ -833,9 +851,11 @@ impl SessionRegistry {
             .map(|entry| entry.handle.live_status())
     }
 
-    /// Current live worker handle for an already-running session. Unlike
-    /// [`Self::attach`], this never starts or resumes a worker; side-channel
-    /// requests use it to avoid creating work for dead sessions.
+    /// Current live worker handle for an already-running session. This is the
+    /// only acceptable session lookup cache: unlike [`Self::attach`], it never
+    /// starts or resumes a worker, and callers must let misses continue through
+    /// the shared DB-backed resume path. No cross-process state may be cached
+    /// across requests without an invalidation path.
     pub fn live_handle(&self, session_id: Uuid) -> Option<SessionWorkerHandle> {
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
@@ -1287,9 +1307,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_claim_drops_closed_stale_handle_and_starts_fresh() {
+    async fn closed_worker_restart_reads_fresh_trust_after_start_claim() {
         let reg = test_registry();
-        let session = test_session(&reg);
+        let session = persisted_test_session(&reg);
         let id = session.id;
         let handle = test_handle(&reg, session);
         assert!(
@@ -1298,13 +1318,89 @@ mod tests {
         );
         let join = tokio::spawn(async {});
         reg.insert_test_worker(handle, join);
+        reg.inner
+            .db
+            .set_workspace_trust(
+                reg.inner
+                    .db
+                    .get_session(id)
+                    .unwrap()
+                    .expect("persisted session")
+                    .project_root
+                    .as_ref(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+            )
+            .unwrap();
 
-        match reg.claim_attach(id) {
-            AttachClaim::Start(_) => {}
-            _ => panic!("closed stale handle should be removed and restarted"),
-        }
+        let result = reg
+            .attach(
+                Some(id),
+                None,
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await;
+        let err = match result {
+            Ok(_) => panic!("closed worker restart must observe revoked trust"),
+            Err(err) => err,
+        };
+        assert!(
+            err.downcast_ref::<crate::config::trust::WorkspaceTrustError>()
+                .is_some(),
+            "unexpected error: {err:#}"
+        );
         assert!(reg.lookup(id).is_none());
         assert!(!crate::sync::lock_or_recover(&reg.inner.worker_joins).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_waiter_preserves_workspace_trust_error() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let id = session.id;
+        reg.inner
+            .db
+            .set_workspace_trust(
+                &session.project_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+            )
+            .unwrap();
+
+        let ticket = match reg.claim_attach(id) {
+            AttachClaim::Start(ticket) => ticket,
+            _ => panic!("first concurrent resume must own the start"),
+        };
+        let slot = match reg.claim_attach(id) {
+            AttachClaim::Starting(slot) => slot,
+            _ => panic!("second concurrent resume must wait on the shared start"),
+        };
+        let result = reg.start_resumed_worker(
+            id,
+            false,
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            ticket.generation(),
+        );
+        match &result {
+            Ok(_) => panic!("winner must observe revoked trust"),
+            Err(error) => assert!(error.downcast_ref::<WorkspaceTrustError>().is_some()),
+        }
+        reg.finish_attach_start(ticket, &result);
+
+        let waiter_error = match wait_for_start(slot).await {
+            Ok(_) => panic!("waiter must receive the failed start"),
+            Err(error) => error,
+        };
+        assert!(
+            waiter_error.downcast_ref::<WorkspaceTrustError>().is_some(),
+            "waiter lost typed trust error: {waiter_error:#}"
+        );
     }
 
     /// drain-awaits-in-flight: a worker still finishing its turn must be

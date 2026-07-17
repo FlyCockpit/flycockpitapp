@@ -69,6 +69,16 @@ use rusqlite::{Connection, OpenFlags};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Exact identity of the pre-release squashed schema in `0001_initial.sql`.
+///
+/// The migration ledger cannot detect edits to an already-applied squashed
+/// migration, so every amendment to `0001_initial.sql` must also increment
+/// this value and the matching `PRAGMA user_version` in that file. This gate
+/// is intentionally strict until the first public release: developers move a
+/// stale database aside and let Cockpit recreate it rather than running a
+/// compatibility migration.
+pub const EXPECTED_SCHEMA_VERSION: i64 = 1;
+
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -290,14 +300,22 @@ impl std::fmt::Debug for Db {
 }
 
 impl Db {
+    /// Resolve the canonical database path without creating or opening it.
+    pub fn default_path() -> Result<PathBuf> {
+        Ok(files::cockpit_data_dir()?.join("cockpit.db"))
+    }
+
     /// Open the canonical cockpit database, creating parent directories
     /// as needed. Runs every pending migration before returning.
     pub fn open_default() -> Result<Self> {
         OPEN_DEFAULT_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-        let dir = files::cockpit_data_dir()?;
-        files::ensure_private_dir(&dir).with_context(|| format!("securing {}", dir.display()))?;
-        Self::open(&dir.join("cockpit.db"))
+        let path = Self::default_path()?;
+        let dir = path
+            .parent()
+            .context("canonical cockpit DB path has no parent")?;
+        files::ensure_private_dir(dir).with_context(|| format!("securing {}", dir.display()))?;
+        Self::open(&path)
     }
 
     /// Open a database at an arbitrary path.
@@ -314,6 +332,8 @@ impl Db {
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         timer.phase("migrate");
+        validate_schema_version(&conn, Some(path))?;
+        timer.phase("schema_version");
         drop(conn);
         let writer = Writer::start(path.to_path_buf())?;
         let db = Self {
@@ -338,14 +358,18 @@ impl Db {
             path: None,
         };
         db.write_blocking(migrate)?;
+        db.read_blocking(|conn| validate_schema_version(conn, None))?;
         Ok(db)
     }
 
     /// File path the database is backed by, or `None` for in-memory.
-    // Retained for diagnostics/tooling that reports the backing DB path.
-    #[allow(dead_code)]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Return the exact squashed-schema identity recorded in SQLite.
+    pub fn schema_version(&self) -> Result<i64> {
+        self.read_blocking(sqlite_schema_version)
     }
 
     pub async fn read<F, T>(&self, f: F) -> Result<T>
@@ -607,6 +631,27 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
         |row| row.get(0),
     )
     .context("reading current schema version")
+}
+
+fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("reading SQLite schema version")
+}
+
+fn validate_schema_version(conn: &Connection, path: Option<&Path>) -> Result<()> {
+    let actual = sqlite_schema_version(conn)?;
+    if actual == EXPECTED_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let location = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<in-memory>".to_string());
+    anyhow::bail!(
+        "database schema version mismatch for {location}: found {actual}, expected \
+         {EXPECTED_SCHEMA_VERSION}. This pre-release build uses a squashed schema; move the \
+         database and its -wal/-shm sidecars aside, then restart Cockpit. See Cockpit CLI \
+         README: Development schema resets"
+    )
 }
 
 fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {

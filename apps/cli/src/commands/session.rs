@@ -13,10 +13,33 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Answer(args) => answer(args).await,
         SessionCommand::Show { session_id, json } => show(&session_id, json),
-        SessionCommand::List | SessionCommand::Delete { .. } => anyhow::bail!(
+        SessionCommand::List => list(),
+        SessionCommand::Delete { .. } => anyhow::bail!(
             "cockpit session is not implemented yet (planned; backed by ~/.local/share/cockpit/cockpit.db)"
         ),
     }
+}
+
+fn list() -> Result<()> {
+    let db = Db::open_default().context("opening cockpit DB")?;
+    let sessions = db.list_sessions(false, 100).context("listing sessions")?;
+    if sessions.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    for session in sessions {
+        let display_id = session
+            .short_id
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| session.session_id.to_string());
+        let title = session.title.as_deref().unwrap_or("(untitled)");
+        println!(
+            "{display_id}\t{}\t{title}\t{}",
+            session.session_id, session.project_root
+        );
+    }
+    Ok(())
 }
 
 fn show(session: &str, json_mode: bool) -> Result<()> {

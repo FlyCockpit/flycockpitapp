@@ -180,6 +180,28 @@ Runtime data:
 - Credentials: `~/.local/state/cockpit/credentials.json` or `$XDG_STATE_HOME/cockpit/credentials.json`
 - Logs: under the user cache directory, typically `~/.cache/cockpit/cockpit.log`
 
+`cockpit daemon status --json` reports the daemon's resolved SQLite path and
+exact schema version. This is useful when two shells appear to see different
+trust or session state.
+
+### Development schema resets
+
+Before the first public release, the SQLite schema is deliberately squashed
+into `0001_initial.sql`. A binary refuses to open a development database made
+from an older amendment instead of silently running against missing tables or
+columns. Preserve the old data by moving the database and its WAL sidecars
+aside, then restart Cockpit to create the current schema:
+
+```sh
+cockpit_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cockpit"
+mkdir -p "$cockpit_data_dir/pre-schema-reset"
+mv "$cockpit_data_dir"/cockpit.db* "$cockpit_data_dir/pre-schema-reset"/
+```
+
+Run `cockpit daemon status --json` first if you use a non-default data layout;
+move the exact `database_path` it reports and the adjacent `-wal` / `-shm`
+files. This is a pre-release development reset, not a production migration.
+
 ## Providers
 
 Provider setup is primarily driven through `/settings -> Providers` in the TUI. The CLI can list templates, inspect configured models, refresh provider catalogs, and show provider usage where supported.

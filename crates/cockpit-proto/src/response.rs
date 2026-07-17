@@ -211,6 +211,12 @@ pub enum Response {
         protocol_version: u32,
         #[serde(default)]
         paused_sessions: u32,
+        /// Resolved backing SQLite path used by this daemon process.
+        #[serde(default)]
+        database_path: String,
+        /// Exact amended-squash schema identity (`PRAGMA user_version`).
+        #[serde(default)]
+        schema_version: i64,
     },
 
     /// The three 30-day autocomplete count maps. `models` and `slash`

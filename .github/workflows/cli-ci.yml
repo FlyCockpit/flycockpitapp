@@ -8,20 +8,24 @@ name: CLI CI
       - master
     paths:
       - "apps/cli/**"
+      - "apps/relay-rs/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/cli-ci.yml"
   pull_request:
     paths:
       - "apps/cli/**"
+      - "apps/relay-rs/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/cli-ci.yml"
   workflow_dispatch:
 
 concurrency:
   group: cli-ci-${{ github.ref }}
   cancel-in-progress: true
-
-defaults:
-  run:
-    working-directory: apps/cli
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,16 +68,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ runner.os }}-${{ matrix.toolchain }}
-          workspaces: apps/cli -> target
+          workspaces: . -> target
 
       - name: Build
-        run: cargo build --locked
+        run: cargo build --locked --workspace
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked --workspace -- -D warnings
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check

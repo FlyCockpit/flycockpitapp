@@ -28,10 +28,38 @@ const INNER_PAD: usize = 1;
 /// env, or the box doesn't fit the pane (too narrow or too short — we
 /// skip rather than clip a half-drawn box).
 pub fn build(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'static>>> {
-    if banner::suppressed_for_tui(info.banner_enabled) {
+    let suppressed = banner::suppressed_for_tui(info.banner_enabled);
+    #[cfg(test)]
+    let suppressed = suppressed && !TEST_FORCE_VISIBLE.with(std::cell::Cell::get);
+    if suppressed {
         return None;
     }
     build_box(info, pane_w, pane_h)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FORCE_VISIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_banner_visible<T>(f: impl FnOnce() -> T) -> T {
+    struct ResetVisibility<'a> {
+        force: &'a std::cell::Cell<bool>,
+        previous: bool,
+    }
+
+    impl Drop for ResetVisibility<'_> {
+        fn drop(&mut self) {
+            self.force.set(self.previous);
+        }
+    }
+
+    TEST_FORCE_VISIBLE.with(|force| {
+        let previous = force.replace(true);
+        let _reset = ResetVisibility { force, previous };
+        f()
+    })
 }
 
 /// The pure box construction, without the config/env suppression gate.

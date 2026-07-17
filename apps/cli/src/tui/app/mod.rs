@@ -84,9 +84,6 @@ use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput, with_input_sus
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
 use crate::welcome::{self, LaunchBundle, LaunchInfo};
 
-const MIN_INPUT_CONTENT: u16 = 1;
-const MAX_INPUT_CONTENT: u16 = 6;
-const INPUT_BORDER: u16 = 2;
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ANIMATION_TICK: Duration = Duration::from_millis(100);
 const RUN_CAPTURE_MAX_BYTES: usize = 256 * 1024;

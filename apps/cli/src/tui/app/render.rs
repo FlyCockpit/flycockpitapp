@@ -25,6 +25,7 @@ use crate::tui::composer::{
     INPUT_PREFIX, VimMode, display_width, input_prefix_width, truncate_display_width,
     visual_position_for_byte, wrap_display_chunks,
 };
+use crate::tui::geometry::{INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneGeometry};
 use crate::tui::history::{
     AGENT_INDENT, HistoryEntry, Rendered, ToolCallState, agent_display_label,
     format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
@@ -36,9 +37,9 @@ use crate::tui::theme::{
 };
 
 use super::{
-    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, INPUT_BORDER,
-    MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide, Selection, SuggestionBoxKind,
-    SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
+    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, PaneSide, Selection,
+    SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
+    WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -1764,10 +1765,10 @@ impl App {
         // pinned messages target the visual row model used for scrolling.
         self.msg_abs_line = msg_abs_line;
 
-        // The launch-banner box is the topmost scroll entry (GOALS
-        // §1g): it floats centered in an under-full pane and scrolls
-        // off the top with the oldest messages once the transcript
-        // grows tall enough to reach it.
+        // The launch-banner box is the topmost scroll entry. Before the first
+        // transcript message it centers against a stable frame-height
+        // baseline, immune to transient bottom chrome. Once history exists it
+        // retains the original centered/slide-up/scroll-off behavior.
         let box_lines = self.banner_box_lines(area.width, area.height);
         let b = box_lines.len();
         let m = all.len();
@@ -1795,7 +1796,12 @@ impl App {
             // directly above the messages once they'd reach it. Content
             // fits, so there's no scrollback.
             self.chat_scroll_offset = 0;
-            let centered_top = (area_h - b) / 2;
+            let centered_top = if m == 0 {
+                let baseline_h = PaneGeometry::baseline_body_height(frame.area().height) as usize;
+                baseline_h.saturating_sub(b) / 2
+            } else {
+                (area_h - b) / 2
+            };
             let box_top = centered_top.min(area_h - m - b);
             let msg_top = area_h - m;
             let mut v: Vec<Line<'static>> = (0..area_h).map(|_| Line::default()).collect();
@@ -4171,10 +4177,12 @@ mod render_history_spacing_tests {
         App, ChatCopyTarget, ChatRowKind, ControlChip, Selection, TranscriptFind,
         affordance_target_for_row, extract_selection_plaintext,
     };
-    use crate::config::extended::{DiffStyle, ThinkingDisplay};
+    use crate::config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
     use crate::db::{open_default_call_count, reset_open_default_call_count};
+    use crate::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use crate::tokens::{count_call_count, reset_count_call_count};
-    use crate::tui::app::AffordanceTarget;
+    use crate::tui::app::{AffordanceTarget, SandboxDownNotice};
+    use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
         ToolCallState, render_entry_call_count, render_pending, render_pending_incremental,
@@ -4417,6 +4425,208 @@ mod render_history_spacing_tests {
             .draw(|f| app.render_history(f, Rect::new(0, 0, width, height)))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn render_app_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        crate::tui::banner_box::with_test_banner_visible(|| {
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        });
+        terminal.backend().buffer().clone()
+    }
+
+    fn banner_top_row(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> usize {
+        (0..height)
+            .find(|&y| (0..width).any(|x| buffer[(x, y)].symbol() == "╭"))
+            .map(usize::from)
+            .expect("launch banner top border")
+    }
+
+    fn empty_banner_app(root: &std::path::Path) -> App {
+        let mut app = App::new(Some(root), false);
+        app.daemon_prompt = None;
+        app.launch.banner_enabled = true;
+        app.vim_setting = VimModeSetting::Disabled;
+        app.composer.set_vim_enabled(false);
+        app
+    }
+
+    #[test]
+    fn banner_row_stable_across_transient_chrome() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 40;
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["alpha.rs", "beta.rs", "gamma.rs"] {
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+
+        let mut idle = empty_banner_app(tmp.path());
+        let expected = banner_top_row(&render_app_buffer(&mut idle, WIDTH, HEIGHT), WIDTH, HEIGHT);
+
+        let mut slash_full = empty_banner_app(tmp.path());
+        slash_full.composer.set("/");
+        slash_full.reset_slash_window();
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut slash_full, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut slash_small = empty_banner_app(tmp.path());
+        slash_small.composer.set("/help");
+        slash_small.reset_slash_window();
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut slash_small, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut at_popup = empty_banner_app(tmp.path());
+        at_popup.composer.set("@");
+        at_popup.reset_at_window();
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut at_popup, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut vim_hint = empty_banner_app(tmp.path());
+        vim_hint.vim_setting = VimModeSetting::Hint;
+        vim_hint.composer.set_vim_enabled(true);
+        vim_hint.composer.set_vim_mode(VimMode::Normal);
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut vim_hint, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut tall_input = empty_banner_app(tmp.path());
+        tall_input.composer.set("one\ntwo\nthree\nfour\nfive\nsix");
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut tall_input, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut queued = empty_banner_app(tmp.path());
+        queued.queue.push(QueuedUserMessage {
+            id: uuid::Uuid::new_v4(),
+            status: QueueItemStatus::Queued,
+            text: "queued".to_string(),
+            target: QueueTarget::default(),
+        });
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut queued, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut pinned = empty_banner_app(tmp.path());
+        pinned.pin_count = 1;
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut pinned, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+
+        let mut sandbox = empty_banner_app(tmp.path());
+        sandbox.sandbox_down_notice = Some(SandboxDownNotice {
+            remedy: "enable unprivileged user namespaces".to_string(),
+            fix_command: None,
+        });
+        assert_eq!(
+            banner_top_row(
+                &render_app_buffer(&mut sandbox, WIDTH, HEIGHT),
+                WIDTH,
+                HEIGHT
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn banner_clamped_when_transient_chrome_would_overlap() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 24;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = empty_banner_app(tmp.path());
+        app.composer.set("/");
+        app.reset_slash_window();
+
+        let buffer = render_app_buffer(&mut app, WIDTH, HEIGHT);
+        let top = banner_top_row(&buffer, WIDTH, HEIGHT);
+        let banner_height = app.chat_banner_lines;
+        let chat = app.chat_area.expect("chat area");
+        let rects = app.geometry().layout(Rect::new(0, 0, WIDTH, HEIGHT));
+
+        assert_eq!(top, chat.height as usize - banner_height);
+        assert!(top + banner_height <= rects.suggestions.y as usize);
+    }
+
+    #[test]
+    fn banner_resting_position_unchanged_without_transient_chrome() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 40;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = empty_banner_app(tmp.path());
+
+        let buffer = render_app_buffer(&mut app, WIDTH, HEIGHT);
+        let top = banner_top_row(&buffer, WIDTH, HEIGHT);
+        let area_h = app.chat_area.expect("chat area").height as usize;
+
+        assert_eq!(top, (area_h - app.chat_banner_lines) / 2);
+    }
+
+    #[test]
+    fn banner_behavior_unchanged_once_transcript_nonempty() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = empty_banner_app(tmp.path());
+        app.history.push(user("first message"));
+
+        let buffer = render_app_buffer(&mut app, WIDTH, HEIGHT);
+        let top = banner_top_row(&buffer, WIDTH, HEIGHT);
+        let area_h = app.chat_area.expect("chat area").height as usize;
+        let banner_height = app.chat_banner_lines;
+        let message_height = app.chat_total_lines - banner_height;
+        assert_eq!(
+            top,
+            ((area_h - banner_height) / 2).min(area_h - message_height - banner_height)
+        );
+
+        app.history = (0..40)
+            .map(|index| user(&format!("overflow message {index}")))
+            .collect();
+        let _ = render_app_buffer(&mut app, WIDTH, HEIGHT);
+        assert!(
+            app.chat_row_meta
+                .iter()
+                .all(|meta| meta.row_kind != ChatRowKind::Banner),
+            "overflow keeps the launch banner above the visible bottom window"
+        );
     }
 
     fn buffer_rows(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<String> {

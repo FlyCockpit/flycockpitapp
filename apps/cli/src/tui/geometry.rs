@@ -13,6 +13,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 
 pub const STATUS_HEIGHT: u16 = 1;
 pub const MIN_HISTORY_HEIGHT: u16 = 1;
+pub const MIN_INPUT_CONTENT: u16 = 1;
+pub const MAX_INPUT_CONTENT: u16 = 6;
+pub const INPUT_BORDER: u16 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PaneGeometry {
@@ -91,6 +94,11 @@ pub struct PaneRects {
 }
 
 impl PaneGeometry {
+    /// Stable launch-banner reference height: the frame minus only the
+    /// permanent status row and the minimum bordered input box.
+    pub const fn baseline_body_height(frame_height: u16) -> u16 {
+        frame_height.saturating_sub(STATUS_HEIGHT + MIN_INPUT_CONTENT + INPUT_BORDER)
+    }
     /// Build the geometry for an app frame.
     ///
     /// `input_height` and `suggestions_height` are passed in (rather than
@@ -278,6 +286,18 @@ impl PaneGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_body_height_subtracts_only_permanent_chrome() {
+        assert_eq!(PaneGeometry::baseline_body_height(24), 20);
+        assert_eq!(PaneGeometry::baseline_body_height(4), 0);
+        assert_eq!(PaneGeometry::baseline_body_height(2), 0);
+
+        let transient_heights = [0, 1, 3, 6, 8, u16::MAX];
+        for _transient in transient_heights {
+            assert_eq!(PaneGeometry::baseline_body_height(40), 36);
+        }
+    }
 
     #[test]
     fn queue_and_input_rects_overlap_on_one_border_row() {

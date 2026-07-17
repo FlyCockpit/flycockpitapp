@@ -69,7 +69,7 @@ async fn handle_request(
             let db = ctx.db.clone();
             let task_call_id_for_read = task_call_id.clone();
             let label_for_read = label.clone();
-            let history = db
+            let mut history = db
                 .read(move |conn| {
                     crate::engine::rehydrate::subagent_history_snapshot_conn(
                         conn,
@@ -80,6 +80,29 @@ async fn handle_request(
                 })
                 .await
                 .map_err(internal)?;
+            if !state.principal.is_owner() {
+                let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
+                    handle.redaction_table()
+                } else {
+                    let session = crate::session::Session::resume(ctx.db.clone(), session_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::UnknownSession,
+                            message: format!("unknown session {session_id}"),
+                        })?;
+                    std::sync::Arc::new(
+                        session
+                            .persisted_redaction_table()
+                            .map_err(internal)?
+                            .ok_or_else(|| ErrorPayload {
+                                code: ErrorCode::Authorization,
+                                message: "session transcript redaction data is unavailable"
+                                    .to_string(),
+                            })?,
+                    )
+                };
+                history = scrub_history_for_principal(&state.principal, history, &redact);
+            }
             Ok(Response::SubagentTranscript {
                 session_id,
                 task_call_id,
@@ -90,6 +113,8 @@ async fn handle_request(
 
         Request::SendUserMessage {
             text,
+            display_text,
+            tag_expansions,
             image_refs,
             forced_skill,
         } => {
@@ -112,6 +137,8 @@ async fn handle_request(
                     submission: Box::new(crate::engine::message::UserSubmission {
                         kind: crate::engine::message::UserSubmissionKind::User,
                         text,
+                        display_text,
+                        tag_expansions,
                         images,
                         forced_skill,
                         origin_principal: state.principal.tag(),

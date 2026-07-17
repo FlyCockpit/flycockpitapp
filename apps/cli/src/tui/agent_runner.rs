@@ -553,6 +553,8 @@ fn try_spawn_inner(
                 match client
                     .request(Request::SendUserMessage {
                         text: sub.text,
+                        display_text: sub.display_text,
+                        tag_expansions: sub.tag_expansions,
                         image_refs: refs,
                         forced_skill: sub.forced_skill,
                     })
@@ -1445,6 +1447,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         },
         QueuedUserMessagesFolded {
             text,
+            display_text,
+            tag_expansions,
             queue_item_ids,
             target,
             seq,
@@ -1452,6 +1456,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::QueuedUserMessagesFolded {
             text,
+            display_text,
+            tag_expansions,
             queue_item_ids,
             target: queue_target_from_proto(target),
             seq,
@@ -2064,6 +2070,7 @@ fn queue_item_from_proto(item: proto::QueueItem) -> crate::engine::message::Queu
             proto::QueueItemStatus::Folding => crate::engine::message::QueueItemStatus::Folding,
         },
         text: item.text,
+        display_text: item.display_text,
         target: queue_target_from_proto(item.target),
     }
 }

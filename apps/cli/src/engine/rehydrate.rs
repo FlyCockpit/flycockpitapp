@@ -365,8 +365,21 @@ fn history_snapshot_from_events_conn(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let display_text = ev
+                    .data
+                    .get("display_text")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let tag_expansions = ev
+                    .data
+                    .get("tag_expansions")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
                 snapshot.push(proto::HistoryEntry::User {
                     text,
+                    display_text,
+                    tag_expansions,
                     ts_ms: ev.ts_ms,
                     seq: ev.seq,
                     origin_principal: ev.origin_principal.clone(),
@@ -618,8 +631,21 @@ pub fn subagent_history_snapshot_conn(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let display_text = ev
+                    .data
+                    .get("display_text")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let tag_expansions = ev
+                    .data
+                    .get("tag_expansions")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
                 snapshot.push(proto::HistoryEntry::User {
                     text,
+                    display_text,
+                    tag_expansions,
                     ts_ms: ev.ts_ms,
                     seq: ev.seq,
                     origin_principal: ev.origin_principal.clone(),
@@ -3729,6 +3755,64 @@ mod tests {
     }
 
     // ---- wire history snapshot (implementation note) -----
+
+    #[test]
+    fn rehydrate_user_message_prefers_display_text() {
+        let s = root_session();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &json!({
+                "text": "<file path=\"src/lib.rs\">expanded</file>",
+                "display_text": "review @src/lib.rs",
+                "tag_expansions": [{
+                    "tool": "read",
+                    "path": "src/lib.rs",
+                    "detail": "142 lines",
+                    "ok": true
+                }]
+            }),
+        )
+        .unwrap();
+
+        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        match &snapshot[0] {
+            proto::HistoryEntry::User {
+                text,
+                display_text,
+                tag_expansions,
+                ..
+            } => {
+                assert!(text.starts_with("<file"));
+                assert_eq!(display_text.as_deref(), Some("review @src/lib.rs"));
+                assert_eq!(tag_expansions.len(), 1);
+                assert_eq!(tag_expansions[0].path, "src/lib.rs");
+            }
+            other => panic!("expected user history entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehydrate_user_message_legacy_text_fallback() {
+        let s = root_session();
+        record_user(&s, "legacy wire text");
+
+        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        match &snapshot[0] {
+            proto::HistoryEntry::User {
+                text,
+                display_text,
+                tag_expansions,
+                ..
+            } => {
+                assert_eq!(text, "legacy wire text");
+                assert!(display_text.is_none());
+                assert!(tag_expansions.is_empty());
+            }
+            other => panic!("expected user history entry, got {other:?}"),
+        }
+    }
 
     /// REGRESSION: the daemon attach snapshot must carry ALL THREE entry kinds
     /// (user message → assistant message → tool call) in chronological order —

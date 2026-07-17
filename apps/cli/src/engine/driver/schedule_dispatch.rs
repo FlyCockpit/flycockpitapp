@@ -86,6 +86,8 @@ impl Driver {
                     UserSubmission {
                         kind: UserSubmissionKind::User,
                         text: injected,
+                        display_text: None,
+                        tag_expansions: Vec::new(),
                         images: Vec::new(),
                         forced_skill: None,
                         origin_principal: None,

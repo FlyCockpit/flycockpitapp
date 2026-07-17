@@ -768,6 +768,8 @@ impl Driver {
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     kind: UserSubmissionKind::User,
                     text: self.with_time_prelude(prepared.text),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
                     images: prepared.images,
                     forced_skill: None,
                     origin_principal: None,
@@ -2270,6 +2272,8 @@ impl Driver {
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     kind: UserSubmissionKind::User,
                     text: self.with_time_prelude(prepared.text),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
                     images: prepared.images,
                     forced_skill: None,
                     origin_principal: None,

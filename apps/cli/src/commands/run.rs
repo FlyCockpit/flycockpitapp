@@ -381,6 +381,8 @@ pub(crate) async fn attach_send_pump(
         client
             .request_ok(Request::SendUserMessage {
                 text: prompt,
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs,
                 forced_skill: None,
             })

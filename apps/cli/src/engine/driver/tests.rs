@@ -3308,6 +3308,8 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
     let prompt = crate::engine::message::build_user_message(UserSubmission {
         kind: UserSubmissionKind::User,
         text: "next root message".into(),
+        display_text: None,
+        tag_expansions: Vec::new(),
         images: vec![],
         forced_skill: None,
         origin_principal: None,
@@ -3427,6 +3429,8 @@ async fn all_unwind_paths_drain_pending_input() {
                     UserSubmission {
                         kind: UserSubmissionKind::User,
                         text: text.to_string(),
+                        display_text: None,
+                        tag_expansions: Vec::new(),
                         images: vec![],
                         forced_skill: None,
                         origin_principal: None,
@@ -3494,6 +3498,7 @@ async fn queued_user_fold_records_and_emits_stable_ids() {
                 target: event_target,
                 seq: event_seq,
                 preflight_cleaned,
+                ..
             } => {
                 assert_eq!(text, expected_text);
                 assert_eq!(queue_item_ids, vec![expected_id]);
@@ -7966,6 +7971,8 @@ fn delivery_event_data_carries_job_id_round_trip() {
     // Async-result delivery: `data.job_id` present.
     let delivery = user_message_event_data(
         "[async result · loop · sched-abc]\nok",
+        None,
+        &[],
         Some("sched-abc"),
         &[],
         None,
@@ -7980,7 +7987,7 @@ fn delivery_event_data_carries_job_id_round_trip() {
         )
         .unwrap();
     // Ordinary user input: no `job_id` key.
-    let ordinary = user_message_event_data("hello", None, &[], None, None);
+    let ordinary = user_message_event_data("hello", None, &[], None, &[], None, None);
     assert!(
         ordinary.get("job_id").is_none(),
         "ordinary input must omit data.job_id: {ordinary}"
@@ -8016,6 +8023,31 @@ fn delivery_event_data_carries_job_id_round_trip() {
             .count(),
         1,
     );
+}
+
+#[test]
+fn user_message_event_data_includes_display_fields() {
+    let expansions = vec![crate::daemon::proto::TagExpansionMeta {
+        tool: "read".into(),
+        path: "src/lib.rs".into(),
+        detail: "142 lines".into(),
+        ok: true,
+    }];
+    let data = user_message_event_data(
+        "<file path=\"src/lib.rs\">expanded</file>",
+        Some("review @src/lib.rs"),
+        &expansions,
+        None,
+        &[],
+        None,
+        None,
+    );
+
+    assert!(data["text"].as_str().unwrap().starts_with("<file"));
+    assert_eq!(data["display_text"], "review @src/lib.rs");
+    assert_eq!(data["tag_expansions"][0]["tool"], "read");
+    assert_eq!(data["tag_expansions"][0]["path"], "src/lib.rs");
+    assert_eq!(data["tag_expansions"][0]["ok"], true);
 }
 
 /// Regression (implementation note, candidate

@@ -1027,3 +1027,17 @@ mod tests {
         );
     }
 }
+#[test]
+fn queue_item_carries_display_text() {
+    let item = crate::engine::message::QueuedUserMessage {
+        id: uuid::Uuid::new_v4(),
+        status: crate::engine::message::QueueItemStatus::Queued,
+        text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
+        display_text: Some("review @src/lib.rs".to_string()),
+        target: crate::engine::message::QueueTarget::root("Build"),
+    };
+
+    let proto = queue_item_to_proto(item);
+    assert!(proto.text.starts_with("<file"));
+    assert_eq!(proto.display_text.as_deref(), Some("review @src/lib.rs"));
+}

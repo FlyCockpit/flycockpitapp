@@ -1403,7 +1403,7 @@ impl App {
     /// detail (lines read / entries listed / why it was skipped).
     pub(super) fn push_tag_call_entries(
         &mut self,
-        expansions: &[crate::tui::file_tag::TagExpansion],
+        expansions: &[crate::daemon::proto::TagExpansionMeta],
     ) {
         for e in expansions {
             let mark = if e.ok { '✓' } else { '✗' };
@@ -2035,11 +2035,16 @@ impl App {
         // can't be handed off. The busy/queue path didn't start a span,
         // so it must never tear one down.
         let was_busy = self.busy;
+        let tag_expansions = expanded
+            .expansions
+            .into_iter()
+            .map(crate::daemon::proto::TagExpansionMeta::from)
+            .collect::<Vec<_>>();
         let fresh_tag_expansions = if was_busy {
-            self.queue.push(optimistic_queue_item(submitted.clone()));
-            // Defer the tool-call entries so they render right after the
-            // folded user message (on the next `ThinkingStarted`).
-            self.queued_tag_batches.push(expanded.expansions);
+            self.queue.push(optimistic_queue_item_with_display(
+                wire.clone(),
+                Some(submitted.clone()),
+            ));
             Vec::new()
         } else {
             // Fresh human message: start a new working span (resets the
@@ -2051,7 +2056,7 @@ impl App {
             self.prompt_history.push(submitted.clone());
             self.prompt_history_cursor = 0;
             self.staged_draft = None;
-            expanded.expansions
+            tag_expansions.clone()
         };
         let owns_working_span = !was_busy;
 
@@ -2061,6 +2066,8 @@ impl App {
         let submission = crate::engine::message::UserSubmission {
             kind: crate::engine::message::UserSubmissionKind::User,
             text: wire,
+            display_text: Some(submitted.clone()),
+            tag_expansions: tag_expansions.clone(),
             images: paste_images,
             forced_skill: None,
             origin_principal: None,
@@ -2306,7 +2313,11 @@ impl App {
             }) if !removed_items.is_empty() => {
                 let removed_text = removed_items
                     .into_iter()
-                    .map(|item| item.text)
+                    .map(|item| {
+                        item.display_text
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(item.text)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 self.replace_queue_from_proto(queue);
@@ -2336,22 +2347,7 @@ impl App {
     }
 
     fn replace_queue_from_proto(&mut self, queue: Vec<proto::QueueItem>) {
-        let previous_queue = std::mem::take(&mut self.queue);
-        let previous_batches = std::mem::take(&mut self.queued_tag_batches);
-        let next_queue: Vec<_> = queue.into_iter().map(queue_item_from_proto).collect();
-        let mut next_batches = Vec::with_capacity(next_queue.len());
-
-        for item in &next_queue {
-            let batch = previous_queue
-                .iter()
-                .position(|previous| previous.id == item.id)
-                .and_then(|idx| previous_batches.get(idx).cloned())
-                .unwrap_or_default();
-            next_batches.push(batch);
-        }
-
-        self.queue = next_queue;
-        self.queued_tag_batches = next_batches;
+        self.queue = queue.into_iter().map(queue_item_from_proto).collect();
     }
 
     #[cfg(test)]
@@ -2370,10 +2366,18 @@ impl App {
 }
 
 pub(super) fn optimistic_queue_item(text: String) -> QueuedUserMessage {
+    optimistic_queue_item_with_display(text, None)
+}
+
+pub(super) fn optimistic_queue_item_with_display(
+    text: String,
+    display_text: Option<String>,
+) -> QueuedUserMessage {
     QueuedUserMessage {
         id: uuid::Uuid::new_v4(),
         status: QueueItemStatus::Queued,
         text,
+        display_text,
         target: crate::engine::message::QueueTarget::root(""),
     }
 }
@@ -2386,6 +2390,7 @@ pub(super) fn queue_item_from_proto(item: proto::QueueItem) -> QueuedUserMessage
             proto::QueueItemStatus::Folding => QueueItemStatus::Folding,
         },
         text: item.text,
+        display_text: item.display_text,
         target: crate::engine::message::QueueTarget {
             id: item.target.id,
             agent: item.target.agent,
@@ -3629,6 +3634,7 @@ mod queued_message_edit_tests {
             id: uuid::Uuid::new_v4(),
             status,
             text: text.to_string(),
+            display_text: None,
             target,
         }
     }
@@ -3645,15 +3651,6 @@ mod queued_message_edit_tests {
         app.queue.push(optimistic_queue_item("edit me".to_string()));
         let older = app.queue[0].clone();
         let newer = app.queue[1].clone();
-        app.queued_tag_batches.push(Vec::new());
-        app.queued_tag_batches
-            .push(vec![crate::tui::file_tag::TagExpansion {
-                tool: "read",
-                path: "a.rs".to_string(),
-                ok: true,
-                detail: "1 line".to_string(),
-            }]);
-
         app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
@@ -3662,24 +3659,22 @@ mod queued_message_edit_tests {
                     id: older.id,
                     status: QueueItemStatus::Queued,
                     text: older.text,
+                    display_text: None,
                     target: crate::daemon::proto::QueueTarget::default(),
                 },
                 QueueItem {
                     id: newer.id,
                     status: QueueItemStatus::Queued,
                     text: newer.text,
+                    display_text: Some("edit @a.rs".to_string()),
                     target: crate::daemon::proto::QueueTarget::default(),
                 },
             ],
             queue: Vec::new(),
         });
 
-        assert_eq!(app.composer.text(), "older\n\nedit me");
+        assert_eq!(app.composer.text(), "older\n\nedit @a.rs");
         assert!(app.queue.is_empty());
-        assert!(
-            app.queued_tag_batches.is_empty(),
-            "tag metadata for removed queued messages is dropped"
-        );
         assert_eq!(app.prompt_history_cursor, 0);
     }
 
@@ -3710,14 +3705,6 @@ mod queued_message_edit_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.queue
             .push(optimistic_queue_item("local stale".to_string()));
-        app.queued_tag_batches
-            .push(vec![crate::tui::file_tag::TagExpansion {
-                tool: "read",
-                path: "stale.rs".to_string(),
-                ok: true,
-                detail: "1 line".to_string(),
-            }]);
-
         app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
@@ -3727,10 +3714,6 @@ mod queued_message_edit_tests {
 
         assert_eq!(app.composer.text(), "daemon authoritative");
         assert!(app.queue.is_empty());
-        assert!(
-            app.queued_tag_batches.is_empty(),
-            "stale local tag metadata is discarded with the stale queue row"
-        );
     }
 
     #[test]
@@ -3748,12 +3731,13 @@ mod queued_message_edit_tests {
                 id: editable.id,
                 status: QueueItemStatus::Queued,
                 text: editable.text,
+                display_text: Some("editable @compact".to_string()),
                 target: crate::daemon::proto::QueueTarget::default(),
             }],
             queue: Vec::new(),
         });
 
-        assert_eq!(app.composer.text(), "editable");
+        assert_eq!(app.composer.text(), "editable @compact");
         assert!(app.queue.is_empty());
         assert!(
             matches!(&app.toast, Some(toast) if toast.text == "some queued messages already started"),

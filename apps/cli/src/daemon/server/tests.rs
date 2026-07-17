@@ -2051,6 +2051,8 @@ mod tests {
             },
             "send_user_message" => Request::SendUserMessage {
                 text: "authz".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
             },
@@ -3115,6 +3117,7 @@ mod tests {
             id: Uuid::new_v4(),
             status: proto::QueueItemStatus::Queued,
             text: text.to_string(),
+            display_text: None,
             target: proto::QueueTarget::default(),
         }
     }
@@ -3127,6 +3130,8 @@ mod tests {
         let request = match kind {
             "send_user_message" => Request::SendUserMessage {
                 text: "hello worker".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
             },
@@ -3372,6 +3377,8 @@ mod tests {
         let request = match kind {
             "send_user_message" => Request::SendUserMessage {
                 text: "detached".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
             },
@@ -4382,6 +4389,8 @@ mod tests {
             CommandMetadataCase {
                 request: Request::SendUserMessage {
                     text: "hello".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
                     image_refs: Vec::new(),
                     forced_skill: None,
                 },
@@ -6150,6 +6159,8 @@ mod tests {
         let err = handle_request(
             Request::SendUserMessage {
                 text: "hi".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs: vec![],
                 forced_skill: None,
             },
@@ -6534,4 +6545,65 @@ mod tests {
         assert_ne!(extended.max_primary_rounds, 77);
         crate::config::trust::clear_runtime_policy_for_tests();
     }
+}
+#[test]
+fn response_redaction_scrubs_queue_display_metadata() {
+    crate::auth::flycockpit::with_redaction_token_override(
+        "fci_response_secret_12345",
+        || {
+            let tmp = tempfile::tempdir().unwrap();
+            let table = crate::redact::RedactionTable::build(
+                &crate::config::extended::RedactConfig::default(),
+                tmp.path(),
+            )
+            .unwrap();
+            let item = proto::QueueItem {
+                id: Uuid::new_v4(),
+                status: proto::QueueItemStatus::Queued,
+                text: "wire fci_response_secret_12345".to_string(),
+                display_text: Some("review @fci_response_secret_12345".to_string()),
+                target: proto::QueueTarget::default(),
+            };
+            let response = scrub_proto_response(
+                Response::UserMessageQueued {
+                    item: item.clone(),
+                    queue: vec![item],
+                },
+                &table,
+            )
+            .expect("redacted response");
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains("fci_response_secret_12345"), "{encoded}");
+            assert!(encoded.contains("REDACT"), "{encoded}");
+        },
+    );
+}
+
+#[test]
+fn history_redaction_scrubs_display_text_and_tag_expansions() {
+    crate::auth::flycockpit::with_redaction_token_override("fci_history_secret_12345", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+        let entry = proto::HistoryEntry::User {
+            text: "wire fci_history_secret_12345".to_string(),
+            display_text: Some("review @fci_history_secret_12345".to_string()),
+            tag_expansions: vec![proto::TagExpansionMeta {
+                tool: "read".to_string(),
+                path: "fci_history_secret_12345.rs".to_string(),
+                detail: "fci_history_secret_12345 lines".to_string(),
+                ok: true,
+            }],
+            ts_ms: 0,
+            seq: 1,
+            origin_principal: Some("flycockpit:remote".to_string()),
+        };
+        let scrubbed = scrub_history_entry(entry, &table).expect("redacted history");
+        let encoded = serde_json::to_string(&scrubbed).unwrap();
+        assert!(!encoded.contains("fci_history_secret_12345"), "{encoded}");
+        assert!(encoded.contains("REDACT"), "{encoded}");
+    });
 }

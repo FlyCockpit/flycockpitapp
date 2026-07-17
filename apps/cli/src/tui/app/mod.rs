@@ -719,6 +719,7 @@ pub(super) enum FreshQueueAck {
     None,
     AwaitingAck,
     SuppressId(uuid::Uuid),
+    FoldedBeforeAck(uuid::Uuid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,8 +1217,6 @@ pub(super) struct SideConversation {
     saved_runner: Option<Result<AgentRunner, String>>,
     saved_history: Vec<HistoryEntry>,
     saved_queue: Vec<QueuedUserMessage>,
-    saved_queued_tag_batches: Vec<Vec<crate::tui::file_tag::TagExpansion>>,
-    saved_folding_tag_batches: HashMap<uuid::Uuid, Vec<crate::tui::file_tag::TagExpansion>>,
     saved_pending: Option<PendingMsg>,
     saved_prunable_tokens: u64,
     saved_cache_cold: bool,
@@ -1766,14 +1765,6 @@ pub struct App {
     /// otherwise. Lives on App (not the composer) because resolving the
     /// object can interact with the paste registry.
     pub(super) pending_text_object: Option<bool>,
-    /// `@`-tag expansions from messages submitted while the agent was
-    /// busy, grouped per queued message. Flushed into history as tool-call
-    /// entries right after the folded user message appears (on the next
-    /// queued-fold event), so they render in order with their message.
-    pub(super) queued_tag_batches: Vec<Vec<crate::tui::file_tag::TagExpansion>>,
-    /// Tag batches for queue items that disappeared from the pending snapshot
-    /// and are waiting for the authoritative queued-fold event.
-    pub(super) folding_tag_batches: HashMap<uuid::Uuid, Vec<crate::tui::file_tag::TagExpansion>>,
     /// True once the user dismissed the `@`-popup with `Esc`. Stays
     /// suppressed until the active `@partial` token is dropped (e.g.
     /// whitespace appears after `@` or the `@` is deleted).
@@ -3096,8 +3087,6 @@ impl App {
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
             pending_text_object: None,
-            queued_tag_batches: Vec::new(),
-            folding_tag_batches: HashMap::new(),
             at_dismissed: false,
             slash_selected: 0,
             slash_scroll: 0,
@@ -4053,10 +4042,7 @@ impl App {
                 // to idle rather than rolling straight into the next one; clear
                 // our mirror of the queue here so the pending rows above the
                 // composer disappear in lockstep and don't masquerade as still
-                // pending. The queued-tag-call entries staged for them go too.
                 self.queue.clear();
-                self.queued_tag_batches.clear();
-                self.folding_tag_batches.clear();
                 self.show_ctrl_c_hint();
                 false
             }
@@ -4849,8 +4835,6 @@ impl App {
         self.staged_draft = None;
         self.pending_git_blocks.clear();
         self.accepted_tags.clear();
-        self.queued_tag_batches.clear();
-        self.folding_tag_batches.clear();
         self.pending_edit_args.clear();
         self.pin_count = 0;
         self.pin_count_session = None;
@@ -5387,11 +5371,17 @@ impl App {
     pub(super) fn dispatch_optimistic_user_submission(
         &mut self,
         display: String,
-        submission: crate::engine::message::UserSubmission,
+        mut submission: crate::engine::message::UserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
-        tag_expansions: &[crate::tui::file_tag::TagExpansion],
+        tag_expansions: &[crate::daemon::proto::TagExpansionMeta],
     ) -> DispatchOutcome {
+        if submission.display_text.is_none() && submission.text != display {
+            submission.display_text = Some(display.clone());
+        }
+        if submission.tag_expansions.is_empty() && !tag_expansions.is_empty() {
+            submission.tag_expansions = tag_expansions.to_vec();
+        }
         self.lock_pending_agent_switch_log();
         self.history.push(HistoryEntry::User {
             text: display,
@@ -5570,6 +5560,8 @@ impl App {
         let submission = crate::engine::message::UserSubmission {
             kind: crate::engine::message::UserSubmissionKind::User,
             text: args.trim().to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             images: Vec::new(),
             forced_skill: Some(name.to_string()),
             origin_principal: None,
@@ -5897,6 +5889,8 @@ impl App {
         let submission = crate::engine::message::UserSubmission {
             kind: crate::engine::message::UserSubmissionKind::User,
             text: kickoff.clone(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             images: Vec::new(),
             forced_skill: None,
             origin_principal: None,
@@ -6369,7 +6363,6 @@ impl App {
         if self.busy {
             self.queue
                 .push(input::optimistic_queue_item("/compact".to_string()));
-            self.queued_tag_batches.push(Vec::new());
         } else {
             self.begin_working_span();
             self.push_plain("/compact: assembling handoff (prune-first, model brief, deterministic appendix, seed tools)...".to_string());
@@ -6835,8 +6828,6 @@ impl App {
             saved_runner: self.agent_runner.take(),
             saved_history: self.history.clone(),
             saved_queue: std::mem::take(&mut self.queue),
-            saved_queued_tag_batches: std::mem::take(&mut self.queued_tag_batches),
-            saved_folding_tag_batches: std::mem::take(&mut self.folding_tag_batches),
             saved_pending: self.pending.take(),
             saved_prunable_tokens: self.prunable_tokens,
             saved_cache_cold: self.cache_cold,
@@ -6860,8 +6851,6 @@ impl App {
         // Reset the live-view fields the side conversation tracks on its own;
         // the visible scrollback (history) is intentionally preserved.
         self.queue.clear();
-        self.queued_tag_batches.clear();
-        self.folding_tag_batches.clear();
         self.pending = None;
         self.pending_render_cache = None;
         self.prunable_tokens = 0;
@@ -6903,8 +6892,6 @@ impl App {
         self.agent_runner = side.saved_runner;
         self.history = side.saved_history;
         self.queue = side.saved_queue;
-        self.queued_tag_batches = side.saved_queued_tag_batches;
-        self.folding_tag_batches = side.saved_folding_tag_batches;
         self.pending = side.saved_pending;
         self.prunable_tokens = side.saved_prunable_tokens;
         self.cache_cold = side.saved_cache_cold;
@@ -10864,13 +10851,6 @@ mod ctrl_c_tests {
             .push(input::optimistic_queue_item("queued one".to_string()));
         app.queue
             .push(input::optimistic_queue_item("queued two".to_string()));
-        app.queued_tag_batches
-            .push(vec![crate::tui::file_tag::TagExpansion {
-                tool: "read",
-                path: "a.rs".to_string(),
-                ok: true,
-                detail: "1 line".to_string(),
-            }]);
 
         // First ctrl+c while busy: interrupt (returns false = do not exit).
         let exit = app.handle_ctrl_c();
@@ -10878,10 +10858,6 @@ mod ctrl_c_tests {
         assert!(
             app.queue.is_empty(),
             "the queued messages are dropped so the cancel returns to idle"
-        );
-        assert!(
-            app.queued_tag_batches.is_empty(),
-            "the staged queued-tag-call entries are dropped alongside the queue"
         );
         // The exit window is armed (a second fast press would exit).
         assert!(app.ctrl_c_armed_at.is_some());
@@ -12273,8 +12249,6 @@ mod keys_overlay_tests {
             saved_queue: vec![input::optimistic_queue_item(
                 "queued main message".to_string(),
             )],
-            saved_queued_tag_batches: Vec::new(),
-            saved_folding_tag_batches: std::collections::HashMap::new(),
             saved_pending: None,
             saved_prunable_tokens: 42,
             saved_cache_cold: false,
@@ -13234,12 +13208,6 @@ mod failed_dispatch_reconciliation_tests {
         app.staged_draft = Some("draft".to_string());
         app.pending_git_blocks.push("git diff".to_string());
         app.accepted_tags.push("path with spaces.rs".to_string());
-        app.queued_tag_batches = vec![vec![crate::tui::file_tag::TagExpansion {
-            tool: "read",
-            path: "src/lib.rs".to_string(),
-            ok: true,
-            detail: "1 line".to_string(),
-        }]];
         app.pending_edit_args.insert(
             "cid".to_string(),
             super::PendingEditArgs {
@@ -13261,8 +13229,6 @@ mod failed_dispatch_reconciliation_tests {
             saved_queue: vec![crate::tui::app::input::optimistic_queue_item(
                 "queued main message".to_string(),
             )],
-            saved_queued_tag_batches: Vec::new(),
-            saved_folding_tag_batches: std::collections::HashMap::new(),
             saved_pending: None,
             saved_prunable_tokens: 42,
             saved_cache_cold: false,
@@ -13375,7 +13341,6 @@ mod failed_dispatch_reconciliation_tests {
         assert!(app.staged_draft.is_none());
         assert!(app.pending_git_blocks.is_empty());
         assert!(app.accepted_tags.is_empty());
-        assert!(app.queued_tag_batches.is_empty());
         assert!(app.pending_edit_args.is_empty());
         assert_eq!(app.composer.text(), "visible draft");
         assert_eq!(app.prompt_history, vec!["cross-session recall"]);
@@ -13644,8 +13609,8 @@ mod failed_dispatch_reconciliation_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.agent_runner = Some(Err("model missing".to_string()));
         app.begin_working_span();
-        let tags = vec![crate::tui::file_tag::TagExpansion {
-            tool: "read",
+        let tags = vec![crate::daemon::proto::TagExpansionMeta {
+            tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "10 lines".to_string(),
             ok: true,
@@ -13831,6 +13796,7 @@ mod fresh_queue_ack_tests {
             id: uuid::Uuid::from_u128(id),
             status: QueueItemStatus::Queued,
             text: text.to_string(),
+            display_text: None,
             target: crate::engine::message::QueueTarget::root("Build"),
         }
     }
@@ -13896,6 +13862,9 @@ mod fresh_queue_ack_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         push_fresh_optimistic(&mut app, "fresh hello");
+        app.history.push(HistoryEntry::Plain {
+            line: "  → read(src/lib.rs) ✓ 1 line".to_string(),
+        });
 
         app.apply_event(TurnEvent::QueueUpdated {
             queue: vec![item(1, "fresh hello")],
@@ -13907,6 +13876,13 @@ mod fresh_queue_ack_tests {
 
         app.apply_event(TurnEvent::QueuedUserMessagesFolded {
             text: "fresh hello".to_string(),
+            display_text: None,
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".to_string(),
+                path: "src/lib.rs".to_string(),
+                detail: "1 line".to_string(),
+                ok: true,
+            }],
             queue_item_ids: vec![uuid::Uuid::from_u128(1)],
             target: crate::engine::message::QueueTarget::root("Build"),
             seq: Some(42),
@@ -13928,6 +13904,44 @@ mod fresh_queue_ack_tests {
             "the original optimistic row receives the persisted seq"
         );
         assert_eq!(app.fresh_queue_ack, FreshQueueAck::None);
+        assert_eq!(
+            app.history
+                .iter()
+                .filter(|entry| matches!(entry, HistoryEntry::Plain { line } if line.contains("read(src/lib.rs)")))
+                .count(),
+            1,
+            "the originating optimistic tag row is not duplicated by the fold event"
+        );
+    }
+
+    #[test]
+    fn fresh_fold_before_queue_ack_still_suppresses_optimistic_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        push_fresh_optimistic(&mut app, "fresh race");
+        let id = uuid::Uuid::from_u128(9);
+
+        app.apply_event(TurnEvent::QueuedUserMessagesFolded {
+            text: "wire race".to_string(),
+            display_text: Some("fresh race".to_string()),
+            tag_expansions: Vec::new(),
+            queue_item_ids: vec![id],
+            target: crate::engine::message::QueueTarget::root("Build"),
+            seq: Some(49),
+            preflight_cleaned: None,
+        });
+        assert_eq!(user_rows(&app), vec![("fresh race", Some(49))]);
+        assert_eq!(app.fresh_queue_ack, FreshQueueAck::FoldedBeforeAck(id));
+
+        app.apply_event(TurnEvent::QueueUpdated {
+            queue: vec![item(9, "wire race")],
+        });
+        assert!(
+            app.queue.is_empty(),
+            "late ack must not resurrect folded row"
+        );
+        assert_eq!(app.fresh_queue_ack, FreshQueueAck::None);
+        assert_eq!(user_rows(&app), vec![("fresh race", Some(49))]);
     }
 
     #[test]
@@ -13938,6 +13952,8 @@ mod fresh_queue_ack_tests {
 
         app.apply_event(TurnEvent::QueuedUserMessagesFolded {
             text: "queued while reading".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             queue_item_ids: vec![uuid::Uuid::from_u128(10)],
             target: crate::engine::message::QueueTarget::root("Build"),
             seq: Some(70),
@@ -13956,6 +13972,8 @@ mod fresh_queue_ack_tests {
 
         app.apply_event(TurnEvent::QueuedUserMessagesFolded {
             text: "queued at tail".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             queue_item_ids: vec![uuid::Uuid::from_u128(12)],
             target: crate::engine::message::QueueTarget::root("Build"),
             seq: Some(72),
@@ -13985,6 +14003,8 @@ mod fresh_queue_ack_tests {
 
         app.apply_event(TurnEvent::QueuedUserMessagesFolded {
             text: "queued while busy".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             queue_item_ids: vec![uuid::Uuid::from_u128(11)],
             target: crate::engine::message::QueueTarget::root("Build"),
             seq: Some(77),
@@ -14004,6 +14024,8 @@ mod fresh_queue_ack_tests {
         });
         app.apply_event(TurnEvent::QueuedUserMessagesFolded {
             text: "first queued\n\nsecond queued".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             queue_item_ids: vec![uuid::Uuid::from_u128(21), uuid::Uuid::from_u128(22)],
             target: crate::engine::message::QueueTarget::root("Build"),
             seq: Some(81),
@@ -14019,20 +14041,13 @@ mod fresh_queue_ack_tests {
     }
 
     #[test]
-    fn queued_fold_event_pairs_tag_batches_after_queue_drains() {
+    fn queued_fold_event_renders_daemon_display_and_tag_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
 
         app.apply_event(TurnEvent::QueueUpdated {
             queue: vec![item(31, "queued @src/lib.rs")],
         });
-        app.queued_tag_batches = vec![vec![crate::tui::file_tag::TagExpansion {
-            tool: "read",
-            path: "src/lib.rs".to_string(),
-            ok: true,
-            detail: "1 line".to_string(),
-        }]];
-
         app.apply_event(TurnEvent::QueueUpdated { queue: vec![] });
         assert!(
             app.queue.is_empty(),
@@ -14040,7 +14055,14 @@ mod fresh_queue_ack_tests {
         );
 
         app.apply_event(TurnEvent::QueuedUserMessagesFolded {
-            text: "queued @src/lib.rs".to_string(),
+            text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
+            display_text: Some("queued @src/lib.rs".to_string()),
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".to_string(),
+                path: "src/lib.rs".to_string(),
+                ok: true,
+                detail: "1 line".to_string(),
+            }],
             queue_item_ids: vec![uuid::Uuid::from_u128(31)],
             target: crate::engine::message::QueueTarget::root("Build"),
             seq: Some(91),
@@ -14054,7 +14076,6 @@ mod fresh_queue_ack_tests {
                 .any(|entry| matches!(entry, HistoryEntry::Plain { line } if line == "  → read(src/lib.rs) ✓ 1 line")),
             "the queued tag expansion renders under the folded user row"
         );
-        assert!(app.folding_tag_batches.is_empty());
     }
 }
 
@@ -15095,6 +15116,70 @@ mod resume_history_conversion_tests {
     use crate::tui::history::{HistoryEntry, ToolCallState};
     use serde_json::json;
 
+    #[test]
+    fn replayed_user_row_uses_display_text() {
+        let entries = wire_history_to_entries(vec![Wire::User {
+            text: "<file path=\"src/lib.rs\">expanded</file>".into(),
+            display_text: Some("review @src/lib.rs".into()),
+            tag_expansions: Vec::new(),
+            ts_ms: 1_700_000_000_000,
+            seq: 1,
+            origin_principal: None,
+        }]);
+        assert!(matches!(
+            &entries[0],
+            HistoryEntry::User { text, .. } if text == "review @src/lib.rs"
+        ));
+
+        let legacy = wire_history_to_entries(vec![Wire::User {
+            text: "legacy wire".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            ts_ms: 1_700_000_000_000,
+            seq: 2,
+            origin_principal: None,
+        }]);
+        assert!(matches!(
+            &legacy[0],
+            HistoryEntry::User { text, .. } if text == "legacy wire"
+        ));
+
+        let empty_display = wire_history_to_entries(vec![Wire::User {
+            text: "wire fallback".into(),
+            display_text: Some(String::new()),
+            tag_expansions: Vec::new(),
+            ts_ms: 1_700_000_000_000,
+            seq: 3,
+            origin_principal: None,
+        }]);
+        assert!(matches!(
+            &empty_display[0],
+            HistoryEntry::User { text, .. } if text == "wire fallback"
+        ));
+    }
+
+    #[test]
+    fn replayed_user_row_renders_tag_entries() {
+        let entries = wire_history_to_entries(vec![Wire::User {
+            text: "expanded wire".into(),
+            display_text: Some("review @src/lib.rs".into()),
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".into(),
+                path: "src/lib.rs".into(),
+                detail: "142 lines".into(),
+                ok: true,
+            }],
+            ts_ms: 1_700_000_000_000,
+            seq: 1,
+            origin_principal: None,
+        }]);
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[1],
+            HistoryEntry::Plain { line } if line == "  → read(src/lib.rs) ✓ 142 lines"
+        ));
+    }
+
     /// REGRESSION (implementation note): the wire→TUI
     /// conversion a `/sessions` resume runs must yield matching `User` / `Agent`
     /// / `ToolBox` entries in order — a resumed transcript renders like a live
@@ -15105,6 +15190,8 @@ mod resume_history_conversion_tests {
         let wire = vec![
             Wire::User {
                 text: "read the file".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 ts_ms: 1_700_000_000_000,
                 seq: 1,
                 origin_principal: None,
@@ -15234,6 +15321,8 @@ mod resume_history_conversion_tests {
         let entries = wire_history_to_entries(vec![
             Wire::User {
                 text: "before".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 ts_ms: 1_700_000_000_000,
                 seq: 1,
                 origin_principal: None,
@@ -15245,6 +15334,8 @@ mod resume_history_conversion_tests {
             },
             Wire::User {
                 text: "after".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 ts_ms: 1_700_000_001_000,
                 seq: 2,
                 origin_principal: None,
@@ -15271,6 +15362,8 @@ mod resume_history_conversion_tests {
     fn steer_user_snapshot_converts_to_provenance_row() {
         let entries = wire_history_to_entries(vec![Wire::User {
             text: "please adjust".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
             ts_ms: 1_700_000_000_000,
             seq: 7,
             origin_principal: Some("local:tester".into()),
@@ -15291,6 +15384,8 @@ mod resume_history_conversion_tests {
         let entries = wire_history_to_entries(vec![
             Wire::User {
                 text: "build it".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 ts_ms: 1_700_000_000_000,
                 seq: 1,
                 origin_principal: None,

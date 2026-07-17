@@ -243,6 +243,53 @@ async fn attach_replays_empty_queue_snapshot() {
     wait_for_queue(&client_b, scenario.session_id, None).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_window_sees_compact_user_message() {
+    let provider = ScriptedProvider::start().await;
+    let home = IsolatedHome::new();
+    home.write_local_provider_config(&provider.base_url);
+    home.trust_project();
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let client_a = daemon.client().await;
+    let attached = client_a
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach first client");
+    let wire = "review <file path=\"src/lib.rs\">expanded contents</file>";
+    let display = "review @src/lib.rs";
+    client_a
+        .send_user_message_with_display(
+            wire,
+            Some(display.to_string()),
+            vec![(
+                "read".to_string(),
+                "src/lib.rs".to_string(),
+                "142 lines".to_string(),
+                true,
+            )],
+        )
+        .await
+        .expect("send display-aware message");
+    let _interrupt_id = wait_for_interrupt(&client_a, attached.session_id).await;
+
+    let client_b = daemon.client().await;
+    let replay = client_b
+        .attach(daemon.project_path(), Some(attached.session_id), None, true)
+        .await
+        .expect("attach second client");
+
+    assert!(
+        replay.user_row_texts.iter().any(|text| text == display),
+        "second window history should contain compact display form: {:?}",
+        replay.user_row_texts
+    );
+    assert!(
+        replay.user_row_texts.iter().all(|text| text != wire),
+        "second window history must not expose expanded wire form: {:?}",
+        replay.user_row_texts
+    );
+}
+
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];

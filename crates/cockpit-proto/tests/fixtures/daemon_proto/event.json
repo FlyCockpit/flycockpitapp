@@ -155,9 +155,18 @@
     "data": {
       "entries": [
         {
+          "display_text": "hello @history",
           "origin_principal": "flycockpit:user",
           "role": "user",
           "seq": 7,
+          "tag_expansions": [
+            {
+              "detail": "142 lines",
+              "ok": true,
+              "path": "src/lib.rs",
+              "tool": "read"
+            }
+          ],
           "text": "hello history",
           "ts_ms": 1700000000000
         }
@@ -421,6 +430,7 @@
     "data": {
       "queue": [
         {
+          "display_text": "queued @src/lib.rs",
           "id": "11111111-1111-4111-8111-111111111111",
           "status": "queued",
           "target": {
@@ -438,10 +448,19 @@
   },
   "queued_user_messages_folded": {
     "data": {
+      "display_text": "queued @src/lib.rs",
       "preflight_cleaned": "preflight_cleaned-fixture",
       "queue_item_ids": ["11111111-1111-4111-8111-111111111111"],
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111",
+      "tag_expansions": [
+        {
+          "detail": "142 lines",
+          "ok": true,
+          "path": "src/lib.rs",
+          "tool": "read"
+        }
+      ],
       "target": {
         "agent": "Build",
         "depth": 1,

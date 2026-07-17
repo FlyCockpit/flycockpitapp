@@ -125,6 +125,8 @@ pub enum TurnEvent {
     /// queued folds; clients must not infer it from `ThinkingStarted`.
     QueuedUserMessagesFolded {
         text: String,
+        display_text: Option<String>,
+        tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
         queue_item_ids: Vec<uuid::Uuid>,
         target: crate::engine::message::QueueTarget,
         seq: Option<i64>,

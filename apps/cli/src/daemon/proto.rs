@@ -101,6 +101,8 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         }
         TurnEvent::QueuedUserMessagesFolded {
             text,
+            display_text,
+            tag_expansions,
             queue_item_ids,
             target,
             seq,
@@ -109,6 +111,8 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             vec![Event::QueuedUserMessagesFolded {
                 session_id,
                 text,
+                display_text,
+                tag_expansions,
                 queue_item_ids,
                 target: queue_target_to_proto(target),
                 seq,

@@ -122,6 +122,27 @@ fn scrub_proto_event(event: proto::Event, redact: &RedactionTable) -> Option<pro
     }
 }
 
+fn scrub_proto_response(
+    response: proto::Response,
+    redact: &RedactionTable,
+) -> Option<proto::Response> {
+    let mut value = match serde_json::to_value(&response) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "serializing response for redaction failed; dropping response");
+            return None;
+        }
+    };
+    scrub_json_strings(&mut value, redact);
+    match serde_json::from_value(value) {
+        Ok(response) => Some(response),
+        Err(error) => {
+            tracing::warn!(error = %error, "deserializing redacted response failed; dropping response");
+            None
+        }
+    }
+}
+
 fn scrub_history_for_principal(
     principal: &ClientPrincipal,
     history: Vec<proto::HistoryEntry>,
@@ -1230,7 +1251,30 @@ where
             let result = handle_request(request, state, ctx).await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             let envelope = match result {
-                Ok(response) => Envelope::response(id, response),
+                Ok(response) => {
+                    let response = if state.principal.is_owner() {
+                        Some(response)
+                    } else if let Some(attached) = state.attached.as_ref() {
+                        scrub_proto_response(response, &attached.handle.redaction_table())
+                    } else {
+                        // Session-bearing responses without an attachment must
+                        // scrub inside their request arm using the target
+                        // session's persisted table (for example
+                        // `SubagentTranscript`). Other unattached responses do
+                        // not carry session user content.
+                        Some(response)
+                    };
+                    match response {
+                        Some(response) => Envelope::response(id, response),
+                        None => Envelope::error(
+                            Some(id),
+                            ErrorPayload {
+                                code: ErrorCode::Internal,
+                                message: "response redaction failed".to_string(),
+                            },
+                        ),
+                    }
+                }
                 Err(err) => Envelope::error(Some(id), err),
             };
             if let Err(error) = proto.send(&envelope).await {

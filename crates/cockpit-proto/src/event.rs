@@ -132,6 +132,10 @@ pub enum Event {
     QueuedUserMessagesFolded {
         session_id: Uuid,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tag_expansions: Vec<TagExpansionMeta>,
         queue_item_ids: Vec<Uuid>,
         target: QueueTarget,
         #[serde(default, skip_serializing_if = "Option::is_none")]

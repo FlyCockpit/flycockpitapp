@@ -22,56 +22,23 @@ impl App {
         {
             self.fresh_queue_ack = FreshQueueAck::SuppressId(item.id);
         }
-        let old_queue = std::mem::take(&mut self.queue);
-        let old_batches = std::mem::take(&mut self.queued_tag_batches);
-        let incoming_ids = queue.iter().map(|item| item.id).collect::<HashSet<_>>();
-        for (idx, item) in old_queue.iter().enumerate() {
-            let replaced_by_ack = queue
-                .get(idx)
-                .is_some_and(|incoming| incoming.text == item.text);
-            if !incoming_ids.contains(&item.id)
-                && !replaced_by_ack
-                && let Some(batch) = old_batches.get(idx)
-                && !batch.is_empty()
-            {
-                self.folding_tag_batches.insert(item.id, batch.clone());
-            }
-        }
+        let folded_before_ack = matches!(self.fresh_queue_ack, FreshQueueAck::FoldedBeforeAck(_));
         self.queue = match self.fresh_queue_ack {
-            FreshQueueAck::SuppressId(id) => {
+            FreshQueueAck::SuppressId(id) | FreshQueueAck::FoldedBeforeAck(id) => {
                 queue.into_iter().filter(|item| item.id != id).collect()
             }
             FreshQueueAck::None | FreshQueueAck::AwaitingAck => queue,
         };
-        let old_positions = old_queue
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| (item.id, idx))
-            .collect::<HashMap<_, _>>();
-        self.queued_tag_batches = self
-            .queue
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| {
-                if let Some(batch) = old_positions
-                    .get(&item.id)
-                    .and_then(|idx| old_batches.get(*idx))
-                {
-                    return batch.clone();
-                }
-                old_queue
-                    .get(idx)
-                    .filter(|old| old.text == item.text)
-                    .and_then(|_| old_batches.get(idx))
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
+        if folded_before_ack {
+            self.fresh_queue_ack = FreshQueueAck::None;
+        }
     }
 
     fn apply_queued_user_messages_folded(
         &mut self,
         text: String,
+        display_text: Option<String>,
+        tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
         queue_item_ids: Vec<uuid::Uuid>,
         seq: Option<i64>,
         preflight_cleaned: Option<String>,
@@ -79,31 +46,14 @@ impl App {
         let folded_ids = queue_item_ids.iter().copied().collect::<HashSet<_>>();
         let suppresses_fresh_optimistic = match self.fresh_queue_ack {
             FreshQueueAck::SuppressId(id) => folded_ids.contains(&id),
-            FreshQueueAck::None | FreshQueueAck::AwaitingAck => false,
+            FreshQueueAck::AwaitingAck => !queue_item_ids.is_empty(),
+            FreshQueueAck::None | FreshQueueAck::FoldedBeforeAck(_) => false,
         };
+        let folded_before_ack_id = matches!(self.fresh_queue_ack, FreshQueueAck::AwaitingAck)
+            .then(|| queue_item_ids.first().copied())
+            .flatten();
 
-        let old_queue = std::mem::take(&mut self.queue);
-        let old_batches = std::mem::take(&mut self.queued_tag_batches);
-        let mut remaining_queue = Vec::new();
-        let mut remaining_batches = Vec::new();
-        let mut calls = Vec::new();
-        for (idx, item) in old_queue.into_iter().enumerate() {
-            if folded_ids.contains(&item.id) {
-                if let Some(batch) = old_batches.get(idx) {
-                    calls.extend(batch.clone());
-                }
-            } else {
-                remaining_queue.push(item);
-                remaining_batches.push(old_batches.get(idx).cloned().unwrap_or_default());
-            }
-        }
-        for id in &queue_item_ids {
-            if let Some(batch) = self.folding_tag_batches.remove(id) {
-                calls.extend(batch);
-            }
-        }
-        self.queue = remaining_queue;
-        self.queued_tag_batches = remaining_batches;
+        self.queue.retain(|item| !folded_ids.contains(&item.id));
 
         let mut stamped_existing = false;
         if suppresses_fresh_optimistic {
@@ -129,7 +79,9 @@ impl App {
         }
         if !stamped_existing {
             self.history.push(HistoryEntry::User {
-                text,
+                text: display_text
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(text),
                 cleaned: preflight_cleaned,
                 expanded: false,
                 timestamp: chrono::Local::now(),
@@ -137,11 +89,11 @@ impl App {
                 preflight_pending: false,
                 persist_failed: false,
             });
+            self.push_tag_call_entries(&tag_expansions);
         }
-        if !calls.is_empty() {
-            self.push_tag_call_entries(&calls);
-        }
-        self.fresh_queue_ack = FreshQueueAck::None;
+        self.fresh_queue_ack = folded_before_ack_id
+            .map(FreshQueueAck::FoldedBeforeAck)
+            .unwrap_or(FreshQueueAck::None);
     }
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
@@ -235,6 +187,8 @@ impl App {
             }
             TurnEvent::QueuedUserMessagesFolded {
                 text,
+                display_text,
+                tag_expansions,
                 queue_item_ids,
                 seq,
                 preflight_cleaned,
@@ -242,6 +196,8 @@ impl App {
             } => {
                 self.apply_queued_user_messages_folded(
                     text,
+                    display_text,
+                    tag_expansions,
                     queue_item_ids,
                     seq,
                     preflight_cleaned,
@@ -1709,22 +1665,41 @@ pub(super) fn wire_history_to_entries(
             }
             Wire::User {
                 text,
+                display_text,
+                tag_expansions,
                 ts_ms,
                 seq,
                 origin_principal,
             } => {
                 if let Some(origin) = origin_principal.filter(|origin| !origin.trim().is_empty()) {
-                    let line = format!("steer from {origin}: {text}");
+                    let line = format!(
+                        "steer from {origin}: {}",
+                        display_text
+                            .as_deref()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(&text)
+                    );
                     out.push(HistoryEntry::Plain { line });
                 } else {
                     out.push(HistoryEntry::User {
-                        text,
+                        text: display_text
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(text),
                         cleaned: None,
                         expanded: false,
                         timestamp: local_from_ts_ms(ts_ms),
                         seq: (seq != 0).then_some(seq),
                         preflight_pending: false,
                         persist_failed: false,
+                    });
+                }
+                for expansion in tag_expansions {
+                    let mark = if expansion.ok { '✓' } else { '✗' };
+                    out.push(HistoryEntry::Plain {
+                        line: format!(
+                            "  → {}({}) {mark} {}",
+                            expansion.tool, expansion.path, expansion.detail
+                        ),
                     });
                 }
             }

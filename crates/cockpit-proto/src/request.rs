@@ -80,6 +80,12 @@ pub enum Request {
     /// contain `IMAGE_PART_SENTINEL` markers, one per image, in order.
     SendUserMessage {
         text: String,
+        /// User-facing transcript form. When absent, clients display `text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        /// Structured display metadata for composer-expanded `@` tags.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tag_expansions: Vec<TagExpansionMeta>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         image_refs: Vec<ImageAttachmentRef>,
         /// A user-issued skill slash command (`/<skill-name>` or

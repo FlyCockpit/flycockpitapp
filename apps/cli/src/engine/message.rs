@@ -38,6 +38,13 @@ pub struct UserSubmission {
     #[serde(default)]
     pub kind: UserSubmissionKind,
     pub text: String,
+    /// User-facing transcript form. `None` means the wire text is also the
+    /// display text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+    /// Structured `@`-tag expansion rows displayed after the user message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
     /// PNG-encoded image bytes, one per real image part, in order.
     #[serde(default)]
     pub images: Vec<Vec<u8>>,
@@ -103,6 +110,7 @@ pub struct QueuedUserMessage {
     pub id: Uuid,
     pub status: QueueItemStatus,
     pub text: String,
+    pub display_text: Option<String>,
     pub target: QueueTarget,
 }
 
@@ -460,6 +468,7 @@ fn queued_message_from_submission(item: &QueuedSubmission) -> QueuedUserMessage 
         id: item.id,
         status: QueueItemStatus::Queued,
         text: item.submission.text.clone(),
+        display_text: item.submission.display_text.clone(),
         target: item.target.clone(),
     }
 }
@@ -718,6 +727,27 @@ mod tests {
         let parts = user_parts(&msg);
         assert_eq!(parts.len(), 1);
         assert!(matches!(parts[0], UserContent::Text(_)));
+    }
+
+    #[test]
+    fn build_user_message_uses_wire_text_not_display_text() {
+        let msg = build_user_message(UserSubmission {
+            text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
+            display_text: Some("review @src/lib.rs".to_string()),
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".into(),
+                path: "src/lib.rs".into(),
+                detail: "142 lines".into(),
+                ok: true,
+            }],
+            ..Default::default()
+        });
+        let parts = user_parts(&msg);
+        let UserContent::Text(text) = &parts[0] else {
+            panic!("expected text-only user message")
+        };
+        assert!(text.text.starts_with("<file"));
+        assert!(!text.text.contains("@src/lib.rs"));
     }
 
     #[test]

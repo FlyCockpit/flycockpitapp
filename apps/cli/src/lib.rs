@@ -146,6 +146,7 @@ pub mod integration {
     pub struct AttachedSession {
         pub session_id: Uuid,
         pub history_len: usize,
+        pub user_row_texts: Vec<String>,
         pub paused_work_len: usize,
     }
 
@@ -240,6 +241,21 @@ pub mod integration {
                 } => Ok(AttachedSession {
                     session_id,
                     history_len: history.len(),
+                    user_row_texts: history
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            crate::daemon::proto::HistoryEntry::User {
+                                text, display_text, ..
+                            } => Some(
+                                display_text
+                                    .as_ref()
+                                    .filter(|value| !value.is_empty())
+                                    .unwrap_or(text)
+                                    .clone(),
+                            ),
+                            _ => None,
+                        })
+                        .collect(),
                     paused_work_len: paused_work.len(),
                 }),
                 other => Err(anyhow!("unexpected attach response: {other:?}")),
@@ -247,10 +263,32 @@ pub mod integration {
         }
 
         pub async fn send_user_message(&self, text: impl Into<String>) -> Result<()> {
+            self.send_user_message_with_display(text, None, Vec::new())
+                .await
+        }
+
+        pub async fn send_user_message_with_display(
+            &self,
+            text: impl Into<String>,
+            display_text: Option<String>,
+            tag_expansions: Vec<(String, String, String, bool)>,
+        ) -> Result<()> {
             match self
                 .inner
                 .request_ok(crate::daemon::proto::Request::SendUserMessage {
                     text: text.into(),
+                    display_text,
+                    tag_expansions: tag_expansions
+                        .into_iter()
+                        .map(
+                            |(tool, path, detail, ok)| crate::daemon::proto::TagExpansionMeta {
+                                tool,
+                                path,
+                                detail,
+                                ok,
+                            },
+                        )
+                        .collect(),
                     image_refs: Vec::new(),
                     forced_skill: None,
                 })

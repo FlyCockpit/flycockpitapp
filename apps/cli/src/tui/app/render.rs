@@ -1444,7 +1444,13 @@ impl App {
             } else {
                 queue_text_style
             };
-            let body = first_line_truncated(&msg.text, inner_w);
+            let body = first_line_truncated(
+                msg.display_text
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&msg.text),
+                inner_w,
+            );
             let body_w = display_width(&body);
             let annotation = if non_foreground {
                 let remaining = inner_w.saturating_sub(body_w);
@@ -4583,6 +4589,7 @@ mod render_history_spacing_tests {
             id: uuid::Uuid::new_v4(),
             status: QueueItemStatus::Queued,
             text: "queued".to_string(),
+            display_text: None,
             target: QueueTarget::default(),
         });
         assert_eq!(
@@ -5963,6 +5970,7 @@ mod prediction_ghost_context_indicator_tests {
             id: uuid::Uuid::new_v4(),
             status: QueueItemStatus::Queued,
             text: text.to_string(),
+            display_text: None,
             target,
         }
     }
@@ -5981,6 +5989,22 @@ mod prediction_ghost_context_indicator_tests {
 
         assert_eq!(top, format!(" ╭{}╮ ", "─".repeat(width as usize - 4)));
         assert_eq!(bottom, format!("╭┴{}┴╮", "─".repeat(width as usize - 4)));
+    }
+
+    #[test]
+    fn queue_renders_display_text_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut item = queued_item(
+            "<file path=\"src/lib.rs\">expanded</file>",
+            QueueTarget::root("Build"),
+        );
+        item.display_text = Some("check @src/lib.rs".to_string());
+        app.queue.push(item);
+
+        let row = row_text(&render_queue_buffer(&mut app, 50, 3), 1, 50);
+        assert!(row.contains("check @src/lib.rs"), "{row:?}");
+        assert!(!row.contains("<file"), "{row:?}");
     }
 
     #[test]

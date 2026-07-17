@@ -330,6 +330,17 @@ pub struct TagExpansion {
     pub ok: bool,
 }
 
+impl From<TagExpansion> for crate::daemon::proto::TagExpansionMeta {
+    fn from(expansion: TagExpansion) -> Self {
+        Self {
+            tool: expansion.tool.to_string(),
+            path: expansion.path,
+            detail: expansion.detail,
+            ok: expansion.ok,
+        }
+    }
+}
+
 /// Result of [`expand_tags`]: the wire payload (tags rewritten into
 /// fenced blocks / references) plus the per-tag expansions to surface in
 /// the chat.

@@ -3220,6 +3220,8 @@ impl Driver {
             .unwrap_or_else(|| self.active_queue_target());
         let data = user_message_event_data(
             &folded.text,
+            folded.display_text.as_deref(),
+            &folded.tag_expansions,
             folded.job_id.as_deref(),
             &folded.queue_item_ids,
             Some(&target),
@@ -3241,6 +3243,8 @@ impl Driver {
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
                 text: folded.text.clone(),
+                display_text: folded.display_text.clone(),
+                tag_expansions: folded.tag_expansions.clone(),
                 queue_item_ids: folded.queue_item_ids.clone(),
                 target,
                 seq,
@@ -3282,6 +3286,8 @@ impl Driver {
         Some(UserSubmission {
             kind: UserSubmissionKind::User,
             text: inbound_text,
+            display_text: submission.display_text,
+            tag_expansions: submission.tag_expansions,
             images: submission.images,
             forced_skill,
             origin_principal: submission.origin_principal,
@@ -3341,6 +3347,8 @@ impl Driver {
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
                 text: submission.text,
+                display_text: None,
+                tag_expansions: Vec::new(),
                 images: submission.images,
                 forced_skill: None,
                 origin_principal: None,
@@ -4444,6 +4452,8 @@ impl Driver {
         // pass none here (composer-paste-handling).
         let images = submission.images;
         let user_text = submission.text;
+        let display_text = submission.display_text;
+        let tag_expansions = submission.tag_expansions;
         let raw_user_text = user_text.clone();
         // A user-issued skill slash command (`/<skill-name>` / `/skill <name>`,
         // implementation note): the skill body loads via a
@@ -4485,6 +4495,8 @@ impl Driver {
         let queue_target = submission.queue_target.clone();
         let event_data = user_message_event_data(
             &user_text,
+            display_text.as_deref(),
+            &tag_expansions,
             job_id.as_deref(),
             &queue_item_ids,
             queue_target.as_ref(),
@@ -4506,6 +4518,8 @@ impl Driver {
                     let _ = tx
                         .send(TurnEvent::QueuedUserMessagesFolded {
                             text: user_text.clone(),
+                            display_text: display_text.clone(),
+                            tag_expansions: tag_expansions.clone(),
                             queue_item_ids: queue_item_ids.clone(),
                             target: queue_target
                                 .clone()
@@ -4629,6 +4643,8 @@ impl Driver {
             crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
                 text: recovered_text.clone(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 images: Vec::new(),
                 forced_skill: None,
                 origin_principal: None,
@@ -4645,6 +4661,8 @@ impl Driver {
                 } else {
                     self.with_time_prelude(user_text)
                 },
+                display_text: None,
+                tag_expansions: Vec::new(),
                 images,
                 forced_skill: None,
                 origin_principal: None,
@@ -4909,6 +4927,8 @@ impl Driver {
                                     crate::engine::message::build_user_message(UserSubmission {
                                         kind: UserSubmissionKind::User,
                                         text: self.with_time_prelude(prepared.text),
+                                        display_text: None,
+                                        tag_expansions: Vec::new(),
                                         images: prepared.images,
                                         forced_skill: None,
                                         origin_principal: None,
@@ -4973,6 +4993,8 @@ impl Driver {
                                     crate::engine::message::build_user_message(UserSubmission {
                                         kind: UserSubmissionKind::User,
                                         text: prepared.text,
+                                        display_text: None,
+                                        tag_expansions: Vec::new(),
                                         images: prepared.images,
                                         forced_skill: None,
                                         origin_principal: None,
@@ -5929,12 +5951,20 @@ fn async_result_header(kind: &str, job_id: &str) -> String {
 /// schema bump; ordinary input omits the key entirely.
 fn user_message_event_data(
     text: &str,
+    display_text: Option<&str>,
+    tag_expansions: &[crate::daemon::proto::TagExpansionMeta],
     job_id: Option<&str>,
     queue_item_ids: &[uuid::Uuid],
     queue_target: Option<&crate::engine::message::QueueTarget>,
     preflight_cleaned: Option<&str>,
 ) -> serde_json::Value {
     let mut data = serde_json::json!({ "text": text });
+    if let Some(display_text) = display_text {
+        data["display_text"] = serde_json::Value::String(display_text.to_string());
+    }
+    if !tag_expansions.is_empty() {
+        data["tag_expansions"] = serde_json::json!(tag_expansions);
+    }
     if let Some(jid) = job_id {
         data["job_id"] = serde_json::Value::String(jid.to_string());
     }

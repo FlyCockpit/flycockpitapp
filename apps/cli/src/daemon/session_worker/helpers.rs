@@ -79,6 +79,7 @@ fn queue_item_to_proto(item: crate::engine::message::QueuedUserMessage) -> proto
             crate::engine::message::QueueItemStatus::Folding => proto::QueueItemStatus::Folding,
         },
         text: item.text,
+        display_text: item.display_text,
         target: queue_target_to_proto(item.target),
     }
 }

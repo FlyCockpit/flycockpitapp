@@ -740,6 +740,12 @@ pub enum HistoryEntry {
     },
     User {
         text: String,
+        /// User-facing transcript form. Legacy rows omit it and display
+        /// `text` unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tag_expansions: Vec<TagExpansionMeta>,
         /// `session_events.ts_ms` of this message (epoch millis) — the wall
         /// clock the TUI stamps on the restored row so a resumed transcript
         /// shows the original send time, not the resume time.
@@ -899,8 +905,18 @@ pub struct QueueItem {
     pub id: Uuid,
     pub status: QueueItemStatus,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
     #[serde(default)]
     pub target: QueueTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagExpansionMeta {
+    pub tool: String,
+    pub path: String,
+    pub detail: String,
+    pub ok: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1223,6 +1239,8 @@ mod tests {
             Uuid::new_v4(),
             Request::SendUserMessage {
                 text: "hello".into(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
             },
@@ -1245,6 +1263,8 @@ mod tests {
             Uuid::new_v4(),
             Request::SendUserMessage {
                 text: IMAGE_PART_SENTINEL.to_string(),
+                display_text: None,
+                tag_expansions: Vec::new(),
                 image_refs: vec![image_ref],
                 forced_skill: None,
             },
@@ -1752,6 +1772,7 @@ mod tests {
             id: item_id,
             status: QueueItemStatus::Queued,
             text: "queued text".to_string(),
+            display_text: Some("queued @file".to_string()),
             target: QueueTarget {
                 id: "root".to_string(),
                 agent: "Build".to_string(),
@@ -1774,6 +1795,7 @@ mod tests {
                 Response::UserMessageQueued { item: got, queue } => {
                     assert_eq!(got.id, item_id);
                     assert_eq!(got.status, QueueItemStatus::Queued);
+                    assert_eq!(got.display_text.as_deref(), Some("queued @file"));
                     assert_eq!(got.target.id, "root");
                     assert_eq!(queue.len(), 1);
                 }

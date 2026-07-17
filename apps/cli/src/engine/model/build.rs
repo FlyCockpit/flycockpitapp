@@ -631,7 +631,10 @@ pub(super) fn build_openai_model_from_resolved(
         // here so the endpoint fallback's persist is best-effort/skipped for
         // tests + utility models.
         config_path: None,
-        wire_api_explicit,
+        live_wire_api: Arc::new(Mutex::new(LiveWireApiState::new(
+            wire_api,
+            wire_api_explicit,
+        ))),
         timeout: timeout.clone(),
         hard_timeout_on_stall,
         client_side_tools,

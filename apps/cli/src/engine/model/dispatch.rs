@@ -435,17 +435,16 @@ impl Model {
             Model::OpenAi {
                 client,
                 model_id,
-                wire_api,
                 provider_id,
                 config_path,
-                wire_api_explicit,
                 ..
             } => {
                 let base_url = client.base_url().to_string();
                 // The endpoint to try first (resolved concrete value), then —
                 // on a qualifying miss — its opposite, exactly once.
-                let mut endpoint = *wire_api;
+                let mut endpoint = self.resolve_live_wire_api_for_base_url(&base_url);
                 let mut tried_swap = false;
+                let mut approved_swap = false;
                 loop {
                     let attempt = || async {
                         let wire_tools = wire_schema::definitions_for_wire(endpoint, tools);
@@ -539,15 +538,18 @@ impl Model {
                             // corrected endpoint so later turns route directly
                             // with no retry (layer-3 persist). Only after an
                             // actual swap, and only when we know where to write.
-                            record_endpoint_observation(
-                                provider_id,
-                                model_id,
-                                &base_url,
-                                endpoint,
-                                EndpointObservation::Works,
-                            );
-                            if tried_swap && let Some(path) = config_path {
-                                persist_wire_api(path, provider_id, model_id, endpoint);
+                            if approved_swap {
+                                self.confirm_wire_api_for_base_url(&base_url, endpoint);
+                                record_endpoint_observation(
+                                    provider_id,
+                                    model_id,
+                                    &base_url,
+                                    endpoint,
+                                    EndpointObservation::Works,
+                                );
+                                if let Some(path) = config_path {
+                                    persist_wire_api(path, provider_id, model_id, endpoint);
+                                }
                             }
                             break Ok(value);
                         }
@@ -577,10 +579,26 @@ impl Model {
                             let alternate_not_incompatible =
                                 endpoint_observation(provider_id, model_id, &base_url, alternate)
                                     != EndpointObservation::Incompatible;
+                            if !tried_swap
+                                && no_output
+                                && is_endpoint_mismatch_error(&err)
+                                && !self.is_live_wire_api_explicit()
+                                && !cancel.is_cancelled()
+                                && !is_attempt_cancelled(&err)
+                                && let Some(confirmed) =
+                                    self.confirmed_wire_api_for_base_url(&base_url)
+                                && confirmed != endpoint
+                                && endpoint_observation(provider_id, model_id, &base_url, confirmed)
+                                    != EndpointObservation::Incompatible
+                            {
+                                tried_swap = true;
+                                endpoint = confirmed;
+                                continue;
+                            }
                             let approved = if !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
-                                && !*wire_api_explicit
+                                && !self.is_live_wire_api_explicit()
                                 && alternate_not_incompatible
                                 && !cancel.is_cancelled()
                                 && !is_attempt_cancelled(&err)
@@ -602,6 +620,7 @@ impl Model {
                             };
                             if approved {
                                 tried_swap = true;
+                                approved_swap = true;
                                 endpoint = alternate;
                                 continue;
                             }
@@ -849,14 +868,9 @@ impl Model {
         tools: &'a [ToolDefinition],
     ) -> std::borrow::Cow<'a, [ToolDefinition]> {
         let wire = match self {
-            Model::OpenAi {
-                model_id, wire_api, ..
-            } => match wire_api {
-                crate::config::providers::WireApi::Auto => {
-                    crate::config::providers::WireApi::detect(model_id)
-                }
-                concrete => *concrete,
-            },
+            Model::OpenAi { client, .. } => {
+                self.resolve_live_wire_api_for_base_url(client.base_url())
+            }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
             Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
         };
@@ -1139,15 +1153,13 @@ impl Model {
     {
         match self {
             Model::OpenAi {
-                client,
-                model_id,
-                wire_api,
-                ..
+                client, model_id, ..
             } => {
                 // Use the resolved endpoint the main call would use first.
+                let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
                 match wire_api {
                     crate::config::providers::WireApi::Responses => {
-                        let wire_tools = wire_schema::definitions_for_wire(*wire_api, tools);
+                        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
                         let wire_tools = wire_tools.as_ref();
                         let responses = client.clone().responses_api();
                         let agent = build_agent(&responses, model_id, system, wire_tools, params);

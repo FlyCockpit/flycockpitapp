@@ -16,7 +16,8 @@ pub(super) struct EndpointProbeKey {
 pub(super) struct EndpointProbeState {
     completions: EndpointObservation,
     responses: EndpointObservation,
-    observed_at: Option<Instant>,
+    completions_observed_at: Option<Instant>,
+    responses_observed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -49,14 +50,14 @@ pub(super) fn prune_endpoint_probes(
     now: Instant,
 ) {
     probes.retain(|_, state| {
-        state.observed_at.is_some_and(|observed_at| {
+        state.observed_at().is_some_and(|observed_at| {
             now.saturating_duration_since(observed_at) <= ENDPOINT_PROBE_TTL
         })
     });
     while probes.len() > ENDPOINT_PROBE_MAX_ENTRIES {
         let Some(oldest_key) = probes
             .iter()
-            .min_by_key(|(_, state)| state.observed_at)
+            .min_by_key(|(_, state)| state.observed_at())
             .map(|(key, _)| key.clone())
         else {
             break;
@@ -75,13 +76,7 @@ pub(super) fn learned_working_endpoint(
         .unwrap_or_else(|poison| poison.into_inner());
     prune_endpoint_probes(&mut probes, Instant::now());
     let state = probes.get(&probe_key(provider, model, base_url))?;
-    if state.completions == EndpointObservation::Works {
-        Some(crate::config::providers::WireApi::Completions)
-    } else if state.responses == EndpointObservation::Works {
-        Some(crate::config::providers::WireApi::Responses)
-    } else {
-        None
-    }
+    state.most_recent_working_endpoint()
 }
 
 pub(super) fn endpoint_observation(
@@ -136,13 +131,53 @@ pub(super) fn record_endpoint_observation_at(
     let state = probes
         .entry(probe_key(provider, model, base_url))
         .or_default();
-    state.observed_at = Some(now);
     match endpoint {
-        crate::config::providers::WireApi::Completions => state.completions = observation,
-        crate::config::providers::WireApi::Responses => state.responses = observation,
+        crate::config::providers::WireApi::Completions => {
+            state.completions = observation;
+            state.completions_observed_at = Some(now);
+        }
+        crate::config::providers::WireApi::Responses => {
+            state.responses = observation;
+            state.responses_observed_at = Some(now);
+        }
         crate::config::providers::WireApi::Auto => {}
     }
     prune_endpoint_probes(&mut probes, now);
+}
+
+impl EndpointProbeState {
+    fn observed_at(&self) -> Option<Instant> {
+        self.completions_observed_at.max(self.responses_observed_at)
+    }
+
+    fn most_recent_working_endpoint(&self) -> Option<crate::config::providers::WireApi> {
+        let completions = if self.completions == EndpointObservation::Works {
+            self.completions_observed_at
+                .map(|at| (crate::config::providers::WireApi::Completions, at))
+        } else {
+            None
+        };
+        let responses = if self.responses == EndpointObservation::Works {
+            self.responses_observed_at
+                .map(|at| (crate::config::providers::WireApi::Responses, at))
+        } else {
+            None
+        };
+        match (completions, responses) {
+            (Some((endpoint, _)), None) | (None, Some((endpoint, _))) => Some(endpoint),
+            (
+                Some((completions_endpoint, completions_at)),
+                Some((responses_endpoint, responses_at)),
+            ) => {
+                if responses_at > completions_at {
+                    Some(responses_endpoint)
+                } else {
+                    Some(completions_endpoint)
+                }
+            }
+            (None, None) => None,
+        }
+    }
 }
 
 pub(super) fn normalize_openai_usage_aliases_bytes(bytes: bytes::Bytes) -> bytes::Bytes {

@@ -317,6 +317,25 @@ type CompleteOut = (
     Option<TokenUsage>,
 );
 
+#[derive(Debug, Clone)]
+pub(crate) struct LiveWireApiState {
+    configured: crate::config::providers::WireApi,
+    explicit: bool,
+    session_confirmed: HashMap<String, crate::config::providers::WireApi>,
+}
+
+impl LiveWireApiState {
+    fn new(configured: crate::config::providers::WireApi, explicit: bool) -> Self {
+        Self {
+            configured,
+            explicit,
+            session_confirmed: HashMap::new(),
+        }
+    }
+}
+
+pub(crate) type LiveWireApi = Arc<Mutex<LiveWireApiState>>;
+
 /// One concrete provider-flavor of completion model. Add variants here
 /// as we wire more providers.
 #[derive(Clone)]
@@ -351,9 +370,11 @@ pub enum Model {
         /// most once. `None` (tests / utility models) skips the persist; the
         /// fallback itself still works.
         config_path: Option<PathBuf>,
-        /// True when the resolved endpoint came from a concrete model/provider
-        /// config value. Recovery never overrides explicit config authority.
-        wire_api_explicit: bool,
+        /// Live per-session endpoint state. The build-time `wire_api` remains
+        /// the diagnostic/default endpoint, but dispatch resolves through this
+        /// cell every turn so a confirmed self-heal and turn-boundary config
+        /// refresh apply without rebuilding the model.
+        live_wire_api: LiveWireApi,
         /// Resolved inference-stream timeouts (TTFT + idle) for this
         /// `(provider, model)`
         /// (implementation note).
@@ -751,13 +772,10 @@ impl Model {
 
     fn needs_responses_tool_identity_normalization(&self, endpoint_recovery_enabled: bool) -> bool {
         match self {
-            Model::OpenAi {
-                wire_api,
-                wire_api_explicit,
-                ..
-            } => {
-                matches!(wire_api, crate::config::providers::WireApi::Responses)
-                    || (!*wire_api_explicit && endpoint_recovery_enabled)
+            Model::OpenAi { client, .. } => {
+                let endpoint = self.resolve_live_wire_api_for_base_url(client.base_url());
+                matches!(endpoint, crate::config::providers::WireApi::Responses)
+                    || (!self.is_live_wire_api_explicit() && endpoint_recovery_enabled)
             }
             Model::ChatGpt { .. } => true,
             Model::Anthropic { .. } => false,
@@ -860,6 +878,108 @@ impl Model {
             Model::ChatGpt { .. } => None,
             Model::Anthropic { .. } => None,
         }
+    }
+
+    pub(crate) fn refresh_wire_api_config(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+    ) {
+        let Model::OpenAi {
+            provider_id,
+            model_id,
+            live_wire_api,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let mut state = live_wire_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.configured = providers.resolve_wire_api(provider_id, model_id);
+        state.explicit = providers.is_wire_api_explicit(provider_id, model_id);
+    }
+
+    pub(crate) fn resolve_live_wire_api_for_base_url(
+        &self,
+        base_url: &str,
+    ) -> crate::config::providers::WireApi {
+        match self {
+            Model::OpenAi {
+                provider_id,
+                model_id,
+                wire_api,
+                live_wire_api,
+                ..
+            } => {
+                let state = live_wire_api
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.explicit && !state.configured.is_auto() {
+                    return state.configured;
+                }
+                let normalized = normalize_probe_base_url(base_url);
+                if let Some(endpoint) = state.session_confirmed.get(&normalized) {
+                    return *endpoint;
+                }
+                drop(state);
+                if let Some(learned) = learned_working_endpoint(provider_id, model_id, base_url) {
+                    return learned;
+                }
+                if !wire_api.is_auto() {
+                    *wire_api
+                } else {
+                    crate::config::providers::WireApi::detect_for_provider(provider_id, model_id)
+                }
+            }
+            Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+        }
+    }
+
+    fn is_live_wire_api_explicit(&self) -> bool {
+        match self {
+            Model::OpenAi { live_wire_api, .. } => {
+                live_wire_api
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .explicit
+            }
+            Model::ChatGpt { .. } | Model::Anthropic { .. } => true,
+        }
+    }
+
+    fn confirmed_wire_api_for_base_url(
+        &self,
+        base_url: &str,
+    ) -> Option<crate::config::providers::WireApi> {
+        let Model::OpenAi { live_wire_api, .. } = self else {
+            return None;
+        };
+        live_wire_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session_confirmed
+            .get(&normalize_probe_base_url(base_url))
+            .copied()
+    }
+
+    fn confirm_wire_api_for_base_url(
+        &self,
+        base_url: &str,
+        endpoint: crate::config::providers::WireApi,
+    ) {
+        let Model::OpenAi { live_wire_api, .. } = self else {
+            return;
+        };
+        if endpoint.is_auto() {
+            return;
+        }
+        live_wire_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session_confirmed
+            .insert(normalize_probe_base_url(base_url), endpoint);
     }
 
     /// Install the daemon's shared shutdown gate, replacing the default
@@ -2816,6 +2936,56 @@ mod tests {
     }
 
     #[test]
+    fn learned_endpoint_prefers_most_recent_observation() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let now = Instant::now();
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model",
+            "http://localhost:1234/v1",
+            WireApi::Completions,
+            EndpointObservation::Works,
+            now,
+        );
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model",
+            "http://localhost:1234/v1",
+            WireApi::Responses,
+            EndpointObservation::Works,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            learned_working_endpoint("probe-provider", "probe-model", "http://localhost:1234/v1"),
+            Some(WireApi::Responses)
+        );
+
+        endpoint_probes().lock().unwrap().clear();
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model",
+            "http://localhost:1234/v1",
+            WireApi::Responses,
+            EndpointObservation::Works,
+            now,
+        );
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model",
+            "http://localhost:1234/v1",
+            WireApi::Completions,
+            EndpointObservation::Works,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            learned_working_endpoint("probe-provider", "probe-model", "http://localhost:1234/v1"),
+            Some(WireApi::Completions)
+        );
+    }
+
+    #[test]
     fn endpoint_probe_observations_expire_without_sleeping() {
         use crate::config::providers::WireApi;
         let _guard = endpoint_probe_test_guard();
@@ -2830,6 +3000,14 @@ mod tests {
             EndpointObservation::Works,
             stale,
         );
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model",
+            "http://localhost:1234/v1",
+            WireApi::Completions,
+            EndpointObservation::Works,
+            now,
+        );
 
         assert_eq!(
             endpoint_observation(
@@ -2840,6 +3018,15 @@ mod tests {
             ),
             EndpointObservation::Unknown
         );
+        assert_eq!(
+            endpoint_observation(
+                "probe-provider",
+                "probe-model",
+                "http://localhost:1234/v1",
+                WireApi::Completions
+            ),
+            EndpointObservation::Works
+        );
     }
 
     #[test]
@@ -2848,7 +3035,23 @@ mod tests {
         let _guard = endpoint_probe_test_guard();
         endpoint_probes().lock().unwrap().clear();
         let now = Instant::now();
-        for index in 0..=ENDPOINT_PROBE_MAX_ENTRIES {
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model-0",
+            "http://localhost:1234/v1",
+            WireApi::Completions,
+            EndpointObservation::Works,
+            now,
+        );
+        record_endpoint_observation_at(
+            "probe-provider",
+            "probe-model-0",
+            "http://localhost:1234/v1",
+            WireApi::Responses,
+            EndpointObservation::Works,
+            now + Duration::from_secs((ENDPOINT_PROBE_MAX_ENTRIES + 2) as u64),
+        );
+        for index in 1..=ENDPOINT_PROBE_MAX_ENTRIES {
             record_endpoint_observation_at(
                 "probe-provider",
                 &format!("probe-model-{index}"),
@@ -2863,9 +3066,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         assert!(probes.len() <= ENDPOINT_PROBE_MAX_ENTRIES);
-        assert!(!probes.contains_key(&probe_key(
+        assert!(probes.contains_key(&probe_key(
             "probe-provider",
             "probe-model-0",
+            "http://localhost:1234/v1"
+        )));
+        assert!(!probes.contains_key(&probe_key(
+            "probe-provider",
+            "probe-model-1",
             "http://localhost:1234/v1"
         )));
         assert!(probes.contains_key(&probe_key(
@@ -4070,12 +4278,14 @@ mod tests {
         (format!("http://{addr}/v1"), rx)
     }
 
-    async fn chat_404_then_responses_ok_server() -> (String, tokio::sync::mpsc::Receiver<String>) {
+    async fn chat_404_then_responses_ok_server_with_limit(
+        max_requests: usize,
+    ) -> (String, tokio::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(max_requests.max(1));
         tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..max_requests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
@@ -4104,6 +4314,10 @@ mod tests {
             }
         });
         (format!("http://{addr}/v1"), rx)
+    }
+
+    async fn chat_404_then_responses_ok_server() -> (String, tokio::sync::mpsc::Receiver<String>) {
+        chat_404_then_responses_ok_server_with_limit(2).await
     }
 
     #[tokio::test]
@@ -4248,6 +4462,524 @@ mod tests {
             serde_json::json!(["string", "null"]),
             "capture must match the successful Responses retry"
         );
+    }
+
+    #[test]
+    fn resolve_live_endpoint_precedence_order() {
+        use crate::config::providers::{ModelEntry, WireApi};
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let resolved = resolved_local_request("http://localhost:1234/v1".to_string());
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved,
+            "plain-model",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Auto,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
+            WireApi::Completions
+        );
+
+        record_endpoint_observation(
+            "p",
+            "plain-model",
+            "http://localhost:1234/v1",
+            WireApi::Responses,
+            EndpointObservation::Works,
+        );
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
+            WireApi::Responses
+        );
+
+        model.confirm_wire_api_for_base_url("http://localhost:1234/v1", WireApi::Completions);
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
+            WireApi::Completions
+        );
+
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: "http://localhost:1234/v1".into(),
+                models: vec![ModelEntry {
+                    id: "plain-model".into(),
+                    wire_api: WireApi::Responses,
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        model.refresh_wire_api_config(&providers);
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
+            WireApi::Responses
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_swap_suppresses_prompt_on_later_turns() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(3).await;
+        let resolved = resolved_local_request(url.clone());
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved,
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        let approvals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery = EndpointRecoveryContext {
+            approve: {
+                let approvals = approvals.clone();
+                std::sync::Arc::new(move |_| {
+                    approvals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async { true })
+                })
+            },
+        };
+        for text in ["first", "second"] {
+            model
+                .complete_captured(
+                    "system",
+                    &[],
+                    Message::user(text),
+                    &[],
+                    ModelParams::default(),
+                    "Build",
+                    None,
+                    &CancellationToken::new(),
+                    Some(recovery.clone()),
+                )
+                .await
+                .expect("endpoint recovery should succeed");
+        }
+        assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+        assert!(requests.recv().await.unwrap().contains("/responses"));
+        assert!(requests.recv().await.unwrap().contains("/responses"));
+        assert!(
+            requests.try_recv().is_err(),
+            "second turn must not hit stale chat endpoint"
+        );
+        assert_eq!(
+            approvals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "approval prompt should run once"
+        );
+        assert_eq!(
+            model.confirmed_wire_api_for_base_url(&url),
+            Some(WireApi::Responses)
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_endpoint_survives_probe_cache_expiry() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(3).await;
+        let resolved = resolved_local_request(url.clone());
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved,
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        let recovery = EndpointRecoveryContext {
+            approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+        };
+        model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("first"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                Some(recovery.clone()),
+            )
+            .await
+            .expect("first recovered turn succeeds");
+        endpoint_probes().lock().unwrap().clear();
+        assert_eq!(learned_working_endpoint("p", "m", &url), None);
+        model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("second"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                Some(recovery),
+            )
+            .await
+            .expect("session-confirmed endpoint survives stale probe cache");
+        assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+        assert!(requests.recv().await.unwrap().contains("/responses"));
+        assert!(requests.recv().await.unwrap().contains("/responses"));
+    }
+
+    #[tokio::test]
+    async fn works_recorded_per_documented_contract() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let (url, _rx) = sse_capture_server().await;
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(url.clone()),
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("direct"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("direct success should succeed");
+        assert_eq!(
+            endpoint_observation("p", "m", &url, WireApi::Completions),
+            EndpointObservation::Unknown,
+            "direct success without a swap is not a meaningful probe observation"
+        );
+
+        endpoint_probes().lock().unwrap().clear();
+        let (url, _requests) = chat_404_then_responses_ok_server_with_limit(2).await;
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(url.clone()),
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        let recovery = EndpointRecoveryContext {
+            approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+        };
+        model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("swap"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                Some(recovery),
+            )
+            .await
+            .expect("approved swap should succeed");
+        assert_eq!(
+            endpoint_observation("p", "m", &url, WireApi::Responses),
+            EndpointObservation::Works
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_wire_api_pin_wins_over_learned() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+        record_endpoint_observation(
+            "p",
+            "m",
+            &url,
+            WireApi::Responses,
+            EndpointObservation::Works,
+        );
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(url.clone()),
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            true,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        model.confirm_wire_api_for_base_url(&url, WireApi::Responses);
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url(&url),
+            WireApi::Completions
+        );
+        let approvals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery = EndpointRecoveryContext {
+            approve: {
+                let approvals = approvals.clone();
+                std::sync::Arc::new(move |_| {
+                    approvals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async { true })
+                })
+            },
+        };
+        let result = model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("hi"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                Some(recovery),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "explicit chat pin must not silently use learned responses"
+        );
+        assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+        assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn wire_api_config_change_applies_without_rebuild() {
+        use crate::config::providers::{ModelEntry, WireApi};
+        let resolved = resolved_local_request("http://localhost:1234/v1".to_string());
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved,
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            true,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
+            WireApi::Completions
+        );
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: "http://localhost:1234/v1".into(),
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    wire_api: WireApi::Responses,
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        model.refresh_wire_api_config(&providers);
+        assert_eq!(
+            model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
+            WireApi::Responses
+        );
+    }
+
+    #[tokio::test]
+    async fn declined_swap_does_not_confirm_or_pin() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&path, "p").unwrap();
+        std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            provider_path,
+            serde_json::json!({ "url": url, "models": [{ "id": "m" }] }).to_string(),
+        )
+        .unwrap();
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(url.clone()),
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap()
+        .with_config_path(path.clone());
+        let recovery = EndpointRecoveryContext {
+            approve: std::sync::Arc::new(|_| Box::pin(async { false })),
+        };
+        let result = model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("decline"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                Some(recovery),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "declined swap should surface the original mismatch"
+        );
+        assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+        assert_eq!(model.confirmed_wire_api_for_base_url(&url), None);
+        let doc = crate::config::providers::ConfigDoc::load(&path).unwrap();
+        assert_eq!(doc.providers().resolve_wire_api("p", "m"), WireApi::Auto);
+    }
+
+    #[tokio::test]
+    async fn utility_model_resolves_without_recovery_context() {
+        use crate::config::providers::WireApi;
+        let _guard = endpoint_probe_test_guard();
+        endpoint_probes().lock().unwrap().clear();
+        let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+        record_endpoint_observation(
+            "p",
+            "m",
+            &url,
+            WireApi::Responses,
+            EndpointObservation::Works,
+        );
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(url),
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Auto,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("utility"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("utility/headless model should resolve learned endpoint without prompting");
+        assert!(requests.recv().await.unwrap().contains("/responses"));
     }
 
     #[tokio::test]

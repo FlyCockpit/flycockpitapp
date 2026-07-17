@@ -1,5 +1,17 @@
 use super::*;
 
+struct CompactBriefDraft {
+    session: Arc<Session>,
+    model: Arc<crate::engine::model::Model>,
+    system: String,
+    history: Vec<Message>,
+    params: crate::engine::model::ModelParams,
+    agent_name: String,
+    prompt_override: Option<String>,
+    #[cfg(test)]
+    test_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
+}
+
 impl Driver {
     /// `/compact` drafts a new-thread brief from a filtered view of history:
     /// non-steering user-invoked skill pairs are deliberately omitted because
@@ -386,10 +398,10 @@ impl Driver {
         // The ctx%-threshold branch (inert when context_length is unknown):
         // prune above the configured ctx% AND prunable% even on a warm cache.
         let ctx_cfg = Self::context_config_from(providers_cfg.as_ref());
-        let usage = self.session.last_usage();
+        let context_length = self.active_model_context_length();
         let metrics = context_metrics(
-            self.active_model_context_length(),
-            usage.map(|u| u.input_tokens),
+            context_length,
+            self.context_input_tokens(context_length),
             plan.tokens_saved() as u64,
         );
         let threshold_hit = metrics.is_some_and(|m| {
@@ -429,6 +441,169 @@ impl Driver {
         true
     }
 
+    /// Publish a completed generation-tagged shadow task without ever waiting
+    /// for one that is still running.
+    pub(in crate::engine::driver) async fn settle_shadow_brief(&mut self) {
+        let Some(state) = self.shadow_brief.take() else {
+            return;
+        };
+        let ShadowBriefState::InFlight(mut task) = state else {
+            self.shadow_brief = Some(state);
+            return;
+        };
+        if !task.handle.is_finished() {
+            self.shadow_brief = Some(ShadowBriefState::InFlight(task));
+            return;
+        }
+        let result = (&mut task.handle).await.ok().flatten();
+        if task.generation == self.shadow_brief_generation
+            && !task.cancel.is_cancelled()
+            && let Some(brief) = result
+        {
+            self.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
+                generation: task.generation,
+                snapshot_history: task.snapshot_history,
+                snapshot_turns: task.snapshot_turns,
+                snapshot_tail_turns: task.snapshot_tail_turns,
+                brief,
+            }));
+        }
+    }
+
+    /// Cancel only unfinished utility work. A ready shadow survives the next
+    /// foreground turn and is delta-revised when compaction eventually fires.
+    pub(in crate::engine::driver) async fn cancel_shadow_brief_inflight(&mut self) {
+        let Some(state) = self.shadow_brief.take() else {
+            return;
+        };
+        match state {
+            ShadowBriefState::InFlight(mut task) => {
+                task.cancel.cancel();
+                task.handle.abort();
+                let _ = (&mut task.handle).await;
+                self.shadow_brief_generation = self.shadow_brief_generation.wrapping_add(1);
+            }
+            ready @ ShadowBriefState::Ready(_) => self.shadow_brief = Some(ready),
+        }
+    }
+
+    /// Foreground preparation priority boundary. Settle first so a draft that
+    /// completed before dequeue remains usable; otherwise cancel and join the
+    /// unfinished task before any foreground utility inference begins.
+    pub(in crate::engine::driver) async fn preempt_shadow_brief_for_foreground(&mut self) {
+        self.settle_shadow_brief().await;
+        self.cancel_shadow_brief_inflight().await;
+    }
+
+    /// At an idle root boundary, pre-draft a full brief once context enters the
+    /// configured shadow band. Effective pruning suppresses the early half of
+    /// the band; the late half always drafts so the hard line has a head start.
+    pub(in crate::engine::driver) async fn maybe_shadow_brief(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        if !self.at_safe_boundary() || self.stack.len() != 1 || self.auto_compacted {
+            return false;
+        }
+        self.settle_shadow_brief().await;
+        let ctx_cfg = self.resolve_context_config();
+        if !ctx_cfg.compact_shadow {
+            self.cancel_shadow_brief_inflight().await;
+            self.shadow_brief = None;
+            return false;
+        }
+
+        let snapshot_history = self.compact_brief_history(&self.stack[0].history);
+        let snapshot_turns = crate::engine::compact::complete_exchange_count(&snapshot_history);
+        let stale_after = std::cmp::max(8, ctx_cfg.compact_keep_recent_turns.saturating_add(4));
+        if matches!(
+            &self.shadow_brief,
+            Some(ShadowBriefState::Ready(ready))
+                if snapshot_turns.saturating_sub(ready.snapshot_turns) > stale_after
+        ) {
+            self.shadow_brief = None;
+        }
+        if self.shadow_brief.is_some() {
+            return false;
+        }
+
+        let context_length = self.active_model_context_length();
+        let Some(metrics) =
+            context_metrics(context_length, self.context_input_tokens(context_length), 0)
+        else {
+            return false;
+        };
+        let margin = ctx_cfg.compact_shadow_margin_pct.min(100);
+        let start = ctx_cfg.auto_compact_pct.saturating_sub(margin);
+        let late_start = ctx_cfg
+            .auto_compact_pct
+            .saturating_sub(margin.saturating_add(1) / 2);
+        if metrics.ctx_pct < f64::from(start)
+            || metrics.ctx_pct >= f64::from(ctx_cfg.auto_compact_pct)
+            || (!self.prune_is_ineffective() && metrics.ctx_pct < f64::from(late_start))
+        {
+            return false;
+        }
+
+        let snapshot_tail_turns = crate::engine::compact::plan_compacted_history(
+            &snapshot_history,
+            "",
+            ctx_cfg.compact_keep_recent_turns,
+            context_length,
+            100,
+        )
+        .map(|plan| plan.tail_kept)
+        .unwrap_or(ctx_cfg.compact_keep_recent_turns);
+        let tail_message_seqs = self.compact_tail_message_seqs(snapshot_tail_turns);
+        let draft = self.compact_brief_draft(tx, snapshot_history.clone()).await;
+        let mut prompt_text =
+            crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
+        prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
+            &tail_message_seqs,
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        self.shadow_brief_generation = self.shadow_brief_generation.wrapping_add(1);
+        let generation = self.shadow_brief_generation;
+        let handle = tokio::spawn(async move {
+            execute_compact_brief(draft, prompt_text, "compact_shadow_brief", &task_cancel).await
+        });
+        self.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+            generation,
+            snapshot_history,
+            snapshot_turns,
+            snapshot_tail_turns,
+            cancel,
+            handle,
+        }));
+        true
+    }
+
+    async fn take_fresh_shadow_brief(
+        &mut self,
+        keep_recent_turns: usize,
+    ) -> Option<ShadowBriefReady> {
+        self.settle_shadow_brief().await;
+        let state = self.shadow_brief.take()?;
+        match state {
+            ShadowBriefState::InFlight(mut task) => {
+                task.cancel.cancel();
+                task.handle.abort();
+                let _ = (&mut task.handle).await;
+                self.shadow_brief_generation = self.shadow_brief_generation.wrapping_add(1);
+                None
+            }
+            ShadowBriefState::Ready(ready) => {
+                let current = self.compact_brief_history(&self.stack[0].history);
+                let current_turns = crate::engine::compact::complete_exchange_count(&current);
+                let stale_after = std::cmp::max(8, keep_recent_turns.saturating_add(4));
+                (ready.generation == self.shadow_brief_generation
+                    && current_turns.saturating_sub(ready.snapshot_turns) <= stale_after)
+                    .then_some(ready)
+            }
+        }
+    }
+
     /// Auto-compact trigger (implementation note): at or
     /// above the configured auto-compact ctx% the foreground context is
     /// compacted automatically via the existing `/compact` machinery — no
@@ -461,12 +636,10 @@ impl Driver {
             return false;
         }
         let ctx_cfg = self.resolve_context_config();
-        let usage = self.session.last_usage();
-        let Some(metrics) = context_metrics(
-            self.active_model_context_length(),
-            usage.map(|u| u.input_tokens),
-            0,
-        ) else {
+        let context_length = self.active_model_context_length();
+        let Some(metrics) =
+            context_metrics(context_length, self.context_input_tokens(context_length), 0)
+        else {
             return false;
         };
         // Two triggers reach the same `/compact` machinery:
@@ -510,10 +683,18 @@ impl Driver {
         let tokens_before = wire_token_total(&original_history);
         let context_window = self.active_model_context_length();
         let ctx_cfg = self.resolve_context_config();
-        let trigger_ctx_pct = match (
-            self.session.last_usage().map(|usage| usage.input_tokens),
-            context_window,
-        ) {
+        // Resolve shadow ownership before mutating history with the private
+        // prune. An unfinished task is cancelled and falls back to the full
+        // synchronous path; a stale ready draft is discarded likewise.
+        let shadow = if ctx_cfg.compact_shadow {
+            self.take_fresh_shadow_brief(ctx_cfg.compact_keep_recent_turns)
+                .await
+        } else {
+            self.cancel_shadow_brief_inflight().await;
+            self.shadow_brief = None;
+            None
+        };
+        let trigger_ctx_pct = match (self.context_input_tokens(context_window), context_window) {
             (Some(used), Some(window)) if window > 0 => {
                 Some(used as f64 / f64::from(window) * 100.0)
             }
@@ -613,7 +794,17 @@ impl Driver {
         let mut tail_positions = candidate_tail.tail_message_positions;
         let (brief, handoff, mut plan) = loop {
             let tail_message_seqs = self.compact_tail_message_seqs(keep);
-            let brief = self.draft_brief(tx, &tail_message_seqs).await;
+            let brief = if let Some(ready) = shadow.as_ref() {
+                let revision_history = compact::shadow_revision_history(
+                    &ready.snapshot_history,
+                    &filtered_history,
+                    ready.snapshot_tail_turns,
+                );
+                self.draft_brief_delta(tx, &tail_message_seqs, &ready.brief, revision_history)
+                    .await
+            } else {
+                self.draft_brief(tx, &tail_message_seqs).await
+            };
             let handoff = compact::assemble_handoff(&brief, &appendix);
             let plan = match compact::plan_compacted_history(
                 &filtered_history,
@@ -732,16 +923,11 @@ impl Driver {
             .await;
     }
 
-    /// Run one model round-trip asking the foreground agent to draft the
-    /// self-contained handoff brief (T6.e step 1). Falls back to a terse
-    /// placeholder if the model call fails so `/compact` always produces
-    /// a usable handoff (the deterministic appendix is the real safety
-    /// net).
-    pub(in crate::engine::driver) async fn draft_brief(
+    async fn compact_brief_draft(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
-        tail_message_seqs: &[i64],
-    ) -> String {
+        history: Vec<Message>,
+    ) -> CompactBriefDraft {
         let top = self.stack.last().expect("stack never empty");
         // Resolve the two `extended.*` compaction knobs from the config
         // chain (implementation note):
@@ -758,13 +944,6 @@ impl Driver {
         };
         #[cfg(not(test))]
         let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
-        let mut prompt_text =
-            crate::engine::compact::brief_prompt(extended.compact_prompt.as_deref());
-        prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
-            tail_message_seqs,
-        ));
-        let prompt = Message::user(prompt_text);
-
         // Two-level model precedence: a configured `compact_model` (when it
         // resolves) drafts the brief; otherwise the active agent's own model.
         // A configured-but-unresolvable `compact_model` falls back to the
@@ -792,74 +971,155 @@ impl Driver {
             },
             None => None,
         };
-        let model = compact_model.as_ref().unwrap_or(&top.agent.model);
+        let model = compact_model
+            .map(Arc::new)
+            .unwrap_or_else(|| top.agent.model.clone());
+        CompactBriefDraft {
+            session: self.session.clone(),
+            model,
+            system: top.agent.system.clone(),
+            history,
+            params: top.agent.params.clone(),
+            agent_name: top.agent.name.clone(),
+            prompt_override: extended.compact_prompt,
+            #[cfg(test)]
+            test_calls: self.test_compact_brief_calls.clone(),
+        }
+    }
 
-        // Always-on capture (Part A): the `/compact` brief is an inference
-        // call too, so persist its request body + a timeline event keyed by
-        // a fresh round-trip id.
-        let call_id = uuid::Uuid::new_v4();
-        let brief_history = self.compact_brief_history(&top.history);
-        match model
-            .complete_captured(
-                &top.agent.system,
-                &brief_history,
-                prompt,
-                &[],
-                top.agent.params.clone(),
-                &top.agent.name,
-                None,
-                // The `/compact` brief is a short utility round-trip, not a
-                // user-message turn; it isn't tied to the run's ctrl+c
-                // cancel slot. A fresh never-cancelled token keeps the
-                // signature uniform.
-                &tokio_util::sync::CancellationToken::new(),
-                None,
-            )
-            .await
-        {
-            Ok(((_, choice, usage), captured, _timing)) => {
-                if let Err(e) = self.session.record_inference_request(
-                    call_id,
-                    &captured,
-                    crate::db::session_log::InferenceRequestStatus::Completed,
-                ) {
-                    tracing::warn!(error = %e, "compact brief: record_inference_request failed");
-                }
-                // The `/compact` brief is background machinery, not a
-                // foreground user turn: persist a utility-flagged
-                // `inference_calls` row so the `/export debug` bundle routes
-                // this request body into `inference_requests_utility/`.
-                if let Some(u) = usage
-                    && let Err(e) = self.session.record_usage_utility(call_id, u)
-                {
-                    tracing::warn!(error = %e, "compact brief: record_usage_utility failed");
-                }
-                let usage_json = usage.map(|u| {
-                    serde_json::json!({
-                        "input_tokens": u.input_tokens,
-                        "output_tokens": u.output_tokens,
-                        "cached_input_tokens": u.cached_input_tokens,
-                    })
-                });
-                if let Err(e) = self.session.record_event(
-                    crate::db::session_log::SessionEventKind::InferenceRequest,
-                    Some(&top.agent.name),
-                    Some(&call_id.to_string()),
-                    &serde_json::json!({ "usage": usage_json, "purpose": "compact_brief" }),
-                ) {
-                    tracing::warn!(error = %e, "compact brief: record inference_request event failed");
-                }
-                let text = crate::engine::message::extract_text(&choice);
-                if text.trim().is_empty() {
-                    "(model produced no brief; rely on the state appendix below)".to_string()
-                } else {
-                    text
-                }
+    /// Run one model round-trip asking the foreground agent to draft the
+    /// self-contained handoff brief (T6.e step 1).
+    pub(in crate::engine::driver) async fn draft_brief(
+        &self,
+        tx: &mpsc::Sender<TurnEvent>,
+        tail_message_seqs: &[i64],
+    ) -> String {
+        let history =
+            self.compact_brief_history(&self.stack.last().expect("stack never empty").history);
+        let draft = self.compact_brief_draft(tx, history).await;
+        let mut prompt_text =
+            crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
+        prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
+            tail_message_seqs,
+        ));
+        execute_compact_brief(
+            draft,
+            prompt_text,
+            "compact_brief",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|| {
+            "(brief generation failed; rely on the state appendix below)".to_string()
+        })
+    }
+
+    async fn draft_brief_delta(
+        &self,
+        tx: &mpsc::Sender<TurnEvent>,
+        tail_message_seqs: &[i64],
+        shadow_brief: &str,
+        new_turns: Vec<Message>,
+    ) -> String {
+        let draft = self.compact_brief_draft(tx, new_turns).await;
+        let prompt_text = crate::engine::compact::shadow_delta_prompt(
+            draft.prompt_override.as_deref(),
+            shadow_brief,
+            tail_message_seqs,
+        );
+        execute_compact_brief(
+            draft,
+            prompt_text,
+            "compact_brief_delta",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|| {
+            "(brief generation failed; rely on the state appendix below)".to_string()
+        })
+    }
+}
+
+async fn execute_compact_brief(
+    draft: CompactBriefDraft,
+    prompt_text: String,
+    purpose: &'static str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    #[cfg(test)]
+    if let Some(calls) = &draft.test_calls {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        crate::sync::lock_or_recover(calls).push(TestCompactBriefCall {
+            purpose,
+            prompt: prompt_text.clone(),
+            history: draft.history.clone(),
+        });
+        let _ = draft.session.record_event(
+            crate::db::session_log::SessionEventKind::InferenceRequest,
+            Some(&draft.agent_name),
+            None,
+            &serde_json::json!({ "usage": null, "purpose": purpose }),
+        );
+        return Some("test compact brief".to_string());
+    }
+    let call_id = uuid::Uuid::new_v4();
+    match draft
+        .model
+        .complete_captured(
+            &draft.system,
+            &draft.history,
+            Message::user(prompt_text),
+            &[],
+            draft.params,
+            &draft.agent_name,
+            None,
+            cancel,
+            None,
+        )
+        .await
+    {
+        Ok(((_, choice, usage), captured, _timing)) if !cancel.is_cancelled() => {
+            if let Err(e) = draft.session.record_inference_request(
+                call_id,
+                &captured,
+                crate::db::session_log::InferenceRequestStatus::Completed,
+            ) {
+                tracing::warn!(error = %e, "compact brief: record_inference_request failed");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "compact: brief generation failed");
-                "(brief generation failed; rely on the state appendix below)".to_string()
+            if let Some(u) = usage
+                && let Err(e) = draft.session.record_usage_utility(call_id, u)
+            {
+                tracing::warn!(error = %e, "compact brief: record_usage_utility failed");
             }
+            let usage_json = usage.map(|u| {
+                serde_json::json!({
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                    "cached_input_tokens": u.cached_input_tokens,
+                })
+            });
+            if let Err(e) = draft.session.record_event(
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some(&draft.agent_name),
+                Some(&call_id.to_string()),
+                &serde_json::json!({ "usage": usage_json, "purpose": purpose }),
+            ) {
+                tracing::warn!(error = %e, "compact brief: record inference_request event failed");
+            }
+            let text = crate::engine::message::extract_text(&choice);
+            Some(if text.trim().is_empty() {
+                "(model produced no brief; rely on the state appendix below)".to_string()
+            } else {
+                text
+            })
+        }
+        Ok(_) => None,
+        Err(_) if cancel.is_cancelled() => None,
+        Err(e) => {
+            tracing::warn!(error = %e, purpose, "compact: brief generation failed");
+            Some("(brief generation failed; rely on the state appendix below)".to_string())
         }
     }
 }

@@ -410,6 +410,31 @@ fn complete_exchange_ranges(history: &[Message]) -> Vec<std::ops::Range<usize>> 
         .collect()
 }
 
+/// Number of complete user-to-assistant exchanges in `history`. Shadow-brief
+/// staleness uses the same turn definition as the verbatim compaction tail.
+pub fn complete_exchange_count(history: &[Message]) -> usize {
+    complete_exchange_ranges(history).len()
+}
+
+/// History supplied to a shadow delta revision. The original shadow omitted
+/// its verbatim tail, so include that snapshot tail again along with later
+/// turns; the current anti-duplication seq list tells the reviser which of
+/// those exchanges still survive verbatim and which have fallen out of tail.
+pub fn shadow_revision_history(
+    snapshot: &[Message],
+    current: &[Message],
+    snapshot_tail_turns: usize,
+) -> Vec<Message> {
+    let ranges = complete_exchange_ranges(snapshot);
+    let retained = snapshot_tail_turns.min(ranges.len());
+    let start = if retained == 0 {
+        snapshot.len()
+    } else {
+        ranges[ranges.len() - retained].start
+    };
+    current.get(start..).unwrap_or(current).to_vec()
+}
+
 fn message_tokens(message: &Message) -> u64 {
     serde_json::to_string(message)
         .ok()
@@ -518,6 +543,29 @@ pub fn tail_anti_duplication_instruction(message_seqs: &[i64]) -> String {
         "\n\nThe messages owned by these durable session event seqs survive verbatim after \
          the handoff: [{seqs}]. Do not summarize, paraphrase, or restate those turns in the brief."
     )
+}
+
+/// Build the delta-revision request for a previously drafted shadow brief.
+/// The model must replace the brief, not append a chronology fragment, so the
+/// result keeps the same sectioned handoff contract as a full draft.
+pub fn shadow_delta_prompt(
+    override_prompt: Option<&str>,
+    shadow_brief: &str,
+    tail_message_seqs: &[i64],
+) -> String {
+    let mut prompt = brief_prompt(override_prompt);
+    prompt.push_str(
+        "\n\nRevise the existing shadow brief below using the revision history supplied \
+         with this request (the shadow's previously verbatim tail plus newer turns). Output one \
+         complete replacement brief with exactly the requested \
+         headings. Reconcile decisions, plan state, unresolved questions, bugs, and next steps \n\
+         section-by-section; do not append a `since then` section or preserve contradictions.\n\n\
+         <existing_shadow_brief>\n",
+    );
+    prompt.push_str(shadow_brief);
+    prompt.push_str("\n</existing_shadow_brief>");
+    prompt.push_str(&tail_anti_duplication_instruction(tail_message_seqs));
+    prompt
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -883,6 +931,30 @@ mod tests {
         }
         let custom = "custom only";
         assert_eq!(brief_prompt(Some(custom)), custom);
+    }
+
+    #[test]
+    fn shadow_delta_replaces_sectioned_brief_and_keeps_tail_contract() {
+        let prompt = shadow_delta_prompt(None, "## Decisions\nold decision", &[7, 9]);
+        assert!(prompt.contains("one complete replacement brief"));
+        assert!(prompt.contains("section-by-section"));
+        assert!(prompt.contains("do not append a `since then` section"));
+        assert!(prompt.contains("<existing_shadow_brief>"));
+        assert!(prompt.contains("## Decisions\nold decision"));
+        assert!(prompt.contains("[7, 9]"));
+    }
+
+    #[test]
+    fn shadow_revision_reintroduces_the_snapshot_tail_before_new_turns() {
+        let snapshot = exchanges(4, "snapshot");
+        let mut current = snapshot.clone();
+        current.extend(exchanges(2, "new"));
+        let revision = shadow_revision_history(&snapshot, &current, 2);
+        assert_eq!(complete_exchange_count(&revision), 4);
+        assert!(revision.len() < current.len());
+
+        let only_new = shadow_revision_history(&snapshot, &current, 0);
+        assert_eq!(complete_exchange_count(&only_new), 2);
     }
 
     #[test]

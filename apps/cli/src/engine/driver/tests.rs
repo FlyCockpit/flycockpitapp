@@ -133,6 +133,14 @@ fn test_provider_base_url() -> String {
 
 /// Build a driver rooted on a keyless local fixture provider.
 fn test_driver(max_schedules: usize) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url(max_schedules, test_provider_base_url())
+}
+
+fn test_driver_without_network(max_schedules: usize) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url(max_schedules, "http://127.0.0.1:1/v1".to_string())
+}
+
+fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, tempfile::TempDir) {
     use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
     use std::collections::BTreeMap;
 
@@ -148,7 +156,7 @@ fn test_driver(max_schedules: usize) -> (Driver, tempfile::TempDir) {
     providers.insert(
         "lmstudio".to_string(),
         ProviderEntry {
-            url: test_provider_base_url(),
+            url: provider_url,
             headers: vec![],
             wire_api: WireApi::Completions,
             ..ProviderEntry::default()
@@ -3564,7 +3572,7 @@ fn install_test_providers(
         ActiveModelRef, CacheConfig, ModelEntry, ProviderEntry, ProvidersConfig, WireApi,
     };
     let mut entry = ProviderEntry {
-        url: test_provider_base_url(),
+        url: "http://127.0.0.1:1/v1".to_string(),
         cache: CacheConfig {
             mode: cache_mode,
             ttl_secs: 300,
@@ -3620,6 +3628,299 @@ fn install_test_providers(
         ..ProvidersConfig::default()
     };
     driver.test_providers_override = Some((cfg, "lmstudio".into(), "local".into()));
+}
+
+fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {
+    driver
+        .session
+        .record_usage(
+            uuid::Uuid::new_v4(),
+            crate::tokens::TokenUsage {
+                input_tokens,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        )
+        .unwrap();
+}
+
+fn append_complete_test_turns(driver: &mut Driver, count: usize) {
+    for index in 0..count {
+        driver.stack[0]
+            .history
+            .push(Message::user(format!("shadow user {index}")));
+        driver.stack[0]
+            .history
+            .push(Message::assistant(format!("shadow assistant {index}")));
+    }
+}
+
+async fn wait_for_shadow_brief(driver: &mut Driver) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            driver.settle_shadow_brief().await;
+            if matches!(driver.shadow_brief, Some(ShadowBriefState::Ready(_))) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture shadow brief should finish");
+}
+
+fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
+    driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| {
+            (event.kind == "inference_request")
+                .then(|| event.data["purpose"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .filter(|purpose| purpose.starts_with("compact_"))
+        .collect()
+}
+
+#[tokio::test]
+async fn shadow_brief_predrafts() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    append_complete_test_turns(&mut driver, 2);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    record_test_context_tokens(&driver, 5_500);
+
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    assert!(matches!(
+        driver.shadow_brief,
+        Some(ShadowBriefState::InFlight(_))
+    ));
+    wait_for_shadow_brief(&mut driver).await;
+    assert_eq!(
+        compact_inference_purposes(&driver),
+        ["compact_shadow_brief"]
+    );
+}
+
+#[tokio::test]
+async fn compact_uses_shadow_delta() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    append_complete_test_turns(&mut driver, 2);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    record_test_context_tokens(&driver, 5_500);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    append_complete_test_turns(&mut driver, 1);
+
+    driver.do_compact(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    let purposes = compact_inference_purposes(&driver);
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|p| p.as_str() == "compact_shadow_brief")
+            .count(),
+        1,
+        "the shadow/full draft runs exactly once"
+    );
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|p| p.as_str() == "compact_brief_delta")
+            .count(),
+        1,
+        "compaction performs one section-wise delta revision"
+    );
+    assert!(!purposes.iter().any(|p| p == "compact_brief"));
+    let calls = crate::sync::lock_or_recover(
+        driver
+            .test_compact_brief_calls
+            .as_ref()
+            .expect("fake compact seam"),
+    );
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].purpose, "compact_shadow_brief");
+    assert_eq!(calls[1].purpose, "compact_brief_delta");
+    assert!(calls[1].prompt.contains("<existing_shadow_brief>"));
+    assert_eq!(
+        crate::engine::compact::complete_exchange_count(&calls[1].history),
+        3,
+        "delta sees the shadow's omitted tail plus the new exchange"
+    );
+}
+
+#[tokio::test]
+async fn stale_shadow_discarded() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    append_complete_test_turns(&mut driver, 1);
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+    record_test_context_tokens(&driver, 55);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    append_complete_test_turns(&mut driver, 9);
+
+    driver.do_compact(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    let purposes = compact_inference_purposes(&driver);
+    assert!(purposes.iter().any(|p| p == "compact_shadow_brief"));
+    assert!(purposes.iter().any(|p| p == "compact_brief"));
+    assert!(!purposes.iter().any(|p| p == "compact_brief_delta"));
+}
+
+#[tokio::test]
+async fn manual_compact_cancels_shadow() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let observed_cancel = cancel.clone();
+    driver.shadow_brief_generation = 1;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 1,
+        snapshot_history: Vec::new(),
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        cancel,
+        handle: tokio::spawn(std::future::pending::<Option<String>>()),
+    }));
+
+    driver.do_compact(&tx).await;
+    assert!(observed_cancel.is_cancelled());
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    assert_eq!(compact_inference_purposes(&driver), ["compact_brief"]);
+
+    let (mut ending_driver, _tmp2) = test_driver_without_network(8);
+    let ending_cancel = tokio_util::sync::CancellationToken::new();
+    let ending_observer = ending_cancel.clone();
+    ending_driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 1,
+        snapshot_history: Vec::new(),
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        cancel: ending_cancel,
+        handle: tokio::spawn(std::future::pending::<Option<String>>()),
+    }));
+    drop(ending_driver);
+    assert!(
+        ending_observer.is_cancelled(),
+        "session teardown cancels shadow work"
+    );
+}
+
+#[tokio::test]
+async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let observed_cancel = cancel.clone();
+    driver.shadow_brief_generation = 1;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 1,
+        snapshot_history: Vec::new(),
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        cancel,
+        handle: tokio::spawn(std::future::pending::<Option<String>>()),
+    }));
+
+    let prepared = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        driver.prepare_queued_user_submission(UserSubmission::text("hello"), &tx),
+    )
+    .await
+    .expect("foreground preparation should not wait for the delayed shadow");
+    assert!(prepared.is_some());
+    assert!(
+        observed_cancel.is_cancelled(),
+        "the first preparation action cancels shadow utility work before preflight"
+    );
+
+    driver.shadow_brief_generation = 2;
+    driver.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
+        generation: 2,
+        snapshot_history: Vec::new(),
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        brief: "ready".to_string(),
+    }));
+    let _ = driver
+        .prepare_queued_user_submission(UserSubmission::text("hello again"), &tx)
+        .await;
+    assert!(
+        matches!(
+            &driver.shadow_brief,
+            Some(ShadowBriefState::Ready(ready)) if ready.brief == "ready"
+        ),
+        "a shadow completed before dequeue remains available"
+    );
+}
+
+#[tokio::test]
+async fn shadow_gated_on_prune_effectiveness() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+    record_test_context_tokens(&driver, 50);
+    assert!(
+        !driver.maybe_shadow_brief(&tx).await,
+        "effective pruning gates early band"
+    );
+    for ctx_pct in [35.0, 42.0, 50.0] {
+        driver.note_prune_effectiveness(PruneEffectiveness {
+            ctx_pct,
+            saved_pct: 0.5,
+        });
+    }
+    assert!(
+        driver.maybe_shadow_brief(&tx).await,
+        "ineffective pruning opens early band"
+    );
+    assert!(
+        !driver.maybe_shadow_brief(&tx).await,
+        "only one draft may be in flight"
+    );
+}
+
+#[tokio::test]
+async fn shadow_killswitch_restores_sync() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 100);
+    record_test_context_tokens(&driver, 55);
+    assert!(!driver.maybe_shadow_brief(&tx).await);
+    driver.do_compact(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    assert_eq!(compact_inference_purposes(&driver), ["compact_brief"]);
 }
 
 /// Threshold-branch auto-prune: a WARM cache (ephemeral, just sent) with

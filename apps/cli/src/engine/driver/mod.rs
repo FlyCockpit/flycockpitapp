@@ -471,6 +471,11 @@ pub struct Driver {
     /// across them, the next boundary escalates to `/compact` instead of
     /// another tiny snapshot prune. Bounded to the last few entries.
     prune_effectiveness: std::collections::VecDeque<PruneEffectiveness>,
+    /// Generation-tagged root-session shadow brief. An in-flight draft owns
+    /// its cancellation token and task; dropping it aborts the utility work so
+    /// no stale completion can publish after session teardown.
+    shadow_brief: Option<ShadowBriefState>,
+    shadow_brief_generation: u64,
     /// Re-executed seed-tool context for a `/compact` fresh session
     /// (T6.e). Set by [`Self::run_seed_tools`] before the loop starts;
     /// prepended to the **first** user message so the fresh agent's first
@@ -662,6 +667,10 @@ pub struct Driver {
     /// test machine's on-disk config layers. Never set in production.
     #[cfg(test)]
     test_providers_override: Option<(crate::config::providers::ProvidersConfig, String, String)>,
+    /// Hermetic compact-utility inference seam. Tests capture invocation mode,
+    /// prompt, and revision history without opening a socket.
+    #[cfg(test)]
+    test_compact_brief_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
     redaction_scan_ssh_keys_override: Option<bool>,
@@ -681,6 +690,45 @@ struct DelegationRecursionOverride {
 struct PendingDelegationShrink {
     tracker: crate::engine::deleg_shrink::DelegationShrink,
     handle: Option<tokio::task::JoinHandle<Vec<Message>>>,
+}
+
+struct ShadowBriefInFlight {
+    generation: u64,
+    snapshot_history: Vec<Message>,
+    snapshot_turns: usize,
+    snapshot_tail_turns: usize,
+    cancel: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<Option<String>>,
+}
+
+struct ShadowBriefReady {
+    generation: u64,
+    snapshot_history: Vec<Message>,
+    snapshot_turns: usize,
+    snapshot_tail_turns: usize,
+    brief: String,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestCompactBriefCall {
+    purpose: &'static str,
+    prompt: String,
+    history: Vec<Message>,
+}
+
+enum ShadowBriefState {
+    InFlight(ShadowBriefInFlight),
+    Ready(ShadowBriefReady),
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        if let Some(ShadowBriefState::InFlight(task)) = &self.shadow_brief {
+            task.cancel.cancel();
+            task.handle.abort();
+        }
+    }
 }
 
 pub(crate) fn is_host_failure_sentinel(report: &str) -> bool {
@@ -886,6 +934,8 @@ impl Driver {
             prune_watermark: self.prune_watermark.clone(),
             auto_compacted: self.auto_compacted,
             prune_effectiveness: self.prune_effectiveness.clone(),
+            shadow_brief: None,
+            shadow_brief_generation: 0,
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_turns_since_mutating_action: self.goal_turns_since_mutating_action,
@@ -920,6 +970,8 @@ impl Driver {
             tandem_set: self.tandem_set.clone(),
             #[cfg(test)]
             test_providers_override: self.test_providers_override.clone(),
+            #[cfg(test)]
+            test_compact_brief_calls: self.test_compact_brief_calls.clone(),
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
             redaction_scan_ssh_keys_override: self.redaction_scan_ssh_keys_override,
@@ -1152,6 +1204,8 @@ impl Driver {
             prune_watermark: std::collections::HashMap::new(),
             auto_compacted: false,
             prune_effectiveness: std::collections::VecDeque::new(),
+            shadow_brief: None,
+            shadow_brief_generation: 0,
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_turns_since_mutating_action: 0,
@@ -1186,6 +1240,8 @@ impl Driver {
             tandem_set: crate::engine::schedule::TandemSet::default(),
             #[cfg(test)]
             test_providers_override: None,
+            #[cfg(test)]
+            test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             redaction_scan_environment_override: None,
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
@@ -2180,6 +2236,10 @@ impl Driver {
                     drain_queue(&input_queue, &mut batch, &active_target_id).await;
                     let items = fold_submission_commands(batch);
                     if items.iter().any(|item| matches!(item, FoldedSubmission::User(_))) {
+                        // Foreground work wins as soon as a user submission is
+                        // accepted, before injection scanning or preflight can
+                        // dispatch their own utility inference.
+                        self.preempt_shadow_brief_for_foreground().await;
                         self.reset_goal_progress_tracking();
                         self.clear_goal_idle_intervention();
                         self.goal_usage_limit_auto_resume_attempts = 0;
@@ -2288,6 +2348,7 @@ impl Driver {
             // (implementation note); it emits `CompactReady`
             // and the client re-attaches to the fresh session. Guarded by the
             // one-shot latch + `at_safe_boundary` so it can't loop.
+            self.maybe_shadow_brief(tx).await;
             self.maybe_auto_compact(tx).await;
             // Emit the falling edge so the TUI can stop its working-indicator
             // clock, and refresh the "% prunable" projection from the
@@ -3168,6 +3229,9 @@ impl Driver {
         submission: UserSubmission,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<UserSubmission> {
+        // Defensive for callers outside the main dequeue branch: no
+        // foreground preparation may overlap unfinished shadow utility work.
+        self.preempt_shadow_brief_for_foreground().await;
         if self.preflight_will_run(&submission.text) {
             let _ = tx.send(TurnEvent::PreflightStarted).await;
         }
@@ -3617,16 +3681,32 @@ impl Driver {
     }
 
     /// Resolve the context-threshold config for the session's active
-    /// (provider, model). Defaults to (80/50/30) when the config can't be
-    /// loaded (implementation note).
+    /// (provider, model). Uses the context-config defaults when the config
+    /// can't be loaded (implementation note).
     fn resolve_context_config(&self) -> crate::config::providers::ContextConfig {
         Self::context_config_from(self.active_providers_config().as_ref())
+    }
+
+    /// Last provider-reported input usage, with a debug-build-only threshold
+    /// forcing seam for deterministic manual compaction verification.
+    fn context_input_tokens(&self, context_length: Option<u32>) -> Option<u64> {
+        #[cfg(debug_assertions)]
+        if let (Some(window), Ok(raw)) =
+            (context_length, std::env::var("COCKPIT_DEV_FORCE_CTX_PCT"))
+            && let Ok(pct) = raw.parse::<f64>()
+            && pct.is_finite()
+            && pct >= 0.0
+        {
+            return Some((f64::from(window) * pct / 100.0).round() as u64);
+        }
+        self.session.last_usage().map(|usage| usage.input_tokens)
     }
 
     fn context_usage_snapshot(&self) -> crate::engine::tool::ContextUsageSnapshot {
         let ctx_cfg = self.resolve_context_config();
         let total_tokens = self.active_model_context_length().map(u64::from);
-        let used_tokens = self.session.last_usage().map(|usage| usage.input_tokens);
+        let used_tokens =
+            self.context_input_tokens(total_tokens.and_then(|n| u32::try_from(n).ok()));
         let ctx_pct = match (used_tokens, total_tokens) {
             (Some(used), Some(total)) if total > 0 => Some(used as f64 / total as f64 * 100.0),
             _ => None,
@@ -4323,6 +4403,10 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        // Shadow drafting is utility work: a foreground user turn always wins.
+        // Preserve a task that already completed, but cancel an unfinished one
+        // before assembling or dispatching the user's inference.
+        self.preempt_shadow_brief_for_foreground().await;
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;

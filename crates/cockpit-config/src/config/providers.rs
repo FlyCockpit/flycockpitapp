@@ -576,7 +576,7 @@ impl ThinkingParams {
 /// (implementation note). All three are percentages of the
 /// model's `context_length`; when the context window is unknown the
 /// ctx%-gated triggers are inert (the cache-cold auto-prune branch still
-/// fires).
+/// fires). The shadow margin is also expressed in percentage points.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextConfig {
     /// At or above this ctx% the foreground context is compacted
@@ -588,6 +588,14 @@ pub struct ContextConfig {
     /// verbatim after compaction. `0` keeps only the handoff. Default 4.
     #[serde(default = "default_compact_keep_recent_turns")]
     pub compact_keep_recent_turns: usize,
+    /// Whether to pre-draft a compaction brief near the automatic threshold.
+    /// Default true.
+    #[serde(default = "default_compact_shadow")]
+    pub compact_shadow: bool,
+    /// How many percentage points before `auto_compact_pct` shadow drafting
+    /// becomes eligible. Default 10.
+    #[serde(default = "default_compact_shadow_margin_pct")]
+    pub compact_shadow_margin_pct: u8,
     /// Above this ctx% (and above `auto_prune_prunable_pct` of prunable
     /// tokens) auto-prune fires even on a warm cache, accepting the cache
     /// bust to reclaim context. Default 50.
@@ -604,6 +612,8 @@ impl Default for ContextConfig {
         Self {
             auto_compact_pct: default_auto_compact_pct(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
+            compact_shadow: default_compact_shadow(),
+            compact_shadow_margin_pct: default_compact_shadow_margin_pct(),
             auto_prune_pct: default_auto_prune_pct(),
             auto_prune_prunable_pct: default_auto_prune_prunable_pct(),
         }
@@ -613,6 +623,10 @@ impl Default for ContextConfig {
 default_const!(default_auto_compact_pct, u8, 60);
 
 default_const!(default_compact_keep_recent_turns, usize, 4);
+
+default_const!(default_compact_shadow, bool, true);
+
+default_const!(default_compact_shadow_margin_pct, u8, 10);
 
 default_const!(default_auto_prune_pct, u8, 50);
 

@@ -403,10 +403,12 @@ fn cache_ttl_selects_one_hour_mode_at_or_above_3600() {
 }
 
 #[test]
-fn context_defaults_are_60_4_50_30() {
+fn context_defaults_include_shadow_brief_policy() {
     let c = ContextConfig::default();
     assert_eq!(c.auto_compact_pct, 60);
     assert_eq!(c.compact_keep_recent_turns, 4);
+    assert!(c.compact_shadow);
+    assert_eq!(c.compact_shadow_margin_pct, 10);
     assert_eq!(c.auto_prune_pct, 50);
     assert_eq!(c.auto_prune_prunable_pct, 30);
     // Older configs (no `context` key) load with the defaults.
@@ -421,6 +423,8 @@ fn context_defaults_are_60_4_50_30() {
     .unwrap();
     assert_eq!(legacy.auto_compact_pct, 77);
     assert_eq!(legacy.compact_keep_recent_turns, 4);
+    assert!(legacy.compact_shadow);
+    assert_eq!(legacy.compact_shadow_margin_pct, 10);
 }
 
 #[test]
@@ -431,6 +435,8 @@ fn resolve_context_prefers_model_then_provider_then_default() {
         context: ContextConfig {
             auto_compact_pct: 90,
             compact_keep_recent_turns: 2,
+            compact_shadow: true,
+            compact_shadow_margin_pct: 10,
             auto_prune_pct: 60,
             auto_prune_prunable_pct: 40,
         },
@@ -440,6 +446,8 @@ fn resolve_context_prefers_model_then_provider_then_default() {
     pinned.context = Some(ContextConfig {
         auto_compact_pct: 70,
         compact_keep_recent_turns: 1,
+        compact_shadow: false,
+        compact_shadow_margin_pct: 12,
         auto_prune_pct: 55,
         auto_prune_prunable_pct: 25,
     });

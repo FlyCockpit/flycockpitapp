@@ -105,6 +105,8 @@ pub(super) enum ProviderSettingId {
     CapabilityContextTokens,
     CapabilityMaxOutputTokens,
     AutoCompactPct,
+    CompactShadow,
+    CompactShadowMarginPct,
     /// Auto-prune master switch (on | off | inherit). `off` disables the
     /// automatic prune trigger entirely — both branches; manual `/prune`
     /// still works. Tri-state at both scopes (model → provider → on).
@@ -153,6 +155,8 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::CapabilityContextTokens,
     ProviderSettingId::CapabilityMaxOutputTokens,
     ProviderSettingId::AutoCompactPct,
+    ProviderSettingId::CompactShadow,
+    ProviderSettingId::CompactShadowMarginPct,
     ProviderSettingId::AutoPruneEnabled,
     ProviderSettingId::AutoPrunePct,
     ProviderSettingId::AutoPrunePrunablePct,
@@ -204,6 +208,8 @@ impl ProviderSettingId {
             Self::CapabilityContextTokens => "Context tokens",
             Self::CapabilityMaxOutputTokens => "Max output tokens",
             Self::AutoCompactPct => "Auto-compact ctx %",
+            Self::CompactShadow => "Compaction shadow brief",
+            Self::CompactShadowMarginPct => "Shadow margin %",
             Self::AutoPruneEnabled => "Auto-prune",
             Self::AutoPrunePct => "Auto-prune ctx %",
             Self::AutoPrunePrunablePct => "Auto-prune prunable %",
@@ -226,6 +232,7 @@ impl ProviderSettingId {
         matches!(
             self,
             Self::AutoCompactPct
+                | Self::CompactShadowMarginPct
                 | Self::AutoPrunePct
                 | Self::AutoPrunePrunablePct
                 | Self::CacheTtlSecs
@@ -274,6 +281,12 @@ impl ProviderSettingId {
             ),
             Self::AutoCompactPct => Some(
                 "At or above this % of the context window (60% by default), the conversation is auto-compacted. The most recent compact_keep_recent_turns complete exchanges (4 by default; 0 disables the tail) survive verbatim, subject to the context budget. Unrelated to the prune thresholds below.",
+            ),
+            Self::CompactShadow => Some(
+                "Pre-draft a compaction brief in the background near the automatic threshold. User turns pre-empt unfinished drafts; off restores synchronous compaction drafting.",
+            ),
+            Self::CompactShadowMarginPct => Some(
+                "Percentage points before Auto-compact ctx % where shadow drafting becomes eligible (10 by default). Effective pruning suppresses the early half of this band.",
             ),
             Self::AutoPrunePct => Some(
                 "Warm-cache prune threshold: above this ctx% (and the prunable % below), auto-prune fires even though it breaks the warm prompt cache. When the cache is cold or Cache mode is none, auto-prune ignores these thresholds — set Auto-prune off to stop it entirely.",
@@ -615,6 +628,8 @@ impl SettingsEditor {
         }
         fields.extend([
             AutoCompactPct,
+            CompactShadow,
+            CompactShadowMarginPct,
             AutoPruneEnabled,
             AutoPrunePct,
             AutoPrunePrunablePct,
@@ -687,6 +702,8 @@ impl SettingsEditor {
                 self.capability_max_output_tokens.is_some()
             }
             ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::CompactShadow
+            | ProviderSettingId::CompactShadowMarginPct
             | ProviderSettingId::AutoPrunePct
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present,
             ProviderSettingId::AutoPruneEnabled => self.auto_prune.is_some(),
@@ -780,6 +797,16 @@ impl SettingsEditor {
                 self.detected_capabilities.max_output_tokens,
             ),
             ProviderSettingId::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
+            ProviderSettingId::CompactShadow => {
+                if self.context.compact_shadow {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            ProviderSettingId::CompactShadowMarginPct => {
+                format!("{}%", self.context.compact_shadow_margin_pct)
+            }
             ProviderSettingId::AutoPruneEnabled => match self.auto_prune {
                 Some(true) => "on".to_string(),
                 Some(false) => "off".to_string(),
@@ -847,6 +874,8 @@ impl SettingsEditor {
     fn mark_present(&mut self, field: ProviderSettingId) {
         match field {
             ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::CompactShadow
+            | ProviderSettingId::CompactShadowMarginPct
             | ProviderSettingId::AutoPrunePct
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present = true,
             ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => {
@@ -919,6 +948,8 @@ impl SettingsEditor {
                 self.capability_max_output_tokens = None
             }
             ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::CompactShadow
+            | ProviderSettingId::CompactShadowMarginPct
             | ProviderSettingId::AutoPrunePct
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present = false,
             ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => {
@@ -1040,6 +1071,10 @@ impl SettingsEditor {
                     None => Some(true),
                 };
             }
+            ProviderSettingId::CompactShadow => {
+                self.context.compact_shadow = !self.context.compact_shadow;
+                self.mark_present(field);
+            }
             ProviderSettingId::CapabilityImages => {
                 self.capability_images = match self.capability_images {
                     None => Some(true),
@@ -1147,6 +1182,9 @@ impl SettingsEditor {
                 .unwrap_or(0)
                 .to_string(),
             ProviderSettingId::AutoCompactPct => self.context.auto_compact_pct.to_string(),
+            ProviderSettingId::CompactShadowMarginPct => {
+                self.context.compact_shadow_margin_pct.to_string()
+            }
             ProviderSettingId::AutoPrunePct => self.context.auto_prune_pct.to_string(),
             ProviderSettingId::AutoPrunePrunablePct => {
                 self.context.auto_prune_prunable_pct.to_string()
@@ -1276,6 +1314,10 @@ impl SettingsEditor {
             }
             ProviderSettingId::AutoCompactPct => {
                 self.context.auto_compact_pct = parsed.min(100) as u8;
+                self.mark_present(field);
+            }
+            ProviderSettingId::CompactShadowMarginPct => {
+                self.context.compact_shadow_margin_pct = parsed.min(100) as u8;
                 self.mark_present(field);
             }
             ProviderSettingId::AutoPrunePct => {
@@ -1709,6 +1751,8 @@ mod tests {
             context: ContextConfig {
                 auto_compact_pct: 85,
                 compact_keep_recent_turns: 4,
+                compact_shadow: true,
+                compact_shadow_margin_pct: 10,
                 auto_prune_pct: 55,
                 auto_prune_prunable_pct: 35,
             },
@@ -2039,7 +2083,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 26);
+        assert_eq!(e.field_count(), 28);
         assert_eq!(
             *e.fields().last().unwrap(),
             ProviderSettingId::HintToolCallCorrections
@@ -2089,7 +2133,7 @@ mod tests {
         // mirroring the `mode` tri-state.
         let mut prov = SettingsEditor::for_provider("p", &entry);
         assert!(prov.fields().contains(&ProviderSettingId::InlineThink));
-        assert_eq!(prov.field_count(), 20);
+        assert_eq!(prov.field_count(), 22);
         // Seeded from the provider's (unset) override → inherit default.
         assert_eq!(
             prov.value_str(ProviderSettingId::InlineThink),
@@ -2627,6 +2671,8 @@ mod tests {
             (CapabilityContextTokens, false, true, false, false),
             (CapabilityMaxOutputTokens, false, true, false, false),
             (AutoCompactPct, false, false, false, false),
+            (CompactShadow, false, false, false, false),
+            (CompactShadowMarginPct, false, false, false, false),
             (AutoPruneEnabled, false, false, false, false),
             (AutoPrunePct, false, false, false, false),
             (AutoPrunePrunablePct, false, false, false, false),

@@ -208,6 +208,8 @@ Provider and model entries can carry policy metadata used by routing, diagnostic
 
 Model instructions are exact to the configured `(provider, model)` and participate in normal global/project config layering; a project value overrides a global value, and deleting it reveals the lower layer. Fresh root sessions snapshot the effective model instructions for the whole conversation lineage, so resumes, model switches, forks, and subagents keep the captured text even if settings change later. New root sessions see the new settings.
 
+Provider/model context settings include a default-on `Compaction shadow brief` switch and `Shadow margin %` (10 percentage points by default). Near the automatic compaction threshold, Cockpit pre-drafts a utility brief only at an idle boundary; foreground user turns pre-empt unfinished drafts, and compaction delta-revises a fresh completed draft. Turn the switch off to restore synchronous full-brief drafting.
+
 Subagent model selection can target exact models, trust classes, or categories such as cheap-code and reasoning work. Hidden models (`subagent_invokable: false`) stay available for direct top-level use but are not advertised or selected for delegated agents. Recursive delegation is bounded by `delegation.defaultRecursionDepth`, `delegation.maxParallel`, and the `swarm.maxDepth` / `swarm.maxConcurrency` limits.
 
 `deepthink` is disabled by default. When enabled, it is a tool-free reasoning-only subagent; completed deepthink prompts are not retained in caller active context, only the response is retained.
@@ -271,6 +273,8 @@ cargo nextest run -p cockpit-cli
 ```
 
 The canonical CI gate remains `cargo test --locked`.
+
+In debug builds, set `COCKPIT_DEV_FORCE_CTX_PCT` to a numeric percentage to force the context gauge used by automatic prune, shadow-brief, and compaction boundary checks. This is a deterministic manual-verification seam only; release builds ignore it.
 
 Tests that exercise retry, timeout, or backoff behavior should use paused
 Tokio time or an injected fake clock/probe. Do not depend on wall-clock sleeps

@@ -33,14 +33,14 @@ use render::{extract_selection_markdown_source, extract_selection_plaintext, is_
 #[cfg(test)]
 use slash::{
     AgentCommandOutcome, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,
-    SandboxEscalationCommand, SkillDispatch, agent_command_outcome, bare_skill_commands_from,
-    builtin_slash_name_taken, last_agent_text, next_sandbox_mode, parse_copy_format,
-    parse_mcp_action, parse_pane_side, parse_sandbox_arg, parse_sandbox_escalation_arg,
-    resolve_skill_dispatch, slash_matches,
+    SandboxEscalationCommand, SkillDispatch, agent_command_outcome, builtin_slash_name_taken,
+    last_agent_text, next_sandbox_mode, parse_copy_format, parse_mcp_action, parse_pane_side,
+    parse_sandbox_arg, parse_sandbox_escalation_arg, resolve_skill_dispatch, slash_matches,
 };
 use slash::{
-    SkillCommand, SlashCommand, SlashEntry, SlashMenuCache, discover_bare_skill_commands,
-    hidden_slash_alias, sandbox_mode_label, slash_args, slash_matches_in,
+    SkillCommand, SlashCommand, SlashEntry, SlashMenuCache, bare_skill_commands_from,
+    discover_bare_skill_commands, hidden_slash_alias, sandbox_mode_label, slash_args,
+    slash_matches_in,
 };
 
 use std::cell::Cell;
@@ -2936,7 +2936,8 @@ impl App {
         // Discovered skills surfaced as bare-`/<name>` slash-menu entries
         // (implementation note); builtin-colliding names are
         // dropped here (still reachable via `/skill <name>`).
-        let skill_commands = discover_bare_skill_commands(&launch.cwd, &extended);
+        let skill_commands =
+            discover_bare_skill_commands(&launch.cwd, &extended, &launch.agent_name);
         timer.phase("skill_discovery");
         let llm_mode =
             resolve_tui_llm_mode(launch.active_model.as_ref(), extended.llm_mode, &providers);
@@ -7320,7 +7321,11 @@ impl App {
             // reuses the just-established daemon, no new spawn, one request.
             self.refresh_guidance_estimate_from_daemon(&r.socket);
         }
+        let refresh_skills = runner.is_ok();
         self.agent_runner = Some(runner);
+        if refresh_skills {
+            self.refresh_skill_commands();
+        }
     }
 
     /// Opportunistic display attach: attach a deferred session so the
@@ -7777,17 +7782,60 @@ impl App {
     }
 
     pub(super) fn sync_active_agent(&mut self) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            return;
+        let (name, path) = {
+            let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+                return;
+            };
+            (
+                crate::sync::lock_or_recover(&runner.active_agent).clone(),
+                crate::sync::lock_or_recover(&runner.active_agent_path).clone(),
+            )
         };
-        let name = crate::sync::lock_or_recover(&runner.active_agent).clone();
+        let mut changed = false;
         if name != self.launch.agent_name {
             self.launch.agent_name = name;
+            changed = true;
         }
-        let path = crate::sync::lock_or_recover(&runner.active_agent_path).clone();
         if !path.is_empty() && path != self.agent_path {
             self.agent_path = path;
         }
+        if changed {
+            self.refresh_skill_commands();
+        }
+    }
+
+    /// Return the skill inventory visible to the current agent. Once attached,
+    /// the daemon publishes names filtered against the exact live toolbox;
+    /// before that point discovery uses the agent definition as a best-effort
+    /// startup approximation.
+    pub(super) fn visible_skills(&self) -> Vec<crate::skills::Skill> {
+        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
+        let exact_names = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .and_then(|runner| runner.skill_inventory_names.lock().unwrap().clone());
+        if let Some(exact_names) = exact_names {
+            crate::skills::discover(&self.launch.cwd, &extended.skills)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|skill| exact_names.contains(&skill.frontmatter.name))
+                .collect()
+        } else {
+            crate::skills::discover_for_agent(
+                &self.launch.cwd,
+                &extended.skills,
+                &self.launch.agent_name,
+            )
+            .unwrap_or_default()
+        }
+    }
+
+    /// Rebuild conditional skill slash entries after the root agent changes.
+    /// The active agent's declared tool grant is the pre-spawn inventory seam;
+    /// actual skill loading rechecks against the live toolbox.
+    pub(super) fn refresh_skill_commands(&mut self) {
+        self.skill_commands = bare_skill_commands_from(self.visible_skills());
     }
 
     pub(super) fn push_agent_path_child(&mut self, parent: &str, child: &str) {
@@ -7799,6 +7847,7 @@ impl App {
         }
         self.agent_path.push(child.to_string());
         self.launch.agent_name = child.to_string();
+        self.refresh_skill_commands();
     }
 
     pub(super) fn pop_agent_path_for_report(&mut self, agent: &str) {
@@ -7812,6 +7861,7 @@ impl App {
         }
         if let Some(current) = self.agent_path.last() {
             self.launch.agent_name = current.clone();
+            self.refresh_skill_commands();
         }
     }
 
@@ -9247,6 +9297,34 @@ mod slash_rank_tests {
             vec!["deploy"],
             "model-only skill must not appear in the slash menu"
         );
+    }
+
+    #[test]
+    fn bare_skill_inventory_hides_conditionally_incompatible_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("skills");
+        for (name, conditional) in [
+            ("plain", ""),
+            (
+                "needs-web",
+                "metadata:\n  hermes:\n    requires_toolsets: [web]\n",
+            ),
+        ] {
+            let package = scan.join(name);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n{conditional}---\nBody"),
+            )
+            .unwrap();
+        }
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.skills.scan_dirs = vec![scan.to_string_lossy().into_owned()];
+
+        let entries =
+            super::discover_bare_skill_commands(tmp.path(), &extended, "agent-that-does-not-exist");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["plain"]);
     }
 
     #[test]
@@ -12796,6 +12874,7 @@ mod footer_selector_tests {
             event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
@@ -13099,6 +13178,7 @@ mod failed_dispatch_reconciliation_tests {
             event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),

@@ -156,6 +156,11 @@ pub struct Session {
     /// clones of this flag so already-built handles refuse future untrusted
     /// dispatches after a toggle.
     trusted_only: Arc<AtomicBool>,
+    /// Exact tool names on the current foreground agent's live toolbox. The
+    /// daemon's skill inventory reads this snapshot so conditional Hermes
+    /// activation matches execution, including config tools and grants.
+    active_tool_names: Mutex<std::collections::HashSet<String>>,
+    active_sandbox_escalate_eligible: AtomicBool,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
     /// pre-§17 rows on [`Session::resume`].
@@ -289,6 +294,25 @@ struct LastRecoverableToolCall {
 }
 
 impl Session {
+    pub fn set_active_tool_names<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+        sandbox_escalate_eligible: bool,
+    ) {
+        *self.active_tool_names.lock().unwrap() = names.into_iter().map(str::to_string).collect();
+        self.active_sandbox_escalate_eligible
+            .store(sandbox_escalate_eligible, Ordering::Relaxed);
+    }
+
+    pub fn active_tool_names(&self) -> Vec<String> {
+        self.active_tool_names
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn model_system_prompt_snapshot(&self) -> Arc<ModelSystemPromptSnapshot> {
         self.model_system_prompt_snapshot.clone()
     }

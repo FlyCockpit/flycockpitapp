@@ -35,7 +35,7 @@
 //!     directive is left verbatim — the model sees the literal text and
 //!     the command never runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,11 +48,79 @@ use crate::redact::RedactionTable;
 pub mod auto_select;
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
+const MAX_CATALOG_DESCRIPTION_CHARS: usize = 60;
+const SUPPORT_DIRS: [&str; 4] = ["references", "templates", "scripts", "assets"];
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillMetadata {
+    #[serde(default)]
+    pub hermes: HermesMetadata,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HermesMetadata {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub requires_toolsets: Vec<String>,
+    #[serde(default)]
+    pub fallback_for_toolsets: Vec<String>,
+    #[serde(default)]
+    pub requires_tools: Vec<String>,
+    #[serde(default)]
+    pub fallback_for_tools: Vec<String>,
+    /// Hermes specifies `platforms` at top level. Accept it here too for
+    /// packages authored against older examples.
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub config: Vec<HermesConfigSetting>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HermesConfigSetting {
+    pub key: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequiredEnvironmentVariable {
+    pub name: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub help: Option<String>,
+    #[serde(default)]
+    pub required_for: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_yaml::Value>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillFrontmatter {
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub metadata: SkillMetadata,
+    #[serde(default)]
+    pub required_environment_variables: Vec<RequiredEnvironmentVariable>,
     #[serde(default)]
     pub model: Option<String>,
     /// Claude Code parity: when `true` the skill is user-only — the
@@ -89,6 +157,10 @@ impl Default for SkillFrontmatter {
         Self {
             name: String::new(),
             description: String::new(),
+            version: None,
+            platforms: Vec::new(),
+            metadata: SkillMetadata::default(),
+            required_environment_variables: Vec::new(),
             model: None,
             disable_model_invocation: false,
             user_invocable: true,
@@ -103,6 +175,56 @@ pub struct Skill {
     pub source: PathBuf,
 }
 
+/// Capabilities used to filter conditional Hermes skills for one live agent
+/// session. Toolsets are derived from Cockpit's concrete tool registry, so
+/// activation follows the surface the model can actually call.
+#[derive(Debug, Clone, Default)]
+pub struct ActivationContext {
+    pub tools: HashSet<String>,
+    pub toolsets: HashSet<String>,
+    pub platform: String,
+}
+
+impl ActivationContext {
+    pub fn from_tool_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let tools: HashSet<String> = names.into_iter().map(str::to_string).collect();
+        let mut toolsets = HashSet::new();
+        for tool in &tools {
+            toolsets.insert(tool.clone());
+            if tool.starts_with("web") {
+                toolsets.insert("web".to_string());
+            }
+            if tool.starts_with("browser") {
+                toolsets.insert("browser".to_string());
+            }
+        }
+        if tools.contains("bash") {
+            toolsets.insert("terminal".to_string());
+        }
+        if tools.contains("read") || tools.contains("grep") || tools.contains("glob") {
+            toolsets.insert("files".to_string());
+        }
+        if tools.contains("mcp") {
+            toolsets.insert("mcp".to_string());
+        }
+        Self {
+            tools,
+            toolsets,
+            platform: current_platform().to_string(),
+        }
+    }
+}
+
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        std::env::consts::OS
+    }
+}
+
 /// Discover every skill reachable from `cwd` under the configured scan
 /// directories. Malformed/missing frontmatter skips that skill with a
 /// logged warning; a non-existent directory is silently ignored. Results
@@ -114,25 +236,7 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for dir in dirs {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            // Non-existent / unreadable scan dir: silently ignored.
-            Err(_) => continue,
-        };
-        // Sort entries so discovery order is deterministic across
-        // platforms (readdir order is filesystem-dependent).
-        let mut subdirs: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        subdirs.sort();
-
-        for sub in subdirs {
-            let manifest = sub.join("SKILL.md");
-            if !manifest.is_file() {
-                continue;
-            }
+        for manifest in manifests_under(&dir) {
             match parse_skill(&manifest) {
                 Ok(skill) => {
                     if seen.insert(skill.frontmatter.name.clone()) {
@@ -147,6 +251,119 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     }
 
     Ok(skills)
+}
+
+/// Return every package manifest beneath one configured root in deterministic
+/// path order. Category directories used by Hermes are traversed recursively;
+/// once a package manifest is found its support directories are not searched
+/// for nested packages. Canonical-root checks plus a visited set prevent
+/// symlink escapes and loops.
+fn manifests_under(root: &Path) -> Vec<PathBuf> {
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut pending = vec![root.clone()];
+    let mut visited = HashSet::from([root.clone()]);
+    let mut manifests = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        let manifest = dir.join("SKILL.md");
+        if dir != root && manifest.is_file() {
+            if let Ok(canonical) = manifest.canonicalize()
+                && canonical.starts_with(&root)
+            {
+                manifests.push(canonical);
+            }
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            let canonical_is_hidden = canonical
+                .strip_prefix(&root)
+                .ok()
+                .is_some_and(|relative| {
+                    relative.components().any(|component| {
+                        matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+                    })
+                });
+            if canonical.starts_with(&root)
+                && !canonical_is_hidden
+                && visited.insert(canonical.clone())
+            {
+                pending.push(canonical);
+            }
+        }
+    }
+    manifests.sort();
+    manifests
+}
+
+/// Discover skills and apply Hermes conditional activation for the current
+/// session. This is filtering only; surviving discovery order is unchanged.
+pub fn discover_for_session(
+    cwd: &Path,
+    cfg: &SkillsConfig,
+    activation: &ActivationContext,
+) -> Result<Vec<Skill>> {
+    Ok(discover(cwd, cfg)?
+        .into_iter()
+        .filter(|skill| skill_is_active(skill, activation))
+        .collect())
+}
+
+/// Best-effort session inventory for UI/server surfaces that have the active
+/// agent name but not the live [`crate::engine::tool::ToolBox`]. Agent
+/// frontmatter is the authoritative pre-spawn tool grant; live tool calls use
+/// the exact toolbox through [`discover_for_session`] instead.
+pub fn discover_for_agent(cwd: &Path, cfg: &SkillsConfig, agent_name: &str) -> Result<Vec<Skill>> {
+    let tool_names = crate::agents::resolve(cwd, agent_name)
+        .ok()
+        .flatten()
+        .and_then(|agent| agent.tools)
+        .unwrap_or_default();
+    let activation = ActivationContext::from_tool_names(tool_names.iter().map(String::as_str));
+    discover_for_session(cwd, cfg, &activation)
+}
+
+pub fn skill_is_active(skill: &Skill, activation: &ActivationContext) -> bool {
+    let hermes = &skill.frontmatter.metadata.hermes;
+    let platforms = if skill.frontmatter.platforms.is_empty() {
+        &hermes.platforms
+    } else {
+        &skill.frontmatter.platforms
+    };
+    (platforms.is_empty() || platforms.iter().any(|p| p == &activation.platform))
+        && hermes
+            .requires_tools
+            .iter()
+            .all(|tool| activation.tools.contains(tool))
+        && hermes
+            .requires_toolsets
+            .iter()
+            .all(|toolset| activation.toolsets.contains(toolset))
+        && !hermes
+            .fallback_for_tools
+            .iter()
+            .any(|tool| activation.tools.contains(tool))
+        && !hermes
+            .fallback_for_toolsets
+            .iter()
+            .any(|toolset| activation.toolsets.contains(toolset))
 }
 
 /// Parse one `SKILL.md` into a [`Skill`] (frontmatter only — the body is
@@ -185,6 +402,75 @@ pub fn load_body(skill: &Skill) -> Result<String> {
         // discovery, but tolerate it: the whole file is the body.
         None => Ok(raw),
     }
+}
+
+/// Load one progressive-disclosure support file from an Agent Skills package.
+/// Only standard package directories are reachable; absolute paths, traversal,
+/// symlink escapes, directories, and non-UTF-8 files are rejected.
+pub fn load_support_file(skill: &Skill, relative: &Path) -> Result<String> {
+    use std::path::Component;
+
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        anyhow::bail!("support file path must be a non-empty relative path");
+    }
+    let mut components = relative.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        anyhow::bail!("support file path is invalid");
+    };
+    if !SUPPORT_DIRS.iter().any(|allowed| first == *allowed) {
+        anyhow::bail!(
+            "support file must be under one of: {}",
+            SUPPORT_DIRS.join(", ")
+        );
+    }
+    if components.any(|component| !matches!(component, Component::Normal(_))) {
+        anyhow::bail!("support file path may not contain traversal components");
+    }
+
+    let package = skill
+        .source
+        .parent()
+        .context("SKILL.md has no package directory")?
+        .canonicalize()
+        .context("canonicalizing skill package")?;
+    let canonical = package
+        .join(relative)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing support file {}", relative.display()))?;
+    if !canonical.starts_with(&package) || !canonical.is_file() {
+        anyhow::bail!("support file escapes its skill package or is not a file");
+    }
+    read_markdown_capped(&canonical)
+}
+
+/// Validate the subset Cockpit's future skill writer must emit. Discovery is
+/// deliberately more permissive for third-party read compatibility.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_conformant_package(skill: &Skill) -> Result<()> {
+    let name = skill.frontmatter.name.as_str();
+    let name_valid = (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !name_valid {
+        anyhow::bail!("skill name is not Agent Skills-conformant");
+    }
+    let parent_name = skill
+        .source
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str());
+    if parent_name != Some(name) {
+        anyhow::bail!("skill name must match its package directory");
+    }
+    let description = skill.frontmatter.description.trim();
+    if description.is_empty() || description.chars().count() > 1024 {
+        anyhow::bail!("skill description must contain 1..=1024 characters");
+    }
+    Ok(())
 }
 
 fn read_markdown_capped(path: &Path) -> Result<String> {
@@ -264,6 +550,9 @@ pub fn resolve_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
     for entry in &cfg.scan_dirs {
         resolve_dir_entry(entry, cwd, cfg.ancestor_walk, &mut out);
     }
+    for entry in &cfg.external_dirs {
+        resolve_dir_entry(entry, cwd, false, &mut out);
+    }
     out.into_iter()
         .filter(|dir| skill_scan_dir_allowed_by_trust(dir))
         .collect()
@@ -283,11 +572,12 @@ fn is_user_global_skill_dir(dir: &Path) -> bool {
         .any(|root| dir == root || dir.starts_with(root))
 }
 
-fn user_global_skill_roots(home: &Path) -> [PathBuf; 3] {
+fn user_global_skill_roots(home: &Path) -> [PathBuf; 4] {
     [
         home.join(".agents").join("skills"),
         home.join(".claude").join("skills"),
         home.join(".cockpit").join("skills"),
+        home.join(".hermes").join("skills"),
     ]
 }
 
@@ -481,10 +771,24 @@ pub fn catalog_lines(skills: &[Skill]) -> String {
         out.push_str("- ");
         out.push_str(&s.frontmatter.name);
         out.push_str(": ");
-        out.push_str(&s.frontmatter.description);
+        out.push_str(&catalog_description(&s.frontmatter.description));
         out.push('\n');
     }
     out
+}
+
+fn catalog_description(description: &str) -> String {
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if description.chars().count() <= MAX_CATALOG_DESCRIPTION_CHARS {
+        return description;
+    }
+    let keep = MAX_CATALOG_DESCRIPTION_CHARS.saturating_sub(1);
+    let mut truncated: String = description.chars().take(keep).collect();
+    if let Some(space) = truncated.rfind(' ') {
+        truncated.truncate(space);
+    }
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -657,6 +961,7 @@ mod tests {
         );
         let cfg = SkillsConfig {
             scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
         };
@@ -680,6 +985,7 @@ mod tests {
 
         let cfg = SkillsConfig {
             scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
         };
@@ -703,6 +1009,7 @@ mod tests {
 
         let cfg = SkillsConfig {
             scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
         };
@@ -745,6 +1052,7 @@ mod tests {
 
         let cfg = SkillsConfig {
             scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
         };
@@ -762,6 +1070,7 @@ mod tests {
         write_skill(&scan, "evil", "---\nname: evil\ndescription: d\n---\n", "B");
         let cfg = SkillsConfig {
             scan_dirs: vec![".agents/skills".to_string()],
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
         };
@@ -786,6 +1095,7 @@ mod tests {
         write_skill(&scan, "ok", "---\nname: ok\ndescription: d\n---\n", "B");
         let cfg = SkillsConfig {
             scan_dirs: vec![".agents/skills".to_string()],
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk: false,
         };
@@ -806,6 +1116,7 @@ mod tests {
     fn skills_cfg(scan_dirs: Vec<&str>, ancestor_walk: bool) -> SkillsConfig {
         SkillsConfig {
             scan_dirs: scan_dirs.into_iter().map(str::to_string).collect(),
+            external_dirs: Vec::new(),
             auto_bang_commands: false,
             ancestor_walk,
         }
@@ -983,5 +1294,285 @@ mod tests {
         ];
         let cat = catalog_lines(&skills);
         assert_eq!(cat, "- a: first\n- b: second\n");
+    }
+
+    #[test]
+    fn agentskills_package_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("skills");
+        write_skill(
+            &scan,
+            "research",
+            "---\nname: research\ndescription: Research workflow\nversion: 1.0.0\n---\n",
+            "Read references/foo.md on demand.",
+        );
+        let package = scan.join("research");
+        std::fs::create_dir_all(package.join("references")).unwrap();
+        std::fs::write(package.join("references/foo.md"), "Reference details").unwrap();
+        let cfg = skills_cfg(vec![scan.to_str().unwrap()], false);
+
+        let found = discover(tmp.path(), &cfg).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            load_body(&found[0]).unwrap(),
+            "Read references/foo.md on demand."
+        );
+        assert_eq!(
+            load_support_file(&found[0], Path::new("references/foo.md")).unwrap(),
+            "Reference details"
+        );
+    }
+
+    #[test]
+    fn support_file_path_allowlisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("skills");
+        write_skill(
+            &scan,
+            "safe-package",
+            "---\nname: safe-package\ndescription: Safe package\n---\n",
+            "Body",
+        );
+        let package = scan.join("safe-package");
+        std::fs::create_dir_all(package.join("references")).unwrap();
+        std::fs::create_dir_all(package.join("docs")).unwrap();
+        std::fs::write(package.join("references/ok.md"), "ok").unwrap();
+        std::fs::write(package.join("docs/no.md"), "no").unwrap();
+        let skill = parse_skill(&package.join("SKILL.md")).unwrap();
+
+        assert_eq!(
+            load_support_file(&skill, Path::new("references/ok.md")).unwrap(),
+            "ok"
+        );
+        assert!(load_support_file(&skill, Path::new("references/../SKILL.md")).is_err());
+        assert!(load_support_file(&skill, Path::new("docs/no.md")).is_err());
+        assert!(load_support_file(&skill, Path::new("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn conditional_activation_matrix() {
+        let skill = Skill {
+            frontmatter: SkillFrontmatter {
+                name: "conditional".into(),
+                description: "Conditional".into(),
+                platforms: vec!["linux".into()],
+                metadata: SkillMetadata {
+                    hermes: HermesMetadata {
+                        requires_toolsets: vec!["web".into()],
+                        fallback_for_toolsets: vec!["browser".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            source: PathBuf::from("/skills/conditional/SKILL.md"),
+        };
+        let mut active = ActivationContext::from_tool_names(["websearch"]);
+        active.platform = "linux".into();
+        assert!(skill_is_active(&skill, &active));
+
+        let mut missing_required = ActivationContext::default();
+        missing_required.platform = "linux".into();
+        assert!(!skill_is_active(&skill, &missing_required));
+
+        active.toolsets.insert("browser".into());
+        assert!(!skill_is_active(&skill, &active));
+        active.toolsets.remove("browser");
+        active.platform = "windows".into();
+        assert!(!skill_is_active(&skill, &active));
+    }
+
+    #[test]
+    fn hermes_metadata_mapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mapped").join("SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "---\nname: mapped\ndescription: Mapped metadata\nversion: 2.1.0\nplatforms: [linux]\nmetadata:\n  hermes:\n    category: research\n    tags: [web, sources]\n    requires_toolsets: [web]\n    fallback_for_tools: [browser_navigate]\n    config:\n      - key: web.region\n        default: us\nrequired_environment_variables:\n  - name: SEARCH_API_KEY\n    prompt: Search key\n---\nBody",
+        )
+        .unwrap();
+        let skill = parse_skill(&path).unwrap();
+        let hermes = &skill.frontmatter.metadata.hermes;
+        assert_eq!(skill.frontmatter.version.as_deref(), Some("2.1.0"));
+        assert_eq!(skill.frontmatter.platforms, ["linux"]);
+        assert_eq!(hermes.category.as_deref(), Some("research"));
+        assert_eq!(hermes.tags, ["web", "sources"]);
+        assert_eq!(hermes.requires_toolsets, ["web"]);
+        assert_eq!(hermes.fallback_for_tools, ["browser_navigate"]);
+        assert_eq!(hermes.config[0].key, "web.region");
+        assert_eq!(
+            skill.frontmatter.required_environment_variables[0].name,
+            "SEARCH_API_KEY"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("future").join("SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "---\nname: future\ndescription: Future metadata\nfuture_top: yes\nmetadata:\n  future_metadata: 7\n  hermes:\n    future_hermes: enabled\n---\nBody",
+        )
+        .unwrap();
+        let skill = parse_skill(&path).unwrap();
+        assert!(skill.frontmatter.extra.contains_key("future_top"));
+        assert!(
+            skill
+                .frontmatter
+                .metadata
+                .extra
+                .contains_key("future_metadata")
+        );
+        assert!(
+            skill
+                .frontmatter
+                .metadata
+                .hermes
+                .extra
+                .contains_key("future_hermes")
+        );
+    }
+
+    #[test]
+    fn external_dirs_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("hermes-skills");
+        write_skill(
+            &external.join("research"),
+            "shared",
+            "---\nname: shared\ndescription: Shared package\n---\n",
+            "Body",
+        );
+        let cfg = SkillsConfig {
+            external_dirs: vec![external.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let found = discover(tmp.path(), &cfg).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].frontmatter.name, "shared");
+        assert!(
+            found[0]
+                .source
+                .ends_with("hermes-skills/research/shared/SKILL.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_discovery_ignores_symlink_escape_and_loop() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external");
+        let outside = tmp.path().join("outside");
+        write_skill(
+            &outside,
+            "escaped",
+            "---\nname: escaped\ndescription: Must not load\n---\n",
+            "Body",
+        );
+        std::fs::create_dir_all(external.join("category")).unwrap();
+        symlink(&outside, external.join("category/escape-link")).unwrap();
+        symlink(&external, external.join("category/loop-link")).unwrap();
+        let manifest_link_package = external.join("category/manifest-link");
+        std::fs::create_dir_all(&manifest_link_package).unwrap();
+        symlink(
+            outside.join("escaped/SKILL.md"),
+            manifest_link_package.join("SKILL.md"),
+        )
+        .unwrap();
+        write_skill(
+            &external.join(".hub/quarantine"),
+            "quarantined",
+            "---\nname: quarantined\ndescription: Must not load\n---\n",
+            "Body",
+        );
+        symlink(
+            external.join(".hub/quarantine"),
+            external.join("category/visible-quarantine-link"),
+        )
+        .unwrap();
+        write_skill(
+            &external.join("category"),
+            "inside",
+            "---\nname: inside\ndescription: Loads\n---\n",
+            "Body",
+        );
+        let cfg = SkillsConfig {
+            external_dirs: vec![external.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        let found = discover(tmp.path(), &cfg).unwrap();
+        let names: Vec<&str> = found
+            .iter()
+            .map(|skill| skill.frontmatter.name.as_str())
+            .collect();
+        assert_eq!(names, ["inside"]);
+    }
+
+    #[test]
+    fn agent_inventory_filters_incompatible_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("skills");
+        write_skill(
+            &scan,
+            "plain",
+            "---\nname: plain\ndescription: Always visible\n---\n",
+            "Body",
+        );
+        write_skill(
+            &scan,
+            "needs-web",
+            "---\nname: needs-web\ndescription: Web only\nmetadata:\n  hermes:\n    requires_toolsets: [web]\n---\n",
+            "Body",
+        );
+        let cfg = SkillsConfig {
+            scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        let found = discover_for_agent(tmp.path(), &cfg, "agent-that-does-not-exist").unwrap();
+        let names: Vec<&str> = found
+            .iter()
+            .map(|skill| skill.frontmatter.name.as_str())
+            .collect();
+        assert_eq!(names, ["plain"]);
+    }
+
+    #[test]
+    fn cockpit_skills_are_conformant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("skills");
+        write_skill(
+            &scan,
+            "cockpit-authored",
+            "---\nname: cockpit-authored\ndescription: A conformant Cockpit-authored package\n---\n",
+            "Body",
+        );
+        let skill = parse_skill(&scan.join("cockpit-authored/SKILL.md")).unwrap();
+        validate_conformant_package(&skill).unwrap();
+    }
+
+    #[test]
+    fn catalog_description_is_capped_without_truncating_manifest() {
+        let full = "This description is intentionally much longer than sixty characters so only the catalog copy is shortened";
+        let skill = Skill {
+            frontmatter: SkillFrontmatter {
+                name: "long".into(),
+                description: full.into(),
+                ..Default::default()
+            },
+            source: PathBuf::from("/skills/long/SKILL.md"),
+        };
+        let catalog = catalog_lines(std::slice::from_ref(&skill));
+        let rendered = catalog.trim_start_matches("- long: ").trim_end();
+        assert!(rendered.chars().count() <= MAX_CATALOG_DESCRIPTION_CHARS);
+        assert!(rendered.ends_with('…'));
+        assert_eq!(skill.frontmatter.description, full);
     }
 }

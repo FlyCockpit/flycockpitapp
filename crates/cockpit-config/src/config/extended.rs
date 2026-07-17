@@ -922,6 +922,12 @@ pub struct SkillsConfig {
     #[serde(default)]
     pub scan_dirs: Vec<String>,
 
+    /// Additional Agent Skills-compatible roots shared with other runtimes
+    /// such as Hermes. Appended after `scan_dirs`, preserving native-root
+    /// precedence when package names collide.
+    #[serde(default)]
+    pub external_dirs: Vec<String>,
+
     /// Auto-`!`-command toggle. `true` = Claude mode (inline
     /// `` !`command` `` directives in a skill body run, their stdout
     /// replaces the directive — scrubbed before entering context).

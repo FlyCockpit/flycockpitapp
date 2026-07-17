@@ -678,6 +678,7 @@ fn already_injected_skill_excluded_before_catalog() {
     write_fm_skill(&scan, "release-notes", "");
     let cfg = crate::config::extended::SkillsConfig {
         scan_dirs: vec![scan.to_string_lossy().into_owned()],
+        external_dirs: Vec::new(),
         auto_bang_commands: false,
         ancestor_walk: false,
     };
@@ -980,6 +981,7 @@ fn disable_model_invocation_excluded_from_catalog() {
     write_fm_skill(&scan, "useronly", "disable-model-invocation: true\n");
     let cfg = crate::config::extended::SkillsConfig {
         scan_dirs: vec![scan.to_string_lossy().into_owned()],
+        external_dirs: Vec::new(),
         auto_bang_commands: false,
         ancestor_walk: false,
     };
@@ -1001,6 +1003,7 @@ fn user_invocable_false_stays_in_catalog() {
     write_fm_skill(&scan, "modelonly", "user-invocable: false\n");
     let cfg = crate::config::extended::SkillsConfig {
         scan_dirs: vec![scan.to_string_lossy().into_owned()],
+        external_dirs: Vec::new(),
         auto_bang_commands: false,
         ancestor_walk: false,
     };
@@ -1080,6 +1083,7 @@ async fn select_low_information_turn_skips_before_model_lookup_with_diagnostics(
         &providers,
         redact,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        &[],
         &turns,
         &std::collections::HashSet::new(),
     )

@@ -506,6 +506,10 @@ pub struct ToolCtx {
     pub root_agent_frame: bool,
     /// Turn-start context-pressure snapshot for model-facing introspection.
     pub context_usage: Option<ContextUsageSnapshot>,
+    /// Exact tool names advertised to the calling agent for this turn. Skill
+    /// package activation uses this session-local surface for Hermes
+    /// `requires_tools` / `fallback_for_tools` gates.
+    pub available_tools: Arc<std::collections::HashSet<String>>,
     /// Whether the calling agent holds the `tree` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests `tree` only when the agent can use it) rather than

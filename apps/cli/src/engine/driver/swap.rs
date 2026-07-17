@@ -214,6 +214,7 @@ impl Driver {
                 // agent; rebind it so any future loop fork runs on the new
                 // primary's model/tool surface (single-authority rule).
                 self.schedule.set_agent(self.stack[0].agent.clone());
+                self.publish_active_tool_names();
                 tracing::info!(agent = %name, "primary agent swapped");
                 // `primary_swap` timeline event (export-audit fidelity):
                 // from/to + trigger + both halves of the wire-vs-user split.

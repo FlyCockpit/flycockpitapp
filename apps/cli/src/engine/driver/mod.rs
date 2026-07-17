@@ -1175,6 +1175,11 @@ impl Driver {
             ctx,
             max_concurrent_schedules,
         );
+        let initial_tools = crate::engine::agent::turn_toolbox(&root, &session, &cwd);
+        session.set_active_tool_names(
+            initial_tools.names(),
+            crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
+        );
         Self {
             session,
             locks,
@@ -1839,6 +1844,16 @@ impl Driver {
             .unwrap_or("")
     }
 
+    fn publish_active_tool_names(&self) {
+        if let Some(frame) = self.stack.last() {
+            let tools = crate::engine::agent::turn_toolbox(&frame.agent, &self.session, &self.cwd);
+            self.session.set_active_tool_names(
+                tools.names(),
+                crate::engine::tool::Capability::SandboxEscalate.enabled(frame.agent.llm_mode),
+            );
+        }
+    }
+
     fn active_queue_target(&self) -> crate::engine::message::QueueTarget {
         self.stack
             .last()
@@ -1923,6 +1938,13 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: self.stack.len() == 1,
             context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             events: Some(tx.clone()),
@@ -2001,6 +2023,7 @@ impl Driver {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
             };
+            self.publish_active_tool_names();
             let is_root = self.stack.len() == 1;
             let backup_model = self.resolve_backup_model(&agent.model);
             let call_id = uuid::Uuid::new_v4();
@@ -4117,6 +4140,7 @@ impl Driver {
     ) -> Option<Message> {
         let popped_depth = self.stack.len();
         let child = self.stack.pop().expect("pop_child requires a child frame");
+        self.publish_active_tool_names();
         self.prune_watermark.remove(&popped_depth);
         // Drop any locks the child still held — the §3c invariant doesn't
         // extend across the child's lifetime, and lingering locks would block
@@ -4674,6 +4698,7 @@ impl Driver {
                 .then(|| self.tandem_set.clone());
 
             let attempted_prompt = next_prompt.clone();
+            self.publish_active_tool_names();
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 // The foreground frame's deferred-log buffer (`plan.md §3d`):
@@ -5159,6 +5184,7 @@ impl Driver {
                         }),
                         deferred_log: crate::engine::deferred::DeferredLog::new(),
                     });
+                    self.publish_active_tool_names();
                     let _ = tx
                         .send(TurnEvent::ForegroundInputTarget {
                             target: self.active_queue_target(),

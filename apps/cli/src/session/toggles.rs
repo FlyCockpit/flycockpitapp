@@ -61,6 +61,15 @@ impl Session {
     pub fn set_sandbox_escalation_enabled(&self, enabled: bool) -> bool {
         self.sandbox_escalation_enabled
             .store(enabled, Ordering::Relaxed);
+        let eligible = self
+            .active_sandbox_escalate_eligible
+            .load(Ordering::Relaxed);
+        let mut active_tools = self.active_tool_names.lock().unwrap();
+        if enabled && eligible {
+            active_tools.insert("escalate".to_string());
+        } else {
+            active_tools.remove("escalate");
+        }
         enabled
     }
 

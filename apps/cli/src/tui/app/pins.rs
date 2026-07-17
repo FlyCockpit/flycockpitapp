@@ -740,6 +740,7 @@ mod tests {
             event_notify: Arc::new(tokio::sync::Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),

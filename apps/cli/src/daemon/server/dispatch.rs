@@ -530,7 +530,16 @@ async fn handle_request(
                 att.handle.trust_policy.clone(),
                 || crate::config::extended::load_for_cwd(cwd),
             );
-            let skills = crate::skills::discover(cwd, &extended.skills).map_err(internal)?;
+            let active_tools = att.handle.active_tool_names();
+            let activation = crate::skills::ActivationContext::from_tool_names(
+                active_tools.iter().map(String::as_str),
+            );
+            let skills = crate::skills::discover_for_session(
+                cwd,
+                &extended.skills,
+                &activation,
+            )
+            .map_err(internal)?;
             let skills = skills
                 .into_iter()
                 .map(|s| proto::SkillSummary {

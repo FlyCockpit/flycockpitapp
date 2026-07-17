@@ -187,6 +187,14 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                agent
+                    .tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -465,6 +473,14 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: false,
             context_usage: None,
+            available_tools: Arc::new(
+                child
+                    .tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             has_tree: child.tools.get("tree").is_some(),
             has_bash: child.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -533,6 +549,14 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                agent
+                    .tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -720,6 +744,14 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                agent
+                    .tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this

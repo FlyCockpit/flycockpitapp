@@ -2924,6 +2924,34 @@ mod tests {
     }
 
     #[test]
+    fn custom_agent_without_tools_gets_defaults_and_config_driven_web() {
+        use crate::agents::{AgentDef, AgentMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let def = AgentDef {
+            name: "custom-reader".to_string(),
+            description: "custom".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("custom-reader.md"),
+        };
+
+        let agent = agent_from_def(&def, &args).unwrap();
+        let names = agent.tools.names();
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"websearch"));
+        assert!(names.contains(&"webfetch"));
+    }
+
+    #[test]
     fn swarm_factory_has_build_surface_plus_recursive_spawn() {
         // `Swarm` (GOALS §24) mirrors `Build`'s surface and adds the
         // recursive `spawn` fan-out tool — the sole leaf-termination

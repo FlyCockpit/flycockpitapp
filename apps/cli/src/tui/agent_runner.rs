@@ -60,6 +60,9 @@ pub struct AgentRunner {
     /// the current runtime behavior, but a vector avoids baking that into
     /// the footer model.
     pub active_agent_path: Arc<Mutex<Vec<String>>>,
+    /// Names in the daemon's conditionally filtered skill inventory for the
+    /// exact foreground toolbox. `None` until the first attached refresh.
+    pub skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
     /// Queue-edit foreground target from the attach snapshot. Live updates
     /// arrive as `TurnEvent::ForegroundInputTarget`.
     pub foreground_target: Option<crate::engine::message::QueueTarget>,
@@ -444,6 +447,21 @@ fn try_spawn_inner(
                 },
                 _ => UsageCounts::default(),
             };
+            let skill_inventory_names = match daemon
+                .client
+                .request_ok(Request::ListSkills {
+                    project_root: cwd.to_string_lossy().into_owned(),
+                })
+                .await
+            {
+                Ok(Response::Skills { skills }) => Some(
+                    skills
+                        .into_iter()
+                        .map(|skill| skill.name)
+                        .collect::<std::collections::HashSet<_>>(),
+                ),
+                _ => None,
+            };
             timer.phase("attach_and_usage");
             timer.done();
             Ok::<_, String>((
@@ -455,6 +473,7 @@ fn try_spawn_inner(
                 foreground_target,
                 project_id,
                 usage,
+                skill_inventory_names,
                 owns_daemon,
                 socket,
                 history,
@@ -474,6 +493,7 @@ fn try_spawn_inner(
         foreground_target,
         project_id,
         usage,
+        initial_skill_names,
         owns_daemon,
         socket,
         history,
@@ -495,6 +515,7 @@ fn try_spawn_inner(
     };
     let active_agent = Arc::new(Mutex::new(initial_active_agent));
     let active_agent_path = Arc::new(Mutex::new(initial_active_agent_path));
+    let skill_inventory_names = Arc::new(Mutex::new(initial_skill_names));
     let last_applied_seq = Arc::new(Mutex::new(
         history.iter().filter_map(history_entry_seq).max(),
     ));
@@ -606,6 +627,7 @@ fn try_spawn_inner(
         let event_notify = event_notify.clone();
         let active_agent = active_agent.clone();
         let active_agent_path = active_agent_path.clone();
+        let skill_inventory_names = skill_inventory_names.clone();
         let current_client = current_client.clone();
         let last_applied_seq = last_applied_seq.clone();
         let attach_context = attach_context.clone();
@@ -629,6 +651,12 @@ fn try_spawn_inner(
             loop {
                 let client = current_client.read().await.clone();
                 while let Some(event) = client.next_event().await {
+                    let refresh_skill_inventory = matches!(
+                        &event,
+                        proto::Event::PrimarySwapped { .. }
+                            | proto::Event::ForegroundInputTarget { .. }
+                            | proto::Event::AgentIdle { .. }
+                    );
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
                     } else if saw_draining {
@@ -643,6 +671,20 @@ fn try_spawn_inner(
                         primary_agent: &primary_agent,
                         last_applied_seq: &last_applied_seq,
                     };
+                    if refresh_skill_inventory
+                        && let Ok(Response::Skills { skills }) = client
+                            .request_ok(Request::ListSkills {
+                                project_root: attach_context.project_root.clone(),
+                            })
+                            .await
+                    {
+                        *skill_inventory_names.lock().unwrap() = Some(
+                            skills
+                                .into_iter()
+                                .map(|skill| skill.name)
+                                .collect::<std::collections::HashSet<_>>(),
+                        );
+                    }
                     apply_incoming_event(event, &incoming);
                 }
                 if !client.is_socket_backed() {
@@ -717,6 +759,7 @@ fn try_spawn_inner(
         event_notify,
         active_agent,
         active_agent_path,
+        skill_inventory_names,
         foreground_target: foreground_target.map(queue_target_from_proto),
         session_id,
         short_id,
@@ -2165,6 +2208,7 @@ mod tests {
             event_notify: Arc::new(Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),

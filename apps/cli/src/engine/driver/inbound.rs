@@ -70,12 +70,19 @@ impl Driver {
             agent: String::new(),
         });
 
+        let active_tools: Vec<String> =
+            crate::engine::agent::turn_toolbox(&self.stack[0].agent, &self.session, &self.cwd)
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
         let (selection, diagnostics) = crate::skills::auto_select::select_with_diagnostics(
             &self.cwd,
             &extended,
             &providers,
             self.redact.clone(),
             self.session.trusted_only_flag(),
+            &active_tools,
             &turns,
             &self.auto_injected_skills,
         )

@@ -1308,6 +1308,13 @@ pub(crate) async fn run_turn(
         seeds,
         root_agent_frame: is_root,
         context_usage: Some(context_usage),
+        available_tools: Arc::new(
+            active_tools
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
         has_tree: agent.tools.get("tree").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         // The blocked-`readlock` waiting indicator routes its

@@ -1174,6 +1174,7 @@ mod tests {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             context_usage: None,
+            available_tools: Arc::new(std::collections::HashSet::new()),
             has_tree: false,
             has_bash: false,
             events: Some(tx.clone()),

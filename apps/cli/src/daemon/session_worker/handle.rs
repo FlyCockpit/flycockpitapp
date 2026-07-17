@@ -551,6 +551,10 @@ impl SessionWorkerHandle {
             .snapshot()
     }
 
+    pub fn active_tool_names(&self) -> Vec<String> {
+        self.session.active_tool_names()
+    }
+
     /// The session's project id — read from the in-memory session so it is
     /// available before the `sessions` row is persisted
     /// (session-id-display-and-lazy-persist).

@@ -2718,6 +2718,50 @@ fn new_constructs_idle_driver() {
     );
 }
 
+#[test]
+fn live_skill_inventory_publishes_exact_dynamic_toolbox() {
+    let (driver, _tmp) = test_driver_without_network(1);
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.llm_mode = crate::config::extended::LlmMode::Normal;
+    agent.tools = crate::engine::tool::ToolBox::new()
+        .with(Arc::new(crate::tools::read::ReadTool))
+        .with(Arc::new(crate::tools::web::WebSearchTool));
+    let session = driver.session.clone();
+
+    let _driver = Driver::new(
+        session.clone(),
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        Arc::new(agent),
+    );
+    let names = session.active_tool_names();
+    assert!(names.iter().any(|name| name == "read"));
+    assert!(names.iter().any(|name| name == "websearch"));
+
+    session.set_sandbox_escalation_enabled(false);
+    assert!(
+        !session
+            .active_tool_names()
+            .iter()
+            .any(|name| name == "escalate")
+    );
+    session.set_sandbox_escalation_enabled(true);
+    assert!(
+        session
+            .active_tool_names()
+            .iter()
+            .any(|name| name == "escalate")
+    );
+    session.set_sandbox_escalation_enabled(false);
+    assert!(
+        !session
+            .active_tool_names()
+            .iter()
+            .any(|name| name == "escalate")
+    );
+}
+
 /// Build a tiny history with two identical `read` snapshots (one
 /// elidable). Mirrors the prune module's wire shape.
 fn dup_read_history() -> Vec<Message> {

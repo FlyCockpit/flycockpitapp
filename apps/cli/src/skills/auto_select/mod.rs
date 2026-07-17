@@ -142,6 +142,7 @@ async fn select(
         providers,
         redact,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        &[],
         turns,
         already_injected,
     )
@@ -149,12 +150,14 @@ async fn select(
     .0
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn select_with_diagnostics(
     cwd: &Path,
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    active_tools: &[String],
     turns: &[PredictionTurn],
     already_injected: &std::collections::HashSet<String>,
 ) -> (Selection, SelectionDiagnostics) {
@@ -164,6 +167,7 @@ pub async fn select_with_diagnostics(
         providers,
         redact,
         trusted_only,
+        active_tools,
         turns,
         already_injected,
     )
@@ -177,12 +181,14 @@ pub async fn select_with_diagnostics(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn select_inner(
     cwd: &Path,
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    active_tools: &[String],
     turns: &[PredictionTurn],
     already_injected: &std::collections::HashSet<String>,
 ) -> Result<(Selection, SelectionDiagnostics)> {
@@ -201,11 +207,14 @@ async fn select_inner(
     // catalog — so the model can't re-vote them and the backstop can't
     // re-pass them (once-per-session suppression). Empty after either filter
     // → skip, never an error.
-    let skills: Vec<crate::skills::Skill> = crate::skills::discover(cwd, &extended.skills)?
-        .into_iter()
-        .filter(|s| !s.frontmatter.disable_model_invocation)
-        .filter(|s| !already_injected.contains(&s.frontmatter.name))
-        .collect();
+    let activation =
+        crate::skills::ActivationContext::from_tool_names(active_tools.iter().map(String::as_str));
+    let skills: Vec<crate::skills::Skill> =
+        crate::skills::discover_for_session(cwd, &extended.skills, &activation)?
+            .into_iter()
+            .filter(|s| !s.frontmatter.disable_model_invocation)
+            .filter(|s| !already_injected.contains(&s.frontmatter.name))
+            .collect();
     if skills.is_empty() {
         return Ok((Selection::None, diagnostics));
     }

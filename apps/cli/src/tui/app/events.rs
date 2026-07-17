@@ -249,6 +249,7 @@ impl App {
             }
             TurnEvent::ForegroundInputTarget { target } => {
                 self.foreground_input_target = Some(target);
+                self.refresh_skill_commands();
             }
             TurnEvent::ThinkingStarted { agent, turn_id } => {
                 // Note: a `ThinkingStarted` does NOT clear the reconnect
@@ -913,6 +914,7 @@ impl App {
                 // `apply_event` exhaustive and covers any in-process path.
                 self.launch.agent_name = name.clone();
                 self.agent_path = vec![name];
+                self.refresh_skill_commands();
             }
             TurnEvent::LlmModeChanged { mode } => {
                 // The live `/llm-mode` switch landed (daemon-authoritative).

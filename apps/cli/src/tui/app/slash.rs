@@ -1219,9 +1219,7 @@ impl App {
         // Re-discover per call so the dispatcher sees colliding +
         // freshly-added skills regardless of the startup `skill_commands`
         // cache (which holds only the non-colliding bare entries).
-        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
-        let skills =
-            crate::skills::discover(&self.launch.cwd, &extended.skills).unwrap_or_default();
+        let skills = self.visible_skills();
         let names: Vec<&str> = skills.iter().map(|s| s.frontmatter.name.as_str()).collect();
         match resolve_skill_dispatch(args, &names) {
             SkillDispatch::Invoke { name, task } => {
@@ -2217,8 +2215,10 @@ pub(super) fn builtin_slash_name_taken(name: &str) -> bool {
 pub(super) fn discover_bare_skill_commands(
     cwd: &Path,
     extended: &crate::config::extended::ExtendedConfig,
+    agent_name: &str,
 ) -> Vec<SkillCommand> {
-    let skills = crate::skills::discover(cwd, &extended.skills).unwrap_or_default();
+    let skills =
+        crate::skills::discover_for_agent(cwd, &extended.skills, agent_name).unwrap_or_default();
     bare_skill_commands_from(skills)
 }
 

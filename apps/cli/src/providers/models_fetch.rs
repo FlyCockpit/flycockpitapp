@@ -82,7 +82,7 @@ impl fmt::Debug for ResolvedRequest {
 /// Resolve environment and named-secret references in every header, collecting
 /// missing references into one list. Caller decides whether to abort or warn.
 pub fn resolve_headers(headers: &[HeaderSpec]) -> (Vec<ResolvedHeader>, Vec<String>) {
-    let store = crate::credentials::CredentialStore::open_default().ok();
+    let store = crate::credentials::CredentialStore::open_default_readonly().ok();
     resolve_headers_with_sources(
         headers,
         |name| std::env::var(name).ok(),
@@ -270,7 +270,7 @@ pub(crate) fn resolve_provider_request_inner(
     request_kind: ProviderRequestKind,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
-    let secret_store = crate::credentials::CredentialStore::open_default().ok();
+    let secret_store = crate::credentials::CredentialStore::open_default_readonly().ok();
     resolve_provider_request_inner_with_sources(
         provider_id,
         entry,

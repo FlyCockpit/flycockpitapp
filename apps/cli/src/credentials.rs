@@ -82,6 +82,24 @@ impl CredentialStore {
         Self::open(path)
     }
 
+    /// Open the credential store without creating parent directories, lock
+    /// files, or repairing permissions. Intended for read-only diagnostics.
+    pub fn open_readonly(path: PathBuf) -> Result<Self> {
+        let data = read_credential_file_readonly(&path)?;
+        Ok(Self {
+            path,
+            records: data.records,
+            secrets: data.secrets,
+            record_mutations: Vec::new(),
+            secret_mutations: Vec::new(),
+        })
+    }
+
+    pub fn open_default_readonly() -> Result<Self> {
+        let path = default_path().context("could not locate $HOME for credentials path")?;
+        Self::open_readonly(path)
+    }
+
     pub fn get(&self, provider_id: &str) -> Option<&Value> {
         self.records.get(provider_id)
     }
@@ -193,6 +211,13 @@ fn read_credential_file(path: &Path) -> Result<CredentialFile> {
         return Ok(CredentialFile::default());
     }
     repair_existing_file_permissions(path)?;
+    read_credential_file_readonly(path)
+}
+
+fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
+    if !path.exists() {
+        return Ok(CredentialFile::default());
+    }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     if raw.trim().is_empty() {

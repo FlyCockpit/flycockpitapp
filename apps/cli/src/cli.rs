@@ -269,9 +269,16 @@ pub struct TrustStatusArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(
+    after_help = "Exit codes:\n  0  no failing checks\n  1  one or more doctor checks failed\n\nNetwork provider checks run by default; use --offline to skip DNS and HTTP."
+)]
 pub struct DoctorArgs {
     /// Directory to inspect (defaults to the current directory).
     pub path: Option<PathBuf>,
+
+    /// Skip provider network checks. Static config, credential, git, and container checks still run.
+    #[arg(long)]
+    pub offline: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1067,7 +1074,17 @@ mod tests {
         let cli = Cli::try_parse_from(["cockpit", "doctor", "/tmp/example"]).unwrap();
         match cli.command {
             Some(Command::Doctor(args)) => {
-                assert_eq!(args.path, Some(PathBuf::from("/tmp/example")))
+                assert_eq!(args.path, Some(PathBuf::from("/tmp/example")));
+                assert!(!args.offline);
+            }
+            other => panic!("expected doctor command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["cockpit", "doctor", "--offline"]).unwrap();
+        match cli.command {
+            Some(Command::Doctor(args)) => {
+                assert!(args.path.is_none());
+                assert!(args.offline);
             }
             other => panic!("expected doctor command, got {other:?}"),
         }

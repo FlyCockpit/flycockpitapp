@@ -1,8 +1,11 @@
 //! Compact read-only diagnostics snapshot for CLI and TUI surfaces.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::Result;
+use futures::StreamExt as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticsInput {
@@ -28,20 +31,32 @@ pub struct DiagnosticsSnapshot {
     pub container_available: String,
     pub approval_mode: String,
     pub providers: Vec<String>,
+    pub git: Vec<String>,
+    pub network: Vec<String>,
     pub harnesses: Vec<String>,
     pub delegation: Vec<String>,
+    pub has_failures: bool,
 }
 
-pub fn cli_snapshot(path: Option<&Path>, no_sandbox: bool) -> Result<DiagnosticsSnapshot> {
+pub async fn cli_snapshot(
+    path: Option<&Path>,
+    no_sandbox: bool,
+    offline: bool,
+) -> Result<DiagnosticsSnapshot> {
     let launch = crate::welcome::load(path, false);
-    build_snapshot(DiagnosticsInput {
+    let mut snapshot = build_snapshot(DiagnosticsInput {
         cwd: launch.cwd,
         session_id: None,
         session_short_id: None,
         active_agent: launch.agent_name,
         active_model: launch.active_model,
         sandbox_enabled: Some(!no_sandbox),
-    })
+    })?;
+    let providers = crate::secret_ref::load_effective(Path::new(&snapshot.cwd));
+    let (network, network_failed) = provider_network_lines(&providers, offline).await;
+    snapshot.network = network;
+    snapshot.has_failures |= network_failed;
+    Ok(snapshot)
 }
 
 pub fn tui_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
@@ -58,8 +73,19 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     out.push_str(&format!("project root: {}\n", snapshot.project_root));
     out.push_str(&format!("workspace trust: {}\n", snapshot.workspace_trust));
     out.push_str(&format!("sandbox: {}\n", snapshot.sandbox));
+    push_section(
+        &mut out,
+        "container",
+        &[
+            format!("runtime: {}", snapshot.container_runtime),
+            format!("harness: {}", snapshot.container_harness),
+            format!("available: {}", snapshot.container_available),
+        ],
+    );
     out.push_str(&format!("approval: {}\n", snapshot.approval_mode));
     push_section(&mut out, "providers", &snapshot.providers);
+    push_section(&mut out, "network", &snapshot.network);
+    push_section(&mut out, "git", &snapshot.git);
     push_section(&mut out, "harnesses", &snapshot.harnesses);
     push_section(&mut out, "delegation", &snapshot.delegation);
     out
@@ -78,6 +104,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
         .map(|reason| reason.as_str())
         .unwrap_or("none");
 
+    let (providers, provider_failures) = provider_lines(&providers, &extended);
     Ok(DiagnosticsSnapshot {
         session: session_label(input.session_id, input.session_short_id.as_deref()),
         active_agent: input.active_agent.clone(),
@@ -108,7 +135,9 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             format!("false ({container_reason})")
         },
         approval_mode: extended.default_approval_mode.as_str().to_string(),
-        providers: provider_lines(&providers, &extended),
+        providers,
+        git: git_lines(&input.cwd),
+        network: Vec::new(),
         harnesses: harness_lines(&harnesses, trust_resolved),
         delegation: delegation_lines(
             &input.active_agent,
@@ -116,6 +145,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             !harnesses.is_empty(),
             &extended,
         ),
+        has_failures: provider_failures,
     })
 }
 
@@ -159,9 +189,10 @@ fn workspace_trust_mode(cwd: &Path) -> String {
 fn provider_lines(
     cfg: &crate::config::providers::ProvidersConfig,
     extended: &crate::config::extended::ExtendedConfig,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     let trusted_only = extended.trusted_only;
     let mut out = Vec::new();
+    let mut failed = false;
     match cfg.resolve_embedding_model(extended) {
         Ok(resolved) => out.push(format!(
             "embedding_model: resolved {}/{}{}",
@@ -173,6 +204,10 @@ fn provider_lines(
                 .unwrap_or_default()
         )),
         Err(err) => out.push(format!("embedding_model: unresolved ({err})")),
+    }
+    if cfg.providers.is_empty() {
+        out.push("no providers configured; run: cockpit provider add".to_string());
+        return (out, true);
     }
     for (id, provider) in &cfg.providers {
         let fetch = provider
@@ -221,8 +256,278 @@ fn provider_lines(
             "{id}: {model_count} model(s), fetch {fetch}, {}",
             notes.join(", ")
         ));
+        let (credential, credential_failed) = credential_line(id, provider);
+        failed |= credential_failed;
+        out.push(credential);
     }
+    (out, failed)
+}
+
+fn credential_line(
+    provider_id: &str,
+    provider: &crate::config::providers::ProviderEntry,
+) -> (String, bool) {
+    let store = crate::credentials::CredentialStore::open_default_readonly().ok();
+    credential_line_with_sources(
+        provider_id,
+        provider,
+        |name| std::env::var(name).ok(),
+        |name| {
+            store
+                .as_ref()
+                .and_then(|store| store.named_secret(name))
+                .map(str::to_string)
+        },
+        |credential_ref| {
+            store
+                .as_ref()
+                .and_then(|store| store.get(credential_ref))
+                .is_some()
+        },
+    )
+}
+
+fn credential_line_with_sources<E, S, C>(
+    provider_id: &str,
+    provider: &crate::config::providers::ProviderEntry,
+    env_lookup: E,
+    secret_lookup: S,
+    credential_present: C,
+) -> (String, bool)
+where
+    E: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
+    C: Fn(&str) -> bool,
+{
+    if provider.auth == Some(crate::config::providers::AuthKind::None) {
+        return (format!("{provider_id} credentials: not required"), false);
+    }
+    if let Some(credential_ref) = provider.credential_ref.as_deref() {
+        if credential_present(credential_ref) {
+            return (
+                format!("{provider_id} credentials: ok (credential {credential_ref})"),
+                false,
+            );
+        }
+        return (
+            format!(
+                "{provider_id} credentials: MISSING — credential `{credential_ref}` not found; run: cockpit provider add {}",
+                provider
+                    .effective_template(provider_id)
+                    .unwrap_or(provider_id)
+            ),
+            true,
+        );
+    }
+
+    if provider.headers.is_empty() {
+        return (
+            format!(
+                "{provider_id} credentials: none configured; run: cockpit provider add {provider_id}"
+            ),
+            true,
+        );
+    }
+
+    let mut refs = Vec::new();
+    let mut missing = Vec::new();
+    let mut has_literal = false;
+    for header in &provider.headers {
+        let resolved = crate::envref::resolve_with_sources(
+            &header.value,
+            |name| env_lookup(name).filter(|value| !value.trim().is_empty()),
+            |name| secret_lookup(name).filter(|value| !value.trim().is_empty()),
+        );
+        if resolved.referenced.is_empty() {
+            has_literal = true;
+        }
+        refs.extend(resolved.referenced);
+        missing.extend(resolved.missing);
+        missing.extend(resolved.errors);
+    }
+    refs.sort();
+    refs.dedup();
+    missing.sort();
+    missing.dedup();
+
+    if !missing.is_empty() {
+        let rendered = missing
+            .iter()
+            .map(|name| {
+                if let Some(secret) = name.strip_prefix("secret:") {
+                    format!("$secret:{secret} not found")
+                } else if name.starts_with("invalid ") {
+                    name.clone()
+                } else {
+                    format!("${name} not set")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (
+            format!(
+                "{provider_id} credentials: MISSING — {rendered}; run: cockpit provider add {}",
+                provider
+                    .effective_template(provider_id)
+                    .unwrap_or(provider_id)
+            ),
+            true,
+        );
+    }
+
+    let source = if refs.is_empty() {
+        if has_literal {
+            "literal header".to_string()
+        } else {
+            "configured headers".to_string()
+        }
+    } else {
+        refs.iter()
+            .map(|name| {
+                if let Some(secret) = name.strip_prefix("secret:") {
+                    format!("secret {secret}")
+                } else {
+                    format!("env {name}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (format!("{provider_id} credentials: ok ({source})"), false)
+}
+
+async fn provider_network_lines(
+    cfg: &crate::config::providers::ProvidersConfig,
+    offline: bool,
+) -> (Vec<String>, bool) {
+    if offline {
+        return (
+            vec!["network checks: skipped (--offline)".to_string()],
+            false,
+        );
+    }
+    if cfg.providers.is_empty() {
+        return (
+            vec!["network checks: no providers configured; run: cockpit provider add".to_string()],
+            true,
+        );
+    }
+    let mut results = futures::stream::iter(cfg.providers.iter().enumerate().map(
+        |(idx, (id, provider))| async move {
+        let Some(template_id) = provider.effective_template(id) else {
+            return (
+                idx,
+                format!("{id}: skipped (custom provider has no built-in auth check)"),
+                false,
+            );
+        };
+        let Some(template) = crate::providers::template_by_id(template_id) else {
+            return (
+                idx,
+                format!("{id}: skipped (unknown provider template {template_id})"),
+                false,
+            );
+        };
+        let (line, failed) = match crate::providers::auth_check::check_provider_auth(
+            id,
+            provider,
+            template,
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(_) => (format!("{id}: reachable · credentials verified"), false),
+            Err(crate::providers::auth_check::AuthCheckError::CredentialsRejected(error)) => (
+                format!(
+                    "{id}: reachable · credentials REJECTED ({}) — run: cockpit provider add {template_id}",
+                    one_line(&error)
+                ),
+                true,
+            ),
+            Err(crate::providers::auth_check::AuthCheckError::Network(error)) => (
+                format!(
+                    "{id}: UNREACHABLE ({}) — check network/proxy; run: cockpit provider add {template_id}",
+                    one_line(&error)
+                ),
+                true,
+            ),
+            Err(crate::providers::auth_check::AuthCheckError::Other(error)) => (
+                format!(
+                    "{id}: check failed ({}) — run: cockpit provider add {template_id}",
+                    one_line(&error)
+                ),
+                true,
+            ),
+        };
+        (idx, line, failed)
+        },
+    ))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    results.sort_by_key(|(idx, _, _)| *idx);
+    let failed = results.iter().any(|(_, _, failed)| *failed);
+    let out = results
+        .into_iter()
+        .map(|(_, line, _)| line)
+        .collect::<Vec<_>>();
+    (out, failed)
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn git_lines(cwd: &Path) -> Vec<String> {
+    let Some(version) = command_output(Command::new("git").arg("--version")) else {
+        return vec!["git: not found (informational)".to_string()];
+    };
+    let mut out = vec![format!("git: {}", version.trim())];
+    let Some(is_repo) = command_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("rev-parse")
+            .arg("--is-inside-work-tree"),
+    ) else {
+        out.push("repo: no (informational)".to_string());
+        return out;
+    };
+    if is_repo.trim() != "true" {
+        out.push("repo: no (informational)".to_string());
+        return out;
+    }
+    out.push("repo: yes".to_string());
+    let branch = command_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("branch")
+            .arg("--show-current"),
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| "detached".to_string());
+    let dirty = command_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("status")
+            .arg("--short"),
+    )
+    .map(|value| value.lines().count())
+    .unwrap_or(0);
+    out.push(format!("branch: {branch}"));
+    out.push(format!("dirty: {dirty} changed path(s)"));
     out
+}
+
+fn command_output(command: &mut Command) -> Option<String> {
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn model_fetch_status_label(
@@ -342,6 +647,7 @@ fn command_on_path(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::providers::{AuthKind, HeaderSpec, ProviderEntry, ProvidersConfig};
 
     fn base_input(cwd: &Path) -> DiagnosticsInput {
         DiagnosticsInput {
@@ -351,6 +657,18 @@ mod tests {
             active_agent: "Build".to_string(),
             active_model: Some(("p".to_string(), "m".to_string())),
             sandbox_enabled: Some(true),
+        }
+    }
+
+    fn provider_with_header(value: &str) -> ProviderEntry {
+        ProviderEntry {
+            url: "https://example.test/v1".to_string(),
+            auth: Some(AuthKind::ApiKey),
+            headers: vec![HeaderSpec {
+                name: "Authorization".to_string(),
+                value: value.to_string(),
+            }],
+            ..ProviderEntry::default()
         }
     }
 
@@ -448,6 +766,194 @@ mod tests {
             "{rendered}"
         );
     }
+
+    #[test]
+    fn doctor_renders_container_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rendered = render(&build_snapshot(base_input(tmp.path())).unwrap());
+
+        assert!(rendered.contains("container:"), "{rendered}");
+        assert!(rendered.contains("runtime:"), "{rendered}");
+        assert!(rendered.contains("harness:"), "{rendered}");
+        assert!(rendered.contains("available:"), "{rendered}");
+    }
+
+    #[test]
+    fn doctor_credential_resolvability_states() {
+        let cases = [
+            (
+                "env-ok",
+                provider_with_header("Bearer $COCKPIT_DOCTOR_PRESENT_KEY"),
+            ),
+            (
+                "env-missing",
+                provider_with_header("Bearer $COCKPIT_DOCTOR_MISSING_KEY"),
+            ),
+            (
+                "secret-ok",
+                provider_with_header("Bearer $secret:doctor-present"),
+            ),
+            (
+                "secret-missing",
+                provider_with_header("Bearer $secret:doctor-missing"),
+            ),
+        ];
+        let mut lines = Vec::new();
+        let mut failed = false;
+        for (id, provider) in cases {
+            let (line, line_failed) = credential_line_with_sources(
+                id,
+                &provider,
+                |name| {
+                    (name == "COCKPIT_DOCTOR_PRESENT_KEY").then(|| "sk-present-secret".to_string())
+                },
+                |name| (name == "doctor-present").then(|| "sk-named-secret-value".to_string()),
+                |_| false,
+            );
+            lines.push(line);
+            failed |= line_failed;
+        }
+        let rendered = lines.join("\n");
+
+        assert!(failed);
+        assert!(
+            rendered.contains("env-ok credentials: ok (env COCKPIT_DOCTOR_PRESENT_KEY)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "env-missing credentials: MISSING — $COCKPIT_DOCTOR_MISSING_KEY not set; run:"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("secret-ok credentials: ok (secret doctor-present)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "secret-missing credentials: MISSING — $secret:doctor-missing not found; run:"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("sk-present-secret"), "{rendered}");
+        assert!(!rendered.contains("sk-named-secret-value"), "{rendered}");
+    }
+
+    async fn one_shot_server(status: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buf = vec![0; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn network_cfg(base_url: String) -> ProvidersConfig {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "zai-test".to_string(),
+            ProviderEntry {
+                url: base_url,
+                template: Some("z-ai".to_string()),
+                auth: Some(AuthKind::ApiKey),
+                headers: vec![HeaderSpec {
+                    name: "Authorization".to_string(),
+                    value: "Bearer literal-test-token".to_string(),
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        cfg
+    }
+
+    #[tokio::test]
+    async fn doctor_network_states_and_mutates_nothing() {
+        let ok_url = one_shot_server("200 OK", r#"{"ok":true}"#).await;
+        let cfg = network_cfg(ok_url);
+        let before = serde_json::to_value(&cfg).unwrap();
+        let (lines, failed) = provider_network_lines(&cfg, false).await;
+        assert!(!failed, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("reachable · credentials verified")),
+            "{lines:?}"
+        );
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
+
+        let rejected_url = one_shot_server("401 Unauthorized", r#"{"error":"bad key"}"#).await;
+        let cfg = network_cfg(rejected_url);
+        let (lines, failed) = provider_network_lines(&cfg, false).await;
+        assert!(failed, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("credentials REJECTED")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_offline_skips_network() {
+        let cfg = network_cfg("http://127.0.0.1:9/v1".to_string());
+        let (lines, failed) = provider_network_lines(&cfg, true).await;
+
+        assert!(!failed);
+        assert_eq!(lines, ["network checks: skipped (--offline)"]);
+    }
+
+    #[test]
+    fn doctor_git_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = git_lines(tmp.path());
+        let rendered = lines.join("\n");
+
+        assert!(
+            rendered.contains("git: not found") || rendered.contains("git version"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("repo: no") || rendered.contains("repo: yes"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn doctor_exit_codes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        assert!(snapshot.has_failures);
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "local".to_string(),
+            ProviderEntry {
+                url: "http://127.0.0.1:11434/v1".to_string(),
+                auth: Some(AuthKind::None),
+                ..ProviderEntry::default()
+            },
+        );
+        let (_lines, failed) =
+            provider_lines(&cfg, &crate::config::extended::ExtendedConfig::default());
+        assert!(!failed);
+    }
+
     #[test]
     fn embedding_doctor_reports_resolution() {
         let tmp = tempfile::tempdir().unwrap();

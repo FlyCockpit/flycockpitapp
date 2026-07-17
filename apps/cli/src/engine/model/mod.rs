@@ -59,6 +59,7 @@ mod dispatch;
 mod failure;
 mod redact;
 mod wire;
+pub(crate) mod wire_schema;
 
 #[allow(unused_imports)]
 pub use build::ModelParams;
@@ -2591,6 +2592,85 @@ mod tests {
     }
 
     #[test]
+    fn responses_wire_gets_transformed_tools_chat_wire_does_not() {
+        use crate::config::providers::WireApi;
+
+        fn optional_is_nullable(schema: &serde_json::Value) -> bool {
+            match schema.get("type") {
+                Some(serde_json::Value::String(kind)) => kind == "null",
+                Some(serde_json::Value::Array(kinds)) => {
+                    kinds.iter().any(|kind| kind.as_str() == Some("null"))
+                }
+                _ => schema
+                    .get("anyOf")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|variants| variants.iter().any(optional_is_nullable)),
+            }
+        }
+
+        fn openai_model(wire_api: WireApi) -> Model {
+            let resolved = resolved_local_request("http://127.0.0.1:1/v1".to_string());
+            build_openai_model_from_resolved(
+                "test",
+                &resolved,
+                "test-model",
+                &crate::config::providers::TimeoutConfig::default(),
+                false,
+                ClientSideToolsCapability::default(),
+                wire_api,
+                true,
+                false,
+                None,
+                0,
+                0,
+                false,
+                trust_flag_off(),
+                TestArc::new(RedactionTable::empty()),
+                TestArc::new(RedactionTable::empty()),
+            )
+            .unwrap()
+        }
+
+        let tool = ToolDefinition {
+            name: "sample".to_string(),
+            description: "sample tool".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "optional": { "type": "string" } }
+            }),
+        };
+        let tools = vec![tool.clone()];
+        let capture = |model: &Model| {
+            model.assemble_dispatch_request(
+                "system",
+                &[],
+                &Message::user("hi"),
+                &tools,
+                &ModelParams::default(),
+            )
+        };
+
+        let responses = capture(&openai_model(WireApi::Responses));
+        assert!(optional_is_nullable(
+            &responses["tools"][0]["parameters"]["properties"]["optional"]
+        ));
+
+        let chat = capture(&openai_model(WireApi::Completions));
+        assert_eq!(chat["tools"][0], serde_json::to_value(&tool).unwrap());
+
+        let anthropic = capture(&native_anthropic_model(TestArc::new(
+            RedactionTable::empty(),
+        )));
+        assert_eq!(anthropic["tools"][0], serde_json::to_value(&tool).unwrap());
+
+        let chatgpt = capture(&native_chatgpt_model(TestArc::new(RedactionTable::empty())));
+        assert!(optional_is_nullable(
+            &chatgpt["tools"][0]["parameters"]["properties"]["optional"]
+        ));
+        assert_eq!(tools[0], tool, "canonical definition must remain unchanged");
+    }
+
+    #[test]
     fn learned_success_is_used_below_explicit_config() {
         use crate::config::providers::WireApi;
         let _guard = endpoint_probe_test_guard();
@@ -3924,6 +4004,42 @@ mod tests {
         (format!("http://{addr}/v1"), rx)
     }
 
+    async fn chat_404_then_responses_ok_server() -> (String, tokio::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(2);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (header, _body) = read_http_request(&mut stream).await;
+                let request_line = header.lines().next().unwrap_or("").to_string();
+                let _ = tx.send(request_line.clone()).await;
+                if request_line.contains("/chat/completions") {
+                    let payload = "{\"error\":\"no route for /v1/chat/completions\"}";
+                    let resp = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                } else {
+                    let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+                        data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":2},\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"ok\"}]}],\"tools\":[]}}\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
     #[tokio::test]
     async fn approved_responses_404_retries_chat_and_persists_completions() {
         use crate::config::providers::WireApi;
@@ -3972,27 +4088,99 @@ mod tests {
             approve: std::sync::Arc::new(|_| Box::pin(async { true })),
         };
         let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
-        let result = model
+        let tools = vec![ToolDefinition {
+            name: "sample".to_string(),
+            description: "sample tool".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "optional": { "type": "string" } }
+            }),
+        }];
+        let ((_message_id, _choice, _usage), captured, _timing) = model
             .complete_captured(
                 "system",
                 &[],
                 Message::user("hi"),
-                &[],
+                &tools,
                 ModelParams::default(),
                 "Build",
                 Some(&tx),
                 &CancellationToken::new(),
                 Some(recovery),
             )
-            .await;
-        assert!(result.is_ok(), "{result:#?}");
+            .await
+            .expect("approved endpoint swap succeeds");
         assert!(requests.recv().await.unwrap().contains("/responses"));
         assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+        assert_eq!(
+            captured["tools"][0]["parameters"]["properties"]["optional"]["type"], "string",
+            "capture must match the successful chat-completions retry"
+        );
         let doc = crate::config::providers::ConfigDoc::load(&path).unwrap();
         assert_eq!(
             doc.providers().resolve_wire_api("p", "m"),
             WireApi::Completions,
             "successful alternate endpoint must persist completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_chat_404_retries_responses_and_captures_final_wire() {
+        use crate::config::providers::WireApi;
+
+        let (url, mut requests) = chat_404_then_responses_ok_server().await;
+        let resolved = resolved_local_request(url);
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved,
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            false,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        let recovery = EndpointRecoveryContext {
+            approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+        };
+        let tools = vec![ToolDefinition {
+            name: "sample".to_string(),
+            description: "sample tool".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "optional": { "type": "string" } }
+            }),
+        }];
+        let ((_message_id, _choice, _usage), captured, _timing) = model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("hi"),
+                &tools,
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                Some(recovery),
+            )
+            .await
+            .expect("approved endpoint swap succeeds");
+
+        assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+        assert!(requests.recv().await.unwrap().contains("/responses"));
+        assert_eq!(
+            captured["tools"][0]["parameters"]["properties"]["optional"]["type"],
+            serde_json::json!(["string", "null"]),
+            "capture must match the successful Responses retry"
         );
     }
 

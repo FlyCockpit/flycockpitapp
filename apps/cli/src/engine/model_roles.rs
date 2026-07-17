@@ -482,6 +482,9 @@ fn parse_trust(value: Option<&Value>) -> Result<Option<ModelTrust>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let Some(value) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
         return Err("`model.trust` must be `trusted` or `untrusted`".to_string());
     };
@@ -498,6 +501,9 @@ fn parse_optimization(value: Option<&Value>) -> Result<ModelOptimization, String
     let Some(value) = value else {
         return Ok(ModelOptimization::Balanced);
     };
+    if value.is_null() {
+        return Ok(ModelOptimization::Balanced);
+    }
     let Some(value) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
         return Err("`model.optimize` must be `quality`, `cost`, or `balanced`".to_string());
     };
@@ -517,6 +523,9 @@ fn parse_required_capabilities(
     let Some(value) = value else {
         return Ok(Vec::new());
     };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
     let Some(items) = value.as_array() else {
         return Err("`model.requires` must be an array of capability names".to_string());
     };
@@ -547,6 +556,9 @@ fn parse_min_context_tokens(value: Option<&Value>) -> Result<Option<u32>, String
     let Some(value) = value else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let Some(n) = value.as_u64() else {
         return Err("`model.min_context_tokens` must be a positive integer".to_string());
     };
@@ -898,6 +910,66 @@ mod tests {
         assert!(
             DelegationModelSelector::from_value(Some(&serde_json::json!("cheap_code"))).is_err()
         );
+    }
+
+    #[test]
+    fn parse_min_context_and_optional_selector_fields_treat_null_as_absent() {
+        assert_eq!(parse_min_context_tokens(Some(&Value::Null)).unwrap(), None);
+        assert_eq!(parse_trust(Some(&Value::Null)).unwrap(), None);
+        assert_eq!(
+            parse_optimization(Some(&Value::Null)).unwrap(),
+            ModelOptimization::Balanced
+        );
+        assert!(
+            parse_required_capabilities(Some(&Value::Null))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn minimal_exact_selector_with_nulled_optionals_resolves() {
+        let minimal = DelegationModelSelector::from_value(Some(&serde_json::json!({
+            "kind": "exact",
+            "selector": "minimax:MiniMax-M2"
+        })))
+        .unwrap()
+        .unwrap();
+        let nulled = DelegationModelSelector::from_value(Some(&serde_json::json!({
+            "kind": "exact",
+            "selector": "minimax:MiniMax-M2",
+            "category": null,
+            "trust": null,
+            "optimize": null,
+            "requires": null,
+            "min_context_tokens": null
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(nulled, minimal);
+
+        let providers = providers();
+        assert_eq!(
+            providers
+                .resolve_capabilities("minimax", "MiniMax-M2")
+                .context_tokens,
+            None,
+            "regression requires an unknown context window"
+        );
+        let session = session_model(&providers);
+        let resolved = resolve_delegated_model(
+            "explore",
+            None,
+            Some(&nulled),
+            &ExtendedConfig {
+                agent_chooses_subagent_model: true,
+                ..ExtendedConfig::default()
+            },
+            &providers,
+            &session,
+        )
+        .unwrap();
+        assert_eq!(resolved.model_id_ref(), "MiniMax-M2");
     }
 
     #[test]

@@ -328,7 +328,7 @@ impl Model {
             system,
             history,
             prompt,
-            captured,
+            mut captured,
         } = prepared;
         let system = system.as_str();
 
@@ -423,6 +423,11 @@ impl Model {
         // *before* the v0.1.128 backup-model fallback (which runs in
         // `agent::turn_with_backup` only on the typed `InferenceFailure` this
         // method finally returns): a wrong endpoint never switches models.
+        let mut successful_wire = match self {
+            Model::ChatGpt { .. } => Some(crate::config::providers::WireApi::Responses),
+            Model::Anthropic { .. } => Some(crate::config::providers::WireApi::Completions),
+            Model::OpenAi { .. } => None,
+        };
         let out = match self {
             Model::OpenAi {
                 client,
@@ -440,6 +445,8 @@ impl Model {
                 let mut tried_swap = false;
                 loop {
                     let attempt = || async {
+                        let wire_tools = wire_schema::definitions_for_wire(endpoint, tools);
+                        let wire_tools = wire_tools.as_ref();
                         // Build the OpenAI-compat agent against the *current*
                         // endpoint: the kept `CompletionsClient` directly, or a
                         // cheap O(1) `.responses_api()` swap of a clone (only the
@@ -450,13 +457,13 @@ impl Model {
                             crate::config::providers::WireApi::Responses => {
                                 let responses = client.clone().responses_api();
                                 let agent =
-                                    build_agent(&responses, model_id, system, tools, &params);
+                                    build_agent(&responses, model_id, system, wire_tools, &params);
                                 drain_completion_stream(
                                     agent,
                                     &prompt,
                                     &history,
                                     &params,
-                                    tools,
+                                    wire_tools,
                                     agent_name,
                                     provider_id,
                                     model_id,
@@ -475,13 +482,14 @@ impl Model {
                             // `Completions` (and the defensive `Auto`, never the
                             // resolved value) use the kept completions client.
                             _ => {
-                                let agent = build_agent(client, model_id, system, tools, &params);
+                                let agent =
+                                    build_agent(client, model_id, system, wire_tools, &params);
                                 drain_completion_stream(
                                     agent,
                                     &prompt,
                                     &history,
                                     &params,
-                                    tools,
+                                    wire_tools,
                                     agent_name,
                                     provider_id,
                                     model_id,
@@ -523,6 +531,7 @@ impl Model {
                     };
                     match result {
                         Ok(value) => {
+                            successful_wire = Some(endpoint);
                             // A swap that produced a working turn pins the
                             // corrected endpoint so later turns route directly
                             // with no retry (layer-3 persist). Only after an
@@ -618,13 +627,18 @@ impl Model {
                 // into top-level `instructions`, posts `/responses`, streams,
                 // and aggregates Responses API tool/reasoning/usage chunks.
                 let attempt = || async {
-                    let agent = build_chatgpt_agent(model.clone(), system, tools, &params);
+                    let wire_tools = wire_schema::definitions_for_wire(
+                        crate::config::providers::WireApi::Responses,
+                        tools,
+                    );
+                    let wire_tools = wire_tools.as_ref();
+                    let agent = build_chatgpt_agent(model.clone(), system, wire_tools, &params);
                     drain_completion_stream(
                         agent,
                         &prompt,
                         &history,
                         &params,
-                        tools,
+                        wire_tools,
                         agent_name,
                         provider_id,
                         model_id,
@@ -694,6 +708,17 @@ impl Model {
 
         match out {
             Ok(value) => {
+                if let Some(wire) = successful_wire {
+                    let wire_tools = wire_schema::definitions_for_wire(wire, tools);
+                    captured["tools"] =
+                        serde_json::to_value(wire_tools.as_ref()).unwrap_or_else(|error| {
+                            tracing::warn!(%error, "serialize final wire tool definitions failed");
+                            serde_json::Value::Array(Vec::new())
+                        });
+                    if let Some(path) = debug_last_message_path() {
+                        write_dump(path, &captured);
+                    }
+                }
                 let ft = first_token_ms.load(std::sync::atomic::Ordering::SeqCst);
                 let timing = InferenceTiming {
                     first_token_ms: (ft > 0).then_some(ft),
@@ -816,6 +841,25 @@ impl Model {
         matches!(self, Model::Anthropic { .. })
     }
 
+    fn definitions_for_initial_wire<'a>(
+        &self,
+        tools: &'a [ToolDefinition],
+    ) -> std::borrow::Cow<'a, [ToolDefinition]> {
+        let wire = match self {
+            Model::OpenAi {
+                model_id, wire_api, ..
+            } => match wire_api {
+                crate::config::providers::WireApi::Auto => {
+                    crate::config::providers::WireApi::detect(model_id)
+                }
+                concrete => *concrete,
+            },
+            Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+        };
+        wire_schema::definitions_for_wire(wire, tools)
+    }
+
     pub(crate) fn prepare_completion_request(
         &self,
         system: &str,
@@ -862,13 +906,14 @@ impl Model {
                 Vec::new()
             };
 
+        let wire_tools = self.definitions_for_initial_wire(tools);
         let mut captured = assembled_request(
             self.model_id(),
             self.provider_label(),
             &system,
             &history,
             &prompt,
-            tools,
+            wire_tools.as_ref(),
             &params,
         );
         if !identity_records.is_empty() {
@@ -948,13 +993,14 @@ impl Model {
         } else {
             None
         };
+        let wire_tools = self.definitions_for_initial_wire(tools);
         let mut captured = assembled_request(
             self.model_id(),
             self.provider_label(),
             &system,
             &history,
             &prompt,
-            tools,
+            wire_tools.as_ref(),
             &params,
         );
         if let Some((key, value)) = identity_metadata {
@@ -1009,13 +1055,14 @@ impl Model {
         let system = system_scrubbed.as_str();
         let prompt_scrubbed = scrub_message(redact, prompt);
         let prompt = &prompt_scrubbed;
+        let wire_tools = self.definitions_for_initial_wire(tools);
         let request = assembled_request(
             self.model_id(),
             self.provider_label(),
             system,
             &stripped,
             prompt,
-            tools,
+            wire_tools.as_ref(),
             &params,
         );
 
@@ -1097,10 +1144,12 @@ impl Model {
                 // Use the resolved endpoint the main call would use first.
                 match wire_api {
                     crate::config::providers::WireApi::Responses => {
+                        let wire_tools = wire_schema::definitions_for_wire(*wire_api, tools);
+                        let wire_tools = wire_tools.as_ref();
                         let responses = client.clone().responses_api();
-                        let agent = build_agent(&responses, model_id, system, tools, params);
+                        let agent = build_agent(&responses, model_id, system, wire_tools, params);
                         let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-                        if params.tools_required && !tools.is_empty() {
+                        if params.tools_required && !wire_tools.is_empty() {
                             req = req.tool_choice(ToolChoice::Required);
                         }
                         let r = req.send().await?;
@@ -1118,9 +1167,14 @@ impl Model {
                 }
             }
             Model::ChatGpt { model, .. } => {
-                let agent = build_chatgpt_agent(model.clone(), system, tools, params);
+                let wire_tools = wire_schema::definitions_for_wire(
+                    crate::config::providers::WireApi::Responses,
+                    tools,
+                );
+                let wire_tools = wire_tools.as_ref();
+                let agent = build_chatgpt_agent(model.clone(), system, wire_tools, params);
                 let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-                if params.tools_required && !tools.is_empty() {
+                if params.tools_required && !wire_tools.is_empty() {
                     req = req.tool_choice(ToolChoice::Required);
                 }
                 let r = req.send().await?;

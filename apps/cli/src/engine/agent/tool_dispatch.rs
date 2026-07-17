@@ -60,6 +60,7 @@ pub(crate) async fn execute_ordinary_call(
         .get(resolved_name)
         .map(|t| t.parameters())
         .unwrap_or(Value::Null);
+    args = crate::engine::model::wire_schema::strip_wire_nulls(&schema, args);
     let mut repair_outcome = repair(&mut args, &schema, resolved_name);
     // §12 repair telemetry (implementation note):
     // emit the shape fingerprint + issue codes + received-key summary +
@@ -919,6 +920,7 @@ mod tests {
     use crate::engine::message::OneOrMany;
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct EchoTool;
@@ -953,6 +955,43 @@ mod tests {
                     .unwrap_or_default()
                     .to_string(),
             ))
+        }
+    }
+
+    struct NestedCaptureTool {
+        received: Arc<Mutex<Option<Value>>>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for NestedCaptureTool {
+        fn name(&self) -> &str {
+            "nested_capture"
+        }
+
+        fn description(&self) -> &str {
+            "Capture nested normalized arguments."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "outer": {
+                        "type": "object",
+                        "properties": {
+                            "required": { "type": "string" },
+                            "optional": { "type": "integer" }
+                        },
+                        "required": ["required"]
+                    }
+                },
+                "required": ["outer"]
+            })
+        }
+
+        async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            *self.received.lock().unwrap() = Some(args);
+            Ok(ToolOutput::text("captured"))
         }
     }
 
@@ -1396,6 +1435,56 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[tokio::test]
+    async fn execute_ordinary_call_strips_nested_wire_null_before_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(None));
+        let tools = ToolBox::new().with(Arc::new(NestedCaptureTool {
+            received: received.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &agent.model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "nested_capture",
+            serde_json::json!({
+                "outer": { "required": "kept", "optional": null }
+            }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "nested_capture",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            received.lock().unwrap().take().unwrap(),
+            serde_json::json!({ "outer": { "required": "kept" } })
+        );
+        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        assert_eq!(rows.len(), 1, "normalized call must reach real dispatch");
     }
 
     #[tokio::test]

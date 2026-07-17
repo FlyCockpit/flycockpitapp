@@ -778,6 +778,7 @@ async fn dispatch_one(
     let tool = tools
         .get(name)
         .with_context(|| format!("unknown tool `{name}`"))?;
+    let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
     tool.call(args, ctx).await
 }
 
@@ -790,6 +791,92 @@ async fn dispatch_one_timed(
     let start = Instant::now();
     let result = dispatch_one(tools, name, args, ctx).await;
     (result, start.elapsed().as_millis() as u64)
+}
+
+#[cfg(test)]
+mod wire_null_normalization_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct CaptureArgsTool {
+        received: Arc<Mutex<Option<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::tool::Tool for CaptureArgsTool {
+        fn name(&self) -> &str {
+            "capture_args"
+        }
+
+        fn description(&self) -> &str {
+            "Capture normalized arguments."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "selector": { "type": "string" },
+                            "min_context_tokens": { "type": "integer" }
+                        }
+                    },
+                    "cwd": { "type": "string" },
+                    "canonical_null": { "type": ["string", "null"] },
+                    "items": { "type": "array", "items": {} }
+                }
+            })
+        }
+
+        async fn call(
+            &self,
+            args: Value,
+            _ctx: &crate::engine::tool::ToolCtx,
+        ) -> Result<crate::engine::tool::ToolOutput> {
+            *self.received.lock().unwrap() = Some(args);
+            Ok(crate::engine::tool::ToolOutput::text("captured"))
+        }
+    }
+
+    #[tokio::test]
+    async fn null_args_stripped_unless_schema_permits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let received = Arc::new(Mutex::new(None));
+        let tools = ToolBox::new().with(Arc::new(CaptureArgsTool {
+            received: received.clone(),
+        }));
+
+        dispatch_one(
+            &tools,
+            "capture_args",
+            serde_json::json!({
+                "model": {
+                    "kind": "exact",
+                    "selector": "p:m",
+                    "min_context_tokens": null
+                },
+                "cwd": null,
+                "canonical_null": null,
+                "items": [null, {"nested": null}]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            received.lock().unwrap().take().unwrap(),
+            serde_json::json!({
+                "model": { "kind": "exact", "selector": "p:m" },
+                "canonical_null": null,
+                "items": [null, {"nested": null}]
+            })
+        );
+    }
 }
 
 /// Decide which canonical args (if any) should overwrite the assistant

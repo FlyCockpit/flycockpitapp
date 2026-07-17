@@ -1309,6 +1309,9 @@ impl SessionsPane {
                 self.preview_enabled = true;
                 self.list_area = Some(list);
                 self.preview_area = Some(preview);
+                if self.preview.is_none() && !self.daemon_connected {
+                    let _ = self.ensure_preview_for_selection();
+                }
 
                 let list_block = Block::default()
                     .borders(Borders::ALL)
@@ -2700,6 +2703,40 @@ mod tests {
                 before_seq: None,
             }) if got == session_id
         ));
+    }
+
+    #[test]
+    fn daemonless_split_first_render_populates_preview() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("pid", "/proj", "builder").unwrap();
+        db.insert_session_event(
+            root.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("builder"),
+            None,
+            &serde_json::json!({"text": "preview on first render"}),
+        )
+        .unwrap();
+        let mut loader = test_pane_mode(vec![], false);
+        loader.db = Some(db);
+        let cards = loader.fetch_level(Some("pid".into()), None);
+        let mut pane = test_pane_mode(cards, false);
+        pane.db = loader.db.take();
+        pane.preview = None;
+        pane.preview_enabled = false;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 120, 24)))
+            .unwrap();
+
+        let preview = pane.preview.as_ref().expect("preview populated");
+        assert_eq!(preview.session_id, root.session_id);
+        assert!(!preview.loading, "daemonless preview loads locally");
+        assert_eq!(preview.messages.len(), 1);
+        assert_eq!(preview.messages[0].text, "preview on first render");
+        assert!(pane.is_preview_enabled());
     }
 
     #[test]

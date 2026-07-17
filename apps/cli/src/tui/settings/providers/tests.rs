@@ -219,6 +219,48 @@ fn header_editor_list_masks_values_but_keeps_env_refs_visible() {
 }
 
 #[test]
+fn header_editor_list_keeps_secret_refs_visible() {
+    let editor = HeaderEditor::new(
+        vec![HeaderSpec {
+            name: "Authorization".to_string(),
+            value: "Bearer $secret:openai".to_string(),
+        }],
+        false,
+    );
+    let mut lines = Vec::new();
+    render_header_editor(&mut lines, &editor);
+    let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+    assert!(rendered.contains("Bearer $secret:openai"), "{rendered}");
+}
+
+#[test]
+fn literal_key_entry_writes_secret_ref() {
+    let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let store_path = tmp.path().join("state/cockpit/credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    dialog.config.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
+        name: "Authorization".into(),
+        value: "Bearer sk-provider-secret-abcdefghijklmnopqrstuvwxyz".into(),
+    }];
+
+    dialog.save_config().unwrap();
+
+    let saved = load_provider(&tmp.path().join("config.json"), "p");
+    assert_eq!(saved.headers[0].value, "$secret:p");
+    let provider_raw = std::fs::read_to_string(tmp.path().join("providers/p.json")).unwrap();
+    assert!(!provider_raw.contains("sk-provider-secret-abcdefghijklmnopqrstuvwxyz"));
+    let store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    assert_eq!(
+        store.named_secret("p"),
+        Some("Bearer sk-provider-secret-abcdefghijklmnopqrstuvwxyz")
+    );
+    let notice = dialog.last_secret_notice.as_deref().unwrap();
+    assert!(notice.contains(&store_path.display().to_string()));
+    assert!(!notice.contains("sk-provider-secret-abcdefghijklmnopqrstuvwxyz"));
+}
+
+#[test]
 fn header_delete_requires_second_press_on_same_row() {
     let mut editor = HeaderEditor::new(
         vec![
@@ -669,7 +711,7 @@ fn edit_delete_enter_requires_second_enter_to_confirm() {
     assert!(state.delete_pending);
     assert_eq!(
         state.status.as_deref(),
-        Some("press Enter again to confirm delete")
+        Some("press Enter again to delete + stored secrets (default); n: keep secrets")
     );
 
     dialog.handle_key(press(KeyCode::Enter));
@@ -698,7 +740,7 @@ fn edit_delete_d_requires_second_d_to_confirm() {
     assert!(state.delete_pending);
     assert_eq!(
         state.status.as_deref(),
-        Some("press d again to confirm delete")
+        Some("press d again to delete + stored secrets (default); n: keep secrets")
     );
 
     dialog.handle_key(press(KeyCode::Char('d')));
@@ -708,6 +750,104 @@ fn edit_delete_d_requires_second_d_to_confirm() {
         dialog.test_page(),
         TestPageRef::Providers(ProvidersPage::List { .. })
     ));
+}
+
+#[test]
+fn provider_delete_removes_its_unshared_stored_secret() {
+    let mut cfg = one_provider_config(None);
+    cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
+        name: "Authorization".into(),
+        value: "$secret:p".into(),
+    }];
+    let (tmp, mut dialog) = dialog_with_config(cfg);
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set_named_secret("p", "sk-provider-secret-value");
+    store.save().unwrap();
+
+    assert_eq!(
+        dialog
+            .delete_provider_and_stored_secrets("p", true)
+            .unwrap(),
+        1
+    );
+    assert!(!dialog.config.providers.contains_key("p"));
+    assert!(
+        crate::credentials::CredentialStore::open(store_path)
+            .unwrap()
+            .named_secret("p")
+            .is_none()
+    );
+}
+
+#[test]
+fn provider_delete_preserves_a_shared_stored_secret() {
+    let mut cfg = one_provider_config(None);
+    cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
+        name: "Authorization".into(),
+        value: "$secret:shared".into(),
+    }];
+    cfg.providers.insert(
+        "other".into(),
+        ProviderEntry {
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:shared".into(),
+            }],
+            ..provider_with_models(vec![])
+        },
+    );
+    let (tmp, mut dialog) = dialog_with_config(cfg);
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set_named_secret("shared", "sk-provider-secret-value");
+    store.save().unwrap();
+
+    assert_eq!(
+        dialog
+            .delete_provider_and_stored_secrets("p", true)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        crate::credentials::CredentialStore::open(store_path)
+            .unwrap()
+            .named_secret("shared"),
+        Some("sk-provider-secret-value")
+    );
+}
+
+#[test]
+fn provider_delete_offer_can_keep_an_unshared_stored_secret() {
+    let mut cfg = one_provider_config(None);
+    cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
+        name: "Authorization".into(),
+        value: "$secret:p".into(),
+    }];
+    let (tmp, mut dialog) = dialog_with_config(cfg);
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set_named_secret("p", "sk-provider-secret-value");
+    store.save().unwrap();
+    let entry = dialog.config.providers["p"].clone();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+        "p".into(),
+        entry,
+    ))));
+
+    dialog.handle_key(press(KeyCode::Char('d')));
+    dialog.handle_key(press(KeyCode::Char('n')));
+
+    assert!(!dialog.config.providers.contains_key("p"));
+    assert_eq!(
+        crate::credentials::CredentialStore::open(store_path)
+            .unwrap()
+            .named_secret("p"),
+        Some("sk-provider-secret-value")
+    );
 }
 
 #[test]

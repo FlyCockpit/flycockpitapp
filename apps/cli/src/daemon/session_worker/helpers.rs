@@ -166,11 +166,10 @@ fn resolve_effective_llm_mode(
     project_root: &std::path::Path,
     global: crate::config::extended::LlmMode,
 ) -> crate::config::extended::LlmMode {
-    use crate::config::providers::ConfigDoc;
     let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
         return global;
     };
-    ConfigDoc::load_effective(project_root).resolve_mode(&provider, &model, global)
+    crate::secret_ref::load_effective(project_root).resolve_mode(&provider, &model, global)
 }
 
 /// Persist a live `/llm-mode` switch to the layered config so a resume
@@ -258,4 +257,3 @@ fn loop_guard_threshold_for(project_root: &std::path::Path) -> u32 {
 fn max_primary_rounds_for(project_root: &std::path::Path) -> u32 {
     crate::config::extended::load_for_cwd(project_root).max_primary_rounds
 }
-

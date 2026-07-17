@@ -49,7 +49,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     }
 
     let redact = Arc::new(
-        crate::redact::RedactionTable::build_with_env(&extended.redact, &cwd, env.vars())
+        crate::redact::RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env.vars())
             .context("building redaction table")?,
     );
     let model = Arc::new(

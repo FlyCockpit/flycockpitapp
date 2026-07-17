@@ -198,7 +198,7 @@ fn active_wire_api_for_session(
 ) -> (String, String, crate::config::providers::WireApi) {
     let provider = session.active_provider().unwrap_or_default();
     let model = session.active_model().unwrap_or_default();
-    let providers = crate::config::providers::ConfigDoc::load_effective(project_root);
+    let providers = crate::secret_ref::load_effective(project_root);
     let configured = providers.resolve_wire_api(&provider, &model);
     let resolved = if configured.is_auto() {
         crate::config::providers::WireApi::detect_for_provider(&provider, &model)

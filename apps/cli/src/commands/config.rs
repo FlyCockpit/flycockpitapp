@@ -82,7 +82,7 @@ async fn import_policy(args: ConfigImportPolicyArgs) -> Result<()> {
 }
 
 fn build_policy_bundle(cwd: &Path) -> PolicyBundle {
-    let mut providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+    let mut providers = crate::secret_ref::load_effective(cwd);
     providers.active_model = None;
     sanitize_providers_for_portability(&mut providers);
     let extended = ExtendedConfigDoc::load(

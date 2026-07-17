@@ -299,10 +299,8 @@ fn accumulated_user_content(session: &Session, content_prefix: &str) -> String {
 /// calls this from inside the spawned auto-title task so config IO doesn't
 /// block the inference loop.
 pub fn load_configs_for(cwd: &Path) -> (ExtendedConfig, ProvidersConfig) {
-    use crate::config::providers::ConfigDoc;
-
     let extended = crate::config::extended::load_for_cwd(cwd);
-    let providers = ConfigDoc::load_effective(cwd);
+    let providers = crate::secret_ref::load_effective(cwd);
     (extended, providers)
 }
 

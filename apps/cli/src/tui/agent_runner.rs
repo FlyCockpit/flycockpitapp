@@ -831,7 +831,7 @@ fn local_guidance_estimate(
     let model_instruction_tokens = provider
         .zip(model)
         .and_then(|(provider, model)| {
-            let cfg = crate::config::providers::ConfigDoc::load_effective(cwd);
+            let cfg = crate::secret_ref::load_effective(cwd);
             cfg.resolve_model_system_prompt(provider, model)
                 .map(|prompt| crate::tokens::count(prompt) as u64)
         })

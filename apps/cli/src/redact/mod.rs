@@ -361,16 +361,47 @@ impl RedactionTable {
                 )
             })
             .collect();
-        Self::build_with_env(cfg, cwd, &env)
+        Self::build_with_env_and_store(cfg, cwd, &env)
     }
 
     /// Build a table from the provided session env + the env files matched
     /// under `cwd`. Daemon sessions use this so redaction tracks the immutable
     /// session snapshot instead of the daemon process environment.
+    #[allow(dead_code)]
     pub fn build_with_env(
         cfg: &RedactConfig,
         cwd: &Path,
         env: &HashMap<String, String>,
+    ) -> Result<Self> {
+        Self::build_with_env_and_secrets(cfg, cwd, env, std::iter::empty())
+    }
+
+    /// Production session-env builder. Named secrets are loaded here so the
+    /// injected [`Self::build_with_env`] seam remains hermetic for tests.
+    pub(crate) fn build_with_env_and_store(
+        cfg: &RedactConfig,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let stored_secrets = crate::credentials::CredentialStore::open_default()
+            .map(|store| {
+                store
+                    .named_secret_entries()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Self::build_with_env_and_secrets(cfg, cwd, env, stored_secrets)
+    }
+
+    /// Hermetic table builder with an injected named-secret source. Production
+    /// callers use [`Self::build_with_env`], which reads the credential store;
+    /// tests use this seam without touching a developer's credentials.
+    pub fn build_with_env_and_secrets(
+        cfg: &RedactConfig,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        stored_secrets: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self> {
         if !cfg.enabled {
             return Ok(Self {
@@ -432,6 +463,10 @@ impl RedactionTable {
                 "$credentials:flycockpit.instance_token".to_string(),
                 true,
             ));
+        }
+
+        for (name, value) in stored_secrets {
+            candidates.push(Candidate::forced(value, format!("$secret:{name}"), true));
         }
 
         // (3) Prune: drop candidates that aren't plausibly secrets. The

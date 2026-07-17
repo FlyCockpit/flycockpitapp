@@ -67,7 +67,7 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
 
 fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let trust_root = crate::config::trust::resolve_trust_root(&input.cwd)?;
-    let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
+    let providers = crate::secret_ref::load_effective(&input.cwd);
     let extended = crate::config::extended::load_for_cwd(&input.cwd);
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
     let trust_mode = workspace_trust_mode(&input.cwd);

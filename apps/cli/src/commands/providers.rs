@@ -22,7 +22,7 @@ pub async fn run(cmd: ProvidersCommand) -> Result<()> {
 
 async fn usage(args: ProvidersUsageArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let cfg = crate::config::providers::ConfigDoc::load_effective(&cwd);
+    let cfg = crate::secret_ref::load_effective(&cwd);
     let rows =
         crate::providers::usage::probes::fetch_all_provider_usage(&cfg, args.provider.as_deref())
             .await?;

@@ -26,7 +26,7 @@ use crate::providers::models_fetch::{self, FetchOutcome};
 
 pub async fn run(args: FetchModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let mut cfg = ConfigDoc::load_effective(&cwd);
+    let mut cfg = crate::secret_ref::load_effective(&cwd);
     let provider_filter = match (args.provider_arg.as_ref(), args.provider.as_ref()) {
         (Some(_), Some(_)) => {
             anyhow::bail!("pass provider id once, either positionally or with --provider")

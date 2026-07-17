@@ -1394,7 +1394,7 @@ async fn run_worker(
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                match crate::redact::RedactionTable::build_with_env(
+                match crate::redact::RedactionTable::build_with_env_and_store(
                     &effective_redact,
                     &project_root,
                     &session_env,

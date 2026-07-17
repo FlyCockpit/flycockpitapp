@@ -35,6 +35,7 @@ mod private_fs;
 mod process;
 mod providers;
 mod redact;
+mod secret_ref;
 mod session;
 mod skills;
 mod startup;

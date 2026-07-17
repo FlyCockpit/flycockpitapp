@@ -4814,7 +4814,7 @@ impl App {
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                let cfg = crate::config::providers::ConfigDoc::load_effective(&cwd);
+                let cfg = crate::secret_ref::load_effective(&cwd);
                 crate::providers::usage::probes::fetch_all_provider_usage(&cfg, filter.as_deref())
                     .await
                     .map(AsyncActionPayload::ProviderUsage)
@@ -5787,7 +5787,7 @@ impl App {
         let Some((provider, model)) = self.launch.active_model.as_ref() else {
             return true;
         };
-        let providers = crate::config::providers::ConfigDoc::load_effective(&self.launch.cwd);
+        let providers = crate::secret_ref::load_effective(&self.launch.cwd);
         let cache = providers.resolve_cache(provider, model);
         cache_config_caches(&cache)
     }
@@ -7035,12 +7035,11 @@ impl App {
     /// interrupt) like the bare `/toggle-redaction` picker; the close handler
     /// matches the synthetic id and routes the selection to the daemon.
     fn open_model_comparison_dialog(&mut self) {
-        use crate::config::providers::ConfigDoc;
         use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 
         // Load configured `(provider, model)` pairs from the effective
         // `config.json` layers; tandem models must have working url/credentials.
-        let cfg = ConfigDoc::load_effective(&self.launch.cwd);
+        let cfg = crate::secret_ref::load_effective(&self.launch.cwd);
         if cfg.providers.is_empty() {
             self.push_plain(
                 "/model-comparison: no cockpit config found — run `/settings` to add a provider"
@@ -8032,7 +8031,7 @@ impl App {
     pub(super) fn spawn_fetch_models(&mut self) {
         use crate::commands::fetch_models::persist_provider;
         use crate::config::providers::{
-            ConfigDoc, ModelMergePolicy, OnUnlistedModelsFetch, merge_fetched_models_with_policy,
+            ModelMergePolicy, OnUnlistedModelsFetch, merge_fetched_models_with_policy,
             redact_model_fetch_reason,
         };
         use crate::providers::models_fetch::{self, FetchOutcome};
@@ -8049,7 +8048,7 @@ impl App {
                 }
             };
 
-            let mut cfg = ConfigDoc::load_effective(&cwd);
+            let mut cfg = crate::secret_ref::load_effective(&cwd);
             let policy = cfg
                 .on_unlisted_models_fetch
                 .unwrap_or(OnUnlistedModelsFetch::Keep);

@@ -466,7 +466,7 @@ fn normalize_harness_selector(raw: &str, cwd: &std::path::Path) -> Result<String
         return Err(invalid_input("external harness selector is required"));
     }
 
-    let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+    let providers = crate::secret_ref::load_effective(cwd);
     if let Some(provider_id) = trimmed.strip_prefix("provider:") {
         let provider_id = provider_id.trim();
         if providers.providers.contains_key(provider_id) {
@@ -492,7 +492,7 @@ fn normalize_harness_selector(raw: &str, cwd: &std::path::Path) -> Result<String
 }
 
 fn provider_ref_in_harness_model(model: &str, cwd: &std::path::Path) -> Option<String> {
-    let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+    let providers = crate::secret_ref::load_effective(cwd);
     if providers.providers.contains_key(model) {
         return Some(model.to_string());
     }

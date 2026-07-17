@@ -79,10 +79,20 @@ impl fmt::Debug for ResolvedRequest {
     }
 }
 
-/// Apply `$VAR` resolution to every header, collecting any missing-env
-/// references into one list. Caller decides whether to abort or warn.
+/// Resolve environment and named-secret references in every header, collecting
+/// missing references into one list. Caller decides whether to abort or warn.
 pub fn resolve_headers(headers: &[HeaderSpec]) -> (Vec<ResolvedHeader>, Vec<String>) {
-    resolve_headers_with_env(headers, |name| std::env::var(name).ok())
+    let store = crate::credentials::CredentialStore::open_default().ok();
+    resolve_headers_with_sources(
+        headers,
+        |name| std::env::var(name).ok(),
+        |name| {
+            store
+                .as_ref()
+                .and_then(|store| store.named_secret(name))
+                .map(str::to_string)
+        },
+    )
 }
 
 pub fn resolve_headers_with_env<F>(
@@ -92,10 +102,22 @@ pub fn resolve_headers_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    resolve_headers_with_sources(headers, lookup, |_| None)
+}
+
+pub fn resolve_headers_with_sources<F, S>(
+    headers: &[HeaderSpec],
+    env_lookup: F,
+    secret_lookup: S,
+) -> (Vec<ResolvedHeader>, Vec<String>)
+where
+    F: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
+{
     let mut out = Vec::with_capacity(headers.len());
     let mut missing: Vec<String> = Vec::new();
     for h in headers {
-        let r = envref::resolve_with(&h.value, &lookup);
+        let r = envref::resolve_with_sources(&h.value, &env_lookup, &secret_lookup);
         push_missing(&mut missing, &r.missing);
         push_missing(&mut missing, &r.errors);
         out.push(ResolvedHeader {
@@ -130,12 +152,32 @@ pub fn resolve_provider_request_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    resolve_provider_request_with_sources(provider_id, entry, lookup, |_| None)
+}
+
+pub fn resolve_provider_request_with_sources<F, S>(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    env_lookup: F,
+    secret_lookup: S,
+) -> Result<ResolvedRequest>
+where
+    F: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
+{
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     if let Some(message) = provider.sync_auth_error() {
         anyhow::bail!(message);
     }
-    provider.request(provider_id, entry, None, &lookup)
+    resolve_provider_request_inner_with_sources(
+        provider_id,
+        entry,
+        None,
+        provider.request_kind(),
+        &env_lookup,
+        &secret_lookup,
+    )
 }
 
 pub async fn resolve_provider_request_async(
@@ -228,6 +270,30 @@ pub(crate) fn resolve_provider_request_inner(
     request_kind: ProviderRequestKind,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    let secret_store = crate::credentials::CredentialStore::open_default().ok();
+    resolve_provider_request_inner_with_sources(
+        provider_id,
+        entry,
+        oauth_credential,
+        request_kind,
+        lookup,
+        &|name| {
+            secret_store
+                .as_ref()
+                .and_then(|store| store.named_secret(name))
+                .map(str::to_string)
+        },
+    )
+}
+
+fn resolve_provider_request_inner_with_sources(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    oauth_credential: Option<OAuthCredential>,
+    request_kind: ProviderRequestKind,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    secret_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<ResolvedRequest> {
     let is_copilot = request_kind == ProviderRequestKind::Copilot;
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(entry.headers.len() + 1);
     let mut missing_other: Vec<String> = Vec::new();
@@ -237,7 +303,7 @@ pub(crate) fn resolve_provider_request_inner(
     let mut auth_errors: Vec<String> = Vec::new();
 
     for h in &entry.headers {
-        let resolved = envref::resolve_with(&h.value, lookup);
+        let resolved = envref::resolve_with_sources(&h.value, env_lookup, secret_lookup);
         if h.name.eq_ignore_ascii_case("authorization") {
             if resolved.has_errors() {
                 push_missing(&mut auth_errors, &resolved.errors);
@@ -265,19 +331,19 @@ pub(crate) fn resolve_provider_request_inner(
 
     if !missing_other.is_empty() {
         anyhow::bail!(
-            "provider `{provider_id}` references unset env var(s): {}",
+            "provider `{provider_id}` references missing environment variable(s) or named secret(s): {}",
             missing_other.join(", ")
         );
     }
     if !errors_other.is_empty() {
         anyhow::bail!(
-            "provider `{provider_id}` has invalid env reference(s): {}",
+            "provider `{provider_id}` has invalid environment or named-secret reference(s): {}",
             errors_other.join(", ")
         );
     }
     if !auth_errors.is_empty() {
         anyhow::bail!(
-            "Authorization for provider `{provider_id}` has invalid env reference(s): {}",
+            "Authorization for provider `{provider_id}` has invalid environment or named-secret reference(s): {}",
             auth_errors.join(", ")
         );
     }
@@ -314,7 +380,7 @@ pub(crate) fn resolve_provider_request_inner(
     } else if let Some(auth) = auth_header {
         headers.push(auth);
     } else if is_copilot {
-        match resolve_copilot_token_with_env(lookup)? {
+        match resolve_copilot_token_with_env(env_lookup)? {
             Some(token) => headers.push(ResolvedHeader {
                 name: "Authorization".to_string(),
                 value: format!("Bearer {token}"),
@@ -338,7 +404,7 @@ pub(crate) fn resolve_provider_request_inner(
         }
     } else if !auth_missing.is_empty() {
         anyhow::bail!(
-            "Authorization for provider `{provider_id}` references unset env var(s): {}",
+            "Authorization for provider `{provider_id}` references missing environment variable(s) or named secret(s): {}",
             auth_missing.join(", ")
         );
     }
@@ -348,7 +414,7 @@ pub(crate) fn resolve_provider_request_inner(
     // 401 from `fetch_models`.
 
     Ok(ResolvedRequest {
-        base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, lookup)?,
+        base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, env_lookup)?,
         headers,
     })
 }
@@ -1663,6 +1729,46 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], "NONEXISTENT_VAR_123");
+    }
+
+    #[test]
+    fn resolve_headers_expands_injected_secret_refs() {
+        let headers = vec![HeaderSpec {
+            name: "Authorization".into(),
+            value: "Bearer $secret:openai".into(),
+        }];
+        let (resolved, missing) = resolve_headers_with_sources(
+            &headers,
+            |_| None,
+            |name| (name == "openai").then(|| "sk-request-secret".to_string()),
+        );
+
+        assert!(missing.is_empty());
+        assert_eq!(resolved[0].value, "Bearer sk-request-secret");
+    }
+
+    #[test]
+    fn resolved_request_expands_injected_secret_refs() {
+        let entry = ProviderEntry {
+            url: "https://api.example.test/v1".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer $secret:openai".into(),
+            }],
+            ..Default::default()
+        };
+        let request = resolve_provider_request_with_sources(
+            "custom",
+            &entry,
+            |_| None,
+            |name| (name == "openai").then(|| "sk-request-secret".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            header_pairs(&request),
+            vec![("Authorization", "Bearer sk-request-secret")]
+        );
     }
 
     fn header_pairs(request: &ResolvedRequest) -> Vec<(&str, &str)> {

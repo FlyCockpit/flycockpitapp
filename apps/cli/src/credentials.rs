@@ -6,15 +6,18 @@
 //! data the program can regenerate (re-login, refresh). `~/.local/share`
 //! is for application data files the program does not regenerate.
 //!
-//! On Unix the file is created with mode `0600`. The file is opaque
-//! JSON: `{ "<provider-id>": { ... }, ... }`. The shape of each entry
-//! is per-provider — `api_key` for static keys, an OAuth bundle for
-//! device-flow providers — so we store them as untyped `serde_json::Value`.
+//! On Unix the file is created with mode `0600`. Provider records retain their
+//! historical top-level shape; named secrets live under the reserved
+//! `$secrets` object. Every mutation is a locked read-modify-write transaction
+//! followed by an atomic replace, so independently opened stores cannot erase
+//! one another's OAuth, account, API-key, or named-secret updates.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Default credentials path: `~/.local/state/cockpit/credentials.json`.
@@ -32,25 +35,46 @@ pub fn default_path() -> Option<PathBuf> {
 pub struct CredentialStore {
     path: PathBuf,
     records: BTreeMap<String, Value>,
+    secrets: BTreeMap<String, String>,
+    record_mutations: Vec<RecordMutation>,
+    secret_mutations: Vec<SecretMutation>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CredentialFile {
+    #[serde(
+        default,
+        rename = "$secrets",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    secrets: BTreeMap<String, String>,
+    #[serde(flatten)]
+    records: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+enum RecordMutation {
+    Set(String, Value),
+    Remove(String),
+}
+
+#[derive(Debug, Clone)]
+enum SecretMutation {
+    Set(String, String),
+    Remove(String),
 }
 
 impl CredentialStore {
     pub fn open(path: PathBuf) -> Result<Self> {
         ensure_parent_dir_private(&path)?;
-        let records = if path.exists() {
-            repair_existing_file_permissions(&path)?;
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            if raw.trim().is_empty() {
-                BTreeMap::new()
-            } else {
-                serde_json::from_str::<BTreeMap<String, Value>>(&raw)
-                    .with_context(|| format!("parsing {}", path.display()))?
-            }
-        } else {
-            BTreeMap::new()
-        };
-        Ok(Self { path, records })
+        let data = read_credential_file(&path)?;
+        Ok(Self {
+            path,
+            records: data.records,
+            secrets: data.secrets,
+            record_mutations: Vec::new(),
+            secret_mutations: Vec::new(),
+        })
     }
 
     pub fn open_default() -> Result<Self> {
@@ -72,7 +96,10 @@ impl CredentialStore {
     }
 
     pub fn set(&mut self, provider_id: impl Into<String>, value: Value) {
-        self.records.insert(provider_id.into(), value);
+        let provider_id = provider_id.into();
+        self.records.insert(provider_id.clone(), value.clone());
+        self.record_mutations
+            .push(RecordMutation::Set(provider_id, value));
     }
 
     pub fn set_api_key(&mut self, provider_id: impl Into<String>, key: impl Into<String>) {
@@ -81,12 +108,66 @@ impl CredentialStore {
 
     pub fn remove(&mut self, provider_id: &str) {
         self.records.remove(provider_id);
+        self.record_mutations
+            .push(RecordMutation::Remove(provider_id.to_string()));
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub fn named_secret(&self, name: &str) -> Option<&str> {
+        self.secrets.get(name).map(String::as_str)
+    }
+
+    pub fn set_named_secret(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let name = name.into();
+        let value = value.into();
+        self.secrets.insert(name.clone(), value.clone());
+        self.secret_mutations.push(SecretMutation::Set(name, value));
+    }
+
+    pub fn remove_named_secret(&mut self, name: &str) {
+        self.secrets.remove(name);
+        self.secret_mutations
+            .push(SecretMutation::Remove(name.to_string()));
+    }
+
+    pub fn list_named_secrets(&self) -> Vec<String> {
+        self.secrets.keys().cloned().collect()
+    }
+
+    pub(crate) fn named_secret_entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.secrets
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    pub fn save(&mut self) -> Result<()> {
         ensure_parent_dir_private(&self.path)?;
-        let pretty = serde_json::to_string_pretty(&self.records)?;
-        write_with_0600(&self.path, pretty.as_bytes())?;
+        let _lock = lock_credential_file(&self.path)?;
+        let mut latest = read_credential_file(&self.path)?;
+        for mutation in &self.record_mutations {
+            match mutation {
+                RecordMutation::Set(id, value) => {
+                    latest.records.insert(id.clone(), value.clone());
+                }
+                RecordMutation::Remove(id) => {
+                    latest.records.remove(id);
+                }
+            }
+        }
+        for mutation in &self.secret_mutations {
+            match mutation {
+                SecretMutation::Set(name, value) => {
+                    latest.secrets.insert(name.clone(), value.clone());
+                }
+                SecretMutation::Remove(name) => {
+                    latest.secrets.remove(name);
+                }
+            }
+        }
+        write_credential_file_atomic(&self.path, &latest)?;
+        self.records = latest.records;
+        self.secrets = latest.secrets;
+        self.record_mutations.clear();
+        self.secret_mutations.clear();
         Ok(())
     }
 
@@ -105,6 +186,91 @@ impl CredentialStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn read_credential_file(path: &Path) -> Result<CredentialFile> {
+    if !path.exists() {
+        return Ok(CredentialFile::default());
+    }
+    repair_existing_file_permissions(path)?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(CredentialFile::default());
+    }
+    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn lock_credential_file(path: &Path) -> Result<std::fs::File> {
+    let lock_path = lock_path(path);
+    ensure_parent_dir_private(&lock_path)?;
+    let file = open_private_lock_file(&lock_path)?;
+    file.lock()
+        .with_context(|| format!("locking credential store {}", path.display()))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("opening credential lock {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening credential lock {}", path.display()))
+}
+
+fn write_credential_file_atomic(path: &Path, data: &CredentialFile) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let pretty = serde_json::to_string_pretty(data)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating credential temp file in {}", parent.display()))?;
+    set_temp_file_private(temp.as_file(), temp.path())?;
+    temp.write_all(pretty.as_bytes())?;
+    temp.as_file_mut().write_all(b"\n")?;
+    temp.as_file_mut().flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically replacing {}", path.display()))?;
+    repair_existing_file_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_temp_file_private(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_temp_file_private(_file: &std::fs::File, _path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -129,17 +295,6 @@ fn repair_existing_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn write_with_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::private_fs::write_private_file(path, bytes)
-}
-
-#[cfg(not(unix))]
-fn write_with_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +314,73 @@ mod tests {
 
         let store2 = CredentialStore::open(path).unwrap();
         assert_eq!(store2.api_key("opencode-zen").as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn named_secrets_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("credentials.json");
+        let mut store = CredentialStore::open(path.clone()).unwrap();
+        store.set_named_secret("openai", "sk-first");
+        store.set_named_secret("anthropic.prod", "sk-second");
+        store.save().unwrap();
+
+        let mut reopened = CredentialStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.named_secret("openai"), Some("sk-first"));
+        assert_eq!(
+            reopened.list_named_secrets(),
+            vec!["anthropic.prod".to_string(), "openai".to_string()]
+        );
+        reopened.remove_named_secret("openai");
+        reopened.save().unwrap();
+
+        let saved = CredentialStore::open(path).unwrap();
+        assert_eq!(saved.named_secret("openai"), None);
+        assert_eq!(saved.named_secret("anthropic.prod"), Some("sk-second"));
+    }
+
+    #[test]
+    fn named_secret_overwrite_replaces() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("credentials.json");
+        let mut store = CredentialStore::open(path.clone()).unwrap();
+        store.set_named_secret("openai", "old-value");
+        store.save().unwrap();
+        store.set_named_secret("openai", "new-value");
+        store.save().unwrap();
+
+        let saved = CredentialStore::open(path).unwrap();
+        assert_eq!(saved.named_secret("openai"), Some("new-value"));
+        assert_eq!(saved.list_named_secrets(), vec!["openai".to_string()]);
+    }
+
+    #[test]
+    fn credential_store_concurrent_writes_preserve_records() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("credentials.json");
+        let first = CredentialStore::open(path.clone()).unwrap();
+        let second = CredentialStore::open(path.clone()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let first_barrier = barrier.clone();
+        let first_thread = std::thread::spawn(move || {
+            let mut first = first;
+            first.set_api_key("oauth-one", "first-value");
+            first_barrier.wait();
+            first.save().unwrap();
+        });
+        let second_thread = std::thread::spawn(move || {
+            let mut second = second;
+            second.set_named_secret("provider-two", "second-value");
+            barrier.wait();
+            second.save().unwrap();
+        });
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+
+        let saved = CredentialStore::open(path).unwrap();
+        assert_eq!(saved.api_key("oauth-one").as_deref(), Some("first-value"));
+        assert_eq!(saved.named_secret("provider-two"), Some("second-value"));
     }
 
     #[test]

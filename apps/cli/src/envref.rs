@@ -1,15 +1,15 @@
-//! Environment-variable references inside config strings.
+//! Environment-variable and credential-store references inside config strings.
 //!
 //! The reference syntax is `$NAME` or `${NAME}`, matching at:
 //!   - the very start of the string, or
 //!   - immediately after an ASCII whitespace byte.
 //!
-//! `NAME` is `[A-Za-z_][A-Za-z0-9_]*`. Anything else (`$$`, `Bearer$X`) is
-//! left verbatim. The conservative rule lets users write `Bearer $TOKEN`
-//! and `$TOKEN` but not surprise themselves with a `$` that appears in
-//! the middle of a literal. A leading `~` also expands to the user's home
-//! directory so every envref-powered config surface shares the same basic
-//! path conveniences.
+//! `NAME` is `[A-Za-z_][A-Za-z0-9_]*`. Named secrets use
+//! `$secret:<name>`, where `<name>` is `[A-Za-z0-9_.-]+`. Anything else
+//! (`$$`, `Bearer$X`) is left verbatim. The conservative rule lets users write
+//! `Bearer $TOKEN`, `Bearer $secret:openai`, and refs at string start without
+//! surprising expansion in the middle of a literal. A leading `~` also
+//! expands to the user's home directory.
 //!
 //! [`resolve`] returns the expanded string plus the names of any
 //! references whose env var is unset; the TUI uses that list to render a
@@ -20,12 +20,11 @@ use std::env;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Resolved {
     pub value: String,
-    /// References whose `$NAME` wasn't found in the environment, in the
-    /// order they appear. Each name is reported once even if referenced
-    /// multiple times.
+    /// References that were not found, in encounter order. Environment refs
+    /// use `NAME`; named secrets use `secret:name`.
     pub missing: Vec<String>,
-    /// All env references that the resolver recognized, regardless of
-    /// whether they were present. Useful for "this string is dynamic".
+    /// All references that the resolver recognized, regardless of whether
+    /// they were present. Useful for "this string is dynamic".
     pub referenced: Vec<String>,
     /// Syntax errors in env references. Callers that send requests with
     /// resolved values should fail rather than forwarding literals.
@@ -42,11 +41,20 @@ impl Resolved {
     }
 }
 
-/// Expand `$VAR` and `${VAR}` references using `std::env::var`.
+/// Expand environment references from the process and named-secret references
+/// from the private credential store. An unreadable/missing store behaves like
+/// an absent secret and never makes request construction crash.
 pub fn resolve(input: &str) -> Resolved {
-    resolve_with_home(
+    let store = crate::credentials::CredentialStore::open_default().ok();
+    resolve_with_sources_and_home(
         input,
         |k| env::var(k).ok(),
+        |name| {
+            store
+                .as_ref()
+                .and_then(|store| store.named_secret(name))
+                .map(str::to_string)
+        },
         env::var("HOME").ok().as_deref(),
     )
 }
@@ -57,12 +65,37 @@ pub fn resolve_with<F>(input: &str, lookup: F) -> Resolved
 where
     F: Fn(&str) -> Option<String>,
 {
-    resolve_with_home(input, lookup, env::var("HOME").ok().as_deref())
+    resolve_with_sources_and_home(input, lookup, |_| None, env::var("HOME").ok().as_deref())
 }
 
-fn resolve_with_home<F>(input: &str, lookup: F, home: Option<&str>) -> Resolved
+/// Resolver seam for hermetic callers and tests that inject both sources.
+pub fn resolve_with_sources<F, S>(input: &str, env_lookup: F, secret_lookup: S) -> Resolved
 where
     F: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
+{
+    resolve_with_sources_and_home(
+        input,
+        env_lookup,
+        secret_lookup,
+        env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Return every recognized reference without consulting process state.
+pub fn referenced_names(input: &str) -> Vec<String> {
+    resolve_with_sources_and_home(input, |_| None, |_| None, None).referenced
+}
+
+fn resolve_with_sources_and_home<F, S>(
+    input: &str,
+    env_lookup: F,
+    secret_lookup: S,
+    home: Option<&str>,
+) -> Resolved
+where
+    F: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
 {
     let expanded_input = expand_leading_tilde(input, home);
     let input = expanded_input.as_str();
@@ -76,11 +109,31 @@ where
         let at_dollar = bytes[i] == b'$';
         let prev_ok = i == 0 || is_ascii_whitespace(bytes[i - 1]);
         if at_dollar && prev_ok {
-            if bytes.get(i + 1) == Some(&b'{') {
+            if input[i..].starts_with("$secret:") {
+                match take_secret_name(&bytes[i + "$secret:".len()..]) {
+                    Some((name, rest)) => {
+                        let reference = format!("secret:{name}");
+                        push_ref(&mut referenced, &reference);
+                        match secret_lookup(name) {
+                            Some(value) => out.push_str(&value),
+                            None => {
+                                out.push_str("$secret:");
+                                out.push_str(name);
+                                push_ref(&mut missing, &reference);
+                            }
+                        }
+                        i = bytes.len() - rest.len();
+                        continue;
+                    }
+                    None => errors.push(format!(
+                        "invalid named secret reference at byte {i}; expected $secret:<name>"
+                    )),
+                }
+            } else if bytes.get(i + 1) == Some(&b'{') {
                 match take_braced_var_name(&bytes[i + 2..], i) {
                     Ok(Some((name, consumed))) => {
                         push_ref(&mut referenced, name);
-                        match lookup(name) {
+                        match env_lookup(name) {
                             Some(val) => out.push_str(&val),
                             None => {
                                 out.push_str(&input[i..i + consumed]);
@@ -95,7 +148,7 @@ where
                 }
             } else if let Some((name, rest)) = take_var_name(&bytes[i + 1..]) {
                 push_ref(&mut referenced, name);
-                match lookup(name) {
+                match env_lookup(name) {
                     Some(val) => out.push_str(&val),
                     None => {
                         // Missing: keep the literal `$NAME` so a later
@@ -121,6 +174,18 @@ where
         referenced,
         errors,
     }
+}
+
+fn take_secret_name(rest: &[u8]) -> Option<(&str, &[u8])> {
+    let end = rest
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-')))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    let name = std::str::from_utf8(&rest[..end]).ok()?;
+    Some((name, &rest[end..]))
 }
 
 fn expand_leading_tilde(input: &str, home: Option<&str>) -> String {
@@ -242,8 +307,39 @@ mod tests {
 
     #[test]
     fn expands_leading_tilde_with_test_home() {
-        let r = resolve_with_home("~/agents", fake(&[]), Some("/home/tester"));
+        let r =
+            resolve_with_sources_and_home("~/agents", fake(&[]), fake(&[]), Some("/home/tester"));
         assert_eq!(r.value, "/home/tester/agents");
+    }
+
+    #[test]
+    fn expands_secret_ref() {
+        let r = resolve_with_sources(
+            "$secret:openai.prod",
+            fake(&[]),
+            fake(&[("openai.prod", "sk-private-value")]),
+        );
+        assert_eq!(r.value, "sk-private-value");
+        assert_eq!(r.referenced, vec!["secret:openai.prod"]);
+        assert!(r.missing.is_empty());
+    }
+
+    #[test]
+    fn mixed_bearer_secret_ref() {
+        let r = resolve_with_sources(
+            "Bearer $secret:openai",
+            fake(&[]),
+            fake(&[("openai", "sk-private-value")]),
+        );
+        assert_eq!(r.value, "Bearer sk-private-value");
+    }
+
+    #[test]
+    fn missing_secret_keeps_literal() {
+        let r = resolve_with_sources("$secret:missing", fake(&[]), fake(&[]));
+        assert_eq!(r.value, "$secret:missing");
+        assert_eq!(r.missing, vec!["secret:missing"]);
+        assert_eq!(r.referenced, vec!["secret:missing"]);
     }
 
     #[test]

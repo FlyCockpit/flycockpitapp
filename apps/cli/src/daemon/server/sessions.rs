@@ -542,7 +542,7 @@ mod sessions_activity_tests {
 /// `tui::agent_runner::load_providers` / `load_extended` so the in-process and
 /// daemon-mediated paths see identical config behavior.
 fn load_configs(cwd: &Path) -> Result<(ProvidersConfig, ExtendedConfig)> {
-    let providers = ConfigDoc::load_effective(cwd);
+    let providers = crate::secret_ref::load_effective(cwd);
     let extended = crate::config::extended::load_for_cwd(cwd);
     Ok((providers, extended))
 }

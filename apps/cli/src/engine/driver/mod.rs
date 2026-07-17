@@ -1325,7 +1325,7 @@ impl Driver {
             if let Some(v) = scan_ssh_keys_override {
                 cfg.scan_ssh_keys = v;
             }
-            RedactionTable::build_with_env(&cfg, &cwd, &session_env)
+            RedactionTable::build_with_env_and_store(&cfg, &cwd, &session_env)
         })
         .await
         {
@@ -3414,8 +3414,7 @@ impl Driver {
         if let Some((providers, _, _)) = &self.test_providers_override {
             return Ok(providers.clone());
         }
-        use crate::config::providers::ConfigDoc;
-        Ok(ConfigDoc::load_effective(&self.cwd))
+        Ok(crate::secret_ref::load_effective(&self.cwd))
     }
 
     /// Re-load a foreground frame under `new_model` (live model switch),
@@ -3784,10 +3783,9 @@ impl Driver {
         if let Some(o) = &self.test_providers_override {
             return Some(o.clone());
         }
-        use crate::config::providers::ConfigDoc;
         let provider = self.session.active_provider()?;
         let model = self.session.active_model()?;
-        let providers = ConfigDoc::load_effective(&self.cwd);
+        let providers = crate::secret_ref::load_effective(&self.cwd);
         Some((providers, provider, model))
     }
 
@@ -6386,8 +6384,7 @@ pub(crate) fn resolve_backup_model_for(
     cwd: &std::path::Path,
     model: &crate::engine::model::Model,
 ) -> Option<Arc<crate::engine::model::Model>> {
-    use crate::config::providers::ConfigDoc;
-    let providers = ConfigDoc::load_effective(cwd);
+    let providers = crate::secret_ref::load_effective(cwd);
     build_backup_model(&providers, model)
 }
 

@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
-use crate::config::providers::{ConfigDoc, ProvidersConfig};
+use crate::config::providers::ProvidersConfig;
 use crate::config::trust::WorkspaceTrustPolicy;
 use crate::daemon::DaemonPaths;
 use crate::daemon::principal::{self, ClientPrincipal, SessionAccess};

@@ -26,8 +26,8 @@
 //! ```
 //!
 //! `name`, `models_fetched_at`, `favorite`, `models`, `thinking_modes`,
-//! and `inputs` are all optional. Headers carry `$VAR` references that
-//! [`crate::envref`] expands at use-time.
+//! and `inputs` are all optional. Header values are opaque config strings;
+//! the CLI expands `$VAR` and `$secret:<name>` references at use-time.
 //!
 //! Each provider entry (and, as an override, each model entry) may also carry
 //! the `cache` / `context` / `shrink` / `timeout` sub-objects and a `backup`
@@ -348,8 +348,9 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_insecure_http: bool,
 
-    /// HTTP headers to send on every request. Values may contain `$VAR`
-    /// env references.
+    /// HTTP headers to send on every request. Values may contain opaque
+    /// `$VAR` environment references or `$secret:<name>` credential-store
+    /// references; this crate deliberately preserves both verbatim.
     #[serde(default)]
     pub headers: Vec<HeaderSpec>,
 

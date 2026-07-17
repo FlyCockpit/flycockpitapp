@@ -217,7 +217,7 @@ async fn refresh_redaction_for_turn(
 ) -> bool {
     let mut cfg = crate::config::extended::load_for_cwd(project_root).redact;
     overrides.apply_to(&mut cfg);
-    match crate::redact::RedactionTable::build_with_env(&cfg, project_root, env) {
+    match crate::redact::RedactionTable::build_with_env_and_store(&cfg, project_root, env) {
         Ok(new_table) => {
             let table = match current_redaction(accumulated_redact).union(&new_table) {
                 Ok(table) => Arc::new(table),

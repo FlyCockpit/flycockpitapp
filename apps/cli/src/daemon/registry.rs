@@ -507,7 +507,7 @@ impl SessionRegistry {
         session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
 
         // Build per-session redaction table from the immutable session env.
-        let redact = RedactionTable::build_with_env(
+        let redact = RedactionTable::build_with_env_and_store(
             &extended_cfg.redact,
             &project_root,
             env_snapshot.vars(),

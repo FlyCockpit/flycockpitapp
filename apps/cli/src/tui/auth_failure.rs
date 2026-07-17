@@ -63,7 +63,7 @@ pub fn notice_text(notice: &AuthFailureNotice, mouse: bool) -> String {
 /// Secret-safe, process-local fingerprint of the auth inputs for one provider.
 /// Only the hash is retained; credential contents never enter TUI state.
 pub fn provider_auth_fingerprint(cwd: &Path, provider_id: &str) -> u64 {
-    let config = crate::config::providers::ConfigDoc::load_effective(cwd);
+    let config = crate::secret_ref::load_effective(cwd);
     let entry = config.providers.get(provider_id);
     let credential_ref = entry
         .and_then(|entry| entry.credential_ref.as_deref())

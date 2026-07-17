@@ -98,7 +98,7 @@ pub fn load(project: Option<&Path>, fetch_git: bool) -> LaunchInfo {
 
 pub fn load_bundle(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
     let cwd = resolve_launch_dir(project);
-    let providers = crate::config::providers::ConfigDoc::load_effective(&cwd);
+    let providers = crate::secret_ref::load_effective(&cwd);
     let extended = crate::config::extended::load_for_cwd(&cwd);
     let launch = build_launch_info(cwd, fetch_git, &providers, &extended);
     LaunchBundle {

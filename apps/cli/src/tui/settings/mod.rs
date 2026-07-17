@@ -342,6 +342,9 @@ pub struct SettingsCx {
     pub(super) command_installed: fn(&str) -> bool,
     pub(super) env_lookup: fn(&str) -> Option<String>,
     pub(super) credential_store_path: Option<PathBuf>,
+    /// Disclosure produced when a provider save moved literal header values
+    /// into the credential store. Consumed by the provider page's status line.
+    pub(super) last_secret_notice: Option<String>,
     pending_daemon_request: Option<Request>,
     pending_oauth_action: Option<OAuthFlowRequest>,
 }
@@ -641,7 +644,7 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let cfg = ConfigDoc::load_effective(cwd);
+        let cfg = crate::secret_ref::load_effective(cwd);
         let Some(entry) = cfg.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };
@@ -1089,6 +1092,7 @@ impl SettingsDialog {
                 command_installed: |cmd| crate::harness::preflight::which_on_path(cmd).is_some(),
                 env_lookup: |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
                 credential_store_path: None,
+                last_secret_notice: None,
                 pending_daemon_request: None,
                 pending_oauth_action: None,
             },
@@ -1148,10 +1152,64 @@ impl SettingsDialog {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
         let mut merged = doc.providers();
         merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        let notice = crate::secret_ref::protect_literal_headers(
+            &mut merged.providers,
+            self.credential_store_path.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         doc.write(&merged).map_err(|e| e.to_string())?;
         self.config = merged.clone();
         self.original_config = merged;
+        self.last_secret_notice = notice.map(|notice| notice.render());
         Ok(())
+    }
+
+    fn delete_provider_and_stored_secrets(
+        &mut self,
+        provider_id: &str,
+        delete_stored_secrets: bool,
+    ) -> Result<usize, String> {
+        let mut names = self
+            .config
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .flat_map(|provider| &provider.headers)
+            .flat_map(|header| crate::envref::referenced_names(&header.value))
+            .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (other_id, provider) in &self.config.providers {
+            if other_id == provider_id {
+                continue;
+            }
+            for name in provider
+                .headers
+                .iter()
+                .flat_map(|header| crate::envref::referenced_names(&header.value))
+                .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+            {
+                names.remove(&name);
+            }
+        }
+
+        self.config.providers.remove(provider_id);
+        self.save_config()?;
+        if !delete_stored_secrets || names.is_empty() {
+            return Ok(0);
+        }
+
+        let mut store = match &self.credential_store_path {
+            Some(path) => crate::credentials::CredentialStore::open(path.clone()),
+            None => crate::credentials::CredentialStore::open_default(),
+        }
+        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        for name in &names {
+            store.remove_named_secret(name);
+        }
+        store
+            .save()
+            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        Ok(names.len())
     }
 
     fn tick(&mut self) {
@@ -2111,10 +2169,64 @@ impl SettingsCx {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
         let mut merged = doc.providers();
         merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        let notice = crate::secret_ref::protect_literal_headers(
+            &mut merged.providers,
+            self.credential_store_path.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         doc.write(&merged).map_err(|e| e.to_string())?;
         self.config = merged.clone();
         self.original_config = merged;
+        self.last_secret_notice = notice.map(|notice| notice.render());
         Ok(())
+    }
+
+    fn delete_provider_and_stored_secrets(
+        &mut self,
+        provider_id: &str,
+        delete_stored_secrets: bool,
+    ) -> Result<usize, String> {
+        let mut names = self
+            .config
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .flat_map(|provider| &provider.headers)
+            .flat_map(|header| crate::envref::referenced_names(&header.value))
+            .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (other_id, provider) in &self.config.providers {
+            if other_id == provider_id {
+                continue;
+            }
+            for name in provider
+                .headers
+                .iter()
+                .flat_map(|header| crate::envref::referenced_names(&header.value))
+                .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+            {
+                names.remove(&name);
+            }
+        }
+
+        self.config.providers.remove(provider_id);
+        self.save_config()?;
+        if !delete_stored_secrets || names.is_empty() {
+            return Ok(0);
+        }
+
+        let mut store = match &self.credential_store_path {
+            Some(path) => crate::credentials::CredentialStore::open(path.clone()),
+            None => crate::credentials::CredentialStore::open_default(),
+        }
+        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        for name in &names {
+            store.remove_named_secret(name);
+        }
+        store
+            .save()
+            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        Ok(names.len())
     }
 
     fn activate_lsp_reset(&mut self, p: &mut LspPage) {

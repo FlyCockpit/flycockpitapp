@@ -135,7 +135,7 @@ pub fn ordered_model_choices(
     counts: &HashMap<String, u64>,
 ) -> Result<Vec<ModelChoice>, String> {
     ensure_config_reachable(cwd)?;
-    let cfg = ConfigDoc::load_effective(cwd);
+    let cfg = crate::secret_ref::load_effective(cwd);
     let mut entries: Vec<Entry> = Vec::new();
     for (pid, entry) in &cfg.providers {
         for model in &entry.models {
@@ -216,7 +216,7 @@ impl ModelPickerDialog {
         now_epoch_secs: i64,
     ) -> Result<Self, String> {
         ensure_config_reachable(cwd)?;
-        let cfg = ConfigDoc::load_effective(cwd);
+        let cfg = crate::secret_ref::load_effective(cwd);
 
         let mut entries: Vec<Entry> = Vec::new();
         for (pid, entry) in &cfg.providers {
@@ -878,7 +878,7 @@ fn reasoning_summary(capability: &ReasoningEffortCapability) -> String {
 /// `Err` if there's no active model or no config to write to.
 pub fn toggle_active_favorite(cwd: &Path) -> Result<(bool, String, String), String> {
     ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let mut cfg = ConfigDoc::load_effective(cwd);
+    let mut cfg = crate::secret_ref::load_effective(cwd);
     let active = cfg
         .active_model
         .clone()
@@ -915,7 +915,7 @@ pub fn cycle_active_favorite(
     forward: bool,
 ) -> Result<Option<(String, String)>, String> {
     ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let cfg = ConfigDoc::load_effective(cwd);
+    let cfg = crate::secret_ref::load_effective(cwd);
     let active = cfg
         .active_model
         .as_ref()

@@ -295,12 +295,23 @@ fn header_value_is_env_only(value: &str) -> bool {
     while i < bytes.len() {
         let at_dollar = bytes[i] == b'$';
         let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
-        if at_dollar
-            && prev_ok
-            && let Some((_, rest)) = take_env_var_name(&bytes[i + 1..])
-        {
-            i = bytes.len() - rest.len();
-            continue;
+        if at_dollar && prev_ok {
+            if value[i..].starts_with("$secret:") {
+                let rest = &bytes[i + "$secret:".len()..];
+                let name_len = rest
+                    .iter()
+                    .position(|byte| {
+                        !(byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+                    })
+                    .unwrap_or(rest.len());
+                if name_len > 0 {
+                    i += "$secret:".len() + name_len;
+                    continue;
+                }
+            } else if let Some((_, rest)) = take_env_var_name(&bytes[i + 1..]) {
+                i = bytes.len() - rest.len();
+                continue;
+            }
         }
         let ch_len = utf8_char_len(bytes[i]);
         literal.push_str(&value[i..i + ch_len]);
@@ -319,15 +330,7 @@ fn header_value_is_env_only(value: &str) -> bool {
 }
 
 fn looks_like_literal_secret(value: &str) -> bool {
-    let trimmed = value.trim();
-    if trimmed.len() >= 20 {
-        return true;
-    }
-    let compact_len = trimmed
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .count();
-    compact_len >= 12
+    crate::secret_ref::looks_like_literal_secret(value)
 }
 
 fn mask_header_value(value: &str) -> String {
@@ -1005,7 +1008,7 @@ impl SettingsCx {
         let ids: Vec<String> = self.config.providers.keys().cloned().collect();
         let row_count = ids.len() + 1;
         let provider_idx = list_provider_idx(*cursor, ids.len());
-        let pressed_d = matches!(key.code, KeyCode::Char('d'));
+        let delete_choice_key = matches!(key.code, KeyCode::Char('d') | KeyCode::Char('n'));
         match key.code {
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                 return Nav::Back;
@@ -1040,6 +1043,20 @@ impl SettingsCx {
                 });
                 return Nav::Stay;
             }
+            KeyCode::Char('n') if *delete_pending => {
+                if let Some(idx) = provider_idx {
+                    let id = ids[idx].clone();
+                    let msg = match self.delete_provider_and_stored_secrets(&id, false) {
+                        Ok(_) => format!("deleted `{id}`; kept stored secret(s)"),
+                        Err(e) => format!("delete failed: {e}"),
+                    };
+                    return Nav::Replace(super::providers_page(ProvidersPage::List {
+                        cursor: (*cursor).min(self.config.providers.len()),
+                        status: Some(msg),
+                        delete_pending: false,
+                    }));
+                }
+            }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if *cursor == 0 {
                     return self.start_fetch_all();
@@ -1059,9 +1076,9 @@ impl SettingsCx {
                 if let Some(idx) = provider_idx {
                     if *delete_pending {
                         let id = ids[idx].clone();
-                        self.config.providers.remove(&id);
-                        let msg = match self.save_config() {
-                            Ok(()) => format!("deleted `{id}`"),
+                        let msg = match self.delete_provider_and_stored_secrets(&id, true) {
+                            Ok(0) => format!("deleted `{id}`"),
+                            Ok(count) => format!("deleted `{id}` and {count} stored secret(s)"),
                             Err(e) => format!("delete failed: {e}"),
                         };
                         let new_len = self.config.providers.len();
@@ -1079,7 +1096,10 @@ impl SettingsCx {
                         }));
                     } else {
                         *delete_pending = true;
-                        *status = Some(format!("press d again to delete `{}`", ids[idx]));
+                        *status = Some(format!(
+                            "press d again to delete `{}` + stored secrets (default); n: keep secrets",
+                            ids[idx]
+                        ));
                         return Nav::Stay;
                     }
                 }
@@ -1087,9 +1107,9 @@ impl SettingsCx {
             }
             _ => {}
         }
-        // Any non-`d` key (or `d` on a non-provider row) clears
+        // Any non-choice key (or choice on a non-provider row) clears
         // the pending-delete arm and the transient status.
-        if !pressed_d {
+        if !delete_choice_key {
             *delete_pending = false;
             *status = None;
         }
@@ -1154,11 +1174,20 @@ impl SettingsCx {
         match self.save_config() {
             Ok(()) => {
                 s.saved_provider_id = Some(id.clone());
-                s.error = Some("saved. Fetching /models…".into());
+                let notice = self.last_secret_notice.take();
                 if !template.supports_models_endpoint {
-                    s.error = Some("saved. provider has no /models endpoint".into());
+                    s.error = Some(match notice {
+                        Some(notice) => {
+                            format!("saved. {notice} Provider has no /models endpoint")
+                        }
+                        None => "saved. provider has no /models endpoint".into(),
+                    });
                     s.step = AddStep::Done;
                 } else {
+                    s.error = Some(match notice {
+                        Some(notice) => format!("saved. {notice} Fetching /models…"),
+                        None => "saved. Fetching /models…".into(),
+                    });
                     s.fetch = Some(FetchHandle::spawn(id, entry));
                     s.step = AddStep::Fetching;
                 }
@@ -1380,7 +1409,15 @@ impl SettingsCx {
         self.config
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
-        super::save_status(self.save_config())
+        match self.save_config() {
+            Ok(()) => Some(
+                self.last_secret_notice
+                    .take()
+                    .map(|notice| format!("saved. {notice}"))
+                    .unwrap_or_else(|| "saved".to_string()),
+            ),
+            Err(error) => Some(format!("save failed: {error}")),
+        }
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
@@ -1470,12 +1507,26 @@ impl SettingsCx {
                     "favorite removed (unsaved — s to save)".into()
                 });
             }
+            KeyCode::Char('n') if s.delete_pending => {
+                let saved = self.delete_provider_and_stored_secrets(&s.provider_id, false);
+                let msg = match saved {
+                    Ok(_) => format!("deleted `{}`; kept stored secret(s)", s.provider_id),
+                    Err(e) => format!("delete failed: {e}"),
+                };
+                return Nav::Replace(super::providers_page(ProvidersPage::List {
+                    cursor: initial_list_cursor(&self.config),
+                    status: Some(msg),
+                    delete_pending: false,
+                }));
+            }
             KeyCode::Char('d') => {
                 if s.delete_pending {
-                    self.config.providers.remove(&s.provider_id);
-                    let saved = self.save_config();
+                    let saved = self.delete_provider_and_stored_secrets(&s.provider_id, true);
                     let msg = match saved {
-                        Ok(()) => format!("deleted `{}`", s.provider_id),
+                        Ok(0) => format!("deleted `{}`", s.provider_id),
+                        Ok(count) => {
+                            format!("deleted `{}` and {count} stored secret(s)", s.provider_id)
+                        }
                         Err(e) => format!("delete failed: {e}"),
                     };
                     return Nav::Replace(super::providers_page(ProvidersPage::List {
@@ -1485,7 +1536,10 @@ impl SettingsCx {
                     }));
                 } else {
                     s.delete_pending = true;
-                    s.status = Some("press d again to confirm delete".into());
+                    s.status = Some(
+                        "press d again to delete + stored secrets (default); n: keep secrets"
+                            .into(),
+                    );
                 }
                 return Nav::Stay;
             }
@@ -1494,7 +1548,8 @@ impl SettingsCx {
             }
             _ => {}
         }
-        s.delete_pending = matches!(key.code, KeyCode::Char('d')) && s.delete_pending;
+        s.delete_pending =
+            matches!(key.code, KeyCode::Char('d') | KeyCode::Char('n')) && s.delete_pending;
         Nav::Stay
     }
 
@@ -1596,10 +1651,12 @@ impl SettingsCx {
             }
             Some(EditAction::Delete) => {
                 if s.delete_pending {
-                    self.config.providers.remove(&s.provider_id);
-                    let saved = self.save_config();
+                    let saved = self.delete_provider_and_stored_secrets(&s.provider_id, true);
                     let msg = match saved {
-                        Ok(()) => format!("deleted `{}`", s.provider_id),
+                        Ok(0) => format!("deleted `{}`", s.provider_id),
+                        Ok(count) => {
+                            format!("deleted `{}` and {count} stored secret(s)", s.provider_id)
+                        }
                         Err(e) => format!("delete failed: {e}"),
                     };
                     return Nav::Replace(super::providers_page(ProvidersPage::List {
@@ -1609,7 +1666,10 @@ impl SettingsCx {
                     }));
                 } else {
                     s.delete_pending = true;
-                    s.status = Some("press Enter again to confirm delete".into());
+                    s.status = Some(
+                        "press Enter again to delete + stored secrets (default); n: keep secrets"
+                            .into(),
+                    );
                     return Nav::Stay;
                 }
             }
@@ -2476,7 +2536,7 @@ impl SettingsCx {
                 EditAction::Delete => (
                     "Delete",
                     if s.delete_pending {
-                        "(press Enter again to confirm)".to_string()
+                        "(Enter: delete secrets; n: keep secrets)".to_string()
                     } else {
                         String::new()
                     },
@@ -3055,20 +3115,50 @@ fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
     render_field_row(&mut body, "Name ", &h.name_buf, name_focus);
     render_field_row(&mut body, "Value", &h.value_buf, !name_focus);
 
-    // Env-var status for the value (headers commonly reference `$VAR`).
+    // Dynamic-reference status for the value (headers commonly reference
+    // `$VAR` or `$secret:<name>`).
     let resolved = envref::resolve(h.value_buf.text());
     if resolved.has_missing() {
-        body.push(Line::from(Span::styled(
+        let env_missing = resolved
+            .missing
+            .iter()
+            .filter(|name| !name.starts_with("secret:"))
+            .map(|name| format!("${name}"))
+            .collect::<Vec<_>>();
+        let secret_missing = resolved
+            .missing
+            .iter()
+            .filter(|name| name.starts_with("secret:"))
+            .map(|name| format!("${name}"))
+            .collect::<Vec<_>>();
+        let message = if !secret_missing.is_empty() && env_missing.is_empty() {
+            let path = crate::credentials::default_path()
+                .map(|path| crate::welcome::display_path(&path))
+                .unwrap_or_else(|| "the credential store".to_string());
             format!(
-                "  Environment variable not detected, make sure to set it: ${}",
-                resolved.missing.join(", $")
-            ),
-            yellow,
-        )));
+                "  Named secret not detected in {path}: {}",
+                secret_missing.join(", ")
+            )
+        } else if secret_missing.is_empty() {
+            format!(
+                "  Environment variable not detected, make sure to set it: {}",
+                env_missing.join(", ")
+            )
+        } else {
+            format!(
+                "  References not detected: {}",
+                env_missing
+                    .into_iter()
+                    .chain(secret_missing)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        body.push(Line::from(Span::styled(message, yellow)));
     } else if !resolved.referenced.is_empty() {
         body.push(Line::from(Span::styled(
             format!(
-                "  env var(s) detected: ${}",
+                "  dynamic reference(s) detected: ${}",
                 resolved.referenced.join(", $")
             ),
             muted,

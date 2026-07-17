@@ -824,8 +824,7 @@ fn build_manifest(
 fn export_resume_repair_state(db: &Db, target: &SessionRow) -> Option<Value> {
     let provider = target.provider.clone().unwrap_or_default();
     let model = target.model.clone().unwrap_or_default();
-    let providers =
-        crate::config::providers::ConfigDoc::load_effective(Path::new(&target.project_root));
+    let providers = crate::secret_ref::load_effective(Path::new(&target.project_root));
     let configured = providers.resolve_wire_api(&provider, &model);
     let wire_api = if configured.is_auto() {
         crate::config::providers::WireApi::detect_for_provider(&provider, &model)
@@ -880,7 +879,7 @@ fn export_redaction_table_with_env(
 ) -> RedactionTable {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    RedactionTable::build_with_env(&extended.redact, &cwd, env).unwrap_or_else(|e| {
+    RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "export: redaction table build failed; payload scrub is a no-op");
         RedactionTable::empty()
     })
@@ -961,7 +960,8 @@ fn collect_config_entries_with_env(
     // redaction) must not block the export — fall back to a no-op table that
     // returns input unchanged, which a disabled config would do anyway.
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    let redactor = RedactionTable::build_with_env(&extended.redact, &cwd, env).unwrap_or_else(|e| {
+    let redactor = RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
+        .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "export: redaction table build failed; config scrub is a no-op");
         RedactionTable::empty()
     });

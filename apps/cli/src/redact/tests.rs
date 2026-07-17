@@ -422,6 +422,57 @@ fn build_with_env_redacts_env_only_secret_without_process_env() {
 }
 
 #[test]
+fn store_secrets_join_redaction_table() {
+    use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
+    use crate::engine::model::Model;
+    use std::sync::Arc;
+
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let secret = "sk-stored-secret-value-123456";
+    let table = Arc::new(
+        RedactionTable::build_with_env_and_secrets(
+            &cfg,
+            dir.path(),
+            &HashMap::new(),
+            [("openai".to_string(), secret.to_string())],
+        )
+        .unwrap(),
+    );
+    assert!(!table.scrub(secret).contains(secret));
+
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "untrusted".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "model".into(),
+                trust: Some(ModelTrust::Untrusted),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    providers.providers.insert(
+        "trusted".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "model".into(),
+                trust: Some(ModelTrust::Trusted),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+
+    let untrusted =
+        Model::effective_redact_table_for(&providers, "untrusted", "model", table.clone());
+    let trusted = Model::effective_redact_table_for(&providers, "trusted", "model", table);
+    assert!(!untrusted.scrub(secret).contains(secret));
+    assert_eq!(trusted.scrub(secret), secret);
+}
+
+#[test]
 fn short_env_values_not_redacted() {
     let key = "COCKPIT_TEST_SHORT_VALUE";
     let val = "abc";

@@ -9,7 +9,7 @@ use crate::config::providers::{
 
 pub async fn run(args: ModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let cfg = crate::config::providers::ConfigDoc::load_effective(&cwd);
+    let cfg = crate::secret_ref::load_effective(&cwd);
     if cfg.providers.is_empty() {
         println!("{}", no_models_message());
         return Ok(());
@@ -20,7 +20,7 @@ pub async fn run(args: ModelsArgs) -> Result<()> {
 
 pub async fn run_provider_catalog_status(args: ProviderCatalogStatusArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let cfg = crate::config::providers::ConfigDoc::load_effective(&cwd);
+    let cfg = crate::secret_ref::load_effective(&cwd);
     print!(
         "{}",
         render_provider_catalog_status(&cfg, args.provider.as_deref(), Utc::now())?

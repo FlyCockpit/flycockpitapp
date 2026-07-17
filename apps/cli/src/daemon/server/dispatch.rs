@@ -850,7 +850,7 @@ async fn handle_request(
                 .as_deref()
                 .zip(model.as_deref())
                 .and_then(|(provider, model)| {
-                    let cfg = crate::config::providers::ConfigDoc::load_effective(cwd);
+                    let cfg = crate::secret_ref::load_effective(cwd);
                     cfg.resolve_model_system_prompt(provider, model).map(|prompt| {
                         crate::tokens::scaled_estimate(prompt, strategy, scale)
                     })

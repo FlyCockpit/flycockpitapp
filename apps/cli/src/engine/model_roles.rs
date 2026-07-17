@@ -328,7 +328,7 @@ pub fn resolve_delegated_model(
 
 pub fn load_model_role_config(cwd: &Path) -> (ExtendedConfig, ProvidersConfig) {
     let extended = crate::config::extended::load_for_cwd(cwd);
-    let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+    let providers = crate::secret_ref::load_effective(cwd);
     (extended, providers)
 }
 

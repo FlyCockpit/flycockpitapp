@@ -2630,6 +2630,13 @@ mod tests {
             hint: None,
             use_id_as_default: true,
             default_wire_api: crate::config::providers::WireApi::Auto,
+            api_key: Some(crate::providers::ApiKeyTemplate {
+                header_name: "Authorization",
+                value_template: "Bearer {key}",
+                format_hint: "synthetic key",
+                console_url: "https://synthetic.example/keys",
+            }),
+            auth_check: crate::providers::AuthCheckKind::ModelsEndpoint,
         };
         let entry = ProviderEntry {
             url: template.url.to_string(),

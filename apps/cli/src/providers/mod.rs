@@ -11,6 +11,7 @@
 //! whose URL and headers are pre-populated. No special code path runs at
 //! request time.
 
+pub(crate) mod auth_check;
 pub(crate) mod http_retry;
 pub mod models_fetch;
 pub(crate) mod registry;
@@ -56,6 +57,39 @@ pub struct ProviderTemplate {
     pub use_id_as_default: bool,
     /// Provider-level wire endpoint default for newly materialized entries.
     pub default_wire_api: WireApi,
+    /// API-key entry metadata for the key-first setup wizard.
+    pub api_key: Option<ApiKeyTemplate>,
+    /// User-visible setup/doctor credential check for this template.
+    pub auth_check: AuthCheckKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiKeyTemplate {
+    pub header_name: &'static str,
+    pub value_template: &'static str,
+    pub format_hint: &'static str,
+    pub console_url: &'static str,
+}
+
+impl ApiKeyTemplate {
+    pub fn value_for_key(&self, key: &str) -> String {
+        self.value_template.replace("{key}", key.trim())
+    }
+
+    pub fn value_for_env_var(&self, env_var: &str) -> String {
+        self.value_template
+            .replace("{key}", &format!("${}", env_var.trim()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthCheckKind {
+    ModelsEndpoint,
+    ChatCompletions {
+        path: &'static str,
+        model: &'static str,
+        docs_url: &'static str,
+    },
 }
 
 /// The catalog the wizard cycles through. `openai-compatible` is first
@@ -75,6 +109,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: false,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "OpenAI-compatible API key",
+            console_url: "https://platform.openai.com/api-keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "openai",
@@ -90,6 +131,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "starts with sk-",
+            console_url: "https://platform.openai.com/api-keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "codex-oauth",
@@ -105,6 +153,8 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
+        api_key: None,
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "grok",
@@ -120,6 +170,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "starts with xai- or a provider-issued xAI key",
+            console_url: "https://console.x.ai/team/default/api-keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "grok-oauth",
@@ -135,6 +192,8 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
+        api_key: None,
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "z-ai",
@@ -148,6 +207,20 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         hint: Some("Generate a key at https://z.ai/manage-apikey/apikey-list"),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "Z.AI API key or JWT token",
+            console_url: "https://z.ai/manage-apikey/apikey-list",
+        }),
+        // Z.AI documents API-key auth via `Authorization: Bearer` and
+        // `POST /chat/completions` as the authenticated HTTP API path:
+        // https://docs.z.ai/api-reference/llm/chat-completion
+        auth_check: AuthCheckKind::ChatCompletions {
+            path: "/chat/completions",
+            model: "glm-5.1",
+            docs_url: "https://docs.z.ai/api-reference/llm/chat-completion",
+        },
     },
     ProviderTemplate {
         id: "minimax",
@@ -161,6 +234,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         hint: Some("Generate a key at https://platform.minimaxi.com/"),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "MiniMax API key",
+            console_url: "https://platform.minimaxi.com/",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "opencode-zen",
@@ -178,6 +258,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         hint: Some("Generate a token at https://opencode.ai/zen"),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "OpenCode Zen token",
+            console_url: "https://opencode.ai/zen",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "copilot",
@@ -193,6 +280,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "GitHub token with Copilot access",
+            console_url: "https://github.com/settings/tokens",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "openrouter",
@@ -206,6 +300,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         hint: Some("Generate a key at https://openrouter.ai/keys"),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "starts with sk-or-",
+            console_url: "https://openrouter.ai/keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "deepseek",
@@ -219,6 +320,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         hint: Some("Generate a key at https://platform.deepseek.com/api_keys"),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "starts with sk-",
+            console_url: "https://platform.deepseek.com/api_keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "anthropic",
@@ -237,6 +345,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "x-api-key",
+            value_template: "{key}",
+            format_hint: "starts with sk-ant-",
+            console_url: "https://console.anthropic.com/settings/keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
         id: "xiaomi-mimo",
@@ -257,6 +372,13 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "Xiaomi MiMo API key",
+            console_url: "https://api.xiaomimimo.com/",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
     },
 ];
 
@@ -298,6 +420,55 @@ pub fn builtin_thinking_params(provider: &str, mode: ThinkingMode) -> Option<Val
 /// Materialize the template's default headers into an owned `Vec`.
 pub fn default_headers_for(template: &ProviderTemplate) -> Vec<HeaderSpec> {
     default_headers_for_with_env(template, env_var_is_nonempty)
+}
+
+pub fn headers_for_pasted_key(template: &ProviderTemplate, key: &str) -> Vec<HeaderSpec> {
+    let Some(api_key) = template.api_key else {
+        return default_headers_for(template);
+    };
+    headers_with_key_value(template, api_key.value_for_key(key))
+}
+
+pub fn headers_for_env_var(template: &ProviderTemplate, env_var: &str) -> Vec<HeaderSpec> {
+    let Some(api_key) = template.api_key else {
+        return default_headers_for(template);
+    };
+    headers_with_key_value(template, api_key.value_for_env_var(env_var))
+}
+
+fn headers_with_key_value(template: &ProviderTemplate, key_value: String) -> Vec<HeaderSpec> {
+    let Some(api_key) = template.api_key else {
+        return default_headers_for(template);
+    };
+    let mut replaced = false;
+    let mut headers = template
+        .default_headers
+        .iter()
+        .map(|(name, value)| {
+            let is_key = name.eq_ignore_ascii_case(api_key.header_name);
+            if is_key {
+                replaced = true;
+            }
+            HeaderSpec {
+                name: (*name).to_string(),
+                value: if is_key {
+                    key_value.clone()
+                } else {
+                    (*value).to_string()
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    if !replaced {
+        headers.insert(
+            0,
+            HeaderSpec {
+                name: api_key.header_name.to_string(),
+                value: key_value,
+            },
+        );
+    }
+    headers
 }
 
 fn default_headers_for_with_env(
@@ -358,6 +529,46 @@ mod tests {
     fn every_template_has_a_display_label() {
         for t in TEMPLATES {
             assert!(!t.display.is_empty(), "template {} missing display", t.id);
+        }
+    }
+
+    #[test]
+    fn api_key_templates_declare_key_and_auth_check() {
+        for template in TEMPLATES
+            .iter()
+            .filter(|template| matches!(template.auth, AuthKind::ApiKey))
+        {
+            let api_key = template
+                .api_key
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} missing API-key metadata", template.id));
+            assert!(
+                !api_key.header_name.is_empty(),
+                "{} missing key header",
+                template.id
+            );
+            assert!(
+                api_key.value_template.contains("{key}"),
+                "{} key template must include {{key}}",
+                template.id
+            );
+            assert!(
+                !api_key.format_hint.is_empty(),
+                "{} missing key format hint",
+                template.id
+            );
+            assert!(
+                api_key.console_url.starts_with("https://"),
+                "{} missing console URL",
+                template.id
+            );
+            if !template.supports_models_endpoint {
+                assert!(
+                    matches!(template.auth_check, AuthCheckKind::ChatCompletions { .. }),
+                    "{} without /models must declare explicit auth_check",
+                    template.id
+                );
+            }
         }
     }
 

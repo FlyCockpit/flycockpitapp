@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::cli::{ProvidersCommand, ProvidersUsageArgs};
+use crate::cli::{ProviderAddArgs, ProvidersCommand, ProvidersUsageArgs};
 
 pub async fn run(cmd: ProvidersCommand) -> Result<()> {
     match cmd {
@@ -16,8 +16,13 @@ pub async fn run(cmd: ProvidersCommand) -> Result<()> {
             }
             Ok(())
         }
+        ProvidersCommand::Add(args) => add(args).await,
         ProvidersCommand::Usage(args) => usage(args).await,
     }
+}
+
+async fn add(args: ProviderAddArgs) -> Result<()> {
+    crate::commands::setup::run_provider_add(args.template).await
 }
 
 async fn usage(args: ProvidersUsageArgs) -> Result<()> {

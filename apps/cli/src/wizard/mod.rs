@@ -271,6 +271,10 @@ pub fn descriptor(id: &str) -> Option<WizardDescriptor> {
 }
 
 pub fn provider_descriptor() -> WizardDescriptor {
+    provider_descriptor_with_template(None)
+}
+
+pub fn provider_descriptor_with_template(default_template: Option<&str>) -> WizardDescriptor {
     use crate::providers::TEMPLATES;
 
     let template_options = TEMPLATES
@@ -294,7 +298,7 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 kind: StepKind::Select {
                     options: template_options,
                 },
-                default_answer: None,
+                default_answer: default_template.map(|id| WizardAnswer::Select(id.to_string())),
                 prefill: None,
                 validate: Some(validate_select),
                 write: None,
@@ -324,9 +328,60 @@ pub fn provider_descriptor() -> WizardDescriptor {
             },
             action_step(
                 "headers",
-                "Configure HTTP headers",
+                "Advanced: edit HTTP headers",
                 "Editing provider headers…",
             ),
+            StepDescriptor {
+                id: "auth-method",
+                prompt: "How do you want to provide the API key?",
+                help: "Paste stores the key in Cockpit's credential store; env var keeps a $VAR reference; advanced opens raw headers.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "paste-key",
+                            label: "Paste key",
+                            description: "Store a masked key as a $secret: reference",
+                        },
+                        SelectOption {
+                            id: "env-var",
+                            label: "Use env var",
+                            description: "Write a $VAR reference and keep the key in your shell",
+                        },
+                        SelectOption {
+                            id: "advanced-headers",
+                            label: "Advanced headers",
+                            description: "Edit HTTP headers directly",
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("paste-key".to_string())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(provider_auth_method_branch),
+            },
+            StepDescriptor {
+                id: "api-key",
+                prompt: "Paste API key",
+                help: "Input is masked. Surrounding whitespace is trimmed before storage.",
+                kind: StepKind::Secret,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_api_key),
+                write: None,
+                branch: Some(action_to_saving),
+            },
+            StepDescriptor {
+                id: "env-var",
+                prompt: "Environment variable name",
+                help: "The provider header will reference this variable with $VAR.",
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: Some(provider_env_var_prefill),
+                validate: Some(validate_env_var_name),
+                write: None,
+                branch: Some(action_to_saving),
+            },
             action_step(
                 "copilot-auth",
                 "Configure GitHub authentication",
@@ -353,7 +408,43 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 prefill: None,
                 validate: None,
                 write: None,
-                branch: Some(provider_fetch_branch),
+                branch: Some(provider_after_save_branch),
+            },
+            StepDescriptor {
+                id: "test-key-choice",
+                prompt: "Test key now?",
+                help: "Default: test now. Choose skip-test to save without validation.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "test",
+                            label: "Test key",
+                            description: "Validate credentials now",
+                        },
+                        SelectOption {
+                            id: "skip-test",
+                            label: "Skip test",
+                            description: "Save now and validate on first use",
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("test".to_string())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(provider_test_choice_branch),
+            },
+            action_step("test-key", "Test key", "Testing provider credentials…"),
+            StepDescriptor {
+                id: "test-skipped",
+                prompt: "key saved but unverified — it will be tested on your first message.",
+                help: "Continue to finish provider setup.",
+                kind: StepKind::Info,
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: Some(fetching_to_done),
             },
             action_step("fetching", "Fetch models", "Fetching /models…"),
             StepDescriptor {
@@ -575,10 +666,9 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
         prefill: None,
         validate: None,
         write: None,
-        branch: Some(if id == "fetching" {
-            fetching_to_done
-        } else {
-            action_to_saving
+        branch: Some(match id {
+            "fetching" | "test-key" => fetching_to_done,
+            _ => action_to_saving,
         }),
     }
 }
@@ -646,6 +736,30 @@ fn validate_provider_url(_: &WizardRun, answer: &WizardAnswer) -> std::result::R
             Ok(())
         }
         _ => Err("url must start with http:// or https://".to_string()),
+    }
+}
+
+fn validate_api_key(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Secret(value) if !value.trim().is_empty() => Ok(()),
+        _ => Err("paste a non-empty API key".to_string()),
+    }
+}
+
+fn validate_env_var_name(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(value) = answer else {
+        return Err("enter an environment variable name".to_string());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("environment variable name cannot be empty".to_string());
+    }
+    if value.chars().enumerate().all(|(index, ch)| {
+        ch == '_' || ch.is_ascii_uppercase() || (index > 0 && ch.is_ascii_digit())
+    }) {
+        Ok(())
+    } else {
+        Err("use uppercase letters, digits, and `_` (not starting with a digit)".to_string())
     }
 }
 
@@ -756,12 +870,33 @@ fn provider_url_prefill(run: &WizardRun) -> Option<WizardAnswer> {
     ))
 }
 
+fn provider_env_var_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let template = selected_provider_template(run)?;
+    Some(WizardAnswer::Text(
+        template
+            .default_env_var
+            .or_else(|| template.env_var_candidates.first().copied())
+            .unwrap_or("API_KEY")
+            .to_string(),
+    ))
+}
+
 fn provider_auth_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     Some(match selected_provider_template(run)?.id {
         "copilot" => "copilot-auth",
         "grok-oauth" => "grok-oauth",
         "codex-oauth" => "codex-oauth",
+        _ if selected_provider_template(run)?.api_key.is_some() => "auth-method",
         _ => "headers",
+    })
+}
+
+fn provider_auth_method_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    Some(match answer {
+        WizardAnswer::Select(value) if value == "paste-key" => "api-key",
+        WizardAnswer::Select(value) if value == "env-var" => "env-var",
+        WizardAnswer::Select(value) if value == "advanced-headers" => "headers",
+        _ => "auth-method",
     })
 }
 
@@ -773,14 +908,21 @@ fn fetching_to_done(_: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     Some("done")
 }
 
-fn provider_fetch_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
-    Some(
-        if selected_provider_template(run)?.supports_models_endpoint {
-            "fetching"
-        } else {
-            "done"
-        },
-    )
+fn provider_after_save_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    Some(if selected_provider_template(run)?.api_key.is_some() {
+        "test-key-choice"
+    } else if selected_provider_template(run)?.supports_models_endpoint {
+        "fetching"
+    } else {
+        "done"
+    })
+}
+
+fn provider_test_choice_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    Some(match answer {
+        WizardAnswer::Select(value) if value == "skip-test" => "test-skipped",
+        _ => "test-key",
+    })
 }
 
 #[cfg(test)]

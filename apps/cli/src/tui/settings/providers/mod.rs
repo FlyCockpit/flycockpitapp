@@ -598,6 +598,8 @@ impl ProvidersPage {
             ProvidersPage::Add(s) => match s.run.current_step_id() {
                 Some("id") => Some(&mut s.id_field),
                 Some("url") => Some(&mut s.url_field),
+                Some("api-key") => Some(s.api_key_field.as_mut()),
+                Some("env-var") => Some(s.env_var_field.as_mut()),
                 Some("headers") => s.headers.active_text_field(),
                 Some("grok-oauth" | "codex-oauth") => s
                     .oauth_auth
@@ -700,7 +702,11 @@ pub(super) struct AddState {
     pub(super) template: Option<&'static ProviderTemplate>,
     pub(super) id_field: TextField,
     pub(super) url_field: TextField,
-    pub(super) headers: HeaderEditor,
+    pub(super) auth_method_cursor: usize,
+    pub(super) api_key_field: Box<TextField>,
+    pub(super) env_var_field: Box<TextField>,
+    pub(super) test_choice_cursor: usize,
+    pub(super) headers: Box<HeaderEditor>,
     pub(super) error: Option<String>,
     pub(super) fetch: Option<FetchHandle>,
     pub(super) saved_provider_id: Option<String>,
@@ -734,7 +740,11 @@ impl AddState {
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
-            headers: HeaderEditor::new(Vec::new(), true),
+            auth_method_cursor: 0,
+            api_key_field: Box::new(TextField::default()),
+            env_var_field: Box::new(TextField::default()),
+            test_choice_cursor: 0,
+            headers: Box::new(HeaderEditor::new(Vec::new(), true)),
             error: None,
             fetch: None,
             saved_provider_id: None,
@@ -1141,9 +1151,25 @@ impl SettingsCx {
             Ok(()) => {
                 s.saved_provider_id = Some(id.clone());
                 let notice = self.last_secret_notice.take();
-                let _ = s.run.submit(WizardAnswer::Acknowledged);
-                let _ = s.run.submit(WizardAnswer::Acknowledged);
-                if !template.supports_models_endpoint {
+                if !s.is_step("saving") {
+                    let _ = s.run.submit(WizardAnswer::Acknowledged);
+                }
+                if s.is_step("saving") {
+                    let _ = s.run.submit(WizardAnswer::Acknowledged);
+                }
+                if s.is_step("fetching") {
+                    s.error = Some(match notice {
+                        Some(notice) => format!("saved. {notice} Fetching /models…"),
+                        None => "saved. Fetching /models…".into(),
+                    });
+                    s.fetch = Some(FetchHandle::spawn(id, entry));
+                    let _ = s.run.submit(WizardAnswer::Acknowledged);
+                } else if s.is_step("test-key-choice") {
+                    s.error = Some(match notice {
+                        Some(notice) => format!("saved. {notice}"),
+                        None => "saved.".into(),
+                    });
+                } else if !template.supports_models_endpoint {
                     s.error = Some(match notice {
                         Some(notice) => {
                             format!("saved. {notice} Provider has no /models endpoint")
@@ -1152,10 +1178,9 @@ impl SettingsCx {
                     });
                 } else {
                     s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice} Fetching /models…"),
-                        None => "saved. Fetching /models…".into(),
+                        Some(notice) => format!("saved. {notice}"),
+                        None => "saved.".into(),
                     });
-                    s.fetch = Some(FetchHandle::spawn(id, entry));
                 }
             }
             Err(e) => {
@@ -1198,9 +1223,14 @@ impl SettingsCx {
                         s.id_field.set("");
                     }
                     s.url_field.set(t.url);
-                    s.headers = HeaderEditor::new(
+                    *s.headers = HeaderEditor::new(
                         templates::default_headers_for(t),
                         /* show_continue */ true,
+                    );
+                    s.env_var_field.set(
+                        t.default_env_var
+                            .or_else(|| t.env_var_candidates.first().copied())
+                            .unwrap_or("API_KEY"),
                     );
                     s.error = None;
                     s.run
@@ -1258,6 +1288,73 @@ impl SettingsCx {
                 }
                 _ => {
                     s.url_field.handle_key(key);
+                }
+            },
+            Some("auth-method") => {
+                const AUTH_METHODS: [&str; 3] = ["paste-key", "env-var", "advanced-headers"];
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        s.auth_method_cursor =
+                            crate::tui::nav::wrap_prev(s.auth_method_cursor, AUTH_METHODS.len());
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        s.auth_method_cursor =
+                            crate::tui::nav::wrap_next(s.auth_method_cursor, AUTH_METHODS.len());
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        let choice = AUTH_METHODS[s.auth_method_cursor];
+                        if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
+                            s.error = Some(error);
+                        } else {
+                            s.error = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("api-key") => match key.code {
+                KeyCode::Enter => {
+                    let key_text = s.api_key_field.text().trim().to_string();
+                    if key_text.is_empty() {
+                        s.error = Some("paste a non-empty API key".into());
+                    } else if let Err(error) = s.run.submit(WizardAnswer::Secret(key_text.clone()))
+                    {
+                        s.error = Some(error);
+                    } else {
+                        let template = s.template.expect("template chosen");
+                        let id = s.id_field.text().trim().to_string();
+                        let entry = provider_entry_from_add(
+                            s,
+                            template,
+                            templates::headers_for_pasted_key(template, &key_text),
+                        );
+                        self.save_and_fetch_provider(s, id, entry, template);
+                    }
+                }
+                _ => {
+                    s.api_key_field.handle_key(key);
+                }
+            },
+            Some("env-var") => match key.code {
+                KeyCode::Enter => {
+                    let env_var = s.env_var_field.text().trim().to_string();
+                    if env_var.is_empty() {
+                        s.error = Some("environment variable name cannot be empty".into());
+                    } else if let Err(error) = s.run.submit(WizardAnswer::Text(env_var.clone())) {
+                        s.error = Some(error);
+                    } else {
+                        let template = s.template.expect("template chosen");
+                        let id = s.id_field.text().trim().to_string();
+                        let entry = provider_entry_from_add(
+                            s,
+                            template,
+                            templates::headers_for_env_var(template, &env_var),
+                        );
+                        self.save_and_fetch_provider(s, id, entry, template);
+                    }
+                }
+                _ => {
+                    s.env_var_field.handle_key(key);
                 }
             },
             Some("headers") => {
@@ -1369,6 +1466,42 @@ impl SettingsCx {
                     let id = s.id_field.text().trim().to_string();
                     let entry = provider_entry_from_add(s, template, Vec::new());
                     self.save_and_fetch_provider(s, id, entry, template);
+                }
+            }
+            Some("test-key-choice") => {
+                const TEST_CHOICES: [&str; 2] = ["test", "skip-test"];
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        s.test_choice_cursor =
+                            crate::tui::nav::wrap_prev(s.test_choice_cursor, TEST_CHOICES.len());
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        s.test_choice_cursor =
+                            crate::tui::nav::wrap_next(s.test_choice_cursor, TEST_CHOICES.len());
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        let choice = TEST_CHOICES[s.test_choice_cursor];
+                        if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
+                            s.error = Some(error);
+                        } else if choice == "skip-test" {
+                            s.error = Some(
+                                "key saved but unverified — it will be tested on your first message."
+                                    .into(),
+                            );
+                        } else if let Some(id) = s.saved_provider_id.clone() {
+                            if let Some(entry) = self.config.providers.get(&id).cloned() {
+                                s.error = Some("Testing key via /models…".into());
+                                s.fetch = Some(FetchHandle::spawn(id, entry));
+                            }
+                            let _ = s.run.submit(WizardAnswer::Acknowledged);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("test-skipped") => {
+                if matches!(key.code, KeyCode::Enter) {
+                    let _ = s.run.submit(WizardAnswer::Acknowledged);
                 }
             }
             Some("saving" | "fetching") => {
@@ -2313,7 +2446,7 @@ impl SettingsCx {
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
                 }
             }
-            Some("id" | "url" | "headers") => {
+            Some("id" | "url" | "auth-method" | "api-key" | "env-var" | "headers") => {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
@@ -2322,6 +2455,54 @@ impl SettingsCx {
                 lines.push(Line::default());
                 render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
                 render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                if s.is_step("auth-method") {
+                    lines.push(Line::default());
+                    let options = [
+                        ("Paste key", "store masked key as $secret:"),
+                        ("Use env var", "write a $VAR reference"),
+                        ("Advanced headers", "edit raw HTTP headers"),
+                    ];
+                    for (index, (label, description)) in options.iter().enumerate() {
+                        let marker = if index == s.auth_method_cursor {
+                            "▸ "
+                        } else {
+                            "  "
+                        };
+                        let style = if index == s.auth_method_cursor {
+                            yellow.add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::raw(marker),
+                            Span::styled((*label).to_string(), style),
+                            Span::raw(" — "),
+                            Span::styled((*description).to_string(), muted),
+                        ]));
+                    }
+                }
+                if s.is_step("api-key") {
+                    lines.push(Line::default());
+                    let masked = if s.api_key_field.text().is_empty() {
+                        ""
+                    } else {
+                        "••••••••"
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("api key: ", muted),
+                        Span::styled(masked.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                    if let Some(meta) = t.api_key {
+                        lines.push(Line::from(Span::styled(
+                            format!("Hint: {} · {}", meta.format_hint, meta.console_url),
+                            muted,
+                        )));
+                    }
+                }
+                if s.is_step("env-var") {
+                    lines.push(Line::default());
+                    render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                }
                 if s.is_step("headers") {
                     lines.push(Line::default());
                     render_header_editor(&mut lines, &s.headers);
@@ -2382,10 +2563,49 @@ impl SettingsCx {
                 lines.push(Line::default());
                 render_oauth_body(&mut lines, OAuthFlowView::OAuth(state));
             }
-            Some("saving" | "fetching") => {
+            Some("test-key-choice") => {
+                lines.push(Line::from(Span::styled(
+                    "Test key now?".to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                for (index, (label, description)) in [
+                    ("Test key", "validate credentials now"),
+                    ("Skip test", "save now and validate on first use"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let marker = if index == s.test_choice_cursor {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
+                    let style = if index == s.test_choice_cursor {
+                        yellow.add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled((*label).to_string(), style),
+                        Span::raw(" — "),
+                        Span::styled((*description).to_string(), muted),
+                    ]));
+                }
+            }
+            Some("test-skipped") => {
+                lines.push(Line::from(Span::styled(
+                    "key saved but unverified — it will be tested on your first message."
+                        .to_string(),
+                    muted,
+                )));
+            }
+            Some("saving" | "fetching" | "test-key") => {
                 lines.push(Line::from(Span::styled(
                     if s.is_step("saving") {
                         "Saving config…"
+                    } else if s.is_step("test-key") {
+                        "Testing key…"
                     } else {
                         "Fetching /models…"
                     }
@@ -3576,6 +3796,8 @@ impl SettingsPage for ProvidersPage {
             ProvidersPage::Add(s) => match s.run.current_step_id() {
                 Some("template") => "↑/↓  enter: choose  esc: cancel",
                 Some("id" | "url") => "type to edit  enter: next  esc: cancel",
+                Some("auth-method" | "test-key-choice") => "↑/↓  enter: choose  esc: cancel",
+                Some("api-key" | "env-var") => "type/paste  enter: save  esc: cancel",
                 Some("headers") => {
                     if s.headers.is_editing() {
                         "type to edit  Tab: switch field  enter: save  esc: cancel"
@@ -3610,7 +3832,8 @@ impl SettingsPage for ProvidersPage {
                         ))
                     }
                 },
-                Some("saving" | "fetching") => "(in progress)  esc: cancel",
+                Some("saving" | "fetching" | "test-key") => "(in progress)  esc: cancel",
+                Some("test-skipped") => "enter: continue",
                 Some("done") | None => "enter: back to list",
                 Some(_) => "esc: cancel",
             },

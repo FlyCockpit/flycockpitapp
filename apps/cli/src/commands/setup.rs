@@ -32,6 +32,21 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_provider_add(template: Option<String>) -> Result<()> {
+    let stdin_tty = io::stdin().is_terminal();
+    let cwd = std::env::current_dir().context("getting cwd")?;
+    if let Some(template) = template.as_deref()
+        && crate::providers::template_by_id(template).is_none()
+    {
+        bail!("unknown provider template `{template}`; run `cockpit providers list`");
+    }
+    let wizard = crate::wizard::provider_descriptor_with_template(template.as_deref());
+    let mut io = StdTerminalIo;
+    let mut actions = ProviderSetupActions::new(cwd);
+    run_terminal_wizard(wizard, &mut io, &stdin_tty, &mut actions).await?;
+    Ok(())
+}
+
 async fn choose_wizard(
     io: &mut dyn TerminalIo,
     tty: bool,
@@ -374,6 +389,9 @@ impl ProviderSetupActions {
             "fetching" => {
                 self.fetch_models(run, io).await?;
             }
+            "test-key" => {
+                self.test_key(run, io).await?;
+            }
             "security-save" => match apply_security_answers(&self.cwd, run)? {
                 Some(path) => {
                     self.security_saved = Some(path.clone());
@@ -388,8 +406,8 @@ impl ProviderSetupActions {
 
     fn save_provider(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
         let id = provider_id_answer(run).context("provider id answer")?;
-        let mut entry =
-            provider_entry_from_answers(run, self.headers.clone()).context("provider answers")?;
+        let headers = provider_headers_for_answers(run, &self.headers)?;
+        let mut entry = provider_entry_from_answers(run, headers).context("provider answers")?;
         let config_path = self.config_path();
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)
@@ -397,14 +415,12 @@ impl ProviderSetupActions {
         }
         let mut doc = ConfigDoc::load(&config_path)?;
         let mut cfg = doc.providers();
-        if cfg.providers.contains_key(&id) {
-            bail!("a provider with id `{id}` already exists");
-        }
         let mut providers = std::collections::BTreeMap::from([(id.clone(), entry.clone())]);
         let notice = crate::secret_ref::protect_literal_headers(&mut providers, None)?;
         entry = providers
             .remove(&id)
             .expect("provider inserted for secret protection");
+        let headers_for_notice = entry.headers.clone();
         cfg.providers.insert(id.clone(), entry);
         doc.write(&cfg)?;
         self.saved = Some((id.clone(), config_path));
@@ -412,6 +428,75 @@ impl ProviderSetupActions {
             io.write_line(&format!("Saved provider `{id}`. {}", notice.render()))?;
         } else {
             io.write_line(&format!("Saved provider `{id}`."))?;
+        }
+        if let Some(message) = env_var_detection_notice(&headers_for_notice) {
+            io.write_line(&message)?;
+        }
+        Ok(())
+    }
+
+    async fn test_key(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
+        let Some((id, config_path)) = self.saved.clone() else {
+            return Ok(());
+        };
+        let Some(template) = selected_provider_template(run) else {
+            return Ok(());
+        };
+        let mut doc = ConfigDoc::load(&config_path)?;
+        let mut cfg = doc.providers();
+        let Some(entry) = cfg.providers.get(&id).cloned() else {
+            return Ok(());
+        };
+        match crate::providers::auth_check::check_provider_auth(
+            &id,
+            &entry,
+            template,
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            Ok(crate::providers::auth_check::AuthCheckSuccess::Models { models, catalog }) => {
+                let Some(entry) = cfg.providers.get_mut(&id) else {
+                    return Ok(());
+                };
+                let policy = match cfg
+                    .on_unlisted_models_fetch
+                    .unwrap_or(OnUnlistedModelsFetch::Keep)
+                {
+                    OnUnlistedModelsFetch::Remove => ModelMergePolicy::RemoveUnlisted,
+                    OnUnlistedModelsFetch::Ask | OnUnlistedModelsFetch::Keep => {
+                        ModelMergePolicy::KeepUnlisted
+                    }
+                };
+                let before = entry.models.clone();
+                entry.models = crate::config::providers::merge_fetched_models_with_policy(
+                    entry.effective_template(&id),
+                    &before,
+                    models,
+                    policy,
+                );
+                entry.models_fetched_at = Some(Utc::now());
+                entry.model_catalog = catalog;
+                entry.mark_model_fetch_success(catalog);
+                io.write_line(&format!("key verified · {} models", entry.models.len()))?;
+                doc.write(&cfg)?;
+            }
+            Ok(crate::providers::auth_check::AuthCheckSuccess::Checked) => {
+                io.write_line("key verified")?;
+            }
+            Err(crate::providers::auth_check::AuthCheckError::CredentialsRejected(error)) => {
+                io.write_line(&format!(
+                    "{error} Retry, re-enter key, or choose skip-test to continue."
+                ))?;
+            }
+            Err(crate::providers::auth_check::AuthCheckError::Network(error)) => {
+                io.write_line(&format!(
+                    "could not reach provider host: {error}. Retry or choose skip-test to continue."
+                ))?;
+            }
+            Err(crate::providers::auth_check::AuthCheckError::Other(error)) => {
+                io.write_line(&format!("key test failed: {error}"))?;
+            }
         }
         Ok(())
     }
@@ -489,6 +574,51 @@ impl ProviderSetupActions {
         }
         doc.write(&cfg)?;
         Ok(())
+    }
+}
+
+fn provider_headers_for_answers(
+    run: &WizardRun,
+    advanced_headers: &[HeaderSpec],
+) -> Result<Vec<HeaderSpec>> {
+    let template = selected_provider_template(run).context("provider template answer")?;
+    match run.answer("auth-method") {
+        Some(WizardAnswer::Select(value)) if value == "paste-key" => {
+            let WizardAnswer::Secret(key) = run.answer("api-key").context("api key answer")? else {
+                bail!("api key answer must be secret");
+            };
+            Ok(crate::providers::headers_for_pasted_key(template, key))
+        }
+        Some(WizardAnswer::Select(value)) if value == "env-var" => {
+            let WizardAnswer::Text(env_var) = run
+                .answer("env-var")
+                .context("environment variable answer")?
+            else {
+                bail!("environment variable answer must be text");
+            };
+            Ok(crate::providers::headers_for_env_var(template, env_var))
+        }
+        _ => Ok(advanced_headers.to_vec()),
+    }
+}
+
+fn env_var_detection_notice(headers: &[HeaderSpec]) -> Option<String> {
+    let mut missing = Vec::new();
+    for header in headers {
+        let resolved = crate::envref::resolve(&header.value);
+        for name in resolved.missing {
+            if !name.starts_with("secret:") && !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Environment variable not detected, make sure to set it: {}",
+            missing.join(", ")
+        ))
     }
 }
 
@@ -629,14 +759,29 @@ mod tests {
     struct CockpitConfigEnvGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
         old: Option<std::ffi::OsString>,
+        old_state_home: Option<std::ffi::OsString>,
     }
 
     impl CockpitConfigEnvGuard {
         fn set(path: &std::path::Path) -> Self {
+            Self::set_with_state(
+                path,
+                path.parent()
+                    .unwrap_or_else(|| std::path::Path::new("/tmp")),
+            )
+        }
+
+        fn set_with_state(path: &std::path::Path, state_home: &std::path::Path) -> Self {
             let guard = crate::test_env::lock();
             let old = std::env::var_os(COCKPIT_CONFIG_ENV);
+            let old_state_home = std::env::var_os("XDG_STATE_HOME");
             unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, path) };
-            Self { _guard: guard, old }
+            unsafe { std::env::set_var("XDG_STATE_HOME", state_home) };
+            Self {
+                _guard: guard,
+                old,
+                old_state_home,
+            }
         }
     }
 
@@ -646,12 +791,16 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, value) },
                 None => unsafe { std::env::remove_var(COCKPIT_CONFIG_ENV) },
             }
+            match &self.old_state_home {
+                Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+                None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            }
         }
     }
 
     #[tokio::test]
     async fn terminal_renderer_runs_provider_wizard() {
-        let mut io = ScriptIo::new(&["openai", "", ""]);
+        let mut io = ScriptIo::new(&["openai", "", "", "advanced-headers", "skip-test"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -671,7 +820,7 @@ mod tests {
                 "https://api.openai.com/v1".to_string()
             ))
         );
-        assert_eq!(actions.fetches, 1);
+        assert_eq!(actions.fetches, 0);
         assert!(io.output.contains("Choose a provider template"));
     }
 
@@ -700,7 +849,15 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_renderer_back_navigation() {
-        let mut io = ScriptIo::new(&["openai", "back", "openai", "", ""]);
+        let mut io = ScriptIo::new(&[
+            "openai",
+            "back",
+            "openai",
+            "",
+            "",
+            "advanced-headers",
+            "skip-test",
+        ]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -724,6 +881,132 @@ mod tests {
             io.output.matches("Choose a provider template").count() >= 2,
             "{}",
             io.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn paste_key_stores_secret_ref() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config/config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state(&config_path, &state_home);
+        let secret = "sk-provider-secret-abcdefghijklmnopqrstuvwxyz";
+        let mut io = ScriptIo::new(&["openai", "", "", "", secret, "skip-test"]);
+        let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
+
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .unwrap();
+
+        assert!(run.is_complete());
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "openai")
+                .expect("provider path");
+        let raw = std::fs::read_to_string(provider_path).expect("provider file");
+        assert!(raw.contains("$secret:openai"), "{raw}");
+        assert!(!raw.contains(secret), "{raw}");
+        let store =
+            crate::credentials::CredentialStore::open(state_home.join("cockpit/credentials.json"))
+                .expect("credential store");
+        assert_eq!(
+            store.named_secret("openai"),
+            Some(&format!("Bearer {secret}")[..])
+        );
+        assert!(!io.output.contains(secret), "secret leaked in output");
+        assert!(io.output.contains("Stored 1 provider secret"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_add_terminal_end_to_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config/config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state(&config_path, &state_home);
+        let mut io = ScriptIo::new(&[
+            "openai",
+            "",
+            "",
+            "",
+            "sk-provider-secret-abcdefghijklmnopqrstuvwxyz",
+            "skip-test",
+        ]);
+        let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
+
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .unwrap();
+
+        assert!(run.is_complete());
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "openai")
+                .expect("provider path");
+        let raw = std::fs::read_to_string(provider_path).expect("provider file");
+        assert!(raw.contains("$secret:openai"), "{raw}");
+        assert!(
+            io.output
+                .contains("key saved but unverified — it will be tested on your first message.")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn env_var_path_writes_var_ref() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config/config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state(&config_path, &state_home);
+        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
+        let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
+
+        run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .unwrap();
+
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "openai")
+                .expect("provider path");
+        let raw = std::fs::read_to_string(provider_path).expect("provider file");
+        assert!(raw.contains("Bearer $OPENAI_API_KEY"), "{raw}");
+        assert!(
+            io.output
+                .contains("Environment variable not detected, make sure to set it: OPENAI_API_KEY"),
+            "{}",
+            io.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wizard_skip_test_shows_unverified() {
+        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
+        let mut actions = TestActions::default();
+
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .unwrap();
+
+        assert!(run.is_complete());
+        assert!(
+            io.output
+                .contains("key saved but unverified — it will be tested on your first message.")
         );
     }
 

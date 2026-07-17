@@ -392,8 +392,17 @@ pub enum AgentCommand {
 pub enum ProvidersCommand {
     #[command(alias = "ls")]
     List,
+    /// Add a provider using the terminal setup wizard.
+    Add(ProviderAddArgs),
     /// Show vendor plan limits and quota for configured providers.
     Usage(ProvidersUsageArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ProviderAddArgs {
+    /// Optional built-in provider template id to preselect.
+    #[arg(value_name = "TEMPLATE")]
+    pub template: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1029,6 +1038,17 @@ mod tests {
                 assert_eq!(args.path, Some(PathBuf::from("/tmp/example")))
             }
             other => panic!("expected doctor command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_add_command_parses_optional_template() {
+        let cli = Cli::try_parse_from(["cockpit", "providers", "add", "openai"]).unwrap();
+        match cli.command {
+            Some(Command::Providers(ProvidersCommand::Add(args))) => {
+                assert_eq!(args.template.as_deref(), Some("openai"));
+            }
+            other => panic!("expected providers add command, got {other:?}"),
         }
     }
 

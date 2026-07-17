@@ -35,7 +35,9 @@ async fn validate_png_attachment(bytes: Vec<u8>) -> std::result::Result<Vec<u8>,
         .map_err(internal)?
 }
 
-fn validate_png_attachment_blocking(bytes: Vec<u8>) -> std::result::Result<Vec<u8>, ErrorPayload> {
+pub(crate) fn validate_png_attachment_blocking(
+    bytes: Vec<u8>,
+) -> std::result::Result<Vec<u8>, ErrorPayload> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
     limits.max_image_height = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
@@ -275,4 +277,3 @@ fn consume_image_refs(
         .collect();
     Ok(images)
 }
-

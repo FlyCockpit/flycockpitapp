@@ -131,12 +131,14 @@ impl Approver {
             allow_freetext: false,
             command_detail: command_detail.map(Box::new),
             permission: true,
+            approval_class: Some(GrantKind::Command),
             sandbox_escalation: Some(escalation),
         };
         let response = self
             .raise_and_wait("Sandboxed command failed — choose a remedy", question)
             .await?;
         match response_to_approval_choice(&response, false) {
+            ApprovalChoice::NoninteractiveDeny => Ok(SandboxEscalationApproval::NoninteractiveDeny),
             ApprovalChoice::GrantPaths(scope) => {
                 let Some(offer) = grant_offer else {
                     return Ok(SandboxEscalationApproval::Deny);
@@ -295,16 +297,16 @@ impl Approver {
                 unreachable!()
             };
             match decision {
-                Decision::Deny => {
+                Decision::Deny | Decision::NoninteractiveDeny => {
                     self.record_permission_decision_with_audit(
                         "bash",
                         command,
                         &offered,
-                        Decision::Deny,
+                        decision,
                         DecisionSource::UserPrompt,
                         Some(audit.clone()),
                     );
-                    return Ok(Decision::Deny);
+                    return Ok(decision);
                 }
                 Decision::Allow { scope } => {
                     widest = narrowest(widest, scope);
@@ -350,7 +352,9 @@ impl Approver {
                 )
                 .await?
             {
-                Decision::Deny => return Ok(Some(Decision::Deny)),
+                denial @ (Decision::Deny | Decision::NoninteractiveDeny) => {
+                    return Ok(Some(denial));
+                }
                 Decision::Allow { scope } => {
                     widest = narrowest(widest, scope);
                 }
@@ -430,6 +434,9 @@ impl Approver {
         match choice {
             ApprovalChoice::ApproveAllOnce => Ok(CommandStepDecision::ApproveAllOnce),
             ApprovalChoice::Deny => Ok(CommandStepDecision::Decision(Decision::Deny)),
+            ApprovalChoice::NoninteractiveDeny => {
+                Ok(CommandStepDecision::Decision(Decision::NoninteractiveDeny))
+            }
             ApprovalChoice::GrantPaths(_) => Ok(CommandStepDecision::Decision(Decision::Deny)),
             ApprovalChoice::Approve(Scope::Once) => {
                 Ok(CommandStepDecision::Decision(Decision::Allow {

@@ -522,7 +522,9 @@ fn try_spawn_inner(
                         push_turn_event(
                             &events,
                             &event_notify,
-                            TurnEvent::UserMessageDispatchFailed { error },
+                            TurnEvent::UserMessageDispatchFailed {
+                                error: error.to_string(),
+                            },
                         );
                         continue;
                     }
@@ -1860,27 +1862,37 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     })
 }
 
-async fn upload_submission_images(
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ImageUploadError {
+    #[error("{0}")]
+    Usage(String),
+    #[error("{0}")]
+    Daemon(String),
+    #[error("{0}")]
+    Transport(String),
+}
+
+pub(crate) async fn upload_submission_images(
     client: &crate::daemon::client::DaemonClient,
     images: &[Vec<u8>],
-) -> Result<Vec<proto::ImageAttachmentRef>, String> {
+) -> Result<Vec<proto::ImageAttachmentRef>, ImageUploadError> {
     if images.is_empty() {
         return Ok(Vec::new());
     }
     if images.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
-        return Err(format!(
+        return Err(ImageUploadError::Usage(format!(
             "too many images: {} exceeds {} image limit",
             images.len(),
             proto::MAX_IMAGES_PER_USER_MESSAGE
-        ));
+        )));
     }
     let total: usize = images.iter().map(Vec::len).sum();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
-        return Err(format!(
+        return Err(ImageUploadError::Usage(format!(
             "total image data is too large: {} bytes exceeds {} byte limit",
             total,
             proto::MAX_TOTAL_IMAGE_BYTES
-        ));
+        )));
     }
 
     let mut refs = Vec::with_capacity(images.len());
@@ -1893,16 +1905,18 @@ async fn upload_submission_images(
 async fn upload_one_image(
     client: &crate::daemon::client::DaemonClient,
     png: &[u8],
-) -> Result<proto::ImageAttachmentRef, String> {
+) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
     if png.is_empty() {
-        return Err("image attachment is empty".to_string());
+        return Err(ImageUploadError::Usage(
+            "image attachment is empty".to_string(),
+        ));
     }
     if png.len() > proto::MAX_SINGLE_IMAGE_BYTES {
-        return Err(format!(
+        return Err(ImageUploadError::Usage(format!(
             "image is too large: {} bytes exceeds {} byte limit",
             png.len(),
             proto::MAX_SINGLE_IMAGE_BYTES
-        ));
+        )));
     }
     let sha256 = crate::intel::hex_lower(&Sha256::digest(png));
     let upload_id = match request_or_error(
@@ -1917,7 +1931,11 @@ async fn upload_one_image(
     .await?
     {
         Response::AttachmentUploadStarted { upload_id, .. } => upload_id,
-        other => return Err(format!("unexpected attachment upload response: {other:?}")),
+        other => {
+            return Err(ImageUploadError::Daemon(format!(
+                "unexpected attachment upload response: {other:?}"
+            )));
+        }
     };
 
     let result = upload_one_image_chunks(client, upload_id, png).await;
@@ -1936,7 +1954,7 @@ async fn upload_one_image_chunks(
     client: &crate::daemon::client::DaemonClient,
     upload_id: Uuid,
     png: &[u8],
-) -> Result<proto::ImageAttachmentRef, String> {
+) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
     let max_raw = (proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4) * 3;
     let chunk_len = max_raw.max(1);
     let mut offset = 0usize;
@@ -1944,7 +1962,9 @@ async fn upload_one_image_chunks(
         let end = (offset + chunk_len).min(png.len());
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&png[offset..end]);
         if data_base64.len() > proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES {
-            return Err("encoded attachment chunk exceeded configured frame budget".to_string());
+            return Err(ImageUploadError::Usage(
+                "encoded attachment chunk exceeded configured frame budget".to_string(),
+            ));
         }
         match request_or_error(
             client,
@@ -1958,29 +1978,38 @@ async fn upload_one_image_chunks(
         {
             Response::AttachmentChunkAccepted { next_offset, .. } => {
                 if next_offset != end {
-                    return Err(format!(
+                    return Err(ImageUploadError::Daemon(format!(
                         "attachment upload ack offset mismatch: got {next_offset}, expected {end}"
-                    ));
+                    )));
                 }
                 offset = next_offset;
             }
-            other => return Err(format!("unexpected attachment chunk response: {other:?}")),
+            other => {
+                return Err(ImageUploadError::Daemon(format!(
+                    "unexpected attachment chunk response: {other:?}"
+                )));
+            }
         }
     }
     match request_or_error(client, Request::FinishAttachmentUpload { upload_id }).await? {
         Response::AttachmentUploaded { image_ref } => Ok(image_ref),
-        other => Err(format!("unexpected attachment finish response: {other:?}")),
+        other => Err(ImageUploadError::Daemon(format!(
+            "unexpected attachment finish response: {other:?}"
+        ))),
     }
 }
 
 async fn request_or_error(
     client: &crate::daemon::client::DaemonClient,
     request: Request,
-) -> Result<Response, String> {
+) -> Result<Response, ImageUploadError> {
     match client.request(request).await {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err(error.message),
-        Err(error) => Err(error.to_string()),
+        Ok(Err(error)) if error.code == ErrorCode::BadRequest => {
+            Err(ImageUploadError::Usage(error.message))
+        }
+        Ok(Err(error)) => Err(ImageUploadError::Daemon(error.to_string())),
+        Err(error) => Err(ImageUploadError::Transport(error.to_string())),
     }
 }
 

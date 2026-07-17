@@ -165,6 +165,9 @@ impl Tool for EscalateTool {
             EscalationApproval::Deny => Ok(ToolOutput::text(
                 "Escalation denied by user or policy; the command was not rerun.",
             )),
+            EscalationApproval::NoninteractiveDeny => {
+                Ok(ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL))
+            }
             EscalationApproval::RunUnconfinedOnce => {
                 crate::tools::bash::rerun_escalated_bash(row.wire_input_json.clone(), ctx, None)
                     .await
@@ -182,6 +185,7 @@ enum EscalationApproval {
     GrantAndRetryConfined,
     RunUnconfinedOnce,
     Deny,
+    NoninteractiveDeny,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +299,9 @@ async fn prompt_user(
             Ok(EscalationApproval::RunUnconfinedOnce)
         }
         crate::approval::SandboxEscalationApproval::Deny => Ok(EscalationApproval::Deny),
+        crate::approval::SandboxEscalationApproval::NoninteractiveDeny => {
+            Ok(EscalationApproval::NoninteractiveDeny)
+        }
     }
 }
 

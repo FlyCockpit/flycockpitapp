@@ -1331,6 +1331,39 @@ impl Db {
         Ok(out)
     }
 
+    /// The most recent durable session for a canonical workspace root,
+    /// ordered by its latest user/assistant message rather than incidental
+    /// metadata activity. Used by noninteractive `run --continue`.
+    pub fn most_recent_session_for_root_by_message(
+        &self,
+        project_root: &str,
+    ) -> Result<Option<SessionRow>> {
+        self.read_blocking(|conn| {
+            let result = conn.query_row(
+                "SELECT s.*
+                   FROM sessions AS s
+                  WHERE s.project_root = ?1 AND s.ephemeral = 0
+                  ORDER BY COALESCE(
+                               (SELECT MAX(e.ts_ms)
+                                  FROM session_events AS e
+                                 WHERE e.session_id = s.session_id
+                                   AND e.type IN ('user_message', 'assistant_message')),
+                               s.last_active_at * 1000
+                           ) DESC,
+                           s.last_active_at DESC,
+                           s.session_id DESC
+                  LIMIT 1",
+                [project_root],
+                SessionRow::from_row,
+            );
+            match result {
+                Ok(row) => Ok(Some(row)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error).context("querying latest session by message time"),
+            }
+        })
+    }
+
     /// Assemble the `/sessions` browser rows for one level, the single
     /// source of truth shared by the daemon's `ListSessions` handler and
     /// the TUI's daemonless direct-DB fallback. The level selection
@@ -1586,6 +1619,7 @@ fn interrupt_payload_has_permission(
             question,
             InterruptQuestion::Single {
                 permission: true,
+                approval_class: None,
                 ..
             }
         )
@@ -1815,6 +1849,49 @@ mod tests {
         assert_eq!(g.project_root, "/x/y");
         assert_eq!(g.active_agent, "Build");
         assert!(g.ended_at.is_none());
+    }
+
+    #[test]
+    fn latest_session_for_root_orders_by_last_message() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_session("p", "/proj", "Build").unwrap();
+        let second = db.create_session("p", "/proj", "Build").unwrap();
+        let other = db.create_session("q", "/other", "Build").unwrap();
+        let first_seq = record_message(&db, first.session_id, "newest message", false);
+        let second_seq = record_message(&db, second.session_id, "older message", true);
+        let other_seq = record_message(&db, other.session_id, "newest elsewhere", false);
+
+        db.write_blocking(move |conn| {
+            conn.execute(
+                "UPDATE session_events SET ts_ms = 3000 WHERE seq = ?1",
+                [first_seq],
+            )?;
+            conn.execute(
+                "UPDATE session_events SET ts_ms = 1000 WHERE seq = ?1",
+                [second_seq],
+            )?;
+            conn.execute(
+                "UPDATE session_events SET ts_ms = 4000 WHERE seq = ?1",
+                [other_seq],
+            )?;
+            conn.execute(
+                "UPDATE sessions SET last_active_at = 9999 WHERE session_id = ?1",
+                [second.session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let selected = db
+            .most_recent_session_for_root_by_message("/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.session_id, first.session_id);
+        assert!(
+            db.most_recent_session_for_root_by_message("/missing")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2631,6 +2708,7 @@ mod tests {
                     allow_freetext: false,
                     command_detail: None,
                     permission: true,
+                    approval_class: None,
                     sandbox_escalation: None,
                 }],
             },

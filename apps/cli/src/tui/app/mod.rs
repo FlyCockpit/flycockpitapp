@@ -6507,6 +6507,7 @@ impl App {
                 allow_freetext: false,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -6584,6 +6585,7 @@ impl App {
                 allow_freetext: false,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -12245,6 +12247,7 @@ mod keys_overlay_tests {
                     allow_freetext: false,
                     command_detail: None,
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 }],
             },
@@ -14023,6 +14026,7 @@ mod attention_interrupt_surface_tests {
                 allow_freetext: false,
                 command_detail: None,
                 permission,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         }

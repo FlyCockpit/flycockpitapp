@@ -111,6 +111,15 @@ Use JSON/NDJSON output for automation:
 cockpit run --json "Run the relevant tests and summarize failures"
 ```
 
+Message arguments take precedence over stdin; with no message or
+`--prompt-file`, `run` reads stdin to EOF. Target another workspace with
+`-C/--cwd` (or global `--project`), continue its latest session with `-c`, and
+use repeatable `--approve command|path` for run-only approval grants. Approval
+requests are otherwise auto-denied without parking the process. Default output
+prints the session id to stderr; JSON ends with `run_complete`. Exit codes are
+0 success, 1 turn failure, 2 usage/configuration, 3 trust refusal, and 4 daemon
+or connection failure.
+
 Generate or refresh a project instruction file:
 
 ```sh
@@ -130,7 +139,7 @@ cockpit packages prune --dry-run
 | Command | Purpose |
 | --- | --- |
 | `cockpit` | Launch the TUI in the current directory. |
-| `cockpit run [message]` | Run a non-interactive turn through the daemon. Reads stdin when no message is supplied. |
+| `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |
 | `cockpit daemon start --detach` | Start the persistent background daemon. |
 | `cockpit daemon status` | Show daemon status. |
 | `cockpit daemon stop` | Stop the daemon. |

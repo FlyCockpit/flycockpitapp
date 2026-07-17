@@ -629,6 +629,7 @@ async fn result_injection_override(
         // A genuine decision prompt (distinct action choices), not a
         // tool-permission scope select — keep the question presentation.
         permission: false,
+        approval_class: None,
         sandbox_escalation: None,
     };
     let set = InterruptQuestionSet {
@@ -729,6 +730,7 @@ async fn result_injection_ask(
         allow_freetext: false,
         command_detail: None,
         permission: false,
+        approval_class: None,
         sandbox_escalation: None,
     };
     let set = InterruptQuestionSet {

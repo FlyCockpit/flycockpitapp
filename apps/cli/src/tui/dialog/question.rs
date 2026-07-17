@@ -207,6 +207,7 @@ impl QuestionDialog {
                 q,
                 InterruptQuestion::Single {
                     permission: true,
+                    approval_class: None,
                     ..
                 }
             )
@@ -1643,6 +1644,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         }
@@ -1701,6 +1703,7 @@ mod tests {
                 allow_freetext: false,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         });
@@ -1755,6 +1758,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: true,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         });
@@ -1846,6 +1850,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         });
@@ -1870,6 +1875,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2044,6 +2050,7 @@ mod tests {
                 allow_freetext: false,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2264,6 +2271,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2308,6 +2316,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2348,6 +2357,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2391,6 +2401,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         }
@@ -2447,6 +2458,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2563,6 +2575,7 @@ mod tests {
                 // Bash approval = a permission interrupt (stripped
                 // presentation: no marker, no free-text).
                 permission: true,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2659,6 +2672,7 @@ mod tests {
                 allow_freetext: false,
                 command_detail: None,
                 permission: true,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };
@@ -2744,6 +2758,7 @@ mod tests {
                     allow_freetext: true,
                     command_detail: None,
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 }],
             },
@@ -2766,6 +2781,7 @@ mod tests {
                     allow_freetext: true,
                     command_detail: None,
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 }],
             },
@@ -3327,6 +3343,7 @@ mod tests {
                     policy_cap: None,
                 })),
                 permission: true,
+                approval_class: None,
                 sandbox_escalation: Some(esc),
             }],
         };

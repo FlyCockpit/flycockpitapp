@@ -53,6 +53,7 @@ impl Approver {
         let question = approval_question(
             &label,
             false,
+            GrantKind::Path,
             Some(&description),
             detail,
             None,
@@ -63,6 +64,7 @@ impl Approver {
         let choice = response_to_approval_choice(&response, false);
         let decision = match choice {
             ApprovalChoice::Deny => Decision::Deny,
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::GrantPaths(_) => Decision::Deny,
             ApprovalChoice::Approve(scope) => {
@@ -112,6 +114,16 @@ impl Approver {
             .prompt_gitignore_stage1(display_path, parent_label)
             .await?;
         let glob = match shape {
+            GitignoreShape::NoninteractiveReject => {
+                self.record_permission_decision(
+                    "read",
+                    display_path,
+                    &[],
+                    Decision::NoninteractiveDeny,
+                    DecisionSource::HeadlessAutoReject,
+                );
+                return Ok(GitignoreReadOutcome::NoninteractiveReject);
+            }
             GitignoreShape::Reject => {
                 self.record_permission_decision(
                     "read",
@@ -130,6 +142,10 @@ impl Approver {
         let offered = [Scope::Once, Scope::Session, Scope::Project];
         let persistence = self.prompt_gitignore_stage2(display_path).await?;
         let (outcome, decision) = match persistence {
+            GitignorePersistence::NoninteractiveReject => (
+                GitignoreReadOutcome::NoninteractiveReject,
+                Decision::NoninteractiveDeny,
+            ),
             GitignorePersistence::Reject => (GitignoreReadOutcome::Reject, Decision::Deny),
             GitignorePersistence::Once => (
                 GitignoreReadOutcome::ApproveOnce,
@@ -178,10 +194,17 @@ impl Approver {
             allow_freetext: false,
             command_detail: None,
             permission: true,
+            approval_class: Some(GrantKind::Path),
             sandbox_escalation: None,
         };
         let description = format!("`{display_path}` is gitignored — allow read?");
         let response = self.raise_and_wait(&description, question).await?;
+        if matches!(
+            &response,
+            ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
+        ) {
+            return Ok(GitignoreShape::NoninteractiveReject);
+        }
         Ok(match response_single_id(&response) {
             Some(id) if id == ID_GITIGNORE_FILE => GitignoreShape::File,
             Some(id) if id == ID_GITIGNORE_PARENT => GitignoreShape::Parent,
@@ -204,10 +227,17 @@ impl Approver {
             allow_freetext: false,
             command_detail: None,
             permission: true,
+            approval_class: Some(GrantKind::Path),
             sandbox_escalation: None,
         };
         let description = format!("Allow reading `{display_path}` — persistence?");
         let response = self.raise_and_wait(&description, question).await?;
+        if matches!(
+            &response,
+            ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
+        ) {
+            return Ok(GitignorePersistence::NoninteractiveReject);
+        }
         Ok(match response_single_id(&response) {
             Some(id) if id == ID_ONCE => GitignorePersistence::Once,
             Some(id) if id == ID_SESSION => GitignorePersistence::Session,

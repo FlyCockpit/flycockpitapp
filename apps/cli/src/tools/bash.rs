@@ -510,8 +510,6 @@ async fn call_bash_inner(
         let decision = approver
             .approve_command_escalated(command, confined_exit, confined_stderr)
             .await?;
-        // Deny → fall through with the original sandboxed result;
-        // `approval_scope_recorded` stays `None` (per the settled spec).
         if let crate::approval::Decision::Allow { scope } = decision {
             meta.approval_scope_recorded = Some(scope.as_str().to_string());
             let rerun = run_shell(
@@ -559,6 +557,11 @@ async fn call_bash_inner(
                 }
                 RunOutcome::Done(o) => final_outcome = o,
             }
+        } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+            // A headless run must give the model the structured reason for
+            // the refusal, not merely replay the sandbox's opaque stderr.
+            return Ok(ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+                .with_bash_meta(meta, &resource_meta));
         }
     }
 
@@ -678,6 +681,10 @@ async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result
         .await?;
     if decision.is_allowed() {
         Ok(())
+    } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+        Err(crate::engine::tool::invalid_input(
+            crate::approval::NONINTERACTIVE_RUN_DENIAL,
+        ))
     } else {
         Err(crate::engine::tool::invalid_input(outside_cwd_error(
             &ctx.cwd,
@@ -1394,6 +1401,9 @@ async fn defensive_human_escalation_offer(
                 .await
                 .map(Some)
         }
+        crate::approval::SandboxEscalationApproval::NoninteractiveDeny => Ok(Some(
+            ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL),
+        )),
         crate::approval::SandboxEscalationApproval::Deny
         | crate::approval::SandboxEscalationApproval::GrantAndRetryConfined { .. } => Ok(None),
     }

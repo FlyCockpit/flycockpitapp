@@ -52,10 +52,15 @@ impl Approver {
         source: DecisionSource,
         audit: Option<PermissionDecisionAudit>,
     ) {
+        let source = if matches!(decision, Decision::NoninteractiveDeny) {
+            DecisionSource::HeadlessAutoReject
+        } else {
+            source
+        };
         let offered: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
         let (decision_str, scope) = match decision {
             Decision::Allow { scope } => ("allow", Some(scope.as_str())),
-            Decision::Deny => ("deny", None),
+            Decision::Deny | Decision::NoninteractiveDeny => ("deny", None),
         };
         let mut data = serde_json::json!({
             "tool": tool,
@@ -115,6 +120,7 @@ impl Approver {
             | ApprovalChoice::Reject(_)
             | ApprovalChoice::ApproveAllOnce
             | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(_) => Decision::Allow { scope: Scope::Once },
         };
         // Once-only per-call approval → the only offered scope is `Once`.
@@ -158,6 +164,7 @@ impl Approver {
             allow_freetext: false,
             command_detail: None,
             permission: true,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let description = format!("Clone `{identifier}` from {clone_url} for docs? ({rationale})");

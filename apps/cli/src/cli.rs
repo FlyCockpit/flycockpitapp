@@ -18,8 +18,8 @@ use crate::agents::AgentMode;
     propagate_version = true
 )]
 pub struct Cli {
-    /// Project path for the no-subcommand TUI launch. Without this flag,
-    /// bare `cockpit` opens the current directory.
+    /// Project path for the no-subcommand TUI launch, or an alias for
+    /// `cockpit run --cwd`. Without this flag, the current directory is used.
     #[arg(long, value_name = "PATH")]
     pub project: Option<PathBuf>,
 
@@ -64,6 +64,9 @@ pub enum Command {
     Ask(AskArgs),
 
     /// Run a one-shot prompt non-interactively (matches `opencode run`).
+    #[command(
+        after_long_help = "Exit codes:\n  0  turn succeeded\n  1  turn failed\n  2  usage or configuration error\n  3  workspace trust refused\n  4  daemon or connection error"
+    )]
     Run(RunArgs),
 
     /// Manage agents.
@@ -254,7 +257,8 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct RunArgs {
-    /// Message to send. If absent, read from stdin.
+    /// Message to send. When present, stdin is ignored. If absent, read
+    /// --prompt-file or stdin to EOF.
     pub message: Vec<String>,
 
     /// Read the exact UTF-8 prompt body from a file.
@@ -274,13 +278,23 @@ pub struct RunArgs {
     #[arg(short, long)]
     pub model: Option<String>,
 
-    /// Continue the last session.
-    #[arg(short, long)]
+    /// Continue the workspace's most recent session by last-message time.
+    #[arg(short, long, conflicts_with = "session")]
     pub continue_session: bool,
 
     /// Continue a specific session id.
-    #[arg(short, long, value_name = "ID")]
+    #[arg(short, long, value_name = "ID", conflicts_with = "continue_session")]
     pub session: Option<String>,
+
+    /// Run against this directory. Sets workspace trust, sandbox, relative
+    /// attachment, and session-root resolution.
+    #[arg(short = 'C', long, value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
+
+    /// Auto-approve this existing approval taxonomy class for this run only.
+    /// Repeatable; valid classes: command, path. Grants are never persisted.
+    #[arg(long, value_name = "CLASS")]
+    pub approve: Vec<crate::approval::store::GrantKind>,
 
     /// Fork instead of continuing in place.
     #[arg(long)]

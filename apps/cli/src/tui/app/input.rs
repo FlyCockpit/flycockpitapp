@@ -4684,6 +4684,7 @@ mod chat_scrollback_key_tests {
                     allow_freetext: false,
                     command_detail: None,
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 }],
             },

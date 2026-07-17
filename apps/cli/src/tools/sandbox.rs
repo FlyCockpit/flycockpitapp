@@ -114,6 +114,9 @@ pub async fn check_native_access(
             if decision.is_allowed() {
                 return Ok(path.to_path_buf());
             }
+            if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+                return Err(invalid_input(crate::approval::NONINTERACTIVE_RUN_DENIAL));
+            }
             return Err(invalid_input(format!(
                 "`{}` is outside the session boundary and access was denied",
                 path.display()
@@ -134,6 +137,8 @@ pub async fn check_native_access(
     let decision = approver.approve_path(&effective, required).await?;
     if decision.is_allowed() {
         Ok(effective)
+    } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+        Err(invalid_input(crate::approval::NONINTERACTIVE_RUN_DENIAL))
     } else {
         Err(invalid_input(format!(
             "`{}` is outside the session boundary and access was denied",
@@ -225,6 +230,9 @@ pub async fn check_gitignore_read(
             ctx.session.remember_gitignore_reject(display.clone());
             Ok(Some(gitignore_refusal(&display)))
         }
+        crate::approval::GitignoreReadOutcome::NoninteractiveReject => Ok(Some(ToolOutput::text(
+            crate::approval::NONINTERACTIVE_RUN_DENIAL,
+        ))),
     }
 }
 
@@ -916,5 +924,45 @@ mod tests {
             .await
             .unwrap();
         assert!(out2.is_none(), "session glob recorded → silent reread");
+    }
+
+    #[tokio::test]
+    async fn gitignore_gate_preserves_noninteractive_run_denial_and_audit_source() {
+        use crate::daemon::proto::ResolveResponse;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gitignore_ctx(tmp.path());
+        let db = ctx.session.db.clone();
+        let sid = ctx.session.id;
+        let hub = ctx.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let interrupt_id = loop {
+                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(hub.resolve(
+                interrupt_id,
+                ResolveResponse::Freetext {
+                    text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                },
+            ));
+        });
+
+        let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))
+            .await
+            .unwrap()
+            .expect("noninteractive denial output");
+        resolver.await.unwrap();
+        assert_eq!(out.content, crate::approval::NONINTERACTIVE_RUN_DENIAL);
+        let event = ctx
+            .session
+            .db
+            .list_session_events(sid)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "permission_decision")
+            .expect("permission decision audit event");
+        assert_eq!(event.data["source"], "headless_auto_reject");
     }
 }

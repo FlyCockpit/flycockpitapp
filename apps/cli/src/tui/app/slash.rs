@@ -1139,6 +1139,7 @@ impl App {
                     // `/init` choice is an agent-asked question, not a
                     // tool-permission approval — keep radios.
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 }],
             };

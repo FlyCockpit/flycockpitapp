@@ -1767,6 +1767,7 @@ impl Driver {
             allow_freetext: false,
             command_detail: None,
             permission: false,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let set = InterruptQuestionSet {
@@ -4075,6 +4076,7 @@ impl Driver {
             allow_freetext: false,
             command_detail: None,
             permission: true,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let set = InterruptQuestionSet {

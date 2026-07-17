@@ -218,6 +218,7 @@ fn parse_question_arg(q: &QuestionArg, index: usize) -> Result<InterruptQuestion
                     // The `question` tool always raises a genuine agent
                     // question — never a tool-permission approval.
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 })
             } else {
@@ -372,6 +373,7 @@ mod tests {
                     allow_freetext: true,
                     command_detail: None,
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 },
                 InterruptQuestion::Freetext {

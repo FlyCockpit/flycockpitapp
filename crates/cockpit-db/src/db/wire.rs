@@ -65,6 +65,39 @@ pub enum SessionActivityState {
     ToolRunning,
 }
 
+/// Existing approval-store taxonomy. Interrupts carry this exact class so
+/// noninteractive clients can grant a class once without parsing display copy
+/// or inventing a parallel vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantKind {
+    Command,
+    Path,
+}
+
+impl GrantKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Path => "path",
+        }
+    }
+}
+
+impl std::str::FromStr for GrantKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "command" => Ok(Self::Command),
+            "path" => Ok(Self::Path),
+            other => Err(format!(
+                "unknown approval class `{other}`; expected command or path"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", content = "data")]
 pub enum InterruptQuestion {
@@ -77,6 +110,8 @@ pub enum InterruptQuestion {
         command_detail: Option<Box<CommandDetail>>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         permission: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_class: Option<GrantKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox_escalation: Option<SandboxEscalation>,
     },

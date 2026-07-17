@@ -1526,6 +1526,7 @@ mod tests {
                 allow_freetext: false,
                 command_detail: None,
                 permission: true,
+                approval_class: None,
                 sandbox_escalation: None,
             }),
             questions: None,

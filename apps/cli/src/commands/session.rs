@@ -210,7 +210,8 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
         } else {
             OutputFormat::Default
         };
-        crate::commands::run::pump_events(&client, session_id, format, args.json).await?;
+        crate::commands::run::pump_events(&client, session_id, format, args.json, &[], false)
+            .await?;
     }
     Ok(())
 }
@@ -415,6 +416,7 @@ mod tests {
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
+                approval_class: None,
                 sandbox_escalation: None,
             }],
         };

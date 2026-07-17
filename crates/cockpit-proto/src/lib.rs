@@ -868,7 +868,7 @@ pub use cockpit_config::{
 
 #[allow(unused_imports)]
 pub use cockpit_db::wire::{
-    CharSpan, CommandDetail, InterruptDecision, InterruptDecisionLine, InterruptOption,
+    CharSpan, CommandDetail, GrantKind, InterruptDecision, InterruptDecisionLine, InterruptOption,
     InterruptQuestion, InterruptQuestionSet, MessageRole, ResolveResponse, SandboxEscalation,
     SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
@@ -1541,6 +1541,7 @@ mod tests {
             allow_freetext: true,
             command_detail: None,
             permission: false,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let s = serde_json::to_string(&q).unwrap();
@@ -1569,6 +1570,7 @@ mod tests {
             allow_freetext: false,
             command_detail: None,
             permission: true,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let s = serde_json::to_string(&q).unwrap();
@@ -1605,6 +1607,7 @@ mod tests {
             }],
             allow_freetext: false,
             permission: true,
+            approval_class: None,
             sandbox_escalation: None,
             command_detail: Some(Box::new(CommandDetail {
                 full_command: "git push && cargo build".into(),
@@ -1666,6 +1669,7 @@ mod tests {
             }],
             allow_freetext: false,
             permission: true,
+            approval_class: None,
             command_detail: None,
             sandbox_escalation: Some(SandboxEscalation {
                 confined_exit: 101,

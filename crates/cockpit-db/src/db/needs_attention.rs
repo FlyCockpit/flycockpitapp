@@ -422,6 +422,7 @@ pub fn summarize_interrupt_decision(
             question,
             InterruptQuestion::Single {
                 permission: true,
+                approval_class: None,
                 ..
             }
         )
@@ -600,6 +601,7 @@ mod tests {
             allow_freetext: true,
             command_detail: None,
             permission: false,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let iid = db
@@ -642,6 +644,7 @@ mod tests {
                         allow_freetext: false,
                         command_detail: None,
                         permission: true,
+                        approval_class: None,
                         sandbox_escalation: None,
                     },
                     InterruptQuestion::Freetext {
@@ -693,6 +696,7 @@ mod tests {
                     allow_freetext: true,
                     command_detail: None,
                     permission: false,
+                    approval_class: None,
                     sandbox_escalation: None,
                 },
                 InterruptQuestion::Freetext {

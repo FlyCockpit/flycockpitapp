@@ -38,6 +38,8 @@ use crate::config::extended::{ApprovalPolicyConfig, ApprovalPolicyScope};
 use crate::db::Db;
 use crate::tools::shell_sandbox::SandboxPathAccess;
 
+pub use cockpit_db::wire::GrantKind;
+
 /// The four approval scopes the user chose. Ordered narrowest→widest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -103,24 +105,6 @@ impl LoopVerdict {
         match self {
             LoopVerdict::Accept => "accept",
             LoopVerdict::Reject => "reject",
-        }
-    }
-}
-
-/// What kind of thing a grant covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantKind {
-    /// A shell command, keyed by `argv[0]`+subcommand.
-    Command,
-    /// A filesystem path (absolute path or prefix).
-    Path,
-}
-
-impl GrantKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            GrantKind::Command => "command",
-            GrantKind::Path => "path",
         }
     }
 }

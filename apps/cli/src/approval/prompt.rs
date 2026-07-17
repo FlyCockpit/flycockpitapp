@@ -159,6 +159,7 @@ impl Approver {
         let question = approval_question(
             label,
             wrapper,
+            GrantKind::Command,
             None,
             detail,
             escalation,

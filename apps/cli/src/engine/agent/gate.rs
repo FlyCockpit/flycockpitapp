@@ -115,10 +115,13 @@ pub(super) async fn safety_gate_decision_with_configs(
             // Unsafe → escalate to the user. A denial blocks dispatch.
             // If the user approves, still honor the result re-check flag.
             match escalate_gated_call(tool, args, ctx, false, tx).await {
-                true => GateOutcome::Run {
+                GateApproval::Allow => GateOutcome::Run {
                     recheck: verdict.recheck_result,
                 },
-                false => GateOutcome::Block(gate_block_message(tool, false)),
+                GateApproval::Deny => GateOutcome::Block(gate_block_message(tool, false)),
+                GateApproval::NoninteractiveDeny => {
+                    GateOutcome::Block(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string())
+                }
             }
         }
         SafetyOutcome::Unavailable => {
@@ -129,10 +132,13 @@ pub(super) async fn safety_gate_decision_with_configs(
                 // the eval that would have set the flag never completed, so a
                 // call the user only let through under an unavailable gate
                 // still gets its result vetted if it's a network tool.
-                true => GateOutcome::Run {
+                GateApproval::Allow => GateOutcome::Run {
                     recheck: tool != "bash",
                 },
-                false => GateOutcome::Block(gate_block_message(tool, true)),
+                GateApproval::Deny => GateOutcome::Block(gate_block_message(tool, true)),
+                GateApproval::NoninteractiveDeny => {
+                    GateOutcome::Block(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string())
+                }
             }
         }
     }
@@ -158,16 +164,23 @@ pub(super) fn gate_payload(tool: &str, args: &Value) -> String {
 /// `unavailable` tailors the surfaced reason (gate down vs. rated unsafe).
 /// With no approver wired (seed re-exec, tests) there is no client to ask —
 /// fail closed by treating it as denied.
-pub(super) async fn escalate_gated_call(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateApproval {
+    Allow,
+    Deny,
+    NoninteractiveDeny,
+}
+
+async fn escalate_gated_call(
     tool: &str,
     args: &Value,
     ctx: &ToolCtx,
     unavailable: bool,
     tx: &mpsc::Sender<TurnEvent>,
-) -> bool {
+) -> GateApproval {
     let Some(approver) = ctx.approver.as_ref() else {
         // No human to ask → fail closed (do not silently run).
-        return false;
+        return GateApproval::Deny;
     };
 
     // Surface why we're asking (the safety gate, not an ordinary approval).
@@ -187,7 +200,11 @@ pub(super) async fn escalate_gated_call(
         let label = format!("{tool} {}", gate_payload(tool, args));
         approver.approve_tool_call(&label).await
     };
-    matches!(decision, Ok(d) if d.is_allowed())
+    match decision {
+        Ok(crate::approval::Decision::Allow { .. }) => GateApproval::Allow,
+        Ok(crate::approval::Decision::NoninteractiveDeny) => GateApproval::NoninteractiveDeny,
+        Ok(crate::approval::Decision::Deny) | Err(_) => GateApproval::Deny,
+    }
 }
 
 /// The model-readable tool result when a gated call is withheld (denied at

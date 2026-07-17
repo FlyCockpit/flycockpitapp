@@ -50,7 +50,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::approval::classify::{Classification, RiskTier, SimpleCommandInfo};
-use crate::approval::store::{GrantStore, LoopVerdict, Scope};
+use crate::approval::store::{GrantKind, GrantStore, LoopVerdict, Scope};
 use crate::daemon::proto::{
     CharSpan, CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet,
     ResolveResponse, SandboxEscalation, WriteContentPreview,
@@ -96,7 +96,16 @@ pub enum Decision {
     Allow { scope: Scope },
     /// Access is denied (the user dismissed the prompt).
     Deny,
+    /// A `cockpit run` client denied the parked decision in-process. Tool
+    /// callers preserve this distinction so the model receives the stable
+    /// noninteractive denial instead of generic interactive-dismissal copy.
+    NoninteractiveDeny,
 }
+
+/// Model-readable denial returned when a headless run resolves an approval
+/// instead of leaving the engine parked forever.
+pub(crate) const NONINTERACTIVE_RUN_DENIAL: &str =
+    "noninteractive run: approval auto-denied; re-run with --approve <class> or use the TUI";
 
 impl Decision {
     pub fn is_allowed(&self) -> bool {
@@ -180,6 +189,7 @@ enum ApprovalChoice {
     GrantPaths(Scope),
     Reject(Scope),
     Deny,
+    NoninteractiveDeny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +203,7 @@ pub enum SandboxEscalationApproval {
     GrantAndRetryConfined { scope: Scope },
     RunUnconfinedOnce,
     Deny,
+    NoninteractiveDeny,
 }
 
 /// The user's choice on a loop-guard prompt. `Always` carries the verdict
@@ -219,6 +230,8 @@ pub enum GitignoreReadOutcome {
     ApproveProject { glob: String },
     /// The user declined; refuse the read and remember the rejection.
     Reject,
+    /// A noninteractive run resolved the prompt with its structured denial.
+    NoninteractiveReject,
 }
 
 /// Stage-1 (scope) gitignore choice: the glob shape, or reject.
@@ -227,6 +240,7 @@ enum GitignoreShape {
     File,
     Parent,
     Reject,
+    NoninteractiveReject,
 }
 
 /// Stage-2 (persistence) gitignore choice.
@@ -236,6 +250,7 @@ enum GitignorePersistence {
     Session,
     Project,
     Reject,
+    NoninteractiveReject,
 }
 
 /// Extract the selected option id from a `Single` (or single-element `Batch`)
@@ -273,6 +288,7 @@ fn repeat_question(tool: &str) -> InterruptQuestion {
         // Loop-guard is a permission/approval prompt (accept/reject at a
         // scope) — stripped presentation, like the scope select.
         permission: true,
+        approval_class: None,
         // The loop-guard prompt is never a sandbox-escalation.
         sandbox_escalation: None,
     }
@@ -316,9 +332,11 @@ fn response_to_repeat_choice(response: &ResolveResponse) -> RepeatChoice {
 /// Build the approval question. Normal approvals expose each scoped approve
 /// and reject action on the first surface; wrappers offer only once-only
 /// approve/reject because they are never persistable.
+#[allow(clippy::too_many_arguments)] // The wire question has independent policy dimensions.
 fn approval_question(
     label: &str,
     wrapper: bool,
+    approval_class: GrantKind,
     prompt_override: Option<&str>,
     detail: Option<CommandDetail>,
     escalation: Option<SandboxEscalation>,
@@ -371,6 +389,7 @@ fn approval_question(
         // Marking it a permission interrupt threads the stripped presentation
         // (no marker, no free-text) into the one render path.
         permission: true,
+        approval_class: Some(approval_class),
         // Present only on the run-fail-escalate path; makes this the distinct
         // escalation variant the dialog renders specially.
         sandbox_escalation: escalation,
@@ -616,6 +635,12 @@ fn scope_label(scope: Scope) -> &'static str {
 /// Map the single approval response back to the final choice. A cancel,
 /// unknown id, or non-`Single` shape reads as deny-once.
 fn response_to_approval_choice(response: &ResolveResponse, wrapper: bool) -> ApprovalChoice {
+    if matches!(
+        response,
+        ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
+    ) {
+        return ApprovalChoice::NoninteractiveDeny;
+    }
     let Some(id) = response_single_id(response) else {
         return ApprovalChoice::Deny;
     };
@@ -876,7 +901,16 @@ mod tests {
 
     #[test]
     fn approval_question_omits_scopes_above_policy_cap() {
-        let q = approval_question("rm foo", false, None, None, None, &[Scope::Once], None);
+        let q = approval_question(
+            "rm foo",
+            false,
+            GrantKind::Command,
+            None,
+            None,
+            None,
+            &[Scope::Once],
+            None,
+        );
         let InterruptQuestion::Single { options, .. } = q else {
             panic!("expected single");
         };
@@ -886,6 +920,7 @@ mod tests {
         let q = approval_question(
             "mkdir logs",
             false,
+            GrantKind::Command,
             None,
             None,
             None,
@@ -921,6 +956,7 @@ mod tests {
                 crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
             ),
             false,
+            GrantKind::Path,
             Some(&description),
             None,
             None,
@@ -937,6 +973,7 @@ mod tests {
         let q = approval_question(
             &path_prompt_label(path, crate::tools::shell_sandbox::SandboxPathAccess::Read),
             false,
+            GrantKind::Path,
             Some(&description),
             None,
             None,

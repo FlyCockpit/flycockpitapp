@@ -276,6 +276,7 @@ impl Driver {
             // A genuine decision prompt (distinct action choices), not a
             // tool-permission scope select — keep the question presentation.
             permission: false,
+            approval_class: None,
             sandbox_escalation: None,
         };
         let set = InterruptQuestionSet {

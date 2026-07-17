@@ -951,6 +951,7 @@ impl App {
                         q,
                         crate::daemon::proto::InterruptQuestion::Single {
                             permission: true,
+                            approval_class: None,
                             ..
                         }
                     )

@@ -9,11 +9,13 @@ use chrono::Utc;
 
 use crate::cli::SetupArgs;
 use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
+use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::{ConfigDoc, HeaderSpec, ModelMergePolicy, OnUnlistedModelsFetch};
 use crate::providers::models_fetch::{self, FetchOutcome};
 use crate::wizard::{
-    StepKind, WizardAnswer, WizardDescriptor, WizardRun, provider_entry_from_answers,
-    provider_id_answer, selected_provider_template,
+    StepKind, WizardAnswer, WizardDescriptor, WizardRun, approval_mode_answer,
+    min_secret_length_answer, provider_entry_from_answers, provider_id_answer, sandbox_mode_answer,
+    selected_provider_template, trusted_only_answer,
 };
 
 pub async fn run(args: SetupArgs) -> Result<()> {
@@ -21,16 +23,20 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
     let mut io = StdTerminalIo;
     let wizard = match args.wizard.as_deref() {
-        Some(id) => crate::wizard::descriptor(id)
+        Some(id) => descriptor_for_cwd(id, &cwd)
             .ok_or_else(|| anyhow!("unknown setup wizard `{id}`; run `cockpit setup` to list"))?,
-        None => choose_wizard(&mut io, stdin_tty).await?,
+        None => choose_wizard(&mut io, stdin_tty, &cwd).await?,
     };
     let mut actions = ProviderSetupActions::new(cwd);
     run_terminal_wizard(wizard, &mut io, &stdin_tty, &mut actions).await?;
     Ok(())
 }
 
-async fn choose_wizard(io: &mut dyn TerminalIo, tty: bool) -> Result<WizardDescriptor> {
+async fn choose_wizard(
+    io: &mut dyn TerminalIo,
+    tty: bool,
+    cwd: &std::path::Path,
+) -> Result<WizardDescriptor> {
     if !tty {
         bail!("cockpit setup requires an interactive stdin; run `cockpit` and use /setup instead");
     }
@@ -46,20 +52,27 @@ async fn choose_wizard(io: &mut dyn TerminalIo, tty: bool) -> Result<WizardDescr
     loop {
         io.write("Choose a wizard: ")?;
         let input = io.read_line()?.trim().to_string();
-        if let Some(wizard) = resolve_wizard_choice(&input) {
+        if let Some(wizard) = resolve_wizard_choice(&input, cwd) {
             return Ok(wizard);
         }
         io.write_line("Choose one of the listed wizard numbers or ids.")?;
     }
 }
 
-fn resolve_wizard_choice(input: &str) -> Option<WizardDescriptor> {
+fn resolve_wizard_choice(input: &str, cwd: &std::path::Path) -> Option<WizardDescriptor> {
     if let Ok(number) = input.parse::<usize>() {
-        return crate::wizard::registry()
-            .into_iter()
-            .nth(number.checked_sub(1)?);
+        let id = crate::wizard::registry().get(number.checked_sub(1)?)?.id;
+        return descriptor_for_cwd(id, cwd);
     }
-    crate::wizard::descriptor(input)
+    descriptor_for_cwd(input, cwd)
+}
+
+pub(crate) fn descriptor_for_cwd(id: &str, cwd: &std::path::Path) -> Option<WizardDescriptor> {
+    if id == crate::wizard::SECURITY_WIZARD_ID {
+        let current = crate::config::extended::load_for_cwd(cwd);
+        return Some(crate::wizard::security_descriptor_for_config(&current));
+    }
+    crate::wizard::descriptor(id)
 }
 
 pub(crate) trait TerminalIo {
@@ -183,16 +196,25 @@ pub(crate) async fn run_terminal_wizard(
                 submit(&mut run, WizardAnswer::Acknowledged, io)?;
             }
             StepKind::Confirm => {
-                io.write(&format!("{} [y/N]: ", step.prompt))?;
+                let default = match run.prefill() {
+                    Some(WizardAnswer::Confirm(value)) => Some(value),
+                    _ => None,
+                };
+                let suffix = match default {
+                    Some(true) => " [Y/n]: ",
+                    Some(false) | None => " [y/N]: ",
+                };
+                io.write(&format!("{}{}", step.prompt, suffix))?;
                 let input = read_input(io)?;
                 if go_back(&mut run, &input, io)? {
                     continue;
                 }
-                submit(
-                    &mut run,
-                    WizardAnswer::Confirm(matches!(input.trim(), "y" | "Y" | "yes" | "YES")),
-                    io,
-                )?;
+                let confirmed = if input.trim().is_empty() {
+                    default.unwrap_or(false)
+                } else {
+                    matches!(input.trim(), "y" | "Y" | "yes" | "YES")
+                };
+                submit(&mut run, WizardAnswer::Confirm(confirmed), io)?;
             }
             StepKind::MultiToggle { options } => {
                 io.write_line(step.prompt)?;
@@ -279,6 +301,7 @@ struct ProviderSetupActions {
     cwd: PathBuf,
     headers: Vec<HeaderSpec>,
     saved: Option<(String, PathBuf)>,
+    security_saved: Option<PathBuf>,
 }
 
 impl ProviderSetupActions {
@@ -287,6 +310,7 @@ impl ProviderSetupActions {
             cwd,
             headers: Vec::new(),
             saved: None,
+            security_saved: None,
         }
     }
 
@@ -350,6 +374,13 @@ impl ProviderSetupActions {
             "fetching" => {
                 self.fetch_models(run, io).await?;
             }
+            "security-save" => match apply_security_answers(&self.cwd, run)? {
+                Some(path) => {
+                    self.security_saved = Some(path.clone());
+                    io.write_line(&format!("Saved security settings to {}.", path.display()))?;
+                }
+                None => io.write_line("Security settings unchanged.")?,
+            },
             _ => {}
         }
         Ok(())
@@ -461,6 +492,52 @@ impl ProviderSetupActions {
     }
 }
 
+pub(crate) fn security_config_path(cwd: &std::path::Path) -> PathBuf {
+    most_specific_config_write_target(cwd).unwrap_or_else(|| cwd.join(".cockpit").join(CONFIG_FILE))
+}
+
+pub(crate) fn apply_security_answers(
+    cwd: &std::path::Path,
+    run: &WizardRun,
+) -> Result<Option<PathBuf>> {
+    let effective = crate::config::extended::load_for_cwd(cwd);
+    let target = security_config_path(cwd);
+    let mut doc = ExtendedConfigDoc::load(&target)?;
+    let mut cfg = doc.config();
+    let mut changed = false;
+
+    if let Some(mode) = sandbox_mode_answer(run)
+        && mode != effective.sandbox.default_mode
+    {
+        cfg.sandbox.default_mode = mode;
+        changed = true;
+    }
+    if let Some(mode) = approval_mode_answer(run)
+        && mode != effective.default_approval_mode
+    {
+        cfg.default_approval_mode = mode;
+        changed = true;
+    }
+    if let Some(enabled) = trusted_only_answer(run)
+        && enabled != effective.trusted_only
+    {
+        cfg.trusted_only = enabled;
+        changed = true;
+    }
+    if let Some(min_secret_length) = min_secret_length_answer(run)
+        && min_secret_length != effective.redact.min_secret_length
+    {
+        cfg.redact.min_secret_length = min_secret_length;
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    doc.write(&cfg)?;
+    Ok(Some(target))
+}
+
 impl TerminalActionHandler for ProviderSetupActions {
     fn run_action<'a>(
         &'a mut self,
@@ -475,6 +552,7 @@ impl TerminalActionHandler for ProviderSetupActions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::dirs::COCKPIT_CONFIG_ENV;
 
     #[derive(Default)]
     struct ScriptIo {
@@ -545,6 +623,29 @@ mod tests {
                 }
                 Ok(())
             })
+        }
+    }
+
+    struct CockpitConfigEnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl CockpitConfigEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let guard = crate::test_env::lock();
+            let old = std::env::var_os(COCKPIT_CONFIG_ENV);
+            unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, path) };
+            Self { _guard: guard, old }
+        }
+    }
+
+    impl Drop for CockpitConfigEnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, value) },
+                None => unsafe { std::env::remove_var(COCKPIT_CONFIG_ENV) },
+            }
         }
     }
 
@@ -624,5 +725,118 @@ mod tests {
             "{}",
             io.output
         );
+    }
+
+    async fn run_security_script(
+        cwd: &std::path::Path,
+        lines: &[&str],
+    ) -> (WizardRun, ScriptIo, ProviderSetupActions) {
+        let descriptor = descriptor_for_cwd(crate::wizard::SECURITY_WIZARD_ID, cwd)
+            .expect("security descriptor");
+        let mut io = ScriptIo::new(lines);
+        let mut actions = ProviderSetupActions::new(cwd.to_path_buf());
+        let run = run_terminal_wizard(descriptor, &mut io, &true, &mut actions)
+            .await
+            .unwrap();
+        (run, io, actions)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_wizard_terminal_end_to_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+
+        let (run, io, _) = run_security_script(tmp.path(), &["", "", "", ""]).await;
+
+        assert!(run.is_complete());
+        assert!(
+            io.output
+                .contains("How should Cockpit confine shell commands")
+        );
+        assert!(io.output.contains("Workspace trust is per project"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_wizard_all_defaults_writes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(&config_path, "{}\n").expect("write config");
+        let _env = CockpitConfigEnvGuard::set(&config_path);
+
+        let (_, _, actions) = run_security_script(tmp.path(), &["", "", "", ""]).await;
+
+        assert!(actions.security_saved.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            "{}\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_step_writes_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+
+        let (_, _, actions) = run_security_script(tmp.path(), &["3", "", "", ""]).await;
+
+        let path = actions.security_saved.expect("security config saved");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
+                .expect("json");
+        assert_eq!(raw["sandbox"]["defaultMode"], "container_readonly");
+        assert_eq!(raw.as_object().expect("object").len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_only_step_toggles_policy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+
+        let (_, _, actions) = run_security_script(tmp.path(), &["", "", "y", ""]).await;
+
+        let path = actions.security_saved.expect("security config saved");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
+                .expect("json");
+        assert_eq!(raw["trustedOnly"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redaction_step_validates_numeric() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+
+        let (_, io, actions) = run_security_script(tmp.path(), &["", "", "", "0", "12"]).await;
+
+        assert!(io.output.contains("enter a number from 1 to 4096"));
+        let path = actions.security_saved.expect("security config saved");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
+                .expect("json");
+        assert_eq!(raw["redact"]["min_secret_length"], 12);
+    }
+
+    #[test]
+    fn security_wizard_copy_mentions_unconfined_and_trust_command() {
+        let descriptor = crate::wizard::security_descriptor();
+        let sandbox = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "sandbox")
+            .expect("sandbox step");
+        let crate::wizard::StepKind::Select { options } = &sandbox.kind else {
+            panic!("sandbox step is select");
+        };
+        assert!(
+            options
+                .iter()
+                .any(|option| option.id == "off" && option.description.contains("Unconfined"))
+        );
+        let trust = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "workspace-trust")
+            .expect("trust step");
+        assert!(trust.prompt.contains("cockpit trust set"));
     }
 }

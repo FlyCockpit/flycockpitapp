@@ -110,6 +110,13 @@ pub enum Dialog {
         cursor: usize,
         cwd: PathBuf,
     },
+    SetupWizard {
+        run: crate::wizard::WizardRun,
+        cursor: usize,
+        text: TextField,
+        cwd: PathBuf,
+        status: Option<String>,
+    },
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
@@ -524,6 +531,7 @@ impl Dialog {
         match self {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
+            Dialog::SetupWizard { run, .. } => Some(run.descriptor().id),
             _ => None,
         }
     }
@@ -656,6 +664,18 @@ impl Dialog {
     pub fn open_setup_wizard(cwd: &std::path::Path, wizard_id: &str) -> Result<Self, String> {
         match wizard_id {
             crate::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
+            crate::wizard::SECURITY_WIZARD_ID => {
+                let descriptor = crate::commands::setup::descriptor_for_cwd(wizard_id, cwd)
+                    .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
+                let run = crate::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
+                Ok(Dialog::SetupWizard {
+                    run,
+                    cursor: 0,
+                    text: TextField::new(""),
+                    cwd: cwd.to_path_buf(),
+                    status: None,
+                })
+            }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
     }
@@ -895,6 +915,13 @@ impl Dialog {
                     false
                 }
             },
+            Dialog::SetupWizard {
+                run,
+                cursor,
+                text,
+                cwd,
+                status,
+            } => handle_setup_wizard_key(run, cursor, text, cwd, status, key),
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
                 if close
@@ -994,6 +1021,13 @@ impl Dialog {
             Dialog::WizardMenu {
                 wizards, cursor, ..
             } => render_wizard_menu(frame, area, wizards, *cursor),
+            Dialog::SetupWizard {
+                run,
+                cursor,
+                text,
+                status,
+                ..
+            } => render_setup_wizard(frame, area, run, *cursor, text, status.as_deref()),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -2381,6 +2415,159 @@ fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {
     }
 }
 
+fn handle_setup_wizard_key(
+    run: &mut crate::wizard::WizardRun,
+    cursor: &mut usize,
+    text: &mut TextField,
+    cwd: &std::path::Path,
+    status: &mut Option<String>,
+    key: KeyEvent,
+) -> bool {
+    if run.is_complete() {
+        return matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'));
+    }
+    let Some(step) = run.current_step().cloned() else {
+        return false;
+    };
+    match step.kind {
+        crate::wizard::StepKind::Select { options } => {
+            match list_key_action(key, cursor, options.len()) {
+                ListAction::Close => return true,
+                ListAction::Stay => {}
+                ListAction::Select(index) => {
+                    submit_setup_wizard_answer(
+                        run,
+                        cursor,
+                        text,
+                        status,
+                        crate::wizard::WizardAnswer::Select(options[index].id.to_string()),
+                    );
+                }
+            }
+        }
+        crate::wizard::StepKind::Confirm => match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Enter => {
+                let answer = run
+                    .prefill()
+                    .unwrap_or(crate::wizard::WizardAnswer::Confirm(false));
+                submit_setup_wizard_answer(run, cursor, text, status, answer);
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => submit_setup_wizard_answer(
+                run,
+                cursor,
+                text,
+                status,
+                crate::wizard::WizardAnswer::Confirm(true),
+            ),
+            KeyCode::Char('n') | KeyCode::Char('N') => submit_setup_wizard_answer(
+                run,
+                cursor,
+                text,
+                status,
+                crate::wizard::WizardAnswer::Confirm(false),
+            ),
+            _ => {}
+        },
+        crate::wizard::StepKind::Text => match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Enter => {
+                submit_setup_wizard_answer(
+                    run,
+                    cursor,
+                    text,
+                    status,
+                    crate::wizard::WizardAnswer::Text(text.text().to_string()),
+                );
+            }
+            _ => {
+                text.handle_key(key);
+            }
+        },
+        crate::wizard::StepKind::Info => match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                submit_setup_wizard_answer(
+                    run,
+                    cursor,
+                    text,
+                    status,
+                    crate::wizard::WizardAnswer::Acknowledged,
+                );
+            }
+            _ => {}
+        },
+        crate::wizard::StepKind::Action { .. } => {
+            if step.id == "security-save" {
+                match crate::commands::setup::apply_security_answers(cwd, run) {
+                    Ok(Some(path)) => *status = Some(format!("Saved {}", path.display())),
+                    Ok(None) => *status = Some("Security settings unchanged.".to_string()),
+                    Err(error) => {
+                        *status = Some(error.to_string());
+                        return false;
+                    }
+                }
+            }
+            submit_setup_wizard_answer(
+                run,
+                cursor,
+                text,
+                status,
+                crate::wizard::WizardAnswer::Acknowledged,
+            );
+        }
+        crate::wizard::StepKind::Secret | crate::wizard::StepKind::MultiToggle { .. } => {}
+    }
+    false
+}
+
+fn submit_setup_wizard_answer(
+    run: &mut crate::wizard::WizardRun,
+    cursor: &mut usize,
+    text: &mut TextField,
+    status: &mut Option<String>,
+    answer: crate::wizard::WizardAnswer,
+) {
+    match run.submit(answer) {
+        Ok(()) => sync_setup_wizard_inputs(run, cursor, text),
+        Err(error) => *status = Some(error),
+    }
+}
+
+fn sync_setup_wizard_inputs(
+    run: &crate::wizard::WizardRun,
+    cursor: &mut usize,
+    text: &mut TextField,
+) {
+    *cursor = setup_wizard_cursor_for_current_prefill(run);
+    let Some(step) = run.current_step() else {
+        return;
+    };
+    if matches!(step.kind, crate::wizard::StepKind::Text) {
+        let value = match run.prefill() {
+            Some(crate::wizard::WizardAnswer::Text(value)) => value,
+            _ => String::new(),
+        };
+        text.set(value);
+    }
+}
+
+fn setup_wizard_cursor_for_current_prefill(run: &crate::wizard::WizardRun) -> usize {
+    let Some(step) = run.current_step() else {
+        return 0;
+    };
+    let crate::wizard::StepKind::Select { options } = &step.kind else {
+        return 0;
+    };
+    let Some(crate::wizard::WizardAnswer::Select(value)) = run.prefill() else {
+        return 0;
+    };
+    options
+        .iter()
+        .position(|option| option.id == value)
+        .unwrap_or(0)
+}
+
 enum ListAction {
     Stay,
     Close,
@@ -2505,6 +2692,91 @@ fn render_wizard_menu(
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(help_line("↑/↓  enter: select  esc: close"), layout[1]);
+}
+
+fn render_setup_wizard(
+    frame: &mut Frame,
+    area: Rect,
+    run: &crate::wizard::WizardRun,
+    cursor: usize,
+    text: &TextField,
+    status: Option<&str>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Setup — {} ", run.descriptor().title));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let selected = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        run.descriptor().description.to_string(),
+        muted,
+    )));
+    lines.push(Line::default());
+
+    if run.is_complete() {
+        lines.push(Line::from("Security setup complete."));
+    } else if let Some(step) = run.current_step() {
+        lines.push(Line::from(Span::styled(
+            step.prompt.to_string(),
+            Style::default().fg(Color::White),
+        )));
+        if !step.help.is_empty() {
+            lines.push(Line::from(Span::styled(step.help.to_string(), muted)));
+        }
+        lines.push(Line::default());
+        match &step.kind {
+            crate::wizard::StepKind::Select { options } => {
+                for (index, option) in options.iter().enumerate() {
+                    let marker = if index == cursor { "▸ " } else { "  " };
+                    let style = if index == cursor {
+                        selected
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled(option.label.to_string(), style),
+                        Span::raw("  "),
+                        Span::styled(option.description.to_string(), muted),
+                    ]));
+                }
+            }
+            crate::wizard::StepKind::Confirm => {
+                let current = match run.prefill() {
+                    Some(crate::wizard::WizardAnswer::Confirm(true)) => "yes",
+                    _ => "no",
+                };
+                lines.push(Line::from(format!("Current/default: {current}")));
+            }
+            crate::wizard::StepKind::Text => {
+                lines.push(Line::from(format!("Value: {}", text.text())));
+            }
+            crate::wizard::StepKind::Info => {
+                lines.push(Line::from("Press Enter to continue."));
+            }
+            crate::wizard::StepKind::Action { progress } => {
+                lines.push(Line::from(*progress));
+            }
+            crate::wizard::StepKind::Secret | crate::wizard::StepKind::MultiToggle { .. } => {
+                lines.push(Line::from("Unsupported setup step."));
+            }
+        }
+    }
+    if let Some(status) = status {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(status.to_string(), muted)));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+    frame.render_widget(
+        help_line("↑/↓  enter: select/continue  y/n: set toggle  esc: close"),
+        layout[1],
+    );
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {
@@ -4418,6 +4690,31 @@ mod tests {
             s.test_page(),
             TestPageRef::Providers(ProvidersPage::Add(_))
         ));
+    }
+
+    #[test]
+    fn security_setup_wizard_tui_edits_redaction_number() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = Dialog::open_setup_wizard(tmp.path(), crate::wizard::SECURITY_WIZARD_ID)
+            .expect("security wizard opens");
+
+        d.handle_key(press(KeyCode::Enter)); // sandbox default
+        d.handle_key(press(KeyCode::Enter)); // approval default
+        d.handle_key(press(KeyCode::Enter)); // trusted-only default
+        for _ in 0..8 {
+            d.handle_key(press(KeyCode::Backspace));
+        }
+        d.handle_key(press(KeyCode::Char('1')));
+        d.handle_key(press(KeyCode::Char('2')));
+        d.handle_key(press(KeyCode::Enter));
+
+        let Dialog::SetupWizard { run, .. } = d else {
+            panic!("expected setup wizard");
+        };
+        assert_eq!(
+            run.answer("redaction"),
+            Some(&crate::wizard::WizardAnswer::Text("12".to_string()))
+        );
     }
 
     #[test]

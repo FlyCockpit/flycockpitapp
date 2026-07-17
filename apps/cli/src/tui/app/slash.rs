@@ -2404,6 +2404,11 @@ mod table_tests {
         app.execute_slash(cmd);
         assert_eq!(app.dialog.test_page_name(), Some("Providers"));
         assert_eq!(app.dialog.test_provider_surface(), Some("other"));
+
+        app.dialog = Dialog::None;
+        app.composer.set("/setup security".to_string());
+        app.execute_slash(cmd);
+        assert_eq!(app.dialog.test_page_name(), Some("security"));
     }
 
     #[test]

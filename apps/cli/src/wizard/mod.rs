@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow};
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
+pub const SECURITY_WIZARD_ID: &str = "security";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -48,6 +49,7 @@ pub struct StepDescriptor {
     pub prompt: &'static str,
     pub help: &'static str,
     pub kind: StepKind,
+    pub default_answer: Option<WizardAnswer>,
     pub prefill: Option<PrefillHook>,
     pub validate: Option<ValidationHook>,
     pub write: Option<WriteHook>,
@@ -143,6 +145,7 @@ impl WizardRun {
         let step = self.current_step()?;
         self.answer(step.id)
             .cloned()
+            .or_else(|| step.default_answer.clone())
             .or_else(|| step.prefill.and_then(|prefill| prefill(self)))
     }
 
@@ -260,7 +263,7 @@ impl WizardRun {
 }
 
 pub fn registry() -> Vec<WizardDescriptor> {
-    vec![provider_descriptor()]
+    vec![provider_descriptor(), security_descriptor()]
 }
 
 pub fn descriptor(id: &str) -> Option<WizardDescriptor> {
@@ -291,6 +294,7 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 kind: StepKind::Select {
                     options: template_options,
                 },
+                default_answer: None,
                 prefill: None,
                 validate: Some(validate_select),
                 write: None,
@@ -301,6 +305,7 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 prompt: "Provider id",
                 help: "Use lowercase letters, digits, `-`, or `_`.",
                 kind: StepKind::Text,
+                default_answer: None,
                 prefill: Some(provider_id_prefill),
                 validate: Some(validate_provider_id),
                 write: None,
@@ -311,6 +316,7 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 prompt: "Base URL",
                 help: "The endpoint must start with http:// or https://.",
                 kind: StepKind::Text,
+                default_answer: None,
                 prefill: Some(provider_url_prefill),
                 validate: Some(validate_provider_url),
                 write: None,
@@ -343,6 +349,7 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 kind: StepKind::Action {
                     progress: "Saving provider…",
                 },
+                default_answer: None,
                 prefill: None,
                 validate: None,
                 write: None,
@@ -354,6 +361,7 @@ pub fn provider_descriptor() -> WizardDescriptor {
                 prompt: "Provider setup complete",
                 help: "Continue to return to the provider list.",
                 kind: StepKind::Info,
+                default_answer: None,
                 prefill: None,
                 validate: None,
                 write: None,
@@ -363,12 +371,207 @@ pub fn provider_descriptor() -> WizardDescriptor {
     }
 }
 
+pub fn security_descriptor() -> WizardDescriptor {
+    security_descriptor_for_config(&crate::config::extended::ExtendedConfig::default())
+}
+
+pub fn security_descriptor_for_config(
+    current: &crate::config::extended::ExtendedConfig,
+) -> WizardDescriptor {
+    WizardDescriptor {
+        id: SECURITY_WIZARD_ID,
+        title: "Security posture",
+        description: "Review sandboxing, approvals, trusted-only, redaction, and workspace trust",
+        write_policy: WritePolicy::CommitAtEnd,
+        steps: vec![
+            StepDescriptor {
+                id: "sandbox",
+                prompt: "How should Cockpit confine shell commands by default?",
+                help: "Keep the host shell sandbox unless you specifically need container isolation or unconfined commands. `off` means commands the model runs are unconfined.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: sandbox_mode_id(current.sandbox.default_mode),
+                            label: "Keep current sandbox setting",
+                            description: "Recommended default is sandbox. Commands run inside the OS shell sandbox when available.",
+                        },
+                        SelectOption {
+                            id: "container",
+                            label: "container",
+                            description: "Run commands in a Docker/Podman container. Shown even if docker/podman is not found.",
+                        },
+                        SelectOption {
+                            id: "container-readonly",
+                            label: "container-readonly",
+                            description: "Run in a container with the project mounted read-only.",
+                        },
+                        SelectOption {
+                            id: "off",
+                            label: "off",
+                            description: "Unconfined: commands the model runs are not sandboxed.",
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select(
+                    sandbox_mode_id(current.sandbox.default_mode).to_string(),
+                )),
+                prefill: None,
+                validate: Some(validate_sandbox_mode),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "approval",
+                prompt: "How should gated commands and network calls be approved?",
+                help: "Manual asks every time. Auto uses the utility-model safety gate for safe calls and asks on unsafe or unavailable. Yolo runs gated calls unprompted. Remembered command/path grants can be once, session, project, or global; project/global grants are machine-local.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: current.default_approval_mode.as_str(),
+                            label: "Keep current approval mode",
+                            description: "Recommended default is manual. You approve every gated command, web fetch, and MCP call.",
+                        },
+                        SelectOption {
+                            id: "auto",
+                            label: "auto",
+                            description: "Use the utility-model safety gate for safe calls; ask when unsafe or unavailable.",
+                        },
+                        SelectOption {
+                            id: "yolo",
+                            label: "yolo",
+                            description: "Runs gated commands and network calls unprompted.",
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select(
+                    current.default_approval_mode.as_str().to_string(),
+                )),
+                prefill: None,
+                validate: Some(validate_approval_mode),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "trusted-only",
+                prompt: "Require trusted providers/models only?",
+                help: "Trusted-only blocks untrusted provider/model choices. Trusted providers can receive original text; untrusted providers receive redacted text.",
+                kind: StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(current.trusted_only)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "redaction",
+                prompt: "Minimum secret length for redaction",
+                help: "For untrusted models, Cockpit redacts known secrets from your environment and Cockpit's secret store. Keep 8 unless short secrets are common in your workflow.",
+                kind: StepKind::Text,
+                default_answer: Some(WizardAnswer::Text(
+                    current.redact.min_secret_length.to_string(),
+                )),
+                prefill: None,
+                validate: Some(validate_min_secret_length),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "workspace-trust",
+                prompt: "Workspace trust is per project. Use `cockpit trust set <path> --mode trust|ignore-config|untrusted` to change it.",
+                help: "Trust allows project config. Ignore-config opens the workspace without project config. Untrusted blocks the workspace.",
+                kind: StepKind::Info,
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "security-save",
+                prompt: "Apply security settings",
+                help: "Only values that differ from the starting effective configuration are written.",
+                kind: StepKind::Action {
+                    progress: "Applying security settings…",
+                },
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+        ],
+    }
+}
+
+pub(crate) fn sandbox_mode_id(mode: crate::tools::sandbox_mode::SandboxMode) -> &'static str {
+    match mode {
+        crate::tools::sandbox_mode::SandboxMode::Off => "off",
+        crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox",
+        crate::tools::sandbox_mode::SandboxMode::Container => "container",
+        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+    }
+}
+
+pub(crate) fn sandbox_mode_from_id(id: &str) -> Option<crate::tools::sandbox_mode::SandboxMode> {
+    Some(match id {
+        "off" => crate::tools::sandbox_mode::SandboxMode::Off,
+        "sandbox" | "on" => crate::tools::sandbox_mode::SandboxMode::Sandbox,
+        "container" => crate::tools::sandbox_mode::SandboxMode::Container,
+        "container-readonly" | "container_readonly" => {
+            crate::tools::sandbox_mode::SandboxMode::ContainerReadonly
+        }
+        _ => return None,
+    })
+}
+
+pub(crate) fn approval_mode_from_id(id: &str) -> Option<crate::config::extended::ApprovalMode> {
+    Some(match id {
+        "manual" => crate::config::extended::ApprovalMode::Manual,
+        "auto" => crate::config::extended::ApprovalMode::Auto,
+        "yolo" => crate::config::extended::ApprovalMode::Yolo,
+        _ => return None,
+    })
+}
+
+pub(crate) fn trusted_only_answer(run: &WizardRun) -> Option<bool> {
+    let WizardAnswer::Confirm(value) = run.answer("trusted-only")? else {
+        return None;
+    };
+    Some(*value)
+}
+
+pub(crate) fn min_secret_length_answer(run: &WizardRun) -> Option<usize> {
+    let WizardAnswer::Text(value) = run.answer("redaction")? else {
+        return None;
+    };
+    value.trim().parse().ok()
+}
+
+pub(crate) fn sandbox_mode_answer(
+    run: &WizardRun,
+) -> Option<crate::tools::sandbox_mode::SandboxMode> {
+    let WizardAnswer::Select(value) = run.answer("sandbox")? else {
+        return None;
+    };
+    sandbox_mode_from_id(value)
+}
+
+pub(crate) fn approval_mode_answer(
+    run: &WizardRun,
+) -> Option<crate::config::extended::ApprovalMode> {
+    let WizardAnswer::Select(value) = run.answer("approval")? else {
+        return None;
+    };
+    approval_mode_from_id(value)
+}
+
 fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -> StepDescriptor {
     StepDescriptor {
         id,
         prompt,
         help: progress,
         kind: StepKind::Action { progress },
+        default_answer: None,
         prefill: None,
         validate: None,
         write: None,
@@ -384,6 +587,38 @@ fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<
     match answer {
         WizardAnswer::Select(value) if !value.is_empty() => Ok(()),
         _ => Err("choose one option".to_string()),
+    }
+}
+
+fn validate_sandbox_mode(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Select(value) if sandbox_mode_from_id(value).is_some() => Ok(()),
+        _ => Err("choose sandbox, container, container-readonly, or off".to_string()),
+    }
+}
+
+fn validate_approval_mode(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Select(value) if approval_mode_from_id(value).is_some() => Ok(()),
+        _ => Err("choose manual, auto, or yolo".to_string()),
+    }
+}
+
+fn validate_min_secret_length(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(value) = answer else {
+        return Err("enter a number".to_string());
+    };
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "enter a number from 1 to 4096".to_string())?;
+    if (1..=4096).contains(&parsed) {
+        Ok(())
+    } else {
+        Err("enter a number from 1 to 4096".to_string())
     }
 }
 
@@ -597,6 +832,7 @@ mod tests {
                     prompt: "start",
                     help: "",
                     kind: StepKind::Select { options: vec![] },
+                    default_answer: None,
                     prefill: None,
                     validate: None,
                     write: Some(count_write),
@@ -607,6 +843,7 @@ mod tests {
                     prompt: "slow",
                     help: "",
                     kind: StepKind::Text,
+                    default_answer: None,
                     prefill: None,
                     validate: Some(reject_bad),
                     write: Some(count_write),
@@ -617,6 +854,7 @@ mod tests {
                     prompt: "finish",
                     help: "",
                     kind: StepKind::Info,
+                    default_answer: None,
                     prefill: None,
                     validate: None,
                     write: Some(count_write),

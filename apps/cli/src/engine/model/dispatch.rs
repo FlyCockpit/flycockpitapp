@@ -38,8 +38,12 @@ impl Model {
                     .context("text_completion: prompt failed")?;
                 Ok(response.trim().to_string())
             }
-            Model::Anthropic { model, .. } => {
-                let agent = rig::agent::AgentBuilder::new(model.clone()).build();
+            Model::Anthropic {
+                model, max_tokens, ..
+            } => {
+                let agent = rig::agent::AgentBuilder::new(model.clone())
+                    .max_tokens(*max_tokens)
+                    .build();
                 let response = agent
                     .prompt(prompt)
                     .await
@@ -89,9 +93,12 @@ impl Model {
                     .context("text_completion_with_system: prompt failed")?;
                 Ok(response.trim().to_string())
             }
-            Model::Anthropic { model, .. } => {
+            Model::Anthropic {
+                model, max_tokens, ..
+            } => {
                 let agent = rig::agent::AgentBuilder::new(model.clone())
                     .preamble(system)
+                    .max_tokens(*max_tokens)
                     .build();
                 let response = agent
                     .prompt(prompt)
@@ -161,9 +168,12 @@ impl Model {
                     .context("tool_completion: send failed")?;
                 Ok(crate::engine::message::collect_tool_calls(&response.choice))
             }
-            Model::Anthropic { model, .. } => {
+            Model::Anthropic {
+                model, max_tokens, ..
+            } => {
                 let agent = rig::agent::AgentBuilder::new(model.clone())
                     .preamble(system)
+                    .max_tokens(*max_tokens)
                     .build();
                 let response = agent
                     .completion(Message::user(prompt), Vec::<Message>::new())
@@ -261,6 +271,7 @@ impl Model {
         serde_json::Value,
         InferenceTiming,
     )> {
+        let params = self.with_resolved_model_params(params);
         let prepared = self.prepare_completion_request(
             system,
             history,
@@ -280,6 +291,15 @@ impl Model {
             pre_drain,
         )
         .await
+    }
+
+    fn with_resolved_model_params(&self, mut params: ModelParams) -> ModelParams {
+        if params.max_tokens.is_none()
+            && let Model::Anthropic { max_tokens, .. } = self
+        {
+            params.max_tokens = Some(*max_tokens);
+        }
+        params
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -302,6 +322,7 @@ impl Model {
         serde_json::Value,
         InferenceTiming,
     )> {
+        let params = self.with_resolved_model_params(params);
         self.ensure_trusted_only_dispatch_allowed()?;
         let PreparedCompletionRequest {
             system,
@@ -805,6 +826,7 @@ impl Model {
         endpoint_recovery_enabled: bool,
     ) -> Result<PreparedCompletionRequest> {
         let prep_started = std::time::Instant::now();
+        let params = self.with_resolved_model_params(params.clone());
         let history = self.prepare_history_for_request(history);
 
         // Non-bypassable redaction chokepoint (GOALS §7,
@@ -847,7 +869,7 @@ impl Model {
             &history,
             &prompt,
             tools,
-            params,
+            &params,
         );
         if !identity_records.is_empty() {
             captured["responses_tool_identity"] = serde_json::to_value(&identity_records)
@@ -894,6 +916,7 @@ impl Model {
         tools: &[ToolDefinition],
         params: &ModelParams,
     ) -> serde_json::Value {
+        let params = self.with_resolved_model_params(params.clone());
         // Scrub identically to `complete_captured` so the pre-dispatch
         // `pending` record and the terminal captured record describe
         // byte-identical requests (GOALS §7).
@@ -932,7 +955,7 @@ impl Model {
             &history,
             &prompt,
             tools,
-            params,
+            &params,
         );
         if let Some((key, value)) = identity_metadata {
             captured[key] = value;
@@ -971,6 +994,7 @@ impl Model {
         tools: &[ToolDefinition],
         params: &ModelParams,
     ) -> TandemOutcome {
+        let params = self.with_resolved_model_params(params.clone());
         // Identical assembly to `complete_captured` / `assemble_dispatch_request`
         // (strip reasoning, scrub every dynamic text field, then
         // `assembled_request`), so the persisted tandem request body is
@@ -992,7 +1016,7 @@ impl Model {
             &stripped,
             prompt,
             tools,
-            params,
+            &params,
         );
 
         // The daemon drain gate still applies — a tandem request is a *new*
@@ -1007,7 +1031,7 @@ impl Model {
         }
 
         let limit = std::time::Duration::from_secs(TANDEM_TIMEOUT_SECS);
-        let attempt = self.tandem_send(system, &stripped, prompt, tools, params);
+        let attempt = self.tandem_send(system, &stripped, prompt, tools, &params);
         match tokio::time::timeout(limit, attempt).await {
             Ok(Ok((choice, usage))) => {
                 let response = serde_json::to_value(&choice)

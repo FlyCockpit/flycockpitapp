@@ -292,10 +292,13 @@ pub(super) fn build_model(
             redact,
         )
     } else if is_anthropic_native(&resolved.base_url) {
+        let max_tokens =
+            crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
         build_anthropic_model(
             provider_id,
             &resolved,
             model_id,
+            max_tokens,
             cache,
             timeout,
             hard_timeout_on_stall,
@@ -346,6 +349,7 @@ pub(super) fn build_anthropic_model(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
     model_id: &str,
+    max_tokens: u64,
     cache: &crate::config::providers::CacheConfig,
     timeout: &crate::config::providers::TimeoutConfig,
     hard_timeout_on_stall: bool,
@@ -395,6 +399,7 @@ pub(super) fn build_anthropic_model(
         model: completion,
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        max_tokens,
         base_url: resolved.base_url.clone(),
         timeout: timeout.clone(),
         hard_timeout_on_stall,

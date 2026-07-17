@@ -999,13 +999,29 @@ pub struct CapabilityValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "type")]
+#[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 pub enum ReasoningEffortRequestMapping {
     JsonField {
         field: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         values: BTreeMap<String, Value>,
     },
+    /// Anthropic's current native adaptive-thinking request shape. `values`
+    /// optionally maps Cockpit's advertised selector to Anthropic's effort
+    /// vocabulary (for example `xhigh` to `max`).
+    AnthropicAdaptive {
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        values: BTreeMap<String, String>,
+    },
+    /// Anthropic's older fixed-budget thinking request shape. Budgets are
+    /// derived deterministically from the resolved output limit.
+    AnthropicManual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffortWire {
+    OpenAiCompatible,
+    AnthropicNative,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1651,6 +1667,147 @@ fn reasoning_effort_supports_value(capability: &ReasoningEffortCapability, value
         .any(|candidate| candidate.value == value)
 }
 
+pub fn manual_thinking_budget(max_tokens: u64, effort: &str) -> Result<u64> {
+    let percent = match effort {
+        "low" => 25,
+        "medium" => 50,
+        "high" => 75,
+        "xhigh" => 85,
+        _ => anyhow::bail!("unsupported manual Anthropic effort `{effort}`"),
+    };
+    let reserve = (max_tokens / 5 + u64::from(!max_tokens.is_multiple_of(5))).max(1_024);
+    let cap = max_tokens.checked_sub(reserve).with_context(|| {
+        format!(
+            "Anthropic max_tokens={max_tokens} cannot reserve {reserve} tokens for the final answer"
+        )
+    })?;
+    if cap < 1_024 {
+        anyhow::bail!(
+            "Anthropic max_tokens={max_tokens} is too small for manual thinking: at least 1024 thinking tokens and a {reserve}-token completion reserve are required"
+        );
+    }
+    let fractional = (max_tokens / 100) * percent + ((max_tokens % 100) * percent) / 100;
+    Ok(fractional.max(1_024).min(cap))
+}
+
+pub fn validate_reasoning_effort_capability(
+    capability: &ReasoningEffortCapability,
+    wire: ReasoningEffortWire,
+    max_tokens: Option<u64>,
+) -> Result<()> {
+    if capability.values.is_empty() {
+        return Ok(());
+    }
+    if let Some(default) = capability.default.as_deref()
+        && !reasoning_effort_supports_value(capability, default)
+    {
+        anyhow::bail!("reasoning default `{default}` is not in the advertised values");
+    }
+    let mapping = capability
+        .request_mapping
+        .as_ref()
+        .context("reasoning effort is advertised without a request mapping")?;
+    match (wire, mapping) {
+        (
+            ReasoningEffortWire::OpenAiCompatible,
+            ReasoningEffortRequestMapping::JsonField { field, .. },
+        ) => {
+            if field.trim().is_empty() {
+                anyhow::bail!("reasoning JSON-field mapping has an empty field name");
+            }
+        }
+        (
+            ReasoningEffortWire::AnthropicNative,
+            ReasoningEffortRequestMapping::AnthropicAdaptive { values },
+        ) => {
+            for (source, target) in values {
+                if !reasoning_effort_supports_value(capability, source) {
+                    anyhow::bail!(
+                        "adaptive Anthropic effort mapping contains unadvertised source `{source}`"
+                    );
+                }
+                if target.trim().is_empty() {
+                    anyhow::bail!(
+                        "adaptive Anthropic effort mapping for `{source}` has an empty target"
+                    );
+                }
+            }
+            for advertised in &capability.values {
+                let target = values
+                    .get(&advertised.value)
+                    .map(String::as_str)
+                    .unwrap_or(&advertised.value);
+                if !matches!(target, "low" | "medium" | "high" | "max") {
+                    anyhow::bail!(
+                        "adaptive Anthropic effort `{}` resolves to unsupported target `{target}`; expected low, medium, high, or max",
+                        advertised.value
+                    );
+                }
+            }
+        }
+        (ReasoningEffortWire::AnthropicNative, ReasoningEffortRequestMapping::AnthropicManual) => {
+            let max_tokens = max_tokens.context(
+                "manual Anthropic reasoning mapping requires an explicit max output token limit",
+            )?;
+            for value in &capability.values {
+                manual_thinking_budget(max_tokens, &value.value)?;
+            }
+        }
+        (
+            ReasoningEffortWire::AnthropicNative,
+            ReasoningEffortRequestMapping::JsonField { field, .. },
+        ) => {
+            anyhow::bail!(
+                "native Anthropic reasoning cannot use JSON field `{field}`; configure an anthropic_adaptive or anthropic_manual mapping"
+            );
+        }
+        (ReasoningEffortWire::OpenAiCompatible, _) => {
+            anyhow::bail!(
+                "Anthropic-native reasoning mapping cannot be used on an OpenAI-compatible wire"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve Anthropic's required output limit without guessing from context
+/// size. Live catalog metadata wins, followed by a user-authored model
+/// override and then an explicit provider default.
+pub fn resolve_anthropic_max_tokens(entry: &ProviderEntry, model_id: &str) -> Option<u64> {
+    let model = entry.models.iter().find(|model| model.id == model_id);
+    model
+        .and_then(|model| model.capabilities.max_output_tokens)
+        .or_else(|| model.and_then(|model| model.capability_overrides.max_output_tokens))
+        .or(entry.capabilities.max_output_tokens)
+        .filter(|value| *value > 0)
+        .map(u64::from)
+}
+
+pub fn validate_anthropic_model_configuration(
+    entry: &ProviderEntry,
+    model_id: &str,
+) -> Result<u64> {
+    let max_tokens = resolve_anthropic_max_tokens(entry, model_id).with_context(|| {
+        format!(
+            "native Anthropic model `{model_id}` has no output limit; fetch catalog metadata or configure model/provider capabilities.max_output_tokens"
+        )
+    })?;
+    if let Some(capability) = entry
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .and_then(|model| model.capabilities.reasoning_effort.as_ref())
+        && let Err(error) = validate_reasoning_effort_capability(
+            capability,
+            ReasoningEffortWire::AnthropicNative,
+            Some(max_tokens),
+        )
+    {
+        anyhow::bail!("invalid native Anthropic model `{model_id}` capability: {error:#}");
+    }
+    Ok(max_tokens)
+}
+
 impl ProvidersConfig {
     /// Resolve the effective prompt-cache config for `(provider, model)`:
     /// the model-level override if present, else the provider-level
@@ -1962,26 +2119,88 @@ impl ProvidersConfig {
         model: &str,
         selected: Option<&str>,
     ) -> Option<Value> {
+        self.resolve_reasoning_effort_params_for_wire(
+            provider,
+            model,
+            selected,
+            ReasoningEffortWire::OpenAiCompatible,
+            None,
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Resolve a typed reasoning mapping for the concrete provider wire.
+    /// Native Anthropic mappings are deliberately rejected on OpenAI-compatible
+    /// wires and vice versa, so a Claude model id never controls serialization.
+    pub fn resolve_reasoning_effort_params_for_wire(
+        &self,
+        provider: &str,
+        model: &str,
+        selected: Option<&str>,
+        wire: ReasoningEffortWire,
+        max_tokens: Option<u64>,
+    ) -> Result<Option<Value>> {
         let capability = self
             .providers
-            .get(provider)?
+            .get(provider)
+            .with_context(|| format!("provider `{provider}` is not configured"))?
             .models
             .iter()
-            .find(|m| m.id == model)?
+            .find(|m| m.id == model)
+            .with_context(|| format!("model `{provider}/{model}` is not in the catalog"))?
             .capabilities
             .reasoning_effort
             .as_ref()
-            .filter(|capability| !capability.values.is_empty())?;
-        let value = selected
-            .filter(|selected| reasoning_effort_supports_value(capability, selected))
-            .or(capability.default.as_deref())?;
-        let ReasoningEffortRequestMapping::JsonField { field, values } =
-            capability.request_mapping.as_ref()?;
-        let mapped = values
-            .get(value)
-            .cloned()
-            .unwrap_or_else(|| Value::String(value.to_string()));
-        Some(Value::Object(Map::from_iter([(field.clone(), mapped)])))
+            .filter(|capability| !capability.values.is_empty());
+        let Some(capability) = capability else {
+            return Ok(None);
+        };
+        let value = match selected {
+            Some(selected) if reasoning_effort_supports_value(capability, selected) => {
+                Some(selected)
+            }
+            Some(selected) => {
+                anyhow::bail!(
+                    "selected reasoning effort `{selected}` is not advertised by `{provider}/{model}`"
+                );
+            }
+            None => capability.default.as_deref(),
+        };
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        validate_reasoning_effort_capability(capability, wire, max_tokens)?;
+        let mapping = capability
+            .request_mapping
+            .as_ref()
+            .context("reasoning effort is advertised without a request mapping")?;
+        let params = match mapping {
+            ReasoningEffortRequestMapping::JsonField { field, values } => {
+                let mapped = values
+                    .get(value)
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(value.to_string()));
+                Value::Object(Map::from_iter([(field.clone(), mapped)]))
+            }
+            ReasoningEffortRequestMapping::AnthropicAdaptive { values } => {
+                let effort = values.get(value).map(String::as_str).unwrap_or(value);
+                serde_json::json!({
+                    "thinking": { "type": "adaptive" },
+                    "output_config": { "effort": effort },
+                })
+            }
+            ReasoningEffortRequestMapping::AnthropicManual => {
+                let budget = manual_thinking_budget(
+                    max_tokens.context("manual Anthropic thinking requires max_tokens")?,
+                    value,
+                )?;
+                serde_json::json!({
+                    "thinking": { "type": "enabled", "budget_tokens": budget },
+                })
+            }
+        };
+        Ok(Some(params))
     }
 
     pub fn has_reasoning_effort_capability(&self, provider: &str, model: &str) -> bool {

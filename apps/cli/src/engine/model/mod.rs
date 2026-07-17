@@ -429,6 +429,10 @@ pub enum Model {
         /// on [`Model::OpenAi`] — exact per-`(provider, model)` backup
         /// resolution (implementation note).
         provider_id: String,
+        /// Explicit output limit resolved from catalog metadata, a model
+        /// override, or a provider default. Native Anthropic rejects requests
+        /// without this field, so construction fails before this can be absent.
+        max_tokens: u64,
         /// Resolved base URL, kept for the retry TCP probe (the rig
         /// `CompletionModel` doesn't expose its client's base URL).
         base_url: String,
@@ -745,6 +749,70 @@ impl Model {
     /// of the backup-resolution key.
     pub fn model_id_ref(&self) -> &str {
         self.model_id()
+    }
+
+    pub fn is_anthropic_native_wire(&self) -> bool {
+        matches!(self, Model::Anthropic { .. })
+    }
+
+    pub fn resolved_max_tokens(&self) -> Option<u64> {
+        match self {
+            Model::Anthropic { max_tokens, .. } => Some(*max_tokens),
+            Model::OpenAi { .. } | Model::ChatGpt { .. } => None,
+        }
+    }
+
+    /// Resolve the active config's reasoning selection for this model using
+    /// the model's concrete wire family, never its provider or model name.
+    pub fn resolve_reasoning_params(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+    ) -> Option<serde_json::Value> {
+        let active = providers.active_model.as_ref()?;
+        if providers.has_reasoning_effort_capability(self.provider_id(), self.model_id_ref()) {
+            let selected = active
+                .reasoning_effort
+                .as_ref()
+                .filter(|_| {
+                    active.provider == self.provider_id() && active.model == self.model_id_ref()
+                })
+                .map(|effort| effort.value.as_str());
+            let wire = if self.is_anthropic_native_wire() {
+                crate::config::providers::ReasoningEffortWire::AnthropicNative
+            } else {
+                crate::config::providers::ReasoningEffortWire::OpenAiCompatible
+            };
+            return match providers.resolve_reasoning_effort_params_for_wire(
+                self.provider_id(),
+                self.model_id_ref(),
+                selected,
+                wire,
+                self.resolved_max_tokens(),
+            ) {
+                Ok(params) => params,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = self.provider_id(),
+                        model = self.model_id_ref(),
+                        %error,
+                        "dropping invalid reasoning-effort request parameters"
+                    );
+                    None
+                }
+            };
+        }
+        if self.is_anthropic_native_wire() {
+            if active.reasoning_effort.is_some() || active.thinking_mode.is_some() {
+                tracing::warn!(
+                    provider = self.provider_id(),
+                    model = self.model_id_ref(),
+                    "dropping unsupported legacy reasoning controls on native Anthropic wire"
+                );
+            }
+            return None;
+        }
+        let mode = active.thinking_mode?;
+        providers.resolve_thinking_params(self.provider_id(), self.model_id_ref(), mode)
     }
 
     /// Provider wire API family used by diagnostics/export. This is not a
@@ -1611,12 +1679,16 @@ mod tests {
         .expect("native ChatGPT model must build")
     }
 
-    fn native_anthropic_model(redact: TestArc<RedactionTable>) -> Model {
+    fn native_anthropic_model_at(
+        redact: TestArc<RedactionTable>,
+        base_url: String,
+        max_tokens: u64,
+    ) -> Model {
         use crate::config::providers::{CacheConfig, TimeoutConfig};
         use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
         let resolved = ResolvedRequest {
-            base_url: "http://127.0.0.1:1/v1".into(),
+            base_url,
             headers: vec![ResolvedHeader {
                 name: "x-api-key".into(),
                 value: "sk-test-anthropic".into(),
@@ -1626,6 +1698,7 @@ mod tests {
             "anthropic",
             &resolved,
             "claude-test",
+            max_tokens,
             &CacheConfig::default(),
             &TimeoutConfig::default(),
             false,
@@ -1641,6 +1714,10 @@ mod tests {
         .expect("native anthropic model must build")
     }
 
+    fn native_anthropic_model(redact: TestArc<RedactionTable>) -> Model {
+        native_anthropic_model_at(redact, "http://127.0.0.1:1/v1".into(), 8_192)
+    }
+
     #[test]
     fn native_anthropic_requires_x_api_key() {
         use crate::config::providers::{CacheConfig, TimeoutConfig};
@@ -1654,6 +1731,7 @@ mod tests {
             "anthropic",
             &resolved,
             "claude-test",
+            8_192,
             &CacheConfig::default(),
             &TimeoutConfig::default(),
             false,
@@ -2177,7 +2255,7 @@ mod tests {
     /// entry (same model id, different host) stays on [`Model::OpenAi`].
     #[test]
     fn build_model_routes_anthropic_host_to_native_arm() {
-        use crate::config::providers::{CacheConfig, HeaderSpec};
+        use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities};
 
         // Set the key the anthropic template reads so the build succeeds.
         // SAFETY: single-threaded test; restored at end.
@@ -2185,6 +2263,10 @@ mod tests {
 
         let native = ProviderEntry {
             url: "https://api.anthropic.com/v1".into(),
+            capabilities: ProviderCapabilities {
+                max_output_tokens: Some(128_000),
+                ..ProviderCapabilities::default()
+            },
             headers: vec![
                 HeaderSpec {
                     name: "x-api-key".into(),
@@ -3167,6 +3249,30 @@ mod tests {
         (format!("http://{addr}/v1"), rx)
     }
 
+    /// Capture rig's fully serialized native-Anthropic streaming body. A 400
+    /// response is sufficient: these tests assert the outbound seam, and the
+    /// non-retryable response keeps the harness minimal and deterministic.
+    async fn anthropic_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let body = read_http_body(&mut stream).await;
+                let _ = tx.send(body);
+                let payload = r#"{"type":"error","error":{"type":"invalid_request_error","message":"capture complete"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
     /// A local server that captures the request line, headers, and body for
     /// native ChatGPT/Codex Responses calls, then returns a minimal valid
     /// Responses API SSE stream. The bound URL intentionally includes the
@@ -3239,6 +3345,326 @@ mod tests {
             base_url,
             headers: Vec::new(),
         }
+    }
+
+    async fn capture_anthropic_body(
+        resolved_max_tokens: u64,
+        params: ModelParams,
+    ) -> serde_json::Value {
+        let (url, rx) = anthropic_capture_server().await;
+        let model = native_anthropic_model_at(
+            TestArc::new(RedactionTable::empty()),
+            url,
+            resolved_max_tokens,
+        );
+        let prepared = model
+            .prepare_completion_request("system", &[], &Message::user("hi"), &[], &params, false)
+            .unwrap();
+        assert_eq!(
+            prepared.captured["params"]["max_tokens"],
+            resolved_max_tokens
+        );
+        let result = model
+            .complete_prepared_with_pre_drain(
+                prepared,
+                &[],
+                params,
+                "Build",
+                None,
+                &CancellationToken::new(),
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "capture server deliberately returns 400");
+        serde_json::from_str(&rx.await.expect("captured Anthropic body")).unwrap()
+    }
+
+    fn resolve_native_reasoning_params(
+        request_mapping: crate::config::providers::ReasoningEffortRequestMapping,
+        selected: &str,
+        max_tokens: u64,
+    ) -> serde_json::Value {
+        use crate::config::providers::{
+            CapabilityValue, ModelCapabilities, ReasoningEffortCapability, ReasoningEffortWire,
+        };
+
+        let capability = ReasoningEffortCapability {
+            values: ["low", "medium", "high", "xhigh"]
+                .into_iter()
+                .map(|value| CapabilityValue {
+                    value: value.to_string(),
+                    label: None,
+                    description: None,
+                })
+                .collect(),
+            default: Some("medium".into()),
+            request_mapping: Some(request_mapping),
+            source: None,
+        };
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "anthropic".into(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "claude".into(),
+                    capabilities: ModelCapabilities {
+                        max_output_tokens: Some(max_tokens.try_into().unwrap()),
+                        reasoning_effort: Some(capability),
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        providers
+            .resolve_reasoning_effort_params_for_wire(
+                "anthropic",
+                "claude",
+                Some(selected),
+                ReasoningEffortWire::AnthropicNative,
+                Some(max_tokens),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    enum CapturedOpenAiReasoning {
+        Typed(&'static str),
+        Raw(serde_json::Value),
+    }
+
+    async fn capture_openai_body(
+        model_id: &str,
+        reasoning: CapturedOpenAiReasoning,
+    ) -> serde_json::Value {
+        use crate::config::providers::{
+            ActiveReasoningEffort, CapabilityValue, ModelCapabilities, ReasoningEffortCapability,
+            ReasoningEffortRequestMapping, WireApi,
+        };
+
+        let (url, rx) = sse_capture_server().await;
+        let resolved = resolved_local_request(url);
+        let model = build_openai_model_from_resolved(
+            "openai-compatible",
+            &resolved,
+            model_id,
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            true,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        let additional_params = match reasoning {
+            CapturedOpenAiReasoning::Raw(params) => params,
+            CapturedOpenAiReasoning::Typed(selected) => {
+                let mut providers = ProvidersConfig::default();
+                providers.providers.insert(
+                    "openai-compatible".into(),
+                    ProviderEntry {
+                        models: vec![ModelEntry {
+                            id: model_id.into(),
+                            capabilities: ModelCapabilities {
+                                reasoning_effort: Some(ReasoningEffortCapability {
+                                    values: vec![CapabilityValue {
+                                        value: selected.into(),
+                                        label: None,
+                                        description: None,
+                                    }],
+                                    default: Some(selected.into()),
+                                    request_mapping: Some(
+                                        ReasoningEffortRequestMapping::JsonField {
+                                            field: "reasoning_effort".into(),
+                                            values: Default::default(),
+                                        },
+                                    ),
+                                    source: None,
+                                }),
+                                ..ModelCapabilities::default()
+                            },
+                            ..ModelEntry::default()
+                        }],
+                        ..ProviderEntry::default()
+                    },
+                );
+                providers.active_model = Some(ActiveModelRef {
+                    provider: "openai-compatible".into(),
+                    model: model_id.into(),
+                    reasoning_effort: Some(ActiveReasoningEffort {
+                        value: selected.into(),
+                    }),
+                    thinking_mode: None,
+                });
+                model
+                    .resolve_reasoning_params(&providers)
+                    .expect("typed OpenAI reasoning mapping must resolve")
+            }
+        };
+        model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("hi"),
+                &[],
+                ModelParams {
+                    additional_params: Some(additional_params),
+                    ..ModelParams::default()
+                },
+                "Build",
+                None,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(&rx.await.expect("captured OpenAI body")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn anthropic_adaptive_params() {
+        use crate::config::providers::ReasoningEffortRequestMapping;
+
+        let additional_params = resolve_native_reasoning_params(
+            ReasoningEffortRequestMapping::AnthropicAdaptive {
+                values: [
+                    ("low".into(), "low".into()),
+                    ("medium".into(), "medium".into()),
+                    ("high".into(), "high".into()),
+                    ("xhigh".into(), "max".into()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            "high",
+            16_384,
+        );
+        let body = capture_anthropic_body(
+            16_384,
+            ModelParams {
+                additional_params: Some(additional_params),
+                ..ModelParams::default()
+            },
+        )
+        .await;
+        assert_eq!(body["max_tokens"], 16_384);
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body["thinking"].get("budget_tokens").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_manual_params() {
+        use crate::config::providers::ReasoningEffortRequestMapping;
+
+        let max_tokens = 10_001;
+        let additional_params = resolve_native_reasoning_params(
+            ReasoningEffortRequestMapping::AnthropicManual,
+            "high",
+            max_tokens,
+        );
+        let body = capture_anthropic_body(
+            max_tokens,
+            ModelParams {
+                additional_params: Some(additional_params),
+                ..ModelParams::default()
+            },
+        )
+        .await;
+        assert_eq!(body["max_tokens"], max_tokens);
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 7_500 })
+        );
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body.get("output_config").is_none(), "{body}");
+    }
+
+    #[test]
+    fn anthropic_unsupported_drops_legacy_thinking() {
+        use crate::config::providers::{
+            ActiveReasoningEffort, ModelCapabilities, ProviderCapabilities, ThinkingParams,
+        };
+
+        let model = native_anthropic_model(TestArc::new(RedactionTable::empty()));
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "anthropic".into(),
+            ProviderEntry {
+                thinking_params: ThinkingParams(std::collections::BTreeMap::from([(
+                    crate::config::providers::ThinkingMode::High,
+                    json!({ "reasoning_effort": "high" }),
+                )])),
+                models: vec![ModelEntry {
+                    id: "claude-test".into(),
+                    thinking_modes: vec![crate::config::providers::ThinkingMode::High],
+                    capabilities: ModelCapabilities {
+                        reasoning: CapabilityStatus::Unsupported,
+                        max_output_tokens: Some(8_192),
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                }],
+                capabilities: ProviderCapabilities {
+                    max_output_tokens: Some(8_192),
+                    ..ProviderCapabilities::default()
+                },
+                ..ProviderEntry::default()
+            },
+        );
+        providers.active_model = Some(ActiveModelRef {
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            reasoning_effort: Some(ActiveReasoningEffort {
+                value: "high".into(),
+            }),
+            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+        });
+        assert_eq!(model.resolve_reasoning_params(&providers), None);
+    }
+
+    #[tokio::test]
+    async fn openai_params_unchanged() {
+        let body = capture_openai_body("gpt-5", CapturedOpenAiReasoning::Typed("high")).await;
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("thinking").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn claude_on_openai_wire_keeps_effort() {
+        let body = capture_openai_body(
+            "claude-sonnet-through-gateway",
+            CapturedOpenAiReasoning::Typed("high"),
+        )
+        .await;
+        assert_eq!(body["model"], "claude-sonnet-through-gateway");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("thinking").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn deepseek_params_unchanged() {
+        let params = ProvidersConfig::default()
+            .resolve_thinking_params(
+                "deepseek",
+                "deepseek-reasoner",
+                crate::config::providers::ThinkingMode::High,
+            )
+            .unwrap();
+        let body =
+            capture_openai_body("deepseek-reasoner", CapturedOpenAiReasoning::Raw(params)).await;
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[tokio::test]

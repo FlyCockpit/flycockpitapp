@@ -28,8 +28,8 @@ use crate::config::dirs::{
     most_specific_config_write_target,
 };
 use crate::config::providers::{
-    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ProvidersConfig,
-    ReasoningEffortCapability, ThinkingMode,
+    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry, ProviderEntry,
+    ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
 };
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::textfield::TextField;
@@ -91,6 +91,33 @@ impl Entry {
     }
 }
 
+fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry) -> Entry {
+    let native_anthropic = crate::config::providers::is_anthropic_native_base_url(&provider.url);
+    let reasoning_effort = if native_anthropic
+        && crate::config::providers::validate_anthropic_model_configuration(provider, &model.id)
+            .is_err()
+    {
+        None
+    } else {
+        model.capabilities.reasoning_effort.clone()
+    };
+    Entry {
+        provider_id: provider_id.to_string(),
+        model_id: model.id.clone(),
+        display_name: model.name.clone(),
+        is_favorite: model.favorite,
+        reasoning_effort,
+        // Legacy free-form thinking mappings are never valid on Anthropic's
+        // native wire. Keeping this empty prevents the picker from advertising
+        // a control the request path must drop.
+        thinking_modes: if native_anthropic {
+            Vec::new()
+        } else {
+            model.thinking_modes.clone()
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub provider_id: String,
@@ -110,14 +137,7 @@ pub fn ordered_model_choices(
     let mut entries: Vec<Entry> = Vec::new();
     for (pid, entry) in &cfg.providers {
         for model in &entry.models {
-            entries.push(Entry {
-                provider_id: pid.clone(),
-                model_id: model.id.clone(),
-                display_name: model.name.clone(),
-                is_favorite: model.favorite,
-                reasoning_effort: model.capabilities.reasoning_effort.clone(),
-                thinking_modes: model.thinking_modes.clone(),
-            });
+            entries.push(picker_entry(pid, entry, model));
         }
     }
     sort_entries(&mut entries, counts);
@@ -189,14 +209,7 @@ impl ModelPickerDialog {
         let mut entries: Vec<Entry> = Vec::new();
         for (pid, entry) in &cfg.providers {
             for model in &entry.models {
-                entries.push(Entry {
-                    provider_id: pid.clone(),
-                    model_id: model.id.clone(),
-                    display_name: model.name.clone(),
-                    is_favorite: model.favorite,
-                    reasoning_effort: model.capabilities.reasoning_effort.clone(),
-                    thinking_modes: model.thinking_modes.clone(),
-                });
+                entries.push(picker_entry(pid, entry, model));
             }
         }
         // Stable order: favorites first, then 30-day usage count desc,
@@ -1039,6 +1052,28 @@ mod tests {
             ),
             source: Some(crate::config::providers::CapabilitySource::Live),
         }
+    }
+
+    #[test]
+    fn native_anthropic_picker_hides_legacy_and_invalid_reasoning_controls() {
+        let model = ModelEntry {
+            id: "claude-test".into(),
+            thinking_modes: vec![ThinkingMode::High],
+            capabilities: crate::config::providers::ModelCapabilities {
+                max_output_tokens: Some(8_192),
+                reasoning_effort: Some(reasoning_capability()),
+                ..crate::config::providers::ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        };
+        let provider = ProviderEntry {
+            url: "https://api.anthropic.com/v1".into(),
+            models: vec![model.clone()],
+            ..ProviderEntry::default()
+        };
+        let entry = picker_entry("anthropic", &provider, &model);
+        assert!(entry.thinking_modes.is_empty());
+        assert!(entry.reasoning_effort.is_none());
     }
 
     fn reasoning_entry(model: &str) -> Entry {

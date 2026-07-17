@@ -3399,23 +3399,7 @@ impl Driver {
         model: &crate::engine::model::Model,
     ) -> Option<serde_json::Value> {
         let providers = self.live_providers_config().ok()?;
-        let active = providers.active_model.as_ref()?;
-        if providers.has_reasoning_effort_capability(model.provider_id(), model.model_id_ref()) {
-            let selected = active
-                .reasoning_effort
-                .as_ref()
-                .filter(|_| {
-                    active.provider == model.provider_id() && active.model == model.model_id_ref()
-                })
-                .map(|effort| effort.value.as_str());
-            return providers.resolve_reasoning_effort_params(
-                model.provider_id(),
-                model.model_id_ref(),
-                selected,
-            );
-        }
-        let mode = active.thinking_mode?;
-        providers.resolve_thinking_params(model.provider_id(), model.model_id_ref(), mode)
+        model.resolve_reasoning_params(&providers)
     }
 
     /// Consume the deferred agent-swap identity marker (`agent-swap-

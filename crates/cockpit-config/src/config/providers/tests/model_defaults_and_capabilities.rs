@@ -102,7 +102,8 @@ fn resolve_reasoning_effort_params_uses_native_mapping_and_default() {
     );
     assert_eq!(
         cfg.resolve_reasoning_effort_params("codex", "gpt-5-codex", Some("stale")),
-        Some(serde_json::json!({ "reasoning_effort": "minimal" }))
+        None,
+        "an explicit stale selection must not silently fall back to the default"
     );
 
     cfg.active_model = Some(ActiveModelRef {
@@ -1724,4 +1725,156 @@ fn embedding_model_unresolvable_is_loud() {
 
     let err = cfg.resolve_embedding_model(&extended).unwrap_err();
     assert!(err.to_string().contains("unknown provider `missing`"));
+}
+
+fn anthropic_reasoning_capability(
+    mapping: ReasoningEffortRequestMapping,
+) -> ReasoningEffortCapability {
+    ReasoningEffortCapability {
+        values: ["low", "medium", "high", "xhigh"]
+            .into_iter()
+            .map(|value| CapabilityValue {
+                value: value.to_string(),
+                ..CapabilityValue::default()
+            })
+            .collect(),
+        default: Some("high".into()),
+        request_mapping: Some(mapping),
+        source: Some(CapabilitySource::Live),
+    }
+}
+
+#[test]
+fn manual_thinking_budget_matrix() {
+    assert_eq!(manual_thinking_budget(10_001, "low").unwrap(), 2_500);
+    assert_eq!(manual_thinking_budget(10_001, "medium").unwrap(), 5_000);
+    assert_eq!(manual_thinking_budget(10_001, "high").unwrap(), 7_500);
+    assert_eq!(manual_thinking_budget(10_001, "xhigh").unwrap(), 8_000);
+    assert_eq!(manual_thinking_budget(3_000, "low").unwrap(), 1_024);
+    assert_eq!(manual_thinking_budget(5_000, "xhigh").unwrap(), 3_976);
+    assert_eq!(manual_thinking_budget(2_048, "low").unwrap(), 1_024);
+    assert!(manual_thinking_budget(2_047, "low").is_err());
+    assert!(manual_thinking_budget(8_192, "unknown").is_err());
+}
+
+#[test]
+fn adaptive_thinking_has_no_budget() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "anthropic".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "claude-adaptive".into(),
+                capabilities: ModelCapabilities {
+                    max_output_tokens: Some(16_384),
+                    reasoning_effort: Some(anthropic_reasoning_capability(
+                        ReasoningEffortRequestMapping::AnthropicAdaptive {
+                            values: BTreeMap::from([("xhigh".into(), "max".into())]),
+                        },
+                    )),
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    let params = cfg
+        .resolve_reasoning_effort_params_for_wire(
+            "anthropic",
+            "claude-adaptive",
+            Some("xhigh"),
+            ReasoningEffortWire::AnthropicNative,
+            Some(16_384),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        params["thinking"],
+        serde_json::json!({ "type": "adaptive" })
+    );
+    assert_eq!(params["output_config"]["effort"], "max");
+    assert!(params.get("budget_tokens").is_none());
+    assert!(params["thinking"].get("budget_tokens").is_none());
+    let error = cfg
+        .resolve_reasoning_effort_params_for_wire(
+            "anthropic",
+            "claude-adaptive",
+            Some("stale"),
+            ReasoningEffortWire::AnthropicNative,
+            Some(16_384),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not advertised"), "{error}");
+}
+
+#[test]
+fn anthropic_max_tokens_always_resolved() {
+    let mut entry = ProviderEntry {
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(4_096),
+            ..ProviderCapabilities::default()
+        },
+        models: vec![ModelEntry {
+            id: "claude".into(),
+            capabilities: ModelCapabilities {
+                max_output_tokens: Some(16_384),
+                ..ModelCapabilities::default()
+            },
+            capability_overrides: ModelCapabilityOverrides {
+                max_output_tokens: Some(8_192),
+                ..ModelCapabilityOverrides::default()
+            },
+            ..ModelEntry::default()
+        }],
+        ..ProviderEntry::default()
+    };
+    assert_eq!(resolve_anthropic_max_tokens(&entry, "claude"), Some(16_384));
+    entry.models[0].capabilities.max_output_tokens = None;
+    assert_eq!(resolve_anthropic_max_tokens(&entry, "claude"), Some(8_192));
+    entry.models[0].capability_overrides.max_output_tokens = None;
+    assert_eq!(resolve_anthropic_max_tokens(&entry, "claude"), Some(4_096));
+}
+
+#[test]
+fn catalog_max_output_tokens_consumed() {
+    let entry = ProviderEntry {
+        models: vec![ModelEntry {
+            id: "claude".into(),
+            capabilities: ModelCapabilities {
+                max_output_tokens: Some(64_000),
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        }],
+        ..ProviderEntry::default()
+    };
+    assert_eq!(
+        validate_anthropic_model_configuration(&entry, "claude").unwrap(),
+        64_000
+    );
+}
+
+#[test]
+fn missing_output_limit_fails_closed() {
+    let models = merge_fetched_models_with_policy(
+        Some("anthropic"),
+        &[],
+        vec![ModelEntry {
+            id: "claude-sonnet-new".into(),
+            ..ModelEntry::default()
+        }],
+        ModelMergePolicy::KeepUnlisted,
+    );
+    assert_eq!(models[0].capabilities.max_output_tokens, None);
+    let entry = ProviderEntry {
+        models,
+        ..ProviderEntry::default()
+    };
+    let error = validate_anthropic_model_configuration(&entry, "claude-sonnet-new")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no output limit"), "{error}");
+    assert!(error.contains("max_output_tokens"), "{error}");
 }

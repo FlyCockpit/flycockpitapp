@@ -25,7 +25,7 @@ use serde_json::{Map, Value};
 use crate::config::providers::{
     CapabilitySource, CapabilityStatus, CapabilityValue, ClientSideToolsCapability, HeaderSpec,
     ModelCapabilities, ModelEntry, ProviderEntry, ProviderModelCatalog, ReasoningEffortCapability,
-    ReasoningEffortRequestMapping, ThinkingMode,
+    ReasoningEffortRequestMapping, ThinkingMode, validate_anthropic_model_configuration,
 };
 use crate::envref;
 use crate::providers::registry::{
@@ -523,7 +523,9 @@ pub async fn fetch_models_for_provider(
     let url = provider.models_url(entry, &request.base_url);
     let fallback_models = provider.fallback_models();
     let fallback_catalog = provider.fallback_catalog();
-    let outcome = fetch_models_at_detailed(&url, &request.headers, timeout).await;
+    let outcome = fetch_models_at_detailed(&url, &request.headers, timeout)
+        .await
+        .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
@@ -576,6 +578,35 @@ pub async fn fetch_models_for_provider(
     }
 }
 
+fn validate_anthropic_fetch_result(
+    entry: &ProviderEntry,
+    base_url: &str,
+    result: FetchModelsAtResult,
+) -> Result<FetchModelsAtResult> {
+    if !crate::config::providers::is_anthropic_native_base_url(base_url) {
+        return Ok(result);
+    }
+    if let FetchOutcome::Models { models, .. } = &result.outcome {
+        for fetched in models {
+            let mut candidate_model = fetched.clone();
+            if let Some(existing) = entry.models.iter().find(|model| model.id == fetched.id) {
+                candidate_model.capability_overrides = existing.capability_overrides.clone();
+            }
+            let mut candidate_provider = entry.clone();
+            candidate_provider.models = vec![candidate_model];
+            if let Err(error) =
+                validate_anthropic_model_configuration(&candidate_provider, &fetched.id)
+            {
+                anyhow::bail!(
+                    "rejecting invalid Anthropic catalog entry `{}`: {error:#}",
+                    fetched.id
+                );
+            }
+        }
+    }
+    Ok(result)
+}
+
 async fn read_success_body_limited(mut resp: reqwest::Response) -> Result<String> {
     let mut body = Vec::new();
     while let Some(chunk) = resp
@@ -606,7 +637,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
         _ => return Err(anyhow!("unexpected models response root")),
     };
 
-    Ok(entries
+    entries
         .into_iter()
         .filter_map(|raw| {
             let obj = raw.as_object()?;
@@ -642,7 +673,10 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 serde_json::from_value::<crate::config::providers::Inputs>(v.clone()).ok()
             });
 
-            let capabilities = model_capabilities_from_metadata(obj);
+            let capabilities = match model_capabilities_from_metadata(obj) {
+                Ok(capabilities) => capabilities,
+                Err(error) => return Some(Err(anyhow!("model `{id}` capabilities: {error}"))),
+            };
 
             // Stash every remaining field into `extra` so re-saving
             // doesn't lose provider-specific metadata.
@@ -667,7 +701,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
             // capability projection so legacy context consumers still work.
             let context_length = context_tokens_from_metadata(obj);
 
-            Some(ModelEntry {
+            Some(Ok(ModelEntry {
                 id,
                 name,
                 thinking_modes,
@@ -703,13 +737,13 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 capabilities,
                 capability_overrides: Default::default(),
                 provider_metadata: extra,
-            })
+            }))
         })
-        .collect())
+        .collect()
 }
 
-fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> ModelCapabilities {
-    ModelCapabilities {
+fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCapabilities> {
+    Ok(ModelCapabilities {
         tool_calling: capability_status_from_metadata(
             obj,
             "tool_calling",
@@ -735,9 +769,9 @@ fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> ModelCapabiliti
                 "json_schema_response_format",
             ],
         ),
-        reasoning_effort: reasoning_effort_capability_from_metadata(obj),
+        reasoning_effort: reasoning_effort_capability_from_metadata(obj)?,
         client_side_tools: client_side_tools_capability_from_metadata(obj).unwrap_or_default(),
-    }
+    })
 }
 
 fn context_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
@@ -1006,7 +1040,18 @@ fn client_side_tools_status(raw: &str) -> Option<CapabilityStatus> {
 
 fn reasoning_effort_capability_from_metadata(
     obj: &Map<String, Value>,
-) -> Option<ReasoningEffortCapability> {
+) -> Result<Option<ReasoningEffortCapability>> {
+    if let Some(raw) = obj
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .and_then(|capabilities| capabilities.get("reasoning_effort"))
+    {
+        let mut capability = serde_json::from_value::<ReasoningEffortCapability>(raw.clone())
+            .context("invalid explicit reasoning_effort capability")?;
+        capability.source.get_or_insert(CapabilitySource::Live);
+        return Ok(Some(capability));
+    }
+
     let mut values = Vec::new();
     if let Some(raw_values) = obj
         .get("supported_reasoning_levels")
@@ -1033,7 +1078,7 @@ fn reasoning_effort_capability_from_metadata(
         .map(str::to_string);
 
     if values.is_empty() && default.is_none() {
-        return None;
+        return Ok(None);
     }
 
     let request_mapping = if values.is_empty() {
@@ -1048,12 +1093,12 @@ fn reasoning_effort_capability_from_metadata(
         })
     };
 
-    Some(ReasoningEffortCapability {
+    Ok(Some(ReasoningEffortCapability {
         values,
         default,
         request_mapping,
         source: Some(CapabilitySource::Live),
-    })
+    }))
 }
 
 fn reasoning_level_value(raw: &Value) -> Option<CapabilityValue> {
@@ -1320,7 +1365,10 @@ mod tests {
         let values: Vec<_> = reasoning.values.iter().map(|v| v.value.as_str()).collect();
         assert_eq!(values, vec!["minimal", "low", "medium", "high", "xhigh"]);
         let ReasoningEffortRequestMapping::JsonField { field, values } =
-            reasoning.request_mapping.as_ref().unwrap();
+            reasoning.request_mapping.as_ref().unwrap()
+        else {
+            panic!("Codex catalog must retain the OpenAI JSON-field mapping");
+        };
         assert_eq!(field, "reasoning_effort");
         assert_eq!(values.get("xhigh"), Some(&serde_json::json!("xhigh")));
         assert!(model.thinking_modes.is_empty());
@@ -1441,6 +1489,140 @@ mod tests {
             model.capabilities.structured_outputs,
             CapabilityStatus::Unsupported
         );
+    }
+
+    #[test]
+    fn ingest_validates_anthropic_mapping() {
+        let openai_shaped = parse_models_body(
+            r#"{"data":[{
+                "id":"claude-invalid",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"high"}],
+                    "default":"high",
+                    "request_mapping":{"type":"json_field","field":"reasoning_effort"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
+        let result = FetchModelsAtResult {
+            outcome: FetchOutcome::Models {
+                models: openai_shaped,
+                catalog: ProviderModelCatalog::Live,
+            },
+            status: Some(StatusCode::OK),
+            body_nonempty: true,
+        };
+        let error = match validate_anthropic_fetch_result(
+            &ProviderEntry::default(),
+            "https://api.anthropic.com/v1",
+            result,
+        ) {
+            Ok(_) => panic!("OpenAI-shaped native Anthropic mapping must be rejected"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("rejecting invalid Anthropic catalog entry"));
+
+        let inconsistent = parse_models_body(
+            r#"{"data":[{
+                "id":"claude-invalid-adaptive",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"high"}],
+                    "request_mapping":{"type":"anthropic_adaptive","budget_tokens":2048}
+                }}
+            }]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            inconsistent.contains("invalid explicit reasoning_effort capability"),
+            "{inconsistent}"
+        );
+
+        let unknown_adaptive_target = parse_models_body(
+            r#"{"data":[{
+                "id":"claude-invalid-effort",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"xhigh"}],
+                    "request_mapping":{"type":"anthropic_adaptive"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
+        let result = FetchModelsAtResult {
+            outcome: FetchOutcome::Models {
+                models: unknown_adaptive_target,
+                catalog: ProviderModelCatalog::Live,
+            },
+            status: Some(StatusCode::OK),
+            body_nonempty: true,
+        };
+        let error = match validate_anthropic_fetch_result(
+            &ProviderEntry::default(),
+            "https://api.anthropic.com/v1",
+            result,
+        ) {
+            Ok(_) => panic!("unknown adaptive Anthropic targets must be rejected"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("unsupported target `xhigh`"), "{error}");
+
+        let manual_without_limit = parse_models_body(
+            r#"{"data":[{
+                "id":"claude-manual",
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"low"}],
+                    "request_mapping":{"type":"anthropic_manual"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
+        let result = FetchModelsAtResult {
+            outcome: FetchOutcome::Models {
+                models: manual_without_limit,
+                catalog: ProviderModelCatalog::Live,
+            },
+            status: Some(StatusCode::OK),
+            body_nonempty: true,
+        };
+        let error = match validate_anthropic_fetch_result(
+            &ProviderEntry::default(),
+            "https://api.anthropic.com/v1",
+            result,
+        ) {
+            Ok(_) => panic!("manual Anthropic mapping without an output limit must be rejected"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("no output limit"), "{error}");
+
+        let valid = parse_models_body(
+            r#"{"data":[{
+                "id":"claude-adaptive",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"high"}],
+                    "default":"high",
+                    "request_mapping":{"type":"anthropic_adaptive"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
+        let result = FetchModelsAtResult {
+            outcome: FetchOutcome::Models {
+                models: valid,
+                catalog: ProviderModelCatalog::Live,
+            },
+            status: Some(StatusCode::OK),
+            body_nonempty: true,
+        };
+        validate_anthropic_fetch_result(
+            &ProviderEntry::default(),
+            "https://api.anthropic.com/v1",
+            result,
+        )
+        .unwrap();
     }
 
     #[test]

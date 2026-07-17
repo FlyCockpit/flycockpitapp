@@ -537,7 +537,7 @@ impl SessionRegistry {
         // thinking modes (implementation note). Threaded
         // onto the root spawn's `ModelParams` so every outbound request on the
         // session model carries the vendor reasoning controls.
-        let thinking_params = providers_cfg.resolve_active_model_reasoning_params();
+        let thinking_params = model.resolve_reasoning_params(providers_cfg);
 
         // Plan-level model override (`cockpit run --model`): a well-formed
         // `provider/model` selector built through the same provider pipeline as

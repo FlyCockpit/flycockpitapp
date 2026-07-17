@@ -61,10 +61,11 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         )
         .context("resolving active model")?,
     );
+    let reasoning_params = model.resolve_reasoning_params(&providers);
     let spawn_args = SpawnArgs {
         model,
         params: ModelParams {
-            additional_params: providers.resolve_active_model_reasoning_params(),
+            additional_params: reasoning_params,
             prompt_cache_key: Some(session.id.to_string()),
             ..ModelParams::default()
         },

@@ -180,7 +180,11 @@ fn apply_anthropic_capability_defaults(model: &mut ModelEntry) {
     if !id.starts_with("claude-") {
         return;
     }
-    fill_chat_core(model, 200_000, Some(64_000));
+    // Model output limits change across Claude families and must come from
+    // catalog metadata or explicit user/provider configuration. Guessing here
+    // would make native requests appear available with an unauthoritative
+    // `max_tokens` value.
+    fill_chat_core(model, 200_000, None);
     fill_images(model, true);
     if id.contains("opus") || id.contains("sonnet") || id.contains("fable") {
         fill_reasoning(model, CapabilityStatus::Supported);

@@ -2,19 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Also read `AGENTS.md` — it contains the binding rules for coding agents (workflow, safety, and code standards). Key ones: do not commit unless explicitly asked, do not install dependencies without asking, never run destructive database commands, and do not weaken auth/CSRF/CORS/CSP/rate limits without explicit approval.
+Also read `AGENTS.md` — it is the authoritative workspace map and contains the binding rules for coding agents (workflow, safety, and code standards). Key ones: do not commit unless explicitly asked, do not install dependencies without asking, never run destructive database commands, and do not weaken auth/CSRF/CORS/CSP/rate limits without explicit approval.
 
 ## Repository shape
 
-Flycockpit is a pnpm + Turborepo monorepo of TypeScript apps and packages, plus a Cargo workspace rooted at `Cargo.toml`. Current Rust members are `apps/cli` (the `cockpit` CLI) and `crates/relay-protocol`. Rust crates are NOT pnpm workspace packages: pnpm/turbo commands never build or test them — run cargo from the repo root.
+Flycockpit is a pnpm + Turborepo monorepo of TypeScript apps and packages, plus a Cargo workspace rooted at `Cargo.toml`. `AGENTS.md` is authoritative for workspace shape; keep this short map in sync with it. Apps under `apps/`: `apps/cli`, `apps/docs`, `apps/native`, `apps/relay`, `apps/relay-rs`, `apps/server`, `apps/web`, and `apps/worker`.
+
+Current Rust members are `apps/cli` (the `cockpit` CLI), `apps/relay-rs` (Rust relay), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (relay wire protocol). Rust crates are NOT pnpm workspace packages: pnpm/turbo commands never build or test them — run cargo from the repo root.
 
 ### TypeScript side
 
 - `apps/web` — React 19 PWA (TanStack Router, React Query, Tailwind, routes in `src/routes/`).
+- `apps/docs` — documentation site.
 - `apps/server` — Hono API server: Better Auth, oRPC mount, asset/video routes, MCP admin tools, SEO, security middleware. Most files have a colocated `*.test.ts`.
 - `apps/worker` — BullMQ worker (asset analysis, video transcoding, cleanup, seed jobs, enterprise log exports).
 - `apps/native` — Expo Router app sharing the same auth and API contracts.
-- `apps/relay` — remote-session relay service (`@flycockpit/relay-protocol` envelopes).
+- `apps/relay` — TypeScript remote-session relay service (`@flycockpit/relay-protocol` envelopes); it remains during the replacement transition.
 - `packages/api` — oRPC routers (`src/routers/`) and service logic; this is where app business logic lives.
 - `packages/db` — Prisma schema in `prisma/schema/`, generated client, seed. Uses `prisma db push`, **not migration files**.
 - `packages/auth` (Better Auth config/roles), `packages/env` (runtime env validation for every surface), `packages/queue` (BullMQ queue names/schemas/producers), `packages/ui` (shared shadcn/ui), `packages/config`, `packages/mailer`, `packages/cockpit-protocol` (shared cockpit session/project types).
@@ -25,7 +28,11 @@ Data flow: web/native → oRPC client (React Query options) → routers in `pack
 
 ### Rust (`apps/cli`, `crates/*`)
 
-`cockpit` is an AI coding harness: ratatui TUI (`src/tui/`), persistent session daemon (`src/daemon/`, SQLite-backed sessions), agent engine (`src/engine/` — driver, prompt pruning, tool loop), providers/model catalogs (`src/providers/`, `src/config/`), MCP, file-locking write tools, multi-agent roles. CI is `.github/workflows/cli-ci.yml`; releases via cargo-dist (`.github/workflows/release.yml`, Homebrew tap). Requires Rust 1.95+.
+`apps/cli` is the Rust `cockpit` AI coding harness. Its current module directories include `apps/cli/src/tui/`, `apps/cli/src/daemon/`, `apps/cli/src/engine/`, `apps/cli/src/providers/`, `apps/cli/src/auth/`, `apps/cli/src/commands/`, `apps/cli/src/tools/`, `apps/cli/src/mcp/`, `apps/cli/src/agents/`, `apps/cli/src/session/`, `apps/cli/src/redact/`, `apps/cli/src/packages/`, and `apps/cli/src/wizard/`. SQLite storage and migrations live in `crates/cockpit-db`; config types/loading live in `crates/cockpit-config`; daemon protocol types live in `crates/cockpit-proto`.
+
+`apps/relay-rs` is the Rust relay that is replacing `apps/relay`; both relay implementations exist during the transition tracked by the `retire-typescript-relay` prompt. Relay wire types live in `crates/relay-protocol`.
+
+CI is `.github/workflows/cli-ci.yml`; releases via cargo-dist (`.github/workflows/release.yml`, Homebrew tap). Requires Rust 1.95+.
 
 ## Commands
 

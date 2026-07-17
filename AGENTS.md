@@ -2,11 +2,16 @@
 
 Rules for coding agents working in Flycockpit.
 
+`AGENTS.md` is the authoritative workspace map for coding agents. When workspace
+shape changes, update this file and mirror the short map in `CLAUDE.md`.
+
 ## Project Shape
 
 Flycockpit is a pnpm/Turborepo monorepo with a React web app, Hono API server, BullMQ worker, Expo native app, relay service, Prisma database package, and shared internal packages under the `@flycockpit/*` scope.
 
-Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` and `crates/relay-protocol`; pnpm/turbo commands do not build or test Rust. Run cargo checks from the repo root: `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked -- -D warnings`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+Apps under `apps/`: `apps/cli` (Rust Cockpit CLI), `apps/docs` (documentation site), `apps/native` (Expo app), `apps/relay` (TypeScript relay), `apps/relay-rs` (Rust relay replacing the TypeScript relay during the transition), `apps/server` (Hono API), `apps/web` (React app), and `apps/worker` (BullMQ worker).
+
+Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI), `apps/relay-rs` (Rust relay), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (relay wire protocol). pnpm/turbo commands do not build or test Rust. Run cargo checks from the repo root: `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked -- -D warnings`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
 
 ## Default Workflow
 

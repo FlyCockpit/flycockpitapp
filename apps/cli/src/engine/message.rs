@@ -218,6 +218,20 @@ impl UserSubmissionQueue {
         }
     }
 
+    /// Publish the current pending-queue snapshot without mutating it.
+    ///
+    /// Attach hydration uses this so a newly subscribed client learns the
+    /// authoritative queue even when the last queue mutation happened before
+    /// it connected. Publishing an empty snapshot is intentional: it clears a
+    /// stale client-side mirror after reconnect.
+    pub async fn republish(&self) {
+        let snapshot = {
+            let state = self.inner.lock().await;
+            snapshot_pending(&state)
+        };
+        self.publish(snapshot);
+    }
+
     pub async fn remove(&self, id: Uuid) -> (RemoveQueuedMessageResult, Vec<QueuedUserMessage>) {
         let (result, snapshot) = {
             let mut state = self.inner.lock().await;

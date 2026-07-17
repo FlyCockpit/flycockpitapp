@@ -1177,14 +1177,17 @@ async fn attach(
         _interactive_guard: interactive_guard,
     });
 
-    // Hydrate the gitignore read-allowlist for this client
-    // (implementation note): broadcast the session's
-    // current session-approved globs over the per-session bus so a late-opened
-    // or reconnecting TUI — and any second concurrent client — re-includes
-    // approvals made before it attached, not only ones broadcast live
-    // afterward. The just-subscribed `event_rx` receives it; full-list replace,
-    // idempotent for already-attached clients. Only the allow-set is sent.
+    // Hydrate the queue and gitignore read-allowlist for this client. The
+    // just-subscribed `event_rx` receives both full-list replacements, so a
+    // late-opened or reconnecting TUI — and any second concurrent client —
+    // learns state established before it attached, not only later mutations.
+    // Queue replay intentionally includes an empty snapshot; gitignore replay
+    // sends only the allow-set.
     if let Some(att) = state.attached.as_ref() {
+        att.handle
+            .broadcast_queue_snapshot()
+            .await
+            .map_err(internal)?;
         att.handle.broadcast_gitignore_allow();
         att.handle.broadcast_active_interrupt();
         att.handle.broadcast_sandbox_escalation();

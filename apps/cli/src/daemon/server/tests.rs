@@ -3081,6 +3081,14 @@ mod tests {
         recv_dispatch_matrix_response(&mut client, attach_id)
             .await
             .expect("attach succeeds");
+        let hydration = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
+            .await
+            .expect("attach hydration delivered")
+            .expect("attach hydration present");
+        assert!(
+            matches!(hydration, SessionWork::RepublishQueue),
+            "unexpected attach hydration: {hydration:?}"
+        );
 
         let id = Uuid::new_v4();
         client

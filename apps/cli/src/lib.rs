@@ -193,6 +193,10 @@ pub mod integration {
             session_id: Uuid,
             count: usize,
         },
+        QueueUpdated {
+            session_id: Uuid,
+            texts: Vec<String>,
+        },
         Other,
     }
 
@@ -446,6 +450,12 @@ pub mod integration {
                 DaemonEvent::PausedWorkAvailable {
                     session_id,
                     count: items.len(),
+                }
+            }
+            crate::daemon::proto::Event::QueueUpdated { session_id, queue } => {
+                DaemonEvent::QueueUpdated {
+                    session_id,
+                    texts: queue.into_iter().map(|item| item.text).collect(),
                 }
             }
             _ => DaemonEvent::Other,

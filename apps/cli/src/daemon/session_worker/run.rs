@@ -1039,6 +1039,9 @@ async fn run_worker(
                     queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                 });
             }
+            SessionWork::RepublishQueue => {
+                driver_input_queue.republish().await;
+            }
             SessionWork::Cancel => {
                 // User ctrl+c (`CancelTurn`). Fire the in-flight run's
                 // cancellation token: the driver's `turn` aborts the

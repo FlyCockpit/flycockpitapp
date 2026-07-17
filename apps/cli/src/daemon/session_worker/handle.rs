@@ -574,6 +574,12 @@ impl SessionWorkerHandle {
         );
     }
 
+    /// Ask the authoritative worker queue to republish its full snapshot.
+    /// The normal queue forwarder performs redaction and event broadcast.
+    pub async fn broadcast_queue_snapshot(&self) -> Result<()> {
+        self.send_work(SessionWork::RepublishQueue).await
+    }
+
     pub fn broadcast_active_interrupt(&self) {
         let Ok(open) = self.session.db.list_open_interrupts(self.session_id) else {
             return;
@@ -721,6 +727,7 @@ pub enum SessionWork {
         target_id: Option<String>,
         respond_to: oneshot::Sender<proto::RemoveQueuedUserMessagesResult>,
     },
+    RepublishQueue,
     Cancel,
     ResolveInterrupt {
         interrupt_id: Uuid,

@@ -15,10 +15,16 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::extended::ThinkingDisplay;
 use crate::tui::markdown;
+#[cfg(test)]
+use crate::tui::message_block::wrap_lines_to_width_reserving_first;
+use crate::tui::message_block::{
+    layout_markdown_message_lines, render_markdown_message_block, slice_spans_at_width,
+    wrap_lines_to_width,
+};
 use crate::tui::theme::{
     ERROR_TEXT, INFO_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE,
     SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
@@ -532,6 +538,14 @@ pub const TIMESTAMP_WIDTH: usize = 5;
 /// The user-facing display label for an agent name.
 pub fn agent_display_label(name: &str) -> &str {
     name
+}
+
+pub fn user_display_label() -> &'static str {
+    "You"
+}
+
+pub fn user_message_color() -> Color {
+    USER_BORDER_FG
 }
 
 pub fn agent_color(name: &str) -> Color {
@@ -1432,18 +1446,19 @@ fn render_pending_markdown_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-    let (wrapped_md, md_conts) = wrap_lines_to_width_reserving_first(
+    let body = layout_markdown_message_lines(
         markdown_lines,
         body_content_w,
         TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN,
+        AGENT_INDENT,
+        Style::default(),
     );
-    let body = indent_lines(wrapped_md, AGENT_INDENT);
-    if body.is_empty() {
+    if body.lines.is_empty() {
         return vec![render_first_line_with_pin_and_timestamp(vec![], timestamp, width, None).0];
     }
 
-    let mut out = Vec::with_capacity(body.len());
-    let mut iter = body.into_iter().zip(md_conts);
+    let mut out = Vec::with_capacity(body.lines.len());
+    let mut iter = body.lines.into_iter().zip(body.continuations);
     let (first, _) = iter.next().expect("body non-empty");
     out.push(render_first_line_with_pin_and_timestamp(first.spans, timestamp, width, None).0);
     out.extend(iter.map(|(line, _)| line));
@@ -1676,7 +1691,7 @@ fn render_user_markdown(
     // Content width inside the `│ ` bar (and a matching right margin), so
     // display-math blocks degrade to raw if they'd exceed the viewport.
     let md_width = (width as usize).saturating_sub(2 + 2).max(1);
-    let body = markdown::render_with_width(text, md_width);
+    let body = render_markdown_message_block(text, md_width, 0, 0, Style::default()).lines;
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(body.len() + 1);
     // The controls ride the first body line (no bubble to host a corner
@@ -1975,11 +1990,14 @@ fn render_agent(
             // Pre-wrap the markdown lines ourselves so ratatui's
             // Paragraph::wrap doesn't strip the indent on
             // continuation rows.
-            let (wrapped_md, md_conts) = wrap_lines_to_width(
-                markdown::render_with_width(text, body_content_w),
+            let body = render_markdown_message_block(
+                text,
                 body_content_w,
+                0,
+                AGENT_INDENT,
+                Style::default(),
             );
-            (indent_lines(wrapped_md, AGENT_INDENT), md_conts)
+            (body.lines, body.continuations)
         } else {
             let lines = wrapped
                 .iter()
@@ -2117,13 +2135,14 @@ fn render_agent(
         // `render_first_line_with_pin_and_timestamp` adds AGENT_INDENT back
         // to `used`, so reserving (TIMESTAMP_WIDTH + 1 + control block) here
         // leaves the right-edge controls + timestamp + gap exactly clear on row 1.
-        let (wrapped_md, md_conts) = wrap_lines_to_width_reserving_first(
-            markdown::render_with_width(text, body_content_w),
+        let body = render_markdown_message_block(
+            text,
             body_content_w,
             TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve,
+            AGENT_INDENT,
+            Style::default(),
         );
-        let body = indent_lines(wrapped_md, AGENT_INDENT);
-        if body.is_empty() {
+        if body.lines.is_empty() {
             let (line, region) =
                 render_first_line_with_pin_and_timestamp(vec![], timestamp, width, pin);
             pin_region = region;
@@ -2135,7 +2154,7 @@ fn render_agent(
             // continuation flags from the wrap helper already mark the
             // timestamp-induced break of the first logical line as a
             // continuation (copy rejoins with a space, not a newline).
-            let mut iter = body.into_iter().zip(md_conts);
+            let mut iter = body.lines.into_iter().zip(body.continuations);
             let (first, first_cont) = iter.next().expect("body non-empty");
             let (line, region) =
                 render_first_line_with_pin_and_timestamp(first.spans, timestamp, width, pin);
@@ -3144,165 +3163,6 @@ fn render_first_line_with_pin_and_timestamp(
     spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
     spans.push(Span::raw(" ".repeat(right_margin)));
     (Line::from(spans), region)
-}
-
-/// Re-wrap a `Vec<Line>` so every emitted line's content fits within
-/// `max_width` cells. Uses `slice_spans_at_width` repeatedly to split
-/// long lines on whitespace boundaries (or hard-cut for unbroken
-/// tokens), preserving each span's style across the splits.
-///
-/// Returns `(wrapped_lines, continuations)` — `continuations[i]` is
-/// `true` when row `i` is a soft-wrap continuation of the previous
-/// row (i.e., it came from the same input Line), `false` for rows
-/// that start a fresh input Line. The copy path uses this to join
-/// continuations with a space and starts-of-line with a newline.
-///
-/// Used to pre-wrap markdown-rendered agent bodies so ratatui's
-/// `Paragraph::wrap` doesn't drop continuation rows to column 0 and
-/// destroy the indent we added with [`indent_lines`].
-fn wrap_lines_to_width(
-    lines: Vec<Line<'static>>,
-    max_width: usize,
-) -> (Vec<Line<'static>>, Vec<bool>) {
-    wrap_lines_to_width_reserving_first(lines, max_width, 0)
-}
-
-/// Like [`wrap_lines_to_width`] but the very first visual row is wrapped
-/// to `max_width - reserve_first` cells instead of the full `max_width`,
-/// reserving room for a right-edge timestamp. Every subsequent row —
-/// including the remainder of the first *logical* line — wraps at the
-/// full `max_width`, so timestamp-induced overflow flows into the normal
-/// wrap stream as a continuation rather than landing as an orphan.
-///
-/// The continuation flags follow the same per-logical-line semantics as
-/// [`wrap_lines_to_width`]: the timestamp-induced break of the first line
-/// is marked as a continuation (same logical line → copy rejoins with a
-/// space, not a newline).
-fn wrap_lines_to_width_reserving_first(
-    lines: Vec<Line<'static>>,
-    max_width: usize,
-    reserve_first: usize,
-) -> (Vec<Line<'static>>, Vec<bool>) {
-    if max_width == 0 {
-        let conts = vec![false; lines.len()];
-        return (lines, conts);
-    }
-    let mut out = Vec::with_capacity(lines.len());
-    let mut conts = Vec::with_capacity(lines.len());
-    // Only the very first visual row of the whole body gets the narrowed
-    // budget; once any row has been emitted the reservation is spent.
-    let mut first_row_overall = true;
-    for line in lines {
-        let mut remaining = line.spans;
-        let mut first = true;
-        loop {
-            let width = if first_row_overall {
-                max_width.saturating_sub(reserve_first).max(1)
-            } else {
-                max_width
-            };
-            let (head, tail) = slice_spans_at_width(remaining, width);
-            out.push(Line::from(head));
-            conts.push(!first);
-            first = false;
-            first_row_overall = false;
-            match tail {
-                Some(t) => remaining = t,
-                None => break,
-            }
-        }
-    }
-    (out, conts)
-}
-
-/// Prepend `n` cells of left padding to every line. Used to apply
-/// `AGENT_INDENT` to markdown-rendered agent bodies whose lines come
-/// back without any leading indent.
-fn indent_lines(lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
-    if n == 0 {
-        return lines;
-    }
-    let prefix = " ".repeat(n);
-    lines
-        .into_iter()
-        .map(|mut l| {
-            let mut spans = vec![Span::raw(prefix.clone())];
-            spans.append(&mut l.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-/// Slice a styled span sequence so the head totals at most `max_width`
-/// columns. If the spans already fit, returns `(spans, None)`. Otherwise
-/// breaks on the last whitespace boundary inside the budget (or at the
-/// hard limit if no whitespace exists), preserving each span's style on
-/// both halves. Used by the markdown agent renderer so the right-edge
-/// timestamp stays anchored on row 1 when the agent's first line would
-/// otherwise overflow into the timestamp's reserved column.
-fn slice_spans_at_width(
-    spans: Vec<Span<'static>>,
-    max_width: usize,
-) -> (Vec<Span<'static>>, Option<Vec<Span<'static>>>) {
-    let total: usize = spans.iter().map(|s| s.content.width()).sum();
-    if total <= max_width || max_width == 0 {
-        return (spans, None);
-    }
-    let flat: Vec<(char, Style)> = spans
-        .iter()
-        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-        .collect();
-    // Prefer breaking right after the last whitespace that lands inside
-    // the column budget; fall back to a hard cut in char space. Always
-    // include at least one char so hard-wrap loops keep making progress
-    // when the next grapheme is wider than the remaining budget.
-    let mut used = 0usize;
-    let mut hard_split = flat.len();
-    let mut ws_split = None;
-    for (i, (c, _)) in flat.iter().enumerate() {
-        let width = UnicodeWidthChar::width(*c).unwrap_or(0);
-        if i > 0 && used + width > max_width {
-            hard_split = i;
-            break;
-        }
-        used += width;
-        if used > max_width {
-            hard_split = i + 1;
-            break;
-        }
-        if c.is_whitespace() {
-            ws_split = Some(i + 1);
-        }
-    }
-    let split_at = ws_split.unwrap_or(hard_split);
-    let head = group_into_spans(&flat[..split_at]);
-    let tail = group_into_spans(&flat[split_at..]);
-    let tail = if tail.is_empty() { None } else { Some(tail) };
-    (head, tail)
-}
-
-fn group_into_spans(chars: &[(char, Style)]) -> Vec<Span<'static>> {
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut cur_style: Option<Style> = None;
-    let mut cur_text = String::new();
-    for &(c, style) in chars {
-        match cur_style {
-            Some(s) if s == style => cur_text.push(c),
-            _ => {
-                if let Some(s) = cur_style.take() {
-                    out.push(Span::styled(std::mem::take(&mut cur_text), s));
-                }
-                cur_style = Some(style);
-                cur_text.push(c);
-            }
-        }
-    }
-    if let Some(s) = cur_style
-        && !cur_text.is_empty()
-    {
-        out.push(Span::styled(cur_text, s));
-    }
-    out
 }
 
 fn format_timestamp(t: DateTime<Local>) -> String {

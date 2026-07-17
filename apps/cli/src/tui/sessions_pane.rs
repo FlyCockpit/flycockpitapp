@@ -41,12 +41,12 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use crate::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
 use crate::db::Db;
 use crate::tui::agent_runner;
+use crate::tui::message_block::{MessageBlock, MessageBlockRole, render_markdown_message_block};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
@@ -270,7 +270,10 @@ struct PreviewState {
     has_more: bool,
     loading: bool,
     error: Option<String>,
+    /// Visual rows above the bottom of the loaded preview.
     scroll: usize,
+    block_cache: std::collections::HashMap<(i64, usize), MessageBlock>,
+    cache_width: Option<usize>,
 }
 
 impl PreviewState {
@@ -282,11 +285,40 @@ impl PreviewState {
             loading: false,
             error: None,
             scroll: 0,
+            block_cache: std::collections::HashMap::new(),
+            cache_width: None,
         }
     }
 
     fn oldest_seq(&self) -> Option<i64> {
         self.messages.first().map(|message| message.seq)
+    }
+
+    fn invalidate_for_width(&mut self, width: usize) {
+        if self.cache_width != Some(width) {
+            self.block_cache.clear();
+            self.cache_width = Some(width);
+        }
+    }
+
+    fn message_block(&mut self, index: usize, width: usize) -> MessageBlock {
+        self.invalidate_for_width(width);
+        let seq = self.messages[index].seq;
+        let key = (seq, width);
+        if let Some(body) = self.block_cache.get(&key) {
+            return body.clone();
+        }
+        let text = self.messages[index].text.clone();
+        let body_width = width.saturating_sub(2).max(1);
+        let body = render_markdown_message_block(
+            &text,
+            body_width,
+            0,
+            2,
+            Style::default().fg(Color::White),
+        );
+        self.block_cache.insert(key, body.clone());
+        body
     }
 }
 
@@ -352,6 +384,8 @@ pub struct SessionsPane {
     card_hits: Vec<CardHit>,
     last_preview_height: usize,
     last_preview_rows: usize,
+    last_preview_reached_top: bool,
+    preview_clock_ms: fn() -> i64,
     last_card_click: Option<(usize, std::time::Instant)>,
 }
 
@@ -455,6 +489,8 @@ impl SessionsPane {
             card_hits: Vec::new(),
             last_preview_height: 0,
             last_preview_rows: 0,
+            last_preview_reached_top: false,
+            preview_clock_ms: || chrono::Utc::now().timestamp_millis(),
             last_card_click: None,
         };
         if daemon_connected {
@@ -745,7 +781,8 @@ impl SessionsPane {
                 preview.has_more = has_more;
                 if before_seq.is_none() {
                     preview.messages = messages;
-                    preview.scroll = usize::MAX;
+                    preview.scroll = 0;
+                    preview.block_cache.clear();
                 } else {
                     let existing: std::collections::HashSet<i64> =
                         preview.messages.iter().map(|message| message.seq).collect();
@@ -755,6 +792,10 @@ impl SessionsPane {
                         .collect();
                     older.append(&mut preview.messages);
                     preview.messages = older;
+                    // `scroll` is measured from the bottom. Prepending older
+                    // messages does not move the existing rows relative to
+                    // that bottom, so retaining it preserves the viewport
+                    // anchor and lets the new page be laid out lazily.
                 }
             }
             Err(error) => {
@@ -1133,7 +1174,10 @@ impl SessionsPane {
 
     fn scroll_preview_up(&mut self) -> Option<SessionsOutcome> {
         let preview = self.preview.as_mut()?;
-        if preview.scroll == 0 {
+        let max = self
+            .last_preview_rows
+            .saturating_sub(self.last_preview_height);
+        if preview.scroll >= max && self.last_preview_reached_top {
             let request = (preview.has_more && !preview.loading)
                 .then(|| {
                     preview
@@ -1146,16 +1190,13 @@ impl SessionsPane {
             }
             return None;
         }
-        preview.scroll = preview.scroll.saturating_sub(1);
+        preview.scroll = (preview.scroll + 1).min(max);
         None
     }
 
     fn scroll_preview_down(&mut self) {
-        let max = self
-            .last_preview_rows
-            .saturating_sub(self.last_preview_height);
         if let Some(preview) = self.preview.as_mut() {
-            preview.scroll = (preview.scroll + 1).min(max);
+            preview.scroll = preview.scroll.saturating_sub(1);
         }
     }
 
@@ -1326,21 +1367,13 @@ impl SessionsPane {
     }
 
     fn render_preview_body(&mut self, frame: &mut Frame, area: Rect) {
-        let lines = self.preview_lines(area.width as usize);
-        self.last_preview_rows = lines.len();
         self.last_preview_height = area.height as usize;
-        let max = self
-            .last_preview_rows
-            .saturating_sub(self.last_preview_height);
-        let scroll = self
-            .preview
-            .as_ref()
-            .map(|preview| preview.scroll.min(max))
-            .unwrap_or(0);
-        if let Some(preview) = self.preview.as_mut() {
-            preview.scroll = scroll;
-        }
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
+        let lines = self.preview_window_lines(
+            area.width as usize,
+            area.height as usize,
+            (self.preview_clock_ms)(),
+        );
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn title(&self) -> Line<'static> {
@@ -1504,9 +1537,13 @@ impl SessionsPane {
         self.card_hits = hits;
     }
 
-    fn preview_lines(&self, width: usize) -> Vec<Line<'static>> {
+    fn preview_lines(&mut self, width: usize, now_ms: i64) -> Vec<Line<'static>> {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let Some(preview) = self.preview.as_ref() else {
+        let agent_name = self
+            .selected()
+            .map(|summary| summary.active_agent.clone())
+            .unwrap_or_else(|| "Agent".to_string());
+        let Some(preview) = self.preview.as_mut() else {
             return vec![Line::from(Span::styled("  (no session selected)", muted))];
         };
         if let Some(error) = &preview.error {
@@ -1519,7 +1556,10 @@ impl SessionsPane {
             if preview.loading {
                 return vec![Line::from(Span::styled("  Loading messages...", muted))];
             }
-            return vec![Line::from(Span::styled("  (no messages yet)", muted))];
+            return vec![Line::from(Span::styled(
+                "  no text messages in this session",
+                muted,
+            ))];
         }
         let mut lines = Vec::new();
         if preview.has_more {
@@ -1531,31 +1571,96 @@ impl SessionsPane {
                 muted,
             )));
         }
-        for message in &preview.messages {
-            let role = match message.role {
-                MessageRole::User => "User",
-                MessageRole::Agent => "Agent",
-            };
-            let style = match message.role {
-                MessageRole::User => Style::default().fg(Color::Yellow),
-                MessageRole::Agent => Style::default().fg(Color::White),
-            };
-            for (line_index, text) in wrap_message(role, &message.text, width)
-                .into_iter()
-                .enumerate()
-            {
-                if line_index == 0 {
-                    lines.push(Line::from(Span::styled(text, style)));
-                } else {
-                    lines.push(Line::from(text));
-                }
-            }
+        for index in 0..preview.messages.len() {
+            lines.extend(preview_message_lines(
+                preview,
+                index,
+                width,
+                now_ms,
+                &agent_name,
+            ));
             lines.push(Line::default());
         }
         if lines.last().is_some_and(|line| line.spans.is_empty()) {
             lines.pop();
         }
         lines
+    }
+
+    /// Materialize only the suffix needed for the visible viewport plus one
+    /// viewport of look-ahead. The preview scroll is measured from the bottom,
+    /// so the common initial/newest-message view does not parse all 50 loaded
+    /// Markdown messages. Moving upward extends the cached suffix lazily.
+    fn preview_window_lines(
+        &mut self,
+        width: usize,
+        height: usize,
+        now_ms: i64,
+    ) -> Vec<Line<'static>> {
+        let special_state = self
+            .preview
+            .as_ref()
+            .is_none_or(|preview| preview.error.is_some() || preview.messages.is_empty());
+        if special_state {
+            let lines = self.preview_lines(width, now_ms);
+            self.last_preview_rows = lines.len();
+            self.last_preview_reached_top = true;
+            return lines.into_iter().take(height).collect();
+        }
+
+        let agent_name = self
+            .selected()
+            .map(|summary| summary.active_agent.clone())
+            .unwrap_or_else(|| "Agent".to_string());
+        let preview = self.preview.as_mut().expect("special state handled");
+        let requested_from_bottom = preview.scroll;
+        let target_rows = if requested_from_bottom == usize::MAX {
+            usize::MAX
+        } else {
+            requested_from_bottom
+                .saturating_add(height)
+                .saturating_add(height.max(4))
+        };
+
+        let mut blocks_reversed: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut materialized_rows = 0usize;
+        let mut reached_top = true;
+        for index in (0..preview.messages.len()).rev() {
+            let mut block = preview_message_lines(preview, index, width, now_ms, &agent_name);
+            if !blocks_reversed.is_empty() {
+                block.push(Line::default());
+            }
+            materialized_rows = materialized_rows.saturating_add(block.len());
+            blocks_reversed.push(block);
+            if materialized_rows >= target_rows {
+                reached_top = index == 0;
+                break;
+            }
+        }
+
+        let mut lines = Vec::with_capacity(materialized_rows + 2);
+        if reached_top {
+            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+            if preview.has_more {
+                lines.push(Line::from(Span::styled("  ↑ more messages", muted)));
+            }
+            if preview.loading {
+                lines.push(Line::from(Span::styled(
+                    "  Loading older messages...",
+                    muted,
+                )));
+            }
+        }
+        for block in blocks_reversed.into_iter().rev() {
+            lines.extend(block);
+        }
+
+        self.last_preview_rows = lines.len();
+        self.last_preview_reached_top = reached_top;
+        let max = lines.len().saturating_sub(height);
+        preview.scroll = requested_from_bottom.min(max);
+        let from_top = max.saturating_sub(preview.scroll);
+        lines.into_iter().skip(from_top).take(height).collect()
     }
 
     fn render_confirm(&self, frame: &mut Frame, body: Rect) {
@@ -1880,34 +1985,47 @@ fn is_double_click(
         .unwrap_or(false)
 }
 
-fn wrap_message(role: &str, text: &str, width: usize) -> Vec<String> {
-    let prefix = format!("{role}: ");
-    let indent = " ".repeat(prefix.width());
-    let width = width.max(prefix.width() + 1);
-    let mut out = Vec::new();
-    for paragraph in text
-        .lines()
-        .chain(if text.is_empty() { Some("") } else { None })
-    {
-        let mut current = prefix.clone();
-        let mut current_width = prefix.width();
-        let mut first = true;
-        for ch in paragraph.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if current_width + ch_width > width && current_width > prefix.width() {
-                out.push(current);
-                current = indent.clone();
-                current_width = indent.width();
-                first = false;
-            }
-            if !first || current_width + ch_width <= width {
-                current.push(ch);
-                current_width += ch_width;
-            }
-        }
-        out.push(current);
+fn preview_message_role(role: MessageRole, agent_name: &str) -> MessageBlockRole {
+    match role {
+        MessageRole::User => MessageBlockRole {
+            label: crate::tui::history::user_display_label().to_string(),
+            style: Style::default().fg(crate::tui::history::user_message_color()),
+        },
+        MessageRole::Agent => MessageBlockRole {
+            label: crate::tui::history::agent_display_label(agent_name).to_string(),
+            style: Style::default().fg(crate::tui::history::agent_color_rendered(agent_name)),
+        },
     }
-    out
+}
+
+fn preview_message_lines(
+    preview: &mut PreviewState,
+    index: usize,
+    width: usize,
+    now_ms: i64,
+    agent_name: &str,
+) -> Vec<Line<'static>> {
+    let role = preview_message_role(preview.messages[index].role, agent_name);
+    let timestamp = preview_timestamp(preview.messages[index].ts_ms, now_ms);
+    let block = preview.message_block(index, width);
+    block.with_header(role, timestamp)
+}
+
+fn preview_timestamp(ts_ms: i64, now_ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+
+    let Some(timestamp) = Local.timestamp_millis_opt(ts_ms).single() else {
+        return "—".to_string();
+    };
+    let elapsed_ms = now_ms.saturating_sub(ts_ms);
+    if elapsed_ms < 0 {
+        return "just now".to_string();
+    }
+    const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+    if elapsed_ms <= SEVEN_DAYS_MS {
+        return relative_time(elapsed_ms / 1_000);
+    }
+    timestamp.format("%Y-%m-%d %H:%M").to_string()
 }
 
 #[cfg(test)]
@@ -2091,6 +2209,7 @@ mod tests {
             None,
             Ok((vec![message(9, MessageRole::User, "stale")], false)),
         );
+        pane.preview.as_mut().unwrap().scroll = 7;
         pane.apply_preview_result(
             session_id,
             Some(3),
@@ -2105,6 +2224,10 @@ mod tests {
         );
         let preview = pane.preview.as_ref().unwrap();
         assert_eq!(
+            preview.scroll, 7,
+            "prepending must preserve the viewport anchor"
+        );
+        assert_eq!(
             preview
                 .messages
                 .iter()
@@ -2113,6 +2236,203 @@ mod tests {
             vec![1, 2, 3, 4]
         );
         assert!(!preview.has_more);
+    }
+
+    fn preview_with_messages(messages: Vec<SessionMessage>) -> SessionsPane {
+        let session_id = Uuid::new_v4();
+        let mut pane = test_pane(vec![(summary(session_id, 100), Tier::Idle)]);
+        let mut preview = PreviewState::new(session_id);
+        preview.messages = messages;
+        pane.preview = Some(preview);
+        pane
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn preview_header_shows_role_and_relative_time() {
+        use chrono::{Local, TimeZone};
+
+        const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+        let now_ms = 1_700_000_000_000;
+        let older_ms = now_ms - 7 * DAY_MS - 1;
+        let mut pane = preview_with_messages(vec![
+            SessionMessage {
+                seq: 1,
+                ts_ms: now_ms - 30_000,
+                role: MessageRole::User,
+                text: "now".into(),
+            },
+            SessionMessage {
+                seq: 2,
+                ts_ms: now_ms - 90 * 60 * 1_000,
+                role: MessageRole::Agent,
+                text: "relative".into(),
+            },
+            SessionMessage {
+                seq: 3,
+                ts_ms: now_ms - 7 * DAY_MS,
+                role: MessageRole::Agent,
+                text: "boundary".into(),
+            },
+            SessionMessage {
+                seq: 4,
+                ts_ms: older_ms,
+                role: MessageRole::Agent,
+                text: "absolute".into(),
+            },
+            SessionMessage {
+                seq: 5,
+                ts_ms: now_ms + 1_000,
+                role: MessageRole::User,
+                text: "future".into(),
+            },
+            SessionMessage {
+                seq: 6,
+                ts_ms: i64::MAX,
+                role: MessageRole::Agent,
+                text: "invalid".into(),
+            },
+        ]);
+
+        let text = pane
+            .preview_lines(80, now_ms)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let absolute = Local
+            .timestamp_millis_opt(older_ms)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert!(text.contains("You · just now"), "{text}");
+        assert!(text.contains("builder · 1 hour ago"), "{text}");
+        assert!(text.contains("builder · 7 days ago"), "{text}");
+        assert!(text.contains(&format!("builder · {absolute}")), "{text}");
+        assert_eq!(text.matches("You · just now").count(), 2, "{text}");
+        assert!(text.contains("builder · —"), "{text}");
+    }
+
+    #[test]
+    fn preview_wraps_on_word_boundaries() {
+        let mut pane =
+            preview_with_messages(vec![message(1, MessageRole::Agent, "alpha bravo charlie")]);
+        let lines = pane.preview_lines(10, 1_000);
+        let body = lines
+            .iter()
+            .skip(1)
+            .map(line_text)
+            .filter(|line| !line.is_empty())
+            .map(|line| line.trim().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(body, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn preview_renders_markdown() {
+        let mut pane =
+            preview_with_messages(vec![message(1, MessageRole::Agent, "**bold** and `code`")]);
+        let lines = pane.preview_lines(40, 1_000);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(!text.contains("**"), "{text}");
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn preview_continuation_lines_styled() {
+        let mut pane = preview_with_messages(vec![message(
+            1,
+            MessageRole::Agent,
+            "alpha bravo charlie delta",
+        )]);
+        let lines = pane.preview_lines(10, 1_000);
+        let body = lines
+            .iter()
+            .skip(1)
+            .filter(|line| !line_text(line).is_empty())
+            .collect::<Vec<_>>();
+        assert!(body.len() >= 3);
+        assert!(body.iter().all(|line| line.style.fg == Some(Color::White)));
+    }
+
+    #[test]
+    fn preview_empty_state() {
+        let mut pane = preview_with_messages(Vec::new());
+        let lines = pane.preview_lines(40, 1_000);
+        assert_eq!(line_text(&lines[0]), "  no text messages in this session");
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(Color::Indexed(MUTED_COLOR_INDEX))
+        );
+    }
+
+    #[test]
+    fn preview_block_cache_hits() {
+        let mut pane =
+            preview_with_messages(vec![message(1, MessageRole::Agent, "**cached** message")]);
+        crate::tui::markdown::reset_render_counters();
+        let _ = pane.preview_lines(40, 1_000);
+        assert_eq!(crate::tui::markdown::render_call_count(), 1);
+        let _ = pane.preview_lines(40, 2_000);
+        assert_eq!(crate::tui::markdown::render_call_count(), 1);
+        let _ = pane.preview_lines(41, 2_000);
+        assert_eq!(crate::tui::markdown::render_call_count(), 2);
+    }
+
+    #[test]
+    fn preview_virtualizes_markdown_layout_to_viewport() {
+        let messages = (1..=20)
+            .map(|seq| message(seq, MessageRole::Agent, &format!("message {seq}")))
+            .collect();
+        let mut pane = preview_with_messages(messages);
+        crate::tui::markdown::reset_render_counters();
+        let lines = pane.preview_window_lines(40, 4, 1_000);
+        assert_eq!(lines.len(), 4);
+        let calls = crate::tui::markdown::render_call_count();
+        assert!(calls < 20, "laid out all {calls} messages");
+        assert!(!pane.last_preview_reached_top);
+    }
+
+    #[test]
+    fn preview_pagination_preserves_anchor_and_lays_out_older_page_lazily() {
+        const HEIGHT: usize = 4;
+        let initial = (51..=60)
+            .map(|seq| message(seq, MessageRole::Agent, &format!("message {seq}")))
+            .collect();
+        let mut pane = preview_with_messages(initial);
+        let full = pane.preview_lines(40, 1_000);
+        let old_max = full.len().saturating_sub(HEIGHT);
+        pane.preview.as_mut().unwrap().scroll = old_max;
+        let before = pane.preview_window_lines(40, HEIGHT, 1_000);
+        assert!(pane.last_preview_reached_top);
+
+        let session_id = pane.preview.as_ref().unwrap().session_id;
+        let older = (1..=50)
+            .map(|seq| message(seq, MessageRole::User, &format!("message {seq}")))
+            .collect();
+        pane.apply_preview_result(session_id, Some(51), Ok((older, false)));
+
+        crate::tui::markdown::reset_render_counters();
+        let after = pane.preview_window_lines(40, HEIGHT, 1_000);
+        assert_eq!(
+            after, before,
+            "older rows must be inserted above the viewport"
+        );
+        let calls = crate::tui::markdown::render_call_count();
+        assert!(
+            calls < 50,
+            "laid out the whole older page ({calls} messages)"
+        );
+        assert!(!pane.last_preview_reached_top);
     }
 
     #[test]
@@ -2182,7 +2502,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let preview = pane
-            .preview_lines(80)
+            .preview_lines(80, 1_000)
             .into_iter()
             .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
             .collect::<Vec<_>>()
@@ -2754,6 +3074,8 @@ mod tests {
             card_hits: Vec::new(),
             last_preview_height: 0,
             last_preview_rows: 0,
+            last_preview_reached_top: false,
+            preview_clock_ms: || 1_700_000_000_000,
             last_card_click: None,
         }
     }

@@ -36,6 +36,7 @@ pub mod keys_overlay;
 pub mod links;
 pub mod markdown;
 pub mod math_render;
+mod message_block;
 pub mod model_picker;
 pub mod multireview_dialog;
 pub mod nav;

@@ -8,7 +8,8 @@ impl Model {
     /// text response, trimmed.
     pub async fn text_completion(&self, prompt: &str) -> Result<String> {
         use rig::completion::Prompt;
-        self.ensure_trusted_only_dispatch_allowed()?;
+        let guard = self.outbound_guard();
+        guard.ensure_dispatch_allowed()?;
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining (`daemon-graceful-drain-shutdown.md`).
         if self.gate().is_draining() {
@@ -17,7 +18,7 @@ impl Model {
         // Non-bypassable redaction chokepoint (GOALS §7,
         // `redaction-cover-all-llm-requests.md`): scrub the outbound prompt
         // before any provider work. A disabled/empty table passes it through.
-        let prompt = self.redact().scrub(prompt);
+        let prompt = guard.scrub(prompt);
         let prompt = prompt.as_str();
         match self {
             Model::OpenAi {
@@ -60,7 +61,8 @@ impl Model {
     /// the trimmed free-text response.
     pub async fn text_completion_with_system(&self, system: &str, prompt: &str) -> Result<String> {
         use rig::completion::Prompt;
-        self.ensure_trusted_only_dispatch_allowed()?;
+        let guard = self.outbound_guard();
+        guard.ensure_dispatch_allowed()?;
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining (`daemon-graceful-drain-shutdown.md`).
         if self.gate().is_draining() {
@@ -68,9 +70,9 @@ impl Model {
         }
         // Non-bypassable redaction chokepoint (GOALS §7): scrub both the
         // system contract and the user payload before any provider work.
-        let system = self.redact().scrub(system);
+        let system = guard.scrub(system);
         let system = system.as_str();
-        let prompt = self.redact().scrub(prompt);
+        let prompt = guard.scrub(prompt);
         let prompt = prompt.as_str();
         match self {
             Model::OpenAi {
@@ -125,7 +127,8 @@ impl Model {
         tool: &ToolDefinition,
     ) -> Result<Vec<crate::engine::message::ToolCall>> {
         use rig::completion::Completion;
-        self.ensure_trusted_only_dispatch_allowed()?;
+        let guard = self.outbound_guard();
+        guard.ensure_dispatch_allowed()?;
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining (`daemon-graceful-drain-shutdown.md`).
         if self.gate().is_draining() {
@@ -135,9 +138,9 @@ impl Model {
         // contract and the (untrusted) prompt before dispatch. Scrubbing
         // secret *values* leaves injection *instructions* intact, so the
         // injection classifier still works on the scrubbed text.
-        let system = self.redact().scrub(system);
+        let system = guard.scrub(system);
         let system = system.as_str();
-        let prompt = self.redact().scrub(prompt);
+        let prompt = guard.scrub(prompt);
         let prompt = prompt.as_str();
         match self {
             Model::OpenAi {
@@ -323,7 +326,7 @@ impl Model {
         InferenceTiming,
     )> {
         let params = self.with_resolved_model_params(params);
-        self.ensure_trusted_only_dispatch_allowed()?;
+        self.outbound_guard().ensure_dispatch_allowed()?;
         let PreparedCompletionRequest {
             system,
             history,

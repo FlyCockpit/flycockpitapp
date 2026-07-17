@@ -57,6 +57,7 @@ pub(crate) type PreDrainFuture = Shared<BoxFuture<'static, std::result::Result<(
 mod build;
 mod dispatch;
 mod failure;
+mod outbound_guard;
 mod redact;
 mod wire;
 pub(crate) mod wire_schema;
@@ -71,6 +72,7 @@ pub use failure::{
     InferenceTiming, as_inference_failure, auth_failure_kind, failure_engages_backup, is_cancelled,
     is_gated,
 };
+pub(crate) use outbound_guard::OutboundGuard;
 #[allow(unused_imports)]
 pub use wire::{EndpointRecoveryContext, EndpointRecoveryPrompt};
 
@@ -80,6 +82,8 @@ use build::*;
 use dispatch::*;
 #[allow(unused_imports)]
 use failure::*;
+#[allow(unused_imports)]
+use outbound_guard::*;
 #[allow(unused_imports)]
 use redact::*;
 #[allow(unused_imports)]
@@ -581,19 +585,17 @@ impl Model {
     }
 
     fn trusted_only_violation(provider_id: &str, model_id: &str) -> anyhow::Error {
-        anyhow::anyhow!(
-            "trusted-only is enabled; model `{provider_id}:{model_id}` is untrusted. Select a trusted model or run `/trusted-only off`."
-        )
+        outbound_guard::trusted_only_violation(provider_id, model_id)
     }
 
-    fn ensure_trusted_only_dispatch_allowed(&self) -> Result<()> {
-        if self.trusted_only_enabled() && !self.is_trusted() {
-            return Err(Self::trusted_only_violation(
-                self.provider_id(),
-                self.model_id_ref(),
-            ));
-        }
-        Ok(())
+    fn outbound_guard(&self) -> OutboundGuard {
+        OutboundGuard::new(
+            self.provider_id(),
+            self.model_id_ref(),
+            self.trusted_only_flag(),
+            self.is_trusted(),
+            self.redact_table(),
+        )
     }
 
     fn ensure_trusted_only_build_allowed(
@@ -4009,6 +4011,24 @@ mod tests {
             ..ProviderEntry::default()
         };
         build_openai_model("p", &entry, "m", redact).expect("model must build")
+    }
+
+    #[test]
+    fn outbound_guard_shared_by_dispatch_and_embedder() {
+        let (_tmp, redact) = secret_table();
+        let model = model_at("http://127.0.0.1:1/v1", redact);
+        let guard = model.outbound_guard();
+        let _: &OutboundGuard = &guard;
+
+        let _embedder = crate::embeddings::OpenAiCompatEmbedder::from_resolved_request(
+            crate::providers::models_fetch::ResolvedRequest {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                headers: vec![],
+            },
+            "text-embedding-3-small".into(),
+            Some(3),
+            guard,
+        );
     }
 
     async fn responses_404_then_chat_ok_server(

@@ -67,7 +67,8 @@ pub use dispatch::TandemOutcome;
 #[allow(unused_imports)]
 pub use failure::{
     InferenceCancelled, InferenceErrorClass, InferenceFailure, InferenceGated, InferencePhase,
-    InferenceTiming, as_inference_failure, failure_engages_backup, is_cancelled, is_gated,
+    InferenceTiming, as_inference_failure, auth_failure_kind, failure_engages_backup, is_cancelled,
+    is_gated,
 };
 #[allow(unused_imports)]
 pub use wire::{EndpointRecoveryContext, EndpointRecoveryPrompt};
@@ -3249,6 +3250,24 @@ mod tests {
         (format!("http://{addr}/v1"), rx)
     }
 
+    async fn http_error_server(status: u16, reason: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_http_body(&mut stream).await;
+                let payload = format!("{{\"error\":{{\"message\":\"{reason}\"}}}}");
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
     /// Capture rig's fully serialized native-Anthropic streaming body. A 400
     /// response is sufficient: these tests assert the outbound seam, and the
     /// non-retryable response keeps the harness minimal and deterministic.
@@ -3665,6 +3684,57 @@ mod tests {
             capture_openai_body("deepseek-reasoner", CapturedOpenAiReasoning::Raw(params)).await;
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_preserves_configured_provider_identity() {
+        use crate::config::providers::WireApi;
+
+        let url = http_error_server(401, "Unauthorized").await;
+        let resolved = resolved_local_request(url);
+        let model = build_openai_model_from_resolved(
+            "lmstudio",
+            &resolved,
+            "local-model",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            true,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert_eq!(model.provider_label(), "openai-compatible");
+
+        let err = model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("hi"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect_err("401 must be a typed terminal failure");
+        let failure = as_inference_failure(&err).expect("typed inference failure");
+        assert_eq!(failure.provider, "lmstudio");
+        assert_eq!(failure.model, "local-model");
+        assert_eq!(failure.class, "http_401", "{failure:?}");
+        assert_eq!(
+            auth_failure_kind(failure),
+            Some(crate::daemon::proto::AuthFailureKind::CredentialsRejected { status: 401 })
+        );
     }
 
     #[tokio::test]

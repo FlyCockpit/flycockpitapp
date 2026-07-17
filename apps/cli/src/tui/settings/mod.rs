@@ -61,8 +61,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::config::dirs::{
-    CONFIG_FILE, ConfigDir, ConfigDirKind, creatable_config_dirs, cwd_scoped_creatable_dirs,
-    discover_config_dirs, scaffold_config_dir,
+    CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
+    cwd_scoped_creatable_dirs, discover_config_dirs, scaffold_config_dir,
 };
 use crate::config::extended::{ExtendedConfig, ExtendedConfigDoc};
 use crate::config::providers::{ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
@@ -399,7 +399,7 @@ use category::{Category, CategoryPage};
 use harnesses_page::HarnessesPage;
 use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
-use providers::{AddState, AddStep, ProvidersPage};
+use providers::{AddState, AddStep, EditState, ProvidersPage};
 pub(crate) use providers::{OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthProvider};
 use reset::{ResetButton, ResetOutcome};
 use skills_page::SkillsPage;
@@ -516,6 +516,19 @@ impl Dialog {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_provider_surface(&self) -> Option<&'static str> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let page = settings.page.as_any().downcast_ref::<ProvidersPage>()?;
+        Some(match page {
+            ProvidersPage::OAuthSetup { .. } => "oauth",
+            ProvidersPage::Edit(_) => "edit",
+            _ => "other",
+        })
+    }
+
     pub fn open(cwd: &std::path::Path) -> Self {
         let dirs = discover_config_dirs(cwd);
         if dirs.is_empty() {
@@ -618,6 +631,45 @@ impl Dialog {
             d = Dialog::Settings(Box::new(s));
         }
         d
+    }
+
+    /// Open directly on one configured provider. OAuth-expired failures for a
+    /// known OAuth template land in its login flow; custom/template-less
+    /// providers land on the ordinary edit page.
+    pub fn open_provider_settings(
+        cwd: &std::path::Path,
+        provider_id: &str,
+        oauth_expired: bool,
+    ) -> Self {
+        let cfg = ConfigDoc::load_effective(cwd);
+        let Some(entry) = cfg.providers.get(provider_id).cloned() else {
+            return Self::open(cwd);
+        };
+        let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
+            return Self::open(cwd);
+        };
+        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+        let parent = EditState::new(provider_id.to_string(), entry.clone());
+        let oauth_provider = if oauth_expired {
+            match entry.effective_template(provider_id) {
+                Some(crate::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
+                    Some(OAuthProvider::Codex)
+                }
+                Some(crate::auth::xai_oauth::CREDENTIAL_KEY | "grok") => Some(OAuthProvider::Grok),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        settings.page = if let Some(provider) = oauth_provider {
+            providers_page(ProvidersPage::OAuthSetup {
+                state: Box::new(providers::OAuthFlowState::new(provider)),
+                parent: Box::new(parent),
+            })
+        } else {
+            providers_page(ProvidersPage::Edit(parent))
+        };
+        Dialog::Settings(Box::new(settings))
     }
 
     /// Re-open the picker after scaffolding a new scoped config, so the

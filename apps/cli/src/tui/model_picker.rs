@@ -68,6 +68,7 @@ struct Entry {
     is_favorite: bool,
     reasoning_effort: Option<ReasoningEffortCapability>,
     thinking_modes: Vec<ThinkingMode>,
+    failure_annotation: Option<String>,
 }
 
 impl Entry {
@@ -115,6 +116,7 @@ fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry)
         } else {
             model.thinking_modes.clone()
         },
+        failure_annotation: None,
     }
 }
 
@@ -202,14 +204,31 @@ enum RowHit {
 impl ModelPickerDialog {
     /// Try to open the picker for the given cwd. Returns `Err` if no
     /// config is reachable; callers should show the message inline.
+    #[cfg(test)]
     pub fn open(cwd: &Path, counts: &HashMap<String, u64>) -> Result<Self, String> {
+        Self::open_with_failures(cwd, counts, &HashMap::new(), chrono::Utc::now().timestamp())
+    }
+
+    pub fn open_with_failures(
+        cwd: &Path,
+        counts: &HashMap<String, u64>,
+        failures: &crate::tui::auth_failure::AuthFailureAnnotations,
+        now_epoch_secs: i64,
+    ) -> Result<Self, String> {
         ensure_config_reachable(cwd)?;
         let cfg = ConfigDoc::load_effective(cwd);
 
         let mut entries: Vec<Entry> = Vec::new();
         for (pid, entry) in &cfg.providers {
             for model in &entry.models {
-                entries.push(picker_entry(pid, entry, model));
+                let mut picker = picker_entry(pid, entry, model);
+                picker.failure_annotation =
+                    failures
+                        .get(&(pid.clone(), model.id.clone()))
+                        .map(|failure| {
+                            crate::tui::auth_failure::annotation_suffix(failure, now_epoch_secs)
+                        });
+                entries.push(picker);
             }
         }
         // Stable order: favorites first, then 30-day usage count desc,
@@ -601,6 +620,13 @@ impl ModelPickerDialog {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled("[active]".to_string(), muted));
                 }
+                if let Some(failure) = &e.failure_annotation {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        failure.clone(),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
                 lines.push(Line::from(spans));
                 let row = area.y + lines.len() as u16 - 1;
                 if row < area.y + area.height
@@ -905,6 +931,7 @@ pub fn cycle_active_favorite(
                     is_favorite: model.favorite,
                     reasoning_effort: model.capabilities.reasoning_effort.clone(),
                     thinking_modes: model.thinking_modes.clone(),
+                    failure_annotation: None,
                 });
             }
         }
@@ -1017,6 +1044,7 @@ mod tests {
             is_favorite: false,
             reasoning_effort: None,
             thinking_modes: Vec::new(),
+            failure_annotation: None,
         }
     }
 
@@ -1138,6 +1166,43 @@ mod tests {
         let rendered = rendered_text(&mut d, 60, 12);
 
         assert!(rendered.contains("filter: aXb"), "{rendered}");
+    }
+
+    #[test]
+    fn picker_annotates_last_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let cockpit = tmp.path().join(".cockpit");
+        fs::create_dir(&cockpit).unwrap();
+        let config_path = cockpit.join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+        fs::write(
+            provider_path,
+            r#"{"url":"https://example.test","models":[{"id":"claude"}]}"#,
+        )
+        .unwrap();
+        let failures = [(
+            ("p".to_string(), "claude".to_string()),
+            crate::tui::auth_failure::AuthFailureRecord {
+                kind: crate::daemon::proto::AuthFailureKind::CredentialsRejected { status: 403 },
+                failed_at_epoch_secs: 10_000,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let mut dialog =
+            ModelPickerDialog::open_with_failures(tmp.path(), &HashMap::new(), &failures, 17_200)
+                .unwrap();
+
+        let rendered = rendered_text(&mut dialog, 80, 12);
+
+        assert!(
+            rendered.contains("p/claude  failed 403 · 2h ago"),
+            "{rendered}"
+        );
     }
 
     #[test]

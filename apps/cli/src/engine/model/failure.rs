@@ -154,6 +154,46 @@ pub fn as_inference_failure(err: &anyhow::Error) -> Option<&InferenceFailure> {
     err.downcast_ref::<InferenceFailure>()
 }
 
+/// Classify only failures for which the TUI can offer credential or
+/// entitlement recovery. HTTP 429 remains a rate-limit error.
+pub fn auth_failure_kind(
+    failure: &InferenceFailure,
+) -> Option<crate::daemon::proto::AuthFailureKind> {
+    use crate::daemon::proto::AuthFailureKind;
+
+    let detail = failure.detail.to_ascii_lowercase();
+    if detail.contains("subscription auth expired")
+        || detail.contains("oauth token expired")
+        || detail.contains("oauth credential expired")
+        || detail.contains("oauth token was revoked")
+    {
+        return Some(AuthFailureKind::OAuthExpired {
+            provider: failure.provider.clone(),
+        });
+    }
+    if failure.class == "missing_tool_entitlement" {
+        let feature = failure
+            .detail
+            .split('`')
+            .nth(1)
+            .filter(|feature| !feature.trim().is_empty())
+            .unwrap_or("client_side_tools")
+            .to_string();
+        return Some(AuthFailureKind::MissingEntitlement { feature });
+    }
+    if failure.class == "provider_not_configured" {
+        return Some(AuthFailureKind::ProviderNotConfigured);
+    }
+    match failure
+        .class
+        .strip_prefix("http_")
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        Some(status @ (401 | 403)) => Some(AuthFailureKind::CredentialsRejected { status }),
+        _ => None,
+    }
+}
+
 /// Whether a terminal [`InferenceFailure`] (identified by its stable `class`
 /// string) engages the configured backup model
 /// (implementation note).
@@ -269,6 +309,21 @@ pub(super) fn classify_inference_failure(
 /// taxonomy reads (`src/engine/retry.rs`): rig's status variants plus a
 /// status-carrying inner `reqwest::Error`.
 fn http_status_of(err: &rig::completion::CompletionError) -> Option<u16> {
+    if let rig::completion::CompletionError::ProviderError(message) = err {
+        // rig's streaming OpenAI-compatible path converts a non-success
+        // response into `ProviderError` and preserves the concrete status in
+        // this stable leading phrase. Keep the parse deliberately narrow so
+        // digits from an arbitrary provider body cannot become a status.
+        let digits = message
+            .strip_prefix("Invalid status code ")?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        return digits
+            .parse::<u16>()
+            .ok()
+            .filter(|status| (100..=599).contains(status));
+    }
     let rig::completion::CompletionError::HttpError(http_err) = err else {
         return None;
     };

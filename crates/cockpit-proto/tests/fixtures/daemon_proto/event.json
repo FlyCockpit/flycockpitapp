@@ -163,6 +163,10 @@
   "inference_failed": {
     "data": {
       "agent": "agent-fixture",
+      "auth_failure": {
+        "kind": "credentials_rejected",
+        "status": 401
+      },
       "detail": "detail-fixture",
       "error_class": "error_class-fixture",
       "model": "model-fixture",
@@ -170,6 +174,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "inference_failed"
+  },
+  "inference_succeeded": {
+    "data": {
+      "model": "model-fixture",
+      "provider": "provider-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "inference_succeeded"
   },
   "inference_warning": {
     "data": {

@@ -115,6 +115,7 @@ pub async fn turn_with_backup(
                 model: failure.model.clone(),
                 error_class: failure.class.clone(),
                 detail: failure.detail.clone(),
+                auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
             .await;
         return Err(err);
@@ -299,6 +300,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 model: failure.model.clone(),
                 error_class: failure.class.clone(),
                 detail: failure.detail.clone(),
+                auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
             .await;
     }
@@ -351,6 +353,62 @@ mod inference_outcome_tests {
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         Arc::new(crate::session::Session::create(db, root.to_path_buf(), "builder").unwrap())
+    }
+
+    async fn emitted_auth_failure(
+        class: &str,
+        detail: &str,
+    ) -> Option<crate::daemon::proto::AuthFailureKind> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = in_memory_session(tmp.path());
+        let call_id = Uuid::new_v4();
+        let payload = serde_json::json!({ "model": "mock-model" });
+        session
+            .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .unwrap();
+        let err = anyhow::Error::new(InferenceFailure {
+            provider: "mock-provider".into(),
+            model: "mock-model".into(),
+            phase: "dispatched".into(),
+            class: class.into(),
+            elapsed_ms: 1,
+            detail: detail.into(),
+        });
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(4);
+        record_inference_outcome(
+            InferenceOutcomeRecord {
+                session,
+                call_id,
+                dispatch_payload: &payload,
+                agent_name: "builder",
+                wire_api: "responses",
+                routing_metadata: serde_json::json!({}),
+                emit_inference_error_ui: true,
+                tx: &tx,
+            },
+            &err,
+        )
+        .await;
+        match rx.recv().await.expect("mocked failure event") {
+            TurnEvent::InferenceFailed { auth_failure, .. } => auth_failure,
+            event => panic!("expected inference failure, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_failure_classified_on_event() {
+        assert_eq!(
+            emitted_auth_failure("http_401", "unauthorized").await,
+            Some(crate::daemon::proto::AuthFailureKind::CredentialsRejected { status: 401 })
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_not_auth_failure() {
+        assert_eq!(
+            emitted_auth_failure("http_429", "too many requests").await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -737,7 +795,7 @@ mod backup_fallback_tests {
         });
         let (pm, class, bm) = banner.expect("a BackupUsed banner was emitted");
         assert_eq!(pm, "primary-model");
-        assert_eq!(class, "network");
+        assert_eq!(class, "http_500");
         assert_eq!(bm, "backup-model");
         // The backup's text reached the UI.
         assert!(events.iter().any(|e| matches!(

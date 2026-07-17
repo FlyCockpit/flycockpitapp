@@ -721,6 +721,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | ResourceClear { session_id, .. }
         | ToolError { session_id, .. }
         | InferenceFailed { session_id, .. }
+        | InferenceSucceeded { session_id, .. }
         | InferenceWarning { session_id, .. }
         | BackupUsed { session_id, .. }
         | SubagentSpawned { session_id, .. }
@@ -898,6 +899,7 @@ mod tests {
                 model: "gpt-5".into(),
                 error_class: "auth".into(),
                 detail: "credentials rejected".into(),
+                auth_failure: None,
             },
             OutputFormat::Default,
             false,
@@ -926,6 +928,7 @@ mod tests {
                 model: "gpt-5".into(),
                 error_class: "auth".into(),
                 detail: "credentials rejected".into(),
+                auth_failure: None,
             },
             OutputFormat::Json,
             false,

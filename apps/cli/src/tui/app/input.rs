@@ -73,6 +73,26 @@ impl App {
                 self.handle_ctrl_c()
             };
         }
+        if key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && self.pane.is_none()
+            && !self.dialog.is_active()
+            && matches!(self.overlay, Overlay::None)
+            && self.question_dialog.is_none()
+            && self.daemon_prompt.is_none()
+        {
+            match key.code {
+                KeyCode::Char('m') if self.auth_failure_notice.is_some() => {
+                    self.open_model_picker();
+                    return false;
+                }
+                KeyCode::Char('p') if self.auth_failure_notice.is_some() => {
+                    self.open_auth_failure_provider();
+                    return false;
+                }
+                _ => {}
+            }
+        }
 
         // Any meaningful keystroke dismisses transient toasts — the user has
         // moved on. Persistent action-required toasts stay until resolved.
@@ -376,6 +396,11 @@ impl App {
                 self.push_plain("⚠ daemon is not connected; LSP action was not sent".to_string());
             }
             self.drain_oauth_actions();
+            // Provider editors can persist credentials without closing the
+            // surrounding settings dialog. Reconcile after every dialog
+            // action so a successful save clears stale failure state now,
+            // rather than waiting for a later close.
+            self.clear_changed_provider_auth_failures();
             return false;
         }
 

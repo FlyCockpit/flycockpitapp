@@ -102,6 +102,176 @@ pub(super) struct FooterHitArea {
     rect: Rect,
 }
 
+#[cfg(test)]
+mod auth_failure_recovery_tests {
+    use std::fs;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{App, Overlay};
+    use crate::daemon::proto::AuthFailureKind;
+    use crate::engine::TurnEvent;
+
+    fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
+        let cockpit = root.join(".cockpit");
+        fs::create_dir_all(&cockpit).unwrap();
+        let config_path = cockpit.join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+        let mut provider = serde_json::json!({
+            "url": url,
+            "models": [{"id": "m"}],
+        });
+        if let Some(template) = template {
+            provider["template"] = serde_json::json!(template);
+        }
+        fs::write(provider_path, serde_json::to_vec(&provider).unwrap()).unwrap();
+    }
+
+    fn auth_event(kind: AuthFailureKind) -> TurnEvent {
+        TurnEvent::InferenceFailed {
+            agent: "subagent".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            error_class: "http_403".into(),
+            detail: "credentials rejected".into(),
+            auth_failure: Some(kind),
+        }
+    }
+
+    fn write_auth_header(root: &std::path::Path, value: &str) {
+        let config_path = root.join(".cockpit/config.json");
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        let provider = serde_json::json!({
+            "url": "https://example.test/v1",
+            "headers": [{"name": "Authorization", "value": value}],
+            "models": [{"id": "m"}],
+        });
+        fs::write(provider_path, serde_json::to_vec(&provider).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn auth_failure_notice_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_provider(tmp.path(), None, "https://example.test/v1");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
+            status: 403,
+        }));
+
+        let notice = app.persistent_notice_text().expect("auth notice");
+        assert!(notice.contains("[switch model]"), "{notice}");
+        assert!(notice.contains("[fix provider]"), "{notice}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
+        app.overlay = Overlay::None;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(app.dialog.test_provider_surface(), Some("edit"));
+    }
+
+    #[test]
+    fn annotation_cleared_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_provider(tmp.path(), None, "https://example.test/v1");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
+            status: 401,
+        }));
+        assert_eq!(app.auth_failure_annotations.len(), 1);
+
+        app.apply_event(TurnEvent::InferenceSucceeded {
+            provider: "p".into(),
+            model: "m".into(),
+        });
+
+        assert!(app.auth_failure_annotations.is_empty());
+    }
+
+    #[test]
+    fn nested_subagent_auth_recovery_updates_when_pane_is_not_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_provider(tmp.path(), None, "https://example.test/v1");
+        let mut app = App::new(Some(tmp.path()), false);
+
+        app.apply_event(TurnEvent::NestedTurn {
+            task_call_id: "task-1".into(),
+            label: "researcher".into(),
+            parent_task_call_id: None,
+            inner: Box::new(auth_event(AuthFailureKind::CredentialsRejected {
+                status: 401,
+            })),
+        });
+        assert_eq!(app.auth_failure_annotations.len(), 1);
+        assert_eq!(app.auth_failure_notice.as_ref().unwrap().model, "m");
+
+        app.apply_event(TurnEvent::NestedTurn {
+            task_call_id: "task-1".into(),
+            label: "researcher".into(),
+            parent_task_call_id: None,
+            inner: Box::new(TurnEvent::InferenceSucceeded {
+                provider: "p".into(),
+                model: "m".into(),
+            }),
+        });
+        assert!(app.auth_failure_annotations.is_empty());
+        assert!(app.auth_failure_notice.is_none());
+    }
+
+    #[test]
+    fn annotation_cleared_on_credential_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_provider(tmp.path(), None, "https://example.test/v1");
+        write_auth_header(tmp.path(), "Bearer old-secret");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
+            status: 401,
+        }));
+
+        write_auth_header(tmp.path(), "Bearer new-secret");
+        app.clear_changed_provider_auth_failures();
+
+        assert!(app.auth_failure_annotations.is_empty());
+    }
+
+    #[test]
+    fn oauth_expired_notice_deep_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_provider(
+            tmp.path(),
+            Some("codex"),
+            "https://chatgpt.com/backend-api/codex",
+        );
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_event(auth_event(AuthFailureKind::OAuthExpired {
+            provider: "p".into(),
+        }));
+
+        app.open_auth_failure_provider();
+
+        assert_eq!(app.dialog.test_provider_surface(), Some("oauth"));
+    }
+
+    #[test]
+    fn auth_failure_annotations_start_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let app = App::new(Some(tmp.path()), false);
+        assert!(app.auth_failure_annotations.is_empty());
+        assert!(app.auth_failure_notice.is_none());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
     Agent,
@@ -1884,6 +2054,13 @@ pub struct App {
     /// enters history or any inference request — purely client-side chrome.
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
     pub(super) sandbox_notice_copy_rect: Option<Rect>,
+    /// Process-local, event-earned per-model auth failures. These deliberately
+    /// have no persistence path and start empty for every TUI process.
+    pub(super) auth_failure_annotations: crate::tui::auth_failure::AuthFailureAnnotations,
+    pub(super) auth_failure_notice: Option<crate::tui::auth_failure::AuthFailureNotice>,
+    auth_failure_fingerprints: std::collections::HashMap<String, u64>,
+    pub(super) auth_notice_switch_rect: Option<Rect>,
+    pub(super) auth_notice_fix_rect: Option<Rect>,
     /// Session-only redaction-source state (`/toggle-redaction`). Seeded
     /// from the layered `redact` config at launch and kept in sync by the
     /// daemon's `RedactionState` broadcast. Tracked client-side so a bare
@@ -2996,6 +3173,11 @@ impl App {
             waiting_for_lock: None,
             sandbox_down_notice: None,
             sandbox_notice_copy_rect: None,
+            auth_failure_annotations: Default::default(),
+            auth_failure_notice: None,
+            auth_failure_fingerprints: Default::default(),
+            auth_notice_switch_rect: None,
+            auth_notice_fix_rect: None,
             redact_scan_environment,
             redact_scan_dotenv,
             redact_scan_ssh_keys,
@@ -3189,11 +3371,22 @@ impl App {
         })
     }
 
+    pub(super) fn persistent_notice_text(&self) -> Option<String> {
+        // Sandbox recovery is safety-critical, so it keeps the shared notice
+        // row while active. The auth notice remains queued and appears as soon
+        // as the sandbox remedy clears.
+        self.sandbox_down_notice_text().or_else(|| {
+            self.auth_failure_notice
+                .as_ref()
+                .map(|notice| crate::tui::auth_failure::notice_text(notice, self.mouse_capture))
+        })
+    }
+
     /// Height of the persistent below-input sandbox-down notice (§6.5): its
     /// wrapped row count (capped) when the sandbox can't initialize, zero
     /// otherwise. Persistent — never times out like a toast.
     pub(super) fn sandbox_notice_lines(&self) -> u16 {
-        let Some(text) = self.sandbox_down_notice_text() else {
+        let Some(text) = self.persistent_notice_text() else {
             return 0;
         };
         let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -3982,6 +4175,12 @@ impl App {
             .iter()
             .any(|l| l.contains("model(s)") || l.ends_with(": done"));
         for line in drained {
+            if let Some(rest) = line.strip_prefix("/fetch-models: provider ")
+                && line.contains(" provider model(s)")
+                && let Some(provider) = rest.split_whitespace().next()
+            {
+                self.clear_auth_failures_for_provider(provider);
+            }
             self.push_plain(line);
         }
         if touches_config {
@@ -4076,8 +4275,21 @@ impl App {
     pub(super) fn drain_async_actions(&mut self) -> bool {
         let results = self.async_actions.drain_completed();
         let changed = !results.is_empty();
+        let oauth_completed = results.iter().any(|result| {
+            matches!(
+                result.kind,
+                AsyncActionKind::Internal("oauth.codex.poll" | "oauth.grok.complete")
+            )
+        });
         for result in results {
             self.apply_async_action_result(result);
+        }
+        // OAuth completion writes credentials asynchronously while its dialog
+        // remains open. Fingerprint reconciliation is deliberately performed
+        // after applying the result; failed/cancelled flows leave the stored
+        // fingerprint unchanged and therefore retain the annotation.
+        if oauth_completed {
+            self.clear_changed_provider_auth_failures();
         }
         changed
     }
@@ -5754,9 +5966,11 @@ impl App {
         self.footer_selection = None;
         self.footer_agent_picker = None;
         self.footer_mode_picker = None;
-        match crate::tui::model_picker::ModelPickerDialog::open(
+        match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
             &self.launch.cwd,
             &self.usage_models,
+            &self.auth_failure_annotations,
+            chrono::Utc::now().timestamp(),
         ) {
             Ok(picker) => {
                 self.overlay = Overlay::ModelPicker(picker);
@@ -5765,6 +5979,96 @@ impl App {
                 self.push_plain(format!("/model: {e}"));
             }
         }
+    }
+
+    pub(super) fn record_auth_failure(
+        &mut self,
+        provider: String,
+        model: String,
+        kind: crate::daemon::proto::AuthFailureKind,
+        failed_at_epoch_secs: i64,
+    ) {
+        self.auth_failure_annotations.insert(
+            (provider.clone(), model.clone()),
+            crate::tui::auth_failure::AuthFailureRecord {
+                kind: kind.clone(),
+                failed_at_epoch_secs,
+            },
+        );
+        self.auth_failure_fingerprints.insert(
+            provider.clone(),
+            crate::tui::auth_failure::provider_auth_fingerprint(&self.launch.cwd, &provider),
+        );
+        self.auth_failure_notice = Some(crate::tui::auth_failure::AuthFailureNotice {
+            provider,
+            model,
+            kind,
+        });
+    }
+
+    pub(super) fn clear_auth_failure_for_model(&mut self, provider: &str, model: &str) {
+        self.auth_failure_annotations
+            .remove(&(provider.to_string(), model.to_string()));
+        if self
+            .auth_failure_notice
+            .as_ref()
+            .is_some_and(|notice| notice.provider == provider && notice.model == model)
+        {
+            self.auth_failure_notice = None;
+        }
+        if !self
+            .auth_failure_annotations
+            .keys()
+            .any(|(failed_provider, _)| failed_provider == provider)
+        {
+            self.auth_failure_fingerprints.remove(provider);
+        }
+    }
+
+    pub(super) fn clear_auth_failures_for_provider(&mut self, provider: &str) {
+        self.auth_failure_annotations
+            .retain(|(failed_provider, _), _| failed_provider != provider);
+        self.auth_failure_fingerprints.remove(provider);
+        if self
+            .auth_failure_notice
+            .as_ref()
+            .is_some_and(|notice| notice.provider == provider)
+        {
+            self.auth_failure_notice = None;
+        }
+    }
+
+    pub(super) fn clear_changed_provider_auth_failures(&mut self) {
+        let changed = self
+            .auth_failure_fingerprints
+            .iter()
+            .filter_map(|(provider, fingerprint)| {
+                (*fingerprint
+                    != crate::tui::auth_failure::provider_auth_fingerprint(
+                        &self.launch.cwd,
+                        provider,
+                    ))
+                .then_some(provider.clone())
+            })
+            .collect::<Vec<_>>();
+        for provider in changed {
+            self.clear_auth_failures_for_provider(&provider);
+        }
+    }
+
+    pub(super) fn open_auth_failure_provider(&mut self) {
+        let Some(notice) = self.auth_failure_notice.clone() else {
+            return;
+        };
+        let oauth_expired = matches!(
+            notice.kind,
+            crate::daemon::proto::AuthFailureKind::OAuthExpired { .. }
+        );
+        self.dialog = crate::tui::settings::Dialog::open_provider_settings(
+            &self.launch.cwd,
+            &notice.provider,
+            oauth_expired,
+        );
     }
 
     pub(super) fn close_model_picker(&mut self, accepted: bool) {

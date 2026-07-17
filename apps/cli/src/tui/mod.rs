@@ -16,6 +16,7 @@ pub mod agent_runner;
 pub mod app;
 pub mod async_action;
 pub mod attention;
+pub mod auth_failure;
 pub mod banner_box;
 pub mod chat;
 pub mod chrome;

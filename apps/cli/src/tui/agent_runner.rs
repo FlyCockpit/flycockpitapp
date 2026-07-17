@@ -1142,6 +1142,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | ResourceClear { session_id, .. }
         | ToolError { session_id, .. }
         | InferenceFailed { session_id, .. }
+        | InferenceSucceeded { session_id, .. }
         | InferenceWarning { session_id, .. }
         | BackupUsed { session_id, .. }
         | SubagentSpawned { session_id, .. }
@@ -1524,6 +1525,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             model,
             error_class,
             detail,
+            auth_failure,
             ..
         } => TurnEvent::InferenceFailed {
             agent,
@@ -1531,7 +1533,11 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             model,
             error_class,
             detail,
+            auth_failure,
         },
+        InferenceSucceeded {
+            provider, model, ..
+        } => TurnEvent::InferenceSucceeded { provider, model },
         BackupUsed {
             agent,
             primary_model,

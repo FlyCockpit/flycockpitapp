@@ -2,6 +2,18 @@ use super::*;
 
 // ---- Events ----------------------------------------------------------------
 
+/// Structured recovery classification for send-time credential and entitlement
+/// failures. Rate limits, timeouts, and transport failures are intentionally
+/// absent from this narrower taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthFailureKind {
+    CredentialsRejected { status: u16 },
+    MissingEntitlement { feature: String },
+    OAuthExpired { provider: String },
+    ProviderNotConfigured,
+}
+
 /// Unsolicited daemon → client notifications. The event stream is
 /// fire-and-forget — clients do not ack individual events. A client
 /// that misses events (e.g. dropped connection) re-`Attach`es and
@@ -284,6 +296,16 @@ pub enum Event {
         model: String,
         error_class: String,
         detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_failure: Option<AuthFailureKind>,
+    },
+
+    /// A concrete provider/model inference completed successfully. TUI clients
+    /// use this only to clear a prior process-local auth annotation.
+    InferenceSucceeded {
+        session_id: Uuid,
+        provider: String,
+        model: String,
     },
 
     /// The primary model failed a qualifying inference and the turn was

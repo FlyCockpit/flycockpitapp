@@ -86,6 +86,26 @@ impl App {
             self.copy_sandbox_fix_command();
             return;
         }
+        if self.mouse_capture
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.auth_failure_notice.is_some()
+            && self
+                .auth_notice_switch_rect
+                .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
+        {
+            self.open_model_picker();
+            return;
+        }
+        if self.mouse_capture
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.auth_failure_notice.is_some()
+            && self
+                .auth_notice_fix_rect
+                .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
+        {
+            self.open_auth_failure_provider();
+            return;
+        }
         // Which-key overlay (`which-key-overlay.md`): rendered on top of every
         // pane, so it intercepts the wheel first. Wheel scrolls it; every other
         // mouse event is eaten so nothing reaches the pane/chat underneath.

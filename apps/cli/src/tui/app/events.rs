@@ -653,8 +653,17 @@ impl App {
                 model,
                 error_class,
                 detail,
+                auth_failure,
                 ..
             } => {
+                if let Some(kind) = auth_failure {
+                    self.record_auth_failure(
+                        provider.clone(),
+                        model.clone(),
+                        kind,
+                        chrono::Utc::now().timestamp(),
+                    );
+                }
                 // A terminal inference failure: stop the spinner and show a red
                 // inline error naming provider/model + the reason (same
                 // treatment as a ToolError). The turn is over (no retry), so
@@ -683,6 +692,9 @@ impl App {
                 self.notify_attention(crate::tui::attention::AttentionEvent::TurnError);
                 self.fresh_queue_ack = FreshQueueAck::None;
                 self.end_working_span();
+            }
+            TurnEvent::InferenceSucceeded { provider, model } => {
+                self.clear_auth_failure_for_model(&provider, &model);
             }
             TurnEvent::InferenceWarning {
                 provider,
@@ -817,6 +829,31 @@ impl App {
                 let active_matches = self
                     .active_subagent_view()
                     .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
+                // Auth recovery is global TUI state, not transcript state. A
+                // nested result must update it even when the user is looking
+                // at the parent (or a different subagent); otherwise a model
+                // can fail invisibly merely because its pane was not active.
+                // The active branch below goes through `apply_event`, so only
+                // handle the metadata here for non-active nested turns.
+                if !active_matches {
+                    match inner.as_ref() {
+                        TurnEvent::InferenceFailed {
+                            provider,
+                            model,
+                            auth_failure: Some(kind),
+                            ..
+                        } => self.record_auth_failure(
+                            provider.clone(),
+                            model.clone(),
+                            kind.clone(),
+                            chrono::Utc::now().timestamp(),
+                        ),
+                        TurnEvent::InferenceSucceeded { provider, model } => {
+                            self.clear_auth_failure_for_model(provider, model);
+                        }
+                        _ => {}
+                    }
+                }
                 if active_matches {
                     self.apply_event(*inner);
                 }

@@ -905,6 +905,13 @@ pub(crate) async fn run_turn(
         tracing::warn!(error = %e, "record inference_request event (completed) failed");
     }
 
+    let _ = tx
+        .send(TurnEvent::InferenceSucceeded {
+            provider: model.provider_id().to_string(),
+            model: model.model_id_ref().to_string(),
+        })
+        .await;
+
     // Assistant output text, extracted once: used both for the
     // calibration text basis below and the AssistantText emit further
     // down.

@@ -725,7 +725,7 @@ impl Model {
                     detail.push_str(" Disable the xAI beta tools entitlement in provider/model settings or choose a non-multi-agent model if the account lacks beta access.");
                 }
                 Err(anyhow::Error::new(InferenceFailure {
-                    provider: self.provider_label().to_string(),
+                    provider: self.provider_id().to_string(),
                     model: self.model_id().to_string(),
                     phase: phase.as_str().to_string(),
                     class: class.as_str(),
@@ -776,7 +776,7 @@ impl Model {
                     .as_deref()
                     .unwrap_or("required provider entitlement");
                 Err(anyhow::Error::new(InferenceFailure {
-                    provider: self.provider_label().to_string(),
+                    provider: self.provider_id().to_string(),
                     model: self.model_id().to_string(),
                     phase: "prep".to_string(),
                     class: "missing_tool_entitlement".to_string(),
@@ -787,7 +787,7 @@ impl Model {
                 }))
             }
             CapabilityStatus::Unsupported => Err(anyhow::Error::new(InferenceFailure {
-                provider: self.provider_label().to_string(),
+                provider: self.provider_id().to_string(),
                 model: self.model_id().to_string(),
                 phase: "prep".to_string(),
                 class: "client_side_tools_unsupported".to_string(),
@@ -849,7 +849,7 @@ impl Model {
                     Ok(records) => records,
                     Err(err) => {
                         return Err(anyhow::Error::new(InferenceFailure {
-                            provider: self.provider_label().to_string(),
+                            provider: self.provider_id().to_string(),
                             model: self.model_id().to_string(),
                             phase: InferencePhase::Prep.as_str().to_string(),
                             class: "responses_tool_identity".to_string(),

@@ -222,7 +222,11 @@ pub enum TurnEvent {
         /// Human-readable reason shown after provider/model (empty for a pure
         /// timeout, whose class already says everything).
         detail: String,
+        auth_failure: Option<crate::daemon::proto::AuthFailureKind>,
     },
+    /// A concrete provider/model inference completed successfully. UI-only;
+    /// used to clear last-known auth failure state for this exact model.
+    InferenceSucceeded { provider: String, model: String },
     /// The primary model failed a qualifying inference on this turn and the
     /// turn was answered by the configured backup model
     /// (implementation note). The TUI renders a

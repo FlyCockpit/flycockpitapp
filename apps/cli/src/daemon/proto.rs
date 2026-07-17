@@ -236,6 +236,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             model,
             error_class,
             detail,
+            auth_failure,
         } => vec![Event::InferenceFailed {
             session_id,
             agent,
@@ -243,6 +244,12 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             model,
             error_class,
             detail,
+            auth_failure,
+        }],
+        TurnEvent::InferenceSucceeded { provider, model } => vec![Event::InferenceSucceeded {
+            session_id,
+            provider,
+            model,
         }],
         TurnEvent::InferenceWarning {
             agent,

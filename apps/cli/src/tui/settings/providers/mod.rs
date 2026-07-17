@@ -1545,6 +1545,34 @@ impl SettingsCx {
         }
     }
 
+    fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> bool {
+        match provider {
+            OAuthProvider::Grok => {
+                xai_oauth::is_logged_in_at(self.credential_store_path.as_deref())
+            }
+            OAuthProvider::Codex => {
+                codex_oauth::is_logged_in_at(self.credential_store_path.as_deref())
+            }
+        }
+    }
+
+    fn provider_oauth_status_value(&self, provider: OAuthProvider) -> String {
+        if self.provider_oauth_logged_in(provider) {
+            "logged in — Enter: Sign out"
+        } else {
+            "not logged in — Enter: Sign in"
+        }
+        .to_string()
+    }
+
+    fn logout_provider_oauth(&self, provider: OAuthProvider) -> Result<(), String> {
+        match provider {
+            OAuthProvider::Grok => xai_oauth::logout_at(self.credential_store_path.as_deref()),
+            OAuthProvider::Codex => codex_oauth::logout_at(self.credential_store_path.as_deref()),
+        }
+        .map_err(|error| error.to_string())
+    }
+
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
         // Inline-edit mode: keystrokes go to the field until Enter/Esc.
         if let Some(field) = s.editing_field {
@@ -1711,6 +1739,16 @@ impl SettingsCx {
                 }));
             }
             Some(EditAction::OAuthAuth(provider)) => {
+                if self.provider_oauth_logged_in(provider) {
+                    s.status = Some(match self.logout_provider_oauth(provider) {
+                        Ok(()) => match provider {
+                            OAuthProvider::Grok => "signed out of Grok subscription auth".into(),
+                            OAuthProvider::Codex => "signed out of Codex subscription auth".into(),
+                        },
+                        Err(error) => format!("sign out failed: {error}"),
+                    });
+                    return Nav::Stay;
+                }
                 let state = Box::new(OAuthFlowState::new(provider));
                 let owned =
                     std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
@@ -2721,21 +2759,11 @@ impl SettingsCx {
                 EditAction::CopilotAuth => ("Copilot auth", String::new()),
                 EditAction::OAuthAuth(OAuthProvider::Grok) => (
                     "Grok subscription auth",
-                    if xai_oauth::is_logged_in() {
-                        "logged in"
-                    } else {
-                        "not logged in"
-                    }
-                    .to_string(),
+                    self.provider_oauth_status_value(OAuthProvider::Grok),
                 ),
                 EditAction::OAuthAuth(OAuthProvider::Codex) => (
                     "Codex subscription auth",
-                    if codex_oauth::is_logged_in() {
-                        "logged in"
-                    } else {
-                        "not logged in"
-                    }
-                    .to_string(),
+                    self.provider_oauth_status_value(OAuthProvider::Codex),
                 ),
                 EditAction::Models => ("Models", models_summary.clone()),
                 EditAction::Settings => ("Settings", settings_summary.clone()),

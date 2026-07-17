@@ -1,5 +1,6 @@
 //! OpenAI Codex subscription OAuth for the `codex-oauth` inference provider.
 
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -179,11 +180,6 @@ pub async fn complete_device_code_login(login: DeviceLogin) -> Result<StoredToke
     }
 }
 
-#[allow(dead_code)]
-pub async fn bearer_token() -> Result<String> {
-    Ok(credential().await?.access_token)
-}
-
 pub async fn credential() -> Result<StoredTokens> {
     crate::auth::refresh_guard::credential_with_refresh(
         CREDENTIAL_KEY,
@@ -200,7 +196,11 @@ pub async fn credential() -> Result<StoredTokens> {
 }
 
 pub fn is_logged_in() -> bool {
-    CredentialStore::open_default()
+    is_logged_in_at(None)
+}
+
+pub(crate) fn is_logged_in_at(store_path: Option<&Path>) -> bool {
+    open_store(store_path)
         .ok()
         .and_then(|store| {
             store
@@ -210,11 +210,21 @@ pub fn is_logged_in() -> bool {
         .is_some()
 }
 
-#[allow(dead_code)]
 pub fn logout() -> Result<()> {
-    let mut store = CredentialStore::open_default()?;
+    logout_at(None)
+}
+
+pub(crate) fn logout_at(store_path: Option<&Path>) -> Result<()> {
+    let mut store = open_store(store_path)?;
     store.remove(CREDENTIAL_KEY);
     store.save()
+}
+
+fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    match store_path {
+        Some(path) => CredentialStore::open(path.to_path_buf()),
+        None => CredentialStore::open_default(),
+    }
 }
 
 fn missing_auth_error() -> anyhow::Error {

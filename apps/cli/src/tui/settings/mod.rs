@@ -65,7 +65,9 @@ use crate::config::dirs::{
     cwd_scoped_creatable_dirs, discover_config_dirs, scaffold_config_dir,
 };
 use crate::config::extended::{ExtendedConfig, ExtendedConfigDoc};
-use crate::config::providers::{ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
+use crate::config::providers::{
+    AuthKind, ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig,
+};
 use crate::daemon::proto::{LspControlAction, Request};
 use crate::providers::models_fetch::FetchOutcome;
 use crate::tui::textfield::TextField;
@@ -1254,6 +1256,14 @@ impl SettingsDialog {
             .flat_map(|header| crate::envref::referenced_names(&header.value))
             .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
             .collect::<std::collections::BTreeSet<_>>();
+        let mut credential_refs = self
+            .config
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .filter(|provider| provider.auth == Some(AuthKind::OAuth))
+            .filter_map(|provider| provider.credential_ref.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         for (other_id, provider) in &self.config.providers {
             if other_id == provider_id {
                 continue;
@@ -1266,11 +1276,18 @@ impl SettingsDialog {
             {
                 names.remove(&name);
             }
+            if let Some(credential_ref) = provider.credential_ref.as_deref() {
+                credential_refs.remove(credential_ref);
+            }
+        }
+
+        if !delete_stored_secrets {
+            names.clear();
         }
 
         self.config.providers.remove(provider_id);
         self.save_config()?;
-        if !delete_stored_secrets || names.is_empty() {
+        if names.is_empty() && credential_refs.is_empty() {
             return Ok(0);
         }
 
@@ -1282,10 +1299,13 @@ impl SettingsDialog {
         for name in &names {
             store.remove_named_secret(name);
         }
+        for credential_ref in &credential_refs {
+            store.remove(credential_ref);
+        }
         store
             .save()
             .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
-        Ok(names.len())
+        Ok(names.len() + credential_refs.len())
     }
 
     fn tick(&mut self) {
@@ -2280,6 +2300,14 @@ impl SettingsCx {
             .flat_map(|header| crate::envref::referenced_names(&header.value))
             .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
             .collect::<std::collections::BTreeSet<_>>();
+        let mut credential_refs = self
+            .config
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .filter(|provider| provider.auth == Some(AuthKind::OAuth))
+            .filter_map(|provider| provider.credential_ref.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         for (other_id, provider) in &self.config.providers {
             if other_id == provider_id {
                 continue;
@@ -2292,11 +2320,18 @@ impl SettingsCx {
             {
                 names.remove(&name);
             }
+            if let Some(credential_ref) = provider.credential_ref.as_deref() {
+                credential_refs.remove(credential_ref);
+            }
+        }
+
+        if !delete_stored_secrets {
+            names.clear();
         }
 
         self.config.providers.remove(provider_id);
         self.save_config()?;
-        if !delete_stored_secrets || names.is_empty() {
+        if names.is_empty() && credential_refs.is_empty() {
             return Ok(0);
         }
 
@@ -2308,10 +2343,13 @@ impl SettingsCx {
         for name in &names {
             store.remove_named_secret(name);
         }
+        for credential_ref in &credential_refs {
+            store.remove(credential_ref);
+        }
         store
             .save()
             .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
-        Ok(names.len())
+        Ok(names.len() + credential_refs.len())
     }
 
     fn activate_lsp_reset(&mut self, p: &mut LspPage) {

@@ -3,6 +3,7 @@
 //! This flow is provider auth, not harness auth: tokens are stored under the
 //! provider credential key and read by the daemon before each request.
 
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -137,7 +138,11 @@ pub async fn bearer_token() -> Result<String> {
 }
 
 pub fn is_logged_in() -> bool {
-    CredentialStore::open_default()
+    is_logged_in_at(None)
+}
+
+pub(crate) fn is_logged_in_at(store_path: Option<&Path>) -> bool {
+    open_store(store_path)
         .ok()
         .and_then(|store| {
             store
@@ -147,11 +152,21 @@ pub fn is_logged_in() -> bool {
         .is_some()
 }
 
-#[allow(dead_code)]
 pub fn logout() -> Result<()> {
-    let mut store = CredentialStore::open_default()?;
+    logout_at(None)
+}
+
+pub(crate) fn logout_at(store_path: Option<&Path>) -> Result<()> {
+    let mut store = open_store(store_path)?;
     store.remove(CREDENTIAL_KEY);
     store.save()
+}
+
+fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    match store_path {
+        Some(path) => CredentialStore::open(path.to_path_buf()),
+        None => CredentialStore::open_default(),
+    }
 }
 
 fn missing_auth_error() -> anyhow::Error {

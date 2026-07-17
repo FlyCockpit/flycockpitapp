@@ -2,6 +2,7 @@ use super::*;
 use crate::config::providers::{AuthKind, ProvidersConfig};
 use crate::config::providers::{ConfigDoc, ProviderEntry};
 use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn provider_with_models(models: Vec<ModelEntry>) -> ProviderEntry {
@@ -67,6 +68,23 @@ fn one_provider_config(policy: Option<OnUnlistedModelsFetch>) -> ProvidersConfig
     ProvidersConfig {
         providers,
         on_unlisted_models_fetch: policy,
+        ..Default::default()
+    }
+}
+
+fn oauth_provider_config(provider_id: &str, credential_ref: &str) -> ProvidersConfig {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        provider_id.to_string(),
+        ProviderEntry {
+            url: "https://api.example.com/v1".to_string(),
+            auth: Some(AuthKind::OAuth),
+            credential_ref: Some(credential_ref.to_string()),
+            ..Default::default()
+        },
+    );
+    ProvidersConfig {
+        providers,
         ..Default::default()
     }
 }
@@ -782,6 +800,121 @@ fn provider_delete_removes_its_unshared_stored_secret() {
 }
 
 #[test]
+fn provider_delete_removes_grok_oauth_credential_record() {
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+    ));
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
+    );
+    store.save().unwrap();
+
+    assert_eq!(
+        dialog
+            .delete_provider_and_stored_secrets(crate::auth::xai_oauth::CREDENTIAL_KEY, true)
+            .unwrap(),
+        1
+    );
+
+    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(store.get(crate::auth::xai_oauth::CREDENTIAL_KEY).is_none());
+}
+
+#[test]
+fn provider_delete_removes_codex_oauth_credential_record() {
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+    ));
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set(
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        json!({"access_token":"codex","refresh_token":"refresh","expires_at":9_999_999_999i64}),
+    );
+    store.save().unwrap();
+
+    assert_eq!(
+        dialog
+            .delete_provider_and_stored_secrets(crate::auth::codex_oauth::CREDENTIAL_KEY, true)
+            .unwrap(),
+        1
+    );
+
+    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(
+        store
+            .get(crate::auth::codex_oauth::CREDENTIAL_KEY)
+            .is_none()
+    );
+}
+
+#[test]
+fn provider_delete_preserves_shared_oauth_credential_record() {
+    let mut cfg = oauth_provider_config("grok-a", crate::auth::xai_oauth::CREDENTIAL_KEY);
+    cfg.providers.insert(
+        "grok-b".into(),
+        ProviderEntry {
+            url: "https://api.example.com/v1".to_string(),
+            auth: Some(AuthKind::OAuth),
+            credential_ref: Some(crate::auth::xai_oauth::CREDENTIAL_KEY.to_string()),
+            ..Default::default()
+        },
+    );
+    let (tmp, mut dialog) = dialog_with_config(cfg);
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
+    );
+    store.save().unwrap();
+
+    assert_eq!(
+        dialog
+            .delete_provider_and_stored_secrets("grok-a", true)
+            .unwrap(),
+        0
+    );
+
+    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(store.get(crate::auth::xai_oauth::CREDENTIAL_KEY).is_some());
+}
+
+#[test]
+fn provider_delete_signs_out_oauth_even_when_named_secrets_are_kept() {
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+    ));
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
+    );
+    store.save().unwrap();
+
+    assert_eq!(
+        dialog
+            .delete_provider_and_stored_secrets(crate::auth::xai_oauth::CREDENTIAL_KEY, false)
+            .unwrap(),
+        1
+    );
+
+    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(store.get(crate::auth::xai_oauth::CREDENTIAL_KEY).is_none());
+}
+
+#[test]
 fn provider_delete_preserves_a_shared_stored_secret() {
     let mut cfg = one_provider_config(None);
     cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
@@ -817,6 +950,52 @@ fn provider_delete_preserves_a_shared_stored_secret() {
             .named_secret("shared"),
         Some("sk-provider-secret-value")
     );
+}
+
+#[test]
+fn provider_edit_oauth_sign_out_updates_login_state_and_row_status() {
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+    ));
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    store.set(
+        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
+    );
+    store.save().unwrap();
+    let entry = dialog.config.providers[crate::auth::xai_oauth::CREDENTIAL_KEY].clone();
+    let mut state = EditState::new(crate::auth::xai_oauth::CREDENTIAL_KEY.into(), entry);
+    state.cursor = edit_menu_actions(crate::auth::xai_oauth::CREDENTIAL_KEY, &state.entry)
+        .iter()
+        .position(|action| *action == EditAction::OAuthAuth(OAuthProvider::Grok))
+        .unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Edit(state)));
+
+    assert!(crate::auth::xai_oauth::is_logged_in_at(Some(&store_path)));
+    assert_eq!(
+        dialog.provider_oauth_status_value(OAuthProvider::Grok),
+        "logged in — Enter: Sign out"
+    );
+
+    dialog.handle_key(press(KeyCode::Enter));
+
+    assert!(!crate::auth::xai_oauth::is_logged_in_at(Some(&store_path)));
+    assert_eq!(
+        dialog.provider_oauth_status_value(OAuthProvider::Grok),
+        "not logged in — Enter: Sign in"
+    );
+    match dialog.test_page() {
+        TestPageRef::Providers(ProvidersPage::Edit(state)) => {
+            assert_eq!(
+                state.status.as_deref(),
+                Some("signed out of Grok subscription auth")
+            );
+        }
+        other => panic!("expected Edit page, got {other:?}"),
+    }
 }
 
 #[test]

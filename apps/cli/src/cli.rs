@@ -425,6 +425,8 @@ pub enum ProvidersCommand {
     List,
     /// Add a provider using the terminal setup wizard.
     Add(ProviderAddArgs),
+    /// Sign out of an OAuth-backed provider without deleting its config entry.
+    Logout(ProviderLogoutArgs),
     /// Show vendor plan limits and quota for configured providers.
     Usage(ProvidersUsageArgs),
 }
@@ -434,6 +436,13 @@ pub struct ProviderAddArgs {
     /// Optional built-in provider template id to preselect.
     #[arg(value_name = "TEMPLATE")]
     pub template: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ProviderLogoutArgs {
+    /// Provider id to sign out.
+    #[arg(value_name = "ID")]
+    pub provider: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1102,6 +1111,17 @@ mod tests {
     }
 
     #[test]
+    fn provider_logout_command_parses_provider_id() {
+        let cli = Cli::try_parse_from(["cockpit", "provider", "logout", "grok-oauth"]).unwrap();
+        match cli.command {
+            Some(Command::Provider(ProvidersCommand::Logout(args))) => {
+                assert_eq!(args.provider, "grok-oauth");
+            }
+            other => panic!("expected provider logout command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn account_tree_parses() {
         let cli = Cli::try_parse_from([
             "cockpit",
@@ -1152,6 +1172,14 @@ mod tests {
                     assert_eq!(args.provider.as_deref(), Some("openai"));
                 }
                 other => panic!("expected provider usage command, got {other:?}"),
+            }
+
+            let cli = Cli::try_parse_from(["cockpit", root, "logout", "codex-oauth"]).unwrap();
+            match cli.command {
+                Some(Command::Provider(ProvidersCommand::Logout(args))) => {
+                    assert_eq!(args.provider, "codex-oauth");
+                }
+                other => panic!("expected provider logout command, got {other:?}"),
             }
         }
     }

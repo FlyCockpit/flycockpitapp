@@ -1,5 +1,5 @@
 //! Provider subscription usage probes for `/usage` and
-//! `cockpit providers usage`.
+//! `cockpit provider usage`.
 //!
 //! This reports vendor plan/quota data when a provider exposes it. It is
 //! distinct from local token/cost stats and from inference response

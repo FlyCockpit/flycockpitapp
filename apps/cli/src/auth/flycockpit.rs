@@ -256,7 +256,9 @@ impl FlycockpitClient {
         let url = endpoint(&self.server_url, "/api/auth/device/token")?;
         loop {
             if started.elapsed() > Duration::from_secs(max_secs) {
-                anyhow::bail!("Flycockpit device-code login expired; run `cockpit login` again");
+                anyhow::bail!(
+                    "Flycockpit device-code login expired; run `cockpit account login` again"
+                );
             }
             let resp = self
                 .http
@@ -294,7 +296,7 @@ impl FlycockpitClient {
                 }
                 PollErrorAction::Expired => {
                     anyhow::bail!(
-                        "Flycockpit device-code login expired; run `cockpit login` again"
+                        "Flycockpit device-code login expired; run `cockpit account login` again"
                     );
                 }
                 PollErrorAction::Denied => {
@@ -500,7 +502,7 @@ pub(crate) fn load_credential_from_path(
 fn load_credential_from_store(store: &CredentialStore) -> Result<StoredFlycockpitCredential> {
     let raw = store
         .get(CREDENTIAL_KEY)
-        .ok_or_else(|| anyhow!("not logged in to Flycockpit; run `cockpit login`"))?;
+        .ok_or_else(|| anyhow!("not logged in to Flycockpit; run `cockpit account login`"))?;
     serde_json::from_value(raw.clone()).context("parsing stored Flycockpit account credential")
 }
 

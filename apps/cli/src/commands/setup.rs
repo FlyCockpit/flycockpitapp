@@ -38,7 +38,7 @@ pub async fn run_provider_add(template: Option<String>) -> Result<()> {
     if let Some(template) = template.as_deref()
         && crate::providers::template_by_id(template).is_none()
     {
-        bail!("unknown provider template `{template}`; run `cockpit providers list`");
+        bail!("unknown provider template `{template}`; run `cockpit provider list`");
     }
     let wizard = crate::wizard::provider_descriptor_with_template(template.as_deref());
     let mut io = StdTerminalIo;

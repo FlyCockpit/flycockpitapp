@@ -5,10 +5,7 @@ use crate::cli::{ProviderAddArgs, ProvidersCommand, ProvidersUsageArgs};
 pub async fn run(cmd: ProvidersCommand) -> Result<()> {
     match cmd {
         ProvidersCommand::List => {
-            // No provider ships an interactive login flow today; all
-            // providers are configured via /settings → Providers + `$VAR`
-            // refs in header values.
-            println!("API-key providers (configure via the TUI's /settings):");
+            println!("API-key provider templates (configure with `cockpit provider add`):");
             for t in crate::providers::TEMPLATES {
                 if matches!(t.auth, crate::config::providers::AuthKind::ApiKey) {
                     println!("  {} — {}", t.id, t.display);

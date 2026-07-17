@@ -1,5 +1,3 @@
-use std::io::Write as _;
-
 use anyhow::{Context, Result};
 
 use crate::auth::flycockpit::{
@@ -19,7 +17,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         && !args.force
     {
         anyhow::bail!(
-            "already logged in to Flycockpit as {} on {}; run `cockpit logout` first or pass `--force`",
+            "already logged in to Flycockpit as {} on {}; run `cockpit account logout` first or pass `--force`",
             existing.account.email,
             existing.server_url
         );
@@ -58,7 +56,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         credential.account.email, credential.server_url
     );
     println!("Instance: {}", credential.instance_id);
-    let enable_remote_access = prompt_remote_access_default_yes()?;
+    let enable_remote_access = remote_access_choice(&args)?;
     let db = crate::db::Db::open_default().ok();
     if let Some(db) = db.as_ref() {
         if let Err(error) = db.set_connector_enabled(
@@ -66,7 +64,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             &credential.instance_id,
             enable_remote_access,
         ) {
-            tracing::warn!(error = %error, "Flycockpit login: updating remote access setting failed");
+            tracing::warn!(error = %error, "Flycockpit account login: updating remote access setting failed");
         } else if enable_remote_access {
             println!("Remote access: enabled (use `cockpit connect off` to disable)");
         } else {
@@ -77,7 +75,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     if let Some(db) = db.as_ref()
         && let Err(error) = crate::daemon::org_sync::sync_current_credential_once(db).await
     {
-        tracing::warn!(error = %error, "Flycockpit login: best-effort org sync policy check failed");
+        tracing::warn!(error = %error, "Flycockpit account login: best-effort org sync policy check failed");
     }
     Ok(())
 }
@@ -93,13 +91,13 @@ pub async fn logout() -> Result<()> {
     if let Ok(client) = FlycockpitClient::new(&credential.server_url)
         && let Err(error) = client.revoke_instance(&credential).await
     {
-        tracing::warn!(error = %error, "Flycockpit logout: best-effort instance revoke failed");
+        tracing::warn!(error = %error, "Flycockpit account logout: best-effort instance revoke failed");
     }
     clear_credential_via_daemon_or_direct().await?;
     if let Ok(db) = crate::db::Db::open_default()
         && let Err(error) = db.mark_org_sync_disabled(&credential.server_url)
     {
-        tracing::warn!(error = %error, "Flycockpit logout: disabling org sync state failed");
+        tracing::warn!(error = %error, "Flycockpit account logout: disabling org sync state failed");
     }
     println!("Logged out of Flycockpit.");
     Ok(())
@@ -269,11 +267,34 @@ pub fn render_whoami_with_sync_and_connector(
     out
 }
 
-fn prompt_remote_access_default_yes() -> Result<bool> {
-    eprint!("Enable remote access for this machine? [Y/n] ");
-    let _ = std::io::stderr().flush();
+fn remote_access_choice(args: &LoginArgs) -> Result<bool> {
+    let mut stdin = std::io::stdin().lock();
+    let mut stderr = std::io::stderr();
+    remote_access_choice_with_io(args, &mut stdin, &mut stderr)
+}
+
+fn remote_access_choice_with_io<R: std::io::BufRead, W: std::io::Write>(
+    args: &LoginArgs,
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool> {
+    if args.remote {
+        return Ok(true);
+    }
+    if args.no_remote {
+        return Ok(false);
+    }
+    prompt_remote_access_default_yes(input, output)
+}
+
+fn prompt_remote_access_default_yes<R: std::io::BufRead, W: std::io::Write>(
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool> {
+    write!(output, "Enable remote access for this machine? [Y/n] ")?;
+    let _ = output.flush();
     let mut answer = String::new();
-    let read = std::io::stdin()
+    let read = input
         .read_line(&mut answer)
         .context("reading remote access preference")?;
     if read == 0 {
@@ -390,6 +411,38 @@ mod tests {
         assert!(parse_remote_access_answer("Y"));
         assert!(!parse_remote_access_answer("n"));
         assert!(!parse_remote_access_answer("No"));
+    }
+
+    #[test]
+    fn login_no_remote_skips_prompt() {
+        struct PanicBufRead;
+
+        impl std::io::Read for PanicBufRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("--no-remote must not read stdin");
+            }
+        }
+
+        impl std::io::BufRead for PanicBufRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                panic!("--no-remote must not read stdin");
+            }
+
+            fn consume(&mut self, _amt: usize) {}
+        }
+
+        let args = LoginArgs {
+            server: DEFAULT_SERVER_URL.to_string(),
+            name: None,
+            force: false,
+            remote: false,
+            no_remote: true,
+        };
+        let mut input = PanicBufRead;
+        let mut output = Vec::new();
+
+        assert!(!remote_access_choice_with_io(&args, &mut input, &mut output).unwrap());
+        assert!(output.is_empty());
     }
 
     #[test]

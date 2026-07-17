@@ -4,6 +4,7 @@
 use std::fmt;
 
 pub const USAGE_EXIT_CODE: u8 = 64;
+pub const REMOVED_COMMAND_EXIT_CODE: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandUsageError {
@@ -29,6 +30,39 @@ impl fmt::Display for CommandUsageError {
 }
 
 impl std::error::Error for CommandUsageError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedCommandError {
+    message: String,
+}
+
+impl RemovedCommandError {
+    pub fn new(command: &'static str) -> Self {
+        let account_command = match command {
+            "login" => "cockpit account login",
+            "logout" => "cockpit account logout",
+            "whoami" => "cockpit account whoami",
+            _ => "cockpit account login",
+        };
+        Self {
+            message: format!(
+                "`cockpit {command}` was split: use `{account_command}` for Flycockpit account access or `cockpit provider add` for model provider API keys/OAuth"
+            ),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for RemovedCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RemovedCommandError {}
 
 pub mod agent;
 pub mod ask;

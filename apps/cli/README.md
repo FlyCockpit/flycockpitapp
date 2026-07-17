@@ -92,6 +92,12 @@ Configure a model provider from inside the TUI:
 /settings -> Providers
 ```
 
+Or add a provider from the terminal:
+
+```sh
+cockpit provider add
+```
+
 Fetch configured provider model lists:
 
 ```sh
@@ -149,8 +155,13 @@ cockpit packages prune --dry-run
 | `cockpit daemon start --detach` | Start the persistent background daemon. |
 | `cockpit daemon status` | Show daemon status. |
 | `cockpit daemon stop` | Stop the daemon. |
+| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
+| `cockpit account whoami` | Show the active Flycockpit account and instance. |
+| `cockpit account logout` | Sign out of Flycockpit on this machine. |
 | `cockpit sync status` | Show session-log sync and remote-audit upload state. |
-| `cockpit providers list` | List built-in provider templates. |
+| `cockpit provider list` | List built-in provider templates. |
+| `cockpit provider add [template]` | Add a model provider using the terminal wizard. |
+| `cockpit provider usage` | Show vendor plan limits and quota where supported. |
 | `cockpit fetch-models [provider]` | Refresh model catalogs from configured providers. |
 | `cockpit models [provider]` | List locally configured models. |
 | `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
@@ -219,15 +230,16 @@ files. This is a pre-release development reset, not a production migration.
 
 ## Providers
 
-Provider setup is primarily driven through `/settings -> Providers` in the TUI. The CLI can list templates, inspect configured models, refresh provider catalogs, and show provider usage where supported.
+Provider setup is available through `/settings -> Providers` in the TUI or `cockpit provider add` in the terminal. The CLI can list templates, inspect configured models, refresh provider catalogs, and show provider usage where supported.
 
 API-key providers store secret references such as `$OPENAI_API_KEY` in provider config instead of copying raw keys into project files. OAuth-backed providers store refreshable token bundles in the private credentials store.
 
 Useful commands:
 
 ```sh
-cockpit providers list
-cockpit providers usage
+cockpit provider list
+cockpit provider add openai
+cockpit provider usage
 cockpit fetch-models
 cockpit provider-catalog-status
 ```

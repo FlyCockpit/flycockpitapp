@@ -581,7 +581,9 @@ pub fn main_entry() -> ExitCode {
 }
 
 fn error_exit_code(err: &anyhow::Error) -> u8 {
-    if err.is::<commands::CommandUsageError>() {
+    if err.is::<commands::RemovedCommandError>() {
+        commands::REMOVED_COMMAND_EXIT_CODE
+    } else if err.is::<commands::CommandUsageError>() {
         commands::USAGE_EXIT_CODE
     } else {
         1
@@ -589,7 +591,9 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
 }
 
 fn error_stderr_line(err: &anyhow::Error) -> String {
-    if let Some(usage) = err.downcast_ref::<commands::CommandUsageError>() {
+    if let Some(removed) = err.downcast_ref::<commands::RemovedCommandError>() {
+        format!("error: {}", removed.message())
+    } else if let Some(usage) = err.downcast_ref::<commands::CommandUsageError>() {
         format!("error: {}", usage.message())
     } else {
         format!("Error: {err:?}")
@@ -619,7 +623,12 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Assistant(crate::cli::AssistantCommand::Learn(args))) => {
             commands::learn::run(args, cli.no_sandbox).await
         }
-        Some(Command::Providers(sub)) => commands::providers::run(sub).await,
+        Some(Command::Account(sub)) => match sub {
+            crate::cli::AccountCommand::Login(args) => commands::flycockpit::login(args).await,
+            crate::cli::AccountCommand::Logout => commands::flycockpit::logout().await,
+            crate::cli::AccountCommand::Whoami => commands::flycockpit::whoami().await,
+        },
+        Some(Command::Provider(sub)) => commands::providers::run(sub).await,
         Some(Command::Setup(args)) => commands::setup::run(args).await,
         Some(Command::Models(args)) => commands::models::run(args).await,
         Some(Command::ProviderCatalogStatus(args)) => {
@@ -637,9 +646,9 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Config(sub)) => commands::config::run(sub).await,
         Some(Command::Meta(args)) => commands::meta::run(args).await,
         Some(Command::Mcp(cmd)) => commands::mcp::run(cmd).await,
-        Some(Command::Login(args)) => commands::flycockpit::login(args).await,
-        Some(Command::Logout) => commands::flycockpit::logout().await,
-        Some(Command::Whoami) => commands::flycockpit::whoami().await,
+        Some(Command::Login(_)) => Err(commands::RemovedCommandError::new("login").into()),
+        Some(Command::Logout) => Err(commands::RemovedCommandError::new("logout").into()),
+        Some(Command::Whoami) => Err(commands::RemovedCommandError::new("whoami").into()),
         Some(Command::Sync(sub)) => commands::sync::run(sub).await,
         Some(Command::Connect(args)) => commands::connect::run(args).await,
         Some(Command::Pr(args)) => commands::pr::run(args).await,
@@ -727,5 +736,16 @@ mod tests {
 
         assert_eq!(error_exit_code(&err), 1);
         assert_eq!(error_stderr_line(&err), "Error: boom");
+    }
+
+    #[test]
+    fn removed_login_stub_points_and_exits_2() {
+        let err = anyhow::Error::new(commands::RemovedCommandError::new("login"));
+
+        assert_eq!(error_exit_code(&err), commands::REMOVED_COMMAND_EXIT_CODE);
+        let line = error_stderr_line(&err);
+        assert!(line.contains("`cockpit login` was split"), "{line}");
+        assert!(line.contains("`cockpit account login`"), "{line}");
+        assert!(line.contains("`cockpit provider add`"), "{line}");
     }
 }

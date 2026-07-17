@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 use crate::agents::AgentMode;
@@ -77,9 +77,13 @@ pub enum Command {
     #[command(subcommand)]
     Assistant(AssistantCommand),
 
+    /// Manage the Flycockpit account used for SaaS sync and relay access.
+    #[command(subcommand)]
+    Account(AccountCommand),
+
     /// Manage AI providers and credentials.
-    #[command(subcommand, alias = "auth")]
-    Providers(ProvidersCommand),
+    #[command(subcommand, name = "provider", alias = "providers", alias = "auth")]
+    Provider(ProvidersCommand),
 
     /// Run an interactive setup wizard.
     Setup(SetupArgs),
@@ -133,20 +137,23 @@ pub enum Command {
     #[command(subcommand)]
     Mcp(McpCommand),
 
-    /// Sign in to a Flycockpit account using browser device authorization.
-    Login(LoginArgs),
+    /// Removed: use `cockpit account login` or `cockpit provider add`.
+    #[command(hide = true)]
+    Login(RemovedCommandArgs),
 
-    /// Sign out of the active Flycockpit account on this machine.
+    /// Removed: use `cockpit account logout` or `cockpit provider add`.
+    #[command(hide = true)]
     Logout,
 
-    /// Show the active Flycockpit account and instance.
+    /// Removed: use `cockpit account whoami` or `cockpit provider add`.
+    #[command(hide = true)]
     Whoami,
 
     /// Inspect enterprise org-policy synchronization.
     #[command(subcommand)]
     Sync(SyncCommand),
 
-    /// Toggle outbound relay access for remote control on this instance; requires `cockpit login`.
+    /// Toggle outbound relay access for remote control on this instance; requires `cockpit account login`.
     Connect(ConnectArgs),
 
     /// Fetch and check out a GitHub PR, then launch cockpit in the worktree.
@@ -215,6 +222,23 @@ pub enum ConfigCommand {
     /// Import portable provider/model policy JSON without credentials.
     #[command(name = "import-policy")]
     ImportPolicy(ConfigImportPolicyArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AccountCommand {
+    /// Sign in to a Flycockpit account using browser device authorization.
+    Login(LoginArgs),
+    /// Sign out of the active Flycockpit account on this machine.
+    Logout,
+    /// Show the active Flycockpit account and instance.
+    Whoami,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RemovedCommandArgs {
+    /// Ignored old arguments. The command always prints the split-command pointer.
+    #[arg(hide = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    pub rest: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -507,6 +531,14 @@ pub struct LoginArgs {
     /// Replace the currently logged-in Flycockpit account without prompting.
     #[arg(long)]
     pub force: bool,
+
+    /// Enable outbound remote access for this instance without prompting.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_remote")]
+    pub remote: bool,
+
+    /// Disable outbound remote access for this instance without prompting.
+    #[arg(long = "no-remote", action = ArgAction::SetTrue)]
+    pub no_remote: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1043,13 +1075,81 @@ mod tests {
 
     #[test]
     fn provider_add_command_parses_optional_template() {
-        let cli = Cli::try_parse_from(["cockpit", "providers", "add", "openai"]).unwrap();
+        let cli = Cli::try_parse_from(["cockpit", "provider", "add", "openai"]).unwrap();
         match cli.command {
-            Some(Command::Providers(ProvidersCommand::Add(args))) => {
+            Some(Command::Provider(ProvidersCommand::Add(args))) => {
                 assert_eq!(args.template.as_deref(), Some("openai"));
             }
             other => panic!("expected providers add command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn account_tree_parses() {
+        let cli = Cli::try_parse_from([
+            "cockpit",
+            "account",
+            "login",
+            "--server",
+            "https://app.flycockpit.dev",
+            "--force",
+            "--no-remote",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Account(AccountCommand::Login(args))) => {
+                assert_eq!(args.server, "https://app.flycockpit.dev");
+                assert!(args.force);
+                assert!(args.no_remote);
+                assert!(!args.remote);
+            }
+            other => panic!("expected account login command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["cockpit", "account", "logout"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Account(AccountCommand::Logout))
+        ));
+
+        let cli = Cli::try_parse_from(["cockpit", "account", "whoami"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Account(AccountCommand::Whoami))
+        ));
+    }
+
+    #[test]
+    fn provider_aliases_parse() {
+        for root in ["provider", "providers", "auth"] {
+            let cli = Cli::try_parse_from(["cockpit", root, "list"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Provider(ProvidersCommand::List))
+            ));
+
+            let cli =
+                Cli::try_parse_from(["cockpit", root, "usage", "--provider", "openai"]).unwrap();
+            match cli.command {
+                Some(Command::Provider(ProvidersCommand::Usage(args))) => {
+                    assert_eq!(args.provider.as_deref(), Some("openai"));
+                }
+                other => panic!("expected provider usage command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn removed_login_stub_parses_but_is_hidden_from_help() {
+        let cli = Cli::try_parse_from(["cockpit", "login", "--force"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Login(_))));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("account"), "{help}");
+        assert!(help.contains("provider"), "{help}");
+        assert!(!help.contains("  login"), "{help}");
+        assert!(!help.contains("  logout"), "{help}");
+        assert!(!help.contains("  whoami"), "{help}");
     }
 
     #[test]

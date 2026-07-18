@@ -99,6 +99,7 @@ pub(super) async fn safety_gate_decision_with_configs(
         providers,
         ctx.redact.clone(),
         ctx.session.trusted_only_flag(),
+        Some(ctx.shutdown_gate.clone()),
         tool,
         &payload,
     )
@@ -274,6 +275,7 @@ mod safety_gate_tests {
             redact,
             interrupts: hub,
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),

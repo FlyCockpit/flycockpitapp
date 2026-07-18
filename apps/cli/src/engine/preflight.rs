@@ -18,14 +18,7 @@
 //!     model dropping a control token must never reach the coding model
 //!     (priority #1, defensive against weaker models).
 
-use std::time::Duration;
-
 use crate::config::providers::ProvidersConfig;
-
-/// Timeout for the preflight rewrite call. Best-effort and gates the
-/// user's turn, so a stalled provider fails open rather than holding the
-/// turn hostage — mirrors [`crate::engine::injection_check::CHECK_TIMEOUT`].
-pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Inputs shorter than this (after trimming) are treated as trivial and
 /// skipped — a rewrite would only add latency to a one-word ack or a
@@ -521,6 +514,7 @@ pub async fn run(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     template: &str,
     raw_text: &str,
     context: &PreflightContext,
@@ -541,6 +535,7 @@ pub async fn run(
         providers,
         redact,
         trusted_only,
+        shutdown_gate,
         template,
         &prose,
         context,
@@ -617,11 +612,13 @@ fn build_message(template: &str, prose: &str, context: &PreflightContext) -> Str
 /// (the chokepoint subsumes `preflight-conversation-context.md`'s
 /// "scrub everything"); the *returned* rewrite is the original-language prose
 /// that flows on for translation + outbound redaction unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn rewrite(
     model_ref: Option<&str>,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     template: &str,
     prose: &str,
     context: &PreflightContext,
@@ -639,20 +636,22 @@ async fn rewrite(
             return None;
         }
     };
+    let model = match shutdown_gate {
+        Some(gate) => model.with_shutdown_gate(gate),
+        None => model,
+    };
     let message = build_message(template, prose, context);
-    match tokio::time::timeout(
-        PREFLIGHT_TIMEOUT,
-        model.text_completion_with_system(PREFLIGHT_SYSTEM, &message),
-    )
-    .await
+    match model
+        .text_completion_with_system_for(
+            crate::engine::model::UtilityCallSite::PreflightRewrite,
+            PREFLIGHT_SYSTEM,
+            &message,
+        )
+        .await
     {
-        Ok(Ok(text)) => Some(text),
-        Ok(Err(e)) => {
+        Ok(text) => Some(text),
+        Err(e) => {
             tracing::debug!(error = %e, "preflight: rewrite call failed; failing open");
-            None
-        }
-        Err(_) => {
-            tracing::debug!("preflight: rewrite call timed out; failing open");
             None
         }
     }
@@ -765,6 +764,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             trust_flag_off(),
+            None,
             "rewrite this",
             "a sufficiently long verbose prompt to rewrite",
             &PreflightContext::default(),
@@ -783,6 +783,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             trust_flag_off(),
+            None,
             "rewrite this",
             "a sufficiently long verbose prompt to rewrite",
             &PreflightContext::default(),
@@ -805,6 +806,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             trust_flag_off(),
+            None,
             "rewrite this",
             "/plan do a big refactor of the parser",
             &PreflightContext::default(),
@@ -1148,6 +1150,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             trust_flag_off(),
+            None,
             "rewrite this",
             "do that again for the other file",
             &ctx,
@@ -1217,6 +1220,7 @@ mod tests {
             &providers,
             redact,
             trust_flag_off(),
+            None,
             "rewrite this",
             "summarize that file again for me please",
             &ctx,

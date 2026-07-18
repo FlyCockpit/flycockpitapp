@@ -1086,6 +1086,7 @@ async fn select_low_information_turn_skips_before_model_lookup_with_diagnostics(
         &providers,
         redact,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         &[],
         &turns,
         &std::collections::HashSet::new(),

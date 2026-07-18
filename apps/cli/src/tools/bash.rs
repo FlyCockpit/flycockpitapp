@@ -2857,6 +2857,7 @@ mod tests {
             redact,
             interrupts: hub,
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: Some(approver),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),

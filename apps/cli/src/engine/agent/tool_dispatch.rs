@@ -1209,6 +1209,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),

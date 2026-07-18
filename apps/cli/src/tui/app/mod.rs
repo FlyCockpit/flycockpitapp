@@ -4208,6 +4208,9 @@ impl App {
         if !mode.is_enabled() {
             return;
         }
+        if self.daemon_draining {
+            return;
+        }
         let turns = self.prediction_turns();
         // Nothing to predict yet (no agent final response) → no call.
         if turns.is_empty() || turns.iter().all(|t| t.agent.trim().is_empty()) {

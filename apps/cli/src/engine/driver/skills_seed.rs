@@ -177,6 +177,7 @@ impl Driver {
             // has no run-scoped cancel slot, so a fresh never-cancelled
             // token suffices.
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: agent.model.shutdown_gate(),
             // Seeds are read-only/idempotent and run before the approver
             // is consulted in earnest; a missing approver skips the
             // boundary prompt (never denies).
@@ -469,6 +470,7 @@ impl Driver {
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: child.model.shutdown_gate(),
             approver: self.approver.clone(),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
@@ -546,6 +548,7 @@ impl Driver {
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),
@@ -742,6 +745,7 @@ impl Driver {
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),

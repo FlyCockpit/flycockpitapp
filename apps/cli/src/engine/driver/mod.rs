@@ -1612,6 +1612,7 @@ impl Driver {
             &providers,
             self.redact.clone(),
             self.session.trusted_only_flag(),
+            Some(root.agent.model.shutdown_gate()),
             &resolved.preflight_prompt,
             raw_text,
             &context,
@@ -1944,6 +1945,7 @@ impl Driver {
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             deferred_log: self
                 .stack
@@ -4578,6 +4580,7 @@ impl Driver {
             // chokepoint as the foreground turn (GOALS §7).
             let redact = self.redact.clone();
             let tx = tx.clone();
+            let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
             tokio::spawn(async move {
                 let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
                 crate::auto_title::generate_session_title(
@@ -4587,6 +4590,7 @@ impl Driver {
                     redact,
                     content_prefix,
                     title_action,
+                    Some(shutdown_gate),
                     tx,
                 )
                 .await;

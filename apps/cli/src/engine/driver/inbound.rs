@@ -82,6 +82,7 @@ impl Driver {
             &providers,
             self.redact.clone(),
             self.session.trusted_only_flag(),
+            Some(self.stack[0].agent.model.shutdown_gate()),
             &active_tools,
             &turns,
             &self.auto_injected_skills,
@@ -156,6 +157,7 @@ impl Driver {
                     &providers,
                     self.redact.clone(),
                     self.session.trusted_only_flag(),
+                    Some(self.stack[0].agent.model.shutdown_gate()),
                 )
                 .await
             }
@@ -200,6 +202,7 @@ impl Driver {
             &providers,
             self.redact.clone(),
             self.session.trusted_only_flag(),
+            Some(self.stack[0].agent.model.shutdown_gate()),
             &guard.check_prompt,
             raw_text,
         )

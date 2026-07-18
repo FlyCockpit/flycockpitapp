@@ -26,17 +26,10 @@
 //! the gate couldn't vet would defeat `auto` mode's whole purpose, so the
 //! safe default is "ask the user".
 
-use std::time::Duration;
-
 use serde_json::json;
 
 use crate::config::providers::ProvidersConfig;
 use crate::engine::message::ToolDefinition;
-
-/// Timeout for the utility-model safety call. The verdict gates a tool
-/// call, so a stalled provider resolves to [`SafetyOutcome::Unavailable`]
-/// (fail closed → ask the user) rather than holding the call open.
-pub const SAFETY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The structured tool name the utility model answers the safety verdict
 /// through.
@@ -118,6 +111,7 @@ pub async fn evaluate(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tool: &str,
     payload: &str,
 ) -> SafetyOutcome {
@@ -126,6 +120,7 @@ pub async fn evaluate(
         providers,
         redact,
         trusted_only,
+        shutdown_gate,
         tool,
         payload,
     )
@@ -141,6 +136,7 @@ async fn evaluate_inner(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tool: &str,
     payload: &str,
 ) -> Option<SafetyVerdict> {
@@ -157,23 +153,26 @@ async fn evaluate_inner(
             return None;
         }
     };
+    let model = match shutdown_gate {
+        Some(gate) => model.with_shutdown_gate(gate),
+        None => model,
+    };
 
     let message = build_eval_message(tool, payload);
     let safety = safety_tool();
 
-    let calls = match tokio::time::timeout(
-        SAFETY_TIMEOUT,
-        model.tool_completion(SAFETY_SYSTEM, &message, &safety),
-    )
-    .await
+    let calls = match model
+        .tool_completion_for(
+            crate::engine::model::UtilityCallSite::SafetyGate,
+            SAFETY_SYSTEM,
+            &message,
+            &safety,
+        )
+        .await
     {
-        Ok(Ok(calls)) => calls,
-        Ok(Err(e)) => {
+        Ok(calls) => calls,
+        Err(e) => {
             tracing::debug!(error = %e, "safety_gate: call failed; failing closed");
-            return None;
-        }
-        Err(_) => {
-            tracing::debug!("safety_gate: call timed out; failing closed");
             return None;
         }
     };
@@ -278,6 +277,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
             "bash",
             "rm -rf /",
         )
@@ -297,6 +297,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
             "bash",
             "ls",
         )

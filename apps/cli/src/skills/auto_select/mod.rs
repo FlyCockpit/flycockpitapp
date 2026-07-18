@@ -20,20 +20,13 @@
 //! `utility_model` is unset the pass is skipped (logged once via the
 //! caller), never erroring and never falling back to the main model.
 
-use std::path::Path;
-use std::time::Duration;
-
 use anyhow::Result;
 use serde::Serialize;
+use std::path::Path;
 
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
 use crate::engine::predict::{PredictionTurn, last_turns};
-
-/// Timeout for the utility-model selection call. Selection is
-/// best-effort; if the provider stalls we'd rather skip injection than
-/// hold up the user's turn.
-pub const SELECT_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Hard cap on the number of skills activated in one turn. Conservative
 /// for token economy (GOALS §10): even within the token budget we never
@@ -142,6 +135,7 @@ async fn select(
         providers,
         redact,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         &[],
         turns,
         already_injected,
@@ -157,6 +151,7 @@ pub async fn select_with_diagnostics(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     active_tools: &[String],
     turns: &[PredictionTurn],
     already_injected: &std::collections::HashSet<String>,
@@ -167,6 +162,7 @@ pub async fn select_with_diagnostics(
         providers,
         redact,
         trusted_only,
+        shutdown_gate,
         active_tools,
         turns,
         already_injected,
@@ -188,6 +184,7 @@ async fn select_inner(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     active_tools: &[String],
     turns: &[PredictionTurn],
     already_injected: &std::collections::HashSet<String>,
@@ -232,10 +229,18 @@ async fn select_inner(
         redact.clone(),
         trusted_only,
     )?;
+    let model = match shutdown_gate {
+        Some(gate) => model.with_shutdown_gate(gate),
+        None => model,
+    };
     let catalog = crate::skills::catalog_lines(&skills);
     let prompt = build_select_prompt(&catalog, &window);
-    let response =
-        tokio::time::timeout(SELECT_CALL_TIMEOUT, model.text_completion(&prompt)).await??;
+    let response = model
+        .text_completion_for(
+            crate::engine::model::UtilityCallSite::SkillAutoSelect,
+            &prompt,
+        )
+        .await?;
 
     // Robustly parse the relevance-ordered name list (each name carries an
     // optional model reason), then apply the deterministic relevance

@@ -21,10 +21,8 @@
 //! Missing `utility_model` logs once per process at info; provider/runtime
 //! errors still warn. Auto-title never blocks the driver loop.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-
 use anyhow::Result;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 use std::path::Path;
@@ -55,11 +53,6 @@ pub const TITLE_TOKEN_THRESHOLD: usize = 500;
 
 /// Maximum title length, post-slugification.
 pub const TITLE_MAX_CHARS: usize = 60;
-
-/// Timeout for the utility-model call. Titles are best-effort; if
-/// the provider takes longer than this, we'd rather drop the title
-/// than tie up a daemon task indefinitely.
-pub const TITLE_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Slugify a raw model response into a `[a-z0-9-]+` title. Returns
 /// `None` if nothing survives — the caller treats that as "no title
@@ -96,6 +89,7 @@ pub fn slugify_title(raw: &str) -> Option<String> {
 /// `Notice` on `tx` and logs at `warn` (no `None`-slug deferral on the
 /// eager path: a model that returned nothing usable simply leaves the next
 /// scheduled slot to try again, which is not surfaced as a failure).
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_session_title(
     session: Arc<Session>,
     extended: ExtendedConfig,
@@ -103,6 +97,7 @@ pub async fn generate_session_title(
     redact: Arc<crate::redact::RedactionTable>,
     content_prefix: String,
     action: TitleAction,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tx: mpsc::Sender<TurnEvent>,
 ) {
     match generate_inner(
@@ -112,6 +107,7 @@ pub async fn generate_session_title(
         redact,
         content_prefix,
         action,
+        shutdown_gate,
     )
     .await
     {
@@ -152,6 +148,8 @@ fn is_utility_model_unset_error(e: &anyhow::Error) -> bool {
 fn is_title_call_timeout_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<tokio::time::error::Elapsed>().is_some()
         || e.to_string().contains("deadline has elapsed")
+        || crate::engine::model::as_inference_failure(e)
+            .is_some_and(|failure| failure.class == "utility_timeout")
 }
 
 fn auto_title_failure_notice(e: &anyhow::Error) -> &'static str {
@@ -192,6 +190,7 @@ pub async fn generate_session_title_once(
         redact,
         content_prefix,
         action,
+        None,
     )
     .await?
     {
@@ -207,6 +206,7 @@ async fn generate_inner(
     redact: Arc<crate::redact::RedactionTable>,
     content_prefix: String,
     action: TitleAction,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> Result<TitleOutcome> {
     let Some(model_ref) = extended.auto_title_model_ref() else {
         anyhow::bail!("utility_model is not configured");
@@ -217,6 +217,10 @@ async fn generate_inner(
         redact,
         session.trusted_only_flag(),
     )?;
+    let model = match shutdown_gate {
+        Some(gate) => model.with_shutdown_gate(gate),
+        None => model,
+    };
 
     let content = match action {
         TitleAction::Eager => content_prefix,
@@ -225,8 +229,9 @@ async fn generate_inner(
         }
     };
     let prompt = build_title_prompt(&content);
-    let response =
-        tokio::time::timeout(TITLE_CALL_TIMEOUT, model.text_completion(&prompt)).await??;
+    let response = model
+        .text_completion_for(crate::engine::model::UtilityCallSite::AutoTitle, &prompt)
+        .await?;
 
     // A reasoning utility model may wrap its answer in `<think>…</think>`;
     // strip that before slugifying so the title is the answer, not the
@@ -528,6 +533,7 @@ mod tests {
             redact,
             msg.to_string(),
             action,
+            None,
             tx,
         )
         .await;
@@ -559,6 +565,7 @@ mod tests {
             redact,
             "/help".into(),
             action,
+            None,
             tx,
         )
         .await;
@@ -586,6 +593,7 @@ mod tests {
             redact,
             "accumulated context".into(),
             TitleAction::Refine,
+            None,
             tx,
         )
         .await;
@@ -612,6 +620,7 @@ mod tests {
             redact,
             "accumulated context".into(),
             TitleAction::Refine,
+            None,
             tx,
         )
         .await;
@@ -679,6 +688,7 @@ mod tests {
             redact,
             "title me".into(),
             action,
+            None,
             tx,
         )
         .await;
@@ -703,6 +713,7 @@ mod tests {
             Arc::new(crate::redact::RedactionTable::empty()),
             "title me".into(),
             action,
+            None,
             tx,
         )
         .await;
@@ -733,6 +744,7 @@ mod tests {
             redact.clone(),
             "title me".into(),
             action,
+            None,
             tx,
         )
         .await;
@@ -762,6 +774,7 @@ mod tests {
             redact2,
             "title me again".into(),
             TitleAction::Eager,
+            None,
             tx2,
         )
         .await;
@@ -779,14 +792,23 @@ mod tests {
         let task = tokio::spawn({
             let session = session.clone();
             async move {
-                generate_session_title(session, ext, prov, redact, "title me".into(), action, tx)
-                    .await;
+                generate_session_title(
+                    session,
+                    ext,
+                    prov,
+                    redact,
+                    "title me".into(),
+                    action,
+                    None,
+                    tx,
+                )
+                .await;
             }
         });
 
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
-        tokio::time::advance(TITLE_CALL_TIMEOUT).await;
+        tokio::time::advance(crate::engine::model::UTILITY_BACKGROUND_TIMEOUT).await;
         tokio::task::yield_now().await;
         task.await.unwrap();
 
@@ -805,6 +827,7 @@ mod tests {
             redact2,
             "title me again".into(),
             TitleAction::Eager,
+            None,
             tx2,
         )
         .await;

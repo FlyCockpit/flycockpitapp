@@ -420,6 +420,7 @@ impl Tool for HarnessInvokeTool {
             trusted_only: ctx.session.trusted_only_flag(),
             utility_model: extended.utility_model.as_deref(),
             providers: &providers,
+            shutdown_gate: Some(ctx.shutdown_gate.clone()),
             env_overlay: Some(&env_overlay),
         })
         .await;

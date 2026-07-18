@@ -478,6 +478,10 @@ pub struct ToolCtx {
     /// of holding the turn open. Fresh per turn; cancelling it never
     /// affects a later turn.
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Daemon shutdown gate shared by the active model for this turn. Utility
+    /// models built inside tools (for example harness-result summarization)
+    /// install it so background utility calls are abandoned during drain.
+    pub shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
     /// Command/path approval driver (sandboxing part 2). The `bash` tool
     /// consults it for the run-fail-escalate flow (broadened re-run on a
     /// non-zero sandboxed exit), and the native file/intel tools consult

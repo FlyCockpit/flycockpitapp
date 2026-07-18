@@ -22,16 +22,9 @@
 //! bounded to the mode (`short` ≈ one line; `long` a bounded full
 //! response, never unbounded).
 
-use std::time::Duration;
-
 use crate::config::extended::{ExtendedConfig, PredictNextMessage};
 use crate::config::providers::ProvidersConfig;
 use crate::engine::message::{Message, extract_text, extract_user_text};
-
-/// Timeout for one prediction call. Predictions are best-effort ghost
-/// text; if the provider stalls we drop the prediction rather than tie up
-/// a task.
-pub const PREDICT_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Hard character cap on a `short` prediction (one line). Belt-and-braces
 /// over the prompt instruction so a misbehaving model can't blow the
@@ -263,18 +256,16 @@ pub async fn predict(
     // (`text_completion`), so no per-site scrub is needed here.
     let prompt = build_prediction_prompt(&window, mode);
 
-    let response =
-        match tokio::time::timeout(PREDICT_CALL_TIMEOUT, model.text_completion(&prompt)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "predict: call failed; no ghost text");
-                return None;
-            }
-            Err(_) => {
-                tracing::debug!("predict: call timed out; no ghost text");
-                return None;
-            }
-        };
+    let response = match model
+        .text_completion_for(crate::engine::model::UtilityCallSite::Predict, &prompt)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "predict: call failed; no ghost text");
+            return None;
+        }
+    };
 
     // A suggested response is always think-stripped, regardless of the
     // model's display/context toggle — reasoning is never part of a message

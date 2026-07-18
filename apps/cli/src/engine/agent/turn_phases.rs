@@ -1214,7 +1214,14 @@ pub(crate) async fn run_turn(
         // to the pre-feature behavior. No streaming translation: the
         // translated answer lands once, here, after the response completes.
         let shown = if is_root && calls.is_empty() && !text.trim().is_empty() {
-            translate_final_response(&text, &cwd, redact.clone(), session.trusted_only_flag()).await
+            translate_final_response(
+                &text,
+                &cwd,
+                redact.clone(),
+                session.trusted_only_flag(),
+                Some(agent.model.shutdown_gate()),
+            )
+            .await
         } else {
             text.clone()
         };
@@ -1305,6 +1312,7 @@ pub(crate) async fn run_turn(
         env_overlay: agent.env_overlay.clone(),
         interrupts,
         cancel,
+        shutdown_gate: agent.model.shutdown_gate(),
         approver,
         deferred_log,
         seeds,

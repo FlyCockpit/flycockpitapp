@@ -956,7 +956,7 @@ impl Driver {
                 self.redact.clone(),
                 top.agent.model.trusted_only_flag(),
             ) {
-                Ok(m) => Some(m),
+                Ok(m) => Some(m.with_shutdown_gate(top.agent.model.shutdown_gate())),
                 Err(e) => {
                     tracing::warn!(error = %e, model = %model_ref, "compact: compact_model failed to resolve; using active agent's model");
                     let _ = tx

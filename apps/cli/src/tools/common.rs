@@ -245,6 +245,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             redact,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             seeds: crate::engine::seed_collector::SeedCollector::new(),

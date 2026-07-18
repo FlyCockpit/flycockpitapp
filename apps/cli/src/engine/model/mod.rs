@@ -65,6 +65,11 @@ pub(crate) mod wire_schema;
 #[allow(unused_imports)]
 pub use build::ModelParams;
 #[allow(unused_imports)]
+pub use build::{
+    UTILITY_BACKGROUND_TIMEOUT, UTILITY_MAX_TOKENS_CAP, UTILITY_TURN_BLOCKING_TIMEOUT,
+    UtilityBudgetClass, UtilityCallSite,
+};
+#[allow(unused_imports)]
 pub use dispatch::TandemOutcome;
 #[allow(unused_imports)]
 pub use failure::{
@@ -354,6 +359,9 @@ pub enum Model {
         /// backup fallback (implementation note) exactly,
         /// regardless of any plan-level model override.
         provider_id: String,
+        /// Known upper bound for utility `max_tokens`, resolved from model or
+        /// provider max-output/context capability metadata when available.
+        utility_token_limit: Option<u64>,
         /// The *resolved concrete* wire endpoint to try first
         /// (implementation note): `Completions` or
         /// `Responses`, never `Auto` (the build path resolves config →
@@ -430,6 +438,9 @@ pub enum Model {
         model_id: String,
         /// The configured provider id this model was built from.
         provider_id: String,
+        /// Known upper bound for utility `max_tokens`, resolved from model or
+        /// provider max-output/context capability metadata when available.
+        utility_token_limit: Option<u64>,
         /// Resolved base URL, kept for the retry TCP probe.
         base_url: String,
         /// Resolved inference-stream timeouts (TTFT + idle).
@@ -797,6 +808,41 @@ impl Model {
             Model::Anthropic { max_tokens, .. } => Some(*max_tokens),
             Model::OpenAi { .. } | Model::ChatGpt { .. } => None,
         }
+    }
+
+    pub fn utility_token_limit(&self) -> Option<u64> {
+        match self {
+            Model::OpenAi {
+                utility_token_limit,
+                ..
+            }
+            | Model::ChatGpt {
+                utility_token_limit,
+                ..
+            } => *utility_token_limit,
+            Model::Anthropic { max_tokens, .. } => Some(*max_tokens),
+        }
+    }
+
+    pub fn utility_params_for(
+        &self,
+        site: UtilityCallSite,
+        mut params: ModelParams,
+    ) -> ModelParams {
+        let cap = self
+            .utility_token_limit()
+            .map_or(UTILITY_MAX_TOKENS_CAP, |limit| {
+                UTILITY_MAX_TOKENS_CAP.min(limit)
+            });
+        params.max_tokens = Some(
+            params
+                .max_tokens
+                .map_or(cap, |requested| requested.min(cap)),
+        );
+        if site.pins_temperature_zero() {
+            params.temperature = Some(0.0);
+        }
+        params
     }
 
     /// Resolve the active config's reasoning selection for this model using
@@ -3604,6 +3650,21 @@ mod tests {
         (format!("http://{addr}/v1"), rx)
     }
 
+    async fn hanging_utility_server() -> (String, tokio::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let (header, _body) = read_http_request(&mut stream).await;
+                let request_line = header.lines().next().unwrap_or("").to_string();
+                let _ = tx.send(request_line).await;
+                std::future::pending::<()>().await;
+            }
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
     async fn header_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4342,6 +4403,34 @@ mod tests {
             trust_flag_off(),
             redact.clone(),
             redact,
+        )
+        .expect("model must build")
+    }
+
+    fn openai_model_at_with_wire_and_utility_limit(
+        base_url: &str,
+        wire_api: WireApi,
+        explicit_wire: bool,
+        utility_token_limit: Option<u64>,
+    ) -> Model {
+        build_openai_model_from_resolved_with_utility_limit(
+            "p",
+            &resolved_local_request(base_url.to_string()),
+            "m",
+            utility_token_limit,
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            wire_api,
+            explicit_wire,
+            false,
+            None,
+            0,
+            0,
+            false,
+            trust_flag_off(),
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
         )
         .expect("model must build")
     }
@@ -5229,6 +5318,224 @@ mod tests {
                 "{call} utility call used wrong endpoint: {request_line}"
             );
             assert!(!request_line.contains("/responses"), "{request_line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn utility_openai_arm_applies_max_tokens_cap() {
+        let (url, mut requests) = utility_json_capture_server(3).await;
+        let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
+        model
+            .text_completion_for(UtilityCallSite::AutoTitle, "hi")
+            .await
+            .unwrap();
+        model
+            .text_completion_with_system_for(UtilityCallSite::PreflightRewrite, "system", "hi")
+            .await
+            .unwrap();
+        model
+            .tool_completion_for(UtilityCallSite::SafetyGate, "system", "hi", &simple_tool())
+            .await
+            .unwrap();
+
+        for call in ["text", "text_with_system", "tool"] {
+            let (_request_line, body) = requests.recv().await.unwrap();
+            assert_eq!(
+                body["max_tokens"], UTILITY_MAX_TOKENS_CAP,
+                "{call} did not apply the utility max_tokens cap: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn utility_max_tokens_respects_model_limits() {
+        let (url, mut requests) = utility_json_capture_server(1).await;
+        let model = openai_model_at_with_wire_and_utility_limit(
+            &url,
+            WireApi::Completions,
+            true,
+            Some(128),
+        );
+        model
+            .text_completion_for(UtilityCallSite::AutoTitle, "hi")
+            .await
+            .unwrap();
+        let (_request_line, body) = requests.recv().await.unwrap();
+        assert_eq!(body["max_tokens"], 128, "{body}");
+    }
+
+    #[tokio::test]
+    async fn utility_params_applied_on_openai_arm() {
+        let (url, mut requests) = utility_json_capture_server(1).await;
+        let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
+        let params = ModelParams {
+            temperature: Some(0.77),
+            max_tokens: Some(99),
+            prompt_cache_key: Some("session-cache-key".to_string()),
+            additional_params: Some(json!({ "vendor_knob": "on" })),
+            ..ModelParams::default()
+        };
+        model
+            .text_completion_with_params(UtilityCallSite::Predict, params, "hi")
+            .await
+            .unwrap();
+        let (_request_line, body) = requests.recv().await.unwrap();
+        assert_eq!(body["temperature"], 0.77, "{body}");
+        assert_eq!(body["max_tokens"], 99, "{body}");
+        assert_eq!(body["prompt_cache_key"], "session-cache-key", "{body}");
+        assert_eq!(body["vendor_knob"], "on", "{body}");
+    }
+
+    #[tokio::test]
+    async fn utility_safety_calls_pin_temperature_zero() {
+        let (url, mut requests) = utility_json_capture_server(2).await;
+        let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
+        let hot = ModelParams {
+            temperature: Some(1.9),
+            ..ModelParams::default()
+        };
+        model
+            .tool_completion_with_params(
+                UtilityCallSite::SafetyGate,
+                hot.clone(),
+                "system",
+                "hi",
+                &simple_tool(),
+            )
+            .await
+            .unwrap();
+        model
+            .tool_completion_with_params(
+                UtilityCallSite::InjectionCheck,
+                hot,
+                "system",
+                "hi",
+                &simple_tool(),
+            )
+            .await
+            .unwrap();
+
+        for call in ["safety", "injection"] {
+            let (_request_line, body) = requests.recv().await.unwrap();
+            assert_eq!(body["temperature"], 0.0, "{call}: {body}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn utility_timeout_cancels_hung_request() {
+        let (url, mut accepted) = hanging_utility_server().await;
+        let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
+        let call = model.text_completion_for(UtilityCallSite::Predict, "hi");
+        tokio::pin!(call);
+
+        tokio::select! {
+            _ = &mut call => panic!("utility request completed before timeout"),
+            request_line = accepted.recv() => {
+                let request_line = request_line.expect("server should observe request");
+                assert!(request_line.contains("/chat/completions"), "{request_line}");
+            }
+        }
+        tokio::time::advance(UTILITY_BACKGROUND_TIMEOUT).await;
+        let err = call
+            .await
+            .expect_err("hung utility request should time out");
+        let failure = as_inference_failure(&err).expect("timeout should be typed");
+        assert_eq!(failure.class, "utility_timeout");
+        assert_eq!(failure.phase, "utility_dispatch");
+    }
+
+    #[test]
+    fn utility_turn_blocking_budget_tighter() {
+        assert!(UTILITY_TURN_BLOCKING_TIMEOUT < UTILITY_BACKGROUND_TIMEOUT);
+        for site in [
+            UtilityCallSite::SafetyGate,
+            UtilityCallSite::InjectionCheck,
+            UtilityCallSite::PreflightRewrite,
+            UtilityCallSite::CompactionBrief,
+            UtilityCallSite::DelegationShrink,
+        ] {
+            assert_eq!(site.budget_class(), UtilityBudgetClass::TurnBlocking);
+        }
+        for site in [
+            UtilityCallSite::AutoTitle,
+            UtilityCallSite::Predict,
+            UtilityCallSite::Translate,
+            UtilityCallSite::SkillAutoSelect,
+            UtilityCallSite::HarnessSummary,
+        ] {
+            assert_eq!(site.budget_class(), UtilityBudgetClass::Background);
+        }
+    }
+
+    #[tokio::test]
+    async fn utility_drain_abandons_background_calls() {
+        let (url, mut requests) = utility_json_capture_server(1).await;
+        let gate = crate::daemon::shutdown::ShutdownSignal::new();
+        let model = openai_model_at_with_wire(&url, WireApi::Completions, true)
+            .with_shutdown_gate(gate.clone());
+        assert!(gate.begin_drain());
+        let err = model
+            .text_completion_for(UtilityCallSite::AutoTitle, "must not send")
+            .await
+            .expect_err("background utility calls should gate during drain");
+        assert!(is_gated(&err), "{err:#}");
+        assert!(
+            requests.try_recv().is_err(),
+            "background drain gate should reject before provider dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn utility_drain_turn_gating_follows_turn() {
+        let (url, mut requests) = utility_json_capture_server(1).await;
+        let gate = crate::daemon::shutdown::ShutdownSignal::new();
+        let model = openai_model_at_with_wire(&url, WireApi::Completions, true)
+            .with_shutdown_gate(gate.clone());
+        assert!(gate.begin_drain());
+        model
+            .tool_completion_for(
+                UtilityCallSite::SafetyGate,
+                "system",
+                "turn-gating utility may finish inside turn drain grace",
+                &simple_tool(),
+            )
+            .await
+            .unwrap();
+        let (request_line, _body) = requests.recv().await.unwrap();
+        assert!(request_line.contains("/chat/completions"), "{request_line}");
+    }
+
+    #[test]
+    fn utility_params_seam_covers_all_arms() {
+        let openai = openai_model_at_with_wire_and_utility_limit(
+            "http://127.0.0.1:1/v1",
+            WireApi::Completions,
+            true,
+            Some(64),
+        );
+        let chatgpt = native_chatgpt_model(TestArc::new(RedactionTable::empty()));
+        let anthropic = native_anthropic_model_at(
+            TestArc::new(RedactionTable::empty()),
+            "http://127.0.0.1:1/v1".into(),
+            512,
+        );
+        for (name, model, expected_cap) in [
+            ("openai", openai, 64),
+            ("chatgpt", chatgpt, UTILITY_MAX_TOKENS_CAP),
+            ("anthropic", anthropic, 512),
+        ] {
+            let params = model.utility_params_for(
+                UtilityCallSite::InjectionCheck,
+                ModelParams {
+                    temperature: Some(1.5),
+                    max_tokens: Some(10_000),
+                    prompt_cache_key: Some("cache".into()),
+                    ..ModelParams::default()
+                },
+            );
+            assert_eq!(params.max_tokens, Some(expected_cap), "{name}");
+            assert_eq!(params.temperature, Some(0.0), "{name}");
+            assert_eq!(params.prompt_cache_key.as_deref(), Some("cache"), "{name}");
         }
     }
 

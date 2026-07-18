@@ -94,6 +94,7 @@ pub(crate) async fn result_recheck(
         &providers,
         ctx.redact.clone(),
         ctx.session.trusted_only_flag(),
+        None,
         &guard.check_prompt,
         output,
     )

@@ -45,10 +45,6 @@ pub const HARNESS_REPORT_TOKEN_CAP: usize = crate::engine::schedule::ASYNC_RESUL
 /// §10 hard cap) — a backstop if the summary model ignores the brief.
 pub const HARNESS_SUMMARY_HARD_CAP: usize = 10_000;
 
-/// Timeout for the utility-model summarization call. Best-effort: if the
-/// summary doesn't land in time we fall back to a deterministic tail.
-const SUMMARY_CALL_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Where the external harness's file writes go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -202,6 +198,7 @@ pub struct RunContext<'a> {
     /// disables summarization (over-cap output falls back to a tail).
     pub utility_model: Option<&'a str>,
     pub providers: &'a ProvidersConfig,
+    pub shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     pub env_overlay: Option<&'a std::collections::HashMap<String, String>>,
 }
 
@@ -313,6 +310,7 @@ pub async fn run_harness(ctx: RunContext<'_>) -> Result<HarnessRunResult, String
         ctx.providers,
         ctx.redact.clone(),
         ctx.trusted_only.clone(),
+        ctx.shutdown_gate.clone(),
     )
     .await;
 
@@ -339,13 +337,21 @@ async fn cap_or_summarize(
     providers: &ProvidersConfig,
     redact: Arc<RedactionTable>,
     trusted_only: Arc<AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> (String, bool) {
     if crate::tokens::count(text) <= HARNESS_REPORT_TOKEN_CAP {
         return (text.to_string(), false);
     }
     if let Some(model_ref) = utility_model
-        && let Some(summary) =
-            summarize_with_utility(text, model_ref, providers, redact, trusted_only).await
+        && let Some(summary) = summarize_with_utility(
+            text,
+            model_ref,
+            providers,
+            redact,
+            trusted_only,
+            shutdown_gate,
+        )
+        .await
     {
         return (summary, true);
     }
@@ -363,6 +369,7 @@ async fn summarize_with_utility(
     providers: &ProvidersConfig,
     redact: Arc<RedactionTable>,
     trusted_only: Arc<AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> Option<String> {
     let model = crate::engine::model::Model::from_ref_trusted_only(
         providers,
@@ -371,6 +378,10 @@ async fn summarize_with_utility(
         trusted_only,
     )
     .ok()?;
+    let model = match shutdown_gate {
+        Some(gate) => model.with_shutdown_gate(gate),
+        None => model,
+    };
     // Bound the input we hand the utility model so we don't blow its own
     // context: an excerpt within the hard cap is plenty for a summary.
     let bounded = excerpt(text, HARNESS_SUMMARY_HARD_CAP);
@@ -379,9 +390,12 @@ async fn summarize_with_utility(
          agent in at most ~1500 words: what was done, what changed, key results/errors, and any \
          follow-ups. Return only the summary.\n\n<output>\n{bounded}\n</output>\n"
     );
-    let resp = tokio::time::timeout(SUMMARY_CALL_TIMEOUT, model.text_completion(&prompt))
+    let resp = model
+        .text_completion_for(
+            crate::engine::model::UtilityCallSite::HarnessSummary,
+            &prompt,
+        )
         .await
-        .ok()?
         .ok()?;
     let resp = resp.trim();
     if resp.is_empty() {
@@ -528,6 +542,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(RedactionTable::empty()),
             trust_flag_off(),
+            None,
         )
         .await;
         assert_eq!(text, "tiny");
@@ -546,6 +561,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(RedactionTable::empty()),
             trust_flag_off(),
+            None,
         )
         .await;
         assert!(!summarized);
@@ -619,6 +635,7 @@ mod tests {
             trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
+            shutdown_gate: None,
             env_overlay: None,
         })
         .await
@@ -664,6 +681,7 @@ mod tests {
             trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
+            shutdown_gate: None,
             env_overlay: None,
         })
         .await
@@ -698,6 +716,7 @@ mod tests {
             trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
+            shutdown_gate: None,
             env_overlay: None,
         })
         .await
@@ -725,6 +744,7 @@ mod tests {
             trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
+            shutdown_gate: None,
             env_overlay: None,
         })
         .await

@@ -275,11 +275,13 @@ pub(super) fn build_model(
 
     let resolved =
         models_fetch::resolve_provider_request_blocking_with_env(provider_id, entry, lookup)?;
+    let utility_token_limit = resolve_utility_token_limit(entry, model_id);
     if is_codex_oauth {
-        build_chatgpt_model(
+        build_chatgpt_model_with_utility_limit(
             provider_id,
             &resolved,
             model_id,
+            utility_token_limit,
             timeout,
             hard_timeout_on_stall,
             trusted,
@@ -312,10 +314,11 @@ pub(super) fn build_model(
             redact,
         )
     } else {
-        build_openai_model_from_resolved(
+        build_openai_model_from_resolved_with_utility_limit(
             provider_id,
             &resolved,
             model_id,
+            utility_token_limit,
             timeout,
             hard_timeout_on_stall,
             client_side_tools,
@@ -331,6 +334,27 @@ pub(super) fn build_model(
             redact,
         )
     }
+}
+
+fn resolve_utility_token_limit(entry: &ProviderEntry, model_id: &str) -> Option<u64> {
+    let model = entry.models.iter().find(|model| model.id == model_id);
+    let caps = model.map(|model| &model.capabilities);
+    let overrides = model.map(|model| &model.capability_overrides);
+    let max_output = overrides
+        .and_then(|caps| caps.max_output_tokens)
+        .or_else(|| caps.and_then(|caps| caps.max_output_tokens))
+        .or(entry.capabilities.max_output_tokens);
+    let context = overrides
+        .and_then(|caps| caps.context_tokens)
+        .or_else(|| caps.and_then(|caps| caps.context_tokens))
+        .or(entry.capabilities.context_tokens)
+        .or_else(|| model.and_then(|model| model.context_length));
+    [max_output, context]
+        .into_iter()
+        .flatten()
+        .filter(|value| *value > 0)
+        .map(u64::from)
+        .min()
 }
 
 /// Build the native Anthropic [`Model::Anthropic`] from an already-resolved
@@ -432,10 +456,46 @@ pub(super) fn build_anthropic_model(
 /// rig never launches its own device flow or reads its auth file; Cockpit's
 /// `models_fetch` resolver owns credential refresh and account-id discovery.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_chatgpt_model(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
     model_id: &str,
+    timeout: &crate::config::providers::TimeoutConfig,
+    hard_timeout_on_stall: bool,
+    trusted: bool,
+    location: Option<ModelLocation>,
+    quality_rank: i64,
+    cost_rank: i64,
+    subagent_invokable: bool,
+    trusted_only: Arc<AtomicBool>,
+    session_redact: Arc<RedactionTable>,
+    redact: Arc<RedactionTable>,
+) -> Result<Model> {
+    build_chatgpt_model_with_utility_limit(
+        provider_id,
+        resolved,
+        model_id,
+        None,
+        timeout,
+        hard_timeout_on_stall,
+        trusted,
+        location,
+        quality_rank,
+        cost_rank,
+        subagent_invokable,
+        trusted_only,
+        session_redact,
+        redact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_chatgpt_model_with_utility_limit(
+    provider_id: &str,
+    resolved: &models_fetch::ResolvedRequest,
+    model_id: &str,
+    utility_token_limit: Option<u64>,
     timeout: &crate::config::providers::TimeoutConfig,
     hard_timeout_on_stall: bool,
     trusted: bool,
@@ -503,6 +563,7 @@ pub(super) fn build_chatgpt_model(
         model: chatgpt::ResponsesCompletionModel::new(client, model_id),
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        utility_token_limit,
         base_url: resolved.base_url.clone(),
         timeout: timeout.clone(),
         hard_timeout_on_stall,
@@ -531,10 +592,11 @@ pub(super) fn build_openai_model(
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
     let resolved = models_fetch::resolve_provider_request(provider_id, entry)?;
-    build_openai_model_from_resolved(
+    build_openai_model_from_resolved_with_utility_limit(
         provider_id,
         &resolved,
         model_id,
+        resolve_utility_token_limit(entry, model_id),
         &crate::config::providers::TimeoutConfig::default(),
         false,
         ClientSideToolsCapability::default(),
@@ -554,10 +616,52 @@ pub(super) fn build_openai_model(
 /// Build [`Model::OpenAi`] from an already-resolved request. The router
 /// ([`build_model`]) resolves once and dispatches here without re-resolving.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_openai_model_from_resolved(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
     model_id: &str,
+    timeout: &crate::config::providers::TimeoutConfig,
+    hard_timeout_on_stall: bool,
+    client_side_tools: ClientSideToolsCapability,
+    wire_api: crate::config::providers::WireApi,
+    wire_api_explicit: bool,
+    trusted: bool,
+    location: Option<ModelLocation>,
+    quality_rank: i64,
+    cost_rank: i64,
+    subagent_invokable: bool,
+    trusted_only: Arc<AtomicBool>,
+    session_redact: Arc<RedactionTable>,
+    redact: Arc<RedactionTable>,
+) -> Result<Model> {
+    build_openai_model_from_resolved_with_utility_limit(
+        provider_id,
+        resolved,
+        model_id,
+        None,
+        timeout,
+        hard_timeout_on_stall,
+        client_side_tools,
+        wire_api,
+        wire_api_explicit,
+        trusted,
+        location,
+        quality_rank,
+        cost_rank,
+        subagent_invokable,
+        trusted_only,
+        session_redact,
+        redact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_openai_model_from_resolved_with_utility_limit(
+    provider_id: &str,
+    resolved: &models_fetch::ResolvedRequest,
+    model_id: &str,
+    utility_token_limit: Option<u64>,
     timeout: &crate::config::providers::TimeoutConfig,
     hard_timeout_on_stall: bool,
     client_side_tools: ClientSideToolsCapability,
@@ -626,6 +730,7 @@ pub(super) fn build_openai_model_from_resolved(
         client,
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        utility_token_limit,
         wire_api: resolved_wire_api,
         // Set by production build sites via `Model::with_config_path`; absent
         // here so the endpoint fallback's persist is best-effort/skipped for
@@ -683,6 +788,68 @@ pub struct ModelParams {
     pub prompt_cache_key: Option<String>,
 }
 
+/// Utility/non-streaming model dispatch budget and override seam.
+///
+/// The enum deliberately names each production utility purpose instead of
+/// letting call sites pick raw durations or params. Compatibility wrappers use
+/// `AdHocBackground`; new production call sites should use a concrete variant.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilityCallSite {
+    AutoTitle,
+    Predict,
+    Translate,
+    SkillAutoSelect,
+    HarnessSummary,
+    SafetyGate,
+    InjectionCheck,
+    PreflightRewrite,
+    CompactionBrief,
+    DelegationShrink,
+    AdHocBackground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilityBudgetClass {
+    TurnBlocking,
+    Background,
+}
+
+/// Generous enough for the largest legitimate utility output (the compaction
+/// handoff brief) while bounding runaway utility completions.
+pub const UTILITY_MAX_TOKENS_CAP: u64 = 4_096;
+pub const UTILITY_TURN_BLOCKING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+pub const UTILITY_BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl UtilityCallSite {
+    pub fn budget_class(self) -> UtilityBudgetClass {
+        match self {
+            Self::SafetyGate
+            | Self::InjectionCheck
+            | Self::PreflightRewrite
+            | Self::CompactionBrief
+            | Self::DelegationShrink => UtilityBudgetClass::TurnBlocking,
+            Self::AutoTitle
+            | Self::Predict
+            | Self::Translate
+            | Self::SkillAutoSelect
+            | Self::HarnessSummary
+            | Self::AdHocBackground => UtilityBudgetClass::Background,
+        }
+    }
+
+    pub fn timeout(self) -> std::time::Duration {
+        match self.budget_class() {
+            UtilityBudgetClass::TurnBlocking => UTILITY_TURN_BLOCKING_TIMEOUT,
+            UtilityBudgetClass::Background => UTILITY_BACKGROUND_TIMEOUT,
+        }
+    }
+
+    pub fn pins_temperature_zero(self) -> bool {
+        matches!(self, Self::SafetyGate | Self::InjectionCheck)
+    }
+}
+
 /// Build a `rig::agent::Agent` (we only use its `.completion()` builder,
 /// not its `.prompt()` convenience layer). The construction is identical
 /// across providers; only the client type differs, so this lives here
@@ -703,7 +870,11 @@ pub(super) fn build_agent<C: CompletionClient>(
         .iter()
         .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    let mut b = client.agent(model_id).preamble(system).tools(boxed);
+    let mut b = client.agent(model_id);
+    if !system.is_empty() {
+        b = b.preamble(system);
+    }
+    let mut b = b.tools(boxed);
     if let Some(t) = params.temperature {
         b = b.temperature(t);
     }
@@ -773,9 +944,11 @@ pub(super) fn build_anthropic_agent(
         .iter()
         .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    let mut b = rig::agent::AgentBuilder::new(model)
-        .preamble(system)
-        .tools(boxed);
+    let mut b = rig::agent::AgentBuilder::new(model);
+    if !system.is_empty() {
+        b = b.preamble(system);
+    }
+    let mut b = b.tools(boxed);
     if let Some(t) = params.temperature {
         b = b.temperature(t);
     }
@@ -802,9 +975,11 @@ pub(super) fn build_chatgpt_agent(
         .iter()
         .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    let mut b = rig::agent::AgentBuilder::new(model)
-        .preamble(system)
-        .tools(boxed);
+    let mut b = rig::agent::AgentBuilder::new(model);
+    if !system.is_empty() {
+        b = b.preamble(system);
+    }
+    let mut b = b.tools(boxed);
     if let Some(t) = params.temperature {
         b = b.temperature(t);
     }

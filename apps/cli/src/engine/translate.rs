@@ -18,15 +18,8 @@
 //! model, inactive languages, or a timeout all return the input
 //! unchanged rather than blocking the turn.
 
-use std::time::Duration;
-
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
-
-/// Timeout for one translation call. Translation is best-effort; if the
-/// provider stalls we'd rather pass the text through untranslated than
-/// hang the turn.
-const TRANSLATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Translate the inbound `text` from the user's language into the model's
 /// language. Returns the input unchanged when translation is inactive
@@ -38,6 +31,7 @@ pub async fn inbound(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     translate_direction(
         text,
@@ -47,6 +41,7 @@ pub async fn inbound(
         providers,
         redact,
         trusted_only,
+        shutdown_gate,
     )
     .await
 }
@@ -60,6 +55,7 @@ pub async fn outbound(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     translate_direction(
         text,
@@ -69,6 +65,7 @@ pub async fn outbound(
         providers,
         redact,
         trusted_only,
+        shutdown_gate,
     )
     .await
 }
@@ -76,6 +73,7 @@ pub async fn outbound(
 /// Core: translate `text` from `source` into `target` using the utility
 /// model. Pass-through (returns `text` owned) on every disabled/degrade
 /// path so callers never have to special-case failure.
+#[allow(clippy::too_many_arguments)]
 async fn translate_direction(
     text: &str,
     source: &str,
@@ -84,6 +82,7 @@ async fn translate_direction(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     // Inactive feature (unset/equal languages) → no translation.
     if !extended.translation.is_active() {
@@ -101,6 +100,7 @@ async fn translate_direction(
         providers,
         redact,
         trusted_only,
+        shutdown_gate,
     )
     .await
     {
@@ -112,6 +112,7 @@ async fn translate_direction(
 /// Attempt the utility-model translation, returning `None` on every
 /// failure path (unset/unparseable/unbuildable model, send error, timeout,
 /// empty response) so the caller degrades to pass-through.
+#[allow(clippy::too_many_arguments)]
 async fn try_translate(
     text: &str,
     source: &str,
@@ -120,6 +121,7 @@ async fn try_translate(
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> Option<String> {
     let model_ref = extended.translation_model_ref()?;
     let model = match crate::engine::model::Model::from_ref_trusted_only(
@@ -134,20 +136,22 @@ async fn try_translate(
             return None;
         }
     };
+    let model = match shutdown_gate {
+        Some(gate) => model.with_shutdown_gate(gate),
+        None => model,
+    };
 
     let prompt = build_translation_prompt(source, target, text);
-    let response =
-        match tokio::time::timeout(TRANSLATE_TIMEOUT, model.text_completion(&prompt)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "translate: call failed; passing through");
-                return None;
-            }
-            Err(_) => {
-                tracing::debug!("translate: call timed out; passing through");
-                return None;
-            }
-        };
+    let response = match model
+        .text_completion_for(crate::engine::model::UtilityCallSite::Translate, &prompt)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "translate: call failed; passing through");
+            return None;
+        }
+    };
 
     if response.trim().is_empty() {
         return None;
@@ -258,6 +262,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         assert_eq!(out, "hello");
@@ -267,6 +272,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         assert_eq!(out, "hello");
@@ -284,6 +290,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         assert_eq!(out, "hola");
@@ -293,6 +300,7 @@ mod tests {
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
         )
         .await;
         assert_eq!(out, "hello");
@@ -337,6 +345,7 @@ mod tests {
                 &providers,
                 std::sync::Arc::new(crate::redact::RedactionTable::empty()),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
             )
             .await,
             "   "

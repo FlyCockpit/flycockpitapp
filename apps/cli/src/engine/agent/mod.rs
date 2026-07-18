@@ -162,6 +162,7 @@ async fn inject_initial_project_guidance(
             &providers,
             redact,
             Arc::new(std::sync::atomic::AtomicBool::new(extended.trusted_only)),
+            None,
             &guard.check_prompt,
             &body,
         )
@@ -222,6 +223,7 @@ async fn inject_live_project_guidance_change(
             &providers,
             redact,
             Arc::new(std::sync::atomic::AtomicBool::new(extended.trusted_only)),
+            None,
             &guard.check_prompt,
             message,
         )
@@ -530,12 +532,21 @@ async fn translate_final_response(
     cwd: &std::path::Path,
     redact: Arc<RedactionTable>,
     trusted_only: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     let Some((extended, providers)) = crate::engine::translate::load_if_active(cwd) else {
         return text.to_string();
     };
     let stripped = crate::engine::translate::strip_think_blocks(text);
-    crate::engine::translate::outbound(&stripped, &extended, &providers, redact, trusted_only).await
+    crate::engine::translate::outbound(
+        &stripped,
+        &extended,
+        &providers,
+        redact,
+        trusted_only,
+        shutdown_gate,
+    )
+    .await
 }
 
 /// The tools the command-safety gate (`auto` approval mode) covers. Native

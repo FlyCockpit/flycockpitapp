@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
@@ -15,6 +15,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, serve};
+use base64::Engine as _;
+use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use flycockpit_relay_protocol::{RelayControlMessage, RelayGrant, RelayPrincipal};
 use futures::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode, decode_header};
@@ -55,6 +58,7 @@ async fn main() -> Result<()> {
     );
     let state = Arc::new(RelayState::new(config.clone(), presence, verifier));
     state.start_control_subscription().await?;
+    state.start_fleet_registration().await;
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -165,6 +169,34 @@ struct Config {
     shutdown_grace_ms: u64,
     mode: RelayMode,
     listen_addr: SocketAddr,
+    fleet: Option<FleetConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct FleetConfig {
+    certificate: RelayCertificate,
+    signing_key: Arc<SigningKey>,
+    register_url: String,
+    heartbeat_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCertificate {
+    kid: String,
+    payload: RelayCertificatePayload,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCertificatePayload {
+    relay_id: String,
+    subdomain: String,
+    region: String,
+    relay_public_key: String,
+    not_before: String,
+    not_after: String,
 }
 
 impl Config {
@@ -193,13 +225,11 @@ impl Config {
                 "RELAY_CONTROL_SECRET is required when RELAY_MODE=shared-secret"
             ));
         }
-        if mode == RelayMode::Fleet {
-            required_env("RELAY_CERTIFICATE_PATH")?;
-            required_env("RELAY_PRIVATE_KEY_PATH")?;
-            return Err(anyhow!(
-                "RELAY_MODE=fleet registration is not available in this build"
-            ));
-        }
+        let fleet = if mode == RelayMode::Fleet {
+            Some(load_fleet_config(&relay_id, &token_issuer)?)
+        } else {
+            None
+        };
         let port = match parse_env("RELAY_PORT", None)? {
             Some(port) => port,
             None => parse_env("PORT", Some(3010))?.unwrap(),
@@ -221,7 +251,15 @@ impl Config {
                 .filter(|v| !v.is_empty()),
             control_secret,
             redis_url: env::var("REDIS_URL").ok().filter(|v| !v.is_empty()),
-            heartbeat_ms: parse_env("RELAY_HEARTBEAT_MS", Some(10_000))?.unwrap(),
+            heartbeat_ms: parse_env(
+                "RELAY_HEARTBEAT_MS",
+                Some(if mode == RelayMode::Fleet {
+                    15_000
+                } else {
+                    10_000
+                }),
+            )?
+            .unwrap(),
             lease_ttl_ms: parse_env("RELAY_LEASE_TTL_MS", Some(30_000))?.unwrap(),
             max_frame_bytes: parse_env("RELAY_MAX_FRAME_BYTES", Some(8 * 1024 * 1024))?.unwrap(),
             max_channels_per_client: parse_env("RELAY_MAX_CHANNELS_PER_CLIENT", Some(16))?.unwrap(),
@@ -235,8 +273,86 @@ impl Config {
             shutdown_grace_ms: parse_env("RELAY_SHUTDOWN_GRACE_MS", Some(10_000))?.unwrap(),
             mode,
             listen_addr: SocketAddr::new(ip, port),
+            fleet,
         })
     }
+}
+
+fn load_fleet_config(relay_id: &str, token_issuer: &str) -> Result<FleetConfig> {
+    let certificate_path = required_env("RELAY_CERTIFICATE_PATH")?;
+    let private_key_path = required_env("RELAY_PRIVATE_KEY_PATH")?;
+    let certificate: RelayCertificate =
+        serde_json::from_slice(&std::fs::read(&certificate_path).with_context(|| {
+            format!(
+                "reading RELAY_CERTIFICATE_PATH {}",
+                redacted_path(&certificate_path)
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "parsing RELAY_CERTIFICATE_PATH {} as JSON",
+                redacted_path(&certificate_path)
+            )
+        })?;
+    if certificate.payload.relay_id != relay_id {
+        return Err(anyhow!(
+            "relay certificate relayId `{}` does not match RELAY_ID `{relay_id}`",
+            certificate.payload.relay_id
+        ));
+    }
+    let private_key_pem = std::fs::read_to_string(&private_key_path).with_context(|| {
+        format!(
+            "reading RELAY_PRIVATE_KEY_PATH {}",
+            redacted_path(&private_key_path)
+        )
+    })?;
+    let signing_key = SigningKey::from_pkcs8_pem(&private_key_pem)
+        .context("RELAY_PRIVATE_KEY_PATH is not a valid Ed25519 PKCS#8 PEM private key")?;
+    let certificate_key = VerifyingKey::from_public_key_pem(&certificate.payload.relay_public_key)
+        .context("relay certificate payload.relayPublicKey is not a valid Ed25519 SPKI PEM")?;
+    if signing_key.verifying_key() != certificate_key {
+        return Err(anyhow!(
+            "RELAY_PRIVATE_KEY_PATH does not match relay certificate payload.relayPublicKey"
+        ));
+    }
+    let origin = issuer_origin(token_issuer)?;
+    Ok(FleetConfig {
+        certificate,
+        signing_key: Arc::new(signing_key),
+        register_url: format!("{origin}/api/relay/register"),
+        heartbeat_url: format!("{origin}/api/relay/heartbeat"),
+    })
+}
+
+fn issuer_origin(issuer: &str) -> Result<String> {
+    let trimmed = issuer.trim();
+    let (scheme, rest) = trimmed
+        .strip_prefix("https://")
+        .map(|rest| ("https://", rest))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("http://")
+                .map(|rest| ("http://", rest))
+        })
+        .ok_or_else(|| {
+            anyhow!("RELAY_TOKEN_ISSUER must be an absolute http(s) URL in fleet mode")
+        })?;
+    let host = rest
+        .split('/')
+        .next()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            anyhow!("RELAY_TOKEN_ISSUER must be an absolute http(s) URL in fleet mode")
+        })?;
+    Ok(format!("{scheme}{host}"))
+}
+
+fn redacted_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("…/{name}"))
+        .unwrap_or_else(|| "…".to_string())
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -261,11 +377,236 @@ where
 }
 
 #[derive(Clone)]
+struct FleetClient {
+    config: FleetConfig,
+    http: reqwest::Client,
+    session: Arc<Mutex<Option<FleetSession>>>,
+}
+
+#[derive(Clone, Debug)]
+struct FleetSession {
+    session_token: String,
+    expires_at_ms: u64,
+    renew_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterResponse {
+    session_token: String,
+    expires_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetHeartbeatBody {
+    relay_id: String,
+    accepting: bool,
+    connections: usize,
+    lease_deltas: FleetDeltas,
+    user_deltas: FleetDeltas,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    users: Option<Vec<String>>,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct FleetDeltas {
+    added: Vec<String>,
+    removed: Vec<String>,
+}
+
+impl FleetClient {
+    fn new(config: FleetConfig) -> Self {
+        Self {
+            config,
+            http: reqwest::Client::new(),
+            session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn ensure_session(&self) -> Result<String> {
+        let renew = {
+            let session = self.session.lock().await;
+            session
+                .as_ref()
+                .is_none_or(|session| now_ms() >= session.renew_at_ms)
+        };
+        if renew {
+            self.register_with_retry().await?;
+        }
+        self.session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.session_token.clone())
+            .ok_or_else(|| anyhow!("fleet relay is not registered"))
+    }
+
+    async fn registered(&self) -> bool {
+        self.session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|session| session.expires_at_ms > now_ms())
+    }
+
+    async fn register_with_retry(&self) -> Result<()> {
+        match self.register_once().await {
+            Ok(()) => Ok(()),
+            Err(err) if registration_rejected(&err) => {
+                log_warn(format_args!(
+                    "fleet registration rejected; retrying once — check system clock / cert validity / revocation"
+                ));
+                self.register_once().await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn register_once(&self) -> Result<()> {
+        let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let timestamp = iso_now();
+        let challenge = serde_json::json!({
+            "relayId": &self.config.certificate.payload.relay_id,
+            "nonce": nonce,
+            "timestamp": timestamp,
+        });
+        let challenge_signature = sign_base64url(&self.config.signing_key, &challenge)?;
+        let body = serde_json::json!({
+            "certificate": &self.config.certificate,
+            "challengeSignature": challenge_signature,
+            "nonce": nonce,
+            "timestamp": timestamp,
+        });
+        let response = self
+            .http
+            .post(&self.config.register_url)
+            .json(&body)
+            .send()
+            .await
+            .context("posting fleet relay registration")?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(anyhow!("fleet registration rejected with 401"));
+        }
+        let response = response.error_for_status()?;
+        let parsed = response.json::<RegisterResponse>().await?;
+        let expires_at_ms = parse_iso_millis(&parsed.expires_at)
+            .ok_or_else(|| anyhow!("fleet registration returned invalid expiresAt"))?;
+        let renew_at_ms = fleet_session_renew_at_ms(expires_at_ms);
+        *self.session.lock().await = Some(FleetSession {
+            session_token: parsed.session_token,
+            expires_at_ms,
+            renew_at_ms,
+        });
+        log_info(format_args!("fleet relay registered"));
+        Ok(())
+    }
+
+    async fn post_heartbeat(&self, body: &FleetHeartbeatBody) -> Result<()> {
+        self.post_json_with_session(&self.config.heartbeat_url, body)
+            .await
+    }
+
+    async fn post_json_with_session<T>(&self, url: &str, body: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let token = self.ensure_session().await?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&token)
+            .json(body)
+            .send()
+            .await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            response.error_for_status()?;
+            return Ok(());
+        }
+        self.register_with_retry().await?;
+        let token = self.ensure_session().await?;
+        self.http
+            .post(url)
+            .bearer_auth(&token)
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+fn registration_rejected(err: &anyhow::Error) -> bool {
+    err.to_string().contains("401")
+}
+
+fn sign_base64url(signing_key: &SigningKey, value: &serde_json::Value) -> Result<String> {
+    let canonical = canonical_json(value)?;
+    let signature: Signature = signing_key.sign(canonical.as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+}
+
+fn fleet_session_renew_at_ms(expires_at_ms: u64) -> u64 {
+    let nonce = Uuid::new_v4();
+    let jitter_ms = u64::from(u16::from_le_bytes([
+        nonce.as_bytes()[0],
+        nonce.as_bytes()[1],
+    ])) % 30_000;
+    expires_at_ms.saturating_sub(60_000 + jitter_ms)
+}
+
+fn canonical_json(value: &serde_json::Value) -> Result<String> {
+    serde_json::to_string(&canonical_value(value)).context("serializing canonical JSON")
+}
+
+fn canonical_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            for (key, value) in map
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_value(value)))
+                .collect::<BTreeMap<_, _>>()
+            {
+                sorted.insert(key, value);
+            }
+            serde_json::Value::Object(sorted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn iso_now() -> String {
+    iso_from_millis(now_ms())
+}
+
+#[derive(Clone)]
 struct RelayState {
     config: Arc<Config>,
     presence: PresenceStore,
     verifier: JwtVerifier,
+    fleet: Option<Arc<FleetClient>>,
+    fleet_tracker: Arc<Mutex<FleetHeartbeatTracker>>,
     inner: Arc<Mutex<RelayInner>>,
+}
+
+#[derive(Default)]
+struct FleetHeartbeatTracker {
+    acknowledged_leases: HashSet<String>,
+    acknowledged_users: HashSet<String>,
+    last_full_reconcile: Option<Instant>,
+}
+
+struct FleetSnapshot {
+    leases: HashSet<String>,
+    users: HashSet<String>,
+    connections: usize,
+    shutting_down: bool,
 }
 
 struct RelayInner {
@@ -281,10 +622,13 @@ struct RelayInner {
 
 impl RelayState {
     fn new(config: Arc<Config>, presence: PresenceStore, verifier: JwtVerifier) -> Self {
+        let fleet = config.fleet.clone().map(FleetClient::new).map(Arc::new);
         Self {
             config,
             presence,
             verifier,
+            fleet,
+            fleet_tracker: Arc::new(Mutex::new(FleetHeartbeatTracker::default())),
             inner: Arc::new(Mutex::new(RelayInner {
                 daemons: HashMap::new(),
                 clients: HashMap::new(),
@@ -295,6 +639,114 @@ impl RelayState {
                 shutting_down: false,
                 tasks: Vec::new(),
             })),
+        }
+    }
+
+    async fn start_fleet_registration(&self) {
+        let Some(fleet) = self.fleet.clone() else {
+            return;
+        };
+        let state = self.clone();
+        let heartbeat_ms = self.config.heartbeat_ms;
+        let task = tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            let mut registered = false;
+            loop {
+                if state.inner.lock().await.shutting_down {
+                    break;
+                }
+                match fleet.register_with_retry().await {
+                    Ok(()) => {
+                        registered = true;
+                        break;
+                    }
+                    Err(err) => {
+                        log_warn(format_args!(
+                            "fleet registration failed; retrying in {:?}: {err}",
+                            backoff
+                        ));
+                        sleep(backoff + jitter_delay()).await;
+                        backoff = (backoff + backoff).min(Duration::from_secs(30));
+                    }
+                }
+            }
+            if !registered {
+                return;
+            }
+
+            let mut tick = interval(Duration::from_millis(heartbeat_ms));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if state.inner.lock().await.shutting_down {
+                    let _ = state.send_fleet_heartbeat().await;
+                    break;
+                }
+                if let Err(err) = state.send_fleet_heartbeat().await {
+                    log_warn(format_args!("fleet heartbeat failed: {err}"));
+                }
+            }
+        });
+        self.inner.lock().await.tasks.push(task);
+    }
+
+    async fn fleet_registered(&self) -> bool {
+        match &self.fleet {
+            Some(fleet) => fleet.registered().await,
+            None => true,
+        }
+    }
+
+    async fn send_fleet_heartbeat(&self) -> Result<()> {
+        let Some(fleet) = &self.fleet else {
+            return Ok(());
+        };
+        let snapshot = self.fleet_snapshot().await;
+        let mut tracker = self.fleet_tracker.lock().await;
+        let full = tracker
+            .last_full_reconcile
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(120));
+        let body = FleetHeartbeatBody {
+            relay_id: self.config.relay_id.clone(),
+            accepting: self.accepting_fleet_traffic(&snapshot).await,
+            connections: snapshot.connections,
+            lease_deltas: if full {
+                FleetDeltas::default()
+            } else {
+                deltas(&tracker.acknowledged_leases, &snapshot.leases)
+            },
+            user_deltas: if full {
+                FleetDeltas::default()
+            } else {
+                deltas(&tracker.acknowledged_users, &snapshot.users)
+            },
+            leases: full.then(|| sorted_vec(&snapshot.leases)),
+            users: full.then(|| sorted_vec(&snapshot.users)),
+        };
+        fleet.post_heartbeat(&body).await?;
+        tracker.acknowledged_leases = snapshot.leases;
+        tracker.acknowledged_users = snapshot.users;
+        if full {
+            tracker.last_full_reconcile = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    async fn accepting_fleet_traffic(&self, snapshot: &FleetSnapshot) -> bool {
+        !snapshot.shutting_down && self.fleet_registered().await
+    }
+
+    async fn fleet_snapshot(&self) -> FleetSnapshot {
+        let inner = self.inner.lock().await;
+        FleetSnapshot {
+            leases: inner.daemons.keys().cloned().collect(),
+            users: inner
+                .users
+                .values()
+                .map(|user| user.user_id.clone())
+                .collect(),
+            connections: inner.daemons.len() + inner.clients.len() + inner.users.len(),
+            shutting_down: inner.shutting_down,
         }
     }
 
@@ -571,9 +1023,13 @@ impl RelayState {
     }
 
     async fn run_client(&self, mut connection: SocketConnection, mut client: ClientConnection) {
+        let mut force_abort_writer = false;
         loop {
             let result = tokio::select! {
-                _ = client.tx.notify.notified() => break,
+                _ = client.tx.notify.notified() => {
+                    force_abort_writer = true;
+                    break;
+                },
                 result = connection.receiver.next() => result,
             };
             let Some(result) = result else {
@@ -605,7 +1061,9 @@ impl RelayState {
                 break;
             }
         }
-        let _ = timeout(Duration::from_millis(250), &mut connection.writer).await;
+        if !force_abort_writer {
+            let _ = timeout(Duration::from_millis(250), &mut connection.writer).await;
+        }
         connection.writer.abort();
         self.unregister_client(&client).await;
     }
@@ -811,21 +1269,13 @@ impl RelayState {
         let Some(url) = &self.config.control_ingest_url else {
             return;
         };
-        let Some(secret) = &self.config.control_secret else {
-            return;
-        };
         let body = serde_json::json!({
             "relayId": self.config.relay_id,
             "event": "user_presence",
             "userId": user.user_id,
             "payload": { "clientId": frame.client_id, "visible": frame.visible, "ts": frame.ts },
         });
-        let result = reqwest::Client::new()
-            .post(url)
-            .bearer_auth(secret)
-            .json(&body)
-            .send()
-            .await;
+        let result = self.post_control_ingest(url, &body).await;
         if let Err(err) = result {
             log_warn(format_args!(
                 "user presence ingest failed user={}: {}",
@@ -847,27 +1297,36 @@ impl RelayState {
             ));
             return;
         };
-        let Some(secret) = &self.config.control_secret else {
-            return;
-        };
         let body = serde_json::json!({
             "instanceId": daemon.instance_id,
             "relayId": self.config.relay_id,
             "event": event,
             "payload": payload,
         });
-        let result = reqwest::Client::new()
-            .post(url)
-            .bearer_auth(secret)
-            .json(&body)
-            .send()
-            .await;
+        let result = self.post_control_ingest(url, &body).await;
         if let Err(err) = result {
             log_warn(format_args!(
                 "control ingest failed instance={}: {}",
                 daemon.instance_id, err
             ));
         }
+    }
+
+    async fn post_control_ingest(&self, url: &str, body: &serde_json::Value) -> Result<()> {
+        if let Some(fleet) = &self.fleet {
+            return fleet.post_json_with_session(url, body).await;
+        }
+        let Some(secret) = &self.config.control_secret else {
+            return Ok(());
+        };
+        reqwest::Client::new()
+            .post(url)
+            .bearer_auth(secret)
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }
 
@@ -1274,6 +1733,9 @@ async fn websocket_response(
     query_token: Option<String>,
     kind: ConnectionKind,
 ) -> Response {
+    if !state.fleet_registered().await {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let token = bearer_token(&headers).or(query_token).unwrap_or_default();
     let claims = match state.verifier.verify(&token).await {
         Ok(claims) => claims,
@@ -1547,6 +2009,9 @@ enum PresenceStore {
 impl PresenceStore {
     async fn new(redis_url: Option<String>, mode: RelayMode) -> Result<Self> {
         let Some(redis_url) = redis_url else {
+            if mode == RelayMode::Fleet {
+                return Err(anyhow!("REDIS_URL is required when RELAY_MODE=fleet"));
+            }
             return Ok(Self::Memory(MemoryPresenceStore::default()));
         };
         match RedisPresenceStore::new(redis_url).await {
@@ -1806,6 +2271,437 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn iso_from_millis(ms: u64) -> String {
+    let seconds = (ms / 1000) as i64;
+    let millis = ms % 1000;
+    let (year, month, day, hour, minute, second) = unix_seconds_to_utc(seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn parse_iso_millis(value: &str) -> Option<u64> {
+    if value.len() < 20 || !value.ends_with('Z') {
+        return None;
+    }
+    let year = value.get(0..4)?.parse::<i32>().ok()?;
+    let month = value.get(5..7)?.parse::<u32>().ok()?;
+    let day = value.get(8..10)?.parse::<u32>().ok()?;
+    let hour = value.get(11..13)?.parse::<u32>().ok()?;
+    let minute = value.get(14..16)?.parse::<u32>().ok()?;
+    let second = value.get(17..19)?.parse::<u32>().ok()?;
+    let millis = if value.as_bytes().get(19) == Some(&b'.') {
+        let frac = value.get(20..value.len() - 1)?;
+        let mut ms = frac.chars().take(3).collect::<String>();
+        while ms.len() < 3 {
+            ms.push('0');
+        }
+        ms.parse::<u64>().ok()?
+    } else {
+        0
+    };
+    Some(
+        utc_to_unix_seconds(year, month, day, hour, minute, second)?
+            .saturating_mul(1000)
+            .saturating_add(millis),
+    )
+}
+
+fn unix_seconds_to_utc(seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = seconds.div_euclid(86_400);
+    let secs = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    (
+        year,
+        month,
+        day,
+        (secs / 3600) as u32,
+        ((secs % 3600) / 60) as u32,
+        (secs % 60) as u32,
+    )
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
+}
+
+fn utc_to_unix_seconds(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let y = i64::from(year) - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))?;
+    u64::try_from(seconds).ok()
+}
+
+fn deltas(previous: &HashSet<String>, current: &HashSet<String>) -> FleetDeltas {
+    let added = current
+        .difference(previous)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let removed = previous
+        .difference(current)
+        .cloned()
+        .collect::<HashSet<_>>();
+    FleetDeltas {
+        added: sorted_vec(&added),
+        removed: sorted_vec(&removed),
+    }
+}
+
+fn sorted_vec(values: &HashSet<String>) -> Vec<String> {
+    let mut values = values.iter().cloned().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn jitter_delay() -> Duration {
+    Duration::from_millis(u64::from(Uuid::new_v4().as_bytes()[0] % 250))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State as AxumState;
+    use ed25519_dalek::Verifier;
+    use ed25519_dalek::pkcs8::EncodePublicKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn canonical_json_matches_typescript_challenge_fixture() {
+        let value = serde_json::json!({
+            "timestamp": "2026-07-10T12:00:00.000Z",
+            "relayId": "relay-a",
+            "nonce": "nonce-nonce-nonce-1",
+        });
+
+        assert_eq!(
+            canonical_json(&value).unwrap(),
+            r#"{"nonce":"nonce-nonce-nonce-1","relayId":"relay-a","timestamp":"2026-07-10T12:00:00.000Z"}"#
+        );
+    }
+
+    #[test]
+    fn canonical_json_matches_typescript_certificate_payload_fixture() {
+        let value = serde_json::json!({
+            "subdomain": "relay-a.example.test",
+            "relayPublicKey": "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n",
+            "region": "iad",
+            "relayId": "relay-a",
+            "notBefore": "2026-07-10T12:00:00.000Z",
+            "notAfter": "2026-08-10T12:00:00.000Z",
+        });
+
+        assert_eq!(
+            canonical_json(&value).unwrap(),
+            r#"{"notAfter":"2026-08-10T12:00:00.000Z","notBefore":"2026-07-10T12:00:00.000Z","region":"iad","relayId":"relay-a","relayPublicKey":"-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n","subdomain":"relay-a.example.test"}"#
+        );
+    }
+
+    #[test]
+    fn issuer_origin_strips_path_and_trailing_slashes() {
+        assert_eq!(
+            issuer_origin("https://api.example.test/auth/v1///").unwrap(),
+            "https://api.example.test"
+        );
+        assert_eq!(
+            issuer_origin("http://127.0.0.1:3000").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        assert!(issuer_origin("api.example.test").is_err());
+    }
+
+    #[test]
+    fn fleet_deltas_are_sorted() {
+        let previous = HashSet::from(["lease-c".to_string(), "lease-a".to_string()]);
+        let current = HashSet::from([
+            "lease-d".to_string(),
+            "lease-b".to_string(),
+            "lease-a".to_string(),
+        ]);
+
+        let deltas = deltas(&previous, &current);
+        assert_eq!(deltas.added, vec!["lease-b", "lease-d"]);
+        assert_eq!(deltas.removed, vec!["lease-c"]);
+    }
+
+    #[test]
+    fn fleet_session_renewal_is_jittered_before_expiry() {
+        let expires_at_ms = 2_000_000;
+        for _ in 0..64 {
+            let renew_at_ms = fleet_session_renew_at_ms(expires_at_ms);
+            assert!(renew_at_ms <= expires_at_ms - 60_000);
+            assert!(renew_at_ms >= expires_at_ms - 89_999);
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_client_registers_and_heartbeats_with_session_token() {
+        let signing_key = test_signing_key();
+        let certificate = test_certificate(&signing_key);
+        let (base_url, state) = spawn_mock_fleet_server(signing_key.verifying_key(), false).await;
+        let client = FleetClient::new(FleetConfig {
+            certificate,
+            signing_key: Arc::new(signing_key),
+            register_url: format!("{base_url}/api/relay/register"),
+            heartbeat_url: format!("{base_url}/api/relay/heartbeat"),
+        });
+
+        client.register_with_retry().await.unwrap();
+        client
+            .post_heartbeat(&FleetHeartbeatBody {
+                relay_id: "relay-a".to_string(),
+                accepting: true,
+                connections: 2,
+                lease_deltas: FleetDeltas {
+                    added: vec!["daemon-1".to_string()],
+                    removed: vec![],
+                },
+                user_deltas: FleetDeltas::default(),
+                leases: None,
+                users: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.register_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *state.heartbeat_tokens.lock().await,
+            vec!["Bearer session-1".to_string()]
+        );
+        let bodies = state.heartbeat_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("region").is_none());
+        assert_eq!(
+            bodies[0]["leaseDeltas"]["added"],
+            serde_json::json!(["daemon-1"])
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_client_reregisters_and_replays_once_after_heartbeat_401() {
+        let signing_key = test_signing_key();
+        let certificate = test_certificate(&signing_key);
+        let (base_url, state) = spawn_mock_fleet_server(signing_key.verifying_key(), true).await;
+        let client = FleetClient::new(FleetConfig {
+            certificate,
+            signing_key: Arc::new(signing_key),
+            register_url: format!("{base_url}/api/relay/register"),
+            heartbeat_url: format!("{base_url}/api/relay/heartbeat"),
+        });
+        let body = FleetHeartbeatBody {
+            relay_id: "relay-a".to_string(),
+            accepting: true,
+            connections: 0,
+            lease_deltas: FleetDeltas {
+                added: vec!["daemon-1".to_string()],
+                removed: vec![],
+            },
+            user_deltas: FleetDeltas::default(),
+            leases: None,
+            users: None,
+        };
+
+        client.register_with_retry().await.unwrap();
+        client.post_heartbeat(&body).await.unwrap();
+
+        assert_eq!(state.register_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *state.heartbeat_tokens.lock().await,
+            vec![
+                "Bearer session-1".to_string(),
+                "Bearer session-2".to_string()
+            ]
+        );
+        let bodies = state.heartbeat_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["leaseDeltas"]["added"],
+            serde_json::json!(["daemon-1"])
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_client_renews_expiring_session_before_send() {
+        let signing_key = test_signing_key();
+        let certificate = test_certificate(&signing_key);
+        let (base_url, state) = spawn_mock_fleet_server(signing_key.verifying_key(), false).await;
+        let client = FleetClient::new(FleetConfig {
+            certificate,
+            signing_key: Arc::new(signing_key),
+            register_url: format!("{base_url}/api/relay/register"),
+            heartbeat_url: format!("{base_url}/api/relay/heartbeat"),
+        });
+        *client.session.lock().await = Some(FleetSession {
+            session_token: "stale-session".to_string(),
+            expires_at_ms: now_ms() + 1_000,
+            renew_at_ms: now_ms(),
+        });
+
+        client
+            .post_heartbeat(&FleetHeartbeatBody {
+                relay_id: "relay-a".to_string(),
+                accepting: true,
+                connections: 0,
+                lease_deltas: FleetDeltas::default(),
+                user_deltas: FleetDeltas::default(),
+                leases: Some(vec![]),
+                users: Some(vec![]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.register_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *state.heartbeat_tokens.lock().await,
+            vec!["Bearer session-1".to_string()]
+        );
+    }
+
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn test_certificate(signing_key: &SigningKey) -> RelayCertificate {
+        let relay_public_key = signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        RelayCertificate {
+            kid: "kid-1".to_string(),
+            payload: RelayCertificatePayload {
+                relay_id: "relay-a".to_string(),
+                subdomain: "relay-a.example.test".to_string(),
+                region: "iad".to_string(),
+                relay_public_key,
+                not_before: "2026-07-10T12:00:00.000Z".to_string(),
+                not_after: "2035-01-01T00:00:00.000Z".to_string(),
+            },
+            signature: "ca-signature".to_string(),
+        }
+    }
+
+    struct MockFleetServerState {
+        verifying_key: VerifyingKey,
+        register_count: AtomicUsize,
+        heartbeat_count: AtomicUsize,
+        reject_next_heartbeat: AtomicBool,
+        heartbeat_tokens: Mutex<Vec<String>>,
+        heartbeat_bodies: Mutex<Vec<serde_json::Value>>,
+    }
+
+    async fn spawn_mock_fleet_server(
+        verifying_key: VerifyingKey,
+        reject_next_heartbeat: bool,
+    ) -> (String, Arc<MockFleetServerState>) {
+        let state = Arc::new(MockFleetServerState {
+            verifying_key,
+            register_count: AtomicUsize::new(0),
+            heartbeat_count: AtomicUsize::new(0),
+            reject_next_heartbeat: AtomicBool::new(reject_next_heartbeat),
+            heartbeat_tokens: Mutex::new(Vec::new()),
+            heartbeat_bodies: Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route("/api/relay/register", post(mock_register))
+            .route("/api/relay/heartbeat", post(mock_heartbeat))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RegisterRequest {
+        certificate: RelayCertificate,
+        challenge_signature: String,
+        nonce: String,
+        timestamp: String,
+    }
+
+    async fn mock_register(
+        AxumState(state): AxumState<Arc<MockFleetServerState>>,
+        Json(body): Json<RegisterRequest>,
+    ) -> Response {
+        assert_eq!(body.certificate.payload.relay_id, "relay-a");
+        assert_eq!(body.nonce.len(), 64);
+        let challenge = serde_json::json!({
+            "relayId": body.certificate.payload.relay_id,
+            "nonce": body.nonce,
+            "timestamp": body.timestamp,
+        });
+        let canonical = canonical_json(&challenge).unwrap();
+        let signature_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body.challenge_signature.as_bytes())
+            .unwrap();
+        let signature = Signature::from_slice(&signature_bytes).unwrap();
+        state
+            .verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .unwrap();
+
+        let register_count = state.register_count.fetch_add(1, Ordering::SeqCst) + 1;
+        Json(serde_json::json!({
+            "sessionToken": format!("session-{register_count}"),
+            "expiresAt": "2035-01-01T00:00:00.000Z",
+        }))
+        .into_response()
+    }
+
+    async fn mock_heartbeat(
+        AxumState(state): AxumState<Arc<MockFleetServerState>>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        state.heartbeat_count.fetch_add(1, Ordering::SeqCst);
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        state.heartbeat_tokens.lock().await.push(authorization);
+        if state.reject_next_heartbeat.swap(false, Ordering::SeqCst) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        assert!(body.get("region").is_none());
+        assert_eq!(body["relayId"], "relay-a");
+        state.heartbeat_bodies.lock().await.push(body);
+        Json(serde_json::json!({ "ok": true })).into_response()
+    }
 }
 
 fn log_info(args: std::fmt::Arguments<'_>) {

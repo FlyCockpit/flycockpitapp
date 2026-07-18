@@ -17,7 +17,7 @@ use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::intel::budget::BudgetedWriter;
 use crate::tools::sandbox;
 
@@ -43,6 +43,10 @@ impl Tool for GlobTool {
 
     fn description(&self) -> &str {
         "List files matching a glob pattern within the package root, gitignore-aware"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn defensive_description(&self) -> Option<String> {

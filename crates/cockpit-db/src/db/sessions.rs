@@ -59,11 +59,17 @@ pub struct SessionRow {
     /// the browser by default.
     pub archived_at: Option<i64>,
     /// `true` for a throwaway `/side` side-conversation fork (migration
-    /// 0017). Ephemeral sessions are excluded from every list query, never
-    /// auto-titled, never surfaced as resumable, and are discarded when the
-    /// side conversation ends, the owning process exits, or the daemon
-    /// sweeps orphans on boot.
+    /// 0017) and for persistent `/btw` forks. Ephemeral sessions are
+    /// excluded from every list query and never auto-titled. Legacy `/side`
+    /// rows are swept on boot; `/btw` rows carry [`Self::btw_parent_session_id`]
+    /// and are not swept.
     pub ephemeral: bool,
+    /// Parent session for a persistent `/btw` fork. `None` for ordinary
+    /// sessions, normal forks, and legacy ephemeral `/side` forks.
+    pub btw_parent_session_id: Option<Uuid>,
+    /// `true` when a `/btw` fork was created in tangent mode, meaning it
+    /// starts with an empty transcript instead of a parent-seeded transcript.
+    pub btw_tangent: bool,
     /// Running cl100k_base estimate of RAW typed user content
     /// (pre-skill-injection) this session. Migration 0037.
     pub user_content_tokens: i64,
@@ -81,12 +87,33 @@ pub struct SessionRow {
     pub shared_with_collaborators: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtwForkInfo {
+    pub session_id: Uuid,
+    pub parent_session_id: Uuid,
+    pub short_id: Option<String>,
+    pub tangent: bool,
+    pub created_at: i64,
+    pub message_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtwForkCreateResult {
+    pub info: BtwForkInfo,
+    pub created: bool,
+}
+
 impl SessionRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id: String = row.get("session_id")?;
         let session_id = parse_uuid(&id)?;
         let parent_str: Option<String> = row.get("parent_session_id")?;
         let parent_session_id = match parent_str {
+            Some(s) => Some(parse_uuid(&s)?),
+            None => None,
+        };
+        let btw_parent_str: Option<String> = row.get("btw_parent_session_id").unwrap_or(None);
+        let btw_parent_session_id = match btw_parent_str {
             Some(s) => Some(parse_uuid(&s)?),
             None => None,
         };
@@ -110,6 +137,8 @@ impl SessionRow {
             last_viewed_at: row.get("last_viewed_at")?,
             archived_at: row.get("archived_at")?,
             ephemeral: row.get::<_, i64>("ephemeral")? != 0,
+            btw_parent_session_id,
+            btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
             user_content_tokens: row.get("user_content_tokens")?,
             title_stage: row.get("title_stage")?,
             guidance_baseline_path: row.get("guidance_baseline_path")?,
@@ -446,8 +475,8 @@ fn execute_fork_insert(
           parent_session_id, fork_point_turn_id,
           provider, model, ephemeral, user_content_tokens, title_stage,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
-          shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+          shared_with_collaborators, btw_parent_session_id, btw_tangent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -468,6 +497,8 @@ fn execute_fork_insert(
             row.redaction_table_json,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
+            row.btw_parent_session_id.map(|id| id.to_string()),
+            row.btw_tangent as i64,
         ],
     )?;
     execute_fork_post_insert_update(conn, row)?;
@@ -552,6 +583,8 @@ fn build_session_row(
         last_viewed_at: None,
         archived_at: None,
         ephemeral: false,
+        btw_parent_session_id: None,
+        btw_tangent: false,
         user_content_tokens: 0,
         title_stage: 0,
         guidance_baseline_path: None,
@@ -725,6 +758,47 @@ fn copy_fork_tool_calls(
     Ok(())
 }
 
+fn live_btw_fork_info_conn(
+    conn: &Connection,
+    parent_session_id: Uuid,
+) -> Result<Option<BtwForkInfo>> {
+    let row = conn
+        .query_row(
+            "SELECT * FROM sessions WHERE btw_parent_session_id = ?1 LIMIT 1",
+            [parent_session_id.to_string()],
+            SessionRow::from_row,
+        )
+        .optional()
+        .context("querying live btw fork")?;
+    row.as_ref()
+        .map(|row| btw_info_for_row_conn(conn, row))
+        .transpose()
+}
+
+fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkInfo> {
+    let parent_session_id = row
+        .btw_parent_session_id
+        .ok_or_else(|| anyhow!("session {} is not a btw fork", row.session_id))?;
+    let message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+               FROM session_events
+              WHERE session_id = ?1
+                AND type IN ('user_message', 'assistant_message')",
+            [row.session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("counting btw fork messages")?;
+    Ok(BtwForkInfo {
+        session_id: row.session_id,
+        parent_session_id,
+        short_id: row.short_id.clone(),
+        tangent: row.btw_tangent,
+        created_at: row.started_at,
+        message_count: message_count.max(0) as u32,
+    })
+}
+
 impl Db {
     pub fn create_session(
         &self,
@@ -855,6 +929,92 @@ impl Db {
         self.create_fork_inner(parent_session_id, fork_point_turn_id, true)
     }
 
+    /// Create or return the one live persistent `/btw` fork for
+    /// `parent_session_id`. The fork is hidden from session lists like an
+    /// ephemeral `/side` fork, but it is not swept on boot because it carries
+    /// typed BTW linkage.
+    pub fn create_btw_fork(
+        &self,
+        parent_session_id: Uuid,
+        tangent: bool,
+    ) -> Result<BtwForkCreateResult> {
+        let session_id = Uuid::new_v4();
+        let now = Utc::now().timestamp();
+        self.write_blocking(move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin create_btw_fork tx")?;
+            if let Some(info) = live_btw_fork_info_conn(&tx, parent_session_id)? {
+                tx.commit().context("commit existing create_btw_fork tx")?;
+                return Ok(BtwForkCreateResult {
+                    info,
+                    created: false,
+                });
+            }
+            let parent = get_session_inner(&tx, parent_session_id)?
+                .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+            let row = SessionRow {
+                session_id,
+                project_id: parent.project_id,
+                project_root: parent.project_root,
+                started_at: now,
+                last_active_at: now,
+                ended_at: None,
+                provider: parent.provider,
+                model: parent.model,
+                active_agent: parent.active_agent,
+                assistant_name: parent.assistant_name,
+                short_id: Some(random_short_id()),
+                parent_session_id: Some(parent_session_id),
+                fork_point_turn_id: None,
+                title: None,
+                user_renamed: false,
+                last_viewed_at: None,
+                archived_at: None,
+                ephemeral: true,
+                btw_parent_session_id: Some(parent_session_id),
+                btw_tangent: tangent,
+                user_content_tokens: if tangent {
+                    0
+                } else {
+                    parent.user_content_tokens
+                },
+                title_stage: if tangent { 0 } else { parent.title_stage },
+                guidance_baseline_path: parent.guidance_baseline_path,
+                guidance_baseline_hash: parent.guidance_baseline_hash,
+                redaction_table_json: parent.redaction_table_json,
+                model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
+                created_by_principal: parent.created_by_principal,
+                shared_with_collaborators: false,
+            };
+            let row = insert_fork_row_with_short_id_retry(&tx, row, &None)
+                .context("inserting btw fork session")?;
+            if !tangent {
+                copy_fork_transcript(&tx, parent_session_id, session_id, None)
+                    .context("copying btw fork transcript")?;
+            }
+            let info = btw_info_for_row_conn(&tx, &row)?;
+            tx.commit().context("commit create_btw_fork tx")?;
+            Ok(BtwForkCreateResult {
+                info,
+                created: true,
+            })
+        })
+    }
+
+    pub fn live_btw_fork_info(&self, parent_session_id: Uuid) -> Result<Option<BtwForkInfo>> {
+        self.read_blocking(|conn| live_btw_fork_info_conn(conn, parent_session_id))
+    }
+
+    pub fn end_btw_fork(&self, parent_session_id: Uuid) -> Result<bool> {
+        let fork = self.live_btw_fork_info(parent_session_id)?;
+        let Some(info) = fork else {
+            return Ok(false);
+        };
+        self.delete_session(info.session_id, true)?;
+        Ok(true)
+    }
+
     fn create_fork_inner(
         &self,
         parent_session_id: Uuid,
@@ -889,6 +1049,8 @@ impl Db {
                 last_viewed_at: None,
                 archived_at: None,
                 ephemeral,
+                btw_parent_session_id: None,
+                btw_tangent: false,
                 user_content_tokens: parent.user_content_tokens,
                 title_stage: parent.title_stage,
                 guidance_baseline_path: parent.guidance_baseline_path,
@@ -1174,7 +1336,12 @@ impl Db {
     pub fn sweep_ephemeral_sessions(&self) -> Result<usize> {
         let roots = self.read_blocking(|conn| {
             let mut stmt = conn
-                .prepare("SELECT session_id FROM sessions WHERE ephemeral = 1")
+                .prepare(
+                    "SELECT session_id
+                       FROM sessions
+                      WHERE ephemeral = 1
+                        AND btw_parent_session_id IS NULL",
+                )
                 .context("preparing ephemeral sweep")?;
             let rows = stmt
                 .query_map([], |row| {
@@ -3089,6 +3256,147 @@ mod tests {
         // The persisted root + its plain fork survive the sweep.
         assert!(db.get_session(root.session_id).unwrap().is_some());
         assert_eq!(db.count_forks_for(root.session_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn btw_fork_seeded_to_ceiling() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        record_message(&db, parent.session_id, "first", false);
+        record_message(&db, parent.session_id, "second", true);
+
+        let result = db.create_btw_fork(parent.session_id, false).unwrap();
+
+        assert!(result.created);
+        assert_eq!(result.info.parent_session_id, parent.session_id);
+        assert!(!result.info.tangent);
+        assert_eq!(result.info.message_count, 2);
+        let events = db.list_session_events(result.info.session_id).unwrap();
+        let texts: Vec<_> = events
+            .iter()
+            .map(|event| event.data["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn btw_tangent_fork_empty() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        record_message(&db, parent.session_id, "parent context", false);
+
+        let result = db.create_btw_fork(parent.session_id, true).unwrap();
+
+        assert!(result.created);
+        assert!(result.info.tangent);
+        assert_eq!(result.info.message_count, 0);
+        assert!(
+            db.list_session_events(result.info.session_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn btw_schema_enforces_one_live_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+
+        let first = db.create_btw_fork(parent.session_id, false).unwrap();
+        let second = db.create_btw_fork(parent.session_id, true).unwrap();
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(first.info.session_id, second.info.session_id);
+        assert!(!second.info.tangent, "existing fork identity wins");
+        assert!(
+            db.list_sessions(false, 100)
+                .unwrap()
+                .iter()
+                .all(|row| row.session_id != first.info.session_id)
+        );
+        let direct_count: i64 = db
+            .read_blocking(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE btw_parent_session_id = ?1",
+                    [parent.session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        assert_eq!(direct_count, 1);
+    }
+
+    #[test]
+    fn btw_create_is_atomic_and_unique() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let mut joins = Vec::new();
+        for tangent in [false, true] {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let parent_id = parent.session_id;
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                db.create_btw_fork(parent_id, tangent).unwrap()
+            }));
+        }
+
+        let first = joins.remove(0).join().unwrap();
+        let second = joins.remove(0).join().unwrap();
+        assert_eq!(first.info.session_id, second.info.session_id);
+        assert_ne!(first.created, second.created);
+        let direct_count: i64 = db
+            .read_blocking(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE btw_parent_session_id = ?1",
+                    [parent.session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        assert_eq!(direct_count, 1);
+    }
+
+    #[test]
+    fn btw_orphan_sweep_spares_live_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let side = db.create_ephemeral_fork(parent.session_id, None).unwrap();
+        let btw = db.create_btw_fork(parent.session_id, false).unwrap();
+
+        let removed = db.sweep_ephemeral_sessions().unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(db.get_session(side.session_id).unwrap().is_none());
+        assert!(db.get_session(btw.info.session_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn btw_end_discards_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let btw = db.create_btw_fork(parent.session_id, false).unwrap();
+
+        assert!(db.end_btw_fork(parent.session_id).unwrap());
+        assert!(db.get_session(btw.info.session_id).unwrap().is_none());
+        assert!(!db.end_btw_fork(parent.session_id).unwrap());
+    }
+
+    #[test]
+    fn btw_parent_delete_cascades() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let btw = db.create_btw_fork(parent.session_id, false).unwrap();
+
+        db.delete_session(parent.session_id, true).unwrap();
+
+        assert!(db.get_session(parent.session_id).unwrap().is_none());
+        assert!(db.get_session(btw.info.session_id).unwrap().is_none());
     }
 
     #[test]

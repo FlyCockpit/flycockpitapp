@@ -369,6 +369,28 @@ pub(crate) async fn execute_ordinary_call(
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
     } else if repair_outcome.valid {
+        if let Some(tool) = env.active_tools.get(resolved_name)
+            && env.session.is_btw_fork()
+            && !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
+        {
+            let label = format!("`{resolved_name}` in /btw side conversation");
+            let decision = if let Some(approver) = env.ctx.approver.as_ref() {
+                approver.approve_tool_call(&label).await?
+            } else {
+                crate::approval::Decision::NoninteractiveDeny
+            };
+            match decision {
+                crate::approval::Decision::Allow { .. } => {}
+                crate::approval::Decision::NoninteractiveDeny => {
+                    return Err(invalid_input(crate::approval::NONINTERACTIVE_RUN_DENIAL));
+                }
+                crate::approval::Decision::Deny => {
+                    return Err(invalid_input(
+                        "btw side conversation: mutating tool call denied",
+                    ));
+                }
+            }
+        }
         let payload = InterruptParkPayload {
             tool: resolved_name.to_string(),
             args: args.clone(),
@@ -971,6 +993,42 @@ mod tests {
         }
     }
 
+    struct ReadOnlyEchoTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for ReadOnlyEchoTool {
+        fn name(&self) -> &str {
+            "readonly_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Read-only echo test input."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            })
+        }
+
+        fn effect(&self) -> crate::engine::tool::ToolEffect {
+            crate::engine::tool::ToolEffect::ReadOnly
+        }
+
+        async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text(
+                args.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        }
+    }
+
     struct NestedCaptureTool {
         received: Arc<Mutex<Option<Value>>>,
     }
@@ -1285,6 +1343,17 @@ mod tests {
         Arc::new(Session::create(db, root.to_path_buf(), "Build").unwrap())
     }
 
+    fn test_btw_session(root: &std::path::Path) -> Arc<Session> {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = Session::create(db.clone(), root.to_path_buf(), "Build").unwrap();
+        let fork = db.create_btw_fork(parent.id, false).expect("btw fork").info;
+        Arc::new(
+            Session::resume(db, fork.session_id)
+                .expect("resume btw fork")
+                .expect("btw fork row"),
+        )
+    }
+
     fn push_assistant_call(history: &mut Vec<Message>, call: &ToolCall) {
         history.push(Message::Assistant {
             id: None,
@@ -1484,6 +1553,104 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[tokio::test]
+    async fn btw_mutating_tool_requires_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "dynamic_tool",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_btw_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("dynamic_tool", serde_json::json!({ "text": "blocked" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        let err = execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "dynamic_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .expect_err("btw dynamic tool must require approval");
+
+        assert!(
+            err.to_string()
+                .contains(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(history.len(), 1);
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .unwrap()
+                .is_empty(),
+            "denied pre-approval call must not be audited as executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn btw_readonly_tool_uses_normal_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyEchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_btw_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("readonly_echo", serde_json::json!({ "text": "allowed" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "readonly_echo",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(last_tool_result_text(&history), "allowed");
+        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "readonly_echo");
     }
 
     #[tokio::test]

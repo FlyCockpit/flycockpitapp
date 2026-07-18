@@ -345,6 +345,22 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// Create or return the one live persistent `/btw` fork for a parent
+    /// session. When `tangent` is true, the fork starts with an empty
+    /// transcript; otherwise it is seeded from the parent at the current fork
+    /// ceiling. Parent compaction after creation does not re-seed the fork.
+    CreateBtwFork {
+        parent_session_id: Uuid,
+        #[serde(default)]
+        tangent: bool,
+    },
+
+    /// End and discard the live `/btw` fork for a parent session, if any.
+    /// Idempotent when no fork exists.
+    EndBtwFork {
+        parent_session_id: Uuid,
+    },
+
     /// Manually set a session's title; locks out auto-titling.
     /// GOALS §17d.
     RenameSession {
@@ -667,6 +683,8 @@ macro_rules! command {
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, none);
             (Request::ForkSession { parent_session_id, .. }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, none);
             (Request::DiscardSession { session_id }, "discard_session", session_row_writer(session_id), field(session_id), true, none);
+            (Request::CreateBtwFork { parent_session_id, .. }, "btw_create", session_row_writer(parent_session_id), field(parent_session_id), true, none);
+            (Request::EndBtwFork { parent_session_id }, "btw_end", session_row_writer(parent_session_id), field(parent_session_id), true, none);
             (Request::RenameSession { session_id, .. }, "rename_session", session_row_writer(session_id), field(session_id), true, none);
             (Request::ShareSession { session_id, .. }, "share_session", owner_only, field(session_id), true, none);
             (Request::RecordSessionNote { session_id, .. }, "record_session_note", session_row_writer(session_id), field(session_id), true, none);

@@ -14,7 +14,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::intel::budget::BudgetedWriter;
 use crate::intel::thin::{ThinLimits, thin_line_output};
 use crate::tools::sandbox;
@@ -39,6 +39,10 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &str {
         "Regex content search confined to the package root; returns budgeted file:line matches"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn defensive_description(&self) -> Option<String> {

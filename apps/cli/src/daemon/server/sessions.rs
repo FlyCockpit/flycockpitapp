@@ -225,6 +225,68 @@ fn fork_session(
     })
 }
 
+fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto::BtwForkInfo {
+    proto::BtwForkInfo {
+        session_id: info.session_id,
+        parent_session_id: info.parent_session_id,
+        short_id: info.short_id,
+        tangent: info.tangent,
+        created_at: info.created_at,
+        message_count: info.message_count,
+    }
+}
+
+fn create_btw_fork(
+    ctx: &DaemonContext,
+    principal: &ClientPrincipal,
+    parent_session_id: Uuid,
+    tangent: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    match ctx.db.get_session(parent_session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown parent session {parent_session_id}"),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    }
+    let result = ctx
+        .db
+        .create_btw_fork(parent_session_id, tangent)
+        .map_err(internal)?;
+    if result.created
+        && let Some(tag) = principal.tag()
+    {
+        ctx.db
+            .set_session_created_by_principal(result.info.session_id, Some(&tag))
+            .map_err(internal)?;
+    }
+    Ok(Response::BtwFork {
+        info: btw_info_to_proto(result.info),
+        created: result.created,
+    })
+}
+
+async fn end_btw_fork(
+    ctx: &DaemonContext,
+    parent_session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    if let Some(info) = ctx
+        .db
+        .live_btw_fork_info(parent_session_id)
+        .map_err(internal)?
+    {
+        ctx.registry
+            .interrupt_and_stop(info.session_id)
+            .await
+            .map_err(internal)?;
+    }
+    ctx.db.end_btw_fork(parent_session_id).map_err(internal)?;
+    Ok(Response::Ack)
+}
+
 /// Discard an ephemeral side-conversation (`/side`): stop its live worker
 /// (cancelling jobs, ending the current turn) then delete its row +
 /// descendant forks. Guarded — a non-ephemeral session is left untouched,

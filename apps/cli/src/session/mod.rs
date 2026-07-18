@@ -176,6 +176,11 @@ pub struct Session {
     // Fork-tree lineage (GOALS §17e); not yet read by any consumer.
     #[allow(dead_code)]
     pub fork_point_turn_id: Option<String>,
+    /// Parent session when this is a persistent `/btw` fork. Loaded from the
+    /// DB row; clients cannot assert this in a tool request.
+    pub btw_parent_session_id: Option<Uuid>,
+    #[allow(dead_code)]
+    pub btw_tangent: bool,
     title: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
     model: Mutex<Option<String>>,

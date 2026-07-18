@@ -16,7 +16,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::session_search::ThreadTurn;
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
 /// Turns per page. A thread rarely needs the whole transcript at once;
 /// the agent pages with `offset` (a `seq`) to see more.
@@ -35,6 +35,10 @@ impl Tool for SessionReadTool {
 
     fn description(&self) -> &str {
         "Read a past session's turns by short id; optional query windows around matches, paginated by seq"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn defensive_description(&self) -> Option<String> {

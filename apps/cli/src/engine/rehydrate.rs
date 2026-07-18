@@ -3880,6 +3880,35 @@ mod tests {
     }
 
     #[test]
+    fn btw_events_absent_from_parent_history() {
+        let parent = root_session();
+        record_user(&parent, "parent before btw");
+        let btw = parent
+            .db
+            .create_btw_fork(parent.id, true)
+            .expect("btw fork");
+        let btw_session = Session::resume(parent.db.clone(), btw.info.session_id)
+            .unwrap()
+            .expect("btw session");
+        record_user(&btw_session, "btw-only prompt");
+        record_assistant(&btw_session, "btw-call", "btw-only answer");
+
+        let parent_snapshot = history_snapshot(&parent.db, parent.id, "Build").unwrap();
+        assert_eq!(parent_snapshot.len(), 1);
+        assert!(
+            matches!(&parent_snapshot[0], proto::HistoryEntry::User { text, .. } if text == "parent before btw")
+        );
+
+        let btw_snapshot = history_snapshot(&parent.db, btw.info.session_id, "Build").unwrap();
+        assert!(
+            btw_snapshot.iter().any(
+                |entry| matches!(entry, proto::HistoryEntry::User { text, .. } if text == "btw-only prompt")
+            ),
+            "btw fork retains its own history"
+        );
+    }
+
+    #[test]
     fn history_snapshot_conn_matches_db_wrapper_byte_for_byte() {
         let s = root_session();
         record_user(&s, "read the file");

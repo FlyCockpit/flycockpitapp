@@ -1094,6 +1094,8 @@ mod tests {
             MutatingDispatchCase { kind: "unarchive_session", effect_class: Durable, observation: "session archived_at is cleared" },
             MutatingDispatchCase { kind: "fork_session", effect_class: Durable, observation: "fork session row references parent session" },
             MutatingDispatchCase { kind: "discard_session", effect_class: Durable, observation: "ephemeral session row is deleted" },
+            MutatingDispatchCase { kind: "btw_create", effect_class: Durable, observation: "hidden persistent btw fork row references parent session" },
+            MutatingDispatchCase { kind: "btw_end", effect_class: Durable, observation: "hidden persistent btw fork row is deleted" },
             MutatingDispatchCase { kind: "rename_session", effect_class: Durable, observation: "session title is updated" },
             MutatingDispatchCase { kind: "share_session", effect_class: Durable, observation: "shared_with_collaborators flag changes" },
             MutatingDispatchCase { kind: "record_session_note", effect_class: Durable, observation: "user_note session event is persisted" },
@@ -1277,6 +1279,8 @@ mod tests {
             | "read_session_messages"
             | "unarchive_session"
             | "fork_session"
+            | "btw_create"
+            | "btw_end"
             | "rename_session"
             | "share_session"
             | "record_session_note"
@@ -1376,6 +1380,8 @@ mod tests {
             authz_session_writer("unarchive_session"),
             authz_session_writer("fork_session"),
             authz_session_writer("discard_session"),
+            authz_session_writer("btw_create"),
+            authz_session_writer("btw_end"),
             authz_session_writer("rename_session"),
             authz_owner_only("share_session"),
             authz_session_writer("record_session_note"),
@@ -2177,6 +2183,13 @@ mod tests {
                 ephemeral: false,
             },
             "discard_session" => Request::DiscardSession { session_id },
+            "btw_create" => Request::CreateBtwFork {
+                parent_session_id: session_id,
+                tangent: false,
+            },
+            "btw_end" => Request::EndBtwFork {
+                parent_session_id: session_id,
+            },
             "rename_session" => Request::RenameSession {
                 session_id,
                 title: "authz".into(),
@@ -2806,6 +2819,8 @@ mod tests {
             | "unarchive_session"
             | "fork_session"
             | "discard_session"
+            | "btw_create"
+            | "btw_end"
             | "rename_session"
             | "share_session"
             | "record_session_note"
@@ -2905,6 +2920,8 @@ mod tests {
             | "unarchive_session"
             | "fork_session"
             | "discard_session"
+            | "btw_create"
+            | "btw_end"
             | "rename_session"
             | "share_session"
             | "record_session_note"
@@ -3916,6 +3933,36 @@ mod tests {
                 assert!(matches!(response, Response::Ack));
                 assert!(ctx.db.get_session(fork.session_id).unwrap().is_none());
             }
+            "btw_create" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::CreateBtwFork {
+                        parent_session_id: session.session_id,
+                        tangent: false,
+                    },
+                )
+                .await
+                .expect("create btw fork");
+                let Response::BtwFork { info, created } = response else {
+                    panic!("expected BtwFork");
+                };
+                assert!(created);
+                assert_eq!(info.parent_session_id, session.session_id);
+                assert!(ctx.db.get_session(info.session_id).unwrap().is_some());
+            }
+            "btw_end" => {
+                let fork = ctx.db.create_btw_fork(session.session_id, false).unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::EndBtwFork {
+                        parent_session_id: session.session_id,
+                    },
+                )
+                .await
+                .expect("end btw fork");
+                assert!(matches!(response, Response::Ack));
+                assert!(ctx.db.get_session(fork.info.session_id).unwrap().is_none());
+            }
             "rename_session" => {
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -4008,6 +4055,13 @@ mod tests {
             },
             "discard_session" => Request::DiscardSession {
                 session_id: session.session_id,
+            },
+            "btw_create" => Request::CreateBtwFork {
+                parent_session_id: missing,
+                tangent: false,
+            },
+            "btw_end" => Request::EndBtwFork {
+                parent_session_id: missing,
             },
             "rename_session" => Request::RenameSession {
                 session_id: missing,
@@ -4723,6 +4777,23 @@ mod tests {
                 request: Request::DiscardSession { session_id },
                 kind: "discard_session",
                 session_id: Some(session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::CreateBtwFork {
+                    parent_session_id,
+                    tangent: false,
+                },
+                kind: "btw_create",
+                session_id: Some(parent_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::EndBtwFork { parent_session_id },
+                kind: "btw_end",
+                session_id: Some(parent_session_id),
                 audit_path: None,
                 mutating: true,
             },
@@ -6002,6 +6073,270 @@ mod tests {
                 .contains("refusing destructive session mutation")
         );
         assert!(ctx.db.get_session(side.session_id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn btw_create_rpc_returns_existing_fork_atomically() {
+        let ctx = test_ctx();
+        let mut state = ClientState::detached_for_test();
+        let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
+
+        let first = handle_request(
+            Request::CreateBtwFork {
+                parent_session_id: parent.session_id,
+                tangent: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("btw create succeeds");
+        let Response::BtwFork {
+            info: first_info,
+            created: true,
+        } = first
+        else {
+            panic!("expected created BtwFork response");
+        };
+
+        let second = handle_request(
+            Request::CreateBtwFork {
+                parent_session_id: parent.session_id,
+                tangent: true,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("second btw create succeeds");
+        let Response::BtwFork {
+            info: second_info,
+            created: false,
+        } = second
+        else {
+            panic!("expected existing BtwFork response");
+        };
+
+        assert_eq!(first_info.session_id, second_info.session_id);
+        assert_eq!(first_info.parent_session_id, parent.session_id);
+        assert!(!second_info.tangent);
+    }
+
+    #[tokio::test]
+    async fn btw_concurrent_with_parent_turn() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_row = ctx
+            .db
+            .create_session("p", tmp.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let parent_session = Arc::new(
+            Session::resume(ctx.db.clone(), parent_row.session_id)
+                .unwrap()
+                .expect("parent session"),
+        );
+        let (parent_handle, mut parent_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
+        let parent_event_rx = parent_handle.subscribe();
+        let mut parent_state = ClientState {
+            principal: ClientPrincipal::owner(),
+            attached: Some(AttachedSession {
+                handle: parent_handle,
+                event_rx: parent_event_rx,
+                _interactive_guard: None,
+            }),
+            pending_replay: Vec::new(),
+            pending_uploads: HashMap::new(),
+            ready_attachments: HashMap::new(),
+            upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
+            upload_limits: AttachmentUploadLimits::default(),
+            terminal_views: HashSet::new(),
+            terminal_host: test_terminal_host(),
+        };
+        let ctx_for_parent = ctx.clone();
+        let parent_request = tokio::spawn(async move {
+            handle_request(
+                Request::SendUserMessage {
+                    text: "parent work".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                &mut parent_state,
+                &ctx_for_parent,
+            )
+            .await
+        });
+        let SessionWork::UserMessage {
+            submission: parent_submission,
+            respond_to: parent_respond,
+        } = parent_rx.recv().await.expect("parent work queued")
+        else {
+            panic!("expected parent user message work");
+        };
+        assert_eq!(parent_submission.text, "parent work");
+
+        let created = ctx
+            .db
+            .create_btw_fork(parent_row.session_id, true)
+            .unwrap();
+        let btw_session = Arc::new(
+            Session::resume(ctx.db.clone(), created.info.session_id)
+                .unwrap()
+                .expect("btw session"),
+        );
+        let (btw_handle, mut btw_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
+        let btw_event_rx = btw_handle.subscribe();
+        let mut btw_state = ClientState {
+            principal: ClientPrincipal::owner(),
+            attached: Some(AttachedSession {
+                handle: btw_handle,
+                event_rx: btw_event_rx,
+                _interactive_guard: None,
+            }),
+            pending_replay: Vec::new(),
+            pending_uploads: HashMap::new(),
+            ready_attachments: HashMap::new(),
+            upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
+            upload_limits: AttachmentUploadLimits::default(),
+            terminal_views: HashSet::new(),
+            terminal_host: test_terminal_host(),
+        };
+        let ctx_for_btw = ctx.clone();
+        let btw_request = tokio::spawn(async move {
+            handle_request(
+                Request::SendUserMessage {
+                    text: "btw work".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                &mut btw_state,
+                &ctx_for_btw,
+            )
+            .await
+        });
+        let SessionWork::UserMessage {
+            submission: btw_submission,
+            respond_to: btw_respond,
+        } = tokio::time::timeout(std::time::Duration::from_millis(250), btw_rx.recv())
+            .await
+            .expect("btw work was not blocked by parent turn")
+            .expect("btw work queued")
+        else {
+            panic!("expected btw user message work");
+        };
+        assert_eq!(btw_submission.text, "btw work");
+        let btw_item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: "btw work".to_string(),
+            display_text: None,
+            target: proto::QueueTarget::default(),
+        };
+        btw_respond.send((btw_item, Vec::new())).unwrap();
+        assert!(matches!(
+            btw_request.await.unwrap().unwrap(),
+            Response::UserMessageQueued { .. }
+        ));
+
+        let parent_item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: "parent work".to_string(),
+            display_text: None,
+            target: proto::QueueTarget::default(),
+        };
+        parent_respond.send((parent_item, Vec::new())).unwrap();
+        assert!(matches!(
+            parent_request.await.unwrap().unwrap(),
+            Response::UserMessageQueued { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn btw_end_rpc_discards_fork() {
+        let ctx = test_ctx();
+        let mut state = ClientState::detached_for_test();
+        let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
+        let created = ctx.db.create_btw_fork(parent.session_id, false).unwrap();
+
+        let response = handle_request(
+            Request::EndBtwFork {
+                parent_session_id: parent.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("btw end succeeds");
+
+        assert!(matches!(response, Response::Ack));
+        assert!(
+            ctx.db
+                .get_session(created.info.session_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn btw_rehydrate_reports_live_fork() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let parent = ctx
+            .db
+            .create_session("p", tmp.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let created = ctx.db.create_btw_fork(parent.session_id, true).unwrap();
+        let live_session = Arc::new(
+            Session::resume(ctx.db.clone(), parent.session_id)
+                .unwrap()
+                .expect("session row"),
+        );
+        let (handle, _work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        ctx.registry.insert_test_worker(handle, join);
+
+        let mut state = ClientState::detached_for_test();
+        let response = handle_request(
+            Request::Attach {
+                session_id: Some(parent.session_id),
+                since_seq: None,
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                no_sandbox: false,
+                interactive: true,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("attach succeeds");
+
+        let Response::Attached { btw_fork, .. } = response else {
+            panic!("expected Attached response");
+        };
+        let info = btw_fork.expect("live btw fork reported");
+        assert_eq!(info.session_id, created.info.session_id);
+        assert_eq!(info.parent_session_id, parent.session_id);
+        assert!(info.tangent);
+        assert_eq!(info.message_count, 0);
     }
 
     #[tokio::test]

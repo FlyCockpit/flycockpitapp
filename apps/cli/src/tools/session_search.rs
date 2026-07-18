@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
 /// Default number of threads shown; the agent can widen via `limit`.
 const DEFAULT_LIMIT: u32 = 10;
@@ -33,6 +33,10 @@ impl Tool for SessionSearchTool {
 
     fn description(&self) -> &str {
         "Search past sessions' titles and messages by relevance; returns ranked threads with snippets"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn defensive_description(&self) -> Option<String> {

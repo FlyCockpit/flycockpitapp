@@ -94,6 +94,8 @@ pub enum Response {
         env_drift: Option<Box<EnvDiffSummary>>,
         #[serde(default)]
         env_policy_applied: EnvDriftPolicy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        btw_fork: Option<BtwForkInfo>,
     },
 
     SubagentTranscript {
@@ -134,6 +136,12 @@ pub enum Response {
         parent_session_id: Uuid,
         #[serde(default)]
         fork_point_turn_id: Option<String>,
+    },
+
+    /// Result of [`Request::CreateBtwFork`].
+    BtwFork {
+        info: BtwForkInfo,
+        created: bool,
     },
 
     Skills {
@@ -308,4 +316,15 @@ pub enum Response {
     PausedWork {
         items: Vec<PausedWorkSummary>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BtwForkInfo {
+    pub session_id: Uuid,
+    pub parent_session_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
+    pub tangent: bool,
+    pub created_at: i64,
+    pub message_count: u32,
 }

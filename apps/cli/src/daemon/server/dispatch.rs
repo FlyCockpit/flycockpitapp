@@ -529,6 +529,13 @@ async fn handle_request(
 
         Request::DiscardSession { session_id } => discard_session(state, ctx, session_id).await,
 
+        Request::CreateBtwFork {
+            parent_session_id,
+            tangent,
+        } => create_btw_fork(ctx, &state.principal, parent_session_id, tangent),
+
+        Request::EndBtwFork { parent_session_id } => end_btw_fork(ctx, parent_session_id).await,
+
         Request::RenameSession { session_id, title } => rename_session(ctx, session_id, &title),
 
         Request::ShareSession { session_id, shared } => {
@@ -1328,6 +1335,11 @@ async fn attach(
         }
         history = Vec::new();
     }
+    let btw_fork = ctx
+        .db
+        .live_btw_fork_info(session_id)
+        .map_err(internal)?
+        .map(btw_info_to_proto);
 
     Ok(Response::Attached {
         session_id,
@@ -1351,6 +1363,7 @@ async fn attach(
         env_session: Some(env_session_meta),
         env_drift: env_drift.map(Box::new),
         env_policy_applied,
+        btw_fork,
     })
 }
 

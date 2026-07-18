@@ -154,6 +154,8 @@ impl Session {
             short_id,
             parent_session_id: row.parent_session_id,
             fork_point_turn_id: row.fork_point_turn_id,
+            btw_parent_session_id: row.btw_parent_session_id,
+            btw_tangent: row.btw_tangent,
             title: Mutex::new(row.title),
             user_renamed: Mutex::new(row.user_renamed),
             model: Mutex::new(row.model),

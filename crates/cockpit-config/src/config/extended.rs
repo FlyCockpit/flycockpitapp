@@ -187,6 +187,12 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_model: Option<String>,
 
+    /// Dedicated model for `/btw` side-conversation turns. Same
+    /// `provider:model` shape as `compact_model`; unset/empty means inherit
+    /// the parent session's current model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btw_model: Option<String>,
+
     /// Dedicated embedding model selector (`provider:model` or `provider/model`).
     /// Missing means no embedding role is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1305,6 +1311,13 @@ impl ExtendedConfig {
             .or(self.utility_model.as_deref())
     }
 
+    pub fn btw_model_ref(&self) -> Option<&str> {
+        self.btw_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn embedding_model_ref(&self) -> Option<&str> {
         self.embedding_model
             .as_deref()
@@ -1340,6 +1353,7 @@ impl Default for ExtendedConfig {
             predict_next_message_model: None,
             harness_report_summarization: None,
             compact_model: None,
+            btw_model: None,
             embedding_model: None,
             project_knowledge: false,
             knowledge_inject_max_tokens: default_knowledge_inject_max_tokens(),
@@ -1561,6 +1575,7 @@ impl ExtendedConfigDoc {
         parse_field!("predict_next_message_model", predict_next_message_model);
         parse_field!("harness_report_summarization", harness_report_summarization);
         parse_field!("compact_model", compact_model);
+        parse_field!("btw_model", btw_model);
         parse_field!("embedding_model", embedding_model);
         parse_field!("project_knowledge", project_knowledge);
         parse_field!("knowledge_inject_max_tokens", knowledge_inject_max_tokens);

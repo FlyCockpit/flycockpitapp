@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput};
 use crate::tools::common::{READ_LINE_CAP, looks_binary, read_slice, resolve, truncation_marker};
 
 pub struct ReadTool;
@@ -24,6 +24,10 @@ impl Tool for ReadTool {
 
     fn description(&self) -> &str {
         "Snapshot-read a file; line-numbered output, 2000-line/8KB cap, no lock"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn defensive_description(&self) -> Option<String> {

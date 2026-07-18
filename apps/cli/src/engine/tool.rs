@@ -66,6 +66,14 @@ pub fn classify_failure(err: &anyhow::Error) -> ToolFailKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolEffect {
+    ReadOnly,
+    Mutating,
+    Dynamic,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewCage {
     state: Arc<Mutex<ReviewCageState>>,
@@ -214,6 +222,13 @@ pub trait Tool: Send + Sync {
     /// falls back to the normal terse description.
     fn frontier_description(&self) -> Option<String> {
         None
+    }
+
+    /// Authoritative side-effect classification for approval policy. Dynamic
+    /// tools must conservatively require approval unless the concrete call is
+    /// proven read-only by that tool's own policy.
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Dynamic
     }
 
     /// JSON Schema for the arguments. Returning `Value::Null` means "no
@@ -1471,5 +1486,88 @@ mod llm_mode_tests {
             serde_json::to_string(&empty_override.definitions(LlmMode::Normal)).unwrap(),
             "an empty override must not change the serialized tools array"
         );
+    }
+
+    #[test]
+    fn btw_tool_effect_metadata_complete() {
+        let expected = [
+            ("bash", ToolEffect::Dynamic),
+            ("change_impact", ToolEffect::Dynamic),
+            ("circular", ToolEffect::Dynamic),
+            ("context_pack", ToolEffect::Dynamic),
+            ("create_goal", ToolEffect::Dynamic),
+            ("defer_to_orchestrator", ToolEffect::Dynamic),
+            ("delegation_payload_retrieve", ToolEffect::Dynamic),
+            ("deps", ToolEffect::Dynamic),
+            ("editunlock", ToolEffect::Dynamic),
+            ("escalate", ToolEffect::Dynamic),
+            ("get_goal", ToolEffect::Dynamic),
+            ("glob", ToolEffect::ReadOnly),
+            ("grep", ToolEffect::ReadOnly),
+            ("handoff", ToolEffect::Dynamic),
+            ("harness_invoke", ToolEffect::Dynamic),
+            ("harness_list", ToolEffect::Dynamic),
+            ("hot", ToolEffect::Dynamic),
+            ("impact", ToolEffect::Dynamic),
+            ("lsp", ToolEffect::Dynamic),
+            ("mcp", ToolEffect::Dynamic),
+            ("outline", ToolEffect::Dynamic),
+            ("plan_edit", ToolEffect::Dynamic),
+            ("plan_read", ToolEffect::Dynamic),
+            ("plan_write", ToolEffect::Dynamic),
+            ("question", ToolEffect::Dynamic),
+            ("read", ToolEffect::ReadOnly),
+            ("readlock", ToolEffect::Dynamic),
+            ("return", ToolEffect::Dynamic),
+            ("schedule", ToolEffect::Dynamic),
+            ("search", ToolEffect::Dynamic),
+            ("session_read", ToolEffect::ReadOnly),
+            ("session_search", ToolEffect::ReadOnly),
+            ("skill", ToolEffect::Dynamic),
+            ("skill_manage", ToolEffect::Dynamic),
+            ("start_build", ToolEffect::Dynamic),
+            ("symbol_find", ToolEffect::Dynamic),
+            ("task", ToolEffect::Dynamic),
+            ("todo", ToolEffect::Dynamic),
+            ("todo_read", ToolEffect::Dynamic),
+            ("tool_result_retrieve", ToolEffect::Dynamic),
+            ("tree", ToolEffect::Dynamic),
+            ("unlock", ToolEffect::Dynamic),
+            ("update_goal", ToolEffect::Dynamic),
+            ("word", ToolEffect::Dynamic),
+            ("writeunlock", ToolEffect::Dynamic),
+        ];
+        let expected: BTreeMap<String, _> = expected
+            .into_iter()
+            .map(|(name, effect)| (name.to_string(), effect))
+            .collect();
+        let actual: BTreeMap<_, _> = crate::engine::builtin::invariant_builtin_tools()
+            .into_iter()
+            .map(|tool| (tool.name().to_string(), tool.effect()))
+            .collect();
+
+        assert_eq!(actual, expected);
+
+        struct Unknown;
+        #[async_trait]
+        impl Tool for Unknown {
+            fn name(&self) -> &str {
+                "unknown"
+            }
+
+            fn description(&self) -> &str {
+                "unknown dynamic tool"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+
+            async fn call(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        assert_eq!(Unknown.effect(), ToolEffect::Dynamic);
     }
 }

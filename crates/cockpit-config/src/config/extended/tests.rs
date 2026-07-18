@@ -543,17 +543,36 @@ fn compact_model_ref_falls_back_to_utility_then_agent_none() {
 }
 
 #[test]
+fn btw_model_ref_uses_only_explicit_non_empty_override() {
+    let mut cfg = ExtendedConfig {
+        utility_model: Some("p:utility".into()),
+        ..ExtendedConfig::default()
+    };
+    assert_eq!(cfg.btw_model_ref(), None);
+
+    cfg.btw_model = Some("o:btw".into());
+    assert_eq!(cfg.btw_model_ref(), Some("o:btw"));
+
+    cfg.btw_model = Some(String::new());
+    assert_eq!(cfg.btw_model_ref(), None);
+    cfg.btw_model = Some("   \t ".into());
+    assert_eq!(cfg.btw_model_ref(), None);
+}
+
+#[test]
 fn compact_model_and_prompt_round_trip_through_config_doc() {
     // The two new keys persist through the same `ExtendedConfigDoc`
     // round-trip the `/settings` save path uses.
     let cfg = ExtendedConfig {
         compact_model: Some("o:compact".into()),
+        btw_model: Some("o:btw".into()),
         compact_prompt: Some("custom brief\nsecond line".into()),
         ..ExtendedConfig::default()
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let back: ExtendedConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back.compact_model.as_deref(), Some("o:compact"));
+    assert_eq!(back.btw_model.as_deref(), Some("o:btw"));
     assert_eq!(
         back.compact_prompt.as_deref(),
         Some("custom brief\nsecond line")
@@ -562,6 +581,7 @@ fn compact_model_and_prompt_round_trip_through_config_doc() {
     // Unset keys are omitted from the serialized form (skip_serializing_if).
     let default_json = serde_json::to_string(&ExtendedConfig::default()).unwrap();
     assert!(!default_json.contains("compact_model"));
+    assert!(!default_json.contains("btw_model"));
     assert!(!default_json.contains("compact_prompt"));
 }
 

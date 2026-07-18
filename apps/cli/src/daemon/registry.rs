@@ -195,6 +195,86 @@ async fn wait_for_start(slot: Arc<StartSlot>) -> Result<SessionWorkerHandle> {
     }
 }
 
+fn with_worker_model_runtime(
+    model: Model,
+    shutdown: &ShutdownSignal,
+    config_path: Option<PathBuf>,
+) -> Arc<Model> {
+    let model = model.with_shutdown_gate(shutdown.clone());
+    let model = match config_path {
+        Some(path) => model.with_config_path(path),
+        None => model,
+    };
+    Arc::new(model)
+}
+
+fn resolve_session_worker_model(
+    providers_cfg: &ProvidersConfig,
+    extended_cfg: &ExtendedConfig,
+    session: &Session,
+    redact: Arc<RedactionTable>,
+    env_snapshot: &EnvSnapshot,
+    config_path: Option<PathBuf>,
+    shutdown: &ShutdownSignal,
+) -> Result<Arc<Model>> {
+    let inherited_model = {
+        let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
+        let model = Model::from_config_with_env_trusted_only(
+            providers_cfg,
+            redact.clone(),
+            session.trusted_only_flag(),
+            env_lookup,
+        )?;
+        with_worker_model_runtime(model, shutdown, config_path.clone())
+    };
+
+    if !session.is_btw_fork() {
+        return Ok(inherited_model);
+    }
+
+    let Some(model_ref) = extended_cfg.btw_model_ref() else {
+        return Ok(inherited_model);
+    };
+    let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
+    let model = split_btw_model_ref(model_ref)
+        .context("model ref must be provider:model-id or provider/model")
+        .and_then(|(provider, model_id)| {
+            Model::for_provider_with_env_trusted_only(
+                providers_cfg,
+                &provider,
+                &model_id,
+                redact,
+                session.trusted_only_flag(),
+                env_lookup,
+            )
+        });
+
+    match model {
+        Ok(model) => Ok(with_worker_model_runtime(model, shutdown, config_path)),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                model = %model_ref,
+                session_id = %session.id,
+                "btw_model failed to resolve; using parent session model"
+            );
+            Ok(inherited_model)
+        }
+    }
+}
+
+fn split_btw_model_ref(value: &str) -> Option<(String, String)> {
+    value
+        .split_once('/')
+        .or_else(|| value.split_once(':'))
+        .and_then(|(provider, model)| {
+            let provider = provider.trim();
+            let model = model.trim();
+            (!provider.is_empty() && !model.is_empty())
+                .then(|| (provider.to_string(), model.to_string()))
+        })
+}
+
 fn remove_start_slot(inner: &Inner, session_id: Uuid, slot: &Arc<StartSlot>) {
     let mut workers = crate::sync::lock_or_recover(&inner.workers);
     if workers
@@ -533,22 +613,16 @@ impl SessionRegistry {
                 )
             })
         });
-        let model = {
-            let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-            let m = Model::from_config_with_env_trusted_only(
-                providers_cfg,
-                redact.clone(),
-                session.trusted_only_flag(),
-                env_lookup,
-            )
-            .context("resolving model")?
-            .with_shutdown_gate(self.inner.shutdown.clone());
-            let m = match config_path.clone() {
-                Some(path) => m.with_config_path(path),
-                None => m,
-            };
-            Arc::new(m)
-        };
+        let model = resolve_session_worker_model(
+            providers_cfg,
+            extended_cfg,
+            &session,
+            redact.clone(),
+            &env_snapshot,
+            config_path.clone(),
+            &self.inner.shutdown,
+        )
+        .context("resolving model")?;
 
         // Resolve the active model's extra-request-body fragment from rich
         // reasoning-effort capabilities first, falling back to legacy
@@ -1032,6 +1106,8 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::proto;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1060,11 +1136,108 @@ mod tests {
         session_worker::SessionWorkerHandle::test_handle(session, reg.inner.locks.clone())
     }
 
+    fn providers_for_btw_model_tests() -> ProvidersConfig {
+        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+        use std::collections::BTreeMap;
+
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".to_string(),
+                models: vec![
+                    ModelEntry {
+                        id: "parent-model".to_string(),
+                        ..ModelEntry::default()
+                    },
+                    ModelEntry {
+                        id: "btw-model".to_string(),
+                        ..ModelEntry::default()
+                    },
+                ],
+                ..ProviderEntry::default()
+            },
+        );
+        ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".to_string(),
+                model: "parent-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..ProvidersConfig::default()
+        }
+    }
+
     fn assert_no_live_worker(reg: &SessionRegistry, id: Uuid) {
         assert!(!reg.active_session_ids().contains(&id));
         assert!(!reg.any_agent_running());
         assert_eq!(reg.live_status(id), None);
         assert!(matches!(reg.claim_attach(id), AttachClaim::Start(_)));
+    }
+
+    #[test]
+    fn btw_model_knob_resolution() {
+        let reg = test_registry();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent =
+            Session::create(reg.inner.db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        parent.set_active_model("lmstudio", "parent-model").unwrap();
+        let fork = reg
+            .inner
+            .db
+            .create_btw_fork(parent.id, false)
+            .expect("btw fork")
+            .info;
+        let fork_session = Session::resume(reg.inner.db.clone(), fork.session_id)
+            .unwrap()
+            .expect("fork session");
+        let providers = providers_for_btw_model_tests();
+        let env_snapshot = EnvSnapshot::new(proto::EnvSnapshotSource::ExplicitCli, HashMap::new());
+        let redact = Arc::new(RedactionTable::empty());
+
+        let inherited = resolve_session_worker_model(
+            &providers,
+            &ExtendedConfig::default(),
+            &fork_session,
+            redact.clone(),
+            &env_snapshot,
+            None,
+            &reg.inner.shutdown,
+        )
+        .unwrap();
+        assert_eq!(inherited.model_id_ref(), "parent-model");
+
+        let overridden = resolve_session_worker_model(
+            &providers,
+            &ExtendedConfig {
+                btw_model: Some("lmstudio:btw-model".into()),
+                ..ExtendedConfig::default()
+            },
+            &fork_session,
+            redact.clone(),
+            &env_snapshot,
+            None,
+            &reg.inner.shutdown,
+        )
+        .unwrap();
+        assert_eq!(overridden.model_id_ref(), "btw-model");
+
+        let fallback = resolve_session_worker_model(
+            &providers,
+            &ExtendedConfig {
+                btw_model: Some("missing-provider:model".into()),
+                ..ExtendedConfig::default()
+            },
+            &fork_session,
+            redact,
+            &env_snapshot,
+            None,
+            &reg.inner.shutdown,
+        )
+        .unwrap();
+        assert_eq!(fallback.model_id_ref(), "parent-model");
     }
 
     #[tokio::test]

@@ -123,6 +123,10 @@ impl Session {
         approval_mode_from_u8(self.approval_mode.load(Ordering::Relaxed))
     }
 
+    pub fn is_btw_fork(&self) -> bool {
+        self.btw_parent_session_id.is_some()
+    }
+
     /// Set the session's command-approval mode. Used by the spawn path to
     /// apply the config default and by `/settings` to flip it at runtime.
     /// Returns the new mode.

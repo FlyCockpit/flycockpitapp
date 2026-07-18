@@ -75,10 +75,17 @@ CREATE TABLE sessions (
     -- lineage. JSON object keyed provider id -> model id -> prompt body.
     model_system_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
 
-    -- 1 for a throwaway side-conversation fork (`/side`): excluded from
-    -- session lists, never auto-titled, discarded when the side
-    -- conversation ends (daemon sweeps orphans on boot).
+    -- 1 for hidden side-conversation forks. Legacy `/side` rows are
+    -- throwaway and swept on daemon boot; BTW rows carry
+    -- btw_parent_session_id and are persistent until explicit end or parent
+    -- deletion.
     ephemeral INTEGER NOT NULL DEFAULT 0,
+
+    -- Persistent `/btw` side-conversation linkage. A BTW row is also a
+    -- fork-tree child via parent_session_id, but this typed linkage is the
+    -- authoritative lifecycle marker and uniqueness key.
+    btw_parent_session_id TEXT,
+    btw_tangent INTEGER NOT NULL DEFAULT 0,
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
@@ -89,7 +96,9 @@ CREATE TABLE sessions (
 
     -- remote principal attribution + collaborator sharing.
     created_by_principal TEXT,
-    shared_with_collaborators INTEGER NOT NULL DEFAULT 0
+    shared_with_collaborators INTEGER NOT NULL DEFAULT 0,
+
+    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
@@ -103,6 +112,10 @@ CREATE UNIQUE INDEX idx_sessions_short_id_project
     WHERE short_id IS NOT NULL;
 CREATE INDEX idx_sessions_archived  ON sessions (archived_at);
 CREATE INDEX idx_sessions_ephemeral ON sessions (ephemeral);
+CREATE INDEX idx_sessions_btw_parent ON sessions (btw_parent_session_id);
+CREATE UNIQUE INDEX idx_sessions_one_live_btw
+    ON sessions (btw_parent_session_id)
+    WHERE btw_parent_session_id IS NOT NULL;
 CREATE INDEX idx_sessions_created_by_principal ON sessions (created_by_principal);
 CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_collaborators)
   WHERE shared_with_collaborators = 1;

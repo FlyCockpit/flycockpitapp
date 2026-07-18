@@ -235,6 +235,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             env_session: _,
             env_drift,
             env_policy_applied: _,
+            btw_fork: _,
         } => {
             scrub_string(project_root, redact);
             if let Some(active) = active_subagent {
@@ -277,6 +278,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             short_id: _,
             parent_session_id: _,
             fork_point_turn_id: _,
+        } => {}
+        proto::Response::BtwFork {
+            info: _,
+            created: _,
         } => {}
         proto::Response::Skills { skills } => {
             for skill in skills {

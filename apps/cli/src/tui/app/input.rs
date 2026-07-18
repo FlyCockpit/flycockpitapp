@@ -17,6 +17,33 @@ use crate::tui::settings::Dialog;
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if is_btw_focus_toggle(&key)
+            && let Some(pane) = self.btw_pane.as_mut()
+        {
+            pane.focused = !pane.focused;
+            if pane.focused {
+                self.pane_focused = false;
+            }
+            return false;
+        }
+
+        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+            && let Some(pane) = self.btw_pane.as_mut()
+        {
+            match pane.handle_focused_key(key) {
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Consumed => return false,
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Error(error) => {
+                    pane.history.push(HistoryEntry::InferenceError {
+                        summary: error.clone(),
+                        detail: error,
+                        expanded: false,
+                    });
+                    return false;
+                }
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Unhandled => {}
+            }
+        }
+
         // Embedded pane (GOALS §1i): while a pane is open, `Ctrl+X`
         // force-closes it and `Ctrl+O` toggles focus — both reserved by
         // cockpit and not delivered to the child. When the pane is
@@ -3267,6 +3294,13 @@ fn is_pane_focus_toggle(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
 }
 
+fn is_btw_focus_toggle(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('b'))
+}
+
 fn is_ws_byte(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
@@ -3616,6 +3650,7 @@ mod queued_message_edit_tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
             client_tasks: ClientTasks::default(),
@@ -4023,6 +4058,7 @@ mod paste_routing_tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
             client_tasks: ClientTasks::default(),

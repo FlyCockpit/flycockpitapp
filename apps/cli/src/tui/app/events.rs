@@ -5,15 +5,15 @@ impl App {
     /// pending+history state machine. Runs each tick.
     pub(super) fn drain_agent_events(&mut self) -> bool {
         self.refresh_subagent_countdown();
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            return false;
-        };
-        let drained = crate::tui::agent_runner::drain_turn_events(&runner.events);
-        let changed = !drained.is_empty();
-        for event in drained {
-            self.apply_event(event);
+        let mut changed = false;
+        if let Some(Ok(runner)) = self.agent_runner.as_ref() {
+            let drained = crate::tui::agent_runner::drain_turn_events(&runner.events);
+            changed |= !drained.is_empty();
+            for event in drained {
+                self.apply_event(event);
+            }
         }
-        changed
+        changed | self.drain_btw_events()
     }
 
     pub(super) fn reconcile_queue_update(&mut self, queue: Vec<QueuedUserMessage>) {
@@ -110,6 +110,8 @@ impl App {
                     .is_some_and(|dialog| dialog.interrupt_id() == interrupt_id)
                 {
                     self.question_dialog = None;
+                    self.question_dialog_btw = false;
+                    self.install_pending_btw_interrupt();
                 }
                 self.resolve_attention_interrupt_for(session_id, interrupt_id);
                 self.history
@@ -948,6 +950,7 @@ impl App {
                     .with_pending_count(pending_count)
                     .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
                 );
+                self.question_dialog_btw = false;
                 self.raise_attention_interrupt(
                     session_id,
                     interrupt_id,
@@ -978,6 +981,15 @@ impl App {
                 session_id,
                 interrupt_id,
             } => {
+                if self
+                    .question_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.interrupt_id() == interrupt_id)
+                {
+                    self.question_dialog = None;
+                    self.question_dialog_btw = false;
+                    self.install_pending_btw_interrupt();
+                }
                 self.resolve_attention_interrupt_for(session_id, interrupt_id);
             }
             TurnEvent::ScheduleStarted {

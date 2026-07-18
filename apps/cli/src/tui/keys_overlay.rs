@@ -148,6 +148,8 @@ pub enum KeyContext {
     Pins,
     /// Embedded `$EDITOR` / `lazygit` pane.
     EmbeddedPane,
+    /// `/btw` side conversation pane.
+    BtwPane,
     /// A `question`-tool answering dialog.
     QuestionDialog,
     /// An approval dialog (`y`/`n` style required decision).
@@ -288,6 +290,33 @@ const EMBEDDED_PANE: KeyGroup = KeyGroup {
             key: "Ctrl+O",
             action: "focus",
             desc: "toggle focus between the pane and the composer",
+        },
+    ],
+};
+
+/// `/btw` side-pane bindings.
+const BTW_PANE: KeyGroup = KeyGroup {
+    title: "BTW pane",
+    bindings: &[
+        KeyBinding {
+            key: "Ctrl+B",
+            action: "focus",
+            desc: "toggle focus between the btw pane and main composer",
+        },
+        KeyBinding {
+            key: "F11",
+            action: "zoom",
+            desc: "toggle the btw pane full-screen",
+        },
+        KeyBinding {
+            key: "Esc",
+            action: "main focus",
+            desc: "return to main composer when the side composer is idle",
+        },
+        KeyBinding {
+            key: "Enter",
+            action: "send",
+            desc: "submit the side-pane message",
         },
     ],
 };
@@ -623,6 +652,7 @@ fn groups_for_owned(context: KeyContext, keyboard_enhancement_active: bool) -> V
         KeyContext::Diff => crate::tui::diff_pane::DiffPane::keybindings().into(),
         KeyContext::Pins => PINS.into(),
         KeyContext::EmbeddedPane => EMBEDDED_PANE.into(),
+        KeyContext::BtwPane => BTW_PANE.into(),
     };
     vec![first, GLOBAL.into()]
 }
@@ -781,6 +811,7 @@ impl KeysOverlay {
             KeyContext::Diff => "Diff",
             KeyContext::Pins => "Pins",
             KeyContext::EmbeddedPane => "Embedded pane",
+            KeyContext::BtwPane => "BTW pane",
             KeyContext::QuestionDialog => "Question",
             KeyContext::ApprovalDialog => "Approval",
         }

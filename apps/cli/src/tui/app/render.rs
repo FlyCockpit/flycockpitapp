@@ -2852,11 +2852,52 @@ impl App {
     /// `None` when a fullscreen pane covers the body). Also stashes the
     /// pane/divider/body rects for the mouse handler.
     pub(super) fn render_pane(&mut self, frame: &mut ratatui::Frame, body: Rect) -> Option<Rect> {
-        if self.pane.is_none() {
+        let btw_live = self.btw_pane.is_some();
+        let pty_live = self.pane.is_some();
+        if !btw_live && !pty_live {
             self.pane_rect = None;
             self.divider = None;
             self.pane_body = None;
             return Some(body);
+        }
+        if btw_live {
+            let layout = crate::tui::app::btw_pane::compose_aux_layout(
+                body,
+                btw_live,
+                pty_live,
+                self.btw_pane.as_ref().is_some_and(|pane| pane.zoomed),
+                self.btw_pane.as_ref().is_some_and(|pane| pane.focused),
+                self.pane_focused,
+            );
+            self.pane_rect = layout.pty;
+            self.divider = None;
+            self.pane_body = Some(body);
+            if let Some(rect) = layout.btw {
+                self.render_btw_pane(frame, rect);
+            }
+            if let Some(rect) = layout.pty
+                && let Some(pane) = self.pane.as_mut()
+            {
+                pane.resize(rect.height, rect.width);
+                pane.render(frame, rect);
+            }
+            if let Some(hidden) = layout.hidden_live {
+                let label = match hidden {
+                    crate::tui::app::btw_pane::BtwAuxVisible::Btw => "btw live hidden",
+                    crate::tui::app::btw_pane::BtwAuxVisible::Pty => "pty live hidden",
+                };
+                let hint = Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                frame.render_widget(
+                    Paragraph::new(hint),
+                    Rect::new(body.x, body.y, body.width.min(20), 1),
+                );
+            }
+            return layout.main;
         }
         let (chat_rect, pane_rect, divider) = split_body(self.pane_side, self.pane_ratio, body);
         if let Some(pane) = self.pane.as_mut() {
@@ -2872,6 +2913,96 @@ impl App {
             pane.render(frame, pane_rect);
         }
         chat_rect
+    }
+
+    fn render_btw_pane(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(pane) = self.btw_pane.as_mut() else {
+            return;
+        };
+        pane.body_rect = Some(area);
+        let border = if pane.focused {
+            DIVIDER_FOCUSED
+        } else {
+            DIVIDER_DIM
+        };
+        let mode = match pane.mode() {
+            crate::tui::app::btw_pane::BtwMode::Seeded => "seeded",
+            crate::tui::app::btw_pane::BtwMode::Tangent => "tangent",
+        };
+        let title = if pane.hidden_streaming {
+            format!(" btw · {mode} · streaming ")
+        } else {
+            format!(" btw · {mode} ")
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
+        let history_area = chunks[0];
+        let input_area = chunks[1];
+        pane.input_rect = Some(input_area);
+
+        let mut lines = Vec::new();
+        for entry in &pane.history {
+            let rendered = render_entry(
+                entry,
+                history_area.width,
+                self.thinking_setting,
+                self.markdown_opts,
+                self.diff_style,
+                self.use_emojis,
+                &self.elided_event_ids,
+                self.started_at.elapsed().as_millis(),
+                None,
+            );
+            lines.extend(rendered.lines);
+            lines.push(Line::default());
+        }
+        if let Some(pending) = &pane.pending {
+            let mut cache = crate::tui::history::PendingRenderState::default();
+            lines.extend(render_pending_incremental(
+                pending,
+                history_area.width,
+                &mut cache,
+            ));
+        }
+        let total = lines.len();
+        let visible = history_area.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        if pane.history_scroll_offset > max_scroll {
+            pane.history_scroll_offset = max_scroll;
+        }
+        let drop = total.saturating_sub(visible + pane.history_scroll_offset);
+        let shown = if total > visible {
+            lines.into_iter().skip(drop).take(visible).collect()
+        } else {
+            lines
+        };
+        frame.render_widget(Paragraph::new(shown), history_area);
+
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(" btw message ");
+        let input_inner = input_block.inner(input_area);
+        frame.render_widget(input_block, input_area);
+        let text = if pane.composer.is_empty() {
+            Line::from(Span::styled(
+                "Ask a side question…",
+                Style::default()
+                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        } else {
+            Line::from(pane.composer.text().to_string())
+        };
+        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), input_inner);
     }
 
     /// Draw the split divider. Brighter when the pane is focused so the

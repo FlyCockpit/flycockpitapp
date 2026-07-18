@@ -235,6 +235,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "btw",
+        description: "Open a persistent side conversation pane (arg: question/new/tangent/end)",
+        takes_args: true,
+        run: run_btw,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "clear",
         description: "Clear the chat and start a fresh session (alias of /new)",
         takes_args: false,
@@ -1095,6 +1103,11 @@ fn run_fork(app: &mut App, args: &str) -> bool {
 
 fn run_side(app: &mut App, args: &str) -> bool {
     app.handle_side_command(args);
+    false
+}
+
+fn run_btw(app: &mut App, args: &str) -> bool {
+    app.handle_btw_command(args);
     false
 }
 

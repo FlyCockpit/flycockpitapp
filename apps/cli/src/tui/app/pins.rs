@@ -751,6 +751,7 @@ mod tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
             client_tasks: ClientTasks::default(),

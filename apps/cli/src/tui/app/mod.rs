@@ -10,6 +10,7 @@
 //! never reach this loop — the user can use `Ctrl+J` as a newline
 //! fallback in the composer.
 
+mod btw_pane;
 mod events;
 pub(in crate::tui) mod help_overlay;
 mod input;
@@ -71,6 +72,7 @@ use crate::engine::TurnEvent;
 use crate::engine::message::{QueueTarget, QueuedUserMessage};
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
+use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy, AsyncActionResult,
     AsyncActionRunner,
@@ -1603,6 +1605,11 @@ pub struct App {
     /// and on submit/cancel sends `ResolveInterrupt` back to the daemon.
     /// `None` when no question is pending.
     pub(super) question_dialog: Option<crate::tui::dialog::question::QuestionDialog>,
+    /// True when the visible question dialog came from the `/btw` side runner
+    /// and must resolve over that runner's attached daemon client.
+    pub(super) question_dialog_btw: bool,
+    /// A side-pane interrupt waiting behind the currently visible main dialog.
+    pub(super) pending_btw_interrupt: Option<TurnEvent>,
     /// Whether the composer has genuinely been the user's active input
     /// surface since the last question dialog closed
     /// (implementation note). Set true by a render pass
@@ -1961,6 +1968,10 @@ pub struct App {
     /// a time; `None` when no pane is open. Auto-closes when the child
     /// exits, serviced once per event-loop tick.
     pub(super) pane: Option<crate::tui::pty::PtyPane>,
+    /// Live `/btw` side conversation pane. Unlike legacy `/side`, this does
+    /// not replace the main session view; it owns its own daemon runner,
+    /// composer, queue mirror, history, and pending assistant turn.
+    pub(super) btw_pane: Option<BtwPane>,
     /// Where the open pane sits in the chat-body region.
     pub(super) pane_side: PaneSide,
     /// Pane's share of the body in a split (0.0–1.0), persisted for the
@@ -3061,6 +3072,8 @@ impl App {
             overlay: Overlay::None,
             daemon_prompt,
             question_dialog: None,
+            question_dialog_btw: false,
+            pending_btw_interrupt: None,
             composer_active_since_dialog: true,
             pending_local_choice: None,
             daemon_connected,
@@ -3152,6 +3165,7 @@ impl App {
             toast: None,
             idle_reason_status: None,
             pane: None,
+            btw_pane: None,
             pane_side: PaneSide::Full,
             pane_ratio: 0.5,
             pane_focused: false,
@@ -3458,6 +3472,17 @@ impl App {
         // live daemon. The daemon's boot sweep is the SIGKILL backstop.
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
+        }
+        if self.btw_pane.is_some() {
+            if let Some(Ok(runner)) = self.agent_runner.as_ref() {
+                let _ = agent_runner::attached_request_tx_blocking(
+                    runner.attached_request_tx.clone(),
+                    crate::daemon::proto::Request::EndBtwFork {
+                        parent_session_id: runner.session_id,
+                    },
+                );
+            }
+            self.close_btw_pane();
         }
 
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
@@ -6278,7 +6303,7 @@ impl App {
     /// per-question `Cancel` so the blocked `question` tool unblocks with
     /// dismissed answers.
     pub(super) fn resolve_question_dialog(
-        &self,
+        &mut self,
         result: crate::tui::dialog::question::QuestionResult,
     ) {
         use crate::daemon::proto::{Request, ResolveResponse};
@@ -6290,10 +6315,23 @@ impl App {
             } => (interrupt_id, ResolveResponse::Batch { responses }),
             QuestionResult::Cancel { interrupt_id } => (interrupt_id, ResolveResponse::Cancel),
         };
-        self.send_daemon_request(Request::ResolveInterrupt {
+        let request = Request::ResolveInterrupt {
             interrupt_id,
             response,
-        });
+        };
+        let was_btw_dialog = self.question_dialog_btw;
+        if was_btw_dialog {
+            if let Some(Ok(runner)) = self.btw_pane.as_ref().and_then(|pane| pane.runner.as_ref()) {
+                let _ = agent_runner::attached_request_tx_blocking(
+                    runner.attached_request_tx.clone(),
+                    request,
+                );
+            }
+        } else {
+            self.send_daemon_request(request);
+        }
+        self.question_dialog_btw = false;
+        self.install_pending_btw_interrupt();
     }
 
     /// `/prune` (T6.d): show the before→after context % and the
@@ -6444,7 +6482,11 @@ impl App {
                 let repair_required = runner.repair_required.clone();
                 let daemon_version = runner.daemon_version.clone();
                 let daemon_compatible = runner.daemon_compatible;
+                let live_btw_fork = runner.btw_fork.clone();
                 self.agent_runner = Some(Ok(runner));
+                if let Some(info) = live_btw_fork {
+                    self.open_btw_pane_from_info(info, true);
+                }
                 let label = if short_id.is_empty() {
                     session_id.to_string()
                 } else {
@@ -7269,6 +7311,7 @@ impl App {
     /// first-message path and the eager display attach.
     fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         if let Ok(r) = &runner {
+            let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();
             // In daemonless mode this runner spawned our own ephemeral
             // daemon; arm the ownership guard so it's reaped on exit.
@@ -7316,6 +7359,9 @@ impl App {
             // daemon (daemonless / auto-spawn), not just the canonical one —
             // reuses the just-established daemon, no new spawn, one request.
             self.refresh_guidance_estimate_from_daemon(&r.socket);
+            if let Some(info) = live_btw_fork {
+                self.open_btw_pane_from_info(info, true);
+            }
         }
         let refresh_skills = runner.is_ok();
         self.agent_runner = Some(runner);
@@ -7928,7 +7974,9 @@ impl App {
     /// that dialog's keys when reached via `/keys`.
     pub(super) fn key_context(&self) -> crate::tui::keys_overlay::KeyContext {
         use crate::tui::keys_overlay::KeyContext;
-        if self.pane.is_some() {
+        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
+            KeyContext::BtwPane
+        } else if self.pane.is_some() {
             KeyContext::EmbeddedPane
         } else if let Some(dialog) = self.question_dialog.as_ref() {
             // The approval dialog is a `question`-tool interrupt rendered
@@ -12868,6 +12916,7 @@ mod footer_selector_tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
             client_tasks: ClientTasks::default(),
@@ -13172,6 +13221,7 @@ mod failed_dispatch_reconciliation_tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
             client_tasks: ClientTasks::default(),

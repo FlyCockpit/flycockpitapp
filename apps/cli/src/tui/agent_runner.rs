@@ -100,6 +100,10 @@ pub struct AgentRunner {
     /// Responses resume repair state, when the daemon opened the session
     /// read-only because provider replay cannot be rebuilt safely.
     pub repair_required: Option<proto::ResumeRepairState>,
+    /// Live `/btw` fork advertised by the daemon when attaching to a parent
+    /// session. The TUI may attach a second runner to this session id for the
+    /// side pane; the main runner remains bound to the parent.
+    pub btw_fork: Option<proto::BtwForkInfo>,
     /// Version advertised by the daemon at attach.
     pub daemon_version: String,
     /// Whether this client is compatible with the daemon protocol/version.
@@ -394,6 +398,7 @@ fn try_spawn_inner(
                 history,
                 paused_work,
                 repair_required,
+                btw_fork,
                 daemon_version,
                 daemon_compatible,
             ) = match attached {
@@ -407,6 +412,7 @@ fn try_spawn_inner(
                     history,
                     paused_work,
                     repair_required,
+                    btw_fork,
                     daemon_version,
                     compatible,
                     ..
@@ -420,6 +426,7 @@ fn try_spawn_inner(
                     history,
                     paused_work,
                     repair_required.map(|repair| *repair),
+                    btw_fork,
                     daemon_version,
                     compatible,
                 ),
@@ -478,6 +485,7 @@ fn try_spawn_inner(
                 history,
                 paused_work,
                 repair_required,
+                btw_fork,
                 daemon_version,
                 daemon_compatible,
             ))
@@ -498,6 +506,7 @@ fn try_spawn_inner(
         history,
         paused_work,
         repair_required,
+        btw_fork,
         daemon_version,
         daemon_compatible,
     ) = attached;
@@ -771,6 +780,7 @@ fn try_spawn_inner(
         history,
         paused_work,
         repair_required,
+        btw_fork,
         daemon_version,
         daemon_compatible,
         client_tasks,
@@ -2030,6 +2040,7 @@ mod tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
             client_tasks,

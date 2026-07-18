@@ -104,8 +104,7 @@ pub(super) enum EditAction {
 pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec<EditAction> {
     let mut actions = vec![EditAction::Url, EditAction::Headers];
     let registry = templates::ProviderRegistry::standard();
-    let provider = registry.provider_for(provider_id, entry);
-    match provider.id() {
+    match registry.provider_id_for(provider_id, entry) {
         "copilot" => actions.push(EditAction::CopilotAuth),
         crate::auth::xai_oauth::CREDENTIAL_KEY => {
             actions.push(EditAction::OAuthAuth(OAuthProvider::Grok))

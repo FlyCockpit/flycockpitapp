@@ -46,10 +46,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 paths.socket.display(),
                 paths.pid_file.display()
             );
+            let terminal_factory = crate::terminal_host::factory();
             if resume_all_sessions {
-                daemon::run_foreground_with_resume(paths, true).await
+                daemon::run_foreground_with_resume(paths, true, terminal_factory).await
             } else {
-                daemon::run_foreground(paths).await
+                daemon::run_foreground(paths, terminal_factory).await
             }
         }
         DaemonCommand::Stop { grace } => {

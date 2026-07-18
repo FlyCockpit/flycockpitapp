@@ -436,7 +436,7 @@ pub enum AgentCommand {
         path: Option<PathBuf>,
         #[arg(long)]
         description: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long, value_parser = parse_agent_mode)]
         mode: Option<AgentMode>,
         /// Comma-separated tool list.
         #[arg(long)]
@@ -446,6 +446,15 @@ pub enum AgentCommand {
     },
     /// List all available agents (project + global + extended `agent_dirs`).
     List,
+}
+
+fn parse_agent_mode(value: &str) -> Result<AgentMode, String> {
+    match value {
+        "all" => Ok(AgentMode::All),
+        "primary" => Ok(AgentMode::Primary),
+        "subagent" => Ok(AgentMode::Subagent),
+        _ => Err("expected one of: all, primary, subagent".to_string()),
+    }
 }
 
 // ---- providers / models ----

@@ -126,7 +126,10 @@ async fn daemon_trust_read_through() {
         json["database_path"],
         daemon.db_path().display().to_string()
     );
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(
+        json["schema_version"],
+        cockpit_cli::db::EXPECTED_SCHEMA_VERSION
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -296,7 +299,13 @@ fn daemon_refuses_stale_schema() {
     assert_failure("stale-schema daemon start", &output, &home);
     let text = output_text(&output);
     assert!(text.contains("database schema version mismatch"), "{text}");
-    assert!(text.contains("found 0, expected 1"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "found 0, expected {}",
+            cockpit_cli::db::EXPECTED_SCHEMA_VERSION
+        )),
+        "{text}"
+    );
     assert!(text.contains("move the database"), "{text}");
     assert!(text.contains("Development schema resets"), "{text}");
     assert!(!home.pid_file().exists(), "stale daemon pid file survived");

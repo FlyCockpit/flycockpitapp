@@ -15,12 +15,8 @@
 //! and glyph table apply to either. Result: a 6-row × 18-col rendered
 //! banner.
 //!
-//! Suppression for the in-TUI banner box (`NO_COLOR` or config
-//! `enabled = false`) is handled by [`suppressed_for_tui`]; callers
-//! skip the box when it returns `true`.
-
-use ratatui::style::{Color, Style};
-use ratatui::text::Span;
+//! Terminal UI rendering lives in the binary crate. Core exposes only the
+//! ANSI/data path used by startup welcome text.
 
 /// A pixel-art plane plus its palette. Selected once per render
 /// (P-51 vs rooster) so every render path draws from the same source.
@@ -90,10 +86,8 @@ pub const RENDERED_WIDTH: usize = PLANE_WIDTH / 2;
 pub const RENDERED_HEIGHT: usize = PLANE_HEIGHT / 2;
 /// Two-space left indent applied when rendering, matching the existing
 /// `welcome.rs` chrome spacing.
-#[cfg(test)]
 const LEFT_INDENT: usize = 2;
 
-#[cfg(test)]
 const RESET: &str = "\x1b[0m";
 
 /// Whether `COCKPIT_ROOSTER` is set to a truthy value — `true`, `1`,
@@ -126,21 +120,10 @@ fn active_art() -> Art {
     }
 }
 
-/// Whether the banner is suppressed for the *in-TUI* box (GOALS §1g
-/// rules minus the TTY/width checks, which the TUI handles itself —
-/// it's always a TTY, and the box does its own pane-fit check). Returns
-/// `true` (suppress) on `enabled = false` or `NO_COLOR`. A truthy
-/// `COCKPIT_ROOSTER` no longer suppresses — it swaps the active art to
-/// the rooster (see [`active_art`]).
-pub fn suppressed_for_tui(enabled: bool) -> bool {
-    !enabled || std::env::var_os("NO_COLOR").is_some()
-}
-
 /// Render the active art (rooster when `COCKPIT_ROOSTER` is truthy,
 /// else P-51) regardless of suppression rules. Useful for tests and for
 /// callers (e.g. `/banner` debug commands later) that want the art
 /// unconditionally.
-#[cfg(test)]
 pub fn render_unconditional() -> Vec<String> {
     let art = active_art();
     let indent = " ".repeat(LEFT_INDENT);
@@ -160,33 +143,6 @@ pub fn render_unconditional() -> Vec<String> {
             ));
         }
         out.push(line);
-    }
-    out
-}
-
-/// The art as ratatui styled spans — one row per `Vec<Span>`, one span
-/// per 2×2 cell group, with no left indent (the in-TUI banner box
-/// centers and borders the art itself). Parallel to
-/// [`render_unconditional`], which bakes ANSI escapes + an indent for
-/// the raw-stdout path.
-pub fn render_styled_lines() -> Vec<Vec<Span<'static>>> {
-    let art = active_art();
-    let mut out = Vec::with_capacity(RENDERED_HEIGHT);
-    for y in (0..PLANE_HEIGHT).step_by(2) {
-        let top = art.plane[y].as_bytes();
-        let bot = art.plane[y + 1].as_bytes();
-        let mut row = Vec::with_capacity(RENDERED_WIDTH);
-        for x in (0..PLANE_WIDTH).step_by(2) {
-            row.push(cell_span(
-                art.color_discovery_order,
-                art.palette,
-                top[x] as char,
-                top[x + 1] as char,
-                bot[x] as char,
-                bot[x + 1] as char,
-            ));
-        }
-        out.push(row);
     }
     out
 }
@@ -242,7 +198,6 @@ fn cell_parts(
 }
 
 /// One 2×2 cell group as an ANSI-styled string (raw-stdout path).
-#[cfg(test)]
 fn draw_cell(
     color_discovery_order: ColorDiscoveryOrder,
     palette: &[u8],
@@ -255,27 +210,6 @@ fn draw_cell(
         None => " ".to_string(),
         Some((glyph, fg, Some(bg))) => format!("\x1b[38;5;{fg};48;5;{bg}m{glyph}{RESET}"),
         Some((glyph, fg, None)) => format!("\x1b[38;5;{fg}m{glyph}{RESET}"),
-    }
-}
-
-/// One 2×2 cell group as a ratatui [`Span`] (in-TUI path).
-fn cell_span(
-    color_discovery_order: ColorDiscoveryOrder,
-    palette: &[u8],
-    ul: char,
-    ur: char,
-    ll: char,
-    lr: char,
-) -> Span<'static> {
-    match cell_parts(color_discovery_order, palette, ul, ur, ll, lr) {
-        None => Span::raw(" "),
-        Some((glyph, fg, Some(bg))) => Span::styled(
-            glyph,
-            Style::default()
-                .fg(Color::Indexed(fg))
-                .bg(Color::Indexed(bg)),
-        ),
-        Some((glyph, fg, None)) => Span::styled(glyph, Style::default().fg(Color::Indexed(fg))),
     }
 }
 
@@ -380,21 +314,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_color_suppresses_tui_box() {
-        // SAFETY: NO_COLOR is read-only-ish in tests but we set/unset
-        // around the assertion. unsafe-block satisfies the
-        // edition-2024 set_var/remove_var contract.
-        let prev = std::env::var_os("NO_COLOR");
-        unsafe { std::env::set_var("NO_COLOR", "1") };
-        let suppressed = suppressed_for_tui(true);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("NO_COLOR", v) },
-            None => unsafe { std::env::remove_var("NO_COLOR") },
-        }
-        assert!(suppressed);
-    }
-
     /// Serializes every test that mutates `COCKPIT_ROOSTER` so they
     /// don't race each other's set/restore (tests run in parallel by
     /// default). Each guarded test saves and restores the prior value.
@@ -422,13 +341,23 @@ mod tests {
         }
     }
 
-    /// Set of distinct fg colors used across the active art's spans.
+    /// Set of distinct fg colors used across the active ANSI art.
     fn active_fg_colors() -> std::collections::BTreeSet<u8> {
         let mut seen = std::collections::BTreeSet::new();
-        for row in render_styled_lines() {
-            for span in row {
-                if let Some(Color::Indexed(i)) = span.style.fg {
-                    seen.insert(i);
+        let art = active_art();
+        for y in (0..PLANE_HEIGHT).step_by(2) {
+            let top = art.plane[y].as_bytes();
+            let bot = art.plane[y + 1].as_bytes();
+            for x in (0..PLANE_WIDTH).step_by(2) {
+                if let Some((_glyph, fg, _bg)) = cell_parts(
+                    art.color_discovery_order,
+                    art.palette,
+                    top[x] as char,
+                    top[x + 1] as char,
+                    bot[x] as char,
+                    bot[x + 1] as char,
+                ) {
+                    seen.insert(fg);
                 }
             }
         }
@@ -507,11 +436,6 @@ mod tests {
                 assert_eq!(active_art().plane, &P51_PLANE);
             });
         }
-    }
-
-    #[test]
-    fn disabled_flag_suppresses_tui_box() {
-        assert!(suppressed_for_tui(false));
     }
 
     /// Visual smoke test. Run with `--nocapture` to see the banner.

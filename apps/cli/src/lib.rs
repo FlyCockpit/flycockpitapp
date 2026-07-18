@@ -4,60 +4,30 @@
 //! target exists so process-boundary tests can exercise the daemon protocol
 //! without duplicating wire types.
 
-mod agents;
-mod approval;
-mod assistants;
-mod auth;
-mod auto_title;
 mod banner;
-mod browser;
 mod cli;
 mod clipboard;
 mod commands;
-mod computer;
 pub use cockpit_config as config;
-mod container;
-mod credentials;
-mod daemon;
-pub use cockpit_db as db;
-mod diagnostics;
-pub mod embeddings;
-mod engine;
-mod env_snapshot;
-mod envref;
-mod git;
-mod gitignore;
-mod harness;
-mod intel;
-mod knowledge;
-mod locks;
-mod mcp;
-mod model_system_prompt;
-mod packages;
-mod private_fs;
-mod process;
-mod providers;
-mod redact;
-mod secret_ref;
-mod session;
-mod skills;
-mod startup;
-mod sync;
-mod sysinfo;
 #[cfg(test)]
-mod test_env;
-mod text;
-mod tokens;
-mod tools;
+pub use cockpit_core::test_env;
+pub use cockpit_core::{
+    agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
+    daemon, diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
+    knowledge, locks, mcp, model_system_prompt, packages, private_fs, process, providers, redact,
+    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools, user_agent, welcome,
+    wizard,
+};
+pub use cockpit_db as db;
+mod terminal_host;
 mod tui;
-pub mod user_agent;
-mod welcome;
-pub mod wizard;
 
 use clap::Parser;
 use std::process::ExitCode;
 
 use crate::cli::{Cli, Command};
+
+const TOKIO_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 pub mod manpages {
     use std::fs;
@@ -566,9 +536,11 @@ pub fn main_entry() -> ExitCode {
     // Sandboxing part 2: dispatch the zerobox Linux sandbox helper and
     // install the PATH-prepend alias BEFORE the tokio runtime starts.
     tools::shell_sandbox::init();
+    terminal_host::install_factory();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(TOKIO_WORKER_STACK_SIZE)
         .build();
     let result = match runtime {
         Ok(runtime) => runtime.block_on(async_main()),

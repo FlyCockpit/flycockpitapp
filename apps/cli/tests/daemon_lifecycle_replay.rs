@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use rusqlite::{Connection, params};
-use support::{IsolatedHome, SpawnedDaemon, output_text, wait_until};
+use support::{IsolatedHome, SpawnedDaemon, log_tail, output_text, wait_until};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -217,6 +217,7 @@ fn assert_replay_payload(row: &InterruptRow) {
 
 async fn wait_for_interrupt(
     client: &cockpit_cli::integration::DaemonClient,
+    daemon: &SpawnedDaemon,
     session_id: Uuid,
     reason: Option<&str>,
 ) -> Uuid {
@@ -224,8 +225,18 @@ async fn wait_for_interrupt(
         match client
             .next_event(Duration::from_secs(20))
             .await
-            .expect("daemon event")
-        {
+            .unwrap_or_else(|err| {
+                let status = daemon
+                    .command()
+                    .args(["daemon", "status"])
+                    .output()
+                    .map(|output| output_text(&output))
+                    .unwrap_or_else(|status_err| format!("status probe failed: {status_err}"));
+                panic!(
+                    "daemon event while waiting for interrupt: {err}\nstatus:\n{status}\nlog tail:\n{}",
+                    log_tail(daemon.home())
+                )
+            }) {
             DaemonEvent::InterruptRaised {
                 session_id: got,
                 interrupt_id,
@@ -311,7 +322,8 @@ async fn create_parked_session_with_hook(
         .send_user_message("trigger lifecycle approval")
         .await
         .expect("send user message");
-    let interrupt_id = wait_for_interrupt(&client, attached.session_id, Some("initial")).await;
+    let interrupt_id =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
 
     (provider, daemon, attached, interrupt_id)
 }
@@ -354,7 +366,7 @@ async fn lifecycle_graceful_park_round_trip_replays_once() {
     assert_eq!(reattached.paused_work_len, 1);
 
     let raised_after_restart =
-        wait_for_interrupt(&client, attached.session_id, Some("rehydration")).await;
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await;
     assert_eq!(raised_after_restart, interrupt_id);
 
     client
@@ -421,7 +433,7 @@ async fn lifecycle_sigkill_open_interrupt_reconciles_and_replays_once() {
     )
     .await;
     let raised_after_restart =
-        wait_for_interrupt(&client, attached.session_id, Some("rehydration")).await;
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await;
     assert_eq!(raised_after_restart, interrupt_id);
 
     client
@@ -474,7 +486,7 @@ async fn lifecycle_deny_round_trip_resolves_without_broadened_rerun() {
         .await
         .expect("reattach session");
     assert_eq!(
-        wait_for_interrupt(&client, attached.session_id, Some("rehydration")).await,
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
 
@@ -526,7 +538,7 @@ async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_abse
         "parked"
     );
     assert_eq!(
-        wait_for_interrupt(&client, attached.session_id, Some("rehydration")).await,
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
 
@@ -577,7 +589,7 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         .await
         .expect("reattach session");
     assert_eq!(
-        wait_for_interrupt(&client, attached.session_id, Some("rehydration")).await,
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
     client
@@ -640,7 +652,7 @@ async fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_i
         .await
         .expect("reattach session");
     assert_eq!(
-        wait_for_interrupt(&client, attached.session_id, Some("rehydration")).await,
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
     client

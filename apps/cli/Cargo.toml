@@ -83,6 +83,7 @@ rig = { version = "0.38", package = "rig-core", features = ["image"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 
 # Storage
+cockpit-core = { path = "../../crates/cockpit-core" }
 cockpit-config = { path = "../../crates/cockpit-config" }
 cockpit-db = { path = "../../crates/cockpit-db" }
 cockpit-proto = { path = "../../crates/cockpit-proto" }
@@ -263,6 +264,7 @@ libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
+cockpit-core = { path = "../../crates/cockpit-core", features = ["test-support"] }
 predicates = "3"
 tempfile = "3"
 # `test-util` enables `tokio::time::{pause, advance}` for deterministic

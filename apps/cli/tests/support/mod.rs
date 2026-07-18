@@ -193,6 +193,10 @@ impl SpawnedDaemon {
         self.home.project_path()
     }
 
+    pub fn home(&self) -> &IsolatedHome {
+        &self.home
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.home.db_path()
     }
@@ -393,7 +397,7 @@ pub async fn wait_until_with_home<F, Fut>(
     }
 }
 
-fn log_tail(home: &IsolatedHome) -> String {
+pub fn log_tail(home: &IsolatedHome) -> String {
     tail_file(home.log_file(), 8192).unwrap_or_else(|| "<no log file>".to_string())
 }
 

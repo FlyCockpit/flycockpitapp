@@ -71,6 +71,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "quality_rank",
     "cost_rank",
     "subagent_invokable",
+    "can_delegate",
     "computer_use",
     "embeddings",
     "availability",

@@ -10,49 +10,7 @@ use anyhow::{Context, Result};
 use crate::cli::LearnArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
 use crate::daemon::ephemeral_guard::{EphemeralDaemonGuard, spawn_signal_shutdown};
-
-const TRANSCRIPT_SOURCE: &str =
-    "the reusable workflow we just completed in this conversation transcript";
-
-pub fn subject_from_parts(parts: &[String]) -> String {
-    let subject = parts.join(" ");
-    let subject = subject.trim();
-    if subject.is_empty() {
-        TRANSCRIPT_SOURCE.to_string()
-    } else {
-        subject.to_string()
-    }
-}
-
-/// Compose the single ordinary user turn shared by the slash and CLI forms.
-pub fn build_learn_prompt(subject: &str) -> String {
-    let subject = subject.trim();
-    let subject = if subject.is_empty() {
-        TRANSCRIPT_SOURCE
-    } else {
-        subject
-    };
-    format!(
-        "Create a reusable Agent Skill from the following source request:\n\n\
-         <learn-source>\n{subject}\n</learn-source>\n\n\
-         This is a user-initiated `/learn` turn. Work through the normal live-agent flow and \
-         save the finished package with the `skill_manage` tool so its validation, optional \
-         write approval, and foreground provenance apply. If this frame does not expose \
-         `skill_manage`, hand off to the Build primary before saving. Do not write SKILL.md \
-         directly.\n\n\
-         Gather evidence before authoring: use read/search for local paths, web fetch/search \
-         for URLs, the current conversation transcript for a just-completed workflow, and \
-         the supplied text for pasted steps. Multiple sources normally produce one skill \
-         unless the user explicitly asks for more. Do not guess missing facts.\n\n\
-         House authoring rules:\n\
-         - Choose a conformant lowercase skill name and a concrete description of at most 60 characters.\n\
-         - Use these body sections in this order: `## When to Use`, `## Procedure`, `## Pitfalls`, `## Verification`.\n\
-         - Frame actions in terms of Cockpit's available tools and ordinary shell commands.\n\
-         - Never invent commands, flags, paths, APIs, or verification results; confirm them from the sources.\n\
-         - Keep the procedure concise, actionable, and reusable rather than narrating this conversation.\n\
-         - Save through `skill_manage` and report the created skill name and source evidence when done."
-    )
-}
+pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     let subject = subject_from_parts(&args.sources);

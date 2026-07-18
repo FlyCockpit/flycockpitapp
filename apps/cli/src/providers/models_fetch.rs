@@ -857,6 +857,7 @@ fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCap
         ),
         reasoning_effort: reasoning_effort_capability_from_metadata(obj)?,
         client_side_tools: client_side_tools_capability_from_metadata(obj).unwrap_or_default(),
+        computer_use: Default::default(),
     })
 }
 

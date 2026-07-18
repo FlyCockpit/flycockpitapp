@@ -75,9 +75,12 @@ impl Model {
         let quality_rank = cfg.resolve_quality_rank(&active.provider, &active.model);
         let cost_rank = cfg.resolve_cost_rank(&active.provider, &active.model);
         let subagent_invokable = cfg.resolve_subagent_invokable(&active.provider, &active.model);
+        let computer_use = cfg
+            .resolve_capabilities(&active.provider, &active.model)
+            .computer_use;
         let effective_redact =
             Self::effective_redact_table_for(cfg, &active.provider, &active.model, redact.clone());
-        build_model(
+        build_model_with_computer_use(
             &active.provider,
             entry,
             &active.model,
@@ -92,6 +95,7 @@ impl Model {
             quality_rank,
             cost_rank,
             subagent_invokable,
+            computer_use,
             trusted_only,
             redact,
             effective_redact,
@@ -209,9 +213,10 @@ impl Model {
         let quality_rank = cfg.resolve_quality_rank(provider_id, model_id);
         let cost_rank = cfg.resolve_cost_rank(provider_id, model_id);
         let subagent_invokable = cfg.resolve_subagent_invokable(provider_id, model_id);
+        let computer_use = cfg.resolve_capabilities(provider_id, model_id).computer_use;
         let effective_redact =
             Self::effective_redact_table_for(cfg, provider_id, model_id, redact.clone());
-        build_model(
+        build_model_with_computer_use(
             provider_id,
             entry,
             model_id,
@@ -226,6 +231,7 @@ impl Model {
             quality_rank,
             cost_rank,
             subagent_invokable,
+            computer_use,
             trusted_only,
             redact,
             effective_redact,
@@ -243,6 +249,7 @@ pub(super) fn is_anthropic_native(base_url: &str) -> bool {
 /// ([`is_anthropic_native`]). The `cache` config drives the Anthropic TTL
 /// mode (5-min vs 1h) and is unused on the OpenAI-compat path (which relies
 /// on prefix stability + `prompt_cache_key`, set later via `ModelParams`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_model(
     provider_id: &str,
@@ -259,6 +266,51 @@ pub(super) fn build_model(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
+    trusted_only: Arc<AtomicBool>,
+    session_redact: Arc<RedactionTable>,
+    redact: Arc<RedactionTable>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Model> {
+    build_model_with_computer_use(
+        provider_id,
+        entry,
+        model_id,
+        cache,
+        timeout,
+        hard_timeout_on_stall,
+        client_side_tools,
+        wire_api,
+        wire_api_explicit,
+        trusted,
+        location,
+        quality_rank,
+        cost_rank,
+        subagent_invokable,
+        None,
+        trusted_only,
+        session_redact,
+        redact,
+        lookup,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_model_with_computer_use(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    model_id: &str,
+    cache: &crate::config::providers::CacheConfig,
+    timeout: &crate::config::providers::TimeoutConfig,
+    hard_timeout_on_stall: bool,
+    client_side_tools: ClientSideToolsCapability,
+    wire_api: crate::config::providers::WireApi,
+    wire_api_explicit: bool,
+    trusted: bool,
+    location: Option<ModelLocation>,
+    quality_rank: i64,
+    cost_rank: i64,
+    subagent_invokable: bool,
+    computer_use: Option<crate::config::providers::ComputerUseCapability>,
     trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
@@ -296,7 +348,7 @@ pub(super) fn build_model(
     } else if is_anthropic_native(&resolved.base_url) {
         let max_tokens =
             crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
-        build_anthropic_model(
+        build_anthropic_model_with_computer_use(
             provider_id,
             &resolved,
             model_id,
@@ -309,6 +361,7 @@ pub(super) fn build_model(
             quality_rank,
             cost_rank,
             subagent_invokable,
+            computer_use.as_ref(),
             trusted_only,
             session_redact,
             redact,
@@ -368,6 +421,7 @@ fn resolve_utility_token_limit(entry: &ProviderEntry, model_id: &str) -> Option<
 /// the no-serialization-fork rule); anything below enables per-block
 /// `with_prompt_caching()` (system prompt + last content block of the last
 /// message, 5-min ephemeral). No new config field — `ttl_secs` is the lever.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_anthropic_model(
     provider_id: &str,
@@ -382,6 +436,45 @@ pub(super) fn build_anthropic_model(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
+    trusted_only: Arc<AtomicBool>,
+    session_redact: Arc<RedactionTable>,
+    redact: Arc<RedactionTable>,
+) -> Result<Model> {
+    build_anthropic_model_with_computer_use(
+        provider_id,
+        resolved,
+        model_id,
+        max_tokens,
+        cache,
+        timeout,
+        hard_timeout_on_stall,
+        trusted,
+        location,
+        quality_rank,
+        cost_rank,
+        subagent_invokable,
+        None,
+        trusted_only,
+        session_redact,
+        redact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_anthropic_model_with_computer_use(
+    provider_id: &str,
+    resolved: &models_fetch::ResolvedRequest,
+    model_id: &str,
+    max_tokens: u64,
+    cache: &crate::config::providers::CacheConfig,
+    timeout: &crate::config::providers::TimeoutConfig,
+    hard_timeout_on_stall: bool,
+    trusted: bool,
+    location: Option<ModelLocation>,
+    quality_rank: i64,
+    cost_rank: i64,
+    subagent_invokable: bool,
+    computer_use: Option<&crate::config::providers::ComputerUseCapability>,
     trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
@@ -405,6 +498,17 @@ pub(super) fn build_anthropic_model(
     if one_hour {
         // The 1h extended cache requires the beta header on the client.
         builder = builder.anthropic_beta("extended-cache-ttl-2025-04-11");
+    }
+    if let Some(contract) = computer_use.and_then(|capability| capability.contract) {
+        builder = match contract {
+            crate::config::providers::ComputerUseContract::Anthropic20251124 => {
+                builder.anthropic_beta("computer-use-2025-11-24")
+            }
+            crate::config::providers::ComputerUseContract::Anthropic20250124 => {
+                builder.anthropic_beta("computer-use-2025-01-24")
+            }
+            crate::config::providers::ComputerUseContract::OpenAiResponses => builder,
+        };
     }
     let extra_headers = resolved
         .headers
@@ -786,6 +890,10 @@ pub struct ModelParams {
     /// `None`. The native Anthropic arm ignores it entirely (it uses
     /// provider-concrete per-block caching instead).
     pub prompt_cache_key: Option<String>,
+    /// Provider-native computer-use tool overlay. This stays `None` by default;
+    /// the gating prompt is responsible for attaching it only to approved
+    /// computer-use subagent turns.
+    pub native_computer: Option<crate::computer::NativeComputerToolConfig>,
 }
 
 /// Utility/non-streaming model dispatch budget and override seam.
@@ -906,6 +1014,9 @@ pub(super) fn build_agent<C: CompletionClient>(
 /// unchanged.
 pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
     let vendor = sanitized_extra_params(params.additional_params.as_ref());
+    let vendor = merge_native_computer_tools(vendor, params, |contract| {
+        contract == crate::computer::ComputerToolContract::OpenAiResponses
+    });
     let Some(key) = params.prompt_cache_key.as_ref().filter(|k| !k.is_empty()) else {
         return vendor;
     };
@@ -922,6 +1033,52 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
         "prompt_cache_key".to_string(),
         serde_json::Value::String(key.clone()),
     );
+    Some(serde_json::Value::Object(map))
+}
+
+pub(super) fn anthropic_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
+    let vendor = sanitized_extra_params(params.additional_params.as_ref());
+    merge_native_computer_tools(vendor, params, |contract| {
+        matches!(
+            contract,
+            crate::computer::ComputerToolContract::Anthropic20251124
+                | crate::computer::ComputerToolContract::Anthropic20250124
+        )
+    })
+}
+
+pub(super) fn native_computer_beta_headers(params: &ModelParams) -> Vec<&'static str> {
+    params
+        .native_computer
+        .as_ref()
+        .map(|computer| computer.wire().beta_headers)
+        .unwrap_or_default()
+}
+
+fn merge_native_computer_tools(
+    vendor: Option<serde_json::Value>,
+    params: &ModelParams,
+    accepts_contract: impl Fn(crate::computer::ComputerToolContract) -> bool,
+) -> Option<serde_json::Value> {
+    let Some(native_computer) = params
+        .native_computer
+        .as_ref()
+        .filter(|computer| accepts_contract(computer.contract))
+    else {
+        return vendor;
+    };
+    let mut map = match vendor {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(other) => return Some(other),
+        None => serde_json::Map::new(),
+    };
+    let native_tools = native_computer.wire().tools;
+    match map.get_mut("tools") {
+        Some(serde_json::Value::Array(tools)) => tools.extend(native_tools),
+        _ => {
+            map.insert("tools".to_string(), serde_json::Value::Array(native_tools));
+        }
+    }
     Some(serde_json::Value::Object(map))
 }
 
@@ -955,7 +1112,7 @@ pub(super) fn build_anthropic_agent(
     if let Some(m) = params.max_tokens {
         b = b.max_tokens(m);
     }
-    if let Some(extra) = sanitized_extra_params(params.additional_params.as_ref()) {
+    if let Some(extra) = anthropic_additional_params(params) {
         b = b.additional_params(extra);
     }
     b.build()
@@ -986,7 +1143,12 @@ pub(super) fn build_chatgpt_agent(
     if let Some(m) = params.max_tokens {
         b = b.max_tokens(m);
     }
-    if let Some(extra) = sanitized_extra_params(params.additional_params.as_ref()) {
+    let extra = merge_native_computer_tools(
+        sanitized_extra_params(params.additional_params.as_ref()),
+        params,
+        |contract| contract == crate::computer::ComputerToolContract::OpenAiResponses,
+    );
+    if let Some(extra) = extra {
         b = b.additional_params(extra);
     }
     b.build()

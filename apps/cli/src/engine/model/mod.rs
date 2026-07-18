@@ -2343,6 +2343,128 @@ mod tests {
     }
 
     #[test]
+    fn computer_final_request_snapshots_pin_anthropic_versions() {
+        let geometry = crate::computer::DisplayGeometry {
+            physical: crate::computer::PixelSize {
+                width: 1280,
+                height: 720,
+            },
+            logical: crate::computer::LogicalSize {
+                width: 640.0,
+                height: 360.0,
+            },
+            scale_factor: crate::computer::ScaleFactor(2.0),
+        };
+        let current = ModelParams {
+            native_computer: Some(crate::computer::NativeComputerToolConfig {
+                contract: crate::computer::ComputerToolContract::Anthropic20251124,
+                geometry: geometry.clone(),
+            }),
+            additional_params: Some(
+                json!({ "tools": [{"type": "custom"}], "thinking": {"type": "enabled"} }),
+            ),
+            ..ModelParams::default()
+        };
+        let body = assembled_request(
+            "claude",
+            "anthropic",
+            "SYS",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &current,
+        );
+        assert_eq!(
+            body["additional_params"],
+            json!({
+                "thinking": {"type": "enabled"},
+                "tools": [{
+                    "type": "computer_20251124",
+                    "name": "computer",
+                    "display_width_px": 1280,
+                    "display_height_px": 720,
+                    "enable_zoom": true,
+                }],
+            })
+        );
+        assert_eq!(
+            body["native_computer_beta_headers"],
+            json!(["computer-use-2025-11-24"])
+        );
+
+        let older = ModelParams {
+            native_computer: Some(crate::computer::NativeComputerToolConfig {
+                contract: crate::computer::ComputerToolContract::Anthropic20250124,
+                geometry,
+            }),
+            ..ModelParams::default()
+        };
+        let body = assembled_request(
+            "claude",
+            "anthropic",
+            "SYS",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &older,
+        );
+        assert_eq!(
+            body["additional_params"]["tools"],
+            json!([{
+                "type": "computer_20250124",
+                "name": "computer",
+                "display_width_px": 1280,
+                "display_height_px": 720,
+            }])
+        );
+        assert!(
+            body["additional_params"]["tools"][0]
+                .get("enable_zoom")
+                .is_none()
+        );
+        assert_eq!(
+            body["native_computer_beta_headers"],
+            json!(["computer-use-2025-01-24"])
+        );
+    }
+
+    #[test]
+    fn computer_final_request_snapshot_pins_openai_builtin_tool() {
+        let params = ModelParams {
+            native_computer: Some(crate::computer::NativeComputerToolConfig {
+                contract: crate::computer::ComputerToolContract::OpenAiResponses,
+                geometry: crate::computer::DisplayGeometry {
+                    physical: crate::computer::PixelSize {
+                        width: 1280,
+                        height: 720,
+                    },
+                    logical: crate::computer::LogicalSize {
+                        width: 640.0,
+                        height: 360.0,
+                    },
+                    scale_factor: crate::computer::ScaleFactor(2.0),
+                },
+            }),
+            ..ModelParams::default()
+        };
+        let body = assembled_request(
+            "gpt",
+            "openai-compatible",
+            "SYS",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &params,
+        );
+
+        assert_eq!(
+            body["additional_params"]["tools"],
+            json!([{ "type": "computer" }])
+        );
+        assert_eq!(body["native_computer_beta_headers"], json!([]));
+    }
+
+    #[test]
     fn assembled_request_task_tool_advertises_intent_envelope() {
         let task = crate::engine::tool::definition_of(
             &crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),

@@ -1,7 +1,7 @@
 //! Model policy selection and capability resolution.
 
 use crate::config::providers::{
-    CapabilityStatus, ModelEntry, ModelLocation, ModelTrust, ProvidersConfig,
+    CapabilityStatus, ComputerUseCapability, ModelEntry, ModelLocation, ModelTrust, ProvidersConfig,
 };
 
 #[allow(dead_code)]
@@ -202,6 +202,7 @@ pub struct EffectiveModelCapabilities {
     pub structured_outputs: CapabilityStatus,
     pub embeddings: Option<bool>,
     pub embedding_dimensions: Option<u32>,
+    pub computer_use: Option<ComputerUseCapability>,
 }
 
 #[allow(dead_code)]
@@ -342,6 +343,12 @@ impl ProvidersConfig {
                 .or_else(|| model_caps.and_then(|c| c.embedding_dimensions))
                 .or_else(|| model_entry.and_then(|m| m.embedding_dimensions))
                 .or(provider_caps.embedding_dimensions),
+            computer_use: model_caps
+                .and_then(|c| (!c.computer_use.is_empty()).then(|| c.computer_use.clone()))
+                .or_else(|| {
+                    (!provider_caps.computer_use.is_empty())
+                        .then(|| provider_caps.computer_use.clone())
+                }),
         }
     }
 

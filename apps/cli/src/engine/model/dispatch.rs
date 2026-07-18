@@ -1399,10 +1399,11 @@ pub(super) fn assembled_request(
         // (`prompt-caching-strategy.md` decision 3). Omitted when there's
         // nothing to add, so existing providers' captured bodies are unchanged.
         "additional_params": if provider == "anthropic" {
-            sanitized_extra_params(params.additional_params.as_ref())
+            anthropic_additional_params(params)
         } else {
             openai_additional_params(params)
         },
+        "native_computer_beta_headers": native_computer_beta_headers(params),
         "history": history,
         "prompt": prompt,
     })

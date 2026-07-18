@@ -1090,6 +1090,28 @@ impl ClientSideToolsCapability {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseContract {
+    Anthropic20251124,
+    Anthropic20250124,
+    OpenAiResponses,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComputerUseCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ComputerUseContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CapabilitySource>,
+}
+
+impl ComputerUseCapability {
+    pub fn is_empty(&self) -> bool {
+        self.contract.is_none() && self.source.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCapabilities {
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
@@ -1116,6 +1138,8 @@ pub struct ModelCapabilities {
     pub reasoning_effort: Option<ReasoningEffortCapability>,
     #[serde(default, skip_serializing_if = "ClientSideToolsCapability::is_empty")]
     pub client_side_tools: ClientSideToolsCapability,
+    #[serde(default, skip_serializing_if = "ComputerUseCapability::is_empty")]
+    pub computer_use: ComputerUseCapability,
 }
 
 impl ModelCapabilities {
@@ -1135,6 +1159,7 @@ impl ModelCapabilities {
                 .as_ref()
                 .is_none_or(ReasoningEffortCapability::is_empty)
             && self.client_side_tools.is_empty()
+            && self.computer_use.is_empty()
     }
 }
 
@@ -1191,6 +1216,8 @@ pub struct ProviderCapabilities {
     pub structured_outputs: CapabilityStatus,
     #[serde(default, skip_serializing_if = "ClientSideToolsCapability::is_empty")]
     pub client_side_tools: ClientSideToolsCapability,
+    #[serde(default, skip_serializing_if = "ComputerUseCapability::is_empty")]
+    pub computer_use: ComputerUseCapability,
 }
 
 impl ProviderCapabilities {
@@ -1204,6 +1231,7 @@ impl ProviderCapabilities {
             && self.reasoning.is_unknown()
             && self.structured_outputs.is_unknown()
             && self.client_side_tools.is_empty()
+            && self.computer_use.is_empty()
     }
 }
 

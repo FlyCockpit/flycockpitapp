@@ -167,6 +167,46 @@ fn resolve_capabilities_applies_model_overrides_after_detection() {
 }
 
 #[test]
+fn resolve_capabilities_selects_computer_contract_from_metadata() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "p".into(),
+        ProviderEntry {
+            capabilities: ProviderCapabilities {
+                computer_use: ComputerUseCapability {
+                    contract: Some(ComputerUseContract::Anthropic20250124),
+                    source: Some(CapabilitySource::Manual),
+                },
+                ..ProviderCapabilities::default()
+            },
+            models: vec![ModelEntry {
+                id: "m".into(),
+                capabilities: ModelCapabilities {
+                    computer_use: ComputerUseCapability {
+                        contract: Some(ComputerUseContract::Anthropic20251124),
+                        source: Some(CapabilitySource::Manual),
+                    },
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+
+    let caps = cfg.resolve_capabilities("p", "m");
+    assert_eq!(
+        caps.computer_use.as_ref().and_then(|cap| cap.contract),
+        Some(ComputerUseContract::Anthropic20251124)
+    );
+    let caps = cfg.resolve_capabilities("p", "unknown-model");
+    assert_eq!(
+        caps.computer_use.as_ref().and_then(|cap| cap.contract),
+        Some(ComputerUseContract::Anthropic20250124)
+    );
+}
+
+#[test]
 fn probed_capability_precedence_order() {
     let mut cfg = ProvidersConfig::default();
     cfg.providers.insert(

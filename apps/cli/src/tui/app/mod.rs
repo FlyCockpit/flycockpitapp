@@ -2912,6 +2912,17 @@ impl App {
         Self::new_inner(project, no_sandbox, Some(db))
     }
 
+    pub fn new_with_db_and_session(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        db: crate::db::Db,
+        session_id: uuid::Uuid,
+    ) -> Self {
+        let mut app = Self::new_inner(project, no_sandbox, Some(db));
+        app.launch.session_id = Some(session_id);
+        app
+    }
+
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,

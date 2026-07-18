@@ -15,7 +15,17 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
+
+-- ---- assistants ------------------------------------------------------------
+
+CREATE TABLE assistants (
+    name         TEXT    PRIMARY KEY,
+    created_at   INTEGER NOT NULL,
+    home_dir     TEXT    NOT NULL,
+    config_json  TEXT    NOT NULL DEFAULT '{}',
+    content_hash TEXT    NOT NULL
+);
 
 -- ---- sessions --------------------------------------------------------------
 
@@ -29,6 +39,7 @@ CREATE TABLE sessions (
     provider        TEXT,
     model           TEXT,
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
+    assistant_name  TEXT,
 
     -- fork tree + auto-titling (GOALS §17). Parent/fork integrity and the
     -- fork-subtree deletion cascade are enforced at the application layer
@@ -95,6 +106,8 @@ CREATE INDEX idx_sessions_ephemeral ON sessions (ephemeral);
 CREATE INDEX idx_sessions_created_by_principal ON sessions (created_by_principal);
 CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_collaborators)
   WHERE shared_with_collaborators = 1;
+CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at DESC)
+  WHERE assistant_name IS NOT NULL;
 
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------
 

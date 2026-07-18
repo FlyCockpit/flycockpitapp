@@ -6,6 +6,7 @@
 
 mod agents;
 mod approval;
+mod assistants;
 mod auth;
 mod auto_title;
 mod banner;
@@ -620,9 +621,7 @@ async fn async_main() -> anyhow::Result<()> {
             commands::run::run(args, cli.no_sandbox, cli.project.as_deref()).await
         }
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
-        Some(Command::Assistant(crate::cli::AssistantCommand::Learn(args))) => {
-            commands::learn::run(args, cli.no_sandbox).await
-        }
+        Some(Command::Assistant(sub)) => commands::assistant::run(sub, cli.no_sandbox).await,
         Some(Command::Account(sub)) => match sub {
             crate::cli::AccountCommand::Login(args) => commands::flycockpit::login(args).await,
             crate::cli::AccountCommand::Logout => commands::flycockpit::logout().await,

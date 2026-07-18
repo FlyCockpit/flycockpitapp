@@ -32,6 +32,9 @@ pub struct SessionRow {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub active_agent: String,
+    /// Owning assistant for assistant-backed sessions. NULL for ordinary
+    /// sessions and for historical rows.
+    pub assistant_name: Option<String>,
     /// 6-char display id, unique within `project_id`. NULL for pre-§17
     /// rows until lazy backfill populates them (see [`Db::resume_session`]).
     pub short_id: Option<String>,
@@ -98,6 +101,7 @@ impl SessionRow {
             provider: row.get("provider")?,
             model: row.get("model")?,
             active_agent: row.get("active_agent")?,
+            assistant_name: row.get("assistant_name").unwrap_or(None),
             short_id: row.get("short_id")?,
             parent_session_id,
             fork_point_turn_id: row.get("fork_point_turn_id")?,
@@ -232,6 +236,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
     let has_redaction_table = table_has_column(conn, "sessions", "redaction_table_json")?;
     let has_model_prompt_snapshot =
         table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")?;
+    let has_assistant_name = table_has_column(conn, "sessions", "assistant_name")?;
     match (has_created_by_principal, has_redaction_table) {
         (true, true) => {
             conn.execute(
@@ -330,16 +335,82 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             )?;
         }
     }
-    if has_model_prompt_snapshot {
-        conn.execute(
-            "UPDATE sessions
-                SET model_system_prompt_snapshot_json = ?1
-              WHERE session_id = ?2",
-            params![
-                row.model_system_prompt_snapshot_json,
-                row.session_id.to_string(),
-            ],
-        )?;
+    match (has_model_prompt_snapshot, has_assistant_name) {
+        (true, true) => {
+            conn.execute(
+                "UPDATE sessions
+                    SET model_system_prompt_snapshot_json = ?1,
+                        assistant_name = ?2
+                  WHERE session_id = ?3",
+                params![
+                    row.model_system_prompt_snapshot_json,
+                    row.assistant_name,
+                    row.session_id.to_string(),
+                ],
+            )?;
+        }
+        (true, false) => {
+            conn.execute(
+                "UPDATE sessions
+                    SET model_system_prompt_snapshot_json = ?1
+                  WHERE session_id = ?2",
+                params![
+                    row.model_system_prompt_snapshot_json,
+                    row.session_id.to_string(),
+                ],
+            )?;
+        }
+        (false, true) => {
+            conn.execute(
+                "UPDATE sessions
+                    SET assistant_name = ?1
+                  WHERE session_id = ?2",
+                params![row.assistant_name, row.session_id.to_string()],
+            )?;
+        }
+        (false, false) => {}
+    }
+    Ok(())
+}
+
+fn execute_fork_post_insert_update(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
+    let has_model_prompt_snapshot =
+        table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")?;
+    let has_assistant_name = table_has_column(conn, "sessions", "assistant_name")?;
+    match (has_model_prompt_snapshot, has_assistant_name) {
+        (true, true) => {
+            conn.execute(
+                "UPDATE sessions
+                    SET model_system_prompt_snapshot_json = ?1,
+                        assistant_name = ?2
+                  WHERE session_id = ?3",
+                params![
+                    row.model_system_prompt_snapshot_json,
+                    row.assistant_name,
+                    row.session_id.to_string(),
+                ],
+            )?;
+        }
+        (true, false) => {
+            conn.execute(
+                "UPDATE sessions
+                    SET model_system_prompt_snapshot_json = ?1
+                  WHERE session_id = ?2",
+                params![
+                    row.model_system_prompt_snapshot_json,
+                    row.session_id.to_string(),
+                ],
+            )?;
+        }
+        (false, true) => {
+            conn.execute(
+                "UPDATE sessions
+                    SET assistant_name = ?1
+                  WHERE session_id = ?2",
+                params![row.assistant_name, row.session_id.to_string()],
+            )?;
+        }
+        (false, false) => {}
     }
     Ok(())
 }
@@ -399,17 +470,7 @@ fn execute_fork_insert(
             row.shared_with_collaborators as i64,
         ],
     )?;
-    if table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")? {
-        conn.execute(
-            "UPDATE sessions
-                SET model_system_prompt_snapshot_json = ?1
-              WHERE session_id = ?2",
-            params![
-                row.model_system_prompt_snapshot_json,
-                row.session_id.to_string(),
-            ],
-        )?;
-    }
+    execute_fork_post_insert_update(conn, row)?;
     Ok(())
 }
 
@@ -468,6 +529,7 @@ fn build_session_row(
     project_root: &str,
     active_agent: &str,
     short_id: Option<String>,
+    assistant_name: Option<String>,
 ) -> SessionRow {
     let session_id = Uuid::new_v4();
     let now = Utc::now().timestamp();
@@ -481,6 +543,7 @@ fn build_session_row(
         provider: None,
         model: None,
         active_agent: active_agent.to_string(),
+        assistant_name,
         short_id,
         parent_session_id: None,
         fork_point_turn_id: None,
@@ -674,6 +737,7 @@ impl Db {
             project_root,
             active_agent,
             Some(random_short_id()),
+            None,
         );
         self.insert_session_row(&row)
     }
@@ -700,6 +764,43 @@ impl Db {
             project_root,
             active_agent,
             Some(short_id),
+            None,
+        ))
+    }
+
+    pub fn create_assistant_session(
+        &self,
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+        assistant_name: &str,
+    ) -> Result<SessionRow> {
+        let row = build_session_row(
+            project_id,
+            project_root,
+            active_agent,
+            Some(random_short_id()),
+            Some(assistant_name.to_string()),
+        );
+        self.insert_session_row(&row)
+    }
+
+    pub fn new_assistant_session_row(
+        &self,
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+        assistant_name: &str,
+    ) -> Result<SessionRow> {
+        let short_id = self.read_blocking(|conn| {
+            generate_unique_short_id(conn, project_id).context("generating session short_id")
+        })?;
+        Ok(build_session_row(
+            project_id,
+            project_root,
+            active_agent,
+            Some(short_id),
+            Some(assistant_name.to_string()),
         ))
     }
 
@@ -779,6 +880,7 @@ impl Db {
                 provider: parent.provider,
                 model: parent.model,
                 active_agent: parent.active_agent,
+                assistant_name: parent.assistant_name,
                 short_id: Some(short_id),
                 parent_session_id: Some(parent_session_id),
                 fork_point_turn_id: fork_point_turn_id.clone(),
@@ -1329,6 +1431,56 @@ impl Db {
             out.push(row.context("decoding session row")?);
         }
         Ok(out)
+    }
+
+    pub fn list_sessions_for_assistant(
+        &self,
+        assistant_name: &str,
+        only_open: bool,
+        limit: u32,
+    ) -> Result<Vec<SessionRow>> {
+        let assistant_name = assistant_name.to_string();
+        self.read_blocking(move |conn| {
+            let sql = if only_open {
+                "SELECT * FROM sessions
+                  WHERE assistant_name = ?1 AND ended_at IS NULL AND ephemeral = 0
+                  ORDER BY last_active_at DESC LIMIT ?2"
+            } else {
+                "SELECT * FROM sessions
+                  WHERE assistant_name = ?1 AND ephemeral = 0
+                  ORDER BY last_active_at DESC LIMIT ?2"
+            };
+            let mut stmt = conn
+                .prepare(sql)
+                .context("preparing list_sessions_for_assistant")?;
+            let rows = stmt
+                .query_map(params![assistant_name, limit], SessionRow::from_row)
+                .context("querying assistant sessions")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding assistant session row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn most_recent_session_for_assistant(
+        &self,
+        assistant_name: &str,
+    ) -> Result<Option<SessionRow>> {
+        let assistant_name = assistant_name.to_string();
+        self.read_blocking(move |conn| {
+            conn.query_row(
+                "SELECT * FROM sessions
+                  WHERE assistant_name = ?1 AND ephemeral = 0
+                  ORDER BY last_active_at DESC, started_at DESC
+                  LIMIT 1",
+                params![assistant_name],
+                SessionRow::from_row,
+            )
+            .optional()
+            .context("loading most recent assistant session")
+        })
     }
 
     /// The most recent durable session for a canonical workspace root,

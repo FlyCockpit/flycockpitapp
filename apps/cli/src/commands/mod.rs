@@ -66,6 +66,7 @@ impl std::error::Error for RemovedCommandError {}
 
 pub mod agent;
 pub mod ask;
+pub mod assistant;
 pub mod bash_hints;
 pub mod config;
 pub mod connect;

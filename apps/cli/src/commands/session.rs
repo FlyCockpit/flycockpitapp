@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand};
+use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
 use crate::daemon::proto::{InterruptQuestion, Request, ResolveResponse, Response};
 use crate::db::Db;
@@ -13,16 +13,21 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Answer(args) => answer(args).await,
         SessionCommand::Show { session_id, json } => show(&session_id, json),
-        SessionCommand::List => list(),
+        SessionCommand::List(args) => list(args),
         SessionCommand::Delete { .. } => anyhow::bail!(
             "cockpit session is not implemented yet (planned; backed by ~/.local/share/cockpit/cockpit.db)"
         ),
     }
 }
 
-fn list() -> Result<()> {
+fn list(args: SessionListArgs) -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
-    let sessions = db.list_sessions(false, 100).context("listing sessions")?;
+    let sessions = if let Some(assistant) = args.assistant.as_deref() {
+        db.list_sessions_for_assistant(assistant, false, 100)
+            .with_context(|| format!("listing sessions for assistant `{assistant}`"))?
+    } else {
+        db.list_sessions(false, 100).context("listing sessions")?
+    };
     if sessions.is_empty() {
         println!("no sessions");
         return Ok(());

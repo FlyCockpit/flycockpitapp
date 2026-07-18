@@ -219,6 +219,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "assistant",
+        description: "Open or create the latest session for a persistent assistant",
+        takes_args: true,
+        run: run_assistant,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "build",
         description: "Switch the primary agent to Build (make changes)",
         takes_args: false,
@@ -1048,6 +1056,11 @@ fn run_agent(app: &mut App, args: &str) -> bool {
     false
 }
 
+fn run_assistant(app: &mut App, args: &str) -> bool {
+    app.handle_assistant_command(args);
+    false
+}
+
 fn run_plan(app: &mut App, _: &str) -> bool {
     app.swap_primary_agent("Plan");
     false
@@ -1492,6 +1505,41 @@ impl App {
                 self.push_plain(line);
             }
         }
+    }
+
+    /// `/assistant <name>` — open the persistent assistant's latest session,
+    /// creating one when none exists. Uses the same resume path as the
+    /// sessions browser so daemon attach, transcript rebuild, and workspace
+    /// trust behavior stay centralized.
+    pub(super) fn handle_assistant_command(&mut self, arg: &str) {
+        let name = arg.trim();
+        if name.is_empty() {
+            self.push_plain("Usage: /assistant <name>".to_string());
+            return;
+        }
+        if let Err(error) = crate::assistants::validate_assistant_name(name) {
+            self.push_plain(format!("/assistant: {error}"));
+            return;
+        }
+        let session = match crate::db::Db::open_default().and_then(|db| {
+            let row = db
+                .get_assistant(name)?
+                .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
+            crate::assistants::load_from_row(&row)?;
+            if let Some(session) = db.most_recent_session_for_assistant(name)? {
+                return Ok(session);
+            }
+            let project_id = crate::session::project_id_for(&self.launch.cwd);
+            let project_root = self.launch.cwd.to_string_lossy().into_owned();
+            db.create_assistant_session(&project_id, &project_root, name, name)
+        }) {
+            Ok(session) => session,
+            Err(error) => {
+                self.push_plain(format!("/assistant: {error}"));
+                return;
+            }
+        };
+        self.resume_session(session.session_id);
     }
 
     /// `/side [end]`: throwaway side conversation forked from here.

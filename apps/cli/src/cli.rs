@@ -192,8 +192,39 @@ pub enum BashHintsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AssistantCommand {
+    /// Create a new persistent assistant.
+    New(AssistantNewArgs),
+    /// List persistent assistants.
+    List,
+    /// Show one assistant definition and metadata.
+    Show {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Delete an assistant registry row without deleting its home directory.
+    Delete(AssistantDeleteArgs),
+    /// Open or create the assistant's latest session.
+    Chat {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
     /// Turn local paths, URLs, text, or a recent workflow into a reusable skill.
     Learn(LearnArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AssistantNewArgs {
+    #[arg(value_name = "NAME")]
+    pub name: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AssistantDeleteArgs {
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Do not prompt for confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -582,7 +613,7 @@ pub struct FetchModelsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
-    List,
+    List(SessionListArgs),
     /// Show a session's durable compaction handoffs and summary statistics.
     Show {
         #[arg(value_name = "SESSION_ID")]
@@ -597,6 +628,13 @@ pub enum SessionCommand {
     },
     /// Answer a pending question or approval interrupt.
     Answer(SessionAnswerArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct SessionListArgs {
+    /// Only list sessions owned by this assistant.
+    #[arg(long, value_name = "NAME")]
+    pub assistant: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]

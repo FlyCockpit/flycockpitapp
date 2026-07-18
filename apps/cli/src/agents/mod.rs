@@ -529,6 +529,18 @@ pub fn load_from_file(path: &Path) -> Result<AgentDef> {
     Ok(def)
 }
 
+/// Load an agent-shaped markdown file while supplying the resolved logical
+/// name from an owning entity. Assistants use this for
+/// `<assistant-home>/assistant.md`: the file shape and validation stay exactly
+/// the same as agents, while the persisted assistant name remains the entity
+/// identity instead of the literal `assistant.md` stem.
+pub fn load_named_from_file(path: &Path, name: &str) -> Result<AgentDef> {
+    let text = read_agent_markdown(path)?;
+    let def = parse_agent(&text, name, path.to_path_buf())?;
+    validate_invariants(&def)?;
+    Ok(def)
+}
+
 /// Load a per-`llm_mode` directory-form agent
 /// (implementation note): `<dir>/<name>/<mode>.md`,
 /// one file per mode. Each mode file is a full agent markdown with
@@ -758,7 +770,20 @@ pub fn resolve(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
             return Ok(Some(load_from_file(&candidate)?));
         }
     }
-    Ok(embedded_default(name))
+    if let Some(def) = embedded_default(name) {
+        return Ok(Some(def));
+    }
+    resolve_assistant_agent(name)
+}
+
+fn resolve_assistant_agent(name: &str) -> Result<Option<AgentDef>> {
+    let Ok(db) = crate::db::Db::open_default() else {
+        return Ok(None);
+    };
+    let Some(row) = db.get_assistant(name)? else {
+        return Ok(None);
+    };
+    Ok(Some(crate::assistants::load_from_row(&row)?.agent))
 }
 
 /// Discover every agent visible at `cwd`: each built-in (overridden when

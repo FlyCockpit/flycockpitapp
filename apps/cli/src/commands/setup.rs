@@ -128,7 +128,7 @@ impl TtyProbe for bool {
     }
 }
 
-type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+pub(crate) type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 
 pub(crate) trait TerminalActionHandler {
     fn run_action<'a>(

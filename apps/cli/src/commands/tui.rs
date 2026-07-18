@@ -2,6 +2,7 @@ use std::io::{IsTerminal, Write, stdin, stdout};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use uuid::Uuid;
 
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::tui::app::App;
@@ -16,6 +17,22 @@ pub async fn run(project: Option<&Path>, no_sandbox: bool) -> Result<()> {
     let db = ensure_tui_workspace_trust(project)?;
 
     let mut app = App::new_with_db(project, no_sandbox, db);
+    app.run().await
+}
+
+pub async fn run_with_session(
+    project: Option<&Path>,
+    no_sandbox: bool,
+    session_id: Uuid,
+) -> Result<()> {
+    if !stdin().is_terminal() || !stdout().is_terminal() {
+        println!("session {session_id}");
+        return Ok(());
+    }
+
+    let db = ensure_tui_workspace_trust(project)?;
+
+    let mut app = App::new_with_db_and_session(project, no_sandbox, db, session_id);
     app.run().await
 }
 

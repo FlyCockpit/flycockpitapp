@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
 pub const SECURITY_WIZARD_ID: &str = "security";
+pub const MODEL_WIZARD_ID: &str = "model";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -82,6 +83,28 @@ pub struct WizardDescriptor {
     pub description: &'static str,
     pub steps: Vec<StepDescriptor>,
     pub write_policy: WritePolicy,
+    pub(crate) model_context: Option<ModelWizardContext>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelWizardContext {
+    default_provider: Option<String>,
+    default_model_ref: Option<String>,
+    models: BTreeMap<String, ModelWizardPrefill>,
+}
+
+#[derive(Clone, Debug)]
+struct ModelWizardPrefill {
+    class: crate::config::extended::LlmMode,
+    trust: crate::config::providers::ModelTrust,
+    capabilities: Vec<String>,
+    context_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    thinking: Option<crate::config::providers::ThinkingMode>,
+    subagent_invokable: bool,
+    can_delegate: bool,
+    make_default: bool,
+    system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,8 +168,8 @@ impl WizardRun {
         let step = self.current_step()?;
         self.answer(step.id)
             .cloned()
-            .or_else(|| step.default_answer.clone())
             .or_else(|| step.prefill.and_then(|prefill| prefill(self)))
+            .or_else(|| step.default_answer.clone())
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -263,11 +286,390 @@ impl WizardRun {
 }
 
 pub fn registry() -> Vec<WizardDescriptor> {
-    vec![provider_descriptor(), security_descriptor()]
+    vec![
+        provider_descriptor(),
+        security_descriptor(),
+        model_descriptor_for_config(&crate::config::providers::ProvidersConfig::default()),
+    ]
 }
 
 pub fn descriptor(id: &str) -> Option<WizardDescriptor> {
     registry().into_iter().find(|wizard| wizard.id == id)
+}
+
+pub fn model_descriptor_for_config(
+    cfg: &crate::config::providers::ProvidersConfig,
+) -> WizardDescriptor {
+    model_descriptor_for_config_with_global(cfg, crate::config::extended::LlmMode::default())
+}
+
+pub fn model_descriptor_for_config_with_global(
+    cfg: &crate::config::providers::ProvidersConfig,
+    global_mode: crate::config::extended::LlmMode,
+) -> WizardDescriptor {
+    let provider_options = cfg
+        .providers
+        .keys()
+        .map(|id| SelectOption {
+            id: leak_static(id.clone()),
+            label: leak_static(id.clone()),
+            description: "Configure a model from this provider",
+        })
+        .collect();
+    let mut model_options = Vec::new();
+    for (provider_id, provider) in &cfg.providers {
+        for model in &provider.models {
+            let id = format!("{provider_id}:{}", model.id);
+            let label = model
+                .name
+                .as_ref()
+                .map(|name| format!("{name} ({provider_id}:{})", model.id))
+                .unwrap_or_else(|| id.clone());
+            model_options.push(SelectOption {
+                id: leak_static(id),
+                label: leak_static(label),
+                description: "Configure this exact provider/model pair",
+            });
+        }
+    }
+    let model_context = model_wizard_context(cfg, global_mode);
+    WizardDescriptor {
+        id: MODEL_WIZARD_ID,
+        title: "Configure model",
+        description: "Set class, trust, capabilities, limits, thinking, delegation, and default model",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: Some(model_context),
+        steps: vec![
+            StepDescriptor {
+                id: "provider",
+                prompt: "Choose a provider",
+                help: "Pick the provider that owns the model you want to configure.",
+                kind: StepKind::Select {
+                    options: provider_options,
+                },
+                default_answer: None,
+                prefill: Some(model_provider_prefill),
+                validate: Some(validate_select),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "model",
+                prompt: "Choose a model",
+                help: "Model ids are provider-qualified as provider:model.",
+                kind: StepKind::Select {
+                    options: model_options,
+                },
+                default_answer: None,
+                prefill: Some(model_ref_prefill),
+                validate: Some(validate_model_ref_matches_provider),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "class",
+                prompt: "Model class",
+                help: "Writes a model-level class override only when it differs from the inherited answer.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "defensive",
+                            label: "defensive",
+                            description: "Small/defensive model class",
+                        },
+                        SelectOption {
+                            id: "normal",
+                            label: "normal",
+                            description: "Default strong-model class",
+                        },
+                        SelectOption {
+                            id: "frontier",
+                            label: "frontier",
+                            description: "Top-tier/frontier class",
+                        },
+                    ],
+                },
+                default_answer: None,
+                prefill: Some(model_class_prefill),
+                validate: Some(validate_llm_mode_answer),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "trust",
+                prompt: "Provider trust",
+                help: "provider default is shown by inheritance. untrusted: cockpit redacts known secrets from requests · trusted: requests are sent unredacted.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "untrusted",
+                            label: "untrusted",
+                            description: "Redact known secrets before requests",
+                        },
+                        SelectOption {
+                            id: "trusted",
+                            label: "trusted",
+                            description: "Self-hosted/trusted endpoint; send requests unredacted",
+                        },
+                    ],
+                },
+                default_answer: None,
+                prefill: Some(model_trust_prefill),
+                validate: Some(validate_model_trust_answer),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "capabilities",
+                prompt: "Input and request capabilities",
+                help: "Leave detected values unchanged to keep Auto. Toggle only values you know are wrong.",
+                kind: StepKind::MultiToggle {
+                    options: vec![
+                        SelectOption {
+                            id: "images",
+                            label: "image input",
+                            description: "Supports image input parts",
+                        },
+                        SelectOption {
+                            id: "tools",
+                            label: "tool calling",
+                            description: "Supports tool/function calling",
+                        },
+                        SelectOption {
+                            id: "reasoning",
+                            label: "reasoning",
+                            description: "Supports reasoning/thinking controls",
+                        },
+                        SelectOption {
+                            id: "structured_outputs",
+                            label: "structured outputs",
+                            description: "Supports JSON-schema structured outputs",
+                        },
+                    ],
+                },
+                default_answer: None,
+                prefill: Some(model_capabilities_prefill),
+                validate: Some(validate_model_capability_toggles),
+                write: None,
+                branch: Some(model_capabilities_branch),
+            },
+            StepDescriptor {
+                id: "context-tokens",
+                prompt: "Context window tokens",
+                help: "Blank keeps Auto. Enter a number only when detection/defaults are wrong.",
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: Some(model_context_tokens_prefill),
+                validate: Some(validate_optional_u32),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "max-output-tokens",
+                prompt: "Max output tokens",
+                help: "Blank keeps Auto. Enter a number only when detection/defaults are wrong.",
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: Some(model_max_output_tokens_prefill),
+                validate: Some(validate_optional_u32),
+                write: None,
+                branch: Some(model_thinking_branch),
+            },
+            StepDescriptor {
+                id: "thinking",
+                prompt: "Default thinking mode",
+                help: "Active /model selections still win. This model default is used only when the active selection does not pin thinking.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "inherit",
+                            label: "inherit",
+                            description: "No model-level default",
+                        },
+                        SelectOption {
+                            id: "off",
+                            label: "off",
+                            description: "Disable legacy thinking mode",
+                        },
+                        SelectOption {
+                            id: "low",
+                            label: "low",
+                            description: "Low thinking mode",
+                        },
+                        SelectOption {
+                            id: "medium",
+                            label: "medium",
+                            description: "Medium thinking mode",
+                        },
+                        SelectOption {
+                            id: "high",
+                            label: "high",
+                            description: "High thinking mode",
+                        },
+                    ],
+                },
+                default_answer: None,
+                prefill: Some(model_thinking_prefill),
+                validate: Some(validate_thinking_mode_answer),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "subagent-flags",
+                prompt: "Subagent behavior",
+                help: "Toggle whether this model can be spawned as a subagent and whether it can spawn subagents.",
+                kind: StepKind::MultiToggle {
+                    options: vec![
+                        SelectOption {
+                            id: "subagent_invokable",
+                            label: "spawn as subagent",
+                            description: "This model may be selected for subagents",
+                        },
+                        SelectOption {
+                            id: "can_delegate",
+                            label: "can spawn subagents",
+                            description: "This model receives delegation affordances",
+                        },
+                    ],
+                },
+                default_answer: None,
+                prefill: Some(model_subagent_prefill),
+                validate: Some(validate_model_subagent_toggles),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "default-model",
+                prompt: "Make this the active/default model?",
+                help: "Affects future model resolution; it does not hijack existing live sessions.",
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: Some(model_make_default_prefill),
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "system-prompt-choice",
+                prompt: "Model-specific system prompt",
+                help: "Skip, or enter model-specific instructions applied to new root sessions.",
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "skip",
+                            label: "skip",
+                            description: "Leave model-specific instructions unchanged",
+                        },
+                        SelectOption {
+                            id: "set",
+                            label: "set prompt",
+                            description: "Enter model-specific instructions now",
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("skip".to_string())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(model_system_prompt_branch),
+            },
+            StepDescriptor {
+                id: "system-prompt",
+                prompt: "System prompt text",
+                help: "Blank clears the model-specific prompt.",
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: Some(model_system_prompt_prefill),
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "model-save",
+                prompt: "Apply model settings",
+                help: "Only changed model-scope values are written.",
+                kind: StepKind::Action {
+                    progress: "Applying model settings…",
+                },
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+        ],
+    }
+}
+
+fn model_wizard_context(
+    cfg: &crate::config::providers::ProvidersConfig,
+    global_mode: crate::config::extended::LlmMode,
+) -> ModelWizardContext {
+    use crate::config::providers::CapabilityStatus;
+
+    let mut default_provider = None;
+    let mut default_model_ref = None;
+    let mut models = BTreeMap::new();
+    for (provider_id, provider) in &cfg.providers {
+        if default_provider.is_none() {
+            default_provider = Some(provider_id.clone());
+        }
+        for model in &provider.models {
+            let model_ref = format!("{provider_id}:{}", model.id);
+            if default_model_ref.is_none() {
+                default_model_ref = Some(model_ref.clone());
+            }
+            let caps = cfg.resolve_capabilities(provider_id, &model.id);
+            let capabilities = [
+                (caps.images == Some(true), "images"),
+                (
+                    matches!(caps.tool_calling, CapabilityStatus::Supported),
+                    "tools",
+                ),
+                (
+                    matches!(caps.reasoning, CapabilityStatus::Supported),
+                    "reasoning",
+                ),
+                (
+                    matches!(caps.structured_outputs, CapabilityStatus::Supported),
+                    "structured_outputs",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(enabled, id)| enabled.then_some(id.to_string()))
+            .collect();
+            models.insert(
+                model_ref.clone(),
+                ModelWizardPrefill {
+                    class: cfg.resolve_mode(provider_id, &model.id, global_mode),
+                    trust: cfg.resolve_trust(provider_id, &model.id),
+                    capabilities,
+                    context_tokens: caps.context_tokens,
+                    max_output_tokens: caps.max_output_tokens,
+                    thinking: cfg.resolve_default_thinking_mode(provider_id, &model.id),
+                    subagent_invokable: cfg.resolve_subagent_invokable(provider_id, &model.id),
+                    can_delegate: cfg.resolve_can_delegate(provider_id, &model.id),
+                    make_default: cfg.active_model.as_ref().is_some_and(|active| {
+                        active.provider == provider_id.as_str() && active.model == model.id.as_str()
+                    }),
+                    system_prompt: cfg
+                        .resolve_model_system_prompt(provider_id, &model.id)
+                        .map(str::to_string),
+                },
+            );
+            if cfg.active_model.as_ref().is_some_and(|active| {
+                active.provider == provider_id.as_str() && active.model == model.id.as_str()
+            }) {
+                default_provider = Some(provider_id.clone());
+                default_model_ref = Some(model_ref);
+            }
+        }
+    }
+    ModelWizardContext {
+        default_provider,
+        default_model_ref,
+        models,
+    }
 }
 
 pub fn provider_descriptor() -> WizardDescriptor {
@@ -290,6 +692,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         title: "Add provider",
         description: "Configure an inference provider and its authentication",
         write_policy: WritePolicy::PerStep,
+        model_context: None,
         steps: vec![
             StepDescriptor {
                 id: "template",
@@ -474,6 +877,7 @@ pub fn security_descriptor_for_config(
         title: "Security posture",
         description: "Review sandboxing, approvals, trusted-only, redaction, and workspace trust",
         write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
         steps: vec![
             StepDescriptor {
                 id: "sandbox",
@@ -656,6 +1060,154 @@ pub(crate) fn approval_mode_answer(
     approval_mode_from_id(value)
 }
 
+pub(crate) fn model_provider_answer(run: &WizardRun) -> Option<String> {
+    let WizardAnswer::Select(value) = run.answer("provider")? else {
+        return None;
+    };
+    Some(value.to_string())
+}
+
+pub(crate) fn model_ref_answer(run: &WizardRun) -> Option<(String, String)> {
+    let WizardAnswer::Select(value) = run.answer("model")? else {
+        return None;
+    };
+    let (provider, model) = value.split_once(':')?;
+    Some((provider.to_string(), model.to_string()))
+}
+
+pub(crate) fn model_class_answer(run: &WizardRun) -> Option<crate::config::extended::LlmMode> {
+    let WizardAnswer::Select(value) = run.answer("class")? else {
+        return None;
+    };
+    llm_mode_from_id(value)
+}
+
+pub(crate) fn model_trust_answer(run: &WizardRun) -> Option<crate::config::providers::ModelTrust> {
+    let WizardAnswer::Select(value) = run.answer("trust")? else {
+        return None;
+    };
+    model_trust_from_id(value)
+}
+
+pub(crate) fn model_capability_answers(run: &WizardRun) -> std::collections::BTreeSet<String> {
+    let Some(WizardAnswer::MultiToggle(values)) = run.answer("capabilities") else {
+        return std::collections::BTreeSet::new();
+    };
+    values.iter().cloned().collect()
+}
+
+pub(crate) fn model_subagent_answers(run: &WizardRun) -> std::collections::BTreeSet<String> {
+    let Some(WizardAnswer::MultiToggle(values)) = run.answer("subagent-flags") else {
+        return std::collections::BTreeSet::new();
+    };
+    values.iter().cloned().collect()
+}
+
+pub(crate) fn model_context_tokens_answer(run: &WizardRun) -> Option<u32> {
+    optional_u32_answer(run, "context-tokens")
+}
+
+pub(crate) fn model_max_output_tokens_answer(run: &WizardRun) -> Option<u32> {
+    optional_u32_answer(run, "max-output-tokens")
+}
+
+pub(crate) fn model_default_thinking_answer(
+    run: &WizardRun,
+) -> Option<Option<crate::config::providers::ThinkingMode>> {
+    let WizardAnswer::Select(value) = run.answer("thinking")? else {
+        return None;
+    };
+    if value == "inherit" {
+        Some(None)
+    } else {
+        Some(thinking_mode_from_id(value))
+    }
+}
+
+pub(crate) fn model_make_default_answer(run: &WizardRun) -> bool {
+    matches!(
+        run.answer("default-model"),
+        Some(WizardAnswer::Confirm(true))
+    )
+}
+
+pub(crate) fn model_system_prompt_answer(run: &WizardRun) -> Option<Option<String>> {
+    let Some(WizardAnswer::Select(choice)) = run.answer("system-prompt-choice") else {
+        return None;
+    };
+    if choice != "set" {
+        return None;
+    }
+    let Some(WizardAnswer::Text(value)) = run.answer("system-prompt") else {
+        return Some(None);
+    };
+    let trimmed = value.trim();
+    Some((!trimmed.is_empty()).then(|| value.clone()))
+}
+
+fn optional_u32_answer(run: &WizardRun, id: &str) -> Option<u32> {
+    let WizardAnswer::Text(value) = run.answer(id)? else {
+        return None;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse().ok()
+    }
+}
+
+pub(crate) fn llm_mode_from_id(id: &str) -> Option<crate::config::extended::LlmMode> {
+    Some(match id {
+        "defensive" => crate::config::extended::LlmMode::Defensive,
+        "normal" => crate::config::extended::LlmMode::Normal,
+        "frontier" => crate::config::extended::LlmMode::Frontier,
+        _ => return None,
+    })
+}
+
+pub(crate) fn model_trust_from_id(id: &str) -> Option<crate::config::providers::ModelTrust> {
+    Some(match id {
+        "trusted" => crate::config::providers::ModelTrust::Trusted,
+        "untrusted" => crate::config::providers::ModelTrust::Untrusted,
+        _ => return None,
+    })
+}
+
+pub(crate) fn thinking_mode_from_id(id: &str) -> Option<crate::config::providers::ThinkingMode> {
+    Some(match id {
+        "off" => crate::config::providers::ThinkingMode::Off,
+        "low" => crate::config::providers::ThinkingMode::Low,
+        "medium" => crate::config::providers::ThinkingMode::Medium,
+        "high" => crate::config::providers::ThinkingMode::High,
+        _ => return None,
+    })
+}
+
+fn llm_mode_id(mode: crate::config::extended::LlmMode) -> &'static str {
+    match mode {
+        crate::config::extended::LlmMode::Defensive => "defensive",
+        crate::config::extended::LlmMode::Normal => "normal",
+        crate::config::extended::LlmMode::Frontier => "frontier",
+    }
+}
+
+fn model_trust_id(trust: crate::config::providers::ModelTrust) -> &'static str {
+    match trust {
+        crate::config::providers::ModelTrust::Trusted => "trusted",
+        crate::config::providers::ModelTrust::Untrusted => "untrusted",
+    }
+}
+
+fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static str {
+    match mode {
+        crate::config::providers::ThinkingMode::Off => "off",
+        crate::config::providers::ThinkingMode::Low => "low",
+        crate::config::providers::ThinkingMode::Medium => "medium",
+        crate::config::providers::ThinkingMode::High => "high",
+    }
+}
+
 fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -> StepDescriptor {
     StepDescriptor {
         id,
@@ -673,11 +1225,119 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
     }
 }
 
+fn leak_static(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
 fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
     match answer {
         WizardAnswer::Select(value) if !value.is_empty() => Ok(()),
         _ => Err("choose one option".to_string()),
     }
+}
+
+fn validate_llm_mode_answer(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(value) = answer else {
+        return Err("choose defensive, normal, or frontier".to_string());
+    };
+    llm_mode_from_id(value)
+        .map(|_| ())
+        .ok_or_else(|| "choose defensive, normal, or frontier".to_string())
+}
+
+fn validate_model_trust_answer(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(value) = answer else {
+        return Err("choose trusted or untrusted".to_string());
+    };
+    model_trust_from_id(value)
+        .map(|_| ())
+        .ok_or_else(|| "choose trusted or untrusted".to_string())
+}
+
+fn validate_thinking_mode_answer(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(value) = answer else {
+        return Err("choose inherit, off, low, medium, or high".to_string());
+    };
+    if value == "inherit" || thinking_mode_from_id(value).is_some() {
+        Ok(())
+    } else {
+        Err("choose inherit, off, low, medium, or high".to_string())
+    }
+}
+
+fn validate_optional_u32(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(value) = answer else {
+        return Err("enter a number or leave blank".to_string());
+    };
+    if value.trim().is_empty() || value.trim().parse::<u32>().is_ok_and(|v| v > 0) {
+        Ok(())
+    } else {
+        Err("enter a positive number or leave blank".to_string())
+    }
+}
+
+fn validate_known_toggles(
+    answer: &WizardAnswer,
+    allowed: &[&str],
+) -> std::result::Result<(), String> {
+    let WizardAnswer::MultiToggle(values) = answer else {
+        return Err("toggle zero or more listed ids".to_string());
+    };
+    for value in values {
+        if !allowed.iter().any(|allowed| allowed == value) {
+            return Err(format!("unknown toggle `{value}`"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_capability_toggles(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    validate_known_toggles(
+        answer,
+        &["images", "tools", "reasoning", "structured_outputs"],
+    )
+}
+
+fn validate_model_subagent_toggles(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    validate_known_toggles(answer, &["subagent_invokable", "can_delegate"])
+}
+
+fn validate_model_ref_matches_provider(
+    run: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(value) = answer else {
+        return Err("choose a model".to_string());
+    };
+    let Some((provider, model)) = value.split_once(':') else {
+        return Err("model must be provider:model".to_string());
+    };
+    if model.is_empty() {
+        return Err("model id cannot be empty".to_string());
+    }
+    if let Some(WizardAnswer::Select(selected_provider)) = run.answer("provider")
+        && selected_provider != provider
+    {
+        return Err(format!(
+            "choose a model from provider `{selected_provider}`"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_sandbox_mode(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
@@ -833,6 +1493,7 @@ pub(crate) fn provider_entry_for_template(
         subagent_invokable: None,
         can_delegate: None,
         computer_use: None,
+        default_thinking_mode: None,
         embeddings: None,
         availability: Default::default(),
         cache: Default::default(),
@@ -881,6 +1542,135 @@ fn provider_env_var_prefill(run: &WizardRun) -> Option<WizardAnswer> {
             .unwrap_or("API_KEY")
             .to_string(),
     ))
+}
+
+fn model_context(run: &WizardRun) -> Option<&ModelWizardContext> {
+    run.descriptor.model_context.as_ref()
+}
+
+fn model_prefill(run: &WizardRun) -> Option<&ModelWizardPrefill> {
+    let (provider, model) = model_ref_answer(run)?;
+    model_context(run)?
+        .models
+        .get(&format!("{provider}:{model}"))
+}
+
+fn model_provider_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    model_context(run)?
+        .default_provider
+        .clone()
+        .map(WizardAnswer::Select)
+}
+
+fn model_ref_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let context = model_context(run)?;
+    if let Some(model_ref) = &context.default_model_ref
+        && model_ref
+            .split_once(':')
+            .is_some_and(|(provider, _)| model_provider_answer(run).as_deref() == Some(provider))
+    {
+        return Some(WizardAnswer::Select(model_ref.clone()));
+    }
+    let provider = model_provider_answer(run)?;
+    context
+        .models
+        .keys()
+        .find(|model_ref| {
+            model_ref
+                .split_once(':')
+                .is_some_and(|(candidate, _)| candidate == provider)
+        })
+        .cloned()
+        .map(WizardAnswer::Select)
+}
+
+fn model_class_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::Select(
+        llm_mode_id(model_prefill(run)?.class).to_string(),
+    ))
+}
+
+fn model_trust_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::Select(
+        model_trust_id(model_prefill(run)?.trust).to_string(),
+    ))
+}
+
+fn model_capabilities_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::MultiToggle(
+        model_prefill(run)?.capabilities.clone(),
+    ))
+}
+
+fn model_context_tokens_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::Text(
+        model_prefill(run)?
+            .context_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    ))
+}
+
+fn model_max_output_tokens_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::Text(
+        model_prefill(run)?
+            .max_output_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    ))
+}
+
+fn model_thinking_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let value = model_prefill(run)?
+        .thinking
+        .map(thinking_mode_id)
+        .unwrap_or("inherit");
+    Some(WizardAnswer::Select(value.to_string()))
+}
+
+fn model_subagent_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let prefill = model_prefill(run)?;
+    let mut values = Vec::new();
+    if prefill.subagent_invokable {
+        values.push("subagent_invokable".to_string());
+    }
+    if prefill.can_delegate {
+        values.push("can_delegate".to_string());
+    }
+    Some(WizardAnswer::MultiToggle(values))
+}
+
+fn model_make_default_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::Confirm(model_prefill(run)?.make_default))
+}
+
+fn model_system_prompt_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    Some(WizardAnswer::Text(
+        model_prefill(run)?
+            .system_prompt
+            .clone()
+            .unwrap_or_default(),
+    ))
+}
+
+fn model_capabilities_branch(_: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    Some("context-tokens")
+}
+
+fn model_thinking_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    let selected = model_capability_answers(run);
+    if selected.contains("reasoning") {
+        Some("thinking")
+    } else {
+        Some("subagent-flags")
+    }
+}
+
+fn model_system_prompt_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    Some(match answer {
+        WizardAnswer::Select(value) if value == "set" => "system-prompt",
+        _ => "model-save",
+    })
 }
 
 fn provider_auth_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
@@ -970,6 +1760,7 @@ mod tests {
             title: "Test",
             description: "Test wizard",
             write_policy: policy,
+            model_context: None,
             steps: vec![
                 StepDescriptor {
                     id: "start",

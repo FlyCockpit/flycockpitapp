@@ -170,6 +170,7 @@ pub fn descriptor() -> WizardDescriptor {
         title: "Create assistant",
         description: "Create a persistent assistant identity backed by an agent definition.",
         write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
         steps: vec![
             StepDescriptor {
                 id: "description",

@@ -61,9 +61,9 @@ use crate::config::extended::LlmMode;
 use crate::config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES, ModelEntry,
-    ModelLocation, ModelTrust, ProviderEntry, ShrinkConfig, ShrinkStrategy, TimeoutConfig, WireApi,
-    XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url, is_xai_grok_provider,
-    model_system_prompt_too_large, normalize_model_system_prompt,
+    ModelLocation, ModelTrust, ProviderEntry, ShrinkConfig, ShrinkStrategy, ThinkingMode,
+    TimeoutConfig, WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url,
+    is_xai_grok_provider, model_system_prompt_too_large, normalize_model_system_prompt,
 };
 use crate::tui::textfield::TextField;
 
@@ -129,6 +129,7 @@ pub(super) enum ProviderSettingId {
     /// it (no fallback).
     Backup,
     Mode,
+    DefaultThinkingMode,
     /// Per-model inline-`<think>` extraction toggle. Model scope only.
     InlineThink,
     /// Per-tier §12 tool-call-correction hinting toggle
@@ -168,6 +169,7 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::WireApi,
     ProviderSettingId::Backup,
     ProviderSettingId::Mode,
+    ProviderSettingId::DefaultThinkingMode,
     ProviderSettingId::InlineThink,
     ProviderSettingId::HintToolCallCorrections,
     ProviderSettingId::XaiMultiAgentToolsBeta,
@@ -221,6 +223,7 @@ impl ProviderSettingId {
             Self::WireApi => "Wire API",
             Self::Backup => "Backup model (provider:model)",
             Self::Mode => "Mode",
+            Self::DefaultThinkingMode => "Default thinking mode",
             Self::InlineThink => "Extract inline <think> tags",
             Self::HintToolCallCorrections => "Hint tool-call corrections",
             Self::XaiMultiAgentToolsBeta => "I have xAI beta access for Grok multi-agent tools",
@@ -257,6 +260,9 @@ impl ProviderSettingId {
             ),
             Self::Mode => Some(
                 "Steering tier for new turns: defensive (weaker models, explicit guidance), normal (strong models, terse), frontier (top-tier models, high autonomy). inherit falls through to the provider, then the global llm mode. Separate from Interface -> Thinking display.",
+            ),
+            Self::DefaultThinkingMode => Some(
+                "Legacy thinking-mode default for models that support thinking modes but not typed reasoning effort. Active /model thinking selections still win.",
             ),
             Self::AutoPruneEnabled => Some(
                 "Master switch for automatic context pruning (lossless dedup of stale tool results). off never auto-prunes, protecting the provider's prompt cache; manual /prune still works. inherit falls through to the provider, then on.",
@@ -363,6 +369,9 @@ pub(super) struct SettingsEditor {
     /// `None` = mode undefined (inherit). Cycles
     /// undefined→defensive→normal→frontier→undefined.
     mode: Option<LlmMode>,
+    /// Per-model/provider legacy thinking-mode default. Active `/model`
+    /// choices still win. `None` inherits.
+    default_thinking_mode: Option<ThinkingMode>,
     /// Per-model inline-`<think>` override (model scope only). `None` =
     /// inherit the default (on); `Some(true/false)` pins it. Cycles
     /// on→off→default. Tracks its own override via `is_some()`.
@@ -439,6 +448,7 @@ impl SettingsEditor {
             wire_api: entry.wire_api,
             backup: entry.backup.clone(),
             mode: entry.mode,
+            default_thinking_mode: entry.default_thinking_mode,
             // Provider-tier inline-`<think>` override (tri-state: inherit
             // global / on / off), mirroring the `mode` tri-state.
             inline_think: entry.inline_think,
@@ -537,6 +547,7 @@ impl SettingsEditor {
             // value, so an unset model shows "inherit".
             backup: model.and_then(|m| m.backup.clone()),
             mode,
+            default_thinking_mode: model.and_then(|m| m.default_thinking_mode),
             inline_think: model.and_then(|m| m.inline_think),
             hint_tool_call_corrections: model.and_then(|m| m.hint_tool_call_corrections),
             xai_multi_agent_tools_beta,
@@ -647,7 +658,13 @@ impl SettingsEditor {
         if show_xai_multi_agent_tools_beta {
             fields.push(XaiMultiAgentToolsBeta);
         }
-        fields.extend([Backup, Mode, InlineThink, HintToolCallCorrections]);
+        fields.extend([
+            Backup,
+            Mode,
+            DefaultThinkingMode,
+            InlineThink,
+            HintToolCallCorrections,
+        ]);
         fields
     }
 
@@ -715,6 +732,7 @@ impl SettingsEditor {
             ProviderSettingId::WireApi => self.wire_api_present,
             ProviderSettingId::Backup => self.backup.is_some(),
             ProviderSettingId::Mode => self.mode.is_some(),
+            ProviderSettingId::DefaultThinkingMode => self.default_thinking_mode.is_some(),
             ProviderSettingId::InlineThink => self.inline_think.is_some(),
             ProviderSettingId::HintToolCallCorrections => self.hint_tool_call_corrections.is_some(),
             ProviderSettingId::XaiMultiAgentToolsBeta => self.xai_multi_agent_tools_beta_present,
@@ -850,6 +868,13 @@ impl SettingsEditor {
                 None if self.is_model_scope() => "inherit".to_string(),
                 None => "inherit (global llm mode)".to_string(),
             },
+            ProviderSettingId::DefaultThinkingMode => match self.default_thinking_mode {
+                Some(ThinkingMode::Off) => "off".to_string(),
+                Some(ThinkingMode::Low) => "low".to_string(),
+                Some(ThinkingMode::Medium) => "medium".to_string(),
+                Some(ThinkingMode::High) => "high".to_string(),
+                None => "inherit".to_string(),
+            },
             ProviderSettingId::InlineThink => match self.inline_think {
                 Some(true) => "extract".to_string(),
                 Some(false) => "leave inline".to_string(),
@@ -914,6 +939,7 @@ impl SettingsEditor {
             | ProviderSettingId::CapabilityStructuredOutputs
             | ProviderSettingId::Backup
             | ProviderSettingId::Mode
+            | ProviderSettingId::DefaultThinkingMode
             | ProviderSettingId::AutoPruneEnabled
             | ProviderSettingId::InlineThink
             | ProviderSettingId::HintToolCallCorrections => {}
@@ -965,6 +991,7 @@ impl SettingsEditor {
             }
             ProviderSettingId::Backup => self.backup = None,
             ProviderSettingId::Mode => self.mode = None,
+            ProviderSettingId::DefaultThinkingMode => self.default_thinking_mode = None,
             ProviderSettingId::AutoPruneEnabled => self.auto_prune = None,
             ProviderSettingId::InlineThink => self.inline_think = None,
             ProviderSettingId::HintToolCallCorrections => self.hint_tool_call_corrections = None,
@@ -1139,6 +1166,16 @@ impl SettingsEditor {
                     Some(LlmMode::Normal) => Some(LlmMode::Frontier),
                     Some(LlmMode::Frontier) => None,
                     None => Some(LlmMode::Defensive),
+                };
+            }
+            ProviderSettingId::DefaultThinkingMode => {
+                // inherit → off → low → medium → high → inherit
+                self.default_thinking_mode = match self.default_thinking_mode {
+                    None => Some(ThinkingMode::Off),
+                    Some(ThinkingMode::Off) => Some(ThinkingMode::Low),
+                    Some(ThinkingMode::Low) => Some(ThinkingMode::Medium),
+                    Some(ThinkingMode::Medium) => Some(ThinkingMode::High),
+                    Some(ThinkingMode::High) => None,
                 };
             }
             ProviderSettingId::InlineThink => {
@@ -1470,6 +1507,7 @@ impl SettingsEditor {
                 entry.wire_api = self.wire_api;
                 entry.backup = self.backup.clone();
                 entry.mode = self.mode;
+                entry.default_thinking_mode = self.default_thinking_mode;
                 entry.inline_think = self.inline_think;
                 entry.hint_tool_call_corrections = self.hint_tool_call_corrections;
                 entry.trust = self.trust;
@@ -1529,6 +1567,7 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     // Backup tracks presence via its `Option` directly (like `mode`).
     m.backup = e.backup.clone();
     m.mode = e.mode;
+    m.default_thinking_mode = e.default_thinking_mode;
     m.auto_prune = e.auto_prune;
     m.trust = e.trust;
     m.location = e.location;
@@ -1773,6 +1812,7 @@ mod tests {
             subagent_invokable: None,
             can_delegate: None,
             computer_use: None,
+            default_thinking_mode: None,
             embeddings: None,
             embedding_dimensions: None,
             availability: Default::default(),
@@ -2085,7 +2125,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 28);
+        assert_eq!(e.field_count(), 29);
         assert_eq!(
             *e.fields().last().unwrap(),
             ProviderSettingId::HintToolCallCorrections
@@ -2135,7 +2175,7 @@ mod tests {
         // mirroring the `mode` tri-state.
         let mut prov = SettingsEditor::for_provider("p", &entry);
         assert!(prov.fields().contains(&ProviderSettingId::InlineThink));
-        assert_eq!(prov.field_count(), 22);
+        assert_eq!(prov.field_count(), 23);
         // Seeded from the provider's (unset) override → inherit default.
         assert_eq!(
             prov.value_str(ProviderSettingId::InlineThink),
@@ -2687,6 +2727,7 @@ mod tests {
             (XaiMultiAgentToolsBeta, false, false, false, true),
             (Backup, false, false, false, false),
             (Mode, false, false, false, false),
+            (DefaultThinkingMode, false, false, false, false),
             (InlineThink, false, false, false, false),
             (HintToolCallCorrections, false, false, false, false),
         ];

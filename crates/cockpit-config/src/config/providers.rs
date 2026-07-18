@@ -78,6 +78,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "backup",
     "mode",
     "inline_think",
+    "default_thinking_mode",
     "hint_tool_call_corrections",
     "text_embedded_recovery",
     "thinking_params",
@@ -414,6 +415,12 @@ pub struct ProviderEntry {
     /// until final resolution, where all-unset resolves to disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
+
+    /// Provider default legacy thinking mode for OpenAI-compatible models
+    /// that expose `thinking_modes` but not typed reasoning-effort controls.
+    /// Active model selections still win at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_mode: Option<ThinkingMode>,
 
     /// Provider default for whether models support OpenAI-compatible embeddings.
     /// Missing resolves to false.
@@ -881,6 +888,11 @@ pub struct ModelEntry {
     /// provider policy within the catalog layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
+    /// Model-level default legacy thinking mode for OpenAI-compatible models.
+    /// Active model selections still win at runtime; missing inherits the
+    /// provider default and then falls back to no extra thinking params.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_mode: Option<ThinkingMode>,
     /// Model-level embeddings support override. Missing inherits provider
     /// default, then resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1488,6 +1500,9 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     }
     if existing.computer_use.is_some() {
         fetched.computer_use = existing.computer_use;
+    }
+    if existing.default_thinking_mode.is_some() {
+        fetched.default_thinking_mode = existing.default_thinking_mode;
     }
     if existing.embeddings.is_some() {
         fetched.embeddings = existing.embeddings;
@@ -2131,6 +2146,20 @@ impl ProvidersConfig {
             .unwrap_or(ComputerUseMode::Disabled)
     }
 
+    pub fn resolve_default_thinking_mode(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<ThinkingMode> {
+        let entry = self.providers.get(provider)?;
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.default_thinking_mode)
+            .or(entry.default_thinking_mode)
+    }
+
     /// Resolve how a leading inline `<think>…</think>` block is **classified**
     /// for `(provider, model)`: the per-model `inline_think` override → the
     /// per-provider `inline_think` override → the `global` default passed in
@@ -2357,7 +2386,9 @@ impl ProvidersConfig {
                     .map(|effort| effort.value.as_str()),
             );
         }
-        let mode = active.thinking_mode?;
+        let mode = active
+            .thinking_mode
+            .or_else(|| self.resolve_default_thinking_mode(&active.provider, &active.model))?;
         self.resolve_thinking_params(&active.provider, &active.model, mode)
     }
 

@@ -112,17 +112,21 @@ pub enum Dialog {
         cursor: usize,
         cwd: PathBuf,
     },
-    SetupWizard {
-        run: crate::wizard::WizardRun,
-        cursor: usize,
-        text: TextField,
-        cwd: PathBuf,
-        status: Option<String>,
-    },
+    SetupWizard(Box<SetupWizardDialog>),
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
     Settings(Box<SettingsDialog>),
+}
+
+pub struct SetupWizardDialog {
+    run: crate::wizard::WizardRun,
+    cursor: usize,
+    text: TextField,
+    multi: std::collections::BTreeSet<String>,
+    multi_touched: bool,
+    cwd: PathBuf,
+    status: Option<String>,
 }
 
 pub struct SettingsDialog {
@@ -532,7 +536,7 @@ impl Dialog {
         match self {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
-            Dialog::SetupWizard { run, .. } => Some(run.descriptor().id),
+            Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
             _ => None,
         }
     }
@@ -665,17 +669,30 @@ impl Dialog {
     pub fn open_setup_wizard(cwd: &std::path::Path, wizard_id: &str) -> Result<Self, String> {
         match wizard_id {
             crate::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
-            crate::wizard::SECURITY_WIZARD_ID => {
+            crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID => {
                 let descriptor = crate::commands::setup::descriptor_for_cwd(wizard_id, cwd)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
                 let run = crate::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
-                Ok(Dialog::SetupWizard {
+                let mut cursor = 0;
+                let mut text = TextField::new("");
+                let mut multi = std::collections::BTreeSet::new();
+                let mut multi_touched = false;
+                sync_setup_wizard_inputs(
+                    &run,
+                    &mut cursor,
+                    &mut text,
+                    &mut multi,
+                    &mut multi_touched,
+                );
+                Ok(Dialog::SetupWizard(Box::new(SetupWizardDialog {
                     run,
-                    cursor: 0,
-                    text: TextField::new(""),
+                    cursor,
+                    text,
+                    multi,
+                    multi_touched,
                     cwd: cwd.to_path_buf(),
                     status: None,
-                })
+                })))
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
@@ -916,13 +933,7 @@ impl Dialog {
                     false
                 }
             },
-            Dialog::SetupWizard {
-                run,
-                cursor,
-                text,
-                cwd,
-                status,
-            } => handle_setup_wizard_key(run, cursor, text, cwd, status, key),
+            Dialog::SetupWizard(wizard) => handle_setup_wizard_key(wizard, key),
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
                 if close
@@ -1022,13 +1033,7 @@ impl Dialog {
             Dialog::WizardMenu {
                 wizards, cursor, ..
             } => render_wizard_menu(frame, area, wizards, *cursor),
-            Dialog::SetupWizard {
-                run,
-                cursor,
-                text,
-                status,
-                ..
-            } => render_setup_wizard(frame, area, run, *cursor, text, status.as_deref()),
+            Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -2452,14 +2457,16 @@ fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {
     }
 }
 
-fn handle_setup_wizard_key(
-    run: &mut crate::wizard::WizardRun,
-    cursor: &mut usize,
-    text: &mut TextField,
-    cwd: &std::path::Path,
-    status: &mut Option<String>,
-    key: KeyEvent,
-) -> bool {
+fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> bool {
+    let SetupWizardDialog {
+        run,
+        cursor,
+        text,
+        multi,
+        multi_touched,
+        cwd,
+        status,
+    } = wizard;
     if run.is_complete() {
         return matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'));
     }
@@ -2476,6 +2483,8 @@ fn handle_setup_wizard_key(
                         run,
                         cursor,
                         text,
+                        multi,
+                        multi_touched,
                         status,
                         crate::wizard::WizardAnswer::Select(options[index].id.to_string()),
                     );
@@ -2488,12 +2497,14 @@ fn handle_setup_wizard_key(
                 let answer = run
                     .prefill()
                     .unwrap_or(crate::wizard::WizardAnswer::Confirm(false));
-                submit_setup_wizard_answer(run, cursor, text, status, answer);
+                submit_setup_wizard_answer(run, cursor, text, multi, multi_touched, status, answer);
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => submit_setup_wizard_answer(
                 run,
                 cursor,
                 text,
+                multi,
+                multi_touched,
                 status,
                 crate::wizard::WizardAnswer::Confirm(true),
             ),
@@ -2501,6 +2512,8 @@ fn handle_setup_wizard_key(
                 run,
                 cursor,
                 text,
+                multi,
+                multi_touched,
                 status,
                 crate::wizard::WizardAnswer::Confirm(false),
             ),
@@ -2513,6 +2526,8 @@ fn handle_setup_wizard_key(
                     run,
                     cursor,
                     text,
+                    multi,
+                    multi_touched,
                     status,
                     crate::wizard::WizardAnswer::Text(text.text().to_string()),
                 );
@@ -2528,6 +2543,8 @@ fn handle_setup_wizard_key(
                     run,
                     cursor,
                     text,
+                    multi,
+                    multi_touched,
                     status,
                     crate::wizard::WizardAnswer::Acknowledged,
                 );
@@ -2544,16 +2561,60 @@ fn handle_setup_wizard_key(
                         return false;
                     }
                 }
+            } else if step.id == "model-save" {
+                match crate::commands::setup::apply_model_answers(cwd, run) {
+                    Ok(Some(path)) => *status = Some(format!("Saved {}", path.display())),
+                    Ok(None) => *status = Some("Model settings unchanged.".to_string()),
+                    Err(error) => {
+                        *status = Some(error.to_string());
+                        return false;
+                    }
+                }
             }
             submit_setup_wizard_answer(
                 run,
                 cursor,
                 text,
+                multi,
+                multi_touched,
                 status,
                 crate::wizard::WizardAnswer::Acknowledged,
             );
         }
-        crate::wizard::StepKind::Secret | crate::wizard::StepKind::MultiToggle { .. } => {}
+        crate::wizard::StepKind::MultiToggle { options } => match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                *cursor = crate::tui::nav::wrap_prev(*cursor, options.len());
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                *cursor = crate::tui::nav::wrap_next(*cursor, options.len());
+            }
+            KeyCode::Char(' ') if *cursor < options.len() => {
+                if !*multi_touched {
+                    multi.clear();
+                    if let Some(crate::wizard::WizardAnswer::MultiToggle(values)) = run.prefill() {
+                        multi.extend(values);
+                    }
+                    *multi_touched = true;
+                }
+                let id = options[*cursor].id.to_string();
+                if !multi.remove(&id) {
+                    multi.insert(id);
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let answer = if !*multi_touched
+                    && let Some(crate::wizard::WizardAnswer::MultiToggle(values)) = run.prefill()
+                {
+                    crate::wizard::WizardAnswer::MultiToggle(values)
+                } else {
+                    crate::wizard::WizardAnswer::MultiToggle(multi.iter().cloned().collect())
+                };
+                submit_setup_wizard_answer(run, cursor, text, multi, multi_touched, status, answer);
+            }
+            _ => {}
+        },
+        crate::wizard::StepKind::Secret => {}
     }
     false
 }
@@ -2562,11 +2623,13 @@ fn submit_setup_wizard_answer(
     run: &mut crate::wizard::WizardRun,
     cursor: &mut usize,
     text: &mut TextField,
+    multi: &mut std::collections::BTreeSet<String>,
+    multi_touched: &mut bool,
     status: &mut Option<String>,
     answer: crate::wizard::WizardAnswer,
 ) {
     match run.submit(answer) {
-        Ok(()) => sync_setup_wizard_inputs(run, cursor, text),
+        Ok(()) => sync_setup_wizard_inputs(run, cursor, text, multi, multi_touched),
         Err(error) => *status = Some(error),
     }
 }
@@ -2575,17 +2638,29 @@ fn sync_setup_wizard_inputs(
     run: &crate::wizard::WizardRun,
     cursor: &mut usize,
     text: &mut TextField,
+    multi: &mut std::collections::BTreeSet<String>,
+    multi_touched: &mut bool,
 ) {
     *cursor = setup_wizard_cursor_for_current_prefill(run);
+    multi.clear();
+    *multi_touched = false;
     let Some(step) = run.current_step() else {
         return;
     };
-    if matches!(step.kind, crate::wizard::StepKind::Text) {
-        let value = match run.prefill() {
-            Some(crate::wizard::WizardAnswer::Text(value)) => value,
-            _ => String::new(),
-        };
-        text.set(value);
+    match step.kind {
+        crate::wizard::StepKind::Text => {
+            let value = match run.prefill() {
+                Some(crate::wizard::WizardAnswer::Text(value)) => value,
+                _ => String::new(),
+            };
+            text.set(value);
+        }
+        crate::wizard::StepKind::MultiToggle { .. } => {
+            if let Some(crate::wizard::WizardAnswer::MultiToggle(values)) = run.prefill() {
+                multi.extend(values);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2731,14 +2806,16 @@ fn render_wizard_menu(
     frame.render_widget(help_line("↑/↓  enter: select  esc: close"), layout[1]);
 }
 
-fn render_setup_wizard(
-    frame: &mut Frame,
-    area: Rect,
-    run: &crate::wizard::WizardRun,
-    cursor: usize,
-    text: &TextField,
-    status: Option<&str>,
-) {
+fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog) {
+    let SetupWizardDialog {
+        run,
+        cursor,
+        text,
+        multi,
+        multi_touched,
+        status,
+        ..
+    } = wizard;
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Setup — {} ", run.descriptor().title));
@@ -2770,8 +2847,8 @@ fn render_setup_wizard(
         match &step.kind {
             crate::wizard::StepKind::Select { options } => {
                 for (index, option) in options.iter().enumerate() {
-                    let marker = if index == cursor { "▸ " } else { "  " };
-                    let style = if index == cursor {
+                    let marker = if index == *cursor { "▸ " } else { "  " };
+                    let style = if index == *cursor {
                         selected
                     } else {
                         Style::default().fg(Color::White)
@@ -2800,18 +2877,49 @@ fn render_setup_wizard(
             crate::wizard::StepKind::Action { progress } => {
                 lines.push(Line::from(*progress));
             }
-            crate::wizard::StepKind::Secret | crate::wizard::StepKind::MultiToggle { .. } => {
+            crate::wizard::StepKind::MultiToggle { options } => {
+                let prefill_values = if *multi_touched {
+                    None
+                } else {
+                    match run.prefill() {
+                        Some(crate::wizard::WizardAnswer::MultiToggle(values)) => Some(values),
+                        _ => None,
+                    }
+                };
+                for (index, option) in options.iter().enumerate() {
+                    let marker = if index == *cursor { "▸ " } else { "  " };
+                    let checked = prefill_values
+                        .as_ref()
+                        .map(|values| values.iter().any(|value| value == option.id))
+                        .unwrap_or_else(|| multi.contains(option.id));
+                    let check = if checked { "[x]" } else { "[ ]" };
+                    let style = if index == *cursor {
+                        selected
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled(check.to_string(), style),
+                        Span::raw(" "),
+                        Span::styled(option.label.to_string(), style),
+                        Span::raw("  "),
+                        Span::styled(option.description.to_string(), muted),
+                    ]));
+                }
+            }
+            crate::wizard::StepKind::Secret => {
                 lines.push(Line::from("Unsupported setup step."));
             }
         }
     }
-    if let Some(status) = status {
+    if let Some(status) = status.as_deref() {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(status.to_string(), muted)));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(
-        help_line("↑/↓  enter: select/continue  y/n: set toggle  esc: close"),
+        help_line("↑/↓  space: toggle  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
     );
 }
@@ -2930,6 +3038,7 @@ mod tests {
                     subagent_invokable: None,
                     can_delegate: None,
                     computer_use: None,
+                    default_thinking_mode: None,
                     embeddings: None,
                     embedding_dimensions: None,
                     availability: Default::default(),
@@ -3018,6 +3127,7 @@ mod tests {
                     subagent_invokable: None,
                     can_delegate: None,
                     computer_use: None,
+                    default_thinking_mode: None,
                     embeddings: None,
                     embedding_dimensions: None,
                     availability: Default::default(),
@@ -3054,6 +3164,7 @@ mod tests {
                     subagent_invokable: None,
                     can_delegate: None,
                     computer_use: None,
+                    default_thinking_mode: None,
                     embeddings: None,
                     embedding_dimensions: None,
                     availability: Default::default(),
@@ -4554,6 +4665,7 @@ mod tests {
                 subagent_invokable: None,
                 can_delegate: None,
                 computer_use: None,
+                default_thinking_mode: None,
                 embeddings: None,
                 embedding_dimensions: None,
                 availability: Default::default(),
@@ -4759,13 +4871,103 @@ mod tests {
         d.handle_key(press(KeyCode::Char('2')));
         d.handle_key(press(KeyCode::Enter));
 
-        let Dialog::SetupWizard { run, .. } = d else {
+        let Dialog::SetupWizard(wizard) = d else {
             panic!("expected setup wizard");
         };
         assert_eq!(
-            run.answer("redaction"),
+            wizard.run.answer("redaction"),
             Some(&crate::wizard::WizardAnswer::Text("12".to_string()))
         );
+    }
+
+    #[test]
+    fn model_wizard_tui_dialog_opens_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        let config_path = cockpit_dir.join("config.json");
+        let mut cfg = ProvidersConfig::default();
+        let mut provider = ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            ..Default::default()
+        };
+        provider.models.push(ModelEntry {
+            id: "m".to_string(),
+            ..Default::default()
+        });
+        cfg.providers.insert("p".to_string(), provider);
+        let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+        doc.write(&cfg).unwrap();
+
+        let d = Dialog::open_setup_wizard(tmp.path(), crate::wizard::MODEL_WIZARD_ID)
+            .expect("model wizard opens");
+        let Dialog::SetupWizard(wizard) = d else {
+            panic!("expected setup wizard");
+        };
+        assert_eq!(wizard.run.descriptor().id, crate::wizard::MODEL_WIZARD_ID);
+        assert_eq!(wizard.run.current_step_id(), Some("provider"));
+    }
+
+    #[test]
+    fn model_wizard_tui_advances_through_multitoggle_steps() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = ProvidersConfig::default();
+        let mut provider = ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            subagent_invokable: Some(true),
+            can_delegate: Some(true),
+            ..Default::default()
+        };
+        provider.models.push(ModelEntry {
+            id: "m".to_string(),
+            capabilities: crate::config::providers::ModelCapabilities {
+                images: Some(true),
+                reasoning: crate::config::providers::CapabilityStatus::Supported,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        cfg.providers.insert("p".to_string(), provider);
+        let run = crate::wizard::WizardRun::new(crate::wizard::model_descriptor_for_config(&cfg))
+            .expect("model wizard run");
+        let mut cursor = 0;
+        let mut text = TextField::new("");
+        let mut multi = std::collections::BTreeSet::new();
+        let mut multi_touched = false;
+        sync_setup_wizard_inputs(&run, &mut cursor, &mut text, &mut multi, &mut multi_touched);
+        let mut d = Dialog::SetupWizard(Box::new(SetupWizardDialog {
+            run,
+            cursor,
+            text,
+            multi,
+            multi_touched,
+            cwd: tmp.path().to_path_buf(),
+            status: None,
+        }));
+        for expected in [
+            "provider",
+            "model",
+            "class",
+            "trust",
+            "capabilities",
+            "context-tokens",
+            "max-output-tokens",
+            "thinking",
+            "subagent-flags",
+            "default-model",
+            "system-prompt-choice",
+        ] {
+            let Dialog::SetupWizard(wizard) = &d else {
+                panic!("expected setup wizard");
+            };
+            assert_eq!(wizard.run.current_step_id(), Some(expected));
+            d.handle_key(press(KeyCode::Enter));
+        }
+
+        let Dialog::SetupWizard(wizard) = d else {
+            panic!("expected setup wizard");
+        };
+        assert_eq!(wizard.run.current_step_id(), Some("model-save"));
     }
 
     #[test]

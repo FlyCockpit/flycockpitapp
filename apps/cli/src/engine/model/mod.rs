@@ -909,7 +909,14 @@ impl Model {
             }
             return None;
         }
-        let mode = active.thinking_mode?;
+        let mode = active
+            .thinking_mode
+            .filter(|_| {
+                active.provider == self.provider_id() && active.model == self.model_id_ref()
+            })
+            .or_else(|| {
+                providers.resolve_default_thinking_mode(self.provider_id(), self.model_id_ref())
+            })?;
         providers.resolve_thinking_params(self.provider_id(), self.model_id_ref(), mode)
     }
 

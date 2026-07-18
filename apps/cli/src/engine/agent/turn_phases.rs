@@ -634,6 +634,15 @@ pub(crate) async fn run_turn(
     session.note_send();
 
     inject_initial_project_guidance(&agent.name, history, &cwd, redact.clone(), tx).await;
+    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, &prompt);
+    crate::knowledge::inject_knowledge_for_turn(
+        history,
+        &session,
+        &cwd,
+        &knowledge_query,
+        redact.clone(),
+    )
+    .await;
 
     // Live instructions-file diff injection (prompt
     // `instructions-file-live-diff.md`). Guidance now rides as user-role

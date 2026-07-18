@@ -28,6 +28,7 @@ mod git;
 mod gitignore;
 mod harness;
 mod intel;
+mod knowledge;
 mod locks;
 mod mcp;
 mod model_system_prompt;

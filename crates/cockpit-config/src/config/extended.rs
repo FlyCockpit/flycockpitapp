@@ -192,6 +192,16 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
 
+    /// Enable the trust-gated `.cockpit/knowledge/` project OKF bundle.
+    /// Assistant-owned bundles are discovered independently from assistant
+    /// home directories; this flag only controls the project attach point.
+    #[serde(default)]
+    pub project_knowledge: bool,
+
+    /// Maximum model-context budget for automatic cited knowledge injection.
+    #[serde(default = "default_knowledge_inject_max_tokens")]
+    pub knowledge_inject_max_tokens: usize,
+
     /// Full override for the `/compact` handoff-brief instruction
     /// (implementation note). When set and
     /// non-empty it **fully replaces** the default brief prompt text; the
@@ -1331,6 +1341,8 @@ impl Default for ExtendedConfig {
             harness_report_summarization: None,
             compact_model: None,
             embedding_model: None,
+            project_knowledge: false,
+            knowledge_inject_max_tokens: default_knowledge_inject_max_tokens(),
             compact_prompt: None,
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
             preflight: PreflightConfig::default(),
@@ -1370,6 +1382,10 @@ impl Default for ExtendedConfig {
 
 fn default_agent_guidance_files() -> Vec<String> {
     vec!["AGENTS.md".into()]
+}
+
+fn default_knowledge_inject_max_tokens() -> usize {
+    2048
 }
 
 thread_local! {
@@ -1546,6 +1562,8 @@ impl ExtendedConfigDoc {
         parse_field!("harness_report_summarization", harness_report_summarization);
         parse_field!("compact_model", compact_model);
         parse_field!("embedding_model", embedding_model);
+        parse_field!("project_knowledge", project_knowledge);
+        parse_field!("knowledge_inject_max_tokens", knowledge_inject_max_tokens);
         parse_field!("compact_prompt", compact_prompt);
         parse_field!("prompt_injection_guard", prompt_injection_guard);
         parse_field!("preflight", preflight);
@@ -1608,6 +1626,8 @@ impl ExtendedConfigDoc {
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("trustedOnly", bool);
         remove_malformed!("trusted_only", bool);
+        remove_malformed!("project_knowledge", bool);
+        remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);
         remove_malformed!("sandbox_escalation_enabled", bool);
         remove_malformed!("prompt_injection_guard", PromptInjectionGuardConfig);

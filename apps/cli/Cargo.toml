@@ -86,7 +86,10 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 cockpit-config = { path = "../../crates/cockpit-config" }
 cockpit-db = { path = "../../crates/cockpit-db" }
 cockpit-proto = { path = "../../crates/cockpit-proto" }
+# rusqlite 0.40 has no separate `fts5` feature; bundled SQLite includes FTS5
+# and the knowledge sidecar tests create/query an FTS5 virtual table.
 rusqlite = { version = "0.40", features = ["bundled"] }
+sqlite-vec = "0.1.10-alpha.4"
 
 # Session-log export archive writer (`cockpit export <session>` → .zip,
 # session-log-export Part D). `default-features = false` + only `deflate`

@@ -1,0 +1,6 @@
+[env]
+# sqlite-vec 0.1.10-alpha.4 publishes the core vec0 amalgamation without the
+# optional DiskANN source file it includes by default. Cockpit uses vec0 for
+# per-bundle knowledge sidecar vector storage/query; disable only the missing
+# optional DiskANN compile path so the native extension links consistently.
+CFLAGS = { value = "-DSQLITE_VEC_ENABLE_DISKANN=0 -DSQLITE_VEC_ENABLE_RESCORE=0", force = true }

@@ -997,6 +997,7 @@ dependencies = [
  "sha2 0.11.0",
  "shellexpand",
  "similar 3.1.1",
+ "sqlite-vec",
  "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
@@ -6440,6 +6441,15 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.10-alpha.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6436dbf1d78c5015f9ae21822dbaa32368039d6b07708874a432c33c0548e47d"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

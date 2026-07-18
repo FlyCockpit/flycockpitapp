@@ -107,6 +107,7 @@ pub(crate) const MULTIREVIEW_PROMPT_NORMAL: &str = include_str!("multireview.nor
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
 pub(crate) const BEE_PROMPT_NORMAL: &str = include_str!("bee.normal.md");
 pub(crate) const BEE_PROMPT_FRONTIER: &str = include_str!("bee.frontier.md");
+const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
 /// Select a bundled agent's prompt body for the active `llm_mode`: defensive
 /// uses the flat body; normal uses the normal body when present; frontier uses
@@ -220,6 +221,109 @@ impl SpawnArgs {
             .clone()
             .unwrap_or_else(|| self.model.clone())
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedComputerUse {
+    tier: crate::config::extended::ComputerUseMode,
+    native_computer: Option<crate::computer::NativeComputerToolConfig>,
+    requires_approval: bool,
+}
+
+fn default_computer_geometry() -> crate::computer::DisplayGeometry {
+    crate::computer::DisplayGeometry {
+        physical: crate::computer::PixelSize {
+            width: 1024,
+            height: 768,
+        },
+        logical: crate::computer::LogicalSize {
+            width: 1024.0,
+            height: 768.0,
+        },
+        scale_factor: crate::computer::ScaleFactor(1.0),
+    }
+}
+
+fn resolved_computer_use_for_model(
+    providers: &crate::config::providers::ProvidersConfig,
+    cwd: &Path,
+    model: &Model,
+) -> ResolvedComputerUse {
+    let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
+    let tier = providers.resolve_computer_use_effective(
+        model.provider_id(),
+        model.model_id_ref(),
+        configured,
+        None,
+    );
+    let caps = providers.resolve_capabilities(model.provider_id(), model.model_id_ref());
+    let native_computer = (tier != crate::config::extended::ComputerUseMode::Disabled
+        && caps.images == Some(true))
+    .then(|| {
+        caps.computer_use
+            .and_then(|capability| capability.contract)
+            .map(|contract| crate::computer::NativeComputerToolConfig {
+                contract: contract.into(),
+                geometry: default_computer_geometry(),
+                approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
+            })
+    })
+    .flatten();
+    ResolvedComputerUse {
+        tier,
+        native_computer,
+        requires_approval: tier == crate::config::extended::ComputerUseMode::Ask,
+    }
+}
+
+fn params_with_direct_computer(args: &SpawnArgs, model: &Model) -> ModelParams {
+    let mut params = args.params.clone();
+    let providers = crate::config::providers::ConfigDoc::load_effective(&args.cwd);
+    params.native_computer =
+        resolved_computer_use_for_model(&providers, &args.cwd, model).native_computer;
+    params
+}
+
+fn computer_subagent_candidate(
+    providers: &crate::config::providers::ProvidersConfig,
+    cwd: &Path,
+) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
+    let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
+    for (provider_id, provider) in &providers.providers {
+        for model in &provider.models {
+            let tier =
+                providers.resolve_computer_use_effective(provider_id, &model.id, configured, None);
+            if tier == crate::config::extended::ComputerUseMode::Disabled {
+                continue;
+            }
+            if !providers.resolve_subagent_invokable(provider_id, &model.id) {
+                continue;
+            }
+            let caps = providers.resolve_capabilities(provider_id, &model.id);
+            if caps.images != Some(true) {
+                continue;
+            }
+            let Some(contract) = caps.computer_use.and_then(|capability| capability.contract)
+            else {
+                continue;
+            };
+            return Some((
+                provider_id.clone(),
+                model.id.clone(),
+                crate::computer::NativeComputerToolConfig {
+                    contract: contract.into(),
+                    geometry: default_computer_geometry(),
+                    approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
+                },
+            ));
+        }
+    }
+    None
+}
+
+fn computer_subagent_reachable(cwd: &Path) -> bool {
+    let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+    computer_subagent_candidate(&providers, cwd).is_some()
 }
 
 /// Append the full codebase-intelligence tool set (GOALS §21) to `tb`.
@@ -813,6 +917,9 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
             "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
         );
     }
+    if name == "computer" {
+        return computer(args);
+    }
 
     // Overlay: an on-disk override (edited built-in) or a custom agent
     // takes precedence over the embedded factory. A malformed override
@@ -859,6 +966,7 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     if !args.granted_tools.is_empty() && name != "deepthink" {
         agent.tools = apply_grants(agent.tools, &args.granted_tools, args)?;
     }
+    agent.params = params_with_direct_computer(args, &agent.model);
     Ok(agent)
 }
 
@@ -1201,6 +1309,9 @@ fn build_subagents(cwd: &Path) -> Vec<String> {
         "explore".to_string(),
         "docs".to_string(),
     ];
+    if computer_subagent_reachable(cwd) {
+        out.push("computer".to_string());
+    }
     if load_extended_config(cwd).deepthink.enabled {
         out.push("deepthink".to_string());
     }
@@ -1400,13 +1511,15 @@ pub fn build(args: &SpawnArgs) -> Agent {
         Some(BUILD_PROMPT_FRONTIER),
         args.llm_mode,
     );
+    let model = args.effective_model();
+    let params = params_with_direct_computer(args, &model);
     Agent {
         name: "Build".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
+        model,
+        params,
         scan_tool_results: true,
         llm_mode: args.llm_mode,
         delegated: args.delegated,
@@ -1577,6 +1690,56 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
     }
 }
 
+/// `computer` — provider-native computer-use worker. It never inherits a
+/// non-vision parent model: the factory selects an eligible
+/// vision-capable, subagent-invokable model with a native computer contract
+/// and refuses loudly when none exists.
+pub fn computer(args: &SpawnArgs) -> Result<Agent> {
+    let providers = crate::config::providers::ConfigDoc::load_effective(&args.cwd);
+    let Some((provider_id, model_id, native_computer)) =
+        computer_subagent_candidate(&providers, &args.cwd)
+    else {
+        bail!(
+            "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
+        );
+    };
+    let model = Arc::new(crate::engine::model::Model::for_provider_trusted_only(
+        &providers,
+        &provider_id,
+        &model_id,
+        args.effective_model().session_redact_table(),
+        args.effective_model().trusted_only_flag(),
+    )?);
+    let caps = providers.resolve_capabilities(model.provider_id(), model.model_id_ref());
+    if caps.images != Some(true) {
+        bail!(
+            "computer-use subagent requires a vision-capable model; `{}`:`{}` is not vision-capable",
+            model.provider_id(),
+            model.model_id_ref()
+        );
+    }
+    let mut params = args.params.clone();
+    params.native_computer = Some(native_computer);
+    Ok(Agent {
+        name: "computer".to_string(),
+        system: compose_system_prompt_for_model(COMPUTER_PROMPT, &model, args),
+        role_prompt: COMPUTER_PROMPT.to_string(),
+        tools: with_return_tool(ToolBox::new(), "computer"),
+        model,
+        params,
+        scan_tool_results: false,
+        llm_mode: args.llm_mode,
+        delegated: args.delegated,
+        delegation_recursion: DelegationRecursionContext {
+            enabled: args.delegation_recursion.enabled,
+            remaining_depth: 0,
+            allowed_targets: Vec::new(),
+            same_model_only: false,
+        },
+        env_overlay: args.env_overlay.clone(),
+    })
+}
+
 /// `scout` — read-only recursive review worker. Its base surface mirrors
 /// `explore` plus `spawn` and `return`; it holds no write/lock tools, no
 /// `task`, no MCP, and no docs-only grep/glob. Used by the hidden
@@ -1710,13 +1873,15 @@ pub fn swarm(args: &SpawnArgs) -> Agent {
         Some(SWARM_PROMPT_FRONTIER),
         args.llm_mode,
     );
+    let model = args.effective_model();
+    let params = params_with_direct_computer(args, &model);
     Agent {
         name: "Swarm".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
+        model,
+        params,
         scan_tool_results: true,
         llm_mode: args.llm_mode,
         delegated: args.delegated,
@@ -1979,6 +2144,42 @@ mod tests {
         std::fs::write(dir.join("config.json"), body).unwrap();
     }
 
+    fn write_computer_provider_config(cwd: &Path, config_body: &str, provider_body: &str) {
+        let dir = cwd.join(".cockpit");
+        std::fs::create_dir_all(dir.join("providers")).unwrap();
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, config_body).unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        std::fs::write(provider_path, provider_body).unwrap();
+    }
+
+    fn disk_model_spawn_args(cwd: &Path, model_id: &str) -> SpawnArgs {
+        let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+        let model = Arc::new(
+            crate::engine::model::Model::for_provider(
+                &providers,
+                "p",
+                model_id,
+                Arc::new(crate::redact::RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let mut args = test_spawn_args(cwd);
+        args.model = model;
+        args
+    }
+
+    fn task_target_names(agent: &Agent) -> Vec<String> {
+        task_definition(agent, crate::config::extended::LlmMode::Normal).parameters["properties"]
+            ["payload"]["properties"]["agent"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect()
+    }
+
     fn write_model_role_config(cwd: &Path) {
         let dir = cwd.join(".cockpit");
         std::fs::create_dir_all(dir.join("providers")).unwrap();
@@ -2170,6 +2371,188 @@ mod tests {
             .unwrap()
             .clone();
         assert!(targets.iter().any(|value| value == "deepthink"));
+    }
+
+    #[test]
+    fn computer_subagent_requires_vision() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [
+                    {
+                        "id": "text",
+                        "subagent_invokable": true,
+                        "capabilities": {
+                            "images": false,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+        let text_args = disk_model_spawn_args(tmp.path(), "text");
+        let err = match load("computer", &text_args) {
+            Ok(_) => panic!("non-vision-only computer provider should not load"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("requires a configured vision-capable"),
+            "{err}"
+        );
+
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [
+                    {
+                        "id": "text",
+                        "subagent_invokable": true,
+                        "capabilities": { "images": false }
+                    },
+                    {
+                        "id": "vision",
+                        "subagent_invokable": true,
+                        "capabilities": {
+                            "images": true,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+        let agent = load("computer", &text_args).unwrap();
+        assert_eq!(agent.model.provider_id(), "p");
+        assert_eq!(agent.model.model_id_ref(), "vision");
+        assert!(agent.params.native_computer.is_some());
+    }
+
+    #[test]
+    fn nonvision_delegates_not_direct() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [
+                    {
+                        "id": "text",
+                        "subagent_invokable": true,
+                        "capabilities": { "images": false }
+                    },
+                    {
+                        "id": "vision",
+                        "subagent_invokable": true,
+                        "capabilities": {
+                            "images": true,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+
+        let text_agent = build(&disk_model_spawn_args(tmp.path(), "text"));
+        assert!(text_agent.params.native_computer.is_none());
+        let text_targets = task_target_names(&text_agent);
+        assert!(text_targets.iter().any(|target| target == "computer"));
+
+        let vision_agent = build(&disk_model_spawn_args(tmp.path(), "vision"));
+        assert!(vision_agent.params.native_computer.is_some());
+    }
+
+    #[test]
+    fn disabled_hides_computer() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "disabled",
+                "models": [
+                    {
+                        "id": "text",
+                        "subagent_invokable": true,
+                        "capabilities": { "images": false }
+                    },
+                    {
+                        "id": "vision",
+                        "subagent_invokable": true,
+                        "capabilities": {
+                            "images": true,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+
+        let args = disk_model_spawn_args(tmp.path(), "vision");
+        let agent = build(&args);
+        assert!(agent.params.native_computer.is_none());
+        let targets = task_target_names(&agent);
+        assert!(!targets.iter().any(|target| target == "computer"));
+        let err = match load("computer", &args) {
+            Ok(_) => panic!("disabled computer-use provider should not load"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("requires a configured vision-capable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ask_routes_to_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "ask",
+                "models": [
+                    {
+                        "id": "vision",
+                        "subagent_invokable": true,
+                        "capabilities": {
+                            "images": true,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+        let args = disk_model_spawn_args(tmp.path(), "vision");
+        let providers = crate::config::providers::ConfigDoc::load_effective(tmp.path());
+        let resolved = resolved_computer_use_for_model(&providers, tmp.path(), &args.model);
+
+        assert_eq!(resolved.tier, crate::config::extended::ComputerUseMode::Ask);
+        assert!(resolved.requires_approval);
+        assert!(
+            resolved
+                .native_computer
+                .as_ref()
+                .is_some_and(|computer| computer.approval_required)
+        );
+
+        let agent = load("computer", &args).unwrap();
+        assert!(
+            agent
+                .params
+                .native_computer
+                .as_ref()
+                .is_some_and(|computer| computer.approval_required)
+        );
     }
 
     #[test]

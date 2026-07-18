@@ -621,6 +621,7 @@ impl RowListEditor for ModelEditor {
                     cost_rank: None,
                     subagent_invokable: None,
                     can_delegate: None,
+                    computer_use: None,
                     embeddings: None,
                     embedding_dimensions: None,
                     availability: Default::default(),

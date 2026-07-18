@@ -231,6 +231,35 @@ fn provider_lines(
             .iter()
             .filter(|model| cfg.resolve_can_delegate(id, &model.id))
             .count();
+        let mut computer_disabled = 0usize;
+        let mut computer_ask = 0usize;
+        let mut computer_yolo = 0usize;
+        let mut computer_vision_models = 0usize;
+        for model in &provider.models {
+            let tier =
+                cfg.resolve_computer_use_effective(id, &model.id, extended.computer_use, None);
+            match tier {
+                crate::config::extended::ComputerUseMode::Disabled => {
+                    computer_disabled += 1;
+                }
+                crate::config::extended::ComputerUseMode::Ask => {
+                    computer_ask += 1;
+                }
+                crate::config::extended::ComputerUseMode::Yolo => {
+                    computer_yolo += 1;
+                }
+            }
+            let caps = cfg.resolve_capabilities(id, &model.id);
+            if tier != crate::config::extended::ComputerUseMode::Disabled
+                && caps.images == Some(true)
+                && caps
+                    .computer_use
+                    .as_ref()
+                    .is_some_and(|c| c.contract.is_some())
+            {
+                computer_vision_models += 1;
+            }
+        }
         let embedding_count = provider
             .models
             .iter()
@@ -249,6 +278,10 @@ fn provider_lines(
             format!("trusted {trusted_count}/{model_count}"),
             format!("subagent-invokable {subagent_count}/{model_count}"),
             format!("can-delegate {can_delegate_count}/{model_count}"),
+            format!(
+                "computer-use disabled/ask/yolo {computer_disabled}/{computer_ask}/{computer_yolo}"
+            ),
+            format!("computer-vision {computer_vision_models}/{model_count}"),
             format!("embedding-capable {embedding_count}/{model_count}"),
             format!("ranked {ranked_count}/{model_count}"),
         ];
@@ -800,6 +833,56 @@ mod tests {
         let rendered = render(&snapshot);
 
         assert!(rendered.contains("can-delegate 1/3"), "{rendered}");
+    }
+
+    #[test]
+    fn doctor_reports_computer_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(cockpit.join("providers")).unwrap();
+        let config_path = cockpit.join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "mixed").unwrap();
+        std::fs::write(
+            provider_path,
+            r#"{
+                "url": "https://mixed.example/v1",
+                "computer_use": "yolo",
+                "models": [
+                    {
+                        "id": "provider-yolo",
+                        "capabilities": { "images": false }
+                    },
+                    {
+                        "id": "model-ask",
+                        "computer_use": "ask",
+                        "capabilities": {
+                            "images": true,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    },
+                    {
+                        "id": "model-disabled",
+                        "computer_use": "disabled",
+                        "capabilities": {
+                            "images": true,
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let rendered = render(&snapshot);
+
+        assert!(
+            rendered.contains("computer-use disabled/ask/yolo 1/1/1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("computer-vision 1/3"), "{rendered}");
     }
 
     #[test]

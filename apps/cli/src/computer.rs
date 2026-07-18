@@ -1065,6 +1065,12 @@ pub struct NativeComputerWire {
 pub struct NativeComputerToolConfig {
     pub contract: ComputerToolContract,
     pub geometry: DisplayGeometry,
+    /// True when the effective `computer_use` tier is `ask`.
+    ///
+    /// The gating prompt wires this bit so the following approval/redaction
+    /// prompt can route native computer actions through the shared approval
+    /// path without re-resolving provider/project policy at dispatch time.
+    pub approval_required: bool,
 }
 
 impl NativeComputerToolConfig {

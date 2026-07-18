@@ -130,6 +130,14 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "WebConfig::is_default")]
     pub web: WebConfig,
 
+    /// Layer-local computer-use safety policy. Catalog provider/model policy
+    /// is resolved separately; explicit config layers tighten that catalog
+    /// value by taking the most restrictive tier. Missing is neutral during
+    /// cross-layer resolution; all-unset resolves to disabled at the final
+    /// call site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<ComputerUseMode>,
+
     /// Require every inference request to use a provider/model marked
     /// `trust: "trusted"`. Off by default.
     #[serde(default, rename = "trustedOnly", alias = "trusted_only")]
@@ -830,6 +838,37 @@ pub enum ApprovalMode {
     Yolo,
 }
 
+/// Computer-use reachability tier.
+///
+/// The declaration order is the safety order: `disabled < ask < yolo`.
+/// Taking `min` over explicit layers therefore chooses the most restrictive
+/// configured policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputerUseMode {
+    Disabled,
+    Ask,
+    Yolo,
+}
+
+impl ComputerUseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComputerUseMode::Disabled => "disabled",
+            ComputerUseMode::Ask => "ask",
+            ComputerUseMode::Yolo => "yolo",
+        }
+    }
+
+    pub fn most_restrictive(values: impl IntoIterator<Item = Self>) -> Option<Self> {
+        values.into_iter().min()
+    }
+
+    pub fn min_with(self, other: Self) -> Self {
+        self.min(other)
+    }
+}
+
 impl ApprovalMode {
     /// The lowercase config/serde spelling.
     pub fn as_str(self) -> &'static str {
@@ -1340,6 +1379,7 @@ impl Default for ExtendedConfig {
             packages_directory: None,
             tools: HashMap::new(),
             web: WebConfig::default(),
+            computer_use: None,
             trusted_only: false,
             allow_remote_config: false,
             utility_model: None,
@@ -1474,6 +1514,47 @@ fn load_merged_from_paths(paths: &[PathBuf]) -> Option<ExtendedConfig> {
     })
 }
 
+/// Resolve the explicitly configured computer-use policy across all config
+/// layers for `cwd`. Missing layers and layers without `computer_use` are
+/// neutral; malformed values are ignored with the same warning posture as the
+/// normal extended-config loader. The caller combines this with catalog
+/// provider/model policy and applies the final all-unset disabled default.
+pub fn resolve_computer_use_policy_for_cwd(cwd: &Path) -> Option<ComputerUseMode> {
+    let paths = config_file_paths_for_load(cwd);
+    resolve_computer_use_policy_from_paths(&paths)
+}
+
+pub fn resolve_computer_use_policy_from_paths(paths: &[PathBuf]) -> Option<ComputerUseMode> {
+    let mut tiers = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        match ExtendedConfigDoc::load(path) {
+            Ok(doc) => {
+                let Some(value) = doc.raw_field("computer_use") else {
+                    continue;
+                };
+                match serde_json::from_value::<ComputerUseMode>(value.clone()) {
+                    Ok(tier) => tiers.push(tier),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            key = "computer_use",
+                            %error,
+                            "skipping malformed computer_use policy"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
+            }
+        }
+    }
+    ComputerUseMode::most_restrictive(tiers)
+}
+
 /// Round-trip loader/saver for the cockpit-only keys in `config.json` that
 /// preserves unknown fields. Same pattern as
 /// [`crate::config::providers::ConfigDoc`] (which owns layer-wide provider
@@ -1561,6 +1642,7 @@ impl ExtendedConfigDoc {
         parse_field!("packages_directory", packages_directory);
         parse_field!("tools", tools);
         parse_field!("web", web);
+        parse_field!("computer_use", computer_use);
         parse_field!("trustedOnly", trusted_only);
         parse_field!("trusted_only", trusted_only);
         parse_field!("allow_remote_config", allow_remote_config);
@@ -1639,6 +1721,7 @@ impl ExtendedConfigDoc {
 
         remove_malformed!("redact", RedactConfig);
         remove_malformed!("tui", TuiConfig);
+        remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("trustedOnly", bool);
         remove_malformed!("trusted_only", bool);
         remove_malformed!("project_knowledge", bool);

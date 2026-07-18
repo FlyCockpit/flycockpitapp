@@ -77,6 +77,7 @@ fn round_trips_a_provider_entry() {
             cost_rank: None,
             subagent_invokable: None,
             can_delegate: Some(false),
+            computer_use: Some(crate::config::extended::ComputerUseMode::Ask),
             embeddings: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
@@ -104,6 +105,7 @@ fn round_trips_a_provider_entry() {
                 cost_rank: None,
                 subagent_invokable: None,
                 can_delegate: Some(true),
+                computer_use: Some(crate::config::extended::ComputerUseMode::Yolo),
                 embeddings: None,
                 embedding_dimensions: None,
                 availability: Default::default(),
@@ -339,6 +341,7 @@ fn resolve_cache_prefers_model_override() {
         cost_rank: None,
         subagent_invokable: None,
         can_delegate: None,
+        computer_use: None,
         embeddings: None,
         embedding_dimensions: None,
         availability: Default::default(),
@@ -948,6 +951,7 @@ fn model(id: &str, manual: bool) -> ModelEntry {
         cost_rank: None,
         subagent_invokable: None,
         can_delegate: None,
+        computer_use: None,
         embeddings: None,
         embedding_dimensions: None,
         availability: Default::default(),
@@ -1222,6 +1226,68 @@ fn fetch_merge_preserves_can_delegate() {
     );
 
     assert_eq!(merged[0].can_delegate, Some(false));
+}
+
+#[test]
+fn computer_use_resolve_matrix() {
+    use crate::config::extended::ComputerUseMode;
+
+    let mut cfg = ProvidersConfig::default();
+    let mut provider = ProviderEntry {
+        computer_use: Some(ComputerUseMode::Ask),
+        ..ProviderEntry::default()
+    };
+    provider.models.push(model("inherits-provider", false));
+    let mut override_yolo = model("override-yolo", false);
+    override_yolo.computer_use = Some(ComputerUseMode::Yolo);
+    provider.models.push(override_yolo);
+    let mut override_disabled = model("override-disabled", false);
+    override_disabled.computer_use = Some(ComputerUseMode::Disabled);
+    provider.models.push(override_disabled);
+    cfg.providers.insert("p".into(), provider);
+
+    assert_eq!(
+        cfg.resolve_computer_use_effective("p", "inherits-provider", None, None),
+        ComputerUseMode::Ask
+    );
+    assert_eq!(
+        cfg.resolve_computer_use_effective("p", "override-yolo", None, None),
+        ComputerUseMode::Yolo
+    );
+    assert_eq!(
+        cfg.resolve_computer_use_effective("p", "override-disabled", None, None),
+        ComputerUseMode::Disabled
+    );
+    assert_eq!(
+        cfg.resolve_computer_use_effective("p", "override-yolo", Some(ComputerUseMode::Ask), None),
+        ComputerUseMode::Ask
+    );
+    assert_eq!(
+        cfg.resolve_computer_use_effective("p", "override-yolo", None, Some(ComputerUseMode::Ask)),
+        ComputerUseMode::Ask
+    );
+    assert_eq!(
+        cfg.resolve_computer_use_effective("missing", "missing", None, None),
+        ComputerUseMode::Disabled
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("global.json");
+    let project = tmp.path().join("project.json");
+    std::fs::write(&global, r#"{"computer_use":"yolo"}"#).unwrap();
+    std::fs::write(&project, "{}").unwrap();
+    assert_eq!(
+        crate::config::extended::resolve_computer_use_policy_from_paths(&[
+            global.clone(),
+            project.clone()
+        ]),
+        Some(ComputerUseMode::Yolo)
+    );
+    std::fs::write(&project, r#"{"computer_use":"ask"}"#).unwrap();
+    assert_eq!(
+        crate::config::extended::resolve_computer_use_policy_from_paths(&[global, project]),
+        Some(ComputerUseMode::Ask)
+    );
 }
 
 #[test]

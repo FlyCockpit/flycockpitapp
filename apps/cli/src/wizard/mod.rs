@@ -832,6 +832,7 @@ pub(crate) fn provider_entry_for_template(
         cost_rank: None,
         subagent_invokable: None,
         can_delegate: None,
+        computer_use: None,
         embeddings: None,
         availability: Default::default(),
         cache: Default::default(),

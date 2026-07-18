@@ -54,7 +54,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::config::extended::{LlmMode, TextEmbeddedRecovery};
+use crate::config::extended::{ComputerUseMode, LlmMode, TextEmbeddedRecovery};
 use crate::config::merge::deep_merge_value;
 
 const PROVIDERS_DIR: &str = "providers";
@@ -71,6 +71,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "quality_rank",
     "cost_rank",
     "subagent_invokable",
+    "computer_use",
     "embeddings",
     "availability",
     "wire_api",
@@ -408,6 +409,11 @@ pub struct ProviderEntry {
     /// Missing resolves to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can_delegate: Option<bool>,
+
+    /// Provider default for computer-use reachability. Missing is neutral
+    /// until final resolution, where all-unset resolves to disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<ComputerUseMode>,
 
     /// Provider default for whether models support OpenAI-compatible embeddings.
     /// Missing resolves to false.
@@ -871,6 +877,10 @@ pub struct ModelEntry {
     /// default, then resolves to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can_delegate: Option<bool>,
+    /// Model-level computer-use reachability override. Missing inherits
+    /// provider policy within the catalog layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<ComputerUseMode>,
     /// Model-level embeddings support override. Missing inherits provider
     /// default, then resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1475,6 +1485,9 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     }
     if existing.can_delegate.is_some() {
         fetched.can_delegate = existing.can_delegate;
+    }
+    if existing.computer_use.is_some() {
+        fetched.computer_use = existing.computer_use;
     }
     if existing.embeddings.is_some() {
         fetched.embeddings = existing.embeddings;
@@ -2086,6 +2099,36 @@ impl ProvidersConfig {
             .and_then(|m| m.can_delegate)
             .or(entry.can_delegate)
             .unwrap_or(true)
+    }
+
+    pub fn resolve_computer_use_catalog(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<ComputerUseMode> {
+        let entry = self.providers.get(provider)?;
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.computer_use)
+            .or(entry.computer_use)
+    }
+
+    pub fn resolve_computer_use_effective(
+        &self,
+        provider: &str,
+        model: &str,
+        configured: Option<ComputerUseMode>,
+        display_cap: Option<ComputerUseMode>,
+    ) -> ComputerUseMode {
+        let tiers = [
+            self.resolve_computer_use_catalog(provider, model),
+            configured,
+            display_cap,
+        ];
+        ComputerUseMode::most_restrictive(tiers.into_iter().flatten())
+            .unwrap_or(ComputerUseMode::Disabled)
     }
 
     /// Resolve how a leading inline `<think>…</think>` block is **classified**

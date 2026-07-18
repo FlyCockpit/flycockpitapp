@@ -2374,6 +2374,7 @@ mod tests {
             native_computer: Some(crate::computer::NativeComputerToolConfig {
                 contract: crate::computer::ComputerToolContract::Anthropic20251124,
                 geometry: geometry.clone(),
+                approval_required: false,
             }),
             additional_params: Some(
                 json!({ "tools": [{"type": "custom"}], "thinking": {"type": "enabled"} }),
@@ -2411,6 +2412,7 @@ mod tests {
             native_computer: Some(crate::computer::NativeComputerToolConfig {
                 contract: crate::computer::ComputerToolContract::Anthropic20250124,
                 geometry,
+                approval_required: false,
             }),
             ..ModelParams::default()
         };
@@ -2459,6 +2461,7 @@ mod tests {
                     },
                     scale_factor: crate::computer::ScaleFactor(2.0),
                 },
+                approval_required: false,
             }),
             ..ModelParams::default()
         };

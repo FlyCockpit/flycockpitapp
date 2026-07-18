@@ -23,7 +23,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 

@@ -117,13 +117,14 @@ fn log_seed_tool_drain_failed(session_id: Uuid, error: &anyhow::Error) {
     );
 }
 
-/// Resolve the root-frame primary for a session: its stored active agent
-/// (so a resume restarts on whatever `Auto` handed off to, or a `/plan`
-/// swap landed on), falling back to the configured default
-/// ([`initial_active_agent`]) when unset/unknown. `Auto`, `Build`, and
-/// `Plan` are the primary-mode agents; anything else degrades to the
-/// default. Shared by [`spawn`] (the handle's initial chrome slot) and
-/// [`run_worker`] (the agent it actually loads) so both agree.
+/// Resolve the root-frame agent for a session. Assistant sessions keep their
+/// durable assistant identity so the shared agent loader can resolve the
+/// authored assistant definition; ordinary sessions use their stored active
+/// primary (so a resume restarts on whatever `Auto` handed off to, or a
+/// `/plan` swap landed on), falling back to the configured default
+/// ([`initial_active_agent`]) when unset/unknown. Shared by [`spawn`] (the
+/// handle's initial chrome slot) and [`run_worker`] (the agent it actually
+/// loads) so both agree.
 pub(crate) fn resolve_root_agent(
     session_id: Uuid,
     db: &crate::db::Db,
@@ -138,10 +139,27 @@ pub(crate) fn resolve_root_agent_conn(
     session_id: Uuid,
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> String {
-    crate::db::Db::get_session_conn(conn, session_id)
-        .ok()
-        .flatten()
-        .map(|row| row.active_agent)
+    let default_primary = || initial_active_agent(cfg).to_string();
+    let Ok(Some(row)) = crate::db::Db::get_session_conn(conn, session_id) else {
+        return default_primary();
+    };
+    if let Some(assistant_name) = row.assistant_name.as_deref() {
+        if conn
+            .query_row(
+                "SELECT 1 FROM assistants WHERE name = ?1 LIMIT 1",
+                rusqlite::params![assistant_name],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return assistant_name.to_string();
+        }
+        return default_primary();
+    }
+    Some(row.active_agent)
         .filter(|name| {
             matches!(
                 name.as_str(),
@@ -153,7 +171,7 @@ pub(crate) fn resolve_root_agent_conn(
         // experimental since turned off) silently loads on `Build` instead —
         // no notice. With the flag on, the stored value is honored.
         .map(|name| crate::agents::resolve_primary_for_flag(&name, cfg.experimental_mode))
-        .unwrap_or_else(|| initial_active_agent(cfg).to_string())
+        .unwrap_or_else(default_primary)
 }
 
 /// Resolve the effective LLM mode for the session's active (provider, model)

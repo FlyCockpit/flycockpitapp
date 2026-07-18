@@ -370,6 +370,126 @@ mod tests {
         }
     }
 
+    struct IsolatedCockpitEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl IsolatedCockpitEnv {
+        fn new(root: &std::path::Path) -> Self {
+            let lock = crate::test_env::lock();
+            let vars = vec![
+                ("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
+                ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+                ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+                ("COCKPIT_CONFIG", std::env::var_os("COCKPIT_CONFIG")),
+            ];
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", root.join("data"));
+                std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+                std::env::set_var("XDG_STATE_HOME", root.join("state"));
+                std::env::remove_var("COCKPIT_CONFIG");
+            }
+            Self { _lock: lock, vars }
+        }
+    }
+
+    impl Drop for IsolatedCockpitEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.vars.iter().rev() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_model_config(cwd: &std::path::Path) {
+        let cockpit_dir = cwd.join(".cockpit");
+        std::fs::create_dir_all(cockpit_dir.join("providers")).unwrap();
+        std::fs::write(
+            cockpit_dir.join("config.json"),
+            r#"{"active_model":{"provider":"lmstudio","model":"session-model"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cockpit_dir.join("providers/lmstudio.json"),
+            r#"{
+              "url": "http://localhost:1/v1",
+              "models": [
+                {"id": "session-model"},
+                {"id": "assistant-model"}
+              ]
+            }"#,
+        )
+        .unwrap();
+    }
+
+    fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
+        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".to_string(),
+                models: vec![
+                    ModelEntry {
+                        id: "session-model".to_string(),
+                        ..ModelEntry::default()
+                    },
+                    ModelEntry {
+                        id: "assistant-model".to_string(),
+                        ..ModelEntry::default()
+                    },
+                ],
+                ..ProviderEntry::default()
+            },
+        );
+        let providers = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".to_string(),
+                model: "session-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        let model = Arc::new(
+            crate::engine::model::Model::from_config(
+                &providers,
+                Arc::new(crate::redact::RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        crate::engine::builtin::SpawnArgs {
+            model,
+            params: crate::engine::model::ModelParams::default(),
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            cwd: cwd.to_path_buf(),
+            session_short_id: "abc123".to_string(),
+            assistant_identity_prefix: None,
+            model_system_prompt_snapshot: Arc::new(
+                crate::model_system_prompt::ModelSystemPromptSnapshot::empty(),
+            ),
+            interactive: true,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            model_override: None,
+            delegation_model: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            swarm_depth: 0,
+            swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
+            granted_tools: Vec::new(),
+        }
+    }
+
     #[test]
     fn initial_active_agent_gates_default_to_build_when_off() {
         use crate::config::extended::DefaultPrimaryAgent as D;
@@ -416,6 +536,86 @@ mod tests {
             resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, true)),
             "Plan"
         );
+    }
+
+    #[test]
+    fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
+        use crate::config::extended::DefaultPrimaryAgent as D;
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.upsert_assistant(
+            "helper-bot",
+            "/tmp/helper-bot",
+            "{}",
+            "hash",
+        )
+        .unwrap();
+        let row = db
+            .create_assistant_session("proj", "/proj", "helper-bot", "helper-bot")
+            .unwrap();
+
+        assert_eq!(
+            resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false)),
+            "helper-bot"
+        );
+    }
+
+    #[test]
+    fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
+        use crate::config::extended::DefaultPrimaryAgent as D;
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let row = db
+            .create_assistant_session("proj", "/proj", "missing-bot", "missing-bot")
+            .unwrap();
+
+        assert_eq!(
+            resolve_root_agent(row.session_id, &db, &cfg_with(D::Build, true)),
+            "Build"
+        );
+    }
+
+    #[test]
+    fn assistant_session_root_agent_loads_assistant_definition() {
+        use crate::agents::AgentMode;
+        use crate::assistants::{CreateAssistantSpec, create_assistant};
+        use crate::config::extended::DefaultPrimaryAgent as D;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = IsolatedCockpitEnv::new(tmp.path());
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_model_config(&cwd);
+        let db = Db::open_default().unwrap();
+        create_assistant(
+            &db,
+            CreateAssistantSpec {
+                name: "helper-bot".to_string(),
+                description: "Helper bot".to_string(),
+                mode: AgentMode::Primary,
+                tools: Some(vec!["read".to_string()]),
+                model: Some("lmstudio/assistant-model".to_string()),
+                prompt: "ASSISTANT_DEFINITION_MARKER".to_string(),
+                home_dir: tmp.path().join("assistants/helper-bot"),
+            },
+        )
+        .unwrap();
+        let row = db
+            .create_assistant_session(
+                "proj",
+                cwd.to_str().unwrap(),
+                "helper-bot",
+                "helper-bot",
+            )
+            .unwrap();
+
+        let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false));
+        let root = crate::engine::builtin::load(&root_agent_name, &test_spawn_args(&cwd)).unwrap();
+
+        assert_eq!(root.name, "helper-bot");
+        assert!(root.role_prompt.contains("ASSISTANT_DEFINITION_MARKER"));
+        assert!(root.system.contains("ASSISTANT_DEFINITION_MARKER"));
+        assert_eq!(root.model.provider_id(), "lmstudio");
+        assert_eq!(root.model.model_id_ref(), "assistant-model");
+        assert!(root.tools.names().contains(&"read"));
     }
 
     #[test]

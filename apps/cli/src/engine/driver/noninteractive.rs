@@ -3498,6 +3498,7 @@ pub(crate) async fn run_noninteractive_resumable(
             // instructions-file diff injection.
             false,
             crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             deferred_log.clone(),
             seeds.clone(),

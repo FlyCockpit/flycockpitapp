@@ -7,8 +7,8 @@ use serde_json::Value;
 use crate::daemon::proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
 };
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, typed_args};
-use crate::skills::manage::{SkillManageArgs, SkillMutationService};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
+use crate::skills::manage::{SkillManageAction, SkillManageArgs, SkillMutationService};
 
 const APPROVE: &str = "approve";
 const REJECT: &str = "reject";
@@ -45,9 +45,29 @@ impl Tool for SkillManageTool {
 
     async fn call(&self, value: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let args: SkillManageArgs = typed_args(value)?;
+        if let Some(cage) = &ctx.review_cage
+            && requires_prior_view(args.action)
+            && !cage.skill_was_viewed(&args.name)
+        {
+            return Err(invalid_input(format!(
+                "background skill review must load `{}` with `skill` before {:?}",
+                args.name, args.action
+            )));
+        }
         let extended = crate::config::extended::load_for_cwd(&ctx.cwd);
         let approval_required = extended.skills.write_approval
             || crate::engine::interrupt::pre_resolved_interrupt_pending();
+        if approval_required
+            && ctx
+                .review_cage
+                .as_ref()
+                .is_some_and(|cage| cage.auto_deny_approvals())
+        {
+            return Ok(ToolOutput::text(format!(
+                "Skill {:?} for `{}` was automatically denied for background review; nothing changed.",
+                args.action, args.name
+            )));
+        }
         if approval_required && !approve_write(&args, ctx).await? {
             return Ok(ToolOutput::text(format!(
                 "Skill {:?} for `{}` was not approved; nothing changed.",
@@ -59,6 +79,10 @@ impl Tool for SkillManageTool {
             .apply(&args)?;
         Ok(ToolOutput::text(result.message))
     }
+}
+
+fn requires_prior_view(action: SkillManageAction) -> bool {
+    !matches!(action, SkillManageAction::Create)
 }
 
 async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
@@ -169,6 +193,141 @@ mod tests {
             "description": "Approval replay skill",
             "content": "Apply the guarded workflow."
         })
+    }
+
+    fn patch_value(name: &str, old: &str, new: &str) -> Value {
+        serde_json::json!({
+            "action": "patch",
+            "name": name,
+            "old_string": old,
+            "new_string": new
+        })
+    }
+
+    async fn create_foreground_skill(cwd: &std::path::Path, root: &std::path::Path, name: &str) {
+        write_config(cwd, root, false);
+        let (ctx, _db) = crate::tools::common::test_ctx_with_db(cwd);
+        SkillManageTool
+            .call(create_value(name), &ctx)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_auto_denies_approvals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        write_config(tmp.path(), &root, true);
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+
+        let output = SkillManageTool
+            .call(create_value("auto-denied"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("automatically denied"));
+        assert!(!root.join("auto-denied/SKILL.md").exists());
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_read_before_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        create_foreground_skill(tmp.path(), &root, "view-first").await;
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+
+        let denied = SkillManageTool
+            .call(
+                patch_value(
+                    "view-first",
+                    "Apply the guarded workflow.",
+                    "Apply reviewed steps.",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("must load `view-first`"));
+
+        crate::tools::skill::SkillTool
+            .call(serde_json::json!({"name": "view-first"}), &ctx)
+            .await
+            .unwrap();
+        let output = SkillManageTool
+            .call(
+                patch_value(
+                    "view-first",
+                    "Apply the guarded workflow.",
+                    "Apply reviewed steps.",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.content.contains("Patched skill"));
+        let body = std::fs::read_to_string(root.join("view-first/SKILL.md")).unwrap();
+        assert!(body.contains("Apply reviewed steps."));
+    }
+
+    #[tokio::test]
+    async fn review_writes_background_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        write_config(tmp.path(), &root, false);
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+
+        SkillManageTool
+            .call(create_value("background-created"), &ctx)
+            .await
+            .unwrap();
+
+        let provenance =
+            std::fs::read_to_string(root.join("background-created/.cockpit-provenance.json"))
+                .unwrap();
+        assert!(provenance.contains("\"created_origin\": \"background_review\""));
+        assert!(provenance.contains("\"origin\": \"background_review\""));
+    }
+
+    #[tokio::test]
+    async fn review_patches_before_creating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        create_foreground_skill(tmp.path(), &root, "existing-workflow").await;
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+
+        crate::tools::skill::SkillTool
+            .call(serde_json::json!({"name": "existing-workflow"}), &ctx)
+            .await
+            .unwrap();
+        SkillManageTool
+            .call(
+                patch_value(
+                    "existing-workflow",
+                    "Apply the guarded workflow.",
+                    "Apply the guarded workflow, then document the reusable retry check.",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(root.join("existing-workflow/SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -477,6 +477,8 @@ pub struct Driver {
     /// no stale completion can publish after session teardown.
     shadow_brief: Option<ShadowBriefState>,
     shadow_brief_generation: u64,
+    self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
+    self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
     /// Re-executed seed-tool context for a `/compact` fresh session
     /// (T6.e). Set by [`Self::run_seed_tools`] before the loop starts;
     /// prepended to the **first** user message so the fresh agent's first
@@ -729,6 +731,9 @@ impl Drop for Driver {
             task.cancel.cancel();
             task.handle.abort();
         }
+        if let Some(review) = &self.self_improvement_review {
+            review.abort();
+        }
     }
 }
 
@@ -938,6 +943,9 @@ impl Driver {
             prune_effectiveness: self.prune_effectiveness.clone(),
             shadow_brief: None,
             shadow_brief_generation: 0,
+            self_improvement_review: None,
+            self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
+            ),
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_turns_since_mutating_action: self.goal_turns_since_mutating_action,
@@ -1214,6 +1222,9 @@ impl Driver {
             prune_effectiveness: std::collections::VecDeque::new(),
             shadow_brief: None,
             shadow_brief_generation: 0,
+            self_improvement_review: None,
+            self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
+            ),
             pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_turns_since_mutating_action: 0,
@@ -1963,6 +1974,7 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: self.stack.len() == 1,
             skill_write_origin: payload.resume.call_origin,
+            review_cage: None,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 active_tools
@@ -2079,6 +2091,7 @@ impl Driver {
                     self.loop_guard_threshold,
                     is_root,
                     crate::skills::manage::SkillWriteOrigin::Foreground,
+                    None,
                     context_usage,
                     deferred_log,
                     crate::engine::seed_collector::SeedCollector::new(),
@@ -2185,6 +2198,7 @@ impl Driver {
                         continue;
                     }
                     self.acknowledge_interrupted_turns_after_progress();
+                    self.maybe_spawn_self_improvement_review(tx);
                     return Ok(());
                 }
                 TurnOutcome::Return { fields } => {
@@ -2193,6 +2207,7 @@ impl Driver {
                         continue;
                     }
                     self.acknowledge_interrupted_turns_after_progress();
+                    self.maybe_spawn_self_improvement_review(tx);
                     return Ok(());
                 }
                 _ => bail!("parked interrupt replay continuation produced unsupported outcome"),
@@ -2210,6 +2225,60 @@ impl Driver {
             Ok(count) => tracing::debug!(count, "acknowledged interrupted session markers"),
             Err(error) => tracing::warn!(%error, "acknowledging interrupted markers failed"),
         }
+    }
+
+    fn preempt_self_improvement_review_for_foreground(&mut self) {
+        let Some(review) = self.self_improvement_review.take() else {
+            return;
+        };
+        if !review.is_finished() {
+            review.abort();
+        }
+    }
+
+    fn maybe_spawn_self_improvement_review(&mut self, tx: &mpsc::Sender<TurnEvent>) -> bool {
+        if let Some(review) = &self.self_improvement_review {
+            if review.is_finished() {
+                self.self_improvement_review = None;
+            } else {
+                return false;
+            }
+        }
+        let Some(assistant_name) = self.session.assistant_name.clone() else {
+            return false;
+        };
+        let interval = self
+            .session
+            .db
+            .get_assistant(&assistant_name)
+            .ok()
+            .flatten()
+            .and_then(|row| {
+                serde_json::from_str::<crate::assistants::AssistantConfig>(&row.config_json).ok()
+            })
+            .map(|config| config.skill_review_interval)
+            .unwrap_or(crate::assistants::self_improvement::DEFAULT_SKILL_REVIEW_INTERVAL);
+        if !self
+            .self_improvement_schedule
+            .record_idle_boundary(&assistant_name, interval)
+        {
+            return false;
+        }
+        let Some(root) = self.stack.first() else {
+            return false;
+        };
+        let Some(review) = crate::assistants::self_improvement::spawn_review(
+            assistant_name,
+            (*root.agent).clone(),
+            root.history.clone(),
+            self.cwd.clone(),
+            self.redact.clone(),
+            tx.clone(),
+        ) else {
+            return false;
+        };
+        self.self_improvement_review = Some(review);
+        true
     }
 
     /// Long-running main loop: pulls user input from `input_rx` and
@@ -2292,6 +2361,7 @@ impl Driver {
                         // accepted, before injection scanning or preflight can
                         // dispatch their own utility inference.
                         self.preempt_shadow_brief_for_foreground().await;
+                        self.preempt_self_improvement_review_for_foreground();
                         self.reset_goal_progress_tracking();
                         self.clear_goal_idle_intervention();
                         self.goal_usage_limit_auto_resume_attempts = 0;
@@ -3288,6 +3358,7 @@ impl Driver {
         // Defensive for callers outside the main dequeue branch: no
         // foreground preparation may overlap unfinished shadow utility work.
         self.preempt_shadow_brief_for_foreground().await;
+        self.preempt_self_improvement_review_for_foreground();
         if self.preflight_will_run(&submission.text) {
             let _ = tx.send(TurnEvent::PreflightStarted).await;
         }
@@ -4464,6 +4535,7 @@ impl Driver {
         // Preserve a task that already completed, but cancel an unfinished one
         // before assembling or dispatching the user's inference.
         self.preempt_shadow_brief_for_foreground().await;
+        self.preempt_self_improvement_review_for_foreground();
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
@@ -4768,6 +4840,7 @@ impl Driver {
                     self.loop_guard_threshold,
                     is_root,
                     crate::skills::manage::SkillWriteOrigin::Foreground,
+                    None,
                     context_usage,
                     deferred_log,
                     // The main/interactive frames never register the `seed`
@@ -5041,6 +5114,7 @@ impl Driver {
                             self.emit_goal_continue_no_progress(anchor_seq, tx).await;
                         }
                     }
+                    self.maybe_spawn_self_improvement_review(tx);
                     return Ok(());
                 }
                 TurnOutcome::SpawnSubagent {

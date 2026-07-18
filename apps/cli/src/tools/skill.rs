@@ -79,7 +79,7 @@ impl Tool for SkillTool {
             ctx.available_tools.iter().map(String::as_str),
         );
         let store = crate::credentials::CredentialStore::open_default().ok();
-        load_skill_for_session(
+        let output = load_skill_for_session(
             name,
             path,
             &ctx.cwd,
@@ -88,7 +88,11 @@ impl Tool for SkillTool {
             &activation,
             &ctx.env_overlay,
             store.as_ref(),
-        )
+        )?;
+        if let Some(cage) = &ctx.review_cage {
+            cage.record_skill_view(name);
+        }
+        Ok(output)
     }
 }
 

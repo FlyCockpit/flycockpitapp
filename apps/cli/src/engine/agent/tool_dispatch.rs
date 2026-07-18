@@ -269,10 +269,20 @@ pub(crate) async fn execute_ordinary_call(
     ) {
         recheck_result = true;
     }
+    let cage_block: Option<String> = if repair_outcome.valid {
+        env.ctx
+            .review_cage
+            .as_ref()
+            .and_then(|cage| cage.allow_dispatch(resolved_name).err())
+            .map(|err| err.to_string())
+    } else {
+        None
+    };
 
     // Dispatch only when validate-then-repair produced a schema-valid
-    // call AND the loop guard didn't reject it AND the safety gate
-    // didn't block it. Otherwise skip dispatch and treat the
+    // call AND the loop guard didn't reject it AND the safety gate didn't
+    // block it AND any background-review cage allowed it. Otherwise skip
+    // dispatch and treat the
     // model-readable diagnostic as an invocation failure — same
     // downstream audit/telemetry/history path a tool's own
     // `invalid_input` takes.
@@ -289,23 +299,24 @@ pub(crate) async fn execute_ordinary_call(
     // here is a hallucination.
     // Loop-guard / safety-gate blocks are NOT rejections in this sense (the
     // call was valid and advertised) and are not classified.
-    let rejection_reason: Option<&'static str> = if loop_guard_reject || gate_block.is_some() {
-        None
-    } else if !repair_outcome.valid {
-        // A model-hallucinated nonexistent path gets its own reason so
-        // path-hallucination telemetry stays separate from genuine
-        // schema-repair failures (`defensive-tool-descriptions-
-        // weak-model-routing.md`).
-        if path_not_found {
-            Some("path_not_found")
+    let rejection_reason: Option<&'static str> =
+        if loop_guard_reject || gate_block.is_some() || cage_block.is_some() {
+            None
+        } else if !repair_outcome.valid {
+            // A model-hallucinated nonexistent path gets its own reason so
+            // path-hallucination telemetry stays separate from genuine
+            // schema-repair failures (`defensive-tool-descriptions-
+            // weak-model-routing.md`).
+            if path_not_found {
+                Some("path_not_found")
+            } else {
+                Some("schema_invalid_unrepairable")
+            }
+        } else if env.active_tools.get(resolved_name).is_none() {
+            Some("not_in_advertised_set")
         } else {
-            Some("schema_invalid_unrepairable")
-        }
-    } else if env.active_tools.get(resolved_name).is_none() {
-        Some("not_in_advertised_set")
-    } else {
-        None
-    };
+            None
+        };
     let lifecycle_started = repair_outcome.valid && env.active_tools.get(resolved_name).is_some();
     let mut assistant_seq = None;
     if lifecycle_started {
@@ -354,6 +365,8 @@ pub(crate) async fn execute_ordinary_call(
             0,
         )
     } else if let Some(msg) = gate_block {
+        (Err(invalid_input(msg)), 0)
+    } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
     } else if repair_outcome.valid {
         let payload = InterruptParkPayload {
@@ -1215,6 +1228,7 @@ mod tests {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
             context_usage: None,
             available_tools: Arc::new(std::collections::HashSet::new()),
             has_tree: false,
@@ -1392,6 +1406,40 @@ mod tests {
                 }
             })
             .expect("assistant tool call")
+    }
+
+    #[tokio::test]
+    async fn review_toolset_whitelisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": "should not run" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let result = last_tool_result_text(&history);
+        assert!(result.contains("background skill review cannot call `echo`"));
+        assert!(!result.contains("should not run"));
     }
 
     #[tokio::test]

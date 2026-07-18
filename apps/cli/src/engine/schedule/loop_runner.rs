@@ -214,6 +214,7 @@ async fn run_iteration(
             // root conversation (`instructions-file-live-diff.md`).
             true,
             crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             // A loop fork is a leaf with no parent to defer to; it carries a
             // fresh empty deferred-log that nobody reads (`plan.md §3d`).

@@ -152,6 +152,7 @@ async fn run_swarm_loop(
             // spawn; it never needs the live instructions-file diff injection.
             false,
             crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             deferred_log.clone(),
             seeds.clone(),

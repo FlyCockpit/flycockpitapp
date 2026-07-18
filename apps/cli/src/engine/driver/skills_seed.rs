@@ -188,6 +188,7 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 agent
@@ -476,6 +477,7 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: false,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
             context_usage: None,
             available_tools: Arc::new(
                 child
@@ -554,6 +556,7 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 agent
@@ -751,6 +754,7 @@ impl Driver {
             seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
                 agent

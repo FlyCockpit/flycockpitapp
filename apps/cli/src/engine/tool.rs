@@ -11,7 +11,7 @@
 //! Concrete tools implement [`Tool`]; the dispatcher holds a
 //! `BTreeMap<String, Arc<dyn Tool>>`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -64,6 +64,84 @@ pub fn classify_failure(err: &anyhow::Error) -> ToolFailKind {
     } else {
         ToolFailKind::Execution
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewCage {
+    state: Arc<Mutex<ReviewCageState>>,
+}
+
+#[derive(Debug)]
+struct ReviewCageState {
+    allowed_tools: HashSet<String>,
+    viewed_skills: HashSet<String>,
+    auto_deny_approvals: bool,
+    max_dispatches: u32,
+    dispatches: u32,
+}
+
+impl ReviewCage {
+    pub fn skills_review() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ReviewCageState {
+                allowed_tools: ["skill", "skill_manage"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                viewed_skills: HashSet::new(),
+                auto_deny_approvals: true,
+                max_dispatches: 16,
+                dispatches: 0,
+            })),
+        }
+    }
+
+    pub fn allow_dispatch(&self, tool: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.allowed_tools.contains(tool) {
+            return Err(invalid_input(format!(
+                "background skill review cannot call `{tool}`; allowed tools: {}",
+                sorted_csv(&state.allowed_tools)
+            )));
+        }
+        if state.dispatches >= state.max_dispatches {
+            return Err(invalid_input(format!(
+                "background skill review stopped after {} tool dispatches",
+                state.max_dispatches
+            )));
+        }
+        state.dispatches = state.dispatches.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn auto_deny_approvals(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .auto_deny_approvals
+    }
+
+    pub fn record_skill_view(&self, name: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .viewed_skills
+            .insert(name.to_string());
+    }
+
+    pub fn skill_was_viewed(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .viewed_skills
+            .contains(name)
+    }
+}
+
+fn sorted_csv(values: &HashSet<String>) -> String {
+    let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
+    values.sort_unstable();
+    values.join(", ")
 }
 
 #[cfg(test)]
@@ -512,6 +590,9 @@ pub struct ToolCtx {
     /// calls default to `Foreground`; the isolated self-improvement reviewer
     /// overrides this on its frame without exposing the field to model args.
     pub skill_write_origin: crate::skills::manage::SkillWriteOrigin,
+    /// Optional dispatch/read-before-write cage for background self-improvement
+    /// review. Foreground turns leave this unset.
+    pub review_cage: Option<ReviewCage>,
     /// Turn-start context-pressure snapshot for model-facing introspection.
     pub context_usage: Option<ContextUsageSnapshot>,
     /// Exact tool names advertised to the calling agent for this turn. Skill

@@ -20,6 +20,7 @@ use crate::wizard::{
 pub const ASSISTANT_WIZARD_ID: &str = "assistant";
 
 pub mod identity;
+pub mod self_improvement;
 
 #[derive(Debug, Clone)]
 pub struct AssistantDef {
@@ -41,6 +42,8 @@ pub struct AssistantConfig {
     pub soul_hash: Option<String>,
     #[serde(default)]
     pub user_hash: Option<String>,
+    #[serde(default = "self_improvement::default_skill_review_interval")]
+    pub skill_review_interval: u32,
 }
 
 impl Default for AssistantConfig {
@@ -51,6 +54,7 @@ impl Default for AssistantConfig {
             identity_max_tokens: identity::default_identity_max_tokens(),
             soul_hash: None,
             user_hash: None,
+            skill_review_interval: self_improvement::DEFAULT_SKILL_REVIEW_INTERVAL,
         }
     }
 }

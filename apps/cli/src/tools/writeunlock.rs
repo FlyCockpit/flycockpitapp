@@ -82,6 +82,13 @@ impl Tool for WriteunlockTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
+        let identity_note =
+            match crate::assistants::identity::check_identity_write(ctx, &path).await? {
+                crate::assistants::identity::IdentityWriteGate::Allow { note } => note,
+                crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
+                    return Ok(crate::assistants::identity::tool_refusal(message));
+                }
+            };
 
         let exists = path.exists();
         let write_guard = if exists {
@@ -111,6 +118,7 @@ impl Tool for WriteunlockTool {
         } else {
             create_new_and_release(ctx, &path, normalized.as_bytes(), create_new_file)?
         };
+        crate::assistants::identity::record_identity_write(ctx, &path)?;
 
         let mut message = format!(
             "wrote `{}` ({} bytes, {})",
@@ -129,6 +137,9 @@ impl Tool for WriteunlockTool {
         }
         if let Some(advisory) = outcome.advisory() {
             message.push_str(advisory);
+        }
+        if let Some(note) = identity_note {
+            message.push_str(&note);
         }
 
         Ok(ToolOutput::text(message))

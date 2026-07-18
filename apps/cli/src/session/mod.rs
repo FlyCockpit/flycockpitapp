@@ -109,6 +109,7 @@ pub struct Session {
     pub id: Uuid,
     pub project_id: String,
     pub project_root: PathBuf,
+    pub assistant_name: Option<String>,
     /// Hydrated from the row; not yet read by any consumer.
     #[allow(dead_code)]
     pub started_at: DateTime<Utc>,

@@ -19,6 +19,8 @@ use crate::wizard::{
 
 pub const ASSISTANT_WIZARD_ID: &str = "assistant";
 
+pub mod identity;
+
 #[derive(Debug, Clone)]
 pub struct AssistantDef {
     pub name: String,
@@ -27,10 +29,30 @@ pub struct AssistantDef {
     pub agent: AgentDef,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantConfig {
     #[serde(default)]
     pub agent_source: String,
+    #[serde(default)]
+    pub soul_edit_mode: identity::SoulEditMode,
+    #[serde(default = "identity::default_identity_max_tokens")]
+    pub identity_max_tokens: usize,
+    #[serde(default)]
+    pub soul_hash: Option<String>,
+    #[serde(default)]
+    pub user_hash: Option<String>,
+}
+
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        Self {
+            agent_source: String::new(),
+            soul_edit_mode: identity::SoulEditMode::default(),
+            identity_max_tokens: identity::default_identity_max_tokens(),
+            soul_hash: None,
+            user_hash: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +143,12 @@ pub fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantR
     let markdown = agent.to_markdown()?;
     std::fs::write(&path, &markdown)
         .with_context(|| format!("writing assistant definition {}", path.display()))?;
+    identity::seed_identity_files(&spec.home_dir)?;
     let config = AssistantConfig {
         agent_source: path.to_string_lossy().into_owned(),
+        soul_hash: identity::hash_optional_file(&identity::soul_path(&spec.home_dir))?,
+        user_hash: identity::hash_optional_file(&identity::user_path(&spec.home_dir))?,
+        ..AssistantConfig::default()
     };
     let config_json = serde_json::to_string(&config)?;
     let content_hash = sha256_hex(markdown.as_bytes());
@@ -294,7 +320,7 @@ fn non_blank(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     crate::intel::hex_lower(&Sha256::digest(bytes))
 }
 

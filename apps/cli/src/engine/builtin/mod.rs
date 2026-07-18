@@ -144,6 +144,10 @@ pub struct SpawnArgs {
     /// is participating in. Empty string is acceptable for legacy /
     /// test paths where a session id isn't yet resolved.
     pub session_short_id: String,
+    /// Assistant-owned sessions prepend SOUL.md and USER.md before the
+    /// assistant definition body. Preloaded by the session worker so prompt
+    /// composition stays pure and stable for the session.
+    pub assistant_identity_prefix: Option<String>,
     /// Frozen model-specific prompt snapshot for this session/invocation.
     pub model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// Whether this agent is being spawned into a user-facing
@@ -529,11 +533,12 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
 }
 
 fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &SpawnArgs) -> String {
+    let role_prompt = assistant_role_prompt(role_prompt, args.assistant_identity_prefix.as_deref());
     let model_prompt = args
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
     if let Some(model_prompt) = model_prompt {
-        let role_system = compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd);
+        let role_system = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
         out.push_str(model_prompt);
         if !out.ends_with('\n') {
@@ -543,8 +548,22 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         out.push_str(&role_system);
         out
     } else {
-        compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd)
+        compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd)
     }
+}
+
+fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
+    let Some(prefix) = prefix.map(str::trim).filter(|s| !s.is_empty()) else {
+        return role_prompt.to_string();
+    };
+    let mut out = String::with_capacity(prefix.len() + role_prompt.len() + 2);
+    out.push_str(prefix);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(role_prompt);
+    out
 }
 
 fn compose_system_prompt_for_effective_model(role_prompt: &str, args: &SpawnArgs) -> String {
@@ -1932,6 +1951,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cwd: cwd.to_path_buf(),
             session_short_id: String::new(),
+            assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
             llm_mode: crate::config::extended::LlmMode::default(),
@@ -3179,6 +3199,27 @@ mod tests {
         let harness_at = out.find("Harness: cockpit").unwrap();
         assert!(
             model_at < role_at && role_at < harness_at,
+            "block was: {out}"
+        );
+    }
+
+    #[test]
+    fn identity_prompt_slot_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.assistant_identity_prefix = Some(
+            "Assistant identity (SOUL.md):\nSOUL BODY\n\nHuman context (USER.md):\nUSER BODY\n\n"
+                .to_string(),
+        );
+
+        let out = compose_system_prompt_for_model("DEFINITION BODY", &args.model, &args);
+        let soul_at = out.find("SOUL BODY").unwrap();
+        let user_at = out.find("USER BODY").unwrap();
+        let def_at = out.find("DEFINITION BODY").unwrap();
+        let harness_at = out.find("Harness: cockpit").unwrap();
+
+        assert!(
+            soul_at < user_at && user_at < def_at && def_at < harness_at,
             "block was: {out}"
         );
     }

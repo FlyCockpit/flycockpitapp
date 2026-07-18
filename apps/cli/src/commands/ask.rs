@@ -72,6 +72,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         env_overlay: Arc::new(RwLock::new(Default::default())),
         cwd: cwd.clone(),
         session_short_id: session.short_id.clone(),
+        assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
         llm_mode: extended.llm_mode,

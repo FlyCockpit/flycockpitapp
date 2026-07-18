@@ -397,6 +397,7 @@ pub struct Driver {
     pub redact: Arc<RedactionTable>,
     pub cwd: std::path::PathBuf,
     pub stack: Vec<AgentSession>,
+    assistant_identity_prefix: Option<String>,
     /// Minutes between `[time: ...]` preludes injected on user
     /// messages (GOALS §17g). Loaded from
     /// `extended.system_prompt.time_injection_interval_minutes`;
@@ -917,6 +918,7 @@ impl Driver {
                     deferred_log: crate::engine::deferred::DeferredLog::new(),
                 })
                 .collect(),
+            assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             time_injection_interval_minutes: self.time_injection_interval_minutes,
             loop_guard_threshold: self.loop_guard_threshold,
             max_primary_rounds: self.max_primary_rounds,
@@ -1192,6 +1194,7 @@ impl Driver {
                 answering: None,
                 deferred_log: crate::engine::deferred::DeferredLog::new(),
             }],
+            assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
             loop_guard_threshold: crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
             max_primary_rounds: 0,
@@ -1413,6 +1416,10 @@ impl Driver {
     /// approver captures the same hub).
     pub fn set_approver(&mut self, approver: Arc<crate::approval::Approver>) {
         self.approver = Some(approver);
+    }
+
+    pub fn set_assistant_identity_prefix(&mut self, prefix: Option<String>) {
+        self.assistant_identity_prefix = prefix;
     }
 
     pub fn set_lsp_manager(&mut self, lsp: Arc<crate::daemon::lsp::LspManager>) {
@@ -5675,6 +5682,7 @@ impl Driver {
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
             session_short_id: self.session.short_id.clone(),
+            assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
             // The active LLM mode rides on the root agent; child spawns

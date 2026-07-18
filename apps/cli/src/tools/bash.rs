@@ -256,6 +256,22 @@ async fn call_bash_inner(
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
+    let mut identity_write_targets = Vec::new();
+    if let ShellWriteTargets::Concrete(targets) = shell_write_targets(command, &cwd) {
+        for target in targets {
+            match crate::assistants::identity::check_identity_write(ctx, &target).await? {
+                crate::assistants::identity::IdentityWriteGate::Allow { note } => {
+                    if let Some(note) = note {
+                        tracing::info!(%note, path = %target.display(), "assistant identity bash write allowed");
+                        identity_write_targets.push(target);
+                    }
+                }
+                crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
+                    return Ok(crate::assistants::identity::tool_refusal(message));
+                }
+            }
+        }
+    }
 
     tracing::debug!(command, timeout_ms, "bash: spawning");
 
@@ -591,6 +607,10 @@ async fn call_bash_inner(
     {
         final_outcome.stderr.extend_from_slice(hint.as_bytes());
         final_outcome.stderr.push(b'\n');
+    }
+
+    for target in &identity_write_targets {
+        crate::assistants::identity::record_identity_write(ctx, target)?;
     }
 
     // Native shell-output compression (implementation note):

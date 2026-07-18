@@ -223,6 +223,44 @@ async fn run_worker(
     // to, `plan.md §4.6.d`), falling back to the configured default
     // (`Auto` unless the user pinned another) when it's unset/unknown.
     let root_agent_name = resolve_root_agent(session_id, &session.db, &extended_cfg);
+    let assistant_identity_prefix =
+        match session.assistant_name.as_deref().and_then(|name| match session.db.get_assistant(name)
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(%error, assistant = name, "loading assistant row for identity failed");
+                None
+            }
+        }) {
+            Some(row) => match crate::assistants::identity::load_for_session(&session.db, &row) {
+                Ok(load) => {
+                    for text in &load.notices {
+                        send_current_event(
+                            &event_tx,
+                            &redaction,
+                            proto::Event::Notice {
+                                session_id,
+                                text: text.clone(),
+                            },
+                        );
+                    }
+                    Some(load.system_prefix)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, assistant = %row.name, "loading assistant identity failed");
+                    send_current_event(
+                        &event_tx,
+                        &redaction,
+                        proto::Event::Notice {
+                            session_id,
+                            text: format!("Assistant identity could not be loaded: {error}"),
+                        },
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
     // The daemon's shared shutdown gate, captured before `model` is moved into
     // `spawn_args`. Reused when building model-comparison tandem (shadow)
     // models so a tandem request — itself a new provider round-trip — refuses
@@ -248,6 +286,7 @@ async fn run_worker(
         },
         cwd: project_root.clone(),
         session_short_id: session.short_id.clone(),
+        assistant_identity_prefix,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
@@ -458,6 +497,7 @@ async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
     // Propagate any plan-level model override to the whole delegation tree
     // (`plan-duplication-and-model-override.md`): the root already runs under
     // it (loaded with the override `SpawnArgs`); this carries it down to

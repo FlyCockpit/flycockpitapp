@@ -148,6 +148,7 @@ impl Session {
             id: row.session_id,
             project_id: row.project_id,
             project_root,
+            assistant_name: row.assistant_name,
             started_at,
             db,
             short_id,

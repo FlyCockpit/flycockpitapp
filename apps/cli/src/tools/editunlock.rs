@@ -118,6 +118,13 @@ impl Tool for EditunlockTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
+        let identity_note =
+            match crate::assistants::identity::check_identity_write(ctx, &path).await? {
+                crate::assistants::identity::IdentityWriteGate::Allow { note } => note,
+                crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
+                    return Ok(crate::assistants::identity::tool_refusal(message));
+                }
+            };
         let write_guard = ctx
             .locks
             .begin_write(&path, &ctx.agent_id, ctx.session.id)?;
@@ -147,6 +154,7 @@ impl Tool for EditunlockTool {
 
         let normalized = normalize_line_endings(&updated, want_crlf);
         let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard)?;
+        crate::assistants::identity::record_identity_write(ctx, &path)?;
 
         let mut message = format!(
             "edited `{}` ({}; {} bytes)",
@@ -165,6 +173,9 @@ impl Tool for EditunlockTool {
         }
         if let Some(advisory) = outcome.advisory() {
             message.push_str(advisory);
+        }
+        if let Some(note) = identity_note {
+            message.push_str(&note);
         }
         let out = ToolOutput::text(message);
         // Per §13c, every cascade stage past `exact` is a content-

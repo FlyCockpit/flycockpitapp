@@ -86,6 +86,23 @@ impl Db {
             Ok(changed > 0)
         })
     }
+
+    pub fn update_assistant_config(&self, name: &str, config_json: &str) -> Result<()> {
+        let name = name.to_string();
+        let config_json = config_json.to_string();
+        self.write_blocking(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE assistants SET config_json = ?2 WHERE name = ?1",
+                    params![name, config_json],
+                )
+                .context("updating assistant config")?;
+            if changed == 0 {
+                anyhow::bail!("assistant `{name}` does not exist");
+            }
+            Ok(())
+        })
+    }
 }
 
 fn get_assistant_conn(conn: &rusqlite::Connection, name: &str) -> Result<Option<AssistantRow>> {

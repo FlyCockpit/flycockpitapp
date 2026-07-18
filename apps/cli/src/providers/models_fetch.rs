@@ -796,6 +796,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 quality_rank: None,
                 cost_rank: None,
                 subagent_invokable: None,
+                can_delegate: None,
                 embeddings: None,
                 embedding_dimensions: None,
                 availability: Default::default(),

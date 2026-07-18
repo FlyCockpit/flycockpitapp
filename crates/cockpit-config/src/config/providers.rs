@@ -404,6 +404,11 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_invokable: Option<bool>,
 
+    /// Provider default for whether models may delegate to subagents.
+    /// Missing resolves to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_delegate: Option<bool>,
+
     /// Provider default for whether models support OpenAI-compatible embeddings.
     /// Missing resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -862,6 +867,10 @@ pub struct ModelEntry {
     /// default, then resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_invokable: Option<bool>,
+    /// Model-level delegation permission override. Missing inherits provider
+    /// default, then resolves to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_delegate: Option<bool>,
     /// Model-level embeddings support override. Missing inherits provider
     /// default, then resolves to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1464,6 +1473,9 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     if existing.subagent_invokable.is_some() {
         fetched.subagent_invokable = existing.subagent_invokable;
     }
+    if existing.can_delegate.is_some() {
+        fetched.can_delegate = existing.can_delegate;
+    }
     if existing.embeddings.is_some() {
         fetched.embeddings = existing.embeddings;
     }
@@ -2061,6 +2073,19 @@ impl ProvidersConfig {
             .and_then(|m| m.subagent_invokable)
             .or(entry.subagent_invokable)
             .unwrap_or(false)
+    }
+
+    pub fn resolve_can_delegate(&self, provider: &str, model: &str) -> bool {
+        let Some(entry) = self.providers.get(provider) else {
+            return true;
+        };
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.can_delegate)
+            .or(entry.can_delegate)
+            .unwrap_or(true)
     }
 
     /// Resolve how a leading inline `<think>…</think>` block is **classified**

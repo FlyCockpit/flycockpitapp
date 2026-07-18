@@ -76,6 +76,7 @@ fn round_trips_a_provider_entry() {
             quality_rank: None,
             cost_rank: None,
             subagent_invokable: None,
+            can_delegate: Some(false),
             embeddings: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
@@ -102,6 +103,7 @@ fn round_trips_a_provider_entry() {
                 quality_rank: None,
                 cost_rank: None,
                 subagent_invokable: None,
+                can_delegate: Some(true),
                 embeddings: None,
                 embedding_dimensions: None,
                 availability: Default::default(),
@@ -142,7 +144,9 @@ fn round_trips_a_provider_entry() {
     assert_eq!(entry.url, "https://opencode.ai/zen/v1");
     assert_eq!(entry.headers.len(), 1);
     assert_eq!(entry.favorite, Some(true));
+    assert_eq!(entry.can_delegate, Some(false));
     assert_eq!(entry.models[0].id, "claude-opus-4-7");
+    assert_eq!(entry.models[0].can_delegate, Some(true));
     assert_eq!(
         cfg2.on_unlisted_models_fetch,
         Some(OnUnlistedModelsFetch::Ask)
@@ -167,6 +171,7 @@ fn provider_write_removes_stale_skipped_optional_fields_but_keeps_empty_models()
                 "quality_rank": 9,
                 "cost_rank": 1,
                 "subagent_invokable": true,
+                "can_delegate": true,
                 "mode": "frontier",
                 "inline_think": false,
                 "hint_tool_call_corrections": true,
@@ -188,6 +193,7 @@ fn provider_write_removes_stale_skipped_optional_fields_but_keeps_empty_models()
     provider.quality_rank = None;
     provider.cost_rank = None;
     provider.subagent_invokable = None;
+    provider.can_delegate = None;
     provider.mode = None;
     provider.inline_think = None;
     provider.hint_tool_call_corrections = None;
@@ -213,6 +219,7 @@ fn provider_write_removes_stale_skipped_optional_fields_but_keeps_empty_models()
         "quality_rank",
         "cost_rank",
         "subagent_invokable",
+        "can_delegate",
         "mode",
         "inline_think",
         "hint_tool_call_corrections",
@@ -331,6 +338,7 @@ fn resolve_cache_prefers_model_override() {
         quality_rank: None,
         cost_rank: None,
         subagent_invokable: None,
+        can_delegate: None,
         embeddings: None,
         embedding_dimensions: None,
         availability: Default::default(),
@@ -939,6 +947,7 @@ fn model(id: &str, manual: bool) -> ModelEntry {
         quality_rank: None,
         cost_rank: None,
         subagent_invokable: None,
+        can_delegate: None,
         embeddings: None,
         embedding_dimensions: None,
         availability: Default::default(),
@@ -1164,6 +1173,55 @@ fn subagent_invokable_defaults_false_and_honors_overrides() {
     assert!(!cfg.resolve_subagent_invokable("provider-default", "disabled"));
     assert!(!cfg.resolve_subagent_invokable("unset", "missing"));
     assert!(!cfg.resolve_subagent_invokable("missing", "missing"));
+}
+
+#[test]
+fn can_delegate_model_overrides_provider() {
+    let mut cfg = ProvidersConfig::default();
+    let mut provider = ProviderEntry {
+        can_delegate: Some(false),
+        ..ProviderEntry::default()
+    };
+    provider.models.push(model("inherits-provider", false));
+    let mut override_on = model("override-on", false);
+    override_on.can_delegate = Some(true);
+    provider.models.push(override_on);
+    cfg.providers.insert("p".into(), provider);
+
+    assert!(!cfg.resolve_can_delegate("p", "inherits-provider"));
+    assert!(cfg.resolve_can_delegate("p", "override-on"));
+}
+
+#[test]
+fn can_delegate_missing_defaults_true() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "p".into(),
+        ProviderEntry {
+            models: vec![model("m", false)],
+            ..ProviderEntry::default()
+        },
+    );
+
+    assert!(cfg.resolve_can_delegate("p", "m"));
+    assert!(cfg.resolve_can_delegate("p", "unknown-model"));
+    assert!(cfg.resolve_can_delegate("unknown-provider", "m"));
+}
+
+#[test]
+fn fetch_merge_preserves_can_delegate() {
+    let mut existing = model("m", false);
+    existing.can_delegate = Some(false);
+    let fetched = vec![model("m", false)];
+
+    let merged = merge_fetched_models_with_policy(
+        None,
+        &[existing],
+        fetched,
+        ModelMergePolicy::KeepUnlisted,
+    );
+
+    assert_eq!(merged[0].can_delegate, Some(false));
 }
 
 #[test]

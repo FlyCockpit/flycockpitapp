@@ -1917,6 +1917,13 @@ mod tests {
     /// factories. The model is never actually called — these tests only
     /// inspect the constructed agent's name + tool surface.
     fn test_spawn_args(cwd: &Path) -> SpawnArgs {
+        test_spawn_args_with_provider_can_delegate(cwd, None)
+    }
+
+    fn test_spawn_args_with_provider_can_delegate(
+        cwd: &Path,
+        can_delegate: Option<bool>,
+    ) -> SpawnArgs {
         use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
         use std::collections::BTreeMap;
         let mut providers = BTreeMap::new();
@@ -1925,6 +1932,7 @@ mod tests {
             ProviderEntry {
                 url: "http://localhost:1/v1".into(),
                 headers: vec![],
+                can_delegate,
                 ..ProviderEntry::default()
             },
         );
@@ -3007,6 +3015,66 @@ mod tests {
             names.contains(&"spawn"),
             "Swarm must hold `spawn`: {names:?}"
         );
+    }
+
+    #[test]
+    fn can_delegate_false_hides_delegation_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
+        let agent = swarm(&args);
+        let session = crate::session::Session::create(
+            crate::db::Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Swarm",
+        )
+        .unwrap();
+
+        let toolbox = crate::engine::agent::turn_toolbox(&agent, &session, tmp.path());
+        let names = toolbox.names();
+
+        assert!(!names.contains(&"task"), "{names:?}");
+        assert!(!names.contains(&"spawn"), "{names:?}");
+    }
+
+    #[test]
+    fn can_delegate_unset_keeps_delegation_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args_with_provider_can_delegate(tmp.path(), None);
+        let agent = swarm(&args);
+        let session = crate::session::Session::create(
+            crate::db::Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Swarm",
+        )
+        .unwrap();
+
+        let toolbox = crate::engine::agent::turn_toolbox(&agent, &session, tmp.path());
+        let names = toolbox.names();
+
+        assert!(names.contains(&"task"), "{names:?}");
+        assert!(names.contains(&"spawn"), "{names:?}");
+    }
+
+    #[test]
+    fn can_delegate_gates_subagent_turns() {
+        // Subagent and primary turns share `turn_toolbox`; proving the filter
+        // there covers every spawned child before the model sees its tools.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
+        args.delegated = true;
+        let agent = bee(&args);
+        let session = crate::session::Session::create(
+            crate::db::Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "bee",
+        )
+        .unwrap();
+
+        let toolbox = crate::engine::agent::turn_toolbox(&agent, &session, tmp.path());
+        let names = toolbox.names();
+
+        assert!(!names.contains(&"task"), "{names:?}");
+        assert!(!names.contains(&"spawn"), "{names:?}");
     }
 
     #[test]

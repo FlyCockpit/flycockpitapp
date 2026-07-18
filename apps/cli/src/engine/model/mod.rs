@@ -408,6 +408,8 @@ pub enum Model {
         cost_rank: i64,
         /// Whether this resolved provider/model may be selected for subagents.
         subagent_invokable: bool,
+        /// Whether this resolved provider/model may delegate to subagents.
+        can_delegate: bool,
         /// Live session trusted-only flag. Checked immediately before every
         /// provider dispatch so `/trusted-only` applies to already-built
         /// active, backup, tandem, and utility model handles.
@@ -457,6 +459,8 @@ pub enum Model {
         cost_rank: i64,
         /// Same routing-audit subagent availability metadata as [`Model::OpenAi`].
         subagent_invokable: bool,
+        /// Same routing-audit delegation permission metadata as [`Model::OpenAi`].
+        can_delegate: bool,
         /// Same live trusted-only flag as [`Model::OpenAi`].
         trusted_only: Arc<AtomicBool>,
         /// Same daemon graceful-shutdown gate as [`Model::OpenAi`].
@@ -504,6 +508,8 @@ pub enum Model {
         cost_rank: i64,
         /// Same routing-audit subagent availability metadata as [`Model::OpenAi`].
         subagent_invokable: bool,
+        /// Same routing-audit delegation permission metadata as [`Model::OpenAi`].
+        can_delegate: bool,
         /// Same live trusted-only flag as [`Model::OpenAi`].
         trusted_only: Arc<AtomicBool>,
         /// Same daemon graceful-shutdown gate as [`Model::OpenAi`].
@@ -560,6 +566,7 @@ impl Model {
             "fallback_decision": "none",
             "matched_capabilities": [],
             "subagent_invokable": self.subagent_invokable(),
+            "can_delegate": self.can_delegate(),
             "trusted_only": self.trusted_only_enabled(),
         })
     }
@@ -599,6 +606,14 @@ impl Model {
             | Model::Anthropic {
                 subagent_invokable, ..
             } => *subagent_invokable,
+        }
+    }
+
+    pub(crate) fn can_delegate(&self) -> bool {
+        match self {
+            Model::OpenAi { can_delegate, .. }
+            | Model::ChatGpt { can_delegate, .. }
+            | Model::Anthropic { can_delegate, .. } => *can_delegate,
         }
     }
 

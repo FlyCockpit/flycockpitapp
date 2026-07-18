@@ -226,6 +226,11 @@ fn provider_lines(
             .iter()
             .filter(|model| cfg.resolve_subagent_invokable(id, &model.id))
             .count();
+        let can_delegate_count = provider
+            .models
+            .iter()
+            .filter(|model| cfg.resolve_can_delegate(id, &model.id))
+            .count();
         let embedding_count = provider
             .models
             .iter()
@@ -243,6 +248,7 @@ fn provider_lines(
         let mut notes = vec![
             format!("trusted {trusted_count}/{model_count}"),
             format!("subagent-invokable {subagent_count}/{model_count}"),
+            format!("can-delegate {can_delegate_count}/{model_count}"),
             format!("embedding-capable {embedding_count}/{model_count}"),
             format!("ranked {ranked_count}/{model_count}"),
         ];
@@ -765,6 +771,35 @@ mod tests {
             rendered.contains("swarm recursion: max depth 4, max concurrency 5"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn can_delegate_doctor_reports_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(cockpit.join("providers")).unwrap();
+        let config_path = cockpit.join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "mixed").unwrap();
+        std::fs::write(
+            provider_path,
+            r#"{
+                "url": "https://mixed.example/v1",
+                "can_delegate": false,
+                "models": [
+                    { "id": "provider-off" },
+                    { "id": "model-on", "can_delegate": true },
+                    { "id": "model-off", "can_delegate": false }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let rendered = render(&snapshot);
+
+        assert!(rendered.contains("can-delegate 1/3"), "{rendered}");
     }
 
     #[test]

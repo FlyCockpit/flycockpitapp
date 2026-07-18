@@ -75,12 +75,13 @@ impl Model {
         let quality_rank = cfg.resolve_quality_rank(&active.provider, &active.model);
         let cost_rank = cfg.resolve_cost_rank(&active.provider, &active.model);
         let subagent_invokable = cfg.resolve_subagent_invokable(&active.provider, &active.model);
+        let can_delegate = cfg.resolve_can_delegate(&active.provider, &active.model);
         let computer_use = cfg
             .resolve_capabilities(&active.provider, &active.model)
             .computer_use;
         let effective_redact =
             Self::effective_redact_table_for(cfg, &active.provider, &active.model, redact.clone());
-        build_model_with_computer_use(
+        build_model_with_can_delegate(
             &active.provider,
             entry,
             &active.model,
@@ -95,6 +96,7 @@ impl Model {
             quality_rank,
             cost_rank,
             subagent_invokable,
+            can_delegate,
             computer_use,
             trusted_only,
             redact,
@@ -213,10 +215,11 @@ impl Model {
         let quality_rank = cfg.resolve_quality_rank(provider_id, model_id);
         let cost_rank = cfg.resolve_cost_rank(provider_id, model_id);
         let subagent_invokable = cfg.resolve_subagent_invokable(provider_id, model_id);
+        let can_delegate = cfg.resolve_can_delegate(provider_id, model_id);
         let computer_use = cfg.resolve_capabilities(provider_id, model_id).computer_use;
         let effective_redact =
             Self::effective_redact_table_for(cfg, provider_id, model_id, redact.clone());
-        build_model_with_computer_use(
+        build_model_with_can_delegate(
             provider_id,
             entry,
             model_id,
@@ -231,6 +234,7 @@ impl Model {
             quality_rank,
             cost_rank,
             subagent_invokable,
+            can_delegate,
             computer_use,
             trusted_only,
             redact,
@@ -271,7 +275,7 @@ pub(super) fn build_model(
     redact: Arc<RedactionTable>,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Model> {
-    build_model_with_computer_use(
+    build_model_with_can_delegate(
         provider_id,
         entry,
         model_id,
@@ -286,6 +290,7 @@ pub(super) fn build_model(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        true,
         None,
         trusted_only,
         session_redact,
@@ -295,7 +300,7 @@ pub(super) fn build_model(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_model_with_computer_use(
+pub(super) fn build_model_with_can_delegate(
     provider_id: &str,
     entry: &ProviderEntry,
     model_id: &str,
@@ -310,6 +315,7 @@ pub(super) fn build_model_with_computer_use(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
+    can_delegate: bool,
     computer_use: Option<crate::config::providers::ComputerUseCapability>,
     trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
@@ -341,6 +347,7 @@ pub(super) fn build_model_with_computer_use(
             quality_rank,
             cost_rank,
             subagent_invokable,
+            can_delegate,
             trusted_only,
             session_redact,
             redact,
@@ -348,7 +355,7 @@ pub(super) fn build_model_with_computer_use(
     } else if is_anthropic_native(&resolved.base_url) {
         let max_tokens =
             crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
-        build_anthropic_model_with_computer_use(
+        build_anthropic_model_with_can_delegate(
             provider_id,
             &resolved,
             model_id,
@@ -361,13 +368,14 @@ pub(super) fn build_model_with_computer_use(
             quality_rank,
             cost_rank,
             subagent_invokable,
+            can_delegate,
             computer_use.as_ref(),
             trusted_only,
             session_redact,
             redact,
         )
     } else {
-        build_openai_model_from_resolved_with_utility_limit(
+        build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
             provider_id,
             &resolved,
             model_id,
@@ -382,6 +390,7 @@ pub(super) fn build_model_with_computer_use(
             quality_rank,
             cost_rank,
             subagent_invokable,
+            can_delegate,
             trusted_only,
             session_redact,
             redact,
@@ -440,7 +449,7 @@ pub(super) fn build_anthropic_model(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    build_anthropic_model_with_computer_use(
+    build_anthropic_model_with_can_delegate(
         provider_id,
         resolved,
         model_id,
@@ -453,6 +462,7 @@ pub(super) fn build_anthropic_model(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        true,
         None,
         trusted_only,
         session_redact,
@@ -461,7 +471,7 @@ pub(super) fn build_anthropic_model(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_anthropic_model_with_computer_use(
+pub(super) fn build_anthropic_model_with_can_delegate(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
     model_id: &str,
@@ -474,6 +484,7 @@ pub(super) fn build_anthropic_model_with_computer_use(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
+    can_delegate: bool,
     computer_use: Option<&crate::config::providers::ComputerUseCapability>,
     trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
@@ -546,6 +557,7 @@ pub(super) fn build_anthropic_model_with_computer_use(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        can_delegate,
         trusted_only,
         // Default never-draining gate; the registry swaps in the daemon's
         // shared gate via `Model::with_shutdown_gate` for worker models.
@@ -588,6 +600,7 @@ pub(super) fn build_chatgpt_model(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        true,
         trusted_only,
         session_redact,
         redact,
@@ -607,6 +620,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
+    can_delegate: bool,
     trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
@@ -676,6 +690,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        can_delegate,
         trusted_only,
         gate: crate::daemon::shutdown::ShutdownSignal::new(),
         session_redact,
@@ -739,7 +754,7 @@ pub(super) fn build_openai_model_from_resolved(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    build_openai_model_from_resolved_with_utility_limit(
+    build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
         provider_id,
         resolved,
         model_id,
@@ -754,6 +769,7 @@ pub(super) fn build_openai_model_from_resolved(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        true,
         trusted_only,
         session_redact,
         redact,
@@ -761,6 +777,7 @@ pub(super) fn build_openai_model_from_resolved(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_openai_model_from_resolved_with_utility_limit(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
@@ -776,6 +793,49 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
+    trusted_only: Arc<AtomicBool>,
+    session_redact: Arc<RedactionTable>,
+    redact: Arc<RedactionTable>,
+) -> Result<Model> {
+    build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
+        provider_id,
+        resolved,
+        model_id,
+        utility_token_limit,
+        timeout,
+        hard_timeout_on_stall,
+        client_side_tools,
+        wire_api,
+        wire_api_explicit,
+        trusted,
+        location,
+        quality_rank,
+        cost_rank,
+        subagent_invokable,
+        true,
+        trusted_only,
+        session_redact,
+        redact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
+    provider_id: &str,
+    resolved: &models_fetch::ResolvedRequest,
+    model_id: &str,
+    utility_token_limit: Option<u64>,
+    timeout: &crate::config::providers::TimeoutConfig,
+    hard_timeout_on_stall: bool,
+    client_side_tools: ClientSideToolsCapability,
+    wire_api: crate::config::providers::WireApi,
+    wire_api_explicit: bool,
+    trusted: bool,
+    location: Option<ModelLocation>,
+    quality_rank: i64,
+    cost_rank: i64,
+    subagent_invokable: bool,
+    can_delegate: bool,
     trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
@@ -852,6 +912,7 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit(
         quality_rank,
         cost_rank,
         subagent_invokable,
+        can_delegate,
         trusted_only,
         // Default never-draining gate; the registry swaps in the daemon's
         // shared gate via `Model::with_shutdown_gate` for worker models.

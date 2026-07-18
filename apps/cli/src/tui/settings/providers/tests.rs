@@ -338,8 +338,33 @@ fn edit_menu_copilot_auth_row_only_for_copilot_providers() {
         !generic_actions.contains(&EditAction::CopilotAuth),
         "generic provider must not expose the Copilot-auth row"
     );
+    assert!(
+        generic_actions.contains(&EditAction::DeepFetch),
+        "provider settings must expose the confirmation-gated deep-fetch action"
+    );
     // The conditional row is the only difference in menu length.
     assert_eq!(actions.len(), generic_actions.len() + 1);
+}
+
+#[test]
+fn edit_menu_deepfetch_action_points_to_confirmed_command() {
+    let (_, mut dialog) = dialog_with_config(one_provider_config(None));
+    let entry = dialog.config.providers["p"].clone();
+    let mut state = EditState::new("p".into(), entry.clone());
+    state.cursor = edit_menu_actions("p", &entry)
+        .iter()
+        .position(|action| matches!(action, EditAction::DeepFetch))
+        .expect("deep fetch row");
+    dialog.set_test_page(Page::Providers(ProvidersPage::Edit(state)));
+
+    dialog.handle_key(press(KeyCode::Enter));
+
+    let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
+        panic!("expected edit page");
+    };
+    let status = state.status.as_deref().unwrap_or_default();
+    assert!(status.contains("cockpit fetch-models --deep p"));
+    assert!(status.contains("confirm"));
 }
 
 #[test]

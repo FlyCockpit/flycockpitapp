@@ -35,6 +35,17 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
         (None, None) => None,
     };
 
+    if args.deep {
+        return run_deepfetch(
+            &cwd,
+            &mut cfg,
+            provider_filter.cloned(),
+            args.model,
+            args.yes,
+        )
+        .await;
+    }
+
     let policy_override = match args.on_unlisted.as_deref() {
         Some("keep") => Some(OnUnlistedModelsFetch::Keep),
         Some("remove") => Some(OnUnlistedModelsFetch::Remove),
@@ -180,6 +191,105 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
     }
 
     println!("config.json updated.");
+    Ok(())
+}
+
+async fn run_deepfetch(
+    cwd: &Path,
+    cfg: &mut ProvidersConfig,
+    provider_filter: Option<String>,
+    model_filter: Option<String>,
+    assume_yes: bool,
+) -> Result<()> {
+    use crate::providers::deepfetch::{
+        DeepfetchMode, DeepfetchScope, HttpDeepfetchProbeClient, collect_deepfetch_targets,
+        deepfetch_confirmation_message, plan_deepfetch, probe_target, should_run_deepfetch,
+    };
+
+    let scope = DeepfetchScope {
+        provider: provider_filter,
+        model: model_filter,
+    };
+    let targets = collect_deepfetch_targets(cfg, &scope)?;
+    if targets.is_empty() {
+        println!("deep fetch: no eligible OpenAI-compatible non-embedding models");
+        return Ok(());
+    }
+    let plan = plan_deepfetch(&targets);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mode = if assume_yes {
+        DeepfetchMode::AssumeYes
+    } else if stdin.is_terminal() && stdout.is_terminal() {
+        DeepfetchMode::Interactive
+    } else {
+        DeepfetchMode::NonInteractive
+    };
+    let confirmed = if matches!(mode, DeepfetchMode::Interactive) {
+        let mut input = stdin.lock();
+        let mut output = stdout.lock();
+        write!(output, "{}", deepfetch_confirmation_message(&plan)).ok();
+        output.flush().ok();
+        let mut line = String::new();
+        input.read_line(&mut line).ok();
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        false
+    };
+    if !should_run_deepfetch(mode, confirmed, stdin.is_terminal() && stdout.is_terminal())? {
+        println!("deep fetch cancelled before sending any probe requests");
+        return Ok(());
+    }
+    if assume_yes {
+        println!("{}", deepfetch_confirmation_message(&plan));
+    }
+
+    let mut resolved = std::collections::BTreeMap::new();
+    for target in &targets {
+        if resolved.contains_key(&target.provider_id) {
+            continue;
+        }
+        let entry = cfg
+            .providers
+            .get(&target.provider_id)
+            .expect("target came from config")
+            .clone();
+        let request = models_fetch::resolve_provider_request_async(&target.provider_id, &entry)
+            .await
+            .with_context(|| format!("resolving provider `{}`", target.provider_id))?;
+        resolved.insert(target.provider_id.clone(), request);
+    }
+
+    let mut client = HttpDeepfetchProbeClient::new(resolved, Duration::from_secs(20));
+    let cancel = tokio::signal::ctrl_c();
+    tokio::pin!(cancel);
+    let mut cancelled = false;
+    for target in &targets {
+        println!("→ deep fetch {}:{}", target.provider_id, target.model_id);
+        let report = tokio::select! {
+            result = probe_target(&mut client, cfg, target) => result?,
+            _ = &mut cancel => {
+                cancelled = true;
+                println!("deep fetch cancelled; completed model results have already been saved");
+                break;
+            }
+        };
+        println!("  {report:?}");
+        let entry = cfg
+            .providers
+            .get(&target.provider_id)
+            .expect("target came from config")
+            .clone();
+        persist_provider(cwd, &target.provider_id, entry)?;
+    }
+    if cancelled {
+        return Ok(());
+    }
+    println!(
+        "deep fetch complete: {} model(s), up to {} request(s)",
+        plan.models,
+        plan.total_requests()
+    );
     Ok(())
 }
 

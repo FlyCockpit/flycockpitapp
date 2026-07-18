@@ -3790,19 +3790,16 @@ impl Driver {
         providers.resolve_context(provider, model)
     }
 
-    /// The active model's declared context window (`context_length`), or
-    /// `None` when no model is selected, the config can't be loaded, or the
-    /// model declares no limit. When `None` the ctx%-gated triggers are inert
-    /// (implementation note).
+    /// The active model's effective context window, or `None` when no model is
+    /// selected, the config can't be loaded, or no context limit is known. This
+    /// uses the capability resolver so probed context-window values power the
+    /// ctx%-gated triggers without pretending to be a user-authored
+    /// `context_length` edit.
     fn active_model_context_length(&self) -> Option<u32> {
         let (providers, provider, model) = self.active_providers_config()?;
         providers
-            .providers
-            .get(&provider)?
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .and_then(|m| m.context_length)
+            .resolve_capabilities(&provider, &model)
+            .context_tokens
     }
 
     /// Resolve and build the backup-model fallback for the agent currently

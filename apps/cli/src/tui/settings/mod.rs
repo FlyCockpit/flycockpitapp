@@ -4373,7 +4373,7 @@ mod tests {
             .map(|e| e.url.clone())
     }
 
-    /// The Edit page's `[save changes]` row (cursor 7) commits the staged
+    /// The Edit page's `[save changes]` row commits the staged
     /// entry to disk and stays on the page with a `saved` confirmation.
     #[test]
     fn edit_save_changes_row_commits_and_stays() {
@@ -4381,10 +4381,15 @@ mod tests {
         let mut d = dialog_with_one_provider(&tmp);
         enter_edit_first_provider(&mut d);
         // Stage a URL edit, then move the cursor to the `[save changes]`
-        // row (index 7) and activate it.
+        // row and activate it.
         if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
             s.entry.url = "https://new".to_string();
-            s.cursor = 7;
+            s.cursor = crate::tui::settings::providers::edit_menu_actions(&s.provider_id, &s.entry)
+                .iter()
+                .position(|action| {
+                    matches!(action, crate::tui::settings::providers::EditAction::Save)
+                })
+                .expect("save row");
         } else {
             panic!("not on Edit page");
         }

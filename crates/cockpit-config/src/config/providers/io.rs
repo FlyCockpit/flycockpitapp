@@ -292,8 +292,7 @@ impl ConfigDoc {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.path, format!("{pretty}\n"))
-            .with_context(|| format!("writing {}", self.path.display()))?;
+        atomic_write(&self.path, format!("{pretty}\n").as_bytes())?;
         Ok(())
     }
 
@@ -327,8 +326,7 @@ impl ConfigDoc {
         }
         let pretty = serde_json::to_string_pretty(&Value::Object(provider))
             .context("serializing provider")?;
-        std::fs::write(&path, format!("{pretty}\n"))
-            .with_context(|| format!("writing {}", path.display()))?;
+        atomic_write(&path, format!("{pretty}\n").as_bytes())?;
         Ok(())
     }
 
@@ -377,6 +375,45 @@ impl ConfigDoc {
         }
         Ok(())
     }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+    let mut tmp = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .with_context(|| format!("creating temporary file {}", tmp_path.display()))?;
+    std::io::Write::write_all(&mut tmp, contents)
+        .with_context(|| format!("writing temporary file {}", tmp_path.display()))?;
+    tmp.sync_all()
+        .with_context(|| format!("syncing temporary file {}", tmp_path.display()))?;
+    drop(tmp);
+    if let Err(error) = std::fs::rename(&tmp_path, path) {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("removing old {}", path.display()))?;
+                std::fs::rename(&tmp_path, path)
+                    .with_context(|| format!("replacing {}", path.display()))?;
+                return Ok(());
+            }
+        }
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error).with_context(|| format!("replacing {}", path.display()));
+    }
+    let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    Ok(())
 }
 
 pub fn is_xai_grok_provider(provider_id: &str, entry: &ProviderEntry) -> bool {

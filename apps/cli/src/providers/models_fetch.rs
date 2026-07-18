@@ -825,6 +825,8 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
 }
 
 fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCapabilities> {
+    let context_tokens = context_tokens_from_metadata(obj);
+    let max_output_tokens = max_output_tokens_from_metadata(obj);
     Ok(ModelCapabilities {
         tool_calling: capability_status_from_metadata(
             obj,
@@ -834,8 +836,10 @@ fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCap
         images: images_from_metadata(obj),
         embeddings: embeddings_from_metadata(obj),
         embedding_dimensions: embedding_dimensions_from_metadata(obj),
-        context_tokens: context_tokens_from_metadata(obj),
-        max_output_tokens: max_output_tokens_from_metadata(obj),
+        context_tokens,
+        context_tokens_source: context_tokens.map(|_| CapabilitySource::Live),
+        max_output_tokens,
+        max_output_tokens_source: max_output_tokens.map(|_| CapabilitySource::Live),
         reasoning: capability_status_from_metadata(
             obj,
             "reasoning",

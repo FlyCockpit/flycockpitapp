@@ -79,7 +79,7 @@ use super::{Page, TestPageRef};
 /// share a single source of truth and stay index-correct when the
 /// conditional "Copilot auth" row is present or absent.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum EditAction {
+pub(super) enum EditAction {
     Url,
     Headers,
     /// Only present for Copilot providers.
@@ -90,6 +90,7 @@ enum EditAction {
     Settings,
     Favorite,
     Refetch,
+    DeepFetch,
     Delete,
     Save,
     Back,
@@ -100,7 +101,7 @@ enum EditAction {
 /// the single source of truth for both [`Self::render_edit`] and
 /// [`Self::handle_edit_key`]: the cursor indexes into the returned `Vec`
 /// and the handler dispatches on the action, never a literal index.
-fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec<EditAction> {
+pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec<EditAction> {
     let mut actions = vec![EditAction::Url, EditAction::Headers];
     let registry = templates::ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
@@ -119,6 +120,7 @@ fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec<EditAction
         EditAction::Settings,
         EditAction::Favorite,
         EditAction::Refetch,
+        EditAction::DeepFetch,
         EditAction::Delete,
         EditAction::Save,
         EditAction::Back,
@@ -1812,6 +1814,12 @@ impl SettingsCx {
                     Some("refetching /models…".into())
                 };
             }
+            Some(EditAction::DeepFetch) => {
+                let provider = &s.provider_id;
+                s.status = Some(format!(
+                    "deep fetch sends billable probes; run `cockpit fetch-models --deep {provider}` and confirm the prompt"
+                ));
+            }
             Some(EditAction::Delete) => {
                 if s.delete_pending {
                     let saved = self.delete_provider_and_stored_secrets(&s.provider_id, true);
@@ -2777,6 +2785,10 @@ impl SettingsCx {
                     .to_string(),
                 ),
                 EditAction::Refetch => ("Refetch /models", refetch_summary(&s.entry)),
+                EditAction::DeepFetch => (
+                    "Deep fetch",
+                    "live endpoint/context probes; confirmation required".to_string(),
+                ),
                 EditAction::Delete => (
                     "Delete",
                     if s.delete_pending {

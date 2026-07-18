@@ -12,6 +12,7 @@
 //! request time.
 
 pub(crate) mod auth_check;
+pub(crate) mod deepfetch;
 pub(crate) mod http_retry;
 pub mod models_fetch;
 pub(crate) mod registry;

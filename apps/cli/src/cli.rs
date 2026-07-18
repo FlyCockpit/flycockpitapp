@@ -607,6 +607,19 @@ pub struct FetchModelsArgs {
     /// fails. Without this flag, existing live models are preserved.
     #[arg(long)]
     pub allow_fallback: bool,
+
+    /// Send explicit live probes to learn endpoint and context-window metadata.
+    #[arg(long)]
+    pub deep: bool,
+
+    /// Skip the deep-fetch money/cost confirmation prompt. Required for
+    /// non-interactive deep fetches.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Limit --deep to one model id within the selected provider set.
+    #[arg(long, value_name = "MODEL_ID", requires = "deep")]
+    pub model: Option<String>,
 }
 
 // ---- sessions ----
@@ -1255,6 +1268,45 @@ mod tests {
             Some(Command::FetchModels(args)) => {
                 assert_eq!(args.provider_arg.as_deref(), Some("codex-oauth"));
                 assert!(args.provider.is_none());
+                assert!(!args.deep);
+                assert!(!args.yes);
+                assert!(args.model.is_none());
+            }
+            other => panic!("expected fetch-models command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_fetch_never_probes() {
+        let cli = Cli::try_parse_from(["cockpit", "fetch-models", "openai"]).unwrap();
+        match cli.command {
+            Some(Command::FetchModels(args)) => {
+                assert!(!args.deep);
+                assert!(!args.yes);
+                assert!(args.model.is_none());
+            }
+            other => panic!("expected fetch-models command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepfetch_cli_requires_explicit_flag() {
+        let cli = Cli::try_parse_from([
+            "cockpit",
+            "fetch-models",
+            "--deep",
+            "--yes",
+            "openai",
+            "--model",
+            "gpt-5-mini",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::FetchModels(args)) => {
+                assert!(args.deep);
+                assert!(args.yes);
+                assert_eq!(args.provider_arg.as_deref(), Some("openai"));
+                assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));
             }
             other => panic!("expected fetch-models command, got {other:?}"),
         }

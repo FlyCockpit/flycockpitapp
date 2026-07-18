@@ -995,6 +995,7 @@ pub struct ModelEntry {
 pub enum CapabilitySource {
     Live,
     Manual,
+    Probed,
     Fallback,
     Legacy,
     ProviderRule,
@@ -1102,7 +1103,11 @@ pub struct ModelCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens_source: Option<CapabilitySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<CapabilitySource>,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub reasoning: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
@@ -1120,7 +1125,9 @@ impl ModelCapabilities {
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
+            && self.context_tokens_source.is_none()
             && self.max_output_tokens.is_none()
+            && self.max_output_tokens_source.is_none()
             && self.reasoning.is_unknown()
             && self.structured_outputs.is_unknown()
             && self
@@ -1488,6 +1495,15 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     }
     if !existing.capability_overrides.is_empty() {
         fetched.capability_overrides = existing.capability_overrides.clone();
+    }
+    if existing.capabilities.context_tokens_source == Some(CapabilitySource::Probed) {
+        fetched.capabilities.context_tokens = existing.capabilities.context_tokens;
+        fetched.capabilities.context_tokens_source = existing.capabilities.context_tokens_source;
+    }
+    if existing.capabilities.max_output_tokens_source == Some(CapabilitySource::Probed) {
+        fetched.capabilities.max_output_tokens = existing.capabilities.max_output_tokens;
+        fetched.capabilities.max_output_tokens_source =
+            existing.capabilities.max_output_tokens_source;
     }
     if !existing.capabilities.client_side_tools.is_empty()
         && existing.capabilities.client_side_tools.source == Some(CapabilitySource::Manual)

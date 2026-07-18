@@ -167,6 +167,147 @@ fn resolve_capabilities_applies_model_overrides_after_detection() {
 }
 
 #[test]
+fn probed_capability_precedence_order() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "entry".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "entry-only".into(),
+                context_length: Some(32_000),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    cfg.providers.insert(
+        "p".into(),
+        ProviderEntry {
+            capabilities: ProviderCapabilities {
+                context_tokens: Some(64_000),
+                ..ProviderCapabilities::default()
+            },
+            models: vec![
+                ModelEntry {
+                    id: "detected".into(),
+                    context_length: Some(32_000),
+                    capabilities: ModelCapabilities {
+                        context_tokens: Some(96_000),
+                        context_tokens_source: Some(CapabilitySource::Live),
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                },
+                ModelEntry {
+                    id: "probed".into(),
+                    context_length: Some(32_000),
+                    capabilities: ModelCapabilities {
+                        context_tokens: Some(128_000),
+                        context_tokens_source: Some(CapabilitySource::Probed),
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                },
+                ModelEntry {
+                    id: "manual".into(),
+                    context_length: Some(32_000),
+                    capabilities: ModelCapabilities {
+                        context_tokens: Some(128_000),
+                        context_tokens_source: Some(CapabilitySource::Probed),
+                        ..ModelCapabilities::default()
+                    },
+                    capability_overrides: ModelCapabilityOverrides {
+                        context_tokens: Some(256_000),
+                        ..ModelCapabilityOverrides::default()
+                    },
+                    ..ModelEntry::default()
+                },
+            ],
+            ..ProviderEntry::default()
+        },
+    );
+
+    assert_eq!(
+        cfg.resolve_capabilities("entry", "entry-only")
+            .context_tokens,
+        Some(32_000)
+    );
+    assert_eq!(
+        cfg.resolve_capabilities("p", "detected").context_tokens,
+        Some(96_000)
+    );
+    assert_eq!(
+        cfg.resolve_capabilities("p", "probed").context_tokens,
+        Some(128_000)
+    );
+    assert_eq!(
+        cfg.resolve_capabilities("p", "manual").context_tokens,
+        Some(256_000)
+    );
+}
+
+#[test]
+fn manual_override_beats_probed_value() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "p".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "m".into(),
+                capabilities: ModelCapabilities {
+                    context_tokens: Some(128_000),
+                    context_tokens_source: Some(CapabilitySource::Probed),
+                    ..ModelCapabilities::default()
+                },
+                capability_overrides: ModelCapabilityOverrides {
+                    context_tokens: Some(256_000),
+                    ..ModelCapabilityOverrides::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+
+    let caps = cfg.resolve_capabilities("p", "m");
+    assert_eq!(caps.context_tokens, Some(256_000));
+}
+
+#[test]
+fn probed_context_survives_refetch_on_non_manual_entry() {
+    let mut existing = model("gpt-5-mini", false);
+    existing.capabilities.context_tokens = Some(128_000);
+    existing.capabilities.context_tokens_source = Some(CapabilitySource::Probed);
+
+    let mut fetched = model("gpt-5-mini", false);
+    fetched.capabilities.context_tokens = Some(32_000);
+    fetched.capabilities.context_tokens_source = Some(CapabilitySource::Live);
+
+    let merged = merge_fetched_models_with_policy(
+        Some("openai"),
+        &[existing],
+        vec![fetched],
+        ModelMergePolicy::KeepUnlisted,
+    );
+    let model = &merged[0];
+    assert!(!model.manual);
+    assert_eq!(model.capabilities.context_tokens, Some(128_000));
+    assert_eq!(
+        model.capabilities.context_tokens_source,
+        Some(CapabilitySource::Probed)
+    );
+}
+
+#[test]
+fn probed_entry_is_not_manual() {
+    let mut model = model("m", false);
+    model.capabilities.context_tokens = Some(128_000);
+    model.capabilities.context_tokens_source = Some(CapabilitySource::Probed);
+
+    assert!(!model.manual);
+}
+
+#[test]
 fn merge_refresh_preserves_overrides_but_not_stale_detected_capabilities() {
     let mut existing = model("mimo-v2.5", false);
     existing.capabilities.images = Some(false);
@@ -1254,6 +1395,10 @@ fn capability_enum_serde_names_are_stable() {
     assert_eq!(
         serde_json::to_value(CapabilitySource::ProviderRule).unwrap(),
         serde_json::json!("provider_rule")
+    );
+    assert_eq!(
+        serde_json::to_value(CapabilitySource::Probed).unwrap(),
+        serde_json::json!("probed")
     );
     assert_eq!(
         serde_json::to_value(CapabilitySource::LegacySynthesized).unwrap(),

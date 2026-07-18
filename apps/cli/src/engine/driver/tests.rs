@@ -3977,6 +3977,50 @@ fn install_test_providers(
     driver.test_providers_override = Some((cfg, "lmstudio".into(), "local".into()));
 }
 
+#[test]
+fn active_context_length_uses_probed_capability() {
+    use crate::config::providers::{
+        ActiveModelRef, CapabilitySource, ModelCapabilities, ModelEntry, ProviderEntry,
+        ProvidersConfig, WireApi,
+    };
+
+    let (mut driver, _tmp) = test_driver(8);
+    let mut entry = ProviderEntry {
+        url: "http://127.0.0.1:1/v1".to_string(),
+        wire_api: WireApi::Completions,
+        ..ProviderEntry::default()
+    };
+    entry.models.push(ModelEntry {
+        id: "local".into(),
+        context_length: None,
+        capabilities: ModelCapabilities {
+            context_tokens: Some(128_000),
+            context_tokens_source: Some(CapabilitySource::Probed),
+            ..ModelCapabilities::default()
+        },
+        wire_api: WireApi::Completions,
+        ..ModelEntry::default()
+    });
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert("lmstudio".to_string(), entry);
+    driver.test_providers_override = Some((
+        ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "local".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..ProvidersConfig::default()
+        },
+        "lmstudio".into(),
+        "local".into(),
+    ));
+
+    assert_eq!(driver.active_model_context_length(), Some(128_000));
+}
+
 fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {
     driver
         .session

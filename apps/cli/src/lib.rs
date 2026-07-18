@@ -14,6 +14,7 @@ mod browser;
 mod cli;
 mod clipboard;
 mod commands;
+mod computer;
 pub use cockpit_config as config;
 mod container;
 mod credentials;

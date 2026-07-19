@@ -648,7 +648,7 @@ fn build_zip_with_options_and_env(
             })
     });
 
-    let manifest = build_manifest(db, target, bundle, options);
+    let manifest = build_manifest(db, target, bundle, options, env);
     let config_entries =
         collect_config_entries_with_env(target, options.include_generated_artifacts, env);
     let approval_entries = collect_approval_entries(db, bundle)?;
@@ -788,7 +788,12 @@ fn build_manifest(
     target: &SessionRow,
     bundle: &[SessionRow],
     options: ExportBundleOptions,
+    env: &HashMap<String, String>,
 ) -> Value {
+    let session_model = session_active_model_value(&target.provider, &target.model);
+    let config_active_model = config_active_model_value(&target.project_root, env);
+    let active_model_diverged =
+        active_models_diverged(session_model.as_ref(), config_active_model.as_ref());
     let sessions: Vec<Value> = bundle
         .iter()
         .map(|s| {
@@ -825,6 +830,9 @@ fn build_manifest(
             "project_root": target.project_root,
             "provider": target.provider,
             "model": target.model,
+            "session_model": session_model,
+            "config_active_model": config_active_model,
+            "active_model_diverged": active_model_diverged,
             "title": target.title,
             "started_at": target.started_at,
             "ended_at": target.ended_at,
@@ -842,6 +850,65 @@ fn build_manifest(
         obj.insert("resume_repair_required".to_string(), repair);
     }
     manifest
+}
+
+fn session_active_model_value(provider: &Option<String>, model: &Option<String>) -> Option<Value> {
+    Some(json!({
+        "provider": provider.as_ref()?,
+        "model": model.as_ref()?,
+    }))
+}
+
+fn config_active_model_value(project_root: &str, env: &HashMap<String, String>) -> Option<Value> {
+    let paths = config_file_paths_for_export(Path::new(project_root), env);
+    crate::config::providers::ConfigDoc::providers_from_paths(&paths)
+        .active_model
+        .map(|active| {
+            json!({
+                "provider": active.provider,
+                "model": active.model,
+            })
+        })
+}
+
+fn config_file_paths_for_export(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+    if let Some(path) = env
+        .get(crate::config::dirs::COCKPIT_CONFIG_ENV)
+        .map(String::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        let path = PathBuf::from(path);
+        if crate::config::trust::project_config_allowed(path.parent().unwrap_or(Path::new(""))) {
+            return vec![path];
+        }
+        return Vec::new();
+    }
+
+    let mut home_and_local = Vec::new();
+    let mut project = Vec::new();
+    for dir in discover_config_dirs(cwd) {
+        match dir.kind {
+            ConfigDirKind::Project => project.push(dir.path.join(crate::config::dirs::CONFIG_FILE)),
+            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
+                home_and_local.push(dir.path.join(crate::config::dirs::CONFIG_FILE));
+            }
+        }
+    }
+    project.reverse();
+    home_and_local.extend(project);
+    home_and_local
+}
+
+fn active_models_diverged(
+    session_model: Option<&Value>,
+    config_active_model: Option<&Value>,
+) -> bool {
+    let (Some(session_model), Some(config_active_model)) = (session_model, config_active_model)
+    else {
+        return false;
+    };
+    session_model.get("provider") != config_active_model.get("provider")
+        || session_model.get("model") != config_active_model.get("model")
 }
 
 fn export_resume_repair_state(db: &Db, target: &SessionRow) -> Option<Value> {

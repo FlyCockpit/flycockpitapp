@@ -241,7 +241,10 @@ impl App {
         };
         self.overlay = Overlay::None;
         if let Some(active) = selected {
-            self.notify_active_model_selected(active);
+            self.notify_active_model_selected(
+                active,
+                crate::daemon::proto::ActiveModelSwitchTrigger::Picker,
+            );
         }
         let line = self.model_summary_history_line();
         self.push_plain(line);
@@ -250,6 +253,7 @@ impl App {
     pub(super) fn notify_active_model_selected(
         &mut self,
         active: crate::config::providers::ActiveModelRef,
+        trigger: crate::daemon::proto::ActiveModelSwitchTrigger,
     ) {
         let provider = active.provider.clone();
         let model = active.model.clone();
@@ -258,7 +262,11 @@ impl App {
             format!("{provider}/{model}"),
             None,
         );
-        self.send_daemon_request("/model", active_model_request(active), ControlApplied::None);
+        self.send_daemon_request(
+            "/model",
+            active_model_request(active, trigger),
+            ControlApplied::None,
+        );
     }
 
     pub(super) fn cycle_footer_model(&mut self, forward: bool) {
@@ -270,7 +278,10 @@ impl App {
             Ok(Some(active)) => {
                 let provider = active.provider.clone();
                 let model = active.model.clone();
-                self.notify_active_model_selected(active);
+                self.notify_active_model_selected(
+                    active,
+                    crate::daemon::proto::ActiveModelSwitchTrigger::Cycle,
+                );
                 self.push_plain(format!("/model: active model is now {provider}/{model} ★"));
             }
             Ok(None) => {
@@ -366,12 +377,15 @@ impl App {
             );
             self.send_daemon_request(
                 "/quick",
-                active_model_request(crate::config::providers::ActiveModelRef {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    reasoning_effort: None,
-                    thinking_mode: None,
-                }),
+                active_model_request(
+                    crate::config::providers::ActiveModelRef {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                    },
+                    crate::daemon::proto::ActiveModelSwitchTrigger::Quick,
+                ),
                 ControlApplied::QuickActiveModel { provider, model },
             );
         }
@@ -553,10 +567,12 @@ impl App {
 
 fn active_model_request(
     active: crate::config::providers::ActiveModelRef,
+    trigger: crate::daemon::proto::ActiveModelSwitchTrigger,
 ) -> crate::daemon::proto::Request {
     crate::daemon::proto::Request::SetActiveModel {
         provider: active.provider,
         model: active.model,
+        trigger,
         reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
         thinking_mode: active.thinking_mode.and_then(|mode| {
             serde_json::to_value(mode)

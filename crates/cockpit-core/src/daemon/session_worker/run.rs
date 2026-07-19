@@ -1311,6 +1311,7 @@ async fn run_worker(
             SessionWork::SetActiveModel {
                 provider,
                 model,
+                trigger,
                 reasoning_effort,
                 thinking_mode,
             } => {
@@ -1327,6 +1328,7 @@ async fn run_worker(
                     crate::engine::driver::DriverControl::SetActiveModel {
                         provider,
                         model,
+                        trigger,
                         reasoning_effort,
                         thinking_mode,
                     },

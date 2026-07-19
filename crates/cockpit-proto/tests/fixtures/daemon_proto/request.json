@@ -424,7 +424,8 @@
   "set_active_model": {
     "params": {
       "model": "model-fixture",
-      "provider": "provider-fixture"
+      "provider": "provider-fixture",
+      "trigger": "daemon"
     },
     "request": "set_active_model"
   },

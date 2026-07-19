@@ -635,6 +635,7 @@ async fn handle_request(
         Request::SetActiveModel {
             provider,
             model,
+            trigger,
             reasoning_effort,
             thinking_mode,
         } => {
@@ -643,6 +644,7 @@ async fn handle_request(
                 .send_work(SessionWork::SetActiveModel {
                     provider,
                     model,
+                    trigger: active_model_trigger_from_proto(trigger),
                     reasoning_effort,
                     thinking_mode,
                 })
@@ -1504,6 +1506,17 @@ fn select_session_env(
         });
     }
     Ok((chosen, baseline_meta, session_meta, drift, policy))
+}
+
+fn active_model_trigger_from_proto(
+    trigger: proto::ActiveModelSwitchTrigger,
+) -> crate::session::ModelSwitchTrigger {
+    match trigger {
+        proto::ActiveModelSwitchTrigger::Picker => crate::session::ModelSwitchTrigger::Picker,
+        proto::ActiveModelSwitchTrigger::Quick => crate::session::ModelSwitchTrigger::Quick,
+        proto::ActiveModelSwitchTrigger::Cycle => crate::session::ModelSwitchTrigger::Cycle,
+        proto::ActiveModelSwitchTrigger::Daemon => crate::session::ModelSwitchTrigger::Daemon,
+    }
 }
 
 fn paused_work_to_proto(row: crate::db::paused_work::PausedWorkRow) -> proto::PausedWorkSummary {

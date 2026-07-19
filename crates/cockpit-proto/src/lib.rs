@@ -540,7 +540,9 @@ pub enum Body {
 // ---- Requests --------------------------------------------------------------
 
 mod request;
-pub use request::{AttachmentPurpose, LspControlAction, Request, UsageKind};
+pub use request::{
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, UsageKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

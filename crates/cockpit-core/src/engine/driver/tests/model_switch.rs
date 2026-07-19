@@ -92,6 +92,7 @@ async fn live_model_switch_routes_next_request_to_new_model() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -149,6 +150,7 @@ async fn live_model_switch_commits_config_and_session_together() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -164,6 +166,7 @@ async fn live_model_switch_commits_config_and_session_together() {
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
     assert_disk_config_active_model(tmp.path(), "provider-b", "model-b");
+    assert_one_model_switch_event(&driver, "ok", false);
     drain_until_active_model_state(&mut rx);
 }
 
@@ -180,6 +183,7 @@ async fn live_model_switch_from_subagent_frame_applies_to_root() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -211,6 +215,7 @@ async fn live_model_switch_persists_requested_reasoning_options() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some("high".into()),
             },
@@ -250,6 +255,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
             DriverControl::SetActiveModel {
                 provider: "provider-c".into(), // never configured
                 model: "model-c".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -281,6 +287,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
         Some("provider-a")
     );
     assert_config_active_model(&driver, "provider-a", "model-a");
+    assert_one_model_switch_event(&driver, "build_failed", true);
     drain_until_active_model_state(&mut rx);
 }
 
@@ -297,6 +304,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -313,6 +321,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
     assert_config_active_model(&driver, "provider-a", "model-a");
+    assert_one_model_switch_event(&driver, "send_failed", true);
     drain_until_active_model_state(&mut rx);
 }
 
@@ -329,6 +338,7 @@ async fn live_model_switch_config_write_failure_rolls_back() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -345,6 +355,7 @@ async fn live_model_switch_config_write_failure_rolls_back() {
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
     assert_config_active_model(&driver, "provider-a", "model-a");
+    assert_one_model_switch_event(&driver, "send_failed", true);
     drain_until_active_model_state(&mut rx);
 }
 
@@ -360,6 +371,7 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
             DriverControl::SetActiveModel {
                 provider: "provider-c".into(),
                 model: "model-c".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -400,6 +412,7 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
             DriverControl::SetActiveModel {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -452,6 +465,7 @@ async fn live_model_switch_same_model_is_noop() {
             DriverControl::SetActiveModel {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -460,6 +474,7 @@ async fn live_model_switch_same_model_is_noop() {
         .await;
 
     assert_eq!(Arc::as_ptr(&driver.stack[0].agent), before);
+    assert_one_model_switch_event(&driver, "noop", false);
     drain_until_active_model_state(&mut rx);
 }
 
@@ -474,6 +489,7 @@ async fn live_model_switch_emits_active_model_state_event() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -502,6 +518,38 @@ async fn live_model_switch_emits_active_model_state_event() {
     }
 }
 
+/// Audit-row write failure is diagnostic-only: an otherwise-successful live
+/// model switch still commits the session row, config file, and root model.
+#[tokio::test]
+async fn live_model_switch_audit_record_failure_does_not_roll_back() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.test_fail_next_model_switch_audit_record = true;
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
+    assert_disk_config_active_model(tmp.path(), "provider-b", "model-b");
+    drain_until_active_model_state(&mut rx);
+}
+
 fn assert_config_active_model(driver: &Driver, provider: &str, model: &str) {
     let (cfg, _, _) = driver
         .test_providers_override
@@ -510,6 +558,27 @@ fn assert_config_active_model(driver: &Driver, provider: &str, model: &str) {
     let active = cfg.active_model.as_ref().expect("active model written");
     assert_eq!(active.provider, provider);
     assert_eq!(active.model, model);
+}
+
+fn assert_one_model_switch_event(driver: &Driver, outcome: &str, error_present: bool) {
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "model_switch")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "one model_switch event must be recorded");
+    assert_eq!(events[0].data["from_provider"], "provider-a");
+    assert_eq!(events[0].data["from_model"], "model-a");
+    assert_eq!(events[0].data["trigger"], "daemon");
+    assert_eq!(events[0].data["outcome"], outcome);
+    assert_eq!(
+        events[0].data["error"].is_string(),
+        error_present,
+        "error presence should match outcome"
+    );
 }
 
 fn assert_notice_contains(rx: &mut mpsc::Receiver<TurnEvent>, expected: &str) {

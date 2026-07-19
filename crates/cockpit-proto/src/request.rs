@@ -457,6 +457,8 @@ pub enum Request {
     SetActiveModel {
         provider: String,
         model: String,
+        #[serde(default)]
+        trigger: ActiveModelSwitchTrigger,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -795,4 +797,14 @@ pub enum LspControlAction {
 pub enum AttachmentPurpose {
     UserMessageImage,
     TerminalPasteImage { terminal_id: Uuid },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveModelSwitchTrigger {
+    Picker,
+    Quick,
+    Cycle,
+    #[default]
+    Daemon,
 }

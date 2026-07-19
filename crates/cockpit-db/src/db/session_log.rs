@@ -127,6 +127,10 @@ pub enum SessionEventKind {
     /// redacted `text`, typed `severity`, and stable `source` metadata so
     /// exports preserve diagnostic warnings that were previously UI-only.
     Notice,
+    /// The active-model switch transaction was attempted. Carries old/new
+    /// provider/model ids, a closed trigger, outcome, and optional redacted
+    /// error text. Data/export only.
+    ModelSwitch,
 }
 
 impl SessionEventKind {
@@ -156,6 +160,7 @@ impl SessionEventKind {
             SessionEventKind::GoalProgressDiagnostic => "goal_progress_diagnostic",
             SessionEventKind::ResourcePromotion => "resource_promotion",
             SessionEventKind::Notice => "notice",
+            SessionEventKind::ModelSwitch => "model_switch",
         }
     }
 }
@@ -746,8 +751,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_rejected_and_primary_swap_events_round_trip() {
-        // The two export-audit-fidelity event kinds persist with their stable
+    fn session_event_kind_export_audit_events_round_trip() {
+        // The export-audit-fidelity event kinds persist with their stable
         // discriminant strings and flow their data payloads back verbatim.
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").unwrap();
@@ -777,14 +782,33 @@ mod tests {
             &swap,
         )
         .unwrap();
+        let model_switch = json!({
+            "from_provider": "provider-a",
+            "from_model": "model-a",
+            "to_provider": "provider-b",
+            "to_model": "model-b",
+            "trigger": "daemon",
+            "outcome": "ok",
+            "error": null,
+        });
+        db.insert_session_event(
+            sid,
+            SessionEventKind::ModelSwitch,
+            None,
+            None,
+            &model_switch,
+        )
+        .unwrap();
 
         let events = db.list_session_events(sid).unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0].kind, "tool_rejected");
         assert_eq!(events[0].data, rejected);
         assert_eq!(events[0].call_id.as_deref(), Some("tc-1"));
         assert_eq!(events[1].kind, "primary_swap");
         assert_eq!(events[1].data, swap);
+        assert_eq!(events[2].kind, "model_switch");
+        assert_eq!(events[2].data, model_switch);
     }
 
     #[test]

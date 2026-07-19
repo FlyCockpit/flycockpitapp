@@ -1,5 +1,54 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSwitchTrigger {
+    Picker,
+    Quick,
+    Cycle,
+    Daemon,
+}
+
+impl ModelSwitchTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Picker => "picker",
+            Self::Quick => "quick",
+            Self::Cycle => "cycle",
+            Self::Daemon => "daemon",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSwitchOutcome {
+    Ok,
+    BuildFailed,
+    SendFailed,
+    Noop,
+}
+
+impl ModelSwitchOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::BuildFailed => "build_failed",
+            Self::SendFailed => "send_failed",
+            Self::Noop => "noop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ModelSwitchAudit<'a> {
+    pub from_provider: Option<&'a str>,
+    pub from_model: Option<&'a str>,
+    pub to_provider: &'a str,
+    pub to_model: &'a str,
+    pub trigger: ModelSwitchTrigger,
+    pub outcome: ModelSwitchOutcome,
+    pub error: Option<&'a str>,
+}
+
 impl Session {
     /// Append one tool-call audit row to the §15b table.
     pub fn record_tool_call(&self, row: ToolCallRow) -> Result<()> {
@@ -586,6 +635,28 @@ impl Session {
                 "trigger": trigger,
                 "display": display,
                 "kickoff": kickoff,
+            }),
+        )
+    }
+
+    /// Record a `model_switch` timeline event for every active-model switch
+    /// attempt, including no-ops and failures. Carries only provider/model
+    /// ids, the closed trigger/outcome strings, and the real error text when
+    /// one exists; the shared session-event redaction path handles payload
+    /// scrubbing before export.
+    pub fn record_model_switch(&self, audit: ModelSwitchAudit<'_>) -> Result<i64> {
+        self.record_event(
+            crate::db::session_log::SessionEventKind::ModelSwitch,
+            None,
+            None,
+            &serde_json::json!({
+                "from_provider": audit.from_provider,
+                "from_model": audit.from_model,
+                "to_provider": audit.to_provider,
+                "to_model": audit.to_model,
+                "trigger": audit.trigger.as_str(),
+                "outcome": audit.outcome.as_str(),
+                "error": audit.error,
             }),
         )
     }

@@ -156,6 +156,7 @@ pub enum DriverControl {
     SetActiveModel {
         provider: String,
         model: String,
+        trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,
     },
@@ -691,6 +692,8 @@ pub struct Driver {
     test_fail_next_active_model_session_persist: bool,
     #[cfg(test)]
     test_fail_next_active_model_config_write: bool,
+    #[cfg(test)]
+    test_fail_next_model_switch_audit_record: bool,
     /// Hermetic compact-utility inference seam. Tests capture invocation mode,
     /// prompt, and revision history without opening a socket.
     #[cfg(test)]
@@ -1155,6 +1158,8 @@ impl Driver {
             #[cfg(test)]
             test_fail_next_active_model_config_write: self.test_fail_next_active_model_config_write,
             #[cfg(test)]
+            test_fail_next_model_switch_audit_record: self.test_fail_next_model_switch_audit_record,
+            #[cfg(test)]
             test_compact_brief_calls: self.test_compact_brief_calls.clone(),
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
@@ -1440,6 +1445,8 @@ impl Driver {
             test_fail_next_active_model_session_persist: false,
             #[cfg(test)]
             test_fail_next_active_model_config_write: false,
+            #[cfg(test)]
+            test_fail_next_model_switch_audit_record: false,
             #[cfg(test)]
             test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             redaction_scan_environment_override: None,
@@ -2904,11 +2911,19 @@ impl Driver {
             DriverControl::SetActiveModel {
                 provider,
                 model,
+                trigger,
                 reasoning_effort,
                 thinking_mode,
             } => {
-                self.set_active_model_live(&provider, &model, reasoning_effort, thinking_mode, tx)
-                    .await;
+                self.set_active_model_live(
+                    &provider,
+                    &model,
+                    trigger,
+                    reasoning_effort,
+                    thinking_mode,
+                    tx,
+                )
+                .await;
             }
         }
     }

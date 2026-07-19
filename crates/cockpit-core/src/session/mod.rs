@@ -39,6 +39,7 @@ use crate::model_system_prompt::ModelSystemPromptSnapshot;
 mod gitignore;
 mod lifecycle;
 mod recording;
+pub use recording::{ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger};
 mod title;
 mod toggles;
 

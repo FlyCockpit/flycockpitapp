@@ -18,6 +18,7 @@ impl Driver {
         &mut self,
         provider: &str,
         model: &str,
+        trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
@@ -39,6 +40,15 @@ impl Driver {
         let active_idx = 0;
         let current = &self.stack[active_idx].agent.model;
         if current.provider_id() == provider && current.model_id_ref() == model {
+            self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                from_provider: old_session_provider.as_deref(),
+                from_model: old_session_model.as_deref(),
+                to_provider: provider,
+                to_model: model,
+                trigger,
+                outcome: crate::session::ModelSwitchOutcome::Noop,
+                error: None,
+            });
             self.emit_active_model_state(tx).await;
             return;
         }
@@ -47,11 +57,21 @@ impl Driver {
         let new_model = match self.build_live_model(&target) {
             Ok(m) => Arc::new(m),
             Err(e) => {
+                let error = format!("{e:#}");
+                self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                    from_provider: old_session_provider.as_deref(),
+                    from_model: old_session_model.as_deref(),
+                    to_provider: provider,
+                    to_model: model,
+                    trigger,
+                    outcome: crate::session::ModelSwitchOutcome::BuildFailed,
+                    error: Some(&error),
+                });
                 // Fail loudly, keep the current model active.
                 let _ = tx
                     .send(TurnEvent::Notice {
                         text: format!(
-                            "Model switch to `{provider}/{model}` failed — {e:#}. \
+                            "Model switch to `{provider}/{model}` failed — {error}. \
                              Keeping the current model active."
                         ),
                     })
@@ -62,12 +82,24 @@ impl Driver {
         };
         let rebuilt = Arc::new(self.rebuild_frame_with_model(active_idx, new_model));
         if let Err(e) = self.persist_active_model_session(provider, model) {
+            let error = format!("{e:#}");
             self.session
                 .restore_active_model_memory(old_session_provider, old_session_model);
+            let restored_provider = self.session.active_provider();
+            let restored_model = self.session.active_model();
+            self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                from_provider: restored_provider.as_deref(),
+                from_model: restored_model.as_deref(),
+                to_provider: provider,
+                to_model: model,
+                trigger,
+                outcome: crate::session::ModelSwitchOutcome::SendFailed,
+                error: Some(&error),
+            });
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(
-                        "Model switch to `{provider}/{model}` failed — {e:#}. \
+                        "Model switch to `{provider}/{model}` failed — {error}. \
                          Keeping the current model active."
                     ),
                 })
@@ -76,6 +108,7 @@ impl Driver {
             return;
         }
         if let Err(e) = self.write_active_model_config(&target) {
+            let error = format!("{e:#}");
             if let (Some(old_provider), Some(old_model)) = (
                 old_session_provider.as_deref(),
                 old_session_model.as_deref(),
@@ -83,10 +116,24 @@ impl Driver {
                 if let Err(restore_error) =
                     self.persist_active_model_session(old_provider, old_model)
                 {
+                    let combined_error = format!(
+                        "{error}; restoring previous session model failed — {restore_error:#}"
+                    );
+                    let restored_provider = self.session.active_provider();
+                    let restored_model = self.session.active_model();
+                    self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                        from_provider: restored_provider.as_deref(),
+                        from_model: restored_model.as_deref(),
+                        to_provider: provider,
+                        to_model: model,
+                        trigger,
+                        outcome: crate::session::ModelSwitchOutcome::SendFailed,
+                        error: Some(&combined_error),
+                    });
                     let _ = tx
                         .send(TurnEvent::Notice {
                             text: format!(
-                                "Model switch to `{provider}/{model}` failed — {e:#}. \
+                                "Model switch to `{provider}/{model}` failed — {error}. \
                                  Restoring the previous session model also failed — \
                                  {restore_error:#}. The config and session may diverge."
                             ),
@@ -99,10 +146,21 @@ impl Driver {
                 self.session
                     .restore_active_model_memory(old_session_provider, old_session_model);
             }
+            let restored_provider = self.session.active_provider();
+            let restored_model = self.session.active_model();
+            self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                from_provider: restored_provider.as_deref(),
+                from_model: restored_model.as_deref(),
+                to_provider: provider,
+                to_model: model,
+                trigger,
+                outcome: crate::session::ModelSwitchOutcome::SendFailed,
+                error: Some(&error),
+            });
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(
-                        "Model switch to `{provider}/{model}` failed — {e:#}. \
+                        "Model switch to `{provider}/{model}` failed — {error}. \
                          Keeping the current model active."
                     ),
                 })
@@ -110,6 +168,15 @@ impl Driver {
             self.emit_active_model_state(tx).await;
             return;
         }
+        self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+            from_provider: old_session_provider.as_deref(),
+            from_model: old_session_model.as_deref(),
+            to_provider: provider,
+            to_model: model,
+            trigger,
+            outcome: crate::session::ModelSwitchOutcome::Ok,
+            error: None,
+        });
         self.stack[active_idx].agent = rebuilt;
         // The job authority's fork context is rooted on the root agent;
         // rebind it when the root model changes.
@@ -227,6 +294,37 @@ impl Driver {
             anyhow::bail!("test injected active model session persist failure");
         }
         self.session.set_active_model(provider, model)
+    }
+
+    fn record_model_switch_audit(&mut self, audit: crate::session::ModelSwitchAudit<'_>) {
+        #[cfg(test)]
+        if self.test_fail_next_model_switch_audit_record {
+            self.test_fail_next_model_switch_audit_record = false;
+            tracing::warn!(
+                from_provider = audit.from_provider,
+                from_model = audit.from_model,
+                to_provider = audit.to_provider,
+                to_model = audit.to_model,
+                trigger = audit.trigger.as_str(),
+                outcome = audit.outcome.as_str(),
+                error = audit.error,
+                "test injected model switch audit record failure"
+            );
+            return;
+        }
+
+        if let Err(e) = self.session.record_model_switch(audit) {
+            tracing::warn!(
+                error = %e,
+                from_provider = audit.from_provider,
+                from_model = audit.from_model,
+                to_provider = audit.to_provider,
+                to_model = audit.to_model,
+                trigger = audit.trigger.as_str(),
+                outcome = audit.outcome.as_str(),
+                "failed to record model switch audit event"
+            );
+        }
     }
 
     async fn emit_active_model_state(&mut self, tx: &mpsc::Sender<TurnEvent>) {

@@ -2332,6 +2332,7 @@ mod tests {
             "set_active_model" => Request::SetActiveModel {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -3301,6 +3302,7 @@ mod tests {
             "set_active_model" => Request::SetActiveModel {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -3448,12 +3450,17 @@ mod tests {
                         SessionWork::SetActiveModel {
                             provider,
                             model,
+                            trigger,
                             reasoning_effort,
                             thinking_mode,
                         },
                     ) => {
                         assert_eq!(provider, "openai");
                         assert_eq!(model, "gpt-5");
+                        assert!(matches!(
+                            trigger,
+                            crate::session::ModelSwitchTrigger::Daemon
+                        ));
                         assert_eq!(reasoning_effort, None);
                         assert_eq!(thinking_mode, None);
                     }
@@ -3556,6 +3563,7 @@ mod tests {
             "set_active_model" => Request::SetActiveModel {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
             },
@@ -5089,6 +5097,7 @@ mod tests {
                 request: Request::SetActiveModel {
                     provider: "openai".into(),
                     model: "gpt".into(),
+                    trigger: proto::ActiveModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
                 },

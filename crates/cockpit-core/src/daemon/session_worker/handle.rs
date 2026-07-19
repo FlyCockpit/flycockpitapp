@@ -759,6 +759,7 @@ pub enum SessionWork {
     SetActiveModel {
         provider: String,
         model: String,
+        trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,
     },

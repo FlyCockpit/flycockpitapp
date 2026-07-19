@@ -1389,6 +1389,153 @@ fn export_includes_primary_swap_event_both_halves() {
     assert!(cmd["data"]["display"].is_null());
 }
 
+fn build_model_switch_zip(
+    trigger: crate::session::ModelSwitchTrigger,
+    outcome: crate::session::ModelSwitchOutcome,
+    error: Option<&str>,
+) -> Vec<u8> {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    session.set_active_model("provider-a", "model-a").unwrap();
+    session
+        .record_model_switch(crate::session::ModelSwitchAudit {
+            from_provider: Some("provider-a"),
+            from_model: Some("model-a"),
+            to_provider: "provider-b",
+            to_model: "model-b",
+            trigger,
+            outcome,
+            error,
+        })
+        .unwrap();
+    let target = db.get_session(session.id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, session.id).unwrap();
+    build_zip(&db, &target, &bundle).unwrap()
+}
+
+fn only_model_switch_event(zip: &[u8]) -> Value {
+    let events = zip_events(zip);
+    events
+        .into_iter()
+        .find(|event| event["type"] == "model_switch")
+        .expect("model_switch event exported")
+}
+
+#[test]
+fn export_includes_model_switch_event_payload_shape() {
+    let zip = build_model_switch_zip(
+        crate::session::ModelSwitchTrigger::Picker,
+        crate::session::ModelSwitchOutcome::Ok,
+        None,
+    );
+    let event = only_model_switch_event(&zip);
+    let data = event["data"].as_object().expect("model_switch data object");
+    let mut keys = data.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "error",
+            "from_model",
+            "from_provider",
+            "outcome",
+            "to_model",
+            "to_provider",
+            "trigger",
+        ]
+    );
+    assert_eq!(event["type"], "model_switch");
+    assert_eq!(event["data"]["from_provider"], "provider-a");
+    assert_eq!(event["data"]["from_model"], "model-a");
+    assert_eq!(event["data"]["to_provider"], "provider-b");
+    assert_eq!(event["data"]["to_model"], "model-b");
+    assert_eq!(event["data"]["trigger"], "picker");
+    assert_eq!(event["data"]["outcome"], "ok");
+    assert!(event["data"]["error"].is_null());
+}
+
+#[test]
+fn export_includes_model_switch_ok_event() {
+    let zip = build_model_switch_zip(
+        crate::session::ModelSwitchTrigger::Picker,
+        crate::session::ModelSwitchOutcome::Ok,
+        None,
+    );
+    let event = only_model_switch_event(&zip);
+    assert_eq!(event["data"]["outcome"], "ok");
+    assert!(event["data"]["error"].is_null());
+}
+
+#[test]
+fn export_includes_model_switch_build_failed_event() {
+    let zip = build_model_switch_zip(
+        crate::session::ModelSwitchTrigger::Picker,
+        crate::session::ModelSwitchOutcome::BuildFailed,
+        Some("provider not configured"),
+    );
+    let event = only_model_switch_event(&zip);
+    assert_eq!(event["data"]["outcome"], "build_failed");
+    assert_eq!(event["data"]["error"], "provider not configured");
+}
+
+#[test]
+fn export_includes_model_switch_send_failed_event() {
+    let zip = build_model_switch_zip(
+        crate::session::ModelSwitchTrigger::Picker,
+        crate::session::ModelSwitchOutcome::SendFailed,
+        Some("config write failed"),
+    );
+    let event = only_model_switch_event(&zip);
+    assert_eq!(event["data"]["outcome"], "send_failed");
+    assert_eq!(event["data"]["error"], "config write failed");
+}
+
+#[test]
+fn export_includes_model_switch_noop_event() {
+    let zip = build_model_switch_zip(
+        crate::session::ModelSwitchTrigger::Picker,
+        crate::session::ModelSwitchOutcome::Noop,
+        None,
+    );
+    let event = only_model_switch_event(&zip);
+    assert_eq!(event["data"]["outcome"], "noop");
+    assert!(event["data"]["error"].is_null());
+}
+
+#[test]
+fn export_model_switch_event_records_all_triggers() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    session.set_active_model("provider-a", "model-a").unwrap();
+    for trigger in [
+        crate::session::ModelSwitchTrigger::Picker,
+        crate::session::ModelSwitchTrigger::Quick,
+        crate::session::ModelSwitchTrigger::Cycle,
+        crate::session::ModelSwitchTrigger::Daemon,
+    ] {
+        session
+            .record_model_switch(crate::session::ModelSwitchAudit {
+                from_provider: Some("provider-a"),
+                from_model: Some("model-a"),
+                to_provider: "provider-b",
+                to_model: "model-b",
+                trigger,
+                outcome: crate::session::ModelSwitchOutcome::Ok,
+                error: None,
+            })
+            .unwrap();
+    }
+    let target = db.get_session(session.id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, session.id).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let triggers = zip_events(&zip)
+        .into_iter()
+        .filter(|event| event["type"] == "model_switch")
+        .map(|event| event["data"]["trigger"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(triggers, vec!["picker", "quick", "cycle", "daemon"]);
+}
+
 /// Export-audit fidelity (c): a `bash` `tool_call` event carries the
 /// authoritative structured `exit_code` field, distinct from the
 /// human-readable `exit: N` text kept in `output` for backward
@@ -2041,6 +2188,7 @@ fn export_older_events_without_new_fields_still_parse() {
     // None of the new event types appear.
     assert!(events.iter().all(|e| e["type"] != "tool_rejected"));
     assert!(events.iter().all(|e| e["type"] != "primary_swap"));
+    assert!(events.iter().all(|e| e["type"] != "model_switch"));
     // The old bash event simply has no `exit_code` key (absent, not null).
     let bash = events
         .iter()
@@ -2705,6 +2853,123 @@ fn manifest_has_version_and_session_date() {
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
     assert_eq!(manifest["excluded_generated_artifacts"], false);
     assert_eq!(manifest["include_generated_artifacts"], true);
+}
+
+fn write_manifest_active_model_config(root: &Path, provider: &str, model: &str) {
+    let config_dir = root.join(".cockpit");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string(&json!({
+            "active_model": {
+                "provider": provider,
+                "model": model,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn build_zip_with_config_override(
+    db: &Db,
+    target: &SessionRow,
+    bundle: &[SessionRow],
+    config_path: &Path,
+) -> Vec<u8> {
+    let mut env = test_export_env();
+    env.insert(
+        crate::config::dirs::COCKPIT_CONFIG_ENV.to_string(),
+        config_path.to_string_lossy().into_owned(),
+    );
+    build_zip_with_options_and_env(db, target, bundle, ExportBundleOptions::default(), &env)
+        .unwrap()
+}
+
+#[test]
+fn export_manifest_includes_session_and_config_active_model() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_manifest_active_model_config(tmp.path(), "provider-a", "model-a");
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    session.set_active_model("provider-a", "model-a").unwrap();
+
+    let target = db.get_session(session.id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, session.id).unwrap();
+    let zip = build_zip_with_config_override(
+        &db,
+        &target,
+        &bundle,
+        &tmp.path().join(".cockpit/config.json"),
+    );
+    let manifest: Value =
+        serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
+
+    assert_eq!(
+        manifest["target"]["session_model"],
+        json!({"provider": "provider-a", "model": "model-a"})
+    );
+    assert_eq!(
+        manifest["target"]["config_active_model"],
+        json!({"provider": "provider-a", "model": "model-a"})
+    );
+    assert_eq!(manifest["target"]["active_model_diverged"], false);
+}
+
+#[test]
+fn export_manifest_flags_active_model_divergence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_manifest_active_model_config(tmp.path(), "provider-b", "model-b");
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    session.set_active_model("provider-a", "model-a").unwrap();
+
+    let target = db.get_session(session.id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, session.id).unwrap();
+    let zip = build_zip_with_config_override(
+        &db,
+        &target,
+        &bundle,
+        &tmp.path().join(".cockpit/config.json"),
+    );
+    let manifest: Value =
+        serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
+
+    assert_eq!(
+        manifest["target"]["session_model"],
+        json!({"provider": "provider-a", "model": "model-a"})
+    );
+    assert_eq!(
+        manifest["target"]["config_active_model"],
+        json!({"provider": "provider-b", "model": "model-b"})
+    );
+    assert_eq!(manifest["target"]["active_model_diverged"], true);
+}
+
+#[test]
+fn export_manifest_active_model_without_config_is_null() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    session.set_active_model("provider-a", "model-a").unwrap();
+
+    let target = db.get_session(session.id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, session.id).unwrap();
+    let zip = build_zip_with_config_override(
+        &db,
+        &target,
+        &bundle,
+        &tmp.path().join(".cockpit/missing-config.json"),
+    );
+    let manifest: Value =
+        serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
+
+    assert_eq!(
+        manifest["target"]["session_model"],
+        json!({"provider": "provider-a", "model": "model-a"})
+    );
+    assert!(manifest["target"]["config_active_model"].is_null());
+    assert_eq!(manifest["target"]["active_model_diverged"], false);
 }
 
 /// The `config/` folder holds the deep-merged effective config plus raw

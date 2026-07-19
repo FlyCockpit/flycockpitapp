@@ -342,7 +342,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ],
         supports_models_endpoint: true,
         hint: Some(
-            "Sanctioned API-key path. Generate a key at https://console.anthropic.com/settings/keys. Anthropic Pro/Max OAuth passthrough is intentionally not offered (see GOALS §20).",
+            "Generate an API key at https://console.anthropic.com/settings/keys. Browser subscription login is not available for this provider.",
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Auto,

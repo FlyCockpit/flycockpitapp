@@ -1046,6 +1046,46 @@ mod tests {
         assert_eq!(overlay.title(), "Sessions");
     }
 
+    #[test]
+    fn keybindings_doc_covers_overlay() {
+        let doc = include_str!("../../docs/keybindings.md");
+        for ctx in [
+            KeyContext::Composer,
+            KeyContext::SlashMenu,
+            KeyContext::ModelPicker,
+            KeyContext::Settings,
+            KeyContext::Sessions,
+            KeyContext::Permissions,
+            KeyContext::Resources,
+            KeyContext::QuickSettings,
+            KeyContext::Scratchpad,
+            KeyContext::Diff,
+            KeyContext::Pins,
+            KeyContext::EmbeddedPane,
+            KeyContext::BtwPane,
+            KeyContext::QuestionDialog,
+            KeyContext::ApprovalDialog,
+        ] {
+            for group in groups_for(ctx) {
+                assert!(doc.contains(group.title), "missing group `{}`", group.title);
+                for binding in group.bindings {
+                    assert!(
+                        doc.contains(binding.key),
+                        "missing key `{}` from group `{}`",
+                        binding.key,
+                        group.title
+                    );
+                    assert!(
+                        doc.contains(binding.action),
+                        "missing action `{}` from group `{}`",
+                        binding.action,
+                        group.title
+                    );
+                }
+            }
+        }
+    }
+
     // ---- render-path snapshot tests (real ratatui buffer) ------------------
 
     use ratatui::Terminal;

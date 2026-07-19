@@ -3,9 +3,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::cli::{
-    PackageCommand, PackagesAddArgs, PackagesCommand, PackagesImportArgs, PackagesPruneArgs,
-};
+use crate::cli::{PackagesAddArgs, PackagesCommand, PackagesImportArgs, PackagesPruneArgs};
 use crate::db::Db;
 
 pub async fn run(cmd: PackagesCommand) -> Result<()> {
@@ -14,23 +12,6 @@ pub async fn run(cmd: PackagesCommand) -> Result<()> {
         PackagesCommand::Add(args) => add(args).await,
         PackagesCommand::Import(args) => import(args).await,
         PackagesCommand::Prune(args) => prune(args).await,
-    }
-}
-
-pub async fn run_singular(cmd: PackageCommand) -> Result<()> {
-    match cmd {
-        PackageCommand::List => list().await,
-        PackageCommand::Add(args) => add(args).await,
-        PackageCommand::Import(args) => {
-            import(PackagesImportArgs {
-                dir: None,
-                package: Some(args.package),
-                id: args.id,
-                path: args.path,
-            })
-            .await
-        }
-        PackageCommand::Prune(args) => prune(args).await,
     }
 }
 
@@ -89,7 +70,8 @@ async fn add(args: PackagesAddArgs) -> Result<()> {
 }
 
 async fn import(args: PackagesImportArgs) -> Result<()> {
-    if args.dir.is_none() && args.package.is_none() {
+    let package = args.package.or(args.package_path);
+    if args.dir.is_none() && package.is_none() {
         bail!("`packages import` needs either `--dir <directory>` or `--package <dir>`");
     }
     if args.dir.is_some() && args.id.is_some() {
@@ -98,10 +80,10 @@ async fn import(args: PackagesImportArgs) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let db = Db::open_default()?;
-    let single_package = args.package.is_some();
+    let single_package = package.is_some();
     let summary = if let Some(dir) = args.dir {
         crate::packages::import_package_directory(&db, &cwd, &dir, args.path)?
-    } else if let Some(package_dir) = args.package {
+    } else if let Some(package_dir) = package {
         crate::packages::import_package(&db, &cwd, &package_dir, args.id.as_deref(), args.path)?
     } else {
         unreachable!("checked above")
@@ -180,7 +162,7 @@ fn print_prune_summary(report: &crate::packages::PackagePruneReport, dry_run: bo
 mod tests {
     use clap::Parser;
 
-    use crate::cli::{Cli, Command, PackageCommand, PackagesCommand};
+    use crate::cli::{Cli, Command, PackagesCommand};
 
     #[test]
     fn package_add_parses_singular_alias_with_git_before_identifier() {
@@ -193,8 +175,8 @@ mod tests {
             "tokio",
         ])
         .unwrap();
-        let Some(Command::Package(PackageCommand::Add(args))) = cli.command else {
-            panic!("expected singular package add command");
+        let Some(Command::Packages(PackagesCommand::Add(args))) = cli.command else {
+            panic!("expected package alias add command");
         };
         assert_eq!(args.identifier, "tokio");
         assert_eq!(
@@ -207,8 +189,8 @@ mod tests {
     #[test]
     fn package_list_parses_singular_alias() {
         let cli = Cli::try_parse_from(["cockpit", "package", "list"]).unwrap();
-        let Some(Command::Package(PackageCommand::List)) = cli.command else {
-            panic!("expected singular package list command");
+        let Some(Command::Packages(PackagesCommand::List)) = cli.command else {
+            panic!("expected package alias list command");
         };
     }
 
@@ -253,8 +235,8 @@ mod tests {
     #[test]
     fn package_prune_parses_singular_alias() {
         let cli = Cli::try_parse_from(["cockpit", "package", "prune"]).unwrap();
-        let Some(Command::Package(PackageCommand::Prune(args))) = cli.command else {
-            panic!("expected package prune command");
+        let Some(Command::Packages(PackagesCommand::Prune(args))) = cli.command else {
+            panic!("expected package alias prune command");
         };
         assert_eq!(args.days, crate::packages::DEFAULT_PRUNE_DAYS);
         assert!(!args.dry_run);
@@ -274,10 +256,10 @@ mod tests {
     fn singular_package_import_parses_single_package_form() {
         let cli =
             Cli::try_parse_from(["cockpit", "package", "import", "deps/tokio", "--path"]).unwrap();
-        let Some(Command::Package(PackageCommand::Import(args))) = cli.command else {
-            panic!("expected singular package import command");
+        let Some(Command::Packages(PackagesCommand::Import(args))) = cli.command else {
+            panic!("expected package alias import command");
         };
-        assert_eq!(args.package, std::path::PathBuf::from("deps/tokio"));
+        assert_eq!(args.package, Some(std::path::PathBuf::from("deps/tokio")));
         assert!(args.path);
     }
 
@@ -288,6 +270,29 @@ mod tests {
             panic!("expected packages import command");
         };
         assert_eq!(args.dir, Some(std::path::PathBuf::from("deps")));
+        assert!(args.package.is_none());
+        assert!(args.package_path.is_none());
+    }
+
+    #[test]
+    fn package_merge_aliases() {
+        for root in ["packages", "package", "dependency", "dependencies"] {
+            let cli = Cli::try_parse_from(["cockpit", root, "list"]).unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Packages(PackagesCommand::List))),
+                "{root} should parse to canonical packages command"
+            );
+        }
+
+        let cli = Cli::try_parse_from(["cockpit", "packages", "import", "--package", "deps/tokio"])
+            .unwrap();
+        let Some(Command::Packages(PackagesCommand::Import(args))) = cli.command else {
+            panic!("expected packages import command");
+        };
+        assert_eq!(
+            args.package_path,
+            Some(std::path::PathBuf::from("deps/tokio"))
+        );
         assert!(args.package.is_none());
     }
 }

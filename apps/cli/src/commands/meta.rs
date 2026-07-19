@@ -17,6 +17,6 @@ pub async fn run(_args: MetaArgs) -> Result<()> {
     anyhow::bail!(
         "external harnesses are invoked in-session via the `harness_list` / `harness_invoke` \
          tools (configure them in /settings → Harnesses); the standalone `cockpit meta` \
-         orchestrator is still on the roadmap (see the design notes §6)"
+         command is reserved for future local orchestration features"
     )
 }

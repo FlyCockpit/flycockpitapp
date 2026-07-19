@@ -2635,6 +2635,20 @@ mod table_tests {
     }
 
     #[test]
+    fn help_copy_no_internal_jargon_in_slash_descriptions() {
+        for command in SLASH_COMMANDS {
+            for needle in ["GOALS", "§", "design notes", "repair catalog", "ralph"] {
+                assert!(
+                    !command.description.contains(needle),
+                    "/{} description contains internal jargon `{needle}`: {}",
+                    command.name,
+                    command.description
+                );
+            }
+        }
+    }
+
+    #[test]
     fn adding_a_slash_command_is_one_row() {
         let mut names = BTreeSet::new();
         for command in SLASH_COMMANDS {

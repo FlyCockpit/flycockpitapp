@@ -74,7 +74,9 @@ The installed binary is `cockpit`.
 
 ## Quick Start
 
-Open the TUI in the current project:
+### Install Cockpit
+
+Install with the release script, Homebrew, Windows PowerShell command, or `cargo install --path apps/cli --locked` from a checkout. Then open the TUI in your project:
 
 ```sh
 cockpit
@@ -86,35 +88,51 @@ Open the TUI for another directory:
 cockpit --project /path/to/project
 ```
 
-Configure a model provider from inside the TUI:
+### First Launch
 
-```text
-/settings -> Providers
-```
+On the first launch for a workspace, Cockpit asks for a workspace trust decision inside the TUI:
 
-Or add a provider from the terminal:
+- `trust` allows project `.cockpit/` config and project approvals.
+- `ignore-config` opens the workspace without project config.
+- `untrusted` records the refusal and exits.
+
+The default daemon mode starts the shared background daemon and shows a one-time notice. You can change that later with `daemon.autostart` in config.
+
+### Provider And Model
+
+If no model provider is configured, the provider wizard opens. Choose a template such as OpenAI, paste an API key when prompted, and let Cockpit store a secret reference instead of writing the raw key to project config.
 
 ```sh
-cockpit provider add
+cockpit provider add openai
 ```
 
-Fetch configured provider model lists:
+After the provider wizard finishes, the model wizard opens so you can choose the default model.
+
+```sh
+cockpit models openai
+```
+
+`cockpit provider` manages model-provider credentials and model catalogs. `cockpit account` signs you in to Flycockpit account services for sync and relay features.
+
+### First Message
+
+Send your first message in the TUI composer, or run a one-shot prompt:
+
+```sh
+cockpit run Summarize this repository
+```
+
+Use newline-delimited JSON output for automation:
+
+```sh
+cockpit run --format json Run the relevant tests and summarize failures
+```
+
+Fetch configured provider model lists when you want to refresh local catalogs:
 
 ```sh
 cockpit fetch-models
 cockpit models
-```
-
-Run a one-shot prompt:
-
-```sh
-cockpit run "Explain this repository's architecture"
-```
-
-Use JSON/NDJSON output for automation:
-
-```sh
-cockpit run --json "Run the relevant tests and summarize failures"
 ```
 
 Message arguments take precedence over stdin; with no message or
@@ -151,34 +169,48 @@ cockpit packages prune --dry-run
 | Command | Purpose |
 | --- | --- |
 | `cockpit` | Launch the TUI in the current directory. |
+| `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
 | `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |
+| `cockpit agent list` | List configured agent definitions. |
+| `cockpit assistant list` | List persistent assistants. |
+| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
+| `cockpit provider list` | List built-in provider templates. |
+| `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
+| `cockpit models [provider]` | List locally configured models. |
+| `cockpit provider-catalog-status [provider]` | Show the last local provider catalog refresh status. |
+| `cockpit fetch-models [provider]` | Refresh model catalogs from configured providers. |
 | `cockpit daemon start --detach` | Start the persistent background daemon. |
 | `cockpit daemon status` | Show daemon status. |
 | `cockpit daemon stop` | Stop the daemon. |
-| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
-| `cockpit account whoami` | Show the active Flycockpit account and instance. |
-| `cockpit account logout` | Sign out of Flycockpit on this machine. |
-| `cockpit sync status` | Show session-log sync and remote-audit upload state. |
-| `cockpit provider list` | List built-in provider templates. |
-| `cockpit provider add [template]` | Add a model provider using the terminal wizard. |
-| `cockpit provider usage` | Show vendor plan limits and quota where supported. |
-| `cockpit fetch-models [provider]` | Refresh model catalogs from configured providers. |
-| `cockpit models [provider]` | List locally configured models. |
-| `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
-| `cockpit packages prune [--days <n>] [--dry-run]` | Delete stale Cockpit-owned package clone directories. |
-| `cockpit config export-policy` | Export portable non-secret provider/model policy JSON. |
-| `cockpit config import-policy <file>` | Import portable provider/model policy JSON. |
+| `cockpit doctor [path]` | Print a read-only diagnostics snapshot. |
 | `cockpit session list` | List recorded sessions. |
-| `cockpit session show <session> [--json]` | Show durable compaction handoffs and their token/tail statistics. |
+| `cockpit schedule list` | List durable scheduler jobs. |
+| `cockpit skill curator status` | Show skill curation and snapshot state. |
+| `cockpit trust status [path]` | Show workspace trust state. |
 | `cockpit export <session>` | Export a redacted session/fork tree debug bundle. |
 | `cockpit import <file>` | Import a session export. |
 | `cockpit stats` | Show token and cost statistics. |
-| `cockpit doctor [path]` | Print a read-only diagnostics snapshot. |
-| `cockpit trust status [path]` | Show workspace trust state. |
+| `cockpit debug paths` | Show resolved global paths for debugging. |
+| `cockpit config export-policy` | Export portable non-secret provider/model policy JSON. |
+| `cockpit meta [message]` | Invoke another local harness from Cockpit. |
+| `cockpit mcp list` | List configured MCP servers. |
+| `cockpit sync status` | Show session-log sync and remote-audit upload state. |
+| `cockpit connect status` | Show outbound relay connector status. |
+| `cockpit pr <number>` | Fetch and check out a GitHub PR, then launch Cockpit in the worktree. |
+| `cockpit packages add <id> --git <url>` | Register dependency package source for the docs agent. |
+| `cockpit kcl import` | Import packages from a local `kcl` registry. |
+| `cockpit init` | Explore the project and write an instructions file. |
+| `cockpit bash-hints list` | List built-in shell post-result hint rules. |
+| `cockpit completion <shell>` | Generate shell completions. |
+| `cockpit account whoami` | Show the active Flycockpit account and instance. |
+| `cockpit account logout` | Sign out of Flycockpit on this machine. |
+| `cockpit provider add [template]` | Add a model provider using the terminal wizard. |
+| `cockpit provider usage` | Show vendor plan limits and quota where supported. |
+| `cockpit packages prune [--days <n>] [--dry-run]` | Delete stale Cockpit-owned package clone directories. |
+| `cockpit config import-policy <file>` | Import portable provider/model policy JSON. |
+| `cockpit session show <session> [--json]` | Show durable compaction handoffs and their token/tail statistics. |
 | `cockpit trust set [path] --mode trust` | Store a workspace trust decision. |
 | `cockpit mcp add ...` | Add an MCP server to layered `.cockpit/mcp.json`. |
-| `cockpit mcp list` | List configured MCP servers. |
-| `cockpit completion <shell>` | Generate shell completions; release installers also ship bash, zsh, and fish completions. Homebrew installs them into its standard completion directories, and the shell installer best-effort copies them under `$XDG_DATA_HOME`/`~/.local/share` without failing the install if a layout is unsupported. PowerShell users can add `cockpit completion powershell` output to their profile. |
 | Man pages | Release artifacts include generated `cockpit.1` and subcommand man pages. Homebrew installs them to `man1`; the shell installer best-effort copies them under `$XDG_DATA_HOME/man/man1` or `~/.local/share/man/man1`. |
 
 ## Configuration

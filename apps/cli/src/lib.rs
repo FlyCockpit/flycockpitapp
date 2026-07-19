@@ -641,7 +641,6 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Connect(args)) => commands::connect::run(args).await,
         Some(Command::Pr(args)) => commands::pr::run(args).await,
         Some(Command::Packages(sub)) => commands::packages::run(sub).await,
-        Some(Command::Package(sub)) => commands::packages::run_singular(sub).await,
         Some(Command::Kcl(sub)) => commands::kcl::run(sub).await,
         Some(Command::Init(args)) => commands::init::run(args, cli.no_sandbox).await,
         Some(Command::BashHints(sub)) => commands::bash_hints::run(sub).await,

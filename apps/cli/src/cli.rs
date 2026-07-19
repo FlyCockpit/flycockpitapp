@@ -1,7 +1,7 @@
 //! Clap definitions for the `cockpit` CLI surface.
 //!
-//! The shape mirrors opencode's CLI (per `the CLI design notes`)
-//! plus the `cockpit`-specific additions: `meta`, `connect`, `--agent-file`.
+//! The shape mirrors opencode's CLI plus the `cockpit`-specific additions:
+//! `meta`, `connect`, and `--agent-file`.
 
 use std::path::PathBuf;
 
@@ -138,10 +138,10 @@ pub enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
-    /// Meta-harness: invoke other harnesses on this device, manage ralph loops.
+    /// Invoke another local harness from Cockpit.
     Meta(MetaArgs),
 
-    /// Manage MCP servers (GOALS §18): add, list, smoke-test.
+    /// Manage MCP servers: add, list, and smoke-test.
     #[command(subcommand)]
     Mcp(McpCommand),
 
@@ -168,12 +168,13 @@ pub enum Command {
     Pr(PrArgs),
 
     /// Manage the package registry the `docs` agent reads from.
-    #[command(subcommand, alias = "dependency", alias = "dependencies")]
+    #[command(
+        subcommand,
+        alias = "package",
+        alias = "dependency",
+        alias = "dependencies"
+    )]
     Packages(PackagesCommand),
-
-    /// Singular alias for package registry commands.
-    #[command(subcommand)]
-    Package(PackageCommand),
 
     /// One-way import of packages from a local `kcl` install's registry.
     #[command(subcommand)]
@@ -477,8 +478,8 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Default)]
     pub format: OutputFormat,
 
-    /// Emit newline-delimited JSON events.
-    #[arg(long)]
+    /// Emit newline-delimited JSON events. Hidden alias for `--format json`.
+    #[arg(long, hide = true)]
     pub json: bool,
 
     /// Include raw daemon envelope details in JSON output.
@@ -823,7 +824,7 @@ pub struct ImportArgs {
     pub file: PathBuf,
 }
 
-/// Scope toggle for `cockpit stats` (GOALS §15a / §15f).
+/// Scope toggle for `cockpit stats`.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum StatsProjectScope {
     /// The project rooted at the current working directory (default).
@@ -832,7 +833,7 @@ pub enum StatsProjectScope {
     All,
 }
 
-/// Range toggle for `cockpit stats` (GOALS §15a / §15f).
+/// Range toggle for `cockpit stats`.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum StatsRangeArg {
     /// The last 7 days (default).
@@ -842,7 +843,7 @@ pub enum StatsRangeArg {
     All,
 }
 
-/// Output format for `cockpit stats` (GOALS §15f).
+/// Output format for `cockpit stats`.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum StatsFormat {
     /// Human-readable aligned columns (default).
@@ -892,12 +893,10 @@ pub enum DebugCommand {
     /// next request.
     Redact,
     /// **cockpit-specific:** dump the full prompt (system + tools + history)
-    /// that would be sent for the next turn, with token counts. Lets users
-    /// audit cockpit's context overhead. See `the design notes` §10.
+    /// that would be sent for the next turn, with token counts.
     Context,
     /// **cockpit-specific:** list recent tool calls that hard-failed
-    /// (and optionally those that fired any recovery). Surfaces
-    /// candidates for the §12 repair catalog.
+    /// (and optionally those that fired any recovery).
     FailedCalls(FailedCallsArgs),
     /// Wait indefinitely (for debugging).
     Wait,
@@ -968,43 +967,28 @@ pub enum PackagesCommand {
 
 #[derive(Debug, clap::Args)]
 pub struct PackagesImportArgs {
+    /// Import one package directory. This is equivalent to `--package <DIR>`.
+    #[arg(
+        value_name = "DIR",
+        conflicts_with = "dir",
+        conflicts_with = "package_path"
+    )]
+    pub package: Option<PathBuf>,
     /// Scan immediate child directories and import each package.
     #[arg(long, value_name = "DIR", conflicts_with = "package")]
     pub dir: Option<PathBuf>,
     /// Import one package directory.
-    #[arg(long, value_name = "DIR", conflicts_with = "dir")]
-    pub package: Option<PathBuf>,
+    #[arg(
+        long = "package",
+        value_name = "DIR",
+        conflicts_with = "dir",
+        conflicts_with = "package"
+    )]
+    pub package_path: Option<PathBuf>,
     /// Override the derived identifier for single-package import.
     #[arg(long, value_name = "IDENTIFIER", conflicts_with = "dir")]
     pub id: Option<String>,
     /// Register exact local paths instead of Git-managed Cockpit clones.
-    #[arg(long)]
-    pub path: bool,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum PackageCommand {
-    /// List every registered package.
-    #[command(alias = "ls")]
-    List,
-    /// Register a package: `--git <url>` clones (shallow by default);
-    /// `--path <dir>` registers a local directory in place.
-    Add(PackagesAddArgs),
-    /// Alias for `cockpit packages import --package <dir>`.
-    Import(PackageImportArgs),
-    /// Delete stale Cockpit-owned Git clone directories; registry rows remain.
-    Prune(PackagesPruneArgs),
-}
-
-#[derive(Debug, clap::Args)]
-pub struct PackageImportArgs {
-    /// Import one package directory.
-    #[arg(value_name = "DIR")]
-    pub package: PathBuf,
-    /// Override the derived identifier.
-    #[arg(long, value_name = "IDENTIFIER")]
-    pub id: Option<String>,
-    /// Register the exact local path instead of a Git-managed Cockpit clone.
     #[arg(long)]
     pub path: bool,
 }
@@ -1037,7 +1021,7 @@ pub struct PackagesPruneArgs {
     pub dry_run: bool,
 }
 
-// ---- MCP (GOALS §18) ----
+// ---- MCP ----
 
 #[derive(Debug, Subcommand)]
 pub enum McpCommand {
@@ -1135,6 +1119,88 @@ pub struct InitArgs {
 mod tests {
     use super::*;
     use clap::{CommandFactory, error::ErrorKind};
+    use std::collections::BTreeSet;
+
+    const README: &str = include_str!("../README.md");
+
+    fn assert_no_internal_jargon(label: &str, text: &str) {
+        for needle in ["GOALS", "§", "design notes", "repair catalog", "ralph"] {
+            assert!(
+                !text.contains(needle),
+                "{label} contains internal jargon `{needle}`:\n{text}"
+            );
+        }
+    }
+
+    fn collect_visible_help(mut command: clap::Command, path: Vec<String>, out: &mut Vec<String>) {
+        out.push(format!(
+            "{}\n{}",
+            path.join(" "),
+            command.render_long_help()
+        ));
+
+        let subcommands: Vec<String> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name().to_string())
+            .collect();
+
+        for name in subcommands {
+            let Some(subcommand) = command.find_subcommand_mut(&name) else {
+                continue;
+            };
+            let mut subpath = path.clone();
+            subpath.push(name);
+            collect_visible_help(subcommand.clone(), subpath, out);
+        }
+    }
+
+    fn markdown_section<'a>(source: &'a str, heading: &str, next_heading: &str) -> &'a str {
+        let start = source
+            .find(heading)
+            .unwrap_or_else(|| panic!("missing {heading}"));
+        let rest = &source[start..];
+        let end = rest
+            .find(next_heading)
+            .unwrap_or_else(|| panic!("missing {next_heading} after {heading}"));
+        &rest[..end]
+    }
+
+    fn common_command_cells() -> BTreeSet<String> {
+        markdown_section(README, "## Common Commands", "## Configuration")
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("| `") {
+                    return None;
+                }
+                let rest = trimmed.trim_start_matches("| `");
+                let end = rest.find('`')?;
+                Some(rest[..end].to_string())
+            })
+            .collect()
+    }
+
+    fn quickstart_shell_commands() -> Vec<Vec<&'static str>> {
+        let quickstart = markdown_section(README, "## Quick Start", "## Common Commands");
+        let mut in_shell = false;
+        let mut commands = Vec::new();
+        for line in quickstart.lines() {
+            let trimmed = line.trim();
+            if trimmed == "```sh" {
+                in_shell = true;
+                continue;
+            }
+            if trimmed == "```" {
+                in_shell = false;
+                continue;
+            }
+            if in_shell && trimmed.starts_with("cockpit") {
+                commands.push(trimmed.split_whitespace().collect());
+            }
+        }
+        commands
+    }
 
     #[test]
     fn bare_cockpit_has_no_project_override_or_subcommand() {
@@ -1346,6 +1412,75 @@ mod tests {
     }
 
     #[test]
+    fn help_copy_no_internal_jargon() {
+        let mut help_pages = Vec::new();
+        collect_visible_help(Cli::command(), vec!["cockpit".to_string()], &mut help_pages);
+        for page in help_pages {
+            assert_no_internal_jargon("clap help", &page);
+        }
+
+        for template in crate::providers::TEMPLATES {
+            if let Some(hint) = template.hint {
+                assert_no_internal_jargon(template.id, hint);
+            }
+        }
+
+        assert_no_internal_jargon("README", README);
+        assert_no_internal_jargon("providers doc", include_str!("../docs/providers.md"));
+        assert_no_internal_jargon("keybindings doc", include_str!("../docs/keybindings.md"));
+    }
+
+    #[test]
+    fn help_copy_readme_covers_top_level_commands() {
+        let cells = common_command_cells();
+        let mut missing = Vec::new();
+        for subcommand in Cli::command()
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            let name = subcommand.get_name();
+            if !cells.iter().any(|cell| {
+                cell == &format!("cockpit {name}") || cell.starts_with(&format!("cockpit {name} "))
+            }) {
+                missing.push(name.to_string());
+            }
+        }
+
+        assert!(missing.is_empty(), "README table missing: {missing:?}");
+    }
+
+    #[test]
+    fn help_copy_quickstart_matches_onboarding_commands() {
+        let quickstart = markdown_section(README, "## Quick Start", "## Common Commands");
+        let ordered = [
+            "Install Cockpit",
+            "cockpit",
+            "workspace trust",
+            "provider wizard",
+            "model wizard",
+            "first message",
+        ];
+        let mut cursor = 0;
+        for needle in ordered {
+            let Some(found) = quickstart[cursor..].find(needle) else {
+                panic!("quickstart missing ordered step `{needle}`:\n{quickstart}");
+            };
+            cursor += found + needle.len();
+        }
+
+        assert!(quickstart.contains("cockpit account"), "{quickstart}");
+        assert!(quickstart.contains("cockpit provider"), "{quickstart}");
+
+        let commands = quickstart_shell_commands();
+        assert!(!commands.is_empty(), "quickstart has cockpit commands");
+        for command in commands {
+            Cli::try_parse_from(command.clone()).unwrap_or_else(|err| {
+                panic!("quickstart command does not parse: {command:?}\n{err}")
+            });
+        }
+    }
+
+    #[test]
     fn run_and_meta_help_return_clap_help() {
         let run = Cli::command()
             .try_get_matches_from(["cockpit", "run", "--help"])
@@ -1526,10 +1661,23 @@ mod tests {
     }
 
     #[test]
-    fn run_json_alias_sets_json_output() {
+    fn run_json_flag_reconciled() {
+        let args = parse_run(&["cockpit", "run", "hi", "--format", "json"]);
+        assert_eq!(args.message, ["hi"]);
+        assert_eq!(args.output_format(), OutputFormat::Json);
+
         let args = parse_run(&["cockpit", "run", "hi", "--json"]);
         assert_eq!(args.message, ["hi"]);
         assert_eq!(args.output_format(), OutputFormat::Json);
+
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--format"), "{help}");
+        assert!(!help.contains("--json"), "{help}");
     }
 
     #[test]

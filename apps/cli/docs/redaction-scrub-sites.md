@@ -1,4 +1,4 @@
-# Redaction Scrub Site Classification
+# Internal: Redaction Scrub Site Classification
 
 This inventory classifies every production `RedactionTable::scrub` boundary and helper entry point. Test-only modules/files are excluded. Keep the machine-checked manifest in sync with the explanations below; `redact::scrub_inventory_tests::scrub_inventory_doc_matches_source_tree` fails when a production scrub file appears, disappears, or is omitted here.
 

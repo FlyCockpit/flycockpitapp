@@ -20,6 +20,7 @@
 //! Database path: `~/.local/share/cockpit/cockpit.db`
 //! (XDG-canonical via [`crate::config::resolve::cockpit_data_dir`]).
 
+pub mod app_flags;
 pub mod assistants;
 pub mod compressed_results;
 pub mod connector;
@@ -80,7 +81,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// is intentionally strict until the first public release: developers move a
 /// stale database aside and let Cockpit recreate it rather than running a
 /// compatibility migration.
-pub const EXPECTED_SCHEMA_VERSION: i64 = 4;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 5;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

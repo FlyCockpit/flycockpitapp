@@ -1,11 +1,11 @@
-use std::io::{IsTerminal, Write, stdin, stdout};
+use std::io::{IsTerminal, stdin, stdout};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::db::workspace_trust::WorkspaceTrustMode;
-use crate::tui::app::App;
+use crate::tui::app::{App, StartupWorkspaceTrust};
 use crate::welcome;
 
 pub async fn run(project: Option<&Path>, no_sandbox: bool) -> Result<()> {
@@ -14,9 +14,9 @@ pub async fn run(project: Option<&Path>, no_sandbox: bool) -> Result<()> {
         return Ok(());
     }
 
-    let db = ensure_tui_workspace_trust(project)?;
+    let (db, trust) = prepare_tui_workspace_trust(project)?;
 
-    let mut app = App::new_with_db(project, no_sandbox, db);
+    let mut app = App::new_with_db_and_workspace_trust(project, no_sandbox, db, trust);
     app.run().await
 }
 
@@ -30,13 +30,16 @@ pub async fn run_with_session(
         return Ok(());
     }
 
-    let db = ensure_tui_workspace_trust(project)?;
+    let (db, trust) = prepare_tui_workspace_trust(project)?;
 
     let mut app = App::new_with_db_and_session(project, no_sandbox, db, session_id);
+    app.set_startup_workspace_trust(trust);
     app.run().await
 }
 
-fn ensure_tui_workspace_trust(project: Option<&Path>) -> Result<crate::db::Db> {
+fn prepare_tui_workspace_trust(
+    project: Option<&Path>,
+) -> Result<(crate::db::Db, StartupWorkspaceTrust)> {
     let opened = match project {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().context("resolving cwd")?,
@@ -45,56 +48,55 @@ fn ensure_tui_workspace_trust(project: Option<&Path>) -> Result<crate::db::Db> {
     let db = crate::db::Db::open_default().context("opening cockpit DB")?;
     if let Some(decision) = db.workspace_trust_by_root(&root.root)? {
         crate::config::trust::apply_trusted_workspace(root, decision.mode)?;
-        return Ok(db);
+        return Ok((db, StartupWorkspaceTrust::Decided));
     }
 
-    let mode = prompt_workspace_trust_choice(&root.root)?;
-    db.set_workspace_trust(&root.root, mode)?;
-    crate::config::trust::apply_trusted_workspace(root, mode)?;
-    Ok(db)
-}
-
-fn prompt_workspace_trust_choice(root: &Path) -> Result<WorkspaceTrustMode> {
-    let mut out = stdout();
-    writeln!(
-        out,
-        "Cockpit has not seen this workspace before:\n  {}\n\nChoose workspace trust:\n  1) trust - open and honor project .cockpit config\n  2) ignore-config - open but ignore project .cockpit config and approvals\n  3) untrusted - refuse to open\n\nSelection [1/2/3]: ",
-        root.display()
-    )?;
-    out.flush()?;
-    let mut line = String::new();
-    stdin().read_line(&mut line)?;
-    parse_trust_choice(&line).with_context(|| {
-        format!(
-            "run `cockpit trust set {} --mode trust|ignore-config|untrusted`",
-            root.display()
-        )
-    })
-}
-
-fn parse_trust_choice(raw: &str) -> Result<WorkspaceTrustMode> {
-    match raw.trim() {
-        "1" | "trust" => Ok(WorkspaceTrustMode::Trust),
-        "2" | "ignore-config" | "ignore" => Ok(WorkspaceTrustMode::IgnoreConfig),
-        "3" | "untrusted" => Ok(WorkspaceTrustMode::Untrusted),
-        other => anyhow::bail!("invalid workspace trust selection `{other}`"),
-    }
+    crate::config::trust::set_runtime_policy(root.clone(), WorkspaceTrustMode::IgnoreConfig);
+    Ok((db, StartupWorkspaceTrust::Pending(root)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::dirs::test_support::IsolatedCockpitHome;
+    use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+
+    fn write_provider_config(cwd: &Path) {
+        let cockpit = cwd.join(".cockpit");
+        std::fs::create_dir_all(&cockpit).unwrap();
+        let mut cfg = ProvidersConfig::default();
+        let mut provider = ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            ..Default::default()
+        };
+        provider.models.push(ModelEntry {
+            id: "m".to_string(),
+            ..Default::default()
+        });
+        cfg.providers.insert("p".to_string(), provider);
+        let mut doc = ConfigDoc::load(&cockpit.join("config.json")).unwrap();
+        doc.write(&cfg).unwrap();
+    }
 
     #[test]
-    fn trust_prompt_choices_map_to_modes() {
-        assert_eq!(parse_trust_choice("1").unwrap(), WorkspaceTrustMode::Trust);
-        assert_eq!(
-            parse_trust_choice("ignore-config").unwrap(),
-            WorkspaceTrustMode::IgnoreConfig
-        );
-        assert_eq!(
-            parse_trust_choice("untrusted").unwrap(),
-            WorkspaceTrustMode::Untrusted
-        );
+    fn trust_gate_excludes_project_config_until_decided() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        write_provider_config(tmp.path());
+
+        let (db, trust) = prepare_tui_workspace_trust(Some(tmp.path())).unwrap();
+        assert!(matches!(trust, StartupWorkspaceTrust::Pending(_)));
+        let ignored = ConfigDoc::load_effective(tmp.path());
+        assert!(!ignored.providers.contains_key("p"));
+
+        let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();
+        db.set_workspace_trust(&root.root, WorkspaceTrustMode::Trust)
+            .unwrap();
+        crate::config::trust::apply_trusted_workspace(root, WorkspaceTrustMode::Trust).unwrap();
+        let trusted = ConfigDoc::load_effective(tmp.path());
+        assert!(trusted.providers.contains_key("p"));
+
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 }

@@ -80,6 +80,11 @@ pub const DIALOG_HEIGHT: u16 = 20;
 
 pub enum Dialog {
     None,
+    WorkspaceTrust {
+        root: crate::config::trust::TrustRoot,
+        cursor: usize,
+        chosen: Option<crate::db::workspace_trust::WorkspaceTrustMode>,
+    },
     PickConfig {
         dirs: Vec<ConfigDir>,
         cursor: usize,
@@ -114,6 +119,7 @@ pub enum Dialog {
         cwd: PathBuf,
     },
     SetupWizard(Box<SetupWizardDialog>),
+    FirstRunComplete,
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
@@ -136,6 +142,28 @@ pub struct SettingsDialog {
     /// exact boxed page object, including cursor and scroll state.
     stack: Vec<PageBox>,
     cx: SettingsCx,
+}
+
+fn setup_wizard_dialog(
+    cwd: &std::path::Path,
+    descriptor: crate::wizard::WizardDescriptor,
+    status: Option<String>,
+) -> Result<Dialog, String> {
+    let run = crate::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
+    let mut cursor = 0;
+    let mut text = TextField::new("");
+    let mut multi = std::collections::BTreeSet::new();
+    let mut multi_touched = false;
+    sync_setup_wizard_inputs(&run, &mut cursor, &mut text, &mut multi, &mut multi_touched);
+    Ok(Dialog::SetupWizard(Box::new(SetupWizardDialog {
+        run,
+        cursor,
+        text,
+        multi,
+        multi_touched,
+        cwd: cwd.to_path_buf(),
+        status,
+    })))
 }
 
 impl Deref for SettingsDialog {
@@ -489,12 +517,18 @@ impl Dialog {
         !matches!(self, Dialog::None)
     }
 
+    pub fn is_workspace_trust(&self) -> bool {
+        matches!(self, Dialog::WorkspaceTrust { .. })
+    }
+
     #[cfg(test)]
     pub(crate) fn test_page_name(&self) -> Option<&'static str> {
         match self {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
+            Dialog::WorkspaceTrust { .. } => Some("workspace_trust"),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
             Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
+            Dialog::FirstRunComplete => Some("first_run_complete"),
             _ => None,
         }
     }
@@ -510,6 +544,51 @@ impl Dialog {
             ProvidersPage::Edit(_) => "edit",
             _ => "other",
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_provider_is_add(&self) -> bool {
+        let Dialog::Settings(settings) = self else {
+            return false;
+        };
+        matches!(
+            settings.page.as_any().downcast_ref::<ProvidersPage>(),
+            Some(ProvidersPage::Add(_))
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mark_provider_add_done(&mut self, provider_id: &str) {
+        let Dialog::Settings(settings) = self else {
+            panic!("expected settings dialog");
+        };
+        let page = settings
+            .page
+            .downcast_mut::<ProvidersPage>()
+            .expect("expected providers page");
+        let ProvidersPage::Add(add) = page else {
+            panic!("expected provider add page");
+        };
+        add.saved_provider_id = Some(provider_id.to_string());
+        add.run
+            .return_to("done")
+            .expect("provider done step exists");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_setup_answer(&self, step_id: &str) -> Option<crate::wizard::WizardAnswer> {
+        let Dialog::SetupWizard(wizard) = self else {
+            return None;
+        };
+        wizard.run.answer(step_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_setup_prefill(&self) -> Option<crate::wizard::WizardAnswer> {
+        let Dialog::SetupWizard(wizard) = self else {
+            return None;
+        };
+        wizard.run.prefill()
     }
 
     pub fn open(cwd: &std::path::Path) -> Self {
@@ -529,6 +608,26 @@ impl Dialog {
                 status: None,
             }
         }
+    }
+
+    pub fn open_workspace_trust(root: crate::config::trust::TrustRoot) -> Self {
+        Dialog::WorkspaceTrust {
+            root,
+            cursor: 0,
+            chosen: None,
+        }
+    }
+
+    pub fn take_workspace_trust_choice(
+        &mut self,
+    ) -> Option<(
+        crate::config::trust::TrustRoot,
+        crate::db::workspace_trust::WorkspaceTrustMode,
+    )> {
+        let Dialog::WorkspaceTrust { root, chosen, .. } = self else {
+            return None;
+        };
+        chosen.take().map(|mode| (root.clone(), mode))
     }
 
     /// Open directly into the MCP page (`/mcp settings`, GOALS §18a).
@@ -604,13 +703,19 @@ impl Dialog {
     /// list. Used when the user has no providers configured at TUI
     /// launch.
     pub fn open_providers_add(cwd: &std::path::Path) -> Self {
+        Self::open_providers_add_with_status(cwd, None)
+    }
+
+    pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
         let mut d = Self::open(cwd);
         if let Dialog::PickConfig { dirs, .. } = &d
             && let Some(dir) = dirs.first()
         {
             let path = dir.path.join(CONFIG_FILE);
             let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
-            s.page = providers_page(ProvidersPage::Add(AddState::new()));
+            let mut add = AddState::new();
+            add.error = status;
+            s.page = providers_page(ProvidersPage::Add(add));
             d = Dialog::Settings(Box::new(s));
         }
         d
@@ -630,30 +735,47 @@ impl Dialog {
             crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID => {
                 let descriptor = crate::commands::setup::descriptor_for_cwd(wizard_id, cwd)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
-                let run = crate::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
-                let mut cursor = 0;
-                let mut text = TextField::new("");
-                let mut multi = std::collections::BTreeSet::new();
-                let mut multi_touched = false;
-                sync_setup_wizard_inputs(
-                    &run,
-                    &mut cursor,
-                    &mut text,
-                    &mut multi,
-                    &mut multi_touched,
-                );
-                Ok(Dialog::SetupWizard(Box::new(SetupWizardDialog {
-                    run,
-                    cursor,
-                    text,
-                    multi,
-                    multi_touched,
-                    cwd: cwd.to_path_buf(),
-                    status: None,
-                })))
+                setup_wizard_dialog(cwd, descriptor, None)
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
+    }
+
+    pub fn open_model_setup_preselected(
+        cwd: &std::path::Path,
+        provider_id: &str,
+        model_id: &str,
+        status: Option<String>,
+    ) -> Result<Self, String> {
+        let descriptor =
+            crate::commands::setup::model_descriptor_for_cwd(cwd, Some((provider_id, model_id)));
+        setup_wizard_dialog(cwd, descriptor, status)
+    }
+
+    pub fn open_first_run_complete() -> Self {
+        Dialog::FirstRunComplete
+    }
+
+    pub fn take_completed_provider_id(&mut self) -> Option<String> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let page = settings.page.downcast_mut::<ProvidersPage>()?;
+        let ProvidersPage::Add(add) = page else {
+            return None;
+        };
+        if add.run.is_complete() || add.is_step("done") {
+            return add.saved_provider_id.clone();
+        }
+        None
+    }
+
+    pub fn setup_wizard_is_complete(&self, wizard_id: &str) -> bool {
+        matches!(
+            self,
+            Dialog::SetupWizard(wizard)
+                if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
+        )
     }
 
     /// Open directly on one configured provider. OAuth-expired failures for a
@@ -789,6 +911,18 @@ impl Dialog {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
+            Dialog::FirstRunComplete => {
+                matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
+            }
+            Dialog::WorkspaceTrust { cursor, chosen, .. } => {
+                match workspace_trust_key_action(key, cursor) {
+                    WorkspaceTrustAction::Stay => false,
+                    WorkspaceTrustAction::Choose(mode) => {
+                        *chosen = Some(mode);
+                        true
+                    }
+                }
+            }
             Dialog::PickConfig {
                 dirs,
                 cursor,
@@ -949,6 +1083,9 @@ impl Dialog {
     ) {
         match self {
             Dialog::None => {}
+            Dialog::WorkspaceTrust { root, cursor, .. } => {
+                render_workspace_trust(frame, area, root, *cursor)
+            }
             Dialog::PickConfig {
                 dirs,
                 cursor,
@@ -992,6 +1129,7 @@ impl Dialog {
                 wizards, cursor, ..
             } => render_wizard_menu(frame, area, wizards, *cursor),
             Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
+            Dialog::FirstRunComplete => render_first_run_complete(frame, area),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -2137,6 +2275,39 @@ fn setup_wizard_cursor_for_current_prefill(run: &crate::wizard::WizardRun) -> us
         .unwrap_or(0)
 }
 
+enum WorkspaceTrustAction {
+    Stay,
+    Choose(crate::db::workspace_trust::WorkspaceTrustMode),
+}
+
+fn workspace_trust_key_action(key: KeyEvent, cursor: &mut usize) -> WorkspaceTrustAction {
+    use crate::db::workspace_trust::WorkspaceTrustMode;
+    const LEN: usize = 3;
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+            *cursor = crate::tui::nav::wrap_prev(*cursor, LEN);
+            WorkspaceTrustAction::Stay
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            *cursor = crate::tui::nav::wrap_next(*cursor, LEN);
+            WorkspaceTrustAction::Stay
+        }
+        KeyCode::Char('1') => WorkspaceTrustAction::Choose(WorkspaceTrustMode::Trust),
+        KeyCode::Char('2') => WorkspaceTrustAction::Choose(WorkspaceTrustMode::IgnoreConfig),
+        KeyCode::Char('3') | KeyCode::Esc => {
+            WorkspaceTrustAction::Choose(WorkspaceTrustMode::Untrusted)
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            WorkspaceTrustAction::Choose(match *cursor {
+                0 => WorkspaceTrustMode::Trust,
+                1 => WorkspaceTrustMode::IgnoreConfig,
+                _ => WorkspaceTrustMode::Untrusted,
+            })
+        }
+        _ => WorkspaceTrustAction::Stay,
+    }
+}
+
 enum ListAction {
     Stay,
     Close,
@@ -2159,6 +2330,66 @@ fn list_key_action(key: KeyEvent, cursor: &mut usize, len: usize) -> ListAction 
         }
         _ => ListAction::Stay,
     }
+}
+
+fn render_workspace_trust(
+    frame: &mut Frame,
+    area: Rect,
+    root: &crate::config::trust::TrustRoot,
+    cursor: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Workspace trust ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let selected = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let options = [
+        (
+            "trust",
+            "open and honor project .cockpit config",
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        ),
+        (
+            "ignore-config",
+            "open but ignore project .cockpit config and approvals",
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        ),
+        (
+            "untrusted",
+            "refuse to open",
+            crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+        ),
+    ];
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Cockpit has not seen this workspace before:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw(format!("  {}", root.root.display()))),
+        Line::default(),
+        Line::from(Span::styled("Choose workspace trust:", muted)),
+    ];
+    for (index, (label, description, _)) in options.iter().enumerate() {
+        let marker = if index == cursor { "▸ " } else { "  " };
+        let style = if index == cursor {
+            selected
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(format!("{}. {label}", index + 1), style),
+            Span::raw(" - "),
+            Span::styled((*description).to_string(), muted),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+    frame.render_widget(help_line("↑/↓  enter: choose  esc: untrusted"), layout[1]);
 }
 
 fn render_picker(
@@ -2380,6 +2611,24 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         help_line("↑/↓  space: toggle  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
     );
+}
+
+fn render_first_run_complete(frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Setup complete ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let lines = vec![
+        Line::from("Cockpit is ready."),
+        Line::default(),
+        Line::from("Next: run /setup security to choose project trust and approval defaults."),
+        Line::from("Use /help any time to see available commands."),
+        Line::default(),
+        Line::from(Span::styled("Press Enter to start.", muted)),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {

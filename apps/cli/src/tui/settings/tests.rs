@@ -567,6 +567,22 @@ fn render_settings_rows(d: &SettingsDialog, width: u16, height: u16) -> Vec<Stri
         .collect()
 }
 
+fn render_dialog_rows(d: &Dialog, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
+
 fn render_settings_links(
     d: &SettingsDialog,
     width: u16,
@@ -1831,6 +1847,15 @@ fn no_providers_auto_opens_wizard() {
         s.test_page(),
         TestPageRef::Providers(ProvidersPage::Add(_))
     ));
+}
+
+#[test]
+fn first_run_completion_copy_points_to_security_and_help() {
+    let d = Dialog::open_first_run_complete();
+    let rendered = render_dialog_rows(&d, 96, 12).join("\n");
+
+    assert!(rendered.contains("/setup security"), "{rendered}");
+    assert!(rendered.contains("/help"), "{rendered}");
 }
 
 #[test]

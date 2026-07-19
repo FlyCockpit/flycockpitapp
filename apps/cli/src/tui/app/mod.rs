@@ -135,6 +135,8 @@ pub(super) struct FooterHitArea {
 mod auth_failure_recovery_tests;
 #[cfg(test)]
 mod control_request_tests;
+#[cfg(test)]
+mod first_run_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
@@ -256,6 +258,27 @@ pub(crate) enum ControlApplied {
     PinContext { text: String },
 }
 
+#[derive(Debug, Clone)]
+pub enum StartupWorkspaceTrust {
+    Decided,
+    Pending(crate::config::trust::TrustRoot),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRunFlow {
+    None,
+    AwaitProvider,
+    AwaitModel,
+}
+
+struct StartupDaemonState {
+    prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
+    connected: bool,
+    socket: Option<std::path::PathBuf>,
+    daemonless: bool,
+    notice: Option<String>,
+}
+
 const FOOTER_MODE_ORDER: [crate::config::extended::LlmMode; 3] = [
     crate::config::extended::LlmMode::Defensive,
     crate::config::extended::LlmMode::Normal,
@@ -299,6 +322,172 @@ fn persist_trusted_only_default(cwd: &Path, enabled: bool) -> anyhow::Result<()>
     cfg.trusted_only = enabled;
     doc.write(&cfg)?;
     Ok(())
+}
+
+const DAEMON_AUTOSTART_NOTICE_FLAG: &str = "daemon-autostart-notice-v1";
+
+fn startup_daemon_state(
+    autostart: crate::config::extended::DaemonAutostart,
+    db: Option<&crate::db::Db>,
+) -> StartupDaemonState {
+    let notice_seen = db
+        .and_then(|db| db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).ok())
+        .unwrap_or(false);
+    match crate::daemon::DaemonPaths::resolve() {
+        Ok(paths) if paths.ephemeral => match crate::daemon::probe_blocking(&paths) {
+            crate::daemon::DaemonStatus::Running => StartupDaemonState {
+                prompt: None,
+                connected: true,
+                socket: Some(paths.socket.clone()),
+                daemonless: false,
+                notice: None,
+            },
+            status => daemon_not_running_state(status, paths, autostart, db, notice_seen),
+        },
+        Ok(_) => {
+            let probe = crate::daemon::discover_blocking();
+            match probe.status {
+                crate::daemon::DaemonStatus::Running => StartupDaemonState {
+                    prompt: None,
+                    connected: true,
+                    socket: Some(probe.paths.socket.clone()),
+                    daemonless: false,
+                    notice: None,
+                },
+                status => daemon_not_running_state(status, probe.paths, autostart, db, notice_seen),
+            }
+        }
+        Err(_) => StartupDaemonState {
+            prompt: None,
+            connected: false,
+            socket: None,
+            daemonless: false,
+            notice: None,
+        },
+    }
+}
+
+fn daemon_not_running_state(
+    status: crate::daemon::DaemonStatus,
+    paths: crate::daemon::DaemonPaths,
+    autostart: crate::config::extended::DaemonAutostart,
+    db: Option<&crate::db::Db>,
+    notice_seen: bool,
+) -> StartupDaemonState {
+    daemon_not_running_state_with_spawn(status, paths, autostart, db, notice_seen, || {
+        crate::daemon::spawn_detached(false)
+    })
+}
+
+fn daemon_not_running_state_with_spawn(
+    status: crate::daemon::DaemonStatus,
+    paths: crate::daemon::DaemonPaths,
+    autostart: crate::config::extended::DaemonAutostart,
+    db: Option<&crate::db::Db>,
+    notice_seen: bool,
+    spawn_shared: impl FnOnce() -> anyhow::Result<u32>,
+) -> StartupDaemonState {
+    match autostart {
+        crate::config::extended::DaemonAutostart::Ask => StartupDaemonState {
+            prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
+                status, paths,
+            )),
+            connected: false,
+            socket: None,
+            daemonless: false,
+            notice: None,
+        },
+        crate::config::extended::DaemonAutostart::Private => StartupDaemonState {
+            prompt: None,
+            connected: true,
+            socket: None,
+            daemonless: true,
+            notice: daemon_autostart_notice(
+                db,
+                notice_seen,
+                "started a private cockpit daemon for this window only",
+            ),
+        },
+        crate::config::extended::DaemonAutostart::Shared => match spawn_shared() {
+            Ok(pid) => StartupDaemonState {
+                prompt: None,
+                connected: true,
+                socket: Some(paths.socket.clone()),
+                daemonless: false,
+                notice: daemon_autostart_notice(
+                    db,
+                    notice_seen,
+                    &format!(
+                        "started the cockpit daemon (pid {pid}) — persists across windows; `cockpit daemon stop` to stop"
+                    ),
+                ),
+            },
+            Err(error) => {
+                let mut prompt = crate::tui::daemon_prompt::DaemonPromptDialog::new(status, paths);
+                prompt.set_error(format!("failed to spawn daemon: {error}"));
+                StartupDaemonState {
+                    prompt: Some(prompt),
+                    connected: false,
+                    socket: None,
+                    daemonless: false,
+                    notice: None,
+                }
+            }
+        },
+    }
+}
+
+fn daemon_autostart_notice(
+    db: Option<&crate::db::Db>,
+    notice_seen: bool,
+    text: &str,
+) -> Option<String> {
+    if notice_seen {
+        return None;
+    }
+    let db = db?;
+    let _ = db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG);
+    Some(text.to_string())
+}
+
+impl App {
+    pub(super) fn apply_workspace_trust_choice(
+        &mut self,
+        root: crate::config::trust::TrustRoot,
+        mode: crate::db::workspace_trust::WorkspaceTrustMode,
+    ) -> bool {
+        let Some(db) = self.startup_background.db.clone() else {
+            self.show_toast("workspace trust could not be saved", ToastKind::Error);
+            return false;
+        };
+        if let Err(error) = db.set_workspace_trust(&root.root, mode) {
+            self.show_toast(
+                format!("workspace trust could not be saved: {error}"),
+                ToastKind::Error,
+            );
+            return false;
+        }
+        if mode == crate::db::workspace_trust::WorkspaceTrustMode::Untrusted {
+            self.push_plain(format!(
+                "workspace {} is untrusted and cannot be opened",
+                root.root.display()
+            ));
+            return true;
+        }
+        if let Err(error) = crate::config::trust::apply_trusted_workspace(root, mode) {
+            self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
+            return false;
+        }
+        if mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust {
+            self.reload_launch_info();
+            self.reload_tui_config();
+        }
+        self.dialog = Dialog::None;
+        if self.daemon_prompt.is_none() {
+            self.maybe_open_add_provider_wizard();
+        }
+        false
+    }
 }
 
 fn new_external_editor_tempfile() -> std::io::Result<tempfile::NamedTempFile> {
@@ -1738,6 +1927,7 @@ pub struct App {
     /// remote-access chrome slot while connector access is enabled.
     pub(super) connector_disclosure: Option<crate::db::connector::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
+    first_run_flow: FirstRunFlow,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -2265,11 +2455,26 @@ pub(crate) fn event_loop_draw_call_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(project, no_sandbox, None)
+        Self::new_inner(project, no_sandbox, None, StartupWorkspaceTrust::Decided)
     }
 
+    #[cfg(test)]
     pub fn new_with_db(project: Option<&Path>, no_sandbox: bool, db: crate::db::Db) -> Self {
-        Self::new_inner(project, no_sandbox, Some(db))
+        Self::new_inner(
+            project,
+            no_sandbox,
+            Some(db),
+            StartupWorkspaceTrust::Decided,
+        )
+    }
+
+    pub fn new_with_db_and_workspace_trust(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        db: crate::db::Db,
+        trust: StartupWorkspaceTrust,
+    ) -> Self {
+        Self::new_inner(project, no_sandbox, Some(db), trust)
     }
 
     pub fn new_with_db_and_session(
@@ -2278,15 +2483,27 @@ impl App {
         db: crate::db::Db,
         session_id: uuid::Uuid,
     ) -> Self {
-        let mut app = Self::new_inner(project, no_sandbox, Some(db));
+        let mut app = Self::new_inner(
+            project,
+            no_sandbox,
+            Some(db),
+            StartupWorkspaceTrust::Decided,
+        );
         app.launch.session_id = Some(session_id);
         app
+    }
+
+    pub fn set_startup_workspace_trust(&mut self, trust: StartupWorkspaceTrust) {
+        if let StartupWorkspaceTrust::Pending(root) = trust {
+            self.dialog = Dialog::open_workspace_trust(root);
+        }
     }
 
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
         startup_db: Option<crate::db::Db>,
+        startup_trust: StartupWorkspaceTrust,
     ) -> Self {
         let mut timer = crate::startup::PhaseTimer::start("App::new");
         // Skip the synchronous `git status` here — it can take seconds in a
@@ -2341,40 +2558,10 @@ impl App {
 
         let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
 
-        // Probe the daemon synchronously up front so the prompt shows
-        // immediately when we open the TUI rather than after a tick.
-        let (daemon_prompt, daemon_connected, startup_daemon_socket) =
-            match crate::daemon::DaemonPaths::resolve() {
-                Ok(paths) if paths.ephemeral => match crate::daemon::probe_blocking(&paths) {
-                    crate::daemon::DaemonStatus::Running => {
-                        (None, true, Some(paths.socket.clone()))
-                    }
-                    status => (
-                        Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
-                            status, paths,
-                        )),
-                        false,
-                        None,
-                    ),
-                },
-                Ok(_) => {
-                    let probe = crate::daemon::discover_blocking();
-                    match probe.status {
-                        crate::daemon::DaemonStatus::Running => {
-                            (None, true, Some(probe.paths.socket.clone()))
-                        }
-                        status => (
-                            Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
-                                status,
-                                probe.paths,
-                            )),
-                            false,
-                            None,
-                        ),
-                    }
-                }
-                Err(_) => (None, false, None),
-            };
+        // Probe the daemon synchronously up front so startup can either
+        // autostart it per config or show the ask-mode/failure prompt on the
+        // first frame.
+        let daemon_state = startup_daemon_state(extended.daemon.autostart, startup_db.as_ref());
         timer.phase("daemon_probe");
         let org_sync_disclosure = None;
         let connector_disclosure = None;
@@ -2420,14 +2607,14 @@ impl App {
             repo_status,
             dialog: Dialog::None,
             overlay: Overlay::None,
-            daemon_prompt,
+            daemon_prompt: daemon_state.prompt,
             question_dialog: None,
             question_dialog_btw: false,
             pending_btw_interrupt: None,
             composer_active_since_dialog: true,
             pending_local_choice: None,
-            daemon_connected,
-            daemonless: false,
+            daemon_connected: daemon_state.connected,
+            daemonless: daemon_state.daemonless,
             daemon_guard: None,
             daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
@@ -2436,7 +2623,7 @@ impl App {
             async_actions: AsyncActionRunner::default(),
             completed_async_actions: Vec::new(),
             startup_background: StartupBackground {
-                daemon_socket: startup_daemon_socket,
+                daemon_socket: daemon_state.socket,
                 db: startup_db,
                 started: false,
             },
@@ -2566,6 +2753,11 @@ impl App {
             org_sync_disclosure,
             connector_disclosure,
             has_no_providers_at_startup,
+            first_run_flow: if has_no_providers_at_startup {
+                FirstRunFlow::AwaitProvider
+            } else {
+                FirstRunFlow::None
+            },
             side_conversation: None,
             daemon_draining: false,
             predict_setting,
@@ -2585,13 +2777,22 @@ impl App {
             keys_overlay: None,
             keyboard_enhancement_active: false,
         };
+        if let Some(notice) = daemon_state.notice {
+            app.show_toast(notice, ToastKind::Info);
+        }
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
         // providers are configured. The prompt-resolution branches
         // call this same helper after the user dismisses the daemon
         // prompt.
-        if app.daemon_prompt.is_none() {
-            app.maybe_open_add_provider_wizard();
+        match startup_trust {
+            StartupWorkspaceTrust::Pending(root) => {
+                app.dialog = Dialog::open_workspace_trust(root);
+            }
+            StartupWorkspaceTrust::Decided if app.daemon_prompt.is_none() => {
+                app.maybe_open_add_provider_wizard();
+            }
+            StartupWorkspaceTrust::Decided => {}
         }
         app
     }
@@ -2832,6 +3033,7 @@ impl App {
         changed |= self.tick_toast();
         changed |= self.tick_ctrl_c_window();
         self.dialog.tick();
+        changed |= self.service_first_run_flow();
         // Auto-close the embedded pane when its child has exited
         // (GOALS §1i — e.g. `:q`).
         self.service_pane();

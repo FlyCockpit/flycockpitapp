@@ -10,7 +10,7 @@ use crate::tui::composer::{FindSpec, Operator, Register, VimMode};
 use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
-use super::{App, ControlApplied, LocalChoiceSelection, Overlay, TranscriptFind};
+use super::{App, ControlApplied, FirstRunFlow, LocalChoiceSelection, Overlay, TranscriptFind};
 use crate::daemon::proto::{self, Request, Response};
 use crate::engine::message::{QueueItemStatus, QueuedUserMessage};
 use crate::tui::settings::Dialog;
@@ -309,6 +309,14 @@ impl App {
         //   1. let inner handle the key
         //   2. if it requested close: drain its result, close it
         //   3. unconditionally `return false`
+        if self.dialog.is_workspace_trust() {
+            let should_close = self.dialog.handle_key(key);
+            if should_close && let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
+                return self.apply_workspace_trust_choice(root, mode);
+            }
+            return false;
+        }
+
         if let Some(prompt) = self.daemon_prompt.as_mut() {
             let should_close = prompt.handle_key(key);
             if !should_close {
@@ -1985,6 +1993,10 @@ impl App {
         if submitted.is_empty() && self.paste_registry.is_empty() {
             return false;
         }
+        if let Err(reason) = self.check_send_model_ready() {
+            self.open_missing_model_setup(reason);
+            return false;
+        }
 
         // Build the paste-side wire from the live (untrimmed) buffer +
         // registry: text blocks inline their full content; image blocks
@@ -2152,6 +2164,75 @@ impl App {
             self.composer.set_vim_mode(VimMode::Insert);
         }
         false
+    }
+
+    fn check_send_model_ready(&self) -> Result<(), MissingModelReason> {
+        let cfg = crate::secret_ref::load_effective(&self.launch.cwd);
+        if cfg.providers.is_empty() {
+            return Err(MissingModelReason::NoProviders);
+        }
+        let Some((provider, _model)) = self.launch.active_model.as_ref() else {
+            return Err(MissingModelReason::NoActiveModel);
+        };
+        if !cfg.providers.contains_key(provider) {
+            return Err(MissingModelReason::MissingProvider(provider.clone()));
+        }
+        Ok(())
+    }
+
+    fn open_missing_model_setup(&mut self, reason: MissingModelReason) {
+        let status = reason.status();
+        let cfg = crate::secret_ref::load_effective(&self.launch.cwd);
+        if cfg.providers.is_empty() {
+            self.first_run_flow = FirstRunFlow::AwaitProvider;
+            self.dialog = Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+            return;
+        }
+        let preselect = cfg.providers.iter().find_map(|(provider_id, entry)| {
+            entry
+                .models
+                .first()
+                .map(|model| (provider_id.as_str(), model.id.as_str()))
+        });
+        let dialog = match preselect {
+            Some((provider_id, model_id)) => Dialog::open_model_setup_preselected(
+                &self.launch.cwd,
+                provider_id,
+                model_id,
+                Some(status),
+            ),
+            None => Dialog::open_setup_wizard(&self.launch.cwd, crate::wizard::MODEL_WIZARD_ID),
+        };
+        match dialog {
+            Ok(dialog) => {
+                self.dialog = dialog;
+            }
+            Err(error) => self.show_toast(error, super::ToastKind::Error),
+        }
+    }
+}
+
+enum MissingModelReason {
+    NoProviders,
+    NoActiveModel,
+    MissingProvider(String),
+}
+
+impl MissingModelReason {
+    fn status(&self) -> String {
+        match self {
+            MissingModelReason::NoProviders => {
+                "No provider is configured yet. Add one before sending; your message is still in the composer."
+                    .to_string()
+            }
+            MissingModelReason::NoActiveModel => {
+                "No model is selected yet. Choose one before sending; your message is still in the composer."
+                    .to_string()
+            }
+            MissingModelReason::MissingProvider(provider) => format!(
+                "The selected provider `{provider}` is not configured. Check COCKPIT_PROVIDER/COCKPIT_MODEL or choose a model before sending; your message is still in the composer."
+            ),
+        }
     }
 }
 

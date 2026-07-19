@@ -13,7 +13,56 @@ impl App {
         if !self.has_no_providers_at_startup {
             return;
         }
+        self.first_run_flow = FirstRunFlow::AwaitProvider;
         self.dialog = crate::tui::settings::Dialog::open_providers_add(&self.launch.cwd);
+    }
+
+    pub(super) fn service_first_run_flow(&mut self) -> bool {
+        match self.first_run_flow {
+            FirstRunFlow::None => false,
+            FirstRunFlow::AwaitProvider => {
+                let Some(provider_id) = self.dialog.take_completed_provider_id() else {
+                    return false;
+                };
+                self.reload_launch_info();
+                let model_id = first_provider_model_id(&self.launch.cwd, &provider_id);
+                let dialog = match model_id.as_deref() {
+                    Some(model_id) => crate::tui::settings::Dialog::open_model_setup_preselected(
+                        &self.launch.cwd,
+                        &provider_id,
+                        model_id,
+                        Some("Choose the model Cockpit should use by default.".to_string()),
+                    ),
+                    None => crate::tui::settings::Dialog::open_setup_wizard(
+                        &self.launch.cwd,
+                        crate::wizard::MODEL_WIZARD_ID,
+                    ),
+                };
+                match dialog {
+                    Ok(dialog) => {
+                        self.dialog = dialog;
+                        self.first_run_flow = FirstRunFlow::AwaitModel;
+                    }
+                    Err(error) => {
+                        self.first_run_flow = FirstRunFlow::None;
+                        self.show_toast(error, super::ToastKind::Error);
+                    }
+                }
+                true
+            }
+            FirstRunFlow::AwaitModel => {
+                if !self
+                    .dialog
+                    .setup_wizard_is_complete(crate::wizard::MODEL_WIZARD_ID)
+                {
+                    return false;
+                }
+                self.reload_launch_info();
+                self.dialog = crate::tui::settings::Dialog::open_first_run_complete();
+                self.first_run_flow = FirstRunFlow::None;
+                true
+            }
+        }
     }
 
     pub(super) fn apply_startup_guidance_estimate(
@@ -170,4 +219,13 @@ impl App {
         let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
         sandbox_notice_wrapped_rows(&text, term_w)
     }
+}
+
+fn first_provider_model_id(cwd: &Path, provider_id: &str) -> Option<String> {
+    crate::secret_ref::load_effective(cwd)
+        .providers
+        .get(provider_id)?
+        .models
+        .first()
+        .map(|model| model.id.clone())
 }

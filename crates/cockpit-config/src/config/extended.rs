@@ -28,7 +28,7 @@ mod resource_scheduler;
 pub mod tui;
 
 #[allow(unused_imports)]
-pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
+pub use daemon::{DaemonAutostart, DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
 #[allow(unused_imports)]
 pub use data_syntax::DataSyntaxConfig;
 #[allow(unused_imports)]

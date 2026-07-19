@@ -2,10 +2,30 @@ use super::*;
 
 pub use crate::db::retention::RetentionConfig;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub uploads: DaemonUploadLimitsConfig,
+    #[serde(default)]
+    pub autostart: DaemonAutostart,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            uploads: DaemonUploadLimitsConfig::default(),
+            autostart: DaemonAutostart::Shared,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DaemonAutostart {
+    #[default]
+    Shared,
+    Private,
+    Ask,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

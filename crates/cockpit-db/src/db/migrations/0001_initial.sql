@@ -15,7 +15,7 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 
 -- ---- assistants ------------------------------------------------------------
 
@@ -146,6 +146,15 @@ CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_
   WHERE shared_with_collaborators = 1;
 CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at DESC)
   WHERE assistant_name IS NOT NULL;
+
+-- ---- app_flags -------------------------------------------------------------
+-- Machine-local one-time UI flags. These are deliberately outside project
+-- config so onboarding notices do not depend on workspace trust state.
+
+CREATE TABLE app_flags (
+    key     TEXT    PRIMARY KEY,
+    seen_at INTEGER NOT NULL
+);
 
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------
 

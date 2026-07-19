@@ -1609,12 +1609,18 @@ pub(super) fn tool_invocation(tool: &str, args: &serde_json::Value) -> (String, 
             (summary, cmd)
         }
         "read" | "readlock" | "unlock" | "write" | "writeunlock" | "edit" | "editunlock" => {
-            let p = field("path").unwrap_or_else(|| crate::text::short_args(args));
-            (p.clone(), p)
+            if let Some(path) = field("path") {
+                (path.clone(), path)
+            } else {
+                readable_args(args)
+            }
         }
         "webfetch" => {
-            let u = field("url").unwrap_or_else(|| crate::text::short_args(args));
-            (u.clone(), u)
+            if let Some(url) = field("url") {
+                (url.clone(), url)
+            } else {
+                readable_args(args)
+            }
         }
         "websearch" => {
             let q = field("query").unwrap_or_else(|| readable_args(args).1);
@@ -1631,45 +1637,24 @@ pub(super) fn tool_invocation(tool: &str, args: &serde_json::Value) -> (String, 
 }
 
 fn readable_args(args: &serde_json::Value) -> (String, String) {
-    if let Some(map) = args.as_object() {
-        let mut summary = Vec::new();
-        let mut full = Vec::new();
-        for (key, value) in map {
-            summary.push(format!(
-                "{key}={}",
-                readable_arg_value(value, TOOL_ARG_SUMMARY_CHARS, false)
-            ));
-            full.push(format!(
-                "{key}={}",
-                readable_arg_value(value, TOOL_ARG_FULL_CHARS, true)
-            ));
-        }
-        return (summary.join(", "), full.join("\n"));
-    }
-
     (
-        readable_arg_value(args, TOOL_ARG_SUMMARY_CHARS, false),
-        readable_arg_value(args, TOOL_ARG_FULL_CHARS, true),
+        crate::text::format_args(
+            args,
+            crate::text::ArgFormatOptions::history(TOOL_ARG_SUMMARY_CHARS, false),
+        ),
+        crate::text::format_args(
+            args,
+            crate::text::ArgFormatOptions::history(TOOL_ARG_FULL_CHARS, true),
+        ),
     )
 }
 
+#[cfg(test)]
 fn readable_arg_value(value: &serde_json::Value, limit: usize, multiline: bool) -> String {
-    match value {
-        serde_json::Value::String(s) => format!("{:?}", bounded_arg_string(s, limit, multiline)),
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::Array(_)
-        | serde_json::Value::Object(_) => bounded_preview(&value.to_string(), limit),
-    }
-}
-
-fn bounded_arg_string(s: &str, limit: usize, multiline: bool) -> String {
-    if multiline {
-        bounded_preview(s, limit)
-    } else {
-        single_line_preview(s, limit)
-    }
+    crate::text::format_arg_value(
+        value,
+        crate::text::ArgFormatOptions::history(limit, multiline),
+    )
 }
 
 fn single_line_preview(s: &str, limit: usize) -> String {
@@ -2658,4 +2643,118 @@ pub(super) fn amend_subagent_routing_in(
     *entry_model_trusted = update.model_trusted;
     *entry_routing = update.routing;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn string_args_render_without_debug_escapes() {
+        let rendered = readable_arg_value(
+            &json!("mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})"),
+            TOOL_ARG_SUMMARY_CHARS,
+            false,
+        );
+
+        assert!(rendered.contains("\"cockpit\""));
+        assert!(!rendered.contains("\\\""));
+    }
+
+    #[test]
+    fn backslashes_are_not_doubled() {
+        let rendered = readable_arg_value(
+            &json!("C:\\Temp\\session.json"),
+            TOOL_ARG_SUMMARY_CHARS,
+            false,
+        );
+
+        assert_eq!(rendered.matches('\\').count(), 2);
+        assert_eq!(rendered, "\"C:\\Temp\\session.json\"");
+    }
+
+    #[test]
+    fn control_characters_are_neutralized_in_summary() {
+        let rendered = readable_arg_value(
+            &json!("first\nsecond\tthird"),
+            TOOL_ARG_SUMMARY_CHARS,
+            false,
+        );
+
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\t'));
+        assert_eq!(rendered, "\"first …\"");
+    }
+
+    #[test]
+    fn surrounding_quotes_are_preserved() {
+        let empty = readable_arg_value(&json!(""), TOOL_ARG_SUMMARY_CHARS, false);
+        let truncated = readable_arg_value(&json!("abcdefghijklmno"), 12, false);
+
+        assert_eq!(empty, "\"\"");
+        assert!(truncated.starts_with('"'));
+        assert!(truncated.ends_with('"'));
+        assert_eq!(truncated, "\"abcdefghi…\"");
+    }
+
+    #[test]
+    fn non_string_values_unchanged() {
+        for value in [
+            json!(3),
+            json!(true),
+            json!({"name": "Test session"}),
+            json!(["read", "write"]),
+        ] {
+            assert_eq!(
+                readable_arg_value(&value, TOOL_ARG_SUMMARY_CHARS, false),
+                value.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_invocation_mcp_summary_is_readable() {
+        let args = json!({
+            "script": "mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})"
+        });
+
+        let (summary, full_input) = tool_invocation("mcp", &args);
+
+        let expected =
+            "script=\"mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})\"";
+        assert_eq!(summary, expected);
+        assert_eq!(full_input, expected);
+    }
+
+    #[test]
+    fn readable_arg_truncation_is_display_bounded() {
+        let rendered = readable_arg_value(&json!("abcdefghijklmno"), 12, false);
+
+        assert_eq!(rendered.chars().count(), 12);
+        assert_eq!(rendered, "\"abcdefghi…\"");
+    }
+
+    #[test]
+    fn path_fallback_uses_the_same_formatter() {
+        let args = json!({
+            "script": "mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})"
+        });
+
+        let (default_summary, _) = tool_invocation("mcp", &args);
+        let (default_multiline_summary, default_multiline_full) =
+            tool_invocation("mcp", &json!({ "script": "first\nsecond" }));
+        let (read_summary, read_full) = tool_invocation("read", &args);
+        let (webfetch_summary, webfetch_full) = tool_invocation("webfetch", &args);
+        let (read_multiline_summary, read_multiline_full) =
+            tool_invocation("read", &json!({ "script": "first\nsecond" }));
+
+        assert_eq!(read_summary, default_summary);
+        assert_eq!(read_full, default_summary);
+        assert_eq!(webfetch_summary, default_summary);
+        assert_eq!(webfetch_full, default_summary);
+        assert_eq!(read_multiline_summary, default_multiline_summary);
+        assert_eq!(read_multiline_full, default_multiline_full);
+        assert!(read_multiline_full.contains('\n'));
+    }
 }

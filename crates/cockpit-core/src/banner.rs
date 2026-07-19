@@ -15,8 +15,10 @@
 //! and glyph table apply to either. Result: a 6-row × 18-col rendered
 //! banner.
 //!
-//! Terminal UI rendering lives in the binary crate. Core exposes only the
-//! ANSI/data path used by startup welcome text.
+//! Terminal UI rendering lives in the binary crate. Core owns the art
+//! data, selection, cell resolution, and the ANSI path used by startup
+//! welcome text; the binary's ratatui `Span` renderer imports the
+//! resolved cell grid ([`active_cells`]) from here.
 
 /// A pixel-art plane plus its palette. Selected once per render
 /// (P-51 vs rooster) so every render path draws from the same source.
@@ -120,20 +122,26 @@ fn active_art() -> Art {
     }
 }
 
-/// Render the active art (rooster when `COCKPIT_ROOSTER` is truthy,
-/// else P-51) regardless of suppression rules. Useful for tests and for
-/// callers (e.g. `/banner` debug commands later) that want the art
-/// unconditionally.
-pub fn render_unconditional() -> Vec<String> {
+/// One resolved 2×2 cell group: `None` for an all-transparent group
+/// (render a space), or `Some((glyph, fg, optional bg))` with ANSI
+/// 256-color indexes. See [`active_cells`].
+pub type ResolvedCell = Option<(&'static str, u8, Option<u8>)>;
+
+/// The active art (rooster when `COCKPIT_ROOSTER` is truthy, else
+/// P-51) as a resolved cell grid: [`RENDERED_HEIGHT`] rows of
+/// [`RENDERED_WIDTH`] cells. This is the shared data surface every
+/// renderer draws from — the raw-stdout ANSI path here and the
+/// ratatui `Span` path in the binary crate — so they cannot disagree
+/// about art selection, glyphs, or colors.
+pub fn active_cells() -> Vec<Vec<ResolvedCell>> {
     let art = active_art();
-    let indent = " ".repeat(LEFT_INDENT);
     let mut out = Vec::with_capacity(RENDERED_HEIGHT);
     for y in (0..PLANE_HEIGHT).step_by(2) {
         let top = art.plane[y].as_bytes();
         let bot = art.plane[y + 1].as_bytes();
-        let mut line = indent.clone();
+        let mut row = Vec::with_capacity(RENDERED_WIDTH);
         for x in (0..PLANE_WIDTH).step_by(2) {
-            line.push_str(&draw_cell(
+            row.push(cell_parts(
                 art.color_discovery_order,
                 art.palette,
                 top[x] as char,
@@ -142,9 +150,27 @@ pub fn render_unconditional() -> Vec<String> {
                 bot[x + 1] as char,
             ));
         }
-        out.push(line);
+        out.push(row);
     }
     out
+}
+
+/// Render the active art (rooster when `COCKPIT_ROOSTER` is truthy,
+/// else P-51) regardless of suppression rules. Useful for tests and for
+/// callers (e.g. `/banner` debug commands later) that want the art
+/// unconditionally.
+pub fn render_unconditional() -> Vec<String> {
+    let indent = " ".repeat(LEFT_INDENT);
+    active_cells()
+        .into_iter()
+        .map(|row| {
+            let mut line = indent.clone();
+            for cell in row {
+                line.push_str(&draw_cell(cell));
+            }
+            line
+        })
+        .collect()
 }
 
 /// Resolve one 2×2 cell group into `(glyph, fg, optional bg)`, or `None`
@@ -197,16 +223,10 @@ fn cell_parts(
     Some((glyph, fg, bg))
 }
 
-/// One 2×2 cell group as an ANSI-styled string (raw-stdout path).
-fn draw_cell(
-    color_discovery_order: ColorDiscoveryOrder,
-    palette: &[u8],
-    ul: char,
-    ur: char,
-    ll: char,
-    lr: char,
-) -> String {
-    match cell_parts(color_discovery_order, palette, ul, ur, ll, lr) {
+/// One resolved 2×2 cell group as an ANSI-styled string (raw-stdout
+/// path).
+fn draw_cell(cell: ResolvedCell) -> String {
+    match cell {
         None => " ".to_string(),
         Some((glyph, fg, Some(bg))) => format!("\x1b[38;5;{fg};48;5;{bg}m{glyph}{RESET}"),
         Some((glyph, fg, None)) => format!("\x1b[38;5;{fg}m{glyph}{RESET}"),

@@ -8,7 +8,7 @@ pub(super) use serde::Deserialize;
 pub(super) use serde_json::Value;
 
 pub(super) use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
-pub(super) use crate::intel::budget::BudgetedWriter;
+pub(super) use crate::intel::budget::{BudgetedWriter, retained_truncated_body};
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
 pub(super) use crate::intel::{DepEdge, FileMetaRow, Index, SymbolRow};
@@ -42,12 +42,23 @@ pub(super) fn rel_path(arg: &str, ctx: &ToolCtx) -> String {
 
 pub(super) fn finish(writer: BudgetedWriter, note: &str) -> ToolOutput {
     if writer.is_truncated() {
+        let retention = writer.retained_truncated_output();
         let mut out = writer.into_string();
         out.push_str(note);
-        ToolOutput::truncated_text(out)
+        match retention {
+            Some(retention) => ToolOutput::truncated_text(out).with_truncated_retention(retention),
+            None => ToolOutput::truncated_text(out),
+        }
     } else {
         ToolOutput::text(writer.into_string())
     }
+}
+
+pub(super) fn write_retained_line(writer: &mut BudgetedWriter, line: &str) -> bool {
+    writer.writeln(line);
+    // Keep legacy `if !write...` call sites compiling while ensuring producers
+    // continue far enough for `original_byte_len` to describe the whole output.
+    true
 }
 
 pub(super) fn format_symbol_line(s: &SymbolRow) -> String {

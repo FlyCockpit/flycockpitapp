@@ -600,6 +600,7 @@ pub(crate) async fn execute_ordinary_call(
     // Keep tool output raw in history and the local audit row. Egress
     // redaction happens at model dispatch and at the client boundary.
     let mut output_str = raw_output;
+    let output_before_recheck = output_str.clone();
 
     // Result injection re-check (implementation note):
     // when the safety gate flagged this call's result as pulling in
@@ -614,9 +615,9 @@ pub(crate) async fn execute_ordinary_call(
         let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
         output_str = result_recheck(&output_str, &recheck_ctx, env.tx).await?;
     }
+    let recheck_modified_output = output_str != output_before_recheck;
 
     if !hard_fail
-        && truncated_tool_result_is_retrievable(resolved_name)
         && matches!(
             &result,
             Ok(ToolOutput {
@@ -625,29 +626,26 @@ pub(crate) async fn execute_ordinary_call(
             })
         )
     {
-        match store_compressed_tool_result(
+        let retained = result
+            .as_ref()
+            .ok()
+            .and_then(|output| output.truncated_retention.as_ref());
+        match maybe_store_retrievable_truncated_tool_result(
             env.session,
             &env.agent.name,
             resolved_name,
             &tc.id,
-            "truncated",
-            &output_str,
-            Some(output_str.len()),
+            &mut output_str,
+            retained,
+            recheck_modified_output,
         ) {
-            Ok(hash) => {
-                output_str.push_str(&format!(
-                    "\n[compressed tool result: tool={} bytes={} hash={} retrieve with tool_result_retrieve]\n",
-                    resolved_name,
-                    output_str.len(),
-                    hash
-                ));
-            }
+            Ok(_) => {}
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     tool = %resolved_name,
                     call_id = %tc.id,
-                    "compressed tool result store failed"
+                    "truncated tool result store failed"
                 );
             }
         }
@@ -1110,6 +1108,64 @@ mod tests {
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
             Ok(ToolOutput::truncated_text("large output"))
+        }
+    }
+
+    struct RetainedTruncatedTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for RetainedTruncatedTool {
+        fn name(&self) -> &str {
+            "big"
+        }
+
+        fn description(&self) -> &str {
+            "Return truncated test output with retained bytes."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(
+                ToolOutput::truncated_text("visible line\n[truncated]\n").with_truncated_retention(
+                    crate::engine::tool::RetainedTruncatedOutput {
+                        content: "visible line\nhidden line\n".to_string(),
+                        original_byte_len: "visible line\nhidden line\n".len(),
+                        partial: false,
+                    },
+                ),
+            )
+        }
+    }
+
+    struct PartialRetainedTruncatedTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for PartialRetainedTruncatedTool {
+        fn name(&self) -> &str {
+            "big_partial"
+        }
+
+        fn description(&self) -> &str {
+            "Return truncated test output with partial retained bytes."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(
+                ToolOutput::truncated_text("visible line\n[truncated]\n").with_truncated_retention(
+                    crate::engine::tool::RetainedTruncatedOutput {
+                        content: "visible line\nhidden prefix".to_string(),
+                        original_byte_len: 10_000,
+                        partial: true,
+                    },
+                ),
+            )
         }
     }
 
@@ -2197,9 +2253,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_ordinary_call_truncated_result_gets_compressed_marker() {
+    async fn truncate_only_banner_says_truncated_not_compressed() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(TruncatedTool));
+        let tools = ToolBox::new().with(Arc::new(RetainedTruncatedTool));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -2232,13 +2288,166 @@ mod tests {
             .unwrap();
         assert!(row.truncated);
         assert!(
-            row.output.contains("[compressed tool result:"),
+            row.output.contains("[truncated tool result:"),
             "{}",
             row.output
         );
+        assert!(!row.output.contains("compressed"), "{}", row.output);
+        let wire = last_tool_result_text(&history);
+        assert!(wire.contains("[truncated tool result:"), "{wire}");
+        assert!(!wire.contains("compressed"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_result_store_holds_pre_truncation_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(RetainedTruncatedTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("big", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "big", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let stored = session.db.list_compressed_tool_results(session.id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].kind, "truncated");
+        assert_eq!(stored[0].compressed_byte_len, None);
+        assert!(stored[0].content.contains("visible line"));
+        assert!(stored[0].content.contains("hidden line"));
+        assert!(!last_tool_result_text(&history).contains("hidden line"));
+    }
+
+    #[tokio::test]
+    async fn retained_truncated_tool_result_partial_banner_says_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(PartialRetainedTruncatedTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("big_partial", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "big_partial",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        assert!(wire.contains("[truncated partial tool result:"), "{wire}");
+        let stored = session.db.list_compressed_tool_results(session.id).unwrap();
+        assert_eq!(stored[0].original_byte_len, 10_000);
+        assert!(stored[0].original_byte_len > stored[0].content.len());
+    }
+
+    #[tokio::test]
+    async fn retrieval_banner_suppressed_without_retained_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(TruncatedTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("big", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "big", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        assert!(!wire.contains("tool_result_retrieve"), "{wire}");
         assert!(
-            last_tool_result_text(&history).contains("[compressed tool result:"),
-            "{history:?}"
+            !toolbox_with_retrieval_if_needed(
+                tools,
+                &session,
+                crate::config::extended::LlmMode::Normal
+            )
+            .names()
+            .contains(&"tool_result_retrieve")
+        );
+    }
+
+    #[test]
+    fn recheck_modified_output_does_not_store_unrechecked_body() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, std::path::PathBuf::from("/x"), "Build").unwrap();
+        let mut delivered = "[tool result withheld]".to_string();
+        let retained = crate::engine::tool::RetainedTruncatedOutput {
+            content: "raw content removed by recheck".to_string(),
+            original_byte_len: "raw content removed by recheck".len(),
+            partial: false,
+        };
+
+        let stored = maybe_store_retrievable_truncated_tool_result(
+            &session,
+            "Build",
+            "tree",
+            "call-1",
+            &mut delivered,
+            Some(&retained),
+            true,
+        )
+        .unwrap();
+
+        assert!(stored.is_none());
+        assert_eq!(delivered, "[tool result withheld]");
+        assert!(
+            session
+                .db
+                .list_compressed_tool_results(session.id)
+                .unwrap()
+                .is_empty()
         );
     }
 }

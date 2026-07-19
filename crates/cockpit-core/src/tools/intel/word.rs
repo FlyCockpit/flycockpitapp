@@ -69,7 +69,7 @@ impl Tool for WordTool {
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            if !writer.writeln(&format!("{path}: {joined}")) {
+            if !write_retained_line(&mut writer, &format!("{path}: {joined}")) {
                 break;
             }
         }

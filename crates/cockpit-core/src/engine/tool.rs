@@ -278,6 +278,10 @@ pub struct ToolOutput {
     pub repeat_guard: Option<RepeatGuard>,
     /// True when [`content`] is capped (per the §10 truncation marker).
     pub truncated: bool,
+    /// Optional retained source body for a truncated result. This is present
+    /// only when the tool can supply bytes that were not delivered in
+    /// [`content`], so retrieval is useful rather than a no-op.
+    pub truncated_retention: Option<RetainedTruncatedOutput>,
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
@@ -309,6 +313,17 @@ pub struct ToolOutput {
     /// persisting it onto the durable event, and the exporter writes it as a
     /// sidecar file.
     pub output_sidecar: Option<ToolOutputSidecar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedTruncatedOutput {
+    /// Retained pre-truncation bytes, capped by the producing tool.
+    pub content: String,
+    /// Full byte length of the pre-truncation body observed by the producer.
+    /// This may exceed `content.len()` when [`partial`] is true.
+    pub original_byte_len: usize,
+    /// True when [`content`] is only a capped prefix of the original body.
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +466,7 @@ impl ToolOutput {
             content: content.into(),
             repeat_guard: None,
             truncated: false,
+            truncated_retention: None,
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -465,6 +481,7 @@ impl ToolOutput {
             content: content.into(),
             repeat_guard: None,
             truncated: true,
+            truncated_retention: None,
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -472,6 +489,11 @@ impl ToolOutput {
             exit_code: None,
             output_sidecar: None,
         }
+    }
+
+    pub fn with_truncated_retention(mut self, retention: RetainedTruncatedOutput) -> Self {
+        self.truncated_retention = Some(retention);
+        self
     }
 
     /// Attach `bash` sandbox-state metadata for the `tool_call` event

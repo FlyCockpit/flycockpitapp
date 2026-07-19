@@ -22,6 +22,7 @@
 //! ├── tool_outputs/
 //! │   └── {seq:05}_{short_id}_{tool_call_id}.json
 //! ├── compressed_tool_results/
+//! │   ├── index.json          # nullable compression lengths are omitted
 //! │   └── {short_id}_{hash}.txt
 //! ├── delegation_payloads/
 //! │   └── {short_id}_{task_call_id}_{label}_{hash}.txt
@@ -376,7 +377,7 @@ fn build_zip_with_options_and_env(
                 short,
                 fs_safe(&entry.hash)
             );
-            compressed_result_index.push(json!({
+            let mut index_entry = json!({
                 "hash": entry.hash,
                 "session_id": entry.session_id.to_string(),
                 "short_id": short,
@@ -384,11 +385,14 @@ fn build_zip_with_options_and_env(
                 "tool": entry.tool,
                 "call_id": entry.call_id,
                 "original_byte_len": entry.original_byte_len,
-                "compressed_byte_len": entry.compressed_byte_len,
                 "created_at": entry.created_at,
                 "kind": entry.kind,
                 "file": path,
-            }));
+            });
+            if let Some(compressed_byte_len) = entry.compressed_byte_len {
+                index_entry["compressed_byte_len"] = json!(compressed_byte_len);
+            }
+            compressed_result_index.push(index_entry);
             compressed_result_files.push((path, entry.content));
         }
         for row in db.list_task_delegation_steers(s.session_id)? {

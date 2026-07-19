@@ -72,7 +72,7 @@ impl Tool for CircularTool {
             names.sort();
             let mut chain = names.clone();
             chain.push(names[0]);
-            if !writer.writeln(&format!("  {}", chain.join(" -> "))) {
+            if !write_retained_line(&mut writer, &format!("  {}", chain.join(" -> "))) {
                 break;
             }
         }

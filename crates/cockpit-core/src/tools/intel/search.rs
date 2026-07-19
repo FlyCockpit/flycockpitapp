@@ -159,7 +159,7 @@ impl Tool for SearchTool {
         let (render_body, thinned) = thin_line_output(&ranked_body, pattern, ThinLimits::default());
         let mut writer = BudgetedWriter::new(SEARCH_TOKEN_CAP);
         for line in render_body.lines() {
-            if !writer.writeln(line) {
+            if !write_retained_line(&mut writer, line) {
                 break;
             }
         }
@@ -172,6 +172,7 @@ impl Tool for SearchTool {
                 );
             }
             ToolOutput::truncated_text(content)
+                .with_truncated_retention(retained_truncated_body(&ranked_body))
         } else {
             finish(
                 writer,

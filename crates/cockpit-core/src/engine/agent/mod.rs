@@ -300,16 +300,16 @@ fn truncated_tool_result_is_retrievable(tool: &str) -> bool {
     )
 }
 
-fn store_compressed_tool_result(
+#[cfg(test)]
+fn store_genuinely_compressed_tool_result(
     session: &Session,
     agent_id: &str,
     tool: &str,
     call_id: &str,
-    kind: &str,
-    content: &str,
-    compressed_byte_len: Option<usize>,
+    original: &str,
+    compressed: &str,
 ) -> Result<String> {
-    let hash = crate::db::compressed_results::compressed_result_hash(content);
+    let hash = crate::db::compressed_results::compressed_result_hash(original);
     session.db.insert_compressed_tool_result(
         &hash,
         crate::db::compressed_results::NewCompressedToolResult {
@@ -317,14 +317,75 @@ fn store_compressed_tool_result(
             agent_id,
             tool,
             call_id,
-            original_byte_len: content.len(),
-            compressed_byte_len,
+            original_byte_len: original.len(),
+            compressed_byte_len: Some(compressed.len()),
             created_at: Utc::now().timestamp(),
-            kind,
-            content,
+            kind: "prune-boundary",
+            content: original,
         },
     )?;
     Ok(hash)
+}
+
+fn store_truncated_tool_result(
+    session: &Session,
+    agent_id: &str,
+    tool: &str,
+    call_id: &str,
+    retained: &crate::engine::tool::RetainedTruncatedOutput,
+) -> Result<String> {
+    let hash = crate::db::compressed_results::compressed_result_hash(&retained.content);
+    session.db.insert_compressed_tool_result(
+        &hash,
+        crate::db::compressed_results::NewCompressedToolResult {
+            session_id: session.id,
+            agent_id,
+            tool,
+            call_id,
+            original_byte_len: retained.original_byte_len,
+            compressed_byte_len: None,
+            created_at: Utc::now().timestamp(),
+            kind: "truncated",
+            content: &retained.content,
+        },
+    )?;
+    Ok(hash)
+}
+
+fn maybe_store_retrievable_truncated_tool_result(
+    session: &Session,
+    agent_id: &str,
+    tool: &str,
+    call_id: &str,
+    delivered_body: &mut String,
+    retained: Option<&crate::engine::tool::RetainedTruncatedOutput>,
+    recheck_modified_output: bool,
+) -> Result<Option<String>> {
+    if !truncated_tool_result_is_retrievable(tool) {
+        return Ok(None);
+    }
+    if recheck_modified_output {
+        // The retained body has not passed through the same result-recheck edit
+        // or drop path as `delivered_body`. Suppress retrieval rather than
+        // persisting bytes the recheck removed.
+        return Ok(None);
+    }
+    let Some(retained) = retained else {
+        return Ok(None);
+    };
+    if retained.content.is_empty() || retained.content == *delivered_body {
+        return Ok(None);
+    }
+
+    let hash = store_truncated_tool_result(session, agent_id, tool, call_id, retained)?;
+    let partial = if retained.partial { " partial" } else { "" };
+    delivered_body.push_str(&format!(
+        "\n[truncated{partial} tool result: tool={tool} delivered_bytes={} stored_bytes={} original_bytes={} hash={hash} retrieve with tool_result_retrieve]\n",
+        delivered_body.len(),
+        retained.content.len(),
+        retained.original_byte_len,
+    ));
+    Ok(Some(hash))
 }
 
 async fn record_inference_request_async(
@@ -1027,18 +1088,78 @@ mod compressed_tool_result_tests {
             .names()
             .contains(&"tool_result_retrieve")
         );
-        store_compressed_tool_result(
+        store_genuinely_compressed_tool_result(
             &session,
             "Build",
             "bash",
             "call-1",
-            "truncated",
-            "redacted output",
-            Some(4),
+            "redacted original output",
+            "redacted",
         )
         .unwrap();
         assert!(
             toolbox_with_retrieval_if_needed(
+                tools,
+                &session,
+                crate::config::extended::LlmMode::Normal
+            )
+            .names()
+            .contains(&"tool_result_retrieve")
+        );
+    }
+
+    #[test]
+    fn truncate_only_store_leaves_compressed_len_none() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let retained = crate::engine::tool::RetainedTruncatedOutput {
+            content: "visible\nhidden\n".to_string(),
+            original_byte_len: "visible\nhidden\n".len(),
+            partial: false,
+        };
+
+        let hash =
+            store_truncated_tool_result(&session, "Build", "tree", "call-1", &retained).unwrap();
+        let row = session
+            .db
+            .compressed_tool_result(session.id, &hash)
+            .unwrap()
+            .expect("stored truncated result");
+
+        assert_eq!(row.kind, "truncated");
+        assert_eq!(row.compressed_byte_len, None);
+        assert_eq!(row.original_byte_len, retained.original_byte_len);
+        assert_eq!(row.content, retained.content);
+    }
+
+    #[test]
+    fn retrieval_advertisement_suppressed_when_retrieval_adds_nothing() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        session.set_sandbox_escalation_enabled(false);
+        let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
+        let mut delivered = "already delivered".to_string();
+        let retained = crate::engine::tool::RetainedTruncatedOutput {
+            content: delivered.clone(),
+            original_byte_len: delivered.len(),
+            partial: false,
+        };
+
+        let stored = maybe_store_retrievable_truncated_tool_result(
+            &session,
+            "Build",
+            "tree",
+            "call-1",
+            &mut delivered,
+            Some(&retained),
+            false,
+        )
+        .unwrap();
+
+        assert!(stored.is_none());
+        assert_eq!(delivered, "already delivered");
+        assert!(
+            !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
                 crate::config::extended::LlmMode::Normal

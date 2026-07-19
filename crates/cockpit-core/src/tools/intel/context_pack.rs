@@ -252,7 +252,7 @@ fn context_pack_overview(
     lang_rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     writer.writeln("languages:");
     for (lang, count) in lang_rows.into_iter().take(limit) {
-        if !writer.writeln(&format!("  {lang}: {count}")) {
+        if !write_retained_line(&mut writer, &format!("  {lang}: {count}")) {
             return Ok(finish(
                 writer,
                 "\n... [truncated; lower `limit` or target a path]\n",
@@ -275,10 +275,13 @@ fn context_pack_overview(
         writer.writeln("  none");
     } else {
         for file in central.into_iter().take(limit) {
-            if !writer.writeln(&format!(
-                "  {} score={:.2} symbols={}",
-                file.path, file.centrality, file.symbols
-            )) {
+            if !write_retained_line(
+                &mut writer,
+                &format!(
+                    "  {} score={:.2} symbols={}",
+                    file.path, file.centrality, file.symbols
+                ),
+            ) {
                 return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
             }
         }
@@ -291,12 +294,15 @@ fn context_pack_overview(
         .collect::<Vec<_>>();
     recent.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
     for file in recent.into_iter().take(limit) {
-        if !writer.writeln(&format!(
-            "  {}  {}b {}",
-            file.path,
-            file.size,
-            line_count_label(file.lines)
-        )) {
+        if !write_retained_line(
+            &mut writer,
+            &format!(
+                "  {}  {}b {}",
+                file.path,
+                file.size,
+                line_count_label(file.lines)
+            ),
+        ) {
             return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
         }
     }
@@ -313,13 +319,16 @@ fn context_pack_overview(
         writer.writeln("  none");
     } else {
         for file in symbol_heavy.into_iter().take(limit) {
-            if !writer.writeln(&format!(
-                "  {} {} symbols={} {}",
-                file.path,
-                file.language,
-                file.symbols,
-                line_count_label(file.lines)
-            )) {
+            if !write_retained_line(
+                &mut writer,
+                &format!(
+                    "  {} {} symbols={} {}",
+                    file.path,
+                    file.language,
+                    file.symbols,
+                    line_count_label(file.lines)
+                ),
+            ) {
                 return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
             }
         }
@@ -331,7 +340,7 @@ fn context_pack_overview(
         writer.writeln("  none detected");
     } else {
         for s in entries {
-            if !writer.writeln(&format_symbol_line(&s)) {
+            if !write_retained_line(&mut writer, &format_symbol_line(&s)) {
                 return Ok(finish(writer, "\n... [truncated; target a symbol]\n"));
             }
         }
@@ -341,7 +350,7 @@ fn context_pack_overview(
     let cycles = import_cycles(&dep_edges);
     writer.writeln(&format!("import cycles: {}", cycles.len()));
     for cycle in cycles.into_iter().take(limit.min(5)) {
-        if !writer.writeln(&format!("  {}", cycle.join(" -> "))) {
+        if !write_retained_line(&mut writer, &format!("  {}", cycle.join(" -> "))) {
             return Ok(finish(writer, "\n... [truncated; use `circular`]\n"));
         }
     }
@@ -404,7 +413,7 @@ fn context_pack_path(
         writer.writeln("  none");
     } else {
         for (target, line) in imports.iter().take(limit) {
-            if !writer.writeln(&format!("  {rel}:{line} -> {target}")) {
+            if !write_retained_line(&mut writer, &format!("  {rel}:{line} -> {target}")) {
                 return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
             }
         }
@@ -416,7 +425,7 @@ fn context_pack_path(
         writer.writeln("  none");
     } else {
         for s in symbols.iter().take(limit) {
-            if !writer.writeln(&format!("  {}", format_symbol_line(s))) {
+            if !write_retained_line(&mut writer, &format!("  {}", format_symbol_line(s))) {
                 return Ok(finish(writer, "\n... [truncated; use `outline`]\n"));
             }
         }
@@ -445,7 +454,10 @@ fn context_pack_path(
     if !unresolved.is_empty() {
         writer.writeln("  unresolved imports:");
         for edge in unresolved.iter().take(limit) {
-            if !writer.writeln(&format!("    {}: {}", edge.line, edge.raw_target)) {
+            if !write_retained_line(
+                &mut writer,
+                &format!("    {}: {}", edge.line, edge.raw_target),
+            ) {
                 return Ok(finish(writer, "\n... [truncated; use `deps`]\n"));
             }
         }
@@ -458,10 +470,13 @@ fn context_pack_path(
         for s in symbols.iter().take(limit.min(4)) {
             let start = s.line.max(1);
             let len = (s.end_line - s.line + 1).clamp(20, 120);
-            if !writer.writeln(&format!(
-                "  read {{path:\"{}\", offset:{}, limit:{}}}  # {}",
-                s.path, start, len, s.name
-            )) {
+            if !write_retained_line(
+                &mut writer,
+                &format!(
+                    "  read {{path:\"{}\", offset:{}, limit:{}}}  # {}",
+                    s.path, start, len, s.name
+                ),
+            ) {
                 return Ok(finish(writer, "\n... [truncated]\n"));
             }
         }
@@ -503,11 +518,10 @@ fn context_pack_symbol(
     writer.writeln(&format!("definitions: {}", hits.len()));
     for s in hits.iter().take(limit) {
         let score = centrality.get(&s.path).copied().unwrap_or(0.0);
-        if !writer.writeln(&format!(
-            "  {} centrality={:.2}",
-            format_symbol_line(s),
-            score
-        )) {
+        if !write_retained_line(
+            &mut writer,
+            &format!("  {} centrality={:.2}", format_symbol_line(s), score),
+        ) {
             return Ok(finish(
                 writer,
                 "\n... [truncated; narrow with exact target/path]\n",
@@ -530,12 +544,18 @@ fn context_pack_symbol(
             let in_sym = caller_symbol
                 .map(|v| format!(" in {v}"))
                 .unwrap_or_default();
-            if !writer.writeln(&format!("    caller {caller_file}:{caller_line}{in_sym}")) {
+            if !write_retained_line(
+                &mut writer,
+                &format!("    caller {caller_file}:{caller_line}{in_sym}"),
+            ) {
                 return Ok(finish(writer, "\n... [truncated; use `impact`]\n"));
             }
         }
         for (callee, def_file, def_line) in calls.into_iter().take(limit) {
-            if !writer.writeln(&format!("    calls {callee} -> {def_file}:{def_line}")) {
+            if !write_retained_line(
+                &mut writer,
+                &format!("    calls {callee} -> {def_file}:{def_line}"),
+            ) {
                 return Ok(finish(writer, "\n... [truncated; use `impact`]\n"));
             }
         }
@@ -547,10 +567,13 @@ fn context_pack_symbol(
     writer.writeln("suggested reads:");
     for s in hits.iter().take(limit.min(6)) {
         let len = (s.end_line - s.line + 1).clamp(20, 120);
-        if !writer.writeln(&format!(
-            "  read {{path:\"{}\", offset:{}, limit:{}}}  # {}",
-            s.path, s.line, len, s.name
-        )) {
+        if !write_retained_line(
+            &mut writer,
+            &format!(
+                "  read {{path:\"{}\", offset:{}, limit:{}}}  # {}",
+                s.path, s.line, len, s.name
+            ),
+        ) {
             return Ok(finish(writer, "\n... [truncated]\n"));
         }
     }
@@ -585,7 +608,7 @@ async fn context_pack_query(
         writer.writeln("  none");
     } else {
         for s in symbol_hits.iter().take(limit) {
-            if !writer.writeln(&format!("  {}", format_symbol_line(s))) {
+            if !write_retained_line(&mut writer, &format!("  {}", format_symbol_line(s))) {
                 return Ok(finish(writer, "\n... [truncated; narrow query]\n"));
             }
         }
@@ -607,7 +630,7 @@ async fn context_pack_query(
                 .map(i64::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            if !writer.writeln(&format!("  {path}: {joined}")) {
+            if !write_retained_line(&mut writer, &format!("  {path}: {joined}")) {
                 return Ok(finish(writer, "\n... [truncated; use `word`]\n"));
             }
         }
@@ -619,7 +642,7 @@ async fn context_pack_query(
         writer.writeln("  none");
     } else {
         for (path, line) in text_hits.into_iter().take(limit) {
-            if !writer.writeln(&format!("  {path}:{line}")) {
+            if !write_retained_line(&mut writer, &format!("  {path}:{line}")) {
                 return Ok(finish(writer, "\n... [truncated; use `search`]\n"));
             }
         }
@@ -683,10 +706,10 @@ fn import_cycles(edges: &[DepEdge]) -> Vec<Vec<String>> {
 
 fn write_dep_rows(writer: &mut BudgetedWriter, rows: &[(usize, String)], limit: usize) -> bool {
     if rows.is_empty() {
-        return writer.writeln("    none");
+        return write_retained_line(writer, "    none");
     }
     for (dist, path) in rows.iter().take(limit) {
-        if !writer.writeln(&format!("    [{dist}] {path}")) {
+        if !write_retained_line(writer, &format!("    [{dist}] {path}")) {
             return false;
         }
     }

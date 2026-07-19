@@ -86,7 +86,7 @@ impl Tool for DepsTool {
             let reached = bfs(&forward, &rel, hops);
             writer.writeln(&format!("forward ({}):", reached.len()));
             for (dist, p) in &reached {
-                if !writer.writeln(&format!("  [{dist}] {p}")) {
+                if !write_retained_line(&mut writer, &format!("  [{dist}] {p}")) {
                     return Ok(finish(writer, "\n... [truncated]\n"));
                 }
             }
@@ -95,7 +95,7 @@ impl Tool for DepsTool {
             let reached = bfs(&reverse, &rel, hops);
             writer.writeln(&format!("reverse ({}):", reached.len()));
             for (dist, p) in &reached {
-                if !writer.writeln(&format!("  [{dist}] {p}")) {
+                if !write_retained_line(&mut writer, &format!("  [{dist}] {p}")) {
                     return Ok(finish(writer, "\n... [truncated]\n"));
                 }
             }
@@ -103,7 +103,7 @@ impl Tool for DepsTool {
         if !unresolved.is_empty() {
             writer.writeln(&format!("unresolved imports ({}):", unresolved.len()));
             for e in &unresolved {
-                if !writer.writeln(&format!("  {}: {}", e.line, e.raw_target)) {
+                if !write_retained_line(&mut writer, &format!("  {}: {}", e.line, e.raw_target)) {
                     break;
                 }
             }

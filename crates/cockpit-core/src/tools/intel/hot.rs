@@ -77,7 +77,7 @@ impl Tool for HotTool {
         }
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
         for (_, rel, size) in &files {
-            if !writer.writeln(&format!("{rel}  {size}b")) {
+            if !write_retained_line(&mut writer, &format!("{rel}  {size}b")) {
                 break;
             }
         }

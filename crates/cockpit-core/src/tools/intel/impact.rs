@@ -100,7 +100,7 @@ impl Tool for ImpactTool {
                         .as_deref()
                         .map(|s| format!(" in {s}"))
                         .unwrap_or_default();
-                    if !writer.writeln(&format!("  {cf}:{cl}{sym}")) {
+                    if !write_retained_line(&mut writer, &format!("  {cf}:{cl}{sym}")) {
                         return Ok(finish(
                             writer,
                             "\n... [truncated; narrow the query with `path`/`kind`]\n",
@@ -114,7 +114,7 @@ impl Tool for ImpactTool {
             } else {
                 writer.writeln(&format!("Calls ({}):", calls.len()));
                 for (callee, df, dl) in &calls {
-                    if !writer.writeln(&format!("  {callee} -> {df}:{dl}")) {
+                    if !write_retained_line(&mut writer, &format!("  {callee} -> {df}:{dl}")) {
                         return Ok(finish(
                             writer,
                             "\n... [truncated; narrow the query with `path`/`kind`]\n",

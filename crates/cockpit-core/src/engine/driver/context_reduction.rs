@@ -1226,3 +1226,28 @@ pub(in crate::engine::driver) fn auto_prune_trigger_reason(
 pub(in crate::engine::driver) fn auto_prune_trigger_breaks_cache(trigger_reason: &str) -> bool {
     trigger_reason == AUTO_PRUNE_TRIGGER_WARM_THRESHOLD
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn genuinely_compressed_result_has_distinct_byte_lengths() {
+        let original = "line 1\nline 2\nline 3\n";
+        let condensed = "[compressed tool result: omitted middle]\n";
+        let entry = crate::db::compressed_results::NewCompressedToolResult {
+            session_id: uuid::Uuid::new_v4(),
+            agent_id: "Build",
+            tool: "bash",
+            call_id: "call-1",
+            original_byte_len: original.len(),
+            compressed_byte_len: Some(condensed.len()),
+            created_at: 123,
+            kind: "prune-boundary",
+            content: original,
+        };
+
+        assert_ne!(
+            entry.original_byte_len,
+            entry.compressed_byte_len.expect("compressed length")
+        );
+    }
+}

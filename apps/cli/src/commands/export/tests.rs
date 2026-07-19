@@ -1829,8 +1829,52 @@ fn export_compressed_tool_results_writes_index_and_payload() {
             .unwrap();
     assert_eq!(index[0]["hash"], "0123456789abcdefabcdef12");
     assert_eq!(index[0]["tool"], "bash");
+    assert_eq!(index[0]["original_byte_len"], 15);
+    assert_eq!(index[0]["compressed_byte_len"], 5);
+    assert_ne!(
+        index[0]["original_byte_len"],
+        index[0]["compressed_byte_len"]
+    );
     let file = index[0]["file"].as_str().unwrap();
     assert_eq!(read_zip_entry(&zip, file).unwrap(), "redacted output");
+}
+
+#[test]
+fn export_truncate_only_result_omits_compressed_byte_len() {
+    let db = Db::open_in_memory().unwrap();
+    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let sid = s.session_id;
+    db.insert_compressed_tool_result(
+        "fedcba987654321001234567",
+        crate::db::compressed_results::NewCompressedToolResult {
+            session_id: sid,
+            agent_id: "Build",
+            tool: "tree",
+            call_id: "tc-truncated",
+            original_byte_len: 128,
+            compressed_byte_len: None,
+            created_at: 124,
+            kind: "truncated",
+            content: "retained pre-truncation body",
+        },
+    )
+    .unwrap();
+
+    let target = db.get_session(sid).unwrap().unwrap();
+    let bundle = collect_bundle(&db, sid).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let index: Vec<Value> =
+        serde_json::from_str(&read_zip_entry(&zip, "compressed_tool_results/index.json").unwrap())
+            .unwrap();
+
+    assert_eq!(index[0]["kind"], "truncated");
+    assert_eq!(index[0]["original_byte_len"], 128);
+    assert!(index[0].get("compressed_byte_len").is_none());
+    let file = index[0]["file"].as_str().unwrap();
+    assert_eq!(
+        read_zip_entry(&zip, file).unwrap(),
+        "retained pre-truncation body"
+    );
 }
 
 #[test]

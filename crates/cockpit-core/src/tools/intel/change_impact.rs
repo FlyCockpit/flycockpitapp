@@ -204,13 +204,16 @@ impl Tool for ChangeImpactTool {
             } else {
                 format!(" ({})", details.join(", "))
             };
-            if !writer.writeln(&format!(
-                "  {} {} risk={}{}",
-                file.status,
-                file.path,
-                risk.as_str(),
-                suffix
-            )) {
+            if !write_retained_line(
+                &mut writer,
+                &format!(
+                    "  {} {} risk={}{}",
+                    file.status,
+                    file.path,
+                    risk.as_str(),
+                    suffix
+                ),
+            ) {
                 return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
             }
             for symbol in overlapping {
@@ -247,17 +250,20 @@ impl Tool for ChangeImpactTool {
             });
             for (sym, risk, callers, calls) in changed_symbols.iter().take(80) {
                 let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                if !writer.writeln(&format!(
-                    "  {}:{}-{} {} {} risk={} callers={} calls={}",
-                    sym.path,
-                    sym.line,
-                    sym.end_line,
-                    sym.kind,
-                    sig,
-                    risk.as_str(),
-                    callers,
-                    calls
-                )) {
+                if !write_retained_line(
+                    &mut writer,
+                    &format!(
+                        "  {}:{}-{} {} {} risk={} callers={} calls={}",
+                        sym.path,
+                        sym.line,
+                        sym.end_line,
+                        sym.kind,
+                        sig,
+                        risk.as_str(),
+                        callers,
+                        calls
+                    ),
+                ) {
                     return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
                 }
             }
@@ -278,7 +284,7 @@ impl Tool for ChangeImpactTool {
                     .take(40)
             {
                 any_reverse = true;
-                if !writer.writeln(&format!("  {} <- {}", file.path, dep)) {
+                if !write_retained_line(&mut writer, &format!("  {} <- {}", file.path, dep)) {
                     return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
                 }
             }
@@ -304,10 +310,13 @@ impl Tool for ChangeImpactTool {
                 let in_sym = caller_symbol
                     .map(|s| format!(" in {s}"))
                     .unwrap_or_default();
-                if !writer.writeln(&format!(
-                    "  caller {}:{}{} -> {}:{} {}",
-                    caller_file, caller_line, in_sym, sym.path, sym.line, sym.name
-                )) {
+                if !write_retained_line(
+                    &mut writer,
+                    &format!(
+                        "  caller {}:{}{} -> {}:{} {}",
+                        caller_file, caller_line, in_sym, sym.path, sym.line, sym.name
+                    ),
+                ) {
                     return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
                 }
             }
@@ -322,10 +331,13 @@ impl Tool for ChangeImpactTool {
                     continue;
                 }
                 any_call = true;
-                if !writer.writeln(&format!(
-                    "  call {}:{} {} -> {}:{}",
-                    sym.path, sym.line, callee, def_file, def_line
-                )) {
+                if !write_retained_line(
+                    &mut writer,
+                    &format!(
+                        "  call {}:{} {} -> {}:{}",
+                        sym.path, sym.line, callee, def_file, def_line
+                    ),
+                ) {
                     return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
                 }
             }

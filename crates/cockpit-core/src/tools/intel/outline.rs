@@ -79,7 +79,7 @@ impl Tool for OutlineTool {
                 writer.writeln("  (no definitions matched)");
             }
             for (name, line) in hits {
-                if !writer.writeln(&format!("  {line}: {name}")) {
+                if !write_retained_line(&mut writer, &format!("  {line}: {name}")) {
                     break;
                 }
             }
@@ -90,7 +90,7 @@ impl Tool for OutlineTool {
         if !imports.is_empty() {
             writer.writeln("imports:");
             for (target, line) in &imports {
-                if !writer.writeln(&format!("  {line}: {target}")) {
+                if !write_retained_line(&mut writer, &format!("  {line}: {target}")) {
                     return Ok(finish(writer, "\n... [truncated]\n"));
                 }
             }
@@ -121,7 +121,7 @@ impl Tool for OutlineTool {
                     }
                     _ => format!("{vis}{} {parent}{}", s.kind, s.name),
                 };
-                if !writer.writeln(&format!("  {span}: {sig}")) {
+                if !write_retained_line(&mut writer, &format!("  {span}: {sig}")) {
                     break;
                 }
             }

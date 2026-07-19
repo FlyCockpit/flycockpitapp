@@ -1,4 +1,4 @@
-//! Retrieve durable compressed tool results by short sha256 hash.
+//! Retrieve durable stored tool results by short sha256 hash.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,13 +15,13 @@ impl Tool for ToolResultRetrieveTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve a compressed tool result by 24-hex hash; optional line range"
+        "Retrieve a stored tool result by 24-hex hash; optional line range"
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Retrieve the exact redacted text for a previous compressed tool result in this session. \
-             Pass the 24-character lowercase hex hash from the compressed-result marker; optionally \
+            "Retrieve the exact redacted text for a previous stored tool result in this session. \
+             Pass the 24-character lowercase hex hash from the tool-result marker; optionally \
              pass `start_line` and `end_line` to read only part of a long text result."
                 .to_string(),
         )
@@ -43,7 +43,7 @@ impl Tool for ToolResultRetrieveTool {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "hash": { "type": "string", "description": "Required 24-character lowercase hexadecimal hash from a `[compressed tool result: ...]` marker" },
+                "hash": { "type": "string", "description": "Required 24-character lowercase hexadecimal hash from a tool-result marker" },
                 "start_line": { "type": "integer", "description": "Optional first 1-indexed line to return when you only need a slice" },
                 "end_line": { "type": "integer", "description": "Optional last 1-indexed line to return, inclusive; requires `start_line`" }
             },
@@ -69,7 +69,7 @@ impl Tool for ToolResultRetrieveTool {
             .compressed_tool_result(ctx.session.id, hash)?
         else {
             return Ok(ToolOutput::text(format!(
-                "No compressed tool result with hash `{hash}` is available in this session."
+                "No stored tool result with hash `{hash}` is available in this session."
             )));
         };
 

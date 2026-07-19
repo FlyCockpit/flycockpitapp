@@ -373,6 +373,7 @@ mod safety_gate_tests {
                 content: "done".to_string(),
                 repeat_guard: None,
                 truncated: false,
+                truncated_retention: None,
                 recovery: None,
                 canonical_args: None,
                 sandbox: None,

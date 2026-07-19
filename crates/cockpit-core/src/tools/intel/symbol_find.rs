@@ -76,7 +76,7 @@ impl Tool for SymbolFindTool {
                 .map(|p| format!("{p}."))
                 .unwrap_or_default();
             let line = format!("{}:{} {} {parent}{}", s.path, s.line, s.kind, s.name);
-            if !writer.writeln(&line) {
+            if !write_retained_line(&mut writer, &line) {
                 break;
             }
         }

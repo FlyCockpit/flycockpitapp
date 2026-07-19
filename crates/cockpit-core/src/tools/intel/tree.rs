@@ -113,7 +113,7 @@ impl Tool for TreeTool {
                 }
                 None => format!("{rel}  {} {size}b [not indexed]", lang.as_str()),
             };
-            if !writer.writeln(&line) {
+            if !write_retained_line(&mut writer, &line) {
                 break;
             }
         }

@@ -108,6 +108,10 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
+    #[cfg(test)]
+    if let Some(result) = host.test_external_invoke(server, tool, args.clone()) {
+        return result;
+    }
     let Some(server_cfg) = cfg.servers.get(server) else {
         bail!("unknown MCP server `{server}`");
     };

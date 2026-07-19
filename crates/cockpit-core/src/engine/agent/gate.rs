@@ -268,6 +268,7 @@ mod safety_gate_tests {
         };
         ToolCtx {
             agent_id: "builder".to_string(),
+            current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,
             session: Arc::new(session),
@@ -392,7 +393,7 @@ mod safety_gate_tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         let (result, duration_ms) =
-            dispatch_one_timed(&tools, "sleepy", serde_json::json!({}), &ctx).await;
+            dispatch_one_timed(&tools, "sleepy", serde_json::json!({}), &ctx, None).await;
 
         result.expect("tool runs");
         assert!(

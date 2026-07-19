@@ -2159,6 +2159,7 @@ impl Driver {
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
             session: self.session.clone(),

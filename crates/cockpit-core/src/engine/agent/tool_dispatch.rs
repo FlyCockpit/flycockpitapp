@@ -404,7 +404,14 @@ pub(crate) async fn execute_ordinary_call(
             },
         };
         crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-            dispatch_one_timed(env.active_tools, resolved_name, args.clone(), env.ctx).await
+            dispatch_one_timed(
+                env.active_tools,
+                resolved_name,
+                args.clone(),
+                env.ctx,
+                Some(&tc.id),
+            )
+            .await
         })
         .await
     } else {
@@ -685,6 +692,8 @@ pub(crate) async fn execute_ordinary_call(
         timestamp: Utc::now(),
         agent: env.agent.name.clone(),
         call_id: tc.id.clone(),
+        parent_call_id: None,
+        parent_child_index: None,
         identity: crate::session::ToolCallProviderIdentity::from_provider_call(
             active_provider.as_deref(),
             active_model.as_deref(),
@@ -695,6 +704,7 @@ pub(crate) async fn execute_ordinary_call(
         ),
         tool: resolved_name.to_string(),
         path: tool_path,
+        mcp_server: None,
         original_input_json: original.clone(),
         wire_input_json: args.clone(),
         recovery: recovery.clone(),
@@ -1333,6 +1343,7 @@ mod tests {
     ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
+            current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks: Arc::new(crate::locks::LockManager::from_db(session.db.clone()).unwrap()),
             session,

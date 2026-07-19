@@ -383,6 +383,29 @@ mod tests {
         assert_eq!(desc, NORMAL_DESCRIPTION);
     }
 
+    #[tokio::test]
+    async fn model_context_invariance_with_child_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = McpTool;
+        let args = serde_json::json!({ "script": "mcp.search('context_usage')" });
+        let plain_ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut child_ctx = crate::tools::common::test_ctx(tmp.path());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        child_ctx.current_tool_call_id = Some("outer-mcp".to_string());
+        child_ctx.events = Some(tx);
+
+        let plain = tool.call(args.clone(), &plain_ctx).await.unwrap();
+        let with_children = tool.call(args, &child_ctx).await.unwrap();
+
+        assert_eq!(tool.description(), NORMAL_DESCRIPTION);
+        assert_eq!(
+            tool.defensive_description().as_deref(),
+            Some(DEFENSIVE_DESCRIPTION)
+        );
+        assert_eq!(plain.content, with_children.content);
+        assert_eq!(plain.truncated, with_children.truncated);
+    }
+
     #[test]
     fn advert_compact_follows_goal_state() {
         let tmp = tempfile::tempdir().unwrap();

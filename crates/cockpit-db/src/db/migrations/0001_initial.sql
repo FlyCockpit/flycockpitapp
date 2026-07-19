@@ -153,6 +153,8 @@ CREATE TABLE tool_call_events (
     event_id            TEXT    PRIMARY KEY,
     session_id          TEXT    NOT NULL,
     call_id             TEXT    NOT NULL,
+    parent_call_id      TEXT    DEFAULT NULL,
+    parent_child_index  INTEGER DEFAULT NULL,
     timestamp           INTEGER NOT NULL,
 
     -- denormalized for fast group-bys; model/provider/project rarely
@@ -164,6 +166,7 @@ CREATE TABLE tool_call_events (
 
     agent               TEXT    NOT NULL,
     tool                TEXT    NOT NULL,
+    mcp_server          TEXT    DEFAULT NULL,
     path                TEXT,
     language            TEXT,
 
@@ -219,6 +222,7 @@ CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
 CREATE INDEX idx_tce_model_ts   ON tool_call_events (model, timestamp);
 CREATE INDEX idx_tce_tool_ts    ON tool_call_events (tool, timestamp);
 CREATE INDEX idx_tce_lang_ts    ON tool_call_events (language, timestamp);
+CREATE INDEX idx_tce_parent     ON tool_call_events (parent_call_id);
 
 -- ---- inference_calls -------------------------------------------------------
 

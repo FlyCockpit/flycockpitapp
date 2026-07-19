@@ -1312,6 +1312,7 @@ pub(crate) async fn run_turn(
     // Tool dispatch.
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
+        current_tool_call_id: None,
         llm_mode: agent.llm_mode,
         locks,
         session: session.clone(),

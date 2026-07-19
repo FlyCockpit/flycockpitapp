@@ -8,19 +8,26 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
+use crate::db::session_log::SessionEventKind;
+use crate::engine::agent::TurnEvent;
+use crate::engine::tool::ToolFailKind;
 use crate::engine::tool::{ContextUsageSnapshot, ToolCtx};
 use crate::mcp::catalog::SearchHit;
 use crate::mcp::protocol::{
     ToolDescriptor, sanitize_tool_description, sanitize_tool_descriptor, sanitize_tool_name,
 };
-use crate::session::Session;
+use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 
 pub const BUILTIN_SERVER_ID: &str = "cockpit";
+const DEFAULT_CHILD_EVENT_CAP: usize = 50;
 
 #[derive(Clone)]
 pub struct HostContext {
@@ -33,12 +40,25 @@ pub struct HostContext {
     pub session: Option<Arc<Session>>,
     pub root_agent_frame: bool,
     pub context_usage: Option<ContextUsageSnapshot>,
+    pub child_events: Option<McpChildEventRecorder>,
     #[cfg(test)]
     test_builtin_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    test_external_invoke: Option<TestExternalInvoke>,
 }
 
 impl HostContext {
     pub fn from_tool_ctx(ctx: &ToolCtx) -> Self {
+        let child_events = ctx.current_tool_call_id.as_ref().map(|parent_call_id| {
+            McpChildEventRecorder::new(
+                ctx.session.clone(),
+                ctx.events.clone(),
+                ctx.agent_id.clone(),
+                parent_call_id.clone(),
+                ctx.llm_mode,
+                DEFAULT_CHILD_EVENT_CAP,
+            )
+        });
         Self {
             db: Some(ctx.session.db.clone()),
             session_id: Some(ctx.session.id),
@@ -46,8 +66,11 @@ impl HostContext {
             session: Some(ctx.session.clone()),
             root_agent_frame: ctx.root_agent_frame,
             context_usage: ctx.context_usage,
+            child_events,
             #[cfg(test)]
             test_builtin_gate: None,
+            #[cfg(test)]
+            test_external_invoke: None,
         }
     }
 
@@ -60,8 +83,11 @@ impl HostContext {
             session: None,
             root_agent_frame: true,
             context_usage: None,
+            child_events: None,
             #[cfg(test)]
             test_builtin_gate: None,
+            #[cfg(test)]
+            test_external_invoke: None,
         }
     }
 
@@ -72,6 +98,378 @@ impl HostContext {
     ) -> Self {
         self.test_builtin_gate = Some(gate);
         self
+    }
+
+    #[cfg(test)]
+    pub fn with_child_event_cap_for_tests(mut self, cap: usize) -> Self {
+        if let Some(recorder) = &mut self.child_events {
+            recorder.cap = cap;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_child_persistence_failure_for_tests(mut self) -> Self {
+        if let Some(recorder) = &mut self.child_events {
+            recorder.fail_persistence = true;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_test_external_invoke<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, &str, Value) -> Result<Value> + Send + Sync + 'static,
+    {
+        self.test_external_invoke = Some(Arc::new(f));
+        self
+    }
+
+    #[cfg(test)]
+    pub fn test_external_invoke(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Option<Result<Value>> {
+        self.test_external_invoke
+            .as_ref()
+            .map(|invoke| invoke(server, tool, args))
+    }
+
+    #[cfg(test)]
+    pub fn has_test_external_invoke(&self) -> bool {
+        self.test_external_invoke.is_some()
+    }
+}
+
+#[cfg(test)]
+type TestExternalInvoke = Arc<dyn Fn(&str, &str, Value) -> Result<Value> + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub struct McpChildDispatch {
+    pub kind: &'static str,
+    pub server: Option<String>,
+    pub tool: String,
+    pub builtin: Option<bool>,
+    pub args: Value,
+}
+
+impl McpChildDispatch {
+    pub fn new(
+        kind: &'static str,
+        server: Option<String>,
+        tool: impl Into<String>,
+        builtin: Option<bool>,
+        args: Value,
+    ) -> Self {
+        Self {
+            kind,
+            server,
+            tool: tool.into(),
+            builtin,
+            args,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpChildSpan {
+    call_id: String,
+    index: i64,
+    dispatch: McpChildDispatch,
+}
+
+#[derive(Clone)]
+pub struct McpChildEventRecorder {
+    session: Arc<Session>,
+    events: Option<mpsc::Sender<TurnEvent>>,
+    agent: String,
+    parent_call_id: String,
+    llm_mode: crate::config::extended::LlmMode,
+    cap: usize,
+    state: Arc<Mutex<McpChildEventState>>,
+    #[cfg(test)]
+    fail_persistence: bool,
+}
+
+#[derive(Debug, Default)]
+struct McpChildEventState {
+    next_index: i64,
+    suppressed: i64,
+    synthetic_recorded: bool,
+}
+
+impl McpChildEventRecorder {
+    fn new(
+        session: Arc<Session>,
+        events: Option<mpsc::Sender<TurnEvent>>,
+        agent: String,
+        parent_call_id: String,
+        llm_mode: crate::config::extended::LlmMode,
+        cap: usize,
+    ) -> Self {
+        Self {
+            session,
+            events,
+            agent,
+            parent_call_id,
+            llm_mode,
+            cap,
+            state: Arc::new(Mutex::new(McpChildEventState::default())),
+            #[cfg(test)]
+            fail_persistence: false,
+        }
+    }
+
+    pub async fn start(&self, dispatch: McpChildDispatch) -> Option<McpChildSpan> {
+        let span = {
+            let mut state = self.state.lock().unwrap();
+            if state.next_index >= self.cap as i64 {
+                state.suppressed += 1;
+                return None;
+            }
+            let index = state.next_index;
+            state.next_index += 1;
+            McpChildSpan {
+                call_id: format!("{}:mcp:{index}", self.parent_call_id),
+                index,
+                dispatch,
+            }
+        };
+
+        let start_data = self.event_data(&span, None, None, 0);
+        if let Err(e) = self.session.record_event(
+            SessionEventKind::ToolCallStarted,
+            Some(&self.agent),
+            Some(&span.call_id),
+            &start_data,
+        ) {
+            tracing::warn!(
+                error = %e,
+                tool = %span.dispatch.tool,
+                parent_call_id = %self.parent_call_id,
+                "record MCP child tool_call_started event failed"
+            );
+        }
+        if let Some(tx) = &self.events {
+            let _ = tx
+                .send(TurnEvent::ToolStart {
+                    agent: self.agent.clone(),
+                    call_id: span.call_id.clone(),
+                    tool: span.dispatch.tool.clone(),
+                    args: start_data,
+                })
+                .await;
+        }
+        Some(span)
+    }
+
+    pub async fn finish(
+        &self,
+        span: McpChildSpan,
+        outcome: Result<Value, String>,
+        duration_ms: u64,
+    ) {
+        let (output, hard_fail, error) = match outcome {
+            Ok(value) => (
+                serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
+                false,
+                None,
+            ),
+            Err(message) => (message.clone(), true, Some(message)),
+        };
+        let event_data = self.event_data(&span, Some(&output), error.as_deref(), duration_ms);
+
+        #[cfg(test)]
+        let persist_result = if self.fail_persistence {
+            Err(anyhow::anyhow!("injected MCP child persistence failure"))
+        } else {
+            self.persist_row(&span, &output, hard_fail, duration_ms)
+        };
+        #[cfg(not(test))]
+        let persist_result = self.persist_row(&span, &output, hard_fail, duration_ms);
+
+        if let Err(e) = persist_result {
+            tracing::warn!(
+                error = %e,
+                tool = %span.dispatch.tool,
+                parent_call_id = %self.parent_call_id,
+                "persisting MCP child tool_call_event failed"
+            );
+        }
+
+        let seq = match self.session.record_event(
+            SessionEventKind::ToolCall,
+            Some(&self.agent),
+            Some(&span.call_id),
+            &event_data,
+        ) {
+            Ok(seq) => Some(seq),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    tool = %span.dispatch.tool,
+                    parent_call_id = %self.parent_call_id,
+                    "record MCP child tool_call event failed"
+                );
+                None
+            }
+        };
+
+        if let Some(tx) = &self.events {
+            if hard_fail {
+                let _ = tx
+                    .send(TurnEvent::ToolError {
+                        agent: self.agent.clone(),
+                        call_id: span.call_id,
+                        tool: span.dispatch.tool,
+                        error: output,
+                        kind: ToolFailKind::Execution,
+                        seq,
+                    })
+                    .await;
+            } else {
+                let _ = tx
+                    .send(TurnEvent::ToolEnd {
+                        agent: self.agent.clone(),
+                        call_id: span.call_id,
+                        tool: span.dispatch.tool,
+                        output,
+                        truncated: false,
+                        seq,
+                        hint: None,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    pub async fn finish_suppressed(&self) {
+        let suppressed = {
+            let mut state = self.state.lock().unwrap();
+            if state.suppressed == 0 || state.synthetic_recorded {
+                return;
+            }
+            state.synthetic_recorded = true;
+            let index = state.next_index;
+            state.next_index += 1;
+            let suppressed = state.suppressed;
+            state.suppressed = 0;
+            (index, suppressed)
+        };
+        let (index, count) = suppressed;
+        let span = McpChildSpan {
+            call_id: format!("{}:mcp:{index}", self.parent_call_id),
+            index,
+            dispatch: McpChildDispatch::new(
+                "cap",
+                None,
+                "mcp.child_events_truncated",
+                None,
+                serde_json::json!({
+                    "unrecorded_dispatches": count
+                }),
+            ),
+        };
+        let output = format!("{count} further MCP dispatches were not recorded");
+        self.emit_start(&span).await;
+        self.finish(span, Ok(serde_json::json!({ "message": output })), 0)
+            .await;
+    }
+
+    async fn emit_start(&self, span: &McpChildSpan) {
+        let start_data = self.event_data(span, None, None, 0);
+        if let Err(e) = self.session.record_event(
+            SessionEventKind::ToolCallStarted,
+            Some(&self.agent),
+            Some(&span.call_id),
+            &start_data,
+        ) {
+            tracing::warn!(
+                error = %e,
+                tool = %span.dispatch.tool,
+                parent_call_id = %self.parent_call_id,
+                "record MCP child tool_call_started event failed"
+            );
+        }
+        if let Some(tx) = &self.events {
+            let _ = tx
+                .send(TurnEvent::ToolStart {
+                    agent: self.agent.clone(),
+                    call_id: span.call_id.clone(),
+                    tool: span.dispatch.tool.clone(),
+                    args: start_data,
+                })
+                .await;
+        }
+    }
+
+    fn event_data(
+        &self,
+        span: &McpChildSpan,
+        output: Option<&str>,
+        error: Option<&str>,
+        duration_ms: u64,
+    ) -> Value {
+        let mut data = serde_json::json!({
+            "tool": span.dispatch.tool,
+            "mcp_child": true,
+            "mcp_kind": span.dispatch.kind,
+            "mcp_server": span.dispatch.server,
+            "mcp_builtin": span.dispatch.builtin,
+            "parent_call_id": self.parent_call_id,
+            "parent_child_index": span.index,
+            "original_input": span.dispatch.args,
+            "wire_input": span.dispatch.args,
+            "recovery_kind": serde_json::Value::Null,
+            "recovery_stage": serde_json::Value::Null,
+            "hard_fail": error.is_some(),
+            "truncated": false,
+            "duration_ms": duration_ms,
+        });
+        if let Some(output) = output {
+            data["output"] = serde_json::json!(output);
+        }
+        if let Some(error) = error {
+            data["error"] = serde_json::json!(error);
+        }
+        data
+    }
+
+    fn persist_row(
+        &self,
+        span: &McpChildSpan,
+        output: &str,
+        hard_fail: bool,
+        duration_ms: u64,
+    ) -> Result<()> {
+        self.session.record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            agent: self.agent.clone(),
+            call_id: span.call_id.clone(),
+            parent_call_id: Some(self.parent_call_id.clone()),
+            parent_child_index: Some(span.index),
+            identity: ToolCallProviderIdentity::synthetic_cockpit_call(&span.call_id, None),
+            tool: span.dispatch.tool.clone(),
+            mcp_server: span.dispatch.server.clone(),
+            path: None,
+            original_input_json: span.dispatch.args.clone(),
+            wire_input_json: span.dispatch.args.clone(),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: output.to_string(),
+            truncated: false,
+            duration_ms,
+            llm_mode: self.llm_mode,
+            shape_fingerprint: None,
+            hint: None,
+        })
     }
 }
 
@@ -559,7 +957,9 @@ mod tests {
             session: Some(session),
             root_agent_frame: true,
             context_usage: None,
+            child_events: None,
             test_builtin_gate: None,
+            test_external_invoke: None,
         };
         let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
             .await
@@ -633,7 +1033,9 @@ mod tests {
             session: Some(session),
             root_agent_frame: true,
             context_usage: None,
+            child_events: None,
             test_builtin_gate: None,
+            test_external_invoke: None,
         };
         advance_title_turns(host.session.as_ref().unwrap(), 8);
 

@@ -854,12 +854,15 @@ async fn dispatch_one(
     name: &str,
     args: Value,
     ctx: &ToolCtx,
+    current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
     let tool = tools
         .get(name)
         .with_context(|| format!("unknown tool `{name}`"))?;
     let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
-    tool.call(args, ctx).await
+    let mut ctx = ctx.clone();
+    ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
+    tool.call(args, &ctx).await
 }
 
 async fn dispatch_one_timed(
@@ -867,9 +870,10 @@ async fn dispatch_one_timed(
     name: &str,
     args: Value,
     ctx: &ToolCtx,
+    current_tool_call_id: Option<&str>,
 ) -> (Result<ToolOutput>, u64) {
     let start = Instant::now();
-    let result = dispatch_one(tools, name, args, ctx).await;
+    let result = dispatch_one(tools, name, args, ctx, current_tool_call_id).await;
     (result, start.elapsed().as_millis() as u64)
 }
 
@@ -944,6 +948,7 @@ mod wire_null_normalization_tests {
                 "items": [null, {"nested": null}]
             }),
             &ctx,
+            None,
         )
         .await
         .unwrap();

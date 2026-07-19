@@ -182,6 +182,7 @@ impl Driver {
         let agent = self.stack.last().expect("stack never empty").agent.clone();
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
             session: self.session.clone(),
@@ -381,9 +382,12 @@ impl Driver {
                 timestamp: chrono::Utc::now(),
                 agent: agent.name.clone(),
                 call_id: call_id.clone(),
+                parent_call_id: None,
+                parent_child_index: None,
                 identity: provider_identity.clone(),
                 tool: seed.tool.clone(),
                 path: None,
+                mcp_server: None,
                 original_input_json: seed.args.clone(),
                 wire_input_json: seed.args.clone(),
                 recovery: crate::db::tool_calls::Recovery::Clean,
@@ -482,6 +486,7 @@ impl Driver {
         // honest (re-execute, never replay the caller's snapshot).
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: child.name.clone(),
+            current_tool_call_id: None,
             llm_mode: child.llm_mode,
             locks: self.locks.clone(),
             session: self.session.clone(),
@@ -561,6 +566,7 @@ impl Driver {
         let agent = self.stack.last().expect("stack never empty").agent.clone();
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
             session: self.session.clone(),
@@ -759,6 +765,7 @@ impl Driver {
         let args = serde_json::json!({ "name": skill_name });
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
             session: self.session.clone(),
@@ -848,9 +855,12 @@ impl Driver {
             timestamp: chrono::Utc::now(),
             agent: agent.name.clone(),
             call_id: call_id.clone(),
+            parent_call_id: None,
+            parent_child_index: None,
             identity: provider_identity.clone(),
             tool: "skill".to_string(),
             path: None,
+            mcp_server: None,
             original_input_json: args.clone(),
             wire_input_json: args.clone(),
             recovery: crate::db::tool_calls::Recovery::Clean,

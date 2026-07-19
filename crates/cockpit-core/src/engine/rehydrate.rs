@@ -1060,7 +1060,7 @@ fn rebuild_history(
                     pending.text_parts.push(text.to_string());
                 }
             }
-            "tool_call" if ev.agent.as_deref() == Some(root_agent) => {
+            "tool_call" if ev.agent.as_deref() == Some(root_agent) && !is_mcp_child_event(ev) => {
                 let Some(call_id) = ev.call_id.as_deref() else {
                     return Err(anyhow!("tool_call event without a call_id (corrupt row)"));
                 };
@@ -1353,6 +1353,13 @@ fn rebuild_history(
     crate::engine::delegation_prompt_prune::prune_completed_delegation_prompts(&mut history);
 
     Ok(history)
+}
+
+fn is_mcp_child_event(ev: &SessionEventRow) -> bool {
+    ev.data
+        .get("mcp_child")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn event_provider_call_id(ev: &SessionEventRow) -> Option<String> {
@@ -1884,9 +1891,12 @@ mod tests {
             timestamp: chrono::Utc::now(),
             agent: "Build".into(),
             call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
             identity: crate::session::ToolCallProviderIdentity::default(),
             tool: tool.into(),
             path: None,
+            mcp_server: None,
             original_input_json: original.clone(),
             wire_input_json: wire.clone(),
             recovery: Recovery::Clean,
@@ -1927,9 +1937,12 @@ mod tests {
             timestamp: chrono::Utc::now(),
             agent: "Build".into(),
             call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
             identity,
             tool: "read".into(),
             path: None,
+            mcp_server: None,
             original_input_json: json!({ "path": "/f" }),
             wire_input_json: json!({ "path": "/f" }),
             recovery: Recovery::Clean,
@@ -2109,6 +2122,90 @@ mod tests {
         assert_eq!(h.len(), 2);
         assert_eq!(user_text(&h[0]), "hello");
         assert_eq!(user_text(&h[1]), "after");
+    }
+
+    #[test]
+    fn rehydrate_model_context_omits_mcp_child_tool_events() {
+        let s = root_session();
+        record_user(&s, "use mcp");
+        record_assistant(&s, "infer-1", "calling mcp");
+        record_tool(
+            &s,
+            "outer-mcp",
+            "mcp",
+            json!({ "script": "mcp.invoke('cockpit', 'context_usage', {})" }),
+            json!({ "script": "mcp.invoke('cockpit', 'context_usage', {})" }),
+            "{\"ok\":true}",
+        );
+
+        s.record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".into(),
+            call_id: "outer-mcp:mcp:0".into(),
+            parent_call_id: Some("outer-mcp".into()),
+            parent_child_index: Some(0),
+            identity: crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+                "outer-mcp:mcp:0",
+                None,
+            ),
+            tool: "context_usage".into(),
+            path: None,
+            mcp_server: Some("cockpit".into()),
+            original_input_json: json!({
+                "server": "cockpit",
+                "tool": "context_usage",
+                "args": {}
+            }),
+            wire_input_json: json!({
+                "server": "cockpit",
+                "tool": "context_usage",
+                "args": {}
+            }),
+            recovery: Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: "{\"snapshot\":\"unavailable\"}".into(),
+            truncated: false,
+            duration_ms: 1,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            shape_fingerprint: None,
+            hint: None,
+        })
+        .unwrap();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::ToolCall,
+            Some("Build"),
+            Some("outer-mcp:mcp:0"),
+            &json!({
+                "tool": "context_usage",
+                "mcp_child": true,
+                "mcp_kind": "invoke",
+                "mcp_server": "cockpit",
+                "mcp_builtin": true,
+                "parent_call_id": "outer-mcp",
+                "parent_child_index": 0,
+                "wire_input": {
+                    "server": "cockpit",
+                    "tool": "context_usage",
+                    "args": {}
+                },
+                "output": "{\"snapshot\":\"unavailable\"}",
+            }),
+        )
+        .unwrap();
+
+        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let h = r.history;
+        assert_eq!(h.len(), 3);
+        let calls = assistant_calls(&h[1]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "mcp");
+        assert_eq!(tool_results(&h[2]).len(), 1);
+        assert_eq!(tool_result_body(&h[2]), "{\"ok\":true}");
     }
 
     #[test]
@@ -2423,9 +2520,12 @@ mod tests {
             timestamp: chrono::Utc::now(),
             agent: "Build".into(),
             call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
             identity: identity.clone(),
             tool: "skill".into(),
             path: None,
+            mcp_server: None,
             original_input_json: json!({ "name": "test-skill" }),
             wire_input_json: json!({ "name": "test-skill" }),
             recovery: Recovery::Clean,
@@ -2489,9 +2589,12 @@ mod tests {
             timestamp: chrono::Utc::now(),
             agent: "Build".into(),
             call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
             identity: identity.clone(),
             tool: "read".into(),
             path: Some("seed.txt".into()),
+            mcp_server: None,
             original_input_json: json!({ "path": "seed.txt" }),
             wire_input_json: json!({ "path": "seed.txt" }),
             recovery: Recovery::Clean,
@@ -4298,9 +4401,12 @@ mod tests {
             timestamp: chrono::Utc::now(),
             agent: "Build".into(),
             call_id: "tc-1".into(),
+            parent_call_id: None,
+            parent_child_index: None,
             identity: crate::session::ToolCallProviderIdentity::default(),
             tool: "read".into(),
             path: None,
+            mcp_server: None,
             original_input_json: json!({ "path": "/f" }),
             wire_input_json: json!({ "path": "/f" }),
             recovery: Recovery::ShapeRepair {

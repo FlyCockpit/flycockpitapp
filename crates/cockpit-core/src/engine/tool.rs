@@ -559,6 +559,11 @@ impl ToolOutput {
 #[derive(Clone)]
 pub struct ToolCtx {
     pub agent_id: String,
+    /// Current outer model tool-call id, when this context was built for a
+    /// live model-issued tool dispatch. Host-side tools can use it to parent
+    /// synthetic UI/telemetry events without exposing the id to tool schemas or
+    /// model-visible arguments.
+    pub current_tool_call_id: Option<String>,
     /// The active LLM-mode of the calling agent. Read by tools that vary
     /// *behavior* (not just description prose) on the defensive/normal axis —
     /// today only `bash`, which appends a defensive-mode-only file/search

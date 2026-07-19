@@ -238,6 +238,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     (
         ToolCtx {
             agent_id: "builder".to_string(),
+            current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,
             session: Arc::new(session),

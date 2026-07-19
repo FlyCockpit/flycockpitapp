@@ -426,6 +426,7 @@ mod tests {
         (
             ToolCtx {
                 agent_id: "helper".to_string(),
+                current_tool_call_id: None,
                 llm_mode: crate::config::extended::LlmMode::Normal,
                 locks,
                 session: Arc::new(session),

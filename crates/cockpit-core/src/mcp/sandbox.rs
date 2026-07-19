@@ -26,6 +26,8 @@
 //! sandbox cannot spawn ambient async work — every MCP call routes through
 //! the host.
 
+use std::time::Instant;
+
 use anyhow::{Result, bail};
 use monty::{
     DictPairs, ExcType, ExtFunctionResult, JsonMontyObject, LimitedTracker, MontyException,
@@ -33,7 +35,7 @@ use monty::{
 };
 use serde_json::Value;
 
-use super::builtin::HostContext;
+use super::builtin::{HostContext, McpChildDispatch};
 use super::config::McpConfig;
 
 const STDOUT_FALLBACK_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
@@ -88,6 +90,9 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
     loop {
         match progress {
             RunProgress::Complete(value) => {
+                if let Some(recorder) = &host.child_events {
+                    recorder.finish_suppressed().await;
+                }
                 return render_complete_value(&value, &stdout);
             }
             RunProgress::FunctionCall(call) => {
@@ -100,25 +105,40 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
                         Some(msg),
                     )),
                 };
-                progress = call
-                    .resume(ext, PrintWriter::CollectString(&mut stdout))
-                    .map_err(|e| anyhow::anyhow!("sandbox error: {}", exc_msg(&e)))?;
+                progress = match call.resume(ext, PrintWriter::CollectString(&mut stdout)) {
+                    Ok(progress) => progress,
+                    Err(e) => {
+                        if let Some(recorder) = &host.child_events {
+                            recorder.finish_suppressed().await;
+                        }
+                        return Err(anyhow::anyhow!("sandbox error: {}", exc_msg(&e)));
+                    }
+                };
             }
             RunProgress::NameLookup(lookup) => {
                 // Only `mcp` is provided (as an input). Any other free name
                 // is undefined — the script must use `mcp.*` exclusively.
                 let name = lookup.name.clone();
+                if let Some(recorder) = &host.child_events {
+                    recorder.finish_suppressed().await;
+                }
                 bail!("name `{name}` is not defined in the MCP sandbox (only `mcp` is available)");
             }
             RunProgress::OsCall(call) => {
                 // Deny-by-default: no filesystem, no env, no OS access. The
                 // VM's own handler raises PermissionError (FS) / RuntimeError.
                 let exc = call.function_call.on_no_handler();
+                if let Some(recorder) = &host.child_events {
+                    recorder.finish_suppressed().await;
+                }
                 bail!("sandbox denied OS access: {}", exc_msg(&exc));
             }
             RunProgress::ResolveFutures(_) => {
                 // We resolve every external call synchronously before
                 // resuming, so the VM never blocks on pending futures.
+                if let Some(recorder) = &host.child_events {
+                    recorder.finish_suppressed().await;
+                }
                 bail!("unexpected pending futures in MCP sandbox");
             }
         }
@@ -191,16 +211,42 @@ async fn dispatch(
                     return Err(format!("mcp.search(query) expects a string, got {other:?}"));
                 }
             };
-            let hits = super::catalog::search(cfg, host, &query).await;
-            Ok(hits_to_monty(&hits))
+            let dispatch = McpChildDispatch::new(
+                "search",
+                None,
+                "mcp.search",
+                None,
+                serde_json::json!({ "query": query }),
+            );
+            observe_child_monty(host, dispatch, async {
+                let hits = super::catalog::search(cfg, host, &query).await;
+                Ok((hits_to_monty(&hits), hits_to_json(&hits)))
+            })
+            .await
         }
         "describe" => {
             let server = str_arg(args, 0, "server", "mcp.describe")?;
             let tool = str_arg(args, 1, "tool", "mcp.describe")?;
-            match super::catalog::describe(cfg, host, &server, &tool).await {
-                Ok(desc) => Ok(descriptor_to_monty(&server, &desc)),
-                Err(e) => Err(format!("mcp.describe failed: {e}")),
-            }
+            let dispatch = McpChildDispatch::new(
+                "describe",
+                Some(server.clone()),
+                tool.clone(),
+                Some(super::builtin::is_builtin_server(&server)),
+                serde_json::json!({
+                    "server": server,
+                    "tool": tool
+                }),
+            );
+            observe_child_monty(host, dispatch, async {
+                match super::catalog::describe(cfg, host, &server, &tool).await {
+                    Ok(desc) => Ok((
+                        descriptor_to_monty(&server, &desc),
+                        descriptor_to_json(&server, &desc),
+                    )),
+                    Err(e) => Err(format!("mcp.describe failed: {e}")),
+                }
+            })
+            .await
         }
         "invoke" => {
             let server = str_arg(args, 0, "server", "mcp.invoke")?;
@@ -216,42 +262,129 @@ async fn dispatch(
                     None,
                     &server,
                     &tool,
-                    call_args,
+                    call_args.clone(),
                     "mcp.invoke",
                 ) {
                     crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => {
                         call_args = args;
                     }
                     crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
-                        return Err(format!("mcp.invoke failed: {message}"));
+                        let error = format!("mcp.invoke failed: {message}");
+                        let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
+                        if let Some(recorder) = &host.child_events
+                            && let Some(span) = recorder.start(dispatch).await
+                        {
+                            recorder.finish(span, Err(error.clone()), 0).await;
+                        }
+                        return Err(error);
                     }
                 }
             } else if let Some(server_cfg) = cfg.servers.get(&server) {
-                match crate::mcp::invoke_prep::prepare_invoke_args(
-                    &server,
-                    server_cfg,
-                    &tool,
-                    call_args,
-                    None,
-                    "mcp.invoke",
-                )
-                .await
-                {
-                    crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => {
-                        call_args = args;
-                    }
-                    crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
-                        return Err(format!("mcp.invoke failed: {message}"));
+                #[cfg(test)]
+                let skip_prepare_for_stub = host.has_test_external_invoke();
+                #[cfg(not(test))]
+                let skip_prepare_for_stub = false;
+                if !skip_prepare_for_stub {
+                    match crate::mcp::invoke_prep::prepare_invoke_args(
+                        &server,
+                        server_cfg,
+                        &tool,
+                        call_args.clone(),
+                        None,
+                        "mcp.invoke",
+                    )
+                    .await
+                    {
+                        crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => {
+                            call_args = args;
+                        }
+                        crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
+                            let error = format!("mcp.invoke failed: {message}");
+                            let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
+                            if let Some(recorder) = &host.child_events
+                                && let Some(span) = recorder.start(dispatch).await
+                            {
+                                recorder.finish(span, Err(error.clone()), 0).await;
+                            }
+                            return Err(error);
+                        }
                     }
                 }
             }
-            match super::catalog::invoke(cfg, host, &server, &tool, call_args).await {
-                Ok(v) => Ok(json_to_monty(&v)),
-                Err(e) => Err(format!("mcp.invoke failed: {e}")),
-            }
+            let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
+            observe_child(host, dispatch, async {
+                match super::catalog::invoke(cfg, host, &server, &tool, call_args).await {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(format!("mcp.invoke failed: {e}")),
+                }
+            })
+            .await
+            .map(|value| json_to_monty(&value))
         }
         other => Err(format!("unknown MCP sandbox function `mcp.{other}`")),
     }
+}
+
+fn invoke_child_dispatch(server: &str, tool: &str, call_args: &Value) -> McpChildDispatch {
+    McpChildDispatch::new(
+        "invoke",
+        Some(server.to_string()),
+        tool.to_string(),
+        Some(super::builtin::is_builtin_server(server)),
+        serde_json::json!({
+            "server": server,
+            "tool": tool,
+            "args": call_args
+        }),
+    )
+}
+
+async fn observe_child<F>(
+    host: &HostContext,
+    dispatch: McpChildDispatch,
+    work: F,
+) -> Result<Value, String>
+where
+    F: std::future::Future<Output = Result<Value, String>>,
+{
+    let span = match &host.child_events {
+        Some(recorder) => recorder.start(dispatch).await,
+        None => None,
+    };
+    let start = Instant::now();
+    let result = work.await;
+    if let (Some(recorder), Some(span)) = (&host.child_events, span) {
+        recorder
+            .finish(span, result.clone(), start.elapsed().as_millis() as u64)
+            .await;
+    }
+    result
+}
+
+async fn observe_child_monty<F>(
+    host: &HostContext,
+    dispatch: McpChildDispatch,
+    work: F,
+) -> Result<MontyObject, String>
+where
+    F: std::future::Future<Output = Result<(MontyObject, Value), String>>,
+{
+    let span = match &host.child_events {
+        Some(recorder) => recorder.start(dispatch).await,
+        None => None,
+    };
+    let start = Instant::now();
+    let result = work.await;
+    if let (Some(recorder), Some(span)) = (&host.child_events, span) {
+        let recorded = result
+            .as_ref()
+            .map(|(_obj, value)| value.clone())
+            .map_err(Clone::clone);
+        recorder
+            .finish(span, recorded, start.elapsed().as_millis() as u64)
+            .await;
+    }
+    result.map(|(obj, _value)| obj)
 }
 
 fn str_arg(
@@ -294,6 +427,10 @@ fn hits_to_monty(hits: &[super::catalog::SearchHit]) -> MontyObject {
     MontyObject::List(list)
 }
 
+fn hits_to_json(hits: &[super::catalog::SearchHit]) -> Value {
+    monty_to_json(&hits_to_monty(hits))
+}
+
 fn descriptor_to_monty(server: &str, desc: &super::protocol::ToolDescriptor) -> MontyObject {
     let pairs = vec![
         (
@@ -316,6 +453,10 @@ fn descriptor_to_monty(server: &str, desc: &super::protocol::ToolDescriptor) -> 
         ),
     ];
     MontyObject::Dict(DictPairs::from(pairs))
+}
+
+fn descriptor_to_json(server: &str, desc: &super::protocol::ToolDescriptor) -> Value {
+    monty_to_json(&descriptor_to_monty(server, desc))
 }
 
 /// Convert a JSON value into a `MontyObject` (host → sandbox).
@@ -351,12 +492,15 @@ fn monty_to_json(obj: &MontyObject) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::agent::TurnEvent;
     use crate::mcp::config::{DisclosureMode, ServerConfig, Transport};
+    use crate::session::Session;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc;
 
     fn test_builtin_host(open: bool) -> (HostContext, Arc<AtomicBool>) {
         let gate = Arc::new(AtomicBool::new(open));
@@ -364,6 +508,79 @@ mod tests {
             HostContext::empty_for_tests().with_test_builtin_gate(gate.clone()),
             gate,
         )
+    }
+
+    fn child_event_host(
+        root: &std::path::Path,
+        parent_call_id: &str,
+        gate_open: bool,
+    ) -> (
+        HostContext,
+        Arc<AtomicBool>,
+        Arc<Session>,
+        mpsc::Receiver<TurnEvent>,
+    ) {
+        let gate = Arc::new(AtomicBool::new(gate_open));
+        let mut ctx = crate::tools::common::test_ctx(root);
+        let (tx, rx) = mpsc::channel(32);
+        ctx.current_tool_call_id = Some(parent_call_id.to_string());
+        ctx.events = Some(tx);
+        let session = ctx.session.clone();
+        let host = HostContext::from_tool_ctx(&ctx).with_test_builtin_gate(gate.clone());
+        (host, gate, session, rx)
+    }
+
+    fn child_rows(
+        session: &Session,
+        parent_call_id: &str,
+    ) -> Vec<crate::db::tool_calls::ToolCallEvent> {
+        session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.parent_call_id.as_deref() == Some(parent_call_id))
+            .collect()
+    }
+
+    fn drain_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn child_starts(events: &[TurnEvent]) -> Vec<(&str, &Value)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ToolStart { tool, args, .. } => Some((tool.as_str(), args)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn configured_external_stub_cfg() -> McpConfig {
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert(
+            "external".into(),
+            ServerConfig {
+                transport: Transport::Stdio,
+                endpoint: None,
+                command: Some("not-executed-by-stub".to_string()),
+                args: vec![],
+                env: BTreeMap::new(),
+                env_credential_refs: BTreeMap::new(),
+                auth: Default::default(),
+                mode: DisclosureMode::Monty,
+                enabled: true,
+                cache_ttl_secs: 3600,
+                connect_timeout_secs: None,
+                timeout_secs: None,
+            },
+        );
+        cfg
     }
 
     fn write_config(root: &std::path::Path, body: &str) {
@@ -517,6 +734,217 @@ mod tests {
         .unwrap();
         assert!(out.contains("\"count\":3"), "{out}");
         assert!(out.contains("\"count_type\":\"int\""), "{out}");
+    }
+
+    #[tokio::test]
+    async fn builtin_invoke_emits_child_event() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, mut rx) = child_event_host(tmp.path(), "outer-mcp", true);
+
+        let out = run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': '3'})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("\"count\":3"), "{out}");
+        let rows = child_rows(&session, "outer-mcp");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "test_count");
+        assert_eq!(rows[0].mcp_server.as_deref(), Some("cockpit"));
+        assert_eq!(rows[0].parent_child_index, Some(0));
+        assert_eq!(
+            rows[0].wire_input_json,
+            serde_json::json!({
+                "server": "cockpit",
+                "tool": "test_count",
+                "args": { "count": 3 }
+            })
+        );
+        assert!(rows[0].output.contains("\"count_type\":\"int\""));
+
+        let events = drain_events(&mut rx);
+        let starts = child_starts(&events);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].0, "test_count");
+        assert_eq!(starts[0].1["mcp_kind"], "invoke");
+        assert_eq!(starts[0].1["mcp_server"], "cockpit");
+        assert_eq!(starts[0].1["mcp_builtin"], true);
+        assert_eq!(starts[0].1["parent_call_id"], "outer-mcp");
+        assert_eq!(starts[0].1["parent_child_index"], 0);
+    }
+
+    #[tokio::test]
+    async fn external_invoke_emits_child_event_marked_non_builtin() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, mut rx) = child_event_host(tmp.path(), "outer-ext", true);
+        let host = host.with_test_external_invoke(|server, tool, args| {
+            Ok(serde_json::json!({
+                "server": server,
+                "tool": tool,
+                "args": args
+            }))
+        });
+
+        let out = run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host)
+            .await
+            .unwrap();
+
+        assert!(out.contains("\"server\":\"external\""), "{out}");
+        let rows = child_rows(&session, "outer-ext");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "echo");
+        assert_eq!(rows[0].mcp_server.as_deref(), Some("external"));
+        assert_eq!(rows[0].parent_child_index, Some(0));
+
+        let events = drain_events(&mut rx);
+        let starts = child_starts(&events);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].1["mcp_builtin"], false);
+        assert_eq!(starts[0].1["mcp_server"], "external");
+    }
+
+    #[tokio::test]
+    async fn search_and_describe_emit_children() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, mut rx) = child_event_host(tmp.path(), "outer-search", true);
+
+        let out = run_with_host(
+            "mcp.search('test_count')\nmcp.describe('cockpit', 'test_count')",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("\"input_schema\""), "{out}");
+        let rows = child_rows(&session, "outer-search");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tool, "mcp.search");
+        assert_eq!(rows[1].tool, "test_count");
+        assert_eq!(rows[0].parent_child_index, Some(0));
+        assert_eq!(rows[1].parent_child_index, Some(1));
+
+        let events = drain_events(&mut rx);
+        let starts = child_starts(&events);
+        assert_eq!(starts[0].1["mcp_kind"], "search");
+        assert_eq!(starts[1].1["mcp_kind"], "describe");
+    }
+
+    #[tokio::test]
+    async fn multiple_dispatches_are_ordered_and_contiguous() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, _rx) = child_event_host(tmp.path(), "outer-order", true);
+
+        run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': 1})\n\
+             mcp.invoke('cockpit', 'test_count', {'count': 2})\n\
+             mcp.invoke('cockpit', 'test_count', {'count': 3})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        let indexes = child_rows(&session, "outer-order")
+            .into_iter()
+            .map(|row| row.parent_child_index.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(indexes, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_is_recorded_and_script_continues() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, _rx) = child_event_host(tmp.path(), "outer-fail", false);
+
+        let out = run_with_host(
+            "try:\n\
+             \tmcp.invoke('cockpit', 'test_count', {'count': 1})\n\
+             except Exception as e:\n\
+             \tfailed = str(e)\n\
+             mcp.invoke('cockpit', 'context_usage', {})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("\"total_tokens\""), "{out}");
+        let rows = child_rows(&session, "outer-fail");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].parent_child_index, Some(0));
+        assert!(rows[0].hard_fail);
+        assert!(rows[0].output.contains("test_count"));
+        assert_eq!(rows[1].parent_child_index, Some(1));
+        assert!(!rows[1].hard_fail);
+        assert_eq!(rows[1].tool, "context_usage");
+    }
+
+    #[tokio::test]
+    async fn child_persistence_failure_does_not_fail_outer_call() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, mut rx) = child_event_host(tmp.path(), "outer-persist", true);
+        let host = host.with_child_persistence_failure_for_tests();
+
+        let out = run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': '3'})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("\"count\":3"), "{out}");
+        assert!(child_rows(&session, "outer-persist").is_empty());
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, TurnEvent::ToolEnd { tool, .. } if tool == "test_count")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn child_emission_cap_is_visible() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _gate, session, mut rx) = child_event_host(tmp.path(), "outer-cap", true);
+        let host = host.with_child_event_cap_for_tests(2);
+
+        run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': 1})\n\
+             mcp.invoke('cockpit', 'test_count', {'count': 2})\n\
+             mcp.invoke('cockpit', 'test_count', {'count': 3})\n\
+             mcp.invoke('cockpit', 'test_count', {'count': 4})\n\
+             mcp.invoke('cockpit', 'test_count', {'count': 5})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        let rows = child_rows(&session, "outer-cap");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].parent_child_index, Some(0));
+        assert_eq!(rows[1].parent_child_index, Some(1));
+        assert_eq!(rows[2].parent_child_index, Some(2));
+        assert_eq!(rows[2].tool, "mcp.child_events_truncated");
+        assert!(rows[2].output.contains("3 further MCP dispatches"));
+
+        let events = drain_events(&mut rx);
+        let starts = child_starts(&events);
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[2].0, "mcp.child_events_truncated");
+        assert_eq!(starts[2].1["original_input"]["unrecorded_dispatches"], 3);
     }
 
     #[tokio::test]

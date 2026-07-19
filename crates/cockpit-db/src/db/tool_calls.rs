@@ -123,6 +123,8 @@ pub struct ToolCallEvent {
     pub event_id: Uuid,
     pub session_id: Uuid,
     pub call_id: String,
+    pub parent_call_id: Option<String>,
+    pub parent_child_index: Option<i64>,
     pub provider_item_id: Option<String>,
     pub provider_call_id: Option<String>,
     pub provider_call_id_source: Option<String>,
@@ -135,6 +137,7 @@ pub struct ToolCallEvent {
     pub project_root: String,
     pub agent: String,
     pub tool: String,
+    pub mcp_server: Option<String>,
     pub path: Option<String>,
     pub recovery: Recovery,
     pub hard_fail: bool,
@@ -186,32 +189,34 @@ impl Db {
         self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO tool_call_events (
-                    event_id, session_id, call_id, timestamp,
+                    event_id, session_id, call_id, parent_call_id, parent_child_index, timestamp,
                     provider_item_id, provider_call_id, provider_call_id_source,
                     wire_api, provider_family,
                     model, provider, project_id, project_root,
-                    agent, tool, path, language,
+                    agent, tool, mcp_server, path, language,
                     recovery_kind, recovery_stage, hard_fail,
                     exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                     original_input_json, wire_input_json,
                     output, truncated, duration_ms,
                     cockpit_version, llm_mode, shape_fingerprint, hint
                  ) VALUES (
-                    ?1, ?2, ?3, ?4,
-                    ?5, ?6, ?7,
-                    ?8, ?9,
-                    ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17,
-                    ?18, ?19, ?20,
-                    ?21, ?22, ?23, ?24,
-                    ?25, ?26,
-                    ?27, ?28, ?29,
-                    ?30, ?31, ?32, ?33
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    ?7, ?8, ?9,
+                    ?10, ?11,
+                    ?12, ?13, ?14, ?15,
+                    ?16, ?17, ?18, ?19,
+                    ?20, ?21, ?22,
+                    ?23, ?24, ?25, ?26,
+                    ?27, ?28,
+                    ?29, ?30, ?31,
+                    ?32, ?33, ?34, ?35, ?36
                  )",
                 params![
                     ev.event_id.to_string(),
                     ev.session_id.to_string(),
                     ev.call_id,
+                    ev.parent_call_id,
+                    ev.parent_child_index,
                     ev.timestamp,
                     ev.provider_item_id,
                     ev.provider_call_id,
@@ -224,6 +229,7 @@ impl Db {
                     ev.project_root,
                     ev.agent,
                     ev.tool,
+                    ev.mcp_server,
                     ev.path,
                     language,
                     recovery_kind,
@@ -284,11 +290,12 @@ impl Db {
             let (pred, params_vec) = where_sql.finish();
 
             let sql = format!(
-                "SELECT event_id, session_id, call_id, timestamp,
+                "SELECT event_id, session_id, call_id,
+                        parent_call_id, parent_child_index, timestamp,
                         provider_item_id, provider_call_id, provider_call_id_source,
                         wire_api, provider_family,
                         model, provider, project_id, project_root,
-                        agent, tool, path,
+                        agent, tool, mcp_server, path,
                         recovery_kind, recovery_stage, hard_fail,
                         exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                         original_input_json, wire_input_json,
@@ -330,11 +337,12 @@ impl Db {
         self.read_blocking(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT event_id, session_id, call_id, timestamp,
+                    "SELECT event_id, session_id, call_id,
+                            parent_call_id, parent_child_index, timestamp,
                             provider_item_id, provider_call_id, provider_call_id_source,
                             wire_api, provider_family,
                             model, provider, project_id, project_root,
-                            agent, tool, path,
+                            agent, tool, mcp_server, path,
                             recovery_kind, recovery_stage, hard_fail,
                             exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                             original_input_json, wire_input_json,
@@ -369,11 +377,12 @@ impl Db {
     ) -> Result<Vec<ToolCallEvent>> {
         let mut stmt = conn
             .prepare(
-                "SELECT event_id, session_id, call_id, timestamp,
+                "SELECT event_id, session_id, call_id,
+                        parent_call_id, parent_child_index, timestamp,
                         provider_item_id, provider_call_id, provider_call_id_source,
                         wire_api, provider_family,
                         model, provider, project_id, project_root,
-                        agent, tool, path,
+                        agent, tool, mcp_server, path,
                         recovery_kind, recovery_stage, hard_fail,
                         exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                         original_input_json, wire_input_json,
@@ -432,6 +441,8 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
         event_id,
         session_id: sid,
         call_id: row.get("call_id")?,
+        parent_call_id: row.get("parent_call_id")?,
+        parent_child_index: row.get("parent_child_index")?,
         provider_item_id: row.get("provider_item_id")?,
         provider_call_id: row.get("provider_call_id")?,
         provider_call_id_source: row.get("provider_call_id_source")?,
@@ -444,6 +455,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
         project_root: row.get("project_root")?,
         agent: row.get("agent")?,
         tool: row.get("tool")?,
+        mcp_server: row.get("mcp_server")?,
         path: row.get("path")?,
         recovery_kind,
         recovery_stage,
@@ -468,6 +480,8 @@ struct ToolCallEventRaw {
     event_id: String,
     session_id: String,
     call_id: String,
+    parent_call_id: Option<String>,
+    parent_child_index: Option<i64>,
     provider_item_id: Option<String>,
     provider_call_id: Option<String>,
     provider_call_id_source: Option<String>,
@@ -480,6 +494,7 @@ struct ToolCallEventRaw {
     project_root: String,
     agent: String,
     tool: String,
+    mcp_server: Option<String>,
     path: Option<String>,
     recovery_kind: Option<String>,
     recovery_stage: Option<String>,
@@ -523,6 +538,8 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
             event_id,
             session_id,
             call_id: r.call_id,
+            parent_call_id: r.parent_call_id,
+            parent_child_index: r.parent_child_index,
             provider_item_id: r.provider_item_id,
             provider_call_id: r.provider_call_id,
             provider_call_id_source: r.provider_call_id_source,
@@ -535,6 +552,7 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
             project_root: r.project_root,
             agent: r.agent,
             tool: r.tool,
+            mcp_server: r.mcp_server,
             path: r.path,
             recovery,
             hard_fail: r.hard_fail,
@@ -647,6 +665,45 @@ mod tests {
         s.session_id
     }
 
+    fn tool_call_fixture(sid: Uuid, call_id: &str, tool: &str, timestamp: i64) -> ToolCallEvent {
+        ToolCallEvent {
+            event_id: Uuid::new_v4(),
+            session_id: sid,
+            call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            provider_item_id: None,
+            provider_call_id: None,
+            provider_call_id_source: None,
+            wire_api: None,
+            provider_family: None,
+            timestamp,
+            model: "claude-opus-4-7".into(),
+            provider: "anthropic".into(),
+            project_id: "p".into(),
+            project_root: "/x".into(),
+            agent: "builder".into(),
+            tool: tool.into(),
+            mcp_server: None,
+            path: None,
+            recovery: Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            original_input_json: json!({}),
+            wire_input_json: json!({}),
+            output: String::new(),
+            truncated: false,
+            duration_ms: 0,
+            cockpit_version: None,
+            llm_mode: None,
+            shape_fingerprint: None,
+            hint: None,
+        }
+    }
+
     #[test]
     fn insert_and_list_round_trip() {
         let db = Db::open_in_memory().unwrap();
@@ -655,6 +712,8 @@ mod tests {
             event_id: Uuid::new_v4(),
             session_id: sid,
             call_id: "call-1".into(),
+            parent_call_id: None,
+            parent_child_index: None,
             provider_item_id: None,
             provider_call_id: None,
             provider_call_id_source: None,
@@ -668,6 +727,7 @@ mod tests {
             agent: "builder".into(),
             tool: "read".into(),
             path: Some("src/main.rs".into()),
+            mcp_server: None,
             recovery: Recovery::Clean,
             hard_fail: false,
             exit_code: None,
@@ -695,6 +755,61 @@ mod tests {
     }
 
     #[test]
+    fn child_rows_round_trip_with_parent_linkage() {
+        let db = Db::open_in_memory().unwrap();
+        let sid = fixture(&db);
+        let parent = tool_call_fixture(sid, "outer", "mcp", 100);
+        let mut child_a = tool_call_fixture(sid, "outer:mcp:0", "test_count", 101);
+        child_a.parent_call_id = Some("outer".into());
+        child_a.parent_child_index = Some(0);
+        child_a.mcp_server = Some("cockpit".into());
+        child_a.wire_input_json = json!({
+            "server": "cockpit",
+            "tool": "test_count",
+            "args": { "count": 1 }
+        });
+        let mut child_b = tool_call_fixture(sid, "outer:mcp:1", "echo", 102);
+        child_b.parent_call_id = Some("outer".into());
+        child_b.parent_child_index = Some(1);
+        child_b.mcp_server = Some("external".into());
+
+        db.insert_tool_call(&parent).unwrap();
+        db.insert_tool_call(&child_a).unwrap();
+        db.insert_tool_call(&child_b).unwrap();
+
+        let rows = db.list_tool_calls_for_session(sid).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].parent_call_id, None);
+        assert_eq!(rows[0].parent_child_index, None);
+        assert_eq!(rows[0].mcp_server, None);
+        assert_eq!(rows[1].parent_call_id.as_deref(), Some("outer"));
+        assert_eq!(rows[1].parent_child_index, Some(0));
+        assert_eq!(rows[1].mcp_server.as_deref(), Some("cockpit"));
+        assert_eq!(rows[1].wire_input_json["args"]["count"], 1);
+        assert_eq!(rows[2].parent_call_id.as_deref(), Some("outer"));
+        assert_eq!(rows[2].parent_child_index, Some(1));
+        assert_eq!(rows[2].mcp_server.as_deref(), Some("external"));
+    }
+
+    #[test]
+    fn existing_call_sites_unchanged() {
+        let db = Db::open_in_memory().unwrap();
+        let sid = fixture(&db);
+        let ev = tool_call_fixture(sid, "top-level", "read", 100);
+
+        db.insert_tool_call(&ev).unwrap();
+
+        let rows = db.list_tool_calls_for_session(sid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parent_call_id, None);
+        assert_eq!(rows[0].parent_child_index, None);
+        assert_eq!(rows[0].mcp_server, None);
+        assert_eq!(rows[0].tool, ev.tool);
+        assert_eq!(rows[0].wire_input_json, ev.wire_input_json);
+        assert_eq!(rows[0].output, ev.output);
+    }
+
+    #[test]
     fn list_failed_tool_calls_filters_correctly() {
         let db = Db::open_in_memory().unwrap();
         let sid = fixture(&db);
@@ -702,6 +817,8 @@ mod tests {
             event_id: Uuid::new_v4(),
             session_id: sid,
             call_id: "c".into(),
+            parent_call_id: None,
+            parent_child_index: None,
             provider_item_id: None,
             provider_call_id: None,
             provider_call_id_source: None,
@@ -715,6 +832,7 @@ mod tests {
             agent: "builder".into(),
             tool: tool.into(),
             path: None,
+            mcp_server: None,
             recovery,
             hard_fail,
             exit_code: None,
@@ -813,6 +931,8 @@ mod tests {
             event_id: Uuid::new_v4(),
             session_id: sid,
             call_id: "c".into(),
+            parent_call_id: None,
+            parent_child_index: None,
             provider_item_id: None,
             provider_call_id: None,
             provider_call_id_source: None,
@@ -826,6 +946,7 @@ mod tests {
             agent: "builder".into(),
             tool: "read".into(),
             path: Some("a.py".into()),
+            mcp_server: None,
             recovery: Recovery::Clean,
             hard_fail: false,
             exit_code: None,
@@ -863,6 +984,8 @@ mod tests {
             event_id: Uuid::new_v4(),
             session_id: sid,
             call_id: "c".into(),
+            parent_call_id: None,
+            parent_child_index: None,
             provider_item_id: None,
             provider_call_id: None,
             provider_call_id_source: None,
@@ -876,6 +999,7 @@ mod tests {
             agent: "builder".into(),
             tool: "read".into(),
             path: None,
+            mcp_server: None,
             recovery: Recovery::Clean,
             hard_fail: true,
             exit_code: None,
@@ -944,6 +1068,8 @@ mod tests {
             event_id: Uuid::new_v4().to_string(),
             session_id: Uuid::new_v4().to_string(),
             call_id: "c".into(),
+            parent_call_id: None,
+            parent_child_index: None,
             provider_item_id: None,
             provider_call_id: None,
             provider_call_id_source: None,
@@ -956,6 +1082,7 @@ mod tests {
             project_root: "/".into(),
             agent: "a".into(),
             tool: "t".into(),
+            mcp_server: None,
             path: None,
             recovery_kind: Some("unknown_future_kind".into()),
             recovery_stage: Some("stage".into()),

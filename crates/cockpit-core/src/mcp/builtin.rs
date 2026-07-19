@@ -107,6 +107,7 @@ struct BuiltinFunction {
     description: &'static str,
     input_schema: fn() -> Value,
     availability: fn(&HostContext) -> Availability,
+    check_availability_on_invoke: bool,
     handler: BuiltinHandler,
 }
 
@@ -163,7 +164,9 @@ pub async fn invoke(ctx: &HostContext, tool: &str, args: Value) -> Result<Value>
     let Some(func) = registry().into_iter().find(|func| func.name == tool) else {
         bail!("unknown MCP tool `{BUILTIN_SERVER_ID}.{tool}`");
     };
-    ensure_available(ctx, &func)?;
+    if func.check_availability_on_invoke {
+        ensure_available(ctx, &func)?;
+    }
     (func.handler)(ctx, args).await
 }
 
@@ -185,9 +188,10 @@ fn registry() -> Vec<BuiltinFunction> {
     let mut funcs = vec![
         BuiltinFunction {
             name: "rename_session",
-            description: "Set an auto-generated session title when auto-titling is disabled",
+            description: "Set an auto-generated session title when this session needs one",
             input_schema: rename_session_schema,
             availability: rename_session_availability,
+            check_availability_on_invoke: false,
             handler: rename_session,
         },
         BuiltinFunction {
@@ -195,6 +199,7 @@ fn registry() -> Vec<BuiltinFunction> {
             description: "Schedule compaction of the root context at the next safe boundary",
             input_schema: empty_object_schema,
             availability: |_ctx| Availability::available(),
+            check_availability_on_invoke: true,
             handler: request_compact,
         },
         BuiltinFunction {
@@ -202,6 +207,7 @@ fn registry() -> Vec<BuiltinFunction> {
             description: "Return the turn-start context-pressure snapshot for this agent frame",
             input_schema: empty_object_schema,
             availability: |_ctx| Availability::available(),
+            check_availability_on_invoke: true,
             handler: context_usage,
         },
     ];
@@ -232,7 +238,10 @@ fn rename_session_schema() -> Value {
 }
 
 fn rename_session_availability(ctx: &HostContext) -> Availability {
-    if auto_title_model_configured(ctx) {
+    let Some(session) = ctx.session.as_ref() else {
+        return Availability::unavailable("rename_session requires a live session");
+    };
+    if !session.agent_rename_session_available(auto_title_model_configured(ctx)) {
         return Availability::unavailable(
             "session auto-titling is configured; the utility model owns titles",
         );
@@ -262,11 +271,6 @@ fn rename_session<'a>(
         if name.chars().count() > 200 {
             bail!("`cockpit.rename_session` title must be 200 characters or fewer");
         }
-        if auto_title_model_configured(ctx) {
-            bail!(
-                "`cockpit.rename_session` is unavailable: session auto-titling is configured; the utility model owns titles"
-            );
-        }
         let session = ctx
             .session
             .as_ref()
@@ -283,6 +287,11 @@ fn rename_session<'a>(
         }
         if row.ephemeral {
             bail!("`cockpit.rename_session` is unavailable: ephemeral sessions are never titled");
+        }
+        if !session.agent_rename_session_invoke_allowed(auto_title_model_configured(ctx)) {
+            bail!(
+                "`cockpit.rename_session` is unavailable: session auto-titling is configured; the utility model owns titles"
+            );
         }
         let updated = session.set_explicit_auto_title(name)?;
         if !updated {
@@ -365,6 +374,7 @@ fn register_test_builtin(funcs: &mut Vec<BuiltinFunction>) {
                 Availability::unavailable("test builtin gate is closed")
             }
         },
+        check_availability_on_invoke: true,
         handler: |_ctx, args| {
             Box::pin(async move {
                 let count = args.get("count").cloned().unwrap_or(Value::Null);
@@ -423,8 +433,14 @@ mod tests {
         HostContext::from_tool_ctx(&ctx)
     }
 
+    fn advance_title_turns(session: &Session, turns: usize) {
+        for turn in 1..=turns {
+            let _ = session.note_user_content(&format!("turn {turn}"));
+        }
+    }
+
     #[tokio::test]
-    async fn rename_session_gated_on_auto_title_ref() {
+    async fn rename_session_available_when_untitled_past_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
@@ -440,6 +456,8 @@ mod tests {
         assert_eq!(desc.name, "rename_session");
 
         write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        let session = host.session.as_ref().unwrap();
+        advance_title_turns(session, 3);
         assert!(
             !search(&host, "rename_session")
                 .iter()
@@ -447,14 +465,106 @@ mod tests {
         );
         let err = describe(&host, "rename_session").unwrap_err();
         assert!(err.to_string().contains("auto-titling is configured"));
-        let err = invoke(
+
+        advance_title_turns(session, 8);
+        assert!(
+            search(&host, "rename_session")
+                .iter()
+                .any(|hit| hit.tool == "rename_session")
+        );
+        let out = invoke(
             &host,
             "rename_session",
             serde_json::json!({ "name": "A title" }),
         )
         .await
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(out["title"], "A title");
+    }
+
+    #[tokio::test]
+    async fn rename_session_unavailable_when_titled() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        let host = host(tmp.path());
+        let session = host.session.as_ref().unwrap();
+        advance_title_turns(session, 8);
+        assert!(session.set_auto_title("robot title").unwrap());
+
+        assert!(
+            !search(&host, "rename_session")
+                .iter()
+                .any(|hit| hit.tool == "rename_session")
+        );
+        let err = describe(&host, "rename_session").unwrap_err();
         assert!(err.to_string().contains("auto-titling is configured"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_invoke_allows_titled_after_threshold_race() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        let host = host(tmp.path());
+        let session = host.session.as_ref().unwrap();
+        advance_title_turns(session, 8);
+        assert!(session.set_auto_title("late utility title").unwrap());
+        assert!(
+            !search(&host, "rename_session")
+                .iter()
+                .any(|hit| hit.tool == "rename_session"),
+            "search/describe availability should still hide already-titled sessions"
+        );
+
+        let out = invoke(
+            &host,
+            "rename_session",
+            serde_json::json!({ "name": "agent race title" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out["title"], "agent race title");
+        let row = session.db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("agent race title"));
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn rename_session_still_refuses_user_renamed_and_ephemeral() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        let host = host(tmp.path());
+        let session = host.session.as_ref().unwrap();
+        advance_title_turns(session, 8);
+        session.db.rename_session(session.id, "manual").unwrap();
+        let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("manually named"), "{err}");
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent =
+            crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let side = db.create_ephemeral_fork(parent.id, None).unwrap();
+        let session = Arc::new(
+            crate::session::Session::resume(db, side.session_id)
+                .unwrap()
+                .unwrap(),
+        );
+        advance_title_turns(&session, 8);
+        let host = HostContext {
+            db: Some(session.db.clone()),
+            session_id: Some(session.id),
+            cwd: tmp.path().to_path_buf(),
+            session: Some(session),
+            root_agent_frame: true,
+            context_usage: None,
+            test_builtin_gate: None,
+        };
+        let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ephemeral"));
     }
 
     #[tokio::test]
@@ -491,31 +601,22 @@ mod tests {
     #[tokio::test]
     async fn rename_session_refuses_user_renamed() {
         let tmp = tempfile::tempdir().unwrap();
-        write_config(
-            tmp.path(),
-            r#"{ "utility_model": null, "auto_title": null }"#,
-        );
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
         let host = host(tmp.path());
         let session = host.session.as_ref().unwrap();
+        advance_title_turns(session, 8);
         session.db.rename_session(session.id, "manual").unwrap();
 
-        let err = invoke(
-            &host,
-            "rename_session",
-            serde_json::json!({ "name": "agent" }),
-        )
-        .await
-        .unwrap_err();
+        let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("manually named"));
     }
 
     #[tokio::test]
     async fn rename_session_refuses_ephemeral() {
         let tmp = tempfile::tempdir().unwrap();
-        write_config(
-            tmp.path(),
-            r#"{ "utility_model": null, "auto_title": null }"#,
-        );
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
         let db = crate::db::Db::open_in_memory().unwrap();
         let parent =
             crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
@@ -534,14 +635,11 @@ mod tests {
             context_usage: None,
             test_builtin_gate: None,
         };
+        advance_title_turns(host.session.as_ref().unwrap(), 8);
 
-        let err = invoke(
-            &host,
-            "rename_session",
-            serde_json::json!({ "name": "agent" }),
-        )
-        .await
-        .unwrap_err();
+        let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("ephemeral"));
     }
 

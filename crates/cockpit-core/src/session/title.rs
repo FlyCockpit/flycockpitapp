@@ -39,6 +39,50 @@ impl Session {
         *self.user_renamed.lock().unwrap()
     }
 
+    pub(crate) fn agent_rename_session_available(&self, auto_title_configured: bool) -> bool {
+        let Ok(Some(row)) = self.db.get_session(self.id) else {
+            return false;
+        };
+        if row.user_renamed || row.ephemeral {
+            return false;
+        }
+        if !auto_title_configured {
+            return true;
+        }
+        row.title.is_none() && self.title_nudge_threshold_reached()
+    }
+
+    pub(crate) fn agent_rename_session_invoke_allowed(&self, auto_title_configured: bool) -> bool {
+        let Ok(Some(row)) = self.db.get_session(self.id) else {
+            return false;
+        };
+        if row.user_renamed || row.ephemeral {
+            return false;
+        }
+        !auto_title_configured || self.title_nudge_threshold_reached()
+    }
+
+    pub(crate) fn unnamed_session_title_nudge(
+        &self,
+        mcp_present: bool,
+        root_agent_frame: bool,
+    ) -> Option<String> {
+        if !root_agent_frame {
+            return None;
+        }
+        let slot = self.title_nudge_due_slot_this_turn()?;
+        if !mcp_present {
+            return None;
+        }
+        let row = self.db.get_session(self.id).ok().flatten()?;
+        if row.user_renamed || row.ephemeral || row.title.is_some() {
+            return None;
+        }
+        Some(format!(
+            "This session is still unnamed after {slot} user turns. Name it now with mcp.invoke(\"cockpit\", \"rename_session\", {{\"name\": \"short-title\"}})."
+        ))
+    }
+
     /// Fold a chunk of RAW typed user content (pre-skill-injection) into the
     /// running estimate and decide the bounded auto-title action.
     ///
@@ -75,6 +119,9 @@ impl Session {
                 scheduled_title_slot(user_turns, self.title_stage.load(Ordering::Relaxed))
         {
             self.title_stage.store(slot, Ordering::Relaxed);
+            if slot >= 8 {
+                self.title_nudge_slot_pending.store(slot, Ordering::Relaxed);
+            }
             self.persist_title_progress();
             return if slot == 1 {
                 TitleAction::Eager
@@ -87,6 +134,19 @@ impl Session {
             self.persist_title_progress();
         }
         TitleAction::None
+    }
+
+    fn title_nudge_threshold_reached(&self) -> bool {
+        let slot = self.title_stage.load(Ordering::Relaxed);
+        TITLE_SCHEDULE_SLOTS.contains(&slot) && slot >= 8
+    }
+
+    fn title_nudge_due_slot_this_turn(&self) -> Option<u8> {
+        let slot = self.title_nudge_slot_pending.swap(0, Ordering::Relaxed);
+        (TITLE_SCHEDULE_SLOTS.contains(&slot)
+            && slot >= 8
+            && self.user_content_turns.load(Ordering::Relaxed) >= usize::from(slot))
+        .then_some(slot)
     }
 
     /// Compatibility hook retained for older call sites/tests. The schedule is

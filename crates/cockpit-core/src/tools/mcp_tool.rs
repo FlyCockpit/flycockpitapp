@@ -55,14 +55,12 @@ pub(crate) fn current_mcp_description_adverts(
     cwd: &std::path::Path,
 ) -> Vec<String> {
     let mut adverts = Vec::new();
-    let auto_title_disabled = crate::config::extended::load_for_cwd(cwd)
+    let auto_title_configured = crate::config::extended::load_for_cwd(cwd)
         .auto_title_model_ref()
-        .is_none();
-    let session_row = session.db.get_session(session.id).ok().flatten();
-    let ephemeral = session_row.as_ref().is_some_and(|row| row.ephemeral);
-    if auto_title_disabled && !session.user_renamed() && !ephemeral {
+        .is_some();
+    if session.agent_rename_session_available(auto_title_configured) {
         adverts.push(
-            "Session auto-titling is disabled; you may name this session via mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": ...})."
+            "This session may be named via mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": ...})."
                 .to_string(),
         );
     }
@@ -289,25 +287,100 @@ mod tests {
     }
 
     #[test]
-    fn advert_rename_follows_auto_title_gate() {
+    fn advert_matches_gate() {
+        for auto_title_configured in [false, true] {
+            for titled in [false, true] {
+                for past_threshold in [false, true] {
+                    for user_renamed in [false, true] {
+                        for ephemeral in [false, true] {
+                            let tmp = tempfile::tempdir().unwrap();
+                            if auto_title_configured {
+                                write_config(
+                                    tmp.path(),
+                                    r#"{ "utility_model": "openai:gpt-4.1-mini" }"#,
+                                );
+                            } else {
+                                write_config(
+                                    tmp.path(),
+                                    r#"{ "utility_model": null, "auto_title": null }"#,
+                                );
+                            }
+                            let ctx = if ephemeral {
+                                let db = crate::db::Db::open_in_memory().unwrap();
+                                let parent = crate::session::Session::create(
+                                    db.clone(),
+                                    tmp.path().to_path_buf(),
+                                    "Build",
+                                )
+                                .unwrap();
+                                let side = db.create_ephemeral_fork(parent.id, None).unwrap();
+                                let session = Arc::new(
+                                    crate::session::Session::resume(db, side.session_id)
+                                        .unwrap()
+                                        .unwrap(),
+                                );
+                                crate::engine::tool::ToolCtx {
+                                    session,
+                                    ..crate::tools::common::test_ctx(tmp.path())
+                                }
+                            } else {
+                                crate::tools::common::test_ctx(tmp.path())
+                            };
+                            if past_threshold {
+                                for turn in 1..=8 {
+                                    let _ = ctx.session.note_user_content(&format!("turn {turn}"));
+                                }
+                            } else {
+                                for turn in 1..=3 {
+                                    let _ = ctx.session.note_user_content(&format!("turn {turn}"));
+                                }
+                            }
+                            if titled && !ephemeral {
+                                assert!(ctx.session.set_auto_title("robot title").unwrap());
+                            }
+                            if user_renamed {
+                                ctx.session
+                                    .db
+                                    .rename_session(ctx.session.id, "manual")
+                                    .unwrap();
+                            }
+
+                            let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+                            let has_rename_advert = adverts
+                                .iter()
+                                .any(|advert| advert.contains("rename_session"));
+                            assert_eq!(
+                                has_rename_advert,
+                                ctx.session
+                                    .agent_rename_session_available(auto_title_configured),
+                                "auto_title_configured={auto_title_configured} titled={titled} past_threshold={past_threshold} user_renamed={user_renamed} ephemeral={ephemeral}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn description_byte_identical_when_no_advert() {
         let tmp = tempfile::tempdir().unwrap();
-        write_config(
-            tmp.path(),
-            r#"{ "utility_model": null, "auto_title": null }"#,
-        );
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
         let ctx = crate::tools::common::test_ctx(tmp.path());
         let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
+        for turn in 1..=3 {
+            let _ = ctx.session.note_user_content(&format!("turn {turn}"));
+        }
 
         let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
-        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
+        assert!(
+            !adverts
+                .iter()
+                .any(|advert| advert.contains("rename_session"))
+        );
+        assert!(!apply_mcp_description_adverts(&mut toolbox, &adverts));
         let desc = mcp_description(&toolbox);
-        assert!(desc.contains("rename_session"), "{desc}");
-
-        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
-        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
-        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
-        let desc = mcp_description(&toolbox);
-        assert!(!desc.contains("rename_session"), "{desc}");
+        assert_eq!(desc, NORMAL_DESCRIPTION);
     }
 
     #[test]

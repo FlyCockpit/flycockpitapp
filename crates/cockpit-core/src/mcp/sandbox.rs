@@ -366,6 +366,12 @@ mod tests {
         )
     }
 
+    fn write_config(root: &std::path::Path, body: &str) {
+        let dir = root.join(".cockpit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), body).unwrap();
+    }
+
     #[tokio::test]
     async fn runs_trivial_script_and_returns_value() {
         let cfg = McpConfig::default();
@@ -465,6 +471,37 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not available"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rename_session_invoke_reaches_handler_after_title_race() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        let tool_ctx = crate::tools::common::test_ctx(tmp.path());
+        let host = HostContext::from_tool_ctx(&tool_ctx);
+        let session = host.session.as_ref().unwrap();
+        for turn in 1..=8 {
+            let _ = session.note_user_content(&format!("turn {turn}"));
+        }
+        assert!(session.set_auto_title("late utility title").unwrap());
+        let out = run_with_host("mcp.search('rename_session')", &cfg, &host)
+            .await
+            .unwrap();
+        assert!(!out.contains("rename_session"), "{out}");
+
+        let out = run_with_host(
+            "mcp.invoke('cockpit', 'rename_session', {'name': 'agent race title'})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("\"title\":\"agent race title\""), "{out}");
+        let row = session.db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("agent race title"));
+        assert!(!row.user_renamed);
     }
 
     #[tokio::test]

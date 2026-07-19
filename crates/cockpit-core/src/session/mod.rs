@@ -209,6 +209,11 @@ pub struct Session {
     /// `sessions.title_stage` column so a resumed session never repeats the
     /// same automatic refresh opportunity.
     title_stage: AtomicU8,
+    /// In-memory marker for the title-nudge slot just consumed by
+    /// [`Self::note_user_content`]. This is deliberately not durable: a
+    /// resumed session has already passed any previous slot and must not
+    /// re-nudge it.
+    title_nudge_slot_pending: AtomicU8,
     /// Latches once a genuine auto-title failure has surfaced a user
     /// `Notice` (§17d / implementation note), so
     /// a broken/unset utility model is reported once per session rather
@@ -1169,6 +1174,81 @@ mod tests {
             s.note_user_content("third user turn after a missed title slot"),
             TitleAction::Refine,
             "the second user turn still uses the slot-2 refresh, not a repeated eager slot"
+        );
+    }
+
+    #[test]
+    fn nudge_fires_at_slot_8_and_16_only_when_untitled() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let observed: Vec<_> = (1..=17)
+            .filter_map(|turn| {
+                let _ = s.note_user_content(&format!("turn {turn}"));
+                s.unnamed_session_title_nudge(true, true)
+                    .map(|nudge| (turn, nudge))
+            })
+            .collect();
+
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, 8);
+        assert!(observed[0].1.contains("after 8 user turns"));
+        assert_eq!(observed[1].0, 16);
+        assert!(observed[1].1.contains("after 16 user turns"));
+    }
+
+    #[test]
+    fn nudge_does_not_fire_once_titled() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let observed: Vec<_> = (1..=17)
+            .filter_map(|turn| {
+                let _ = s.note_user_content(&format!("turn {turn}"));
+                if turn == 3 {
+                    assert!(s.set_auto_title("robot-title").unwrap());
+                }
+                s.unnamed_session_title_nudge(true, true)
+                    .map(|nudge| (turn, nudge))
+            })
+            .collect();
+
+        assert!(observed.is_empty(), "{observed:?}");
+    }
+
+    #[test]
+    fn resumed_session_does_not_renudge_a_passed_slot() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
+        let id = s.id;
+        for turn in 1..=8 {
+            s.record_event(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("a"),
+                None,
+                &json!({"text": format!("turn {turn}")}),
+            )
+            .unwrap();
+            let _ = s.note_user_content(&format!("turn {turn}"));
+        }
+        assert_eq!(s.title_stage(), 8);
+        drop(s);
+
+        let resumed = Session::resume(db, id).unwrap().unwrap();
+        assert_eq!(resumed.user_content_turns(), 8);
+        assert_eq!(resumed.title_stage(), 8);
+        assert!(
+            resumed.unnamed_session_title_nudge(true, true).is_none(),
+            "resuming past slot 8 must not re-arm the in-memory nudge"
+        );
+        for turn in 9..=15 {
+            let _ = resumed.note_user_content(&format!("turn {turn}"));
+            assert!(resumed.unnamed_session_title_nudge(true, true).is_none());
+        }
+        let _ = resumed.note_user_content("turn 16");
+        assert!(
+            resumed
+                .unnamed_session_title_nudge(true, true)
+                .unwrap()
+                .contains("after 16 user turns")
         );
     }
 

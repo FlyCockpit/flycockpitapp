@@ -613,10 +613,7 @@ pub(crate) async fn run_turn(
     let active_tools = turn_toolbox(agent, &session, &cwd);
     let tools = active_tools.definitions(agent.llm_mode);
 
-    let sandbox_escalate_present = active_tools.names().contains(&"escalate");
-    if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
-        history.push(Message::System { content: notice });
-    }
+    inject_turn_start_system_messages(&session, &active_tools, is_root, history);
 
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.
@@ -1414,6 +1411,27 @@ pub(crate) async fn run_turn(
     Ok(TurnOutcome::Continue)
 }
 
+fn inject_turn_start_system_messages(
+    session: &Session,
+    active_tools: &ToolBox,
+    is_root: bool,
+    history: &mut Vec<Message>,
+) {
+    let active_tool_names = active_tools.names();
+    let sandbox_escalate_present = active_tool_names.contains(&"escalate");
+    if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
+        history.push(Message::System { content: notice });
+    }
+    if let Some(nudge) =
+        session.unnamed_session_title_nudge(active_tool_names.contains(&"mcp"), is_root)
+        && !history
+            .iter()
+            .any(|message| matches!(message, Message::System { content } if content == &nudge))
+    {
+        history.push(Message::System { content: nudge });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1491,86 @@ mod tests {
             signature: None,
             additional_params: None,
         }
+    }
+
+    #[test]
+    fn nudge_is_injected_as_system_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        for turn in 1..=8 {
+            let _ = session.note_user_content(&format!("turn {turn}"));
+        }
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let mut history = Vec::new();
+
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+
+        let nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content } if content.contains("rename_session") => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("after 8 user turns"));
+
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        let nudge_count = history
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::System { content } if content.contains("rename_session"))
+            })
+            .count();
+        assert_eq!(nudge_count, 1, "same-slot nudge is one-shot");
+    }
+
+    #[test]
+    fn nudge_does_not_fire_for_subagent_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        for turn in 1..=8 {
+            let _ = session.note_user_content(&format!("turn {turn}"));
+        }
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let mut history = Vec::new();
+
+        inject_turn_start_system_messages(&session, &toolbox, false, &mut history);
+
+        assert!(
+            history.iter().all(
+                |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
+            ),
+            "{history:?}"
+        );
+    }
+
+    #[test]
+    fn nudge_is_suppressed_without_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        for turn in 1..=8 {
+            let _ = session.note_user_content(&format!("turn {turn}"));
+        }
+        let toolbox = ToolBox::new();
+        let mut history = Vec::new();
+
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+
+        assert!(
+            history.iter().all(
+                |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
+            ),
+            "{history:?}"
+        );
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        assert!(
+            history.iter().all(
+                |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
+            ),
+            "suppressed unactionable nudge must not carry into a later turn"
+        );
     }
 
     #[tokio::test]

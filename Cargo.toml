@@ -26,6 +26,7 @@ brush-parser = "0.4"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 csv = "1"
+croner = "3.0.1"
 dirs = "6"
 dotenvy = "0.15"
 firecrawl = "2"

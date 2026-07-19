@@ -118,6 +118,9 @@ async fn handle_request(
             image_refs,
             forced_skill,
         } => {
+            if let Some(scheduler) = &ctx.scheduler {
+                scheduler.record_user_activity();
+            }
             // New-user-work gate (`daemon-graceful-drain-shutdown.md`): once
             // a drain begins, reject new turns with a short notice rather
             // than silently dropping or queuing them. In-flight turns keep
@@ -591,6 +594,40 @@ async fn handle_request(
             request_id,
             session_id,
         } => promote_resource_request(ctx, &request_id, session_id),
+
+        Request::CreateScheduledJob { job } => {
+            let scheduler = require_scheduler(ctx)?;
+            let job = scheduler.create_job(job).map_err(internal)?;
+            Ok(Response::ScheduledJob { job })
+        }
+        Request::ListScheduledJobs { owner } => {
+            let scheduler = require_scheduler(ctx)?;
+            let jobs = scheduler
+                .list_jobs(owner.as_deref())
+                .map_err(internal)?;
+            Ok(Response::ScheduledJobs { jobs })
+        }
+        Request::DeleteScheduledJob { id } => {
+            let scheduler = require_scheduler(ctx)?;
+            let deleted = scheduler.delete_job(&id).map_err(internal)?;
+            Ok(Response::ScheduledJobDeleted { id, deleted })
+        }
+        Request::SetScheduledJobEnabled { id, enabled } => {
+            let scheduler = require_scheduler(ctx)?;
+            let job = scheduler
+                .set_enabled(&id, enabled)
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!("scheduled job `{id}` not found"),
+                })?;
+            Ok(Response::ScheduledJob { job })
+        }
+        Request::RunScheduledJob { id } => {
+            let scheduler = require_scheduler(ctx)?;
+            let result = scheduler.run_now(&id).await.map_err(internal)?;
+            Ok(Response::ScheduledJobRun { id, result })
+        }
 
         Request::ListAgents => Err(not_implemented("ListAgents")),
         Request::ListModels { .. } => Err(not_implemented("ListModels")),

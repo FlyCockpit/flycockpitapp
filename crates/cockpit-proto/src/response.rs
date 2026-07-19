@@ -160,6 +160,24 @@ pub enum Response {
         snapshot: ResourceSchedulerSnapshot,
     },
 
+    ScheduledJob {
+        job: ScheduledJobSummary,
+    },
+
+    ScheduledJobs {
+        jobs: Vec<ScheduledJobSummary>,
+    },
+
+    ScheduledJobDeleted {
+        id: String,
+        deleted: bool,
+    },
+
+    ScheduledJobRun {
+        id: String,
+        result: ScheduledJobLastResult,
+    },
+
     Agents {
         agents: Vec<AgentSummary>,
     },

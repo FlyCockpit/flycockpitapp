@@ -526,6 +526,13 @@ fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     }
 }
 
+fn require_scheduler(ctx: &DaemonContext) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
+    ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "scheduler is only available in the shared daemon".to_string(),
+    })
+}
+
 fn workspace_trust_error(err: anyhow::Error) -> ErrorPayload {
     if err
         .downcast_ref::<crate::config::trust::WorkspaceTrustError>()
@@ -603,4 +610,3 @@ mod sessions_activity_tests {
         );
     }
 }
-

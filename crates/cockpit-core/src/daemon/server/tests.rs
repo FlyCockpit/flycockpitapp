@@ -781,8 +781,8 @@ mod tests {
         assert_eq!(rows[0].path.as_deref(), Some("src/main.rs"));
     }
 
-    #[test]
-    fn resource_scheduler_is_shared_only_for_persistent_daemons() {
+    #[tokio::test]
+    async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
         let persistent_db = Db::open_in_memory().expect("in-memory db");
         let persistent_locks =
             Arc::new(LockManager::from_db(persistent_db.clone()).expect("locks"));
@@ -1034,6 +1034,7 @@ mod tests {
             | ("terminal_resize", "terminal", false)
             | ("subagent_transcript", "custom", false)
             | ("resource_snapshot", "owner_only", false)
+            | ("list_scheduled_jobs", "owner_only", false)
             | ("list_agents", "owner_only", false)
             | ("list_models", "owner_only", false)
             | ("get_usage_counts", "owner_only", false) => DispatchMatrixClass::AccessControlled,
@@ -1178,6 +1179,10 @@ mod tests {
             MutatingDispatchCase { kind: "record_session_note", effect_class: Durable, observation: "user_note session event is persisted" },
             MutatingDispatchCase { kind: "delete_session", effect_class: Durable, observation: "session row is deleted" },
             MutatingDispatchCase { kind: "promote_resource", effect_class: InMemory, observation: "queued resource request status changes to promoted response" },
+            MutatingDispatchCase { kind: "create_scheduled_job", effect_class: Durable, observation: "scheduled job row is persisted in the shared daemon" },
+            MutatingDispatchCase { kind: "delete_scheduled_job", effect_class: Durable, observation: "scheduled job row is deleted in the shared daemon" },
+            MutatingDispatchCase { kind: "set_scheduled_job_enabled", effect_class: Durable, observation: "scheduled job enabled state changes in the shared daemon" },
+            MutatingDispatchCase { kind: "run_scheduled_job", effect_class: Durable, observation: "scheduled job run result is recorded in the shared daemon" },
             MutatingDispatchCase { kind: "set_active_model", effect_class: DriverForwarded, observation: "SessionWork::SetActiveModel delivered to attached worker" },
             MutatingDispatchCase { kind: "set_agent", effect_class: DriverForwarded, observation: "SessionWork::SetAgent delivered to attached worker" },
             MutatingDispatchCase { kind: "set_llm_mode", effect_class: DriverForwarded, observation: "SessionWork::SetLlmMode delivered to attached worker" },
@@ -1386,6 +1391,11 @@ mod tests {
             | "terminal_input"
             | "terminal_resize"
             | "close_terminal"
+            | "create_scheduled_job"
+            | "list_scheduled_jobs"
+            | "delete_scheduled_job"
+            | "set_scheduled_job_enabled"
+            | "run_scheduled_job"
             | "store_flycockpit_credential"
             | "clear_flycockpit_credential" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
             "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
@@ -1466,6 +1476,11 @@ mod tests {
             authz_project_read("list_skills"),
             authz_owner_only("resource_snapshot"),
             authz_owner_only("promote_resource"),
+            authz_owner_only("create_scheduled_job"),
+            authz_owner_only("list_scheduled_jobs"),
+            authz_owner_only("delete_scheduled_job"),
+            authz_owner_only("set_scheduled_job_enabled"),
+            authz_owner_only("run_scheduled_job"),
             authz_owner_only("list_agents"),
             authz_owner_only("list_models"),
             authz_session_writer("set_active_model"),
@@ -2289,6 +2304,29 @@ mod tests {
                 request_id: "missing".into(),
                 session_id: None,
             },
+            "create_scheduled_job" => Request::CreateScheduledJob {
+                job: proto::ScheduledJobCreate {
+                    id: "job-authz".into(),
+                    owner: "system:test".into(),
+                    schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+                    payload: proto::ScheduledJobPayload::Callback {
+                        subsystem: "test".into(),
+                    },
+                    enabled: true,
+                    missed_run_policy: proto::MissedRunPolicy::Skip,
+                },
+            },
+            "list_scheduled_jobs" => Request::ListScheduledJobs { owner: None },
+            "delete_scheduled_job" => Request::DeleteScheduledJob {
+                id: "job-authz".into(),
+            },
+            "set_scheduled_job_enabled" => Request::SetScheduledJobEnabled {
+                id: "job-authz".into(),
+                enabled: true,
+            },
+            "run_scheduled_job" => Request::RunScheduledJob {
+                id: "job-authz".into(),
+            },
             "list_agents" => Request::ListAgents,
             "list_models" => Request::ListModels { provider: None },
             "set_active_model" => Request::SetActiveModel {
@@ -2903,6 +2941,10 @@ mod tests {
             | "record_session_note"
             | "delete_session" => assert_session_db_mutating_happy(case.kind).await,
             "promote_resource" => assert_promote_resource_happy().await,
+            "create_scheduled_job"
+            | "delete_scheduled_job"
+            | "set_scheduled_job_enabled"
+            | "run_scheduled_job" => assert_scheduler_shared_only_dispatch(case.kind).await,
             "set_approval_mode"
             | "set_sandbox"
             | "set_sandbox_escalation"
@@ -3019,6 +3061,10 @@ mod tests {
                 };
                 assert_eq!(status, proto::ResourcePromoteStatus::NotFound);
             }
+            "create_scheduled_job"
+            | "delete_scheduled_job"
+            | "set_scheduled_job_enabled"
+            | "run_scheduled_job" => assert_scheduler_shared_only_dispatch(case.kind).await,
             "set_approval_mode"
             | "set_sandbox"
             | "set_sandbox_escalation"
@@ -4213,6 +4259,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_scheduler_shared_only_dispatch(kind: &str) {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let request = authz_matrix_request(kind, Uuid::new_v4(), tmp.path());
+        let err = dispatch_matrix_request(&ctx, request)
+            .await
+            .expect_err("scheduler RPCs are shared-daemon-only in the matrix context");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("shared daemon"),
+            "unexpected scheduler error: {}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
     async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         match kind {
             "set_approval_mode" => {
@@ -4943,6 +5005,55 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::CreateScheduledJob {
+                    job: proto::ScheduledJobCreate {
+                        id: "job-1".into(),
+                        owner: "system:test".into(),
+                        schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+                        payload: proto::ScheduledJobPayload::Callback {
+                            subsystem: "test".into(),
+                        },
+                        enabled: true,
+                        missed_run_policy: proto::MissedRunPolicy::Skip,
+                    },
+                },
+                kind: "create_scheduled_job",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ListScheduledJobs { owner: None },
+                kind: "list_scheduled_jobs",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::DeleteScheduledJob { id: "job-1".into() },
+                kind: "delete_scheduled_job",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::SetScheduledJobEnabled {
+                    id: "job-1".into(),
+                    enabled: false,
+                },
+                kind: "set_scheduled_job_enabled",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::RunScheduledJob { id: "job-1".into() },
+                kind: "run_scheduled_job",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::ListAgents,
                 kind: "list_agents",
                 session_id: None,
@@ -5246,6 +5357,11 @@ mod tests {
             ListSkills,
             ResourceSnapshot,
             PromoteResource,
+            CreateScheduledJob,
+            ListScheduledJobs,
+            DeleteScheduledJob,
+            SetScheduledJobEnabled,
+            RunScheduledJob,
             ListAgents,
             ListModels,
             SetActiveModel,

@@ -622,6 +622,82 @@
     },
     "response": "resource_snapshot"
   },
+  "scheduled_job": {
+    "data": {
+      "job": {
+        "backoff_until": null,
+        "disabled_notice": null,
+        "enabled": true,
+        "failure_count": 0,
+        "id": "job-fixture",
+        "last_result": null,
+        "last_run_at": null,
+        "missed_run_policy": "skip",
+        "next_run_at": 1700000000,
+        "owner": "assistant:helper-bot",
+        "payload": {
+          "assistant": "helper-bot",
+          "project_root": "/tmp/project",
+          "prompt": "summarize",
+          "type": "run_prompt"
+        },
+        "schedule": {
+          "expr": "*/15 * * * *",
+          "type": "cron"
+        }
+      }
+    },
+    "response": "scheduled_job"
+  },
+  "scheduled_job_deleted": {
+    "data": {
+      "deleted": true,
+      "id": "job-fixture"
+    },
+    "response": "scheduled_job_deleted"
+  },
+  "scheduled_job_run": {
+    "data": {
+      "id": "job-fixture",
+      "result": {
+        "finished_at": 1700000001,
+        "ok": true,
+        "summary": "completed"
+      }
+    },
+    "response": "scheduled_job_run"
+  },
+  "scheduled_jobs": {
+    "data": {
+      "jobs": [
+        {
+          "backoff_until": null,
+          "disabled_notice": null,
+          "enabled": true,
+          "failure_count": 0,
+          "id": "job-fixture",
+          "last_result": {
+            "finished_at": 1700000001,
+            "ok": true,
+            "summary": "completed"
+          },
+          "last_run_at": 1700000001,
+          "missed_run_policy": "skip",
+          "next_run_at": 1700003600,
+          "owner": "system:test",
+          "payload": {
+            "subsystem": "test",
+            "type": "callback"
+          },
+          "schedule": {
+            "seconds": 3600,
+            "type": "every"
+          }
+        }
+      ]
+    },
+    "response": "scheduled_jobs"
+  },
   "sandbox_escalation_state": {
     "data": {
       "enabled": true

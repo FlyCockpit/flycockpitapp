@@ -28,6 +28,7 @@ use crate::daemon::proto::{
     self, Body, Envelope, ErrorCode, ErrorPayload, ProtoStream, RecvFrame, Request, Response,
 };
 use crate::daemon::registry::SessionRegistry;
+use crate::daemon::scheduler::DaemonSchedulerHandle;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::daemon::{
@@ -296,6 +297,16 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_string(message, redact);
             scrub_resource_scheduler_snapshot(snapshot, redact);
+        }
+        proto::Response::ScheduledJob { job } => scrub_scheduled_job_summary(job, redact),
+        proto::Response::ScheduledJobs { jobs } => {
+            for job in jobs {
+                scrub_scheduled_job_summary(job, redact);
+            }
+        }
+        proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
+        proto::Response::ScheduledJobRun { id: _, result } => {
+            scrub_scheduled_job_last_result(result, redact);
         }
         proto::Response::Agents { agents } => {
             for agent in agents {
@@ -1036,6 +1047,45 @@ fn scrub_model_summary(model: &mut proto::ModelSummary, redact: &RedactionTable)
     scrub_option_string(display_name, redact);
 }
 
+fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &RedactionTable) {
+    let proto::ScheduledJobSummary {
+        id: _,
+        owner: _,
+        schedule: _,
+        payload,
+        enabled: _,
+        missed_run_policy: _,
+        last_run_at: _,
+        next_run_at: _,
+        last_result,
+        failure_count: _,
+        backoff_until: _,
+        disabled_notice,
+    } = job;
+    match payload {
+        proto::ScheduledJobPayload::RunPrompt {
+            assistant: _,
+            prompt,
+            project_root,
+        } => {
+            scrub_string(prompt, redact);
+            scrub_string(project_root, redact);
+        }
+        proto::ScheduledJobPayload::Callback { subsystem: _ } => {}
+    }
+    if let Some(result) = last_result {
+        scrub_scheduled_job_last_result(result, redact);
+    }
+    scrub_option_string(disabled_notice, redact);
+}
+
+fn scrub_scheduled_job_last_result(
+    result: &mut proto::ScheduledJobLastResult,
+    redact: &RedactionTable,
+) {
+    scrub_string(&mut result.summary, redact);
+}
+
 fn scrub_fs_entry(entry: &mut proto::FsEntry, redact: &RedactionTable) {
     let proto::FsEntry {
         name,
@@ -1319,6 +1369,7 @@ pub struct DaemonContext {
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
+    pub scheduler: Option<DaemonSchedulerHandle>,
     credential_store_path: Option<PathBuf>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
     /// the single route by which request handling resolves layered
@@ -1387,6 +1438,19 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
+        let scheduler = (!paths.ephemeral).then(|| {
+            let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+                db.clone(),
+                registry.clone(),
+            ));
+            let callbacks = executor.callback_registry();
+            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
+                db.clone(),
+                Arc::new(crate::daemon::scheduler::SystemClock),
+                executor,
+            ))
+            .start_with_callbacks(shutdown.clone(), callbacks)
+        });
         Self {
             db,
             registry,
@@ -1404,6 +1468,7 @@ impl DaemonContext {
             ))),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
             connector_wake,
+            scheduler,
             credential_store_path: None,
             config_source,
         }

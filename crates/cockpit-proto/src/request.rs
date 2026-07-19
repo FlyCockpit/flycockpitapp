@@ -414,6 +414,35 @@ pub enum Request {
         session_id: Option<Uuid>,
     },
 
+    /// Create or replace a durable daemon scheduler job. Owner-only; future
+    /// assistant-facing tools will call this RPC after assistant policy checks.
+    CreateScheduledJob {
+        job: ScheduledJobCreate,
+    },
+
+    /// List durable scheduler jobs. Owner filtering is exact, e.g.
+    /// `assistant:alice` or `system:dreamer`.
+    ListScheduledJobs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+    },
+
+    /// Delete a durable scheduler job.
+    DeleteScheduledJob {
+        id: String,
+    },
+
+    /// Enable or disable a durable scheduler job.
+    SetScheduledJobEnabled {
+        id: String,
+        enabled: bool,
+    },
+
+    /// Fire a durable scheduler job immediately without changing its schedule.
+    RunScheduledJob {
+        id: String,
+    },
+
     /// List discovered agents (bundled + on-disk + agent_dirs).
     ListAgents,
 
@@ -692,6 +721,11 @@ macro_rules! command {
             (Request::ListSkills { project_root }, "list_skills", project_read(project_root), none, false, none);
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, none);
             (Request::PromoteResource { session_id, .. }, "promote_resource", owner_only, option_field(session_id), true, none);
+            (Request::CreateScheduledJob { .. }, "create_scheduled_job", owner_only, none, true, none);
+            (Request::ListScheduledJobs { .. }, "list_scheduled_jobs", owner_only, none, false, none);
+            (Request::DeleteScheduledJob { .. }, "delete_scheduled_job", owner_only, none, true, none);
+            (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled", owner_only, none, true, none);
+            (Request::RunScheduledJob { .. }, "run_scheduled_job", owner_only, none, true, none);
             (Request::ListAgents, "list_agents", owner_only, none, false, none);
             (Request::ListModels { .. }, "list_models", owner_only, none, false, none);
             (Request::SetActiveModel { .. }, "set_active_model", session_writer, attached, true, none);

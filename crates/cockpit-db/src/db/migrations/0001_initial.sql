@@ -15,7 +15,7 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 
 -- ---- assistants ------------------------------------------------------------
 
@@ -26,6 +26,31 @@ CREATE TABLE assistants (
     config_json  TEXT    NOT NULL DEFAULT '{}',
     content_hash TEXT    NOT NULL
 );
+
+-- ---- scheduled_jobs --------------------------------------------------------
+
+CREATE TABLE scheduled_jobs (
+    id                TEXT    PRIMARY KEY,
+    owner             TEXT    NOT NULL,
+    schedule_json     TEXT    NOT NULL,
+    payload_json      TEXT    NOT NULL,
+    enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    last_run_at       INTEGER,
+    next_run_at       INTEGER,
+    last_result_json  TEXT,
+    failure_count     INTEGER NOT NULL DEFAULT 0,
+    backoff_until     INTEGER,
+    disabled_notice   TEXT
+);
+
+CREATE INDEX idx_scheduled_jobs_next_run
+    ON scheduled_jobs(enabled, next_run_at);
+
+CREATE INDEX idx_scheduled_jobs_owner
+    ON scheduled_jobs(owner);
 
 -- ---- sessions --------------------------------------------------------------
 

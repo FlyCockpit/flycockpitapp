@@ -168,6 +168,93 @@ pub struct ResourceQueuedSnapshot {
     pub state: ResourceQueuedState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScheduledJobSchedule {
+    Cron {
+        expr: String,
+    },
+    Every {
+        seconds: u64,
+    },
+    Once {
+        at: i64,
+    },
+    Idle {
+        min_idle_seconds: u64,
+        max_age_seconds: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScheduledJobPayload {
+    RunPrompt {
+        assistant: String,
+        prompt: String,
+        project_root: String,
+    },
+    Callback {
+        subsystem: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissedRunPolicy {
+    #[default]
+    Skip,
+    RunOnceOnStart,
+}
+
+impl MissedRunPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::RunOnceOnStart => "run_once_on_start",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledJobCreate {
+    pub id: String,
+    pub owner: String,
+    pub schedule: ScheduledJobSchedule,
+    pub payload: ScheduledJobPayload,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub missed_run_policy: MissedRunPolicy,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledJobLastResult {
+    pub ok: bool,
+    pub summary: String,
+    pub finished_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledJobSummary {
+    pub id: String,
+    pub owner: String,
+    pub schedule: ScheduledJobSchedule,
+    pub payload: ScheduledJobPayload,
+    pub enabled: bool,
+    pub missed_run_policy: MissedRunPolicy,
+    pub last_run_at: Option<i64>,
+    pub next_run_at: Option<i64>,
+    pub last_result: Option<ScheduledJobLastResult>,
+    pub failure_count: u32,
+    pub backoff_until: Option<i64>,
+    pub disabled_notice: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceQueuedState {

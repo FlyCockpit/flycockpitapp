@@ -36,6 +36,7 @@ pub mod proto;
 pub mod registry;
 pub mod relay_envelope;
 pub mod remote_audit_upload;
+pub mod scheduler;
 pub mod server;
 pub mod session_worker;
 pub mod shutdown;

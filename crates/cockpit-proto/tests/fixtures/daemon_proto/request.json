@@ -88,6 +88,27 @@
     },
     "request": "create_btw_fork"
   },
+  "create_scheduled_job": {
+    "params": {
+      "job": {
+        "enabled": true,
+        "id": "job-fixture",
+        "missed_run_policy": "skip",
+        "owner": "assistant:helper-bot",
+        "payload": {
+          "assistant": "helper-bot",
+          "project_root": "/tmp/project",
+          "prompt": "summarize",
+          "type": "run_prompt"
+        },
+        "schedule": {
+          "expr": "*/15 * * * *",
+          "type": "cron"
+        }
+      }
+    },
+    "request": "create_scheduled_job"
+  },
   "daemon_status": {
     "request": "daemon_status"
   },
@@ -97,6 +118,12 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "delete_session"
+  },
+  "delete_scheduled_job": {
+    "params": {
+      "id": "job-fixture"
+    },
+    "request": "delete_scheduled_job"
   },
   "discard_session": {
     "params": {
@@ -220,6 +247,12 @@
       "project_id": "project_id-fixture"
     },
     "request": "list_sessions"
+  },
+  "list_scheduled_jobs": {
+    "params": {
+      "owner": "assistant:helper-bot"
+    },
+    "request": "list_scheduled_jobs"
   },
   "list_skills": {
     "params": {
@@ -349,6 +382,12 @@
   "resource_snapshot": {
     "request": "resource_snapshot"
   },
+  "run_scheduled_job": {
+    "params": {
+      "id": "job-fixture"
+    },
+    "request": "run_scheduled_job"
+  },
   "resume_paused_work": {
     "params": {
       "session_id": "11111111-1111-4111-8111-111111111111"
@@ -440,6 +479,13 @@
       "mode": "container"
     },
     "request": "set_sandbox"
+  },
+  "set_scheduled_job_enabled": {
+    "params": {
+      "enabled": true,
+      "id": "job-fixture"
+    },
+    "request": "set_scheduled_job_enabled"
   },
   "set_sandbox_escalation": {
     "params": {

@@ -38,6 +38,7 @@ pub mod project_notes;
 pub mod prune_ledger;
 pub mod remote_audit_upload;
 pub mod retention;
+pub mod scheduler;
 pub mod seed_tools;
 pub mod session_goals;
 pub mod session_log;
@@ -78,7 +79,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// is intentionally strict until the first public release: developers move a
 /// stale database aside and let Cockpit recreate it rather than running a
 /// compatibility migration.
-pub const EXPECTED_SCHEMA_VERSION: i64 = 2;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 3;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

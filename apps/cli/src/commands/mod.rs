@@ -87,6 +87,7 @@ pub mod packages;
 pub mod pr;
 pub mod providers;
 pub mod run;
+pub mod schedule;
 pub mod session;
 pub mod setup;
 pub mod stats;

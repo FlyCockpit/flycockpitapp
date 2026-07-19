@@ -109,6 +109,10 @@ pub enum Command {
     #[command(subcommand)]
     Session(SessionCommand),
 
+    /// Manage durable daemon scheduler jobs.
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
+
     /// Manage workspace trust decisions.
     #[command(subcommand)]
     Trust(TrustCommand),
@@ -243,6 +247,34 @@ pub enum TrustCommand {
     Status(TrustStatusArgs),
     /// Store a workspace trust mode for the effective root.
     Set(TrustSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    /// List durable scheduler jobs.
+    List(ScheduleListArgs),
+    /// Enable a durable scheduler job.
+    Enable {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Disable a durable scheduler job.
+    Disable {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Fire a durable scheduler job immediately.
+    Run {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ScheduleListArgs {
+    /// Exact owner filter, e.g. assistant:alice or system:dreamer.
+    #[arg(long, value_name = "OWNER")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

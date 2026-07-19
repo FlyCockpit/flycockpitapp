@@ -7148,7 +7148,7 @@ async fn inject_seeds_caps_under_budget_and_injects_pairs() {
             r.provider_call_id_source.as_deref(),
             Some("synthetic_from_cockpit_call_id")
         );
-        assert_eq!(r.wire_api.as_deref(), Some("responses"));
+        assert_eq!(r.wire_api.as_deref(), Some("completions"));
         assert_eq!(r.provider_family.as_deref(), Some("cockpit"));
         assert_eq!(
             r.wire_input_json, r.original_input_json,
@@ -7549,7 +7549,7 @@ async fn seed_forced_skill_records_and_folds_a_real_skill_call() {
         row.provider_call_id_source.as_deref(),
         Some("synthetic_from_cockpit_call_id")
     );
-    assert_eq!(row.wire_api.as_deref(), Some("responses"));
+    assert_eq!(row.wire_api.as_deref(), Some("completions"));
     assert_eq!(row.provider_family.as_deref(), Some("cockpit"));
     assert_eq!(
         row.wire_input_json, row.original_input_json,

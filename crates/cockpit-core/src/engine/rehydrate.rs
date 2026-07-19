@@ -2414,7 +2414,10 @@ mod tests {
         let s = root_session();
         record_user(&s, "/skill test-skill");
         let call_id = "skillslash-synthetic";
-        let identity = crate::session::ToolCallProviderIdentity::synthetic_responses_call(call_id);
+        let identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+            call_id,
+            Some(crate::config::providers::WireApi::Responses),
+        );
         s.record_tool_call(ToolCallRow {
             event_id: Uuid::new_v4(),
             timestamp: chrono::Utc::now(),
@@ -2477,7 +2480,10 @@ mod tests {
         record_user(&s, "delegate with seed");
         record_assistant(&s, "infer-1", "reading seed");
         let call_id = "seed-synthetic";
-        let identity = crate::session::ToolCallProviderIdentity::synthetic_responses_call(call_id);
+        let identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+            call_id,
+            Some(crate::config::providers::WireApi::Responses),
+        );
         s.record_tool_call(ToolCallRow {
             event_id: Uuid::new_v4(),
             timestamp: chrono::Utc::now(),

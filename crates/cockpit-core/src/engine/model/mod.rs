@@ -935,6 +935,16 @@ impl Model {
         }
     }
 
+    pub(crate) fn current_wire_api(&self) -> crate::config::providers::WireApi {
+        match self {
+            Model::OpenAi { client, .. } => {
+                self.resolve_live_wire_api_for_base_url(client.base_url())
+            }
+            Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+        }
+    }
+
     /// The config file path this model self-heals its wire-API endpoint into
     /// (implementation note), if one was installed via
     /// [`Self::with_config_path`]. `None` on the native Anthropic arm (the

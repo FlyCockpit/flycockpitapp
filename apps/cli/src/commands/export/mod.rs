@@ -44,6 +44,7 @@ use crate::config::dirs::{ConfigDir, ConfigDirKind, discover_config_dirs};
 use crate::db::Db;
 use crate::db::session_log::SessionEventRow;
 use crate::db::sessions::SessionRow;
+use crate::db::tool_calls::ToolCallEvent;
 use crate::redact::RedactionTable;
 
 mod tandem_validation;
@@ -358,17 +359,9 @@ fn build_zip_with_options_and_env(
     let mut tool_identity_by_call: BTreeMap<(Uuid, String), Value> = BTreeMap::new();
     for s in bundle {
         for tool_call in db.list_tool_calls_for_session(s.session_id)? {
-            tool_identity_by_call.insert(
-                (tool_call.session_id, tool_call.call_id.clone()),
-                json!({
-                    "cockpit_call_id": tool_call.call_id,
-                    "provider_item_id": tool_call.provider_item_id,
-                    "provider_call_id": tool_call.provider_call_id,
-                    "provider_call_id_source": tool_call.provider_call_id_source,
-                    "wire_api": tool_call.wire_api,
-                    "provider_family": tool_call.provider_family,
-                }),
-            );
+            let identity = tool_provider_identity_json(&tool_call)?;
+            tool_identity_by_call
+                .insert((tool_call.session_id, tool_call.call_id.clone()), identity);
         }
         let short = short_ids
             .get(&s.session_id)
@@ -859,6 +852,57 @@ fn export_resume_repair_state(db: &Db, target: &SessionRow) -> Option<Value> {
             "cancel",
         ],
         "detail": repair.detail,
+    }))
+}
+
+fn tool_provider_identity_json(tool_call: &ToolCallEvent) -> Result<Value> {
+    let has_any_identity = tool_call.provider_item_id.is_some()
+        || tool_call.provider_call_id.is_some()
+        || tool_call.provider_call_id_source.is_some()
+        || tool_call.wire_api.is_some()
+        || tool_call.provider_family.is_some();
+    if has_any_identity {
+        if tool_call.provider_call_id.is_some() != tool_call.provider_call_id_source.is_some() {
+            anyhow::bail!(
+                "invalid provider identity for tool_call row {}: provider_call_id and provider_call_id_source must be present together",
+                tool_call.call_id
+            );
+        }
+        match tool_call.wire_api.as_deref() {
+            Some("completions") | Some("responses") => {
+                if tool_call.provider_call_id.is_none() {
+                    anyhow::bail!(
+                        "invalid provider identity for tool_call row {}: {} wire requires provider_call_id",
+                        tool_call.call_id,
+                        tool_call.wire_api.as_deref().unwrap_or("unknown")
+                    );
+                }
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "invalid provider identity for tool_call row {}: unsupported wire_api `{}`",
+                    tool_call.call_id,
+                    other
+                );
+            }
+            None => {}
+        }
+        if tool_call.provider_call_id == tool_call.provider_item_id
+            && tool_call.provider_call_id_source.as_deref() == Some("provider")
+        {
+            anyhow::bail!(
+                "invalid provider identity for tool_call row {}: mirrored provider_call_id cannot use source `provider`",
+                tool_call.call_id
+            );
+        }
+    }
+    Ok(json!({
+        "cockpit_call_id": tool_call.call_id.clone(),
+        "provider_item_id": tool_call.provider_item_id.clone(),
+        "provider_call_id": tool_call.provider_call_id.clone(),
+        "provider_call_id_source": tool_call.provider_call_id_source.clone(),
+        "wire_api": tool_call.wire_api.clone(),
+        "provider_family": tool_call.provider_family.clone(),
     }))
 }
 

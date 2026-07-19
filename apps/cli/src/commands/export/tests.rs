@@ -495,11 +495,112 @@ fn export_tool_call_event_includes_provider_identity_provenance() {
 }
 
 #[test]
+fn export_completions_wire_tool_call_event_includes_provider_identity() {
+    let db = Db::open_in_memory().unwrap();
+    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let sid = s.session_id;
+    let providers = crate::config::providers::ProvidersConfig {
+        providers: [(
+            "openrouter".to_string(),
+            crate::config::providers::ProviderEntry {
+                template: Some("openrouter".to_string()),
+                url: "https://openrouter.ai/api/v1".to_string(),
+                wire_api: crate::config::providers::WireApi::Completions,
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..crate::config::providers::ProvidersConfig::default()
+    };
+    let identity = ToolCallProviderIdentity::from_provider_call(
+        Some("openrouter"),
+        Some("anthropic/claude"),
+        Some(&providers),
+        Some(providers.resolve_wire_api("openrouter", "anthropic/claude")),
+        "provider-chat-call".into(),
+        None,
+    );
+
+    db.insert_tool_call(&ToolCallEvent {
+        event_id: Uuid::new_v4(),
+        session_id: sid,
+        call_id: "cockpit-completions-call".into(),
+        provider_item_id: identity.provider_item_id.clone(),
+        provider_call_id: identity.provider_call_id.clone(),
+        provider_call_id_source: identity.provider_call_id_source.clone(),
+        wire_api: identity.wire_api.clone(),
+        provider_family: identity.provider_family.clone(),
+        timestamp: 10,
+        model: "anthropic/claude".into(),
+        provider: "openrouter".into(),
+        project_id: "p".into(),
+        project_root: "/proj".into(),
+        agent: "Build".into(),
+        tool: "read".into(),
+        path: Some("/proj/a.rs".into()),
+        recovery: Recovery::Clean,
+        hard_fail: false,
+        exit_code: None,
+        sandbox_enabled: false,
+        sandboxed: false,
+        sandbox_unavailable_reason: None,
+        original_input_json: json!({"path": "a.rs"}),
+        wire_input_json: json!({"path": "/proj/a.rs"}),
+        output: "body".into(),
+        truncated: false,
+        duration_ms: 3,
+        cockpit_version: Some(env!("CARGO_PKG_VERSION").into()),
+        llm_mode: Some("normal".into()),
+        shape_fingerprint: None,
+        hint: None,
+    })
+    .unwrap();
+    db.insert_session_event(
+        sid,
+        SessionEventKind::ToolCall,
+        Some("Build"),
+        Some("cockpit-completions-call"),
+        &json!({
+            "tool": "read",
+            "original_input": {"path": "a.rs"},
+            "wire_input": {"path": "/proj/a.rs"},
+        }),
+    )
+    .unwrap();
+
+    let target = db.get_session(sid).unwrap().unwrap();
+    let bundle = collect_bundle(&db, sid).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let events: Vec<Value> =
+        serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
+    let tool_call = events
+        .iter()
+        .find(|e| e["type"] == "tool_call")
+        .expect("tool_call event present");
+
+    assert_eq!(
+        tool_call["data"]["provider_identity"],
+        json!({
+            "cockpit_call_id": "cockpit-completions-call",
+            "provider_item_id": "provider-chat-call",
+            "provider_call_id": "provider-chat-call",
+            "provider_call_id_source": "completions_tool_call_id",
+            "wire_api": "completions",
+            "provider_family": "openrouter",
+        })
+    );
+}
+
+#[test]
 fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
     let db = Db::open_in_memory().unwrap();
     let s = db.create_session("p", "/proj", "Build").unwrap();
     let sid = s.session_id;
-    let identity = ToolCallProviderIdentity::synthetic_responses_call("seed-export");
+    let identity = ToolCallProviderIdentity::synthetic_cockpit_call(
+        "seed-export",
+        Some(crate::config::providers::WireApi::Responses),
+    );
 
     db.insert_tool_call(&ToolCallEvent {
         event_id: Uuid::new_v4(),
@@ -681,7 +782,7 @@ fn export_responses_interactive_subagent_has_provider_identity_without_resume_re
 }
 
 #[test]
-fn export_manifest_includes_responses_repair_diagnosis() {
+fn export_rejects_invalid_responses_provider_identity() {
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db, PathBuf::from("/proj"), "Build").unwrap();
     session.set_active_model("codex-oauth", "gpt-5.4").unwrap();
@@ -746,16 +847,10 @@ fn export_manifest_includes_responses_repair_diagnosis() {
 
     let target = session.db.get_session(session.id).unwrap().unwrap();
     let bundle = collect_bundle(&session.db, session.id).unwrap();
-    let zip = build_zip(&session.db, &target, &bundle).unwrap();
-    let manifest: Value =
-        serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
-    let repair = &manifest["resume_repair_required"];
-    assert_eq!(repair["wire_api"], json!("responses"));
-    assert_eq!(repair["failure_kind"], json!("missing_provider_call_id"));
-    assert_eq!(
-        repair["failing_tool_call_ids"],
-        json!(["call-without-provider-id"])
-    );
+    let err = build_zip(&session.db, &target, &bundle).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("invalid provider identity"), "{msg}");
+    assert!(msg.contains("call-without-provider-id"), "{msg}");
 }
 
 #[test]

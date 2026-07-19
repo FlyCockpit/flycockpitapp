@@ -679,14 +679,19 @@ pub(crate) async fn execute_ordinary_call(
     // tool_use↔tool_result pairing valid and can't 400 the provider. The
     // original (malformed) name rides the `recovery` (`NameRepair.original`)
     // for the §14 wire-vs-user split.
+    let providers = crate::secret_ref::load_effective(env.cwd);
+    let active_provider = env.session.active_provider();
+    let active_model = env.session.active_model();
     if let Err(e) = env.session.record_tool_call(ToolCallRow {
         event_id: Uuid::new_v4(),
         timestamp: Utc::now(),
         agent: env.agent.name.clone(),
         call_id: tc.id.clone(),
         identity: crate::session::ToolCallProviderIdentity::from_provider_call(
-            env.session.active_provider().as_deref().unwrap_or(""),
-            env.session.active_model().as_deref().unwrap_or(""),
+            active_provider.as_deref(),
+            active_model.as_deref(),
+            Some(&providers),
+            Some(env.model.current_wire_api()),
             tc.id.clone(),
             tc.call_id.clone(),
         ),

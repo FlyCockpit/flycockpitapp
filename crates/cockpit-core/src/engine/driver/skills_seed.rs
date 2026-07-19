@@ -329,7 +329,10 @@ impl Driver {
             }
             let call_id = format!("seed-{}", uuid::Uuid::new_v4());
             let provider_identity =
-                crate::session::ToolCallProviderIdentity::synthetic_responses_call(&call_id);
+                crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+                    &call_id,
+                    Some(agent.model.current_wire_api()),
+                );
             let provider_call_id = provider_identity.provider_call_id.clone();
             if let Some(tx) = tx {
                 let _ = tx
@@ -796,8 +799,10 @@ impl Driver {
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let call_id = format!("skillslash-{}", uuid::Uuid::new_v4());
-        let provider_identity =
-            crate::session::ToolCallProviderIdentity::synthetic_responses_call(&call_id);
+        let provider_identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+            &call_id,
+            Some(agent.model.current_wire_api()),
+        );
         let provider_call_id = provider_identity.provider_call_id.clone();
         let _ = tx
             .send(TurnEvent::ToolStart {

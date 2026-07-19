@@ -574,29 +574,50 @@ pub struct ToolCallProviderIdentity {
 }
 
 impl ToolCallProviderIdentity {
-    pub fn synthetic_responses_call(cockpit_call_id: &str) -> Self {
+    pub fn synthetic_cockpit_call(
+        cockpit_call_id: &str,
+        wire_api: Option<crate::config::providers::WireApi>,
+    ) -> Self {
         Self {
             provider_item_id: Some(cockpit_call_id.to_string()),
             provider_call_id: Some(cockpit_call_id.to_string()),
             provider_call_id_source: Some("synthetic_from_cockpit_call_id".to_string()),
-            wire_api: Some("responses".to_string()),
+            wire_api: wire_api.and_then(wire_api_label).map(str::to_string),
             provider_family: Some("cockpit".to_string()),
         }
     }
 
     pub fn from_provider_call(
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        providers: Option<&crate::config::providers::ProvidersConfig>,
+        resolved_wire_api: Option<crate::config::providers::WireApi>,
         provider_item_id: String,
         provider_call_id: Option<String>,
     ) -> Self {
-        let wire_api = crate::config::providers::WireApi::detect_for_provider(provider, model);
-        let is_responses = matches!(wire_api, crate::config::providers::WireApi::Responses);
+        let wire_api = resolved_wire_api.or_else(|| {
+            // Fallback only: normal recording passes the concrete endpoint from
+            // the resolved model/config. If that is unavailable, keep the old
+            // conservative provider-aware detector rather than fabricating a
+            // Responses label.
+            Some(crate::config::providers::WireApi::detect_for_provider(
+                provider?, model?,
+            ))
+        });
+        let is_responses = matches!(wire_api, Some(crate::config::providers::WireApi::Responses));
+        let is_completions = matches!(
+            wire_api,
+            Some(crate::config::providers::WireApi::Completions)
+        );
         let (provider_call_id, provider_call_id_source) = match provider_call_id {
             Some(call_id) => (Some(call_id), Some("provider".to_string())),
             None if is_responses => (
                 Some(provider_item_id.clone()),
                 Some("normalized_from_assistant_id".to_string()),
+            ),
+            None if is_completions => (
+                Some(provider_item_id.clone()),
+                Some("completions_tool_call_id".to_string()),
             ),
             None => (None, None),
         };
@@ -604,26 +625,47 @@ impl ToolCallProviderIdentity {
             provider_item_id: Some(provider_item_id),
             provider_call_id,
             provider_call_id_source,
-            wire_api: Some(
-                match wire_api {
-                    crate::config::providers::WireApi::Responses => "responses",
-                    crate::config::providers::WireApi::Completions => "completions",
-                    crate::config::providers::WireApi::Auto => "unknown",
-                }
-                .to_string(),
-            ),
-            provider_family: Some(provider_family_for_id(provider).to_string()),
+            wire_api: wire_api.and_then(wire_api_label).map(str::to_string),
+            provider_family: Some(provider_family_from_config(provider, providers)),
         }
     }
 }
 
-fn provider_family_for_id(provider: &str) -> &'static str {
-    match provider {
+fn wire_api_label(wire_api: crate::config::providers::WireApi) -> Option<&'static str> {
+    match wire_api {
+        crate::config::providers::WireApi::Responses => Some("responses"),
+        crate::config::providers::WireApi::Completions => Some("completions"),
+        // `Auto` is a configuration directive, not an observed wire endpoint.
+        // Preserve that uncertainty as SQL/JSON null instead of inventing a
+        // string label.
+        crate::config::providers::WireApi::Auto => None,
+    }
+}
+
+fn provider_family_from_config(
+    provider: Option<&str>,
+    providers: Option<&crate::config::providers::ProvidersConfig>,
+) -> String {
+    let Some(provider_id) = provider else {
+        return "unset".to_string();
+    };
+    let Some(entry) = providers.and_then(|cfg| cfg.providers.get(provider_id)) else {
+        return "unknown".to_string();
+    };
+    let family = match entry.effective_template(provider_id) {
+        Some(template) => provider_family_for_template(template),
+        None => provider_id,
+    };
+    family.to_string()
+}
+
+fn provider_family_for_template(template: &str) -> &str {
+    match template {
         "openai" => "openai",
         "codex-oauth" => "codex",
         "grok" | "grok-oauth" => "xai",
         "anthropic" => "anthropic",
-        _ => "unknown",
+        other => other,
     }
 }
 
@@ -719,7 +761,269 @@ fn count_user_turns_for_title(db: &Db, session_id: Uuid) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::providers::{ProviderEntry, ProvidersConfig, WireApi};
     use serde_json::json;
+
+    fn providers_config(
+        entries: impl IntoIterator<Item = (&'static str, ProviderEntry)>,
+    ) -> ProvidersConfig {
+        ProvidersConfig {
+            providers: entries
+                .into_iter()
+                .map(|(id, entry)| (id.to_string(), entry))
+                .collect(),
+            ..ProvidersConfig::default()
+        }
+    }
+
+    fn provider_entry(template: Option<&str>, wire_api: WireApi) -> ProviderEntry {
+        ProviderEntry {
+            template: template.map(str::to_string),
+            url: "https://example.test/v1".to_string(),
+            wire_api,
+            ..ProviderEntry::default()
+        }
+    }
+
+    fn identity_for(
+        provider: Option<&str>,
+        model: Option<&str>,
+        providers: Option<&ProvidersConfig>,
+        wire_api: Option<WireApi>,
+        provider_call_id: Option<&str>,
+    ) -> ToolCallProviderIdentity {
+        ToolCallProviderIdentity::from_provider_call(
+            provider,
+            model,
+            providers,
+            wire_api,
+            "provider-item".to_string(),
+            provider_call_id.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn provider_family_resolves_for_non_builtin_provider() {
+        let providers = providers_config([(
+            "openrouter",
+            provider_entry(Some("openrouter"), WireApi::Completions),
+        )]);
+
+        let identity = identity_for(
+            Some("openrouter"),
+            Some("claude-sonnet"),
+            Some(&providers),
+            Some(providers.resolve_wire_api("openrouter", "claude-sonnet")),
+            None,
+        );
+
+        assert_eq!(identity.provider_family.as_deref(), Some("openrouter"));
+        assert_ne!(identity.provider_family.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn provider_family_resolves_for_custom_named_provider() {
+        let providers =
+            providers_config([("my-llama-box", provider_entry(None, WireApi::Completions))]);
+
+        let identity = identity_for(
+            Some("my-llama-box"),
+            Some("llama-local"),
+            Some(&providers),
+            Some(providers.resolve_wire_api("my-llama-box", "llama-local")),
+            None,
+        );
+
+        assert_eq!(identity.provider_family.as_deref(), Some("my-llama-box"));
+        assert_ne!(identity.provider_family.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn builtin_provider_families_are_unchanged() {
+        let providers = providers_config([
+            ("openai", provider_entry(Some("openai"), WireApi::Responses)),
+            (
+                "codex-oauth",
+                provider_entry(Some("codex-oauth"), WireApi::Responses),
+            ),
+            ("grok", provider_entry(Some("grok"), WireApi::Responses)),
+            (
+                "grok-oauth",
+                provider_entry(Some("grok-oauth"), WireApi::Responses),
+            ),
+            (
+                "anthropic",
+                provider_entry(Some("anthropic"), WireApi::Completions),
+            ),
+        ]);
+
+        for (provider, family) in [
+            ("openai", "openai"),
+            ("codex-oauth", "codex"),
+            ("grok", "xai"),
+            ("grok-oauth", "xai"),
+            ("anthropic", "anthropic"),
+        ] {
+            let identity = identity_for(
+                Some(provider),
+                Some("model"),
+                Some(&providers),
+                Some(providers.resolve_wire_api(provider, "model")),
+                None,
+            );
+            assert_eq!(identity.provider_family.as_deref(), Some(family));
+        }
+    }
+
+    #[test]
+    fn unset_provider_is_distinct_from_unknown_provider() {
+        let providers = ProvidersConfig::default();
+        let unset = identity_for(None, Some("model"), Some(&providers), None, None);
+        let unknown = identity_for(
+            Some("missing-provider"),
+            Some("model"),
+            Some(&providers),
+            None,
+            None,
+        );
+
+        assert_eq!(unset.provider_family.as_deref(), Some("unset"));
+        assert_eq!(unknown.provider_family.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn completions_wire_mirrors_item_id_into_call_id() {
+        let identity = identity_for(
+            Some("openrouter"),
+            Some("model"),
+            None,
+            Some(WireApi::Completions),
+            None,
+        );
+
+        assert_eq!(identity.provider_item_id.as_deref(), Some("provider-item"));
+        assert_eq!(identity.provider_call_id.as_deref(), Some("provider-item"));
+        assert_eq!(
+            identity.provider_call_id_source.as_deref(),
+            Some("completions_tool_call_id")
+        );
+        assert_eq!(identity.wire_api.as_deref(), Some("completions"));
+    }
+
+    #[test]
+    fn mirrored_call_id_never_claims_provider_source() {
+        let identity = identity_for(
+            Some("openrouter"),
+            Some("model"),
+            None,
+            Some(WireApi::Completions),
+            None,
+        );
+
+        assert_eq!(identity.provider_call_id, identity.provider_item_id);
+        assert_ne!(
+            identity.provider_call_id_source.as_deref(),
+            Some("provider")
+        );
+    }
+
+    #[test]
+    fn responses_wire_call_id_sources_are_unchanged() {
+        let supplied = identity_for(
+            Some("codex-oauth"),
+            Some("gpt-5"),
+            None,
+            Some(WireApi::Responses),
+            Some("provider-call"),
+        );
+        assert_eq!(supplied.provider_call_id.as_deref(), Some("provider-call"));
+        assert_eq!(
+            supplied.provider_call_id_source.as_deref(),
+            Some("provider")
+        );
+
+        let normalized = identity_for(
+            Some("codex-oauth"),
+            Some("gpt-5"),
+            None,
+            Some(WireApi::Responses),
+            None,
+        );
+        assert_eq!(
+            normalized.provider_call_id.as_deref(),
+            Some("provider-item")
+        );
+        assert_eq!(
+            normalized.provider_call_id_source.as_deref(),
+            Some("normalized_from_assistant_id")
+        );
+    }
+
+    #[test]
+    fn wire_api_honors_explicit_config_override() {
+        // `gpt-5-override` under the OpenAI provider would be detected as
+        // Responses by the legacy id heuristic; the explicit provider config
+        // must win.
+        let providers = providers_config([(
+            "openai",
+            provider_entry(Some("openai"), WireApi::Completions),
+        )]);
+
+        let identity = identity_for(
+            Some("openai"),
+            Some("gpt-5-override"),
+            Some(&providers),
+            Some(providers.resolve_wire_api("openai", "gpt-5-override")),
+            None,
+        );
+
+        assert_eq!(identity.wire_api.as_deref(), Some("completions"));
+        assert_eq!(
+            identity.provider_call_id_source.as_deref(),
+            Some("completions_tool_call_id")
+        );
+    }
+
+    #[test]
+    fn wire_api_auto_is_reachable_and_recorded() {
+        let identity = identity_for(
+            Some("openai"),
+            Some("gpt-5-auto"),
+            None,
+            Some(WireApi::Auto),
+            None,
+        );
+
+        assert_eq!(identity.wire_api, None);
+        assert_eq!(identity.provider_call_id, None);
+        assert_eq!(identity.provider_call_id_source, None);
+    }
+
+    #[test]
+    fn synthetic_call_in_completions_session_is_not_labeled_responses() {
+        let identity =
+            ToolCallProviderIdentity::synthetic_cockpit_call("seed-1", Some(WireApi::Completions));
+
+        assert_eq!(identity.wire_api.as_deref(), Some("completions"));
+        assert_ne!(identity.wire_api.as_deref(), Some("responses"));
+        assert_eq!(identity.provider_family.as_deref(), Some("cockpit"));
+        assert_eq!(
+            identity.provider_call_id_source.as_deref(),
+            Some("synthetic_from_cockpit_call_id")
+        );
+    }
+
+    #[test]
+    fn synthetic_call_with_unresolved_wire_records_none() {
+        let identity = ToolCallProviderIdentity::synthetic_cockpit_call("seed-1", None);
+
+        assert_eq!(identity.wire_api, None);
+        assert_eq!(identity.provider_family.as_deref(), Some("cockpit"));
+        assert_eq!(
+            identity.provider_call_id_source.as_deref(),
+            Some("synthetic_from_cockpit_call_id")
+        );
+    }
 
     #[test]
     fn create_and_resume_round_trip() {
@@ -1204,14 +1508,20 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
         s.set_active_model("codex-oauth", "gpt-5.5").unwrap();
+        let providers = providers_config([(
+            "codex-oauth",
+            provider_entry(Some("codex-oauth"), WireApi::Responses),
+        )]);
         s.record_tool_call(ToolCallRow {
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             agent: "builder".into(),
             call_id: "cockpit-internal".into(),
             identity: ToolCallProviderIdentity::from_provider_call(
-                "codex-oauth",
-                "gpt-5.5",
+                Some("codex-oauth"),
+                Some("gpt-5.5"),
+                Some(&providers),
+                Some(WireApi::Responses),
                 "provider-item".into(),
                 Some("provider-call".into()),
             ),

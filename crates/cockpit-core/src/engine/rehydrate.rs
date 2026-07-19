@@ -2581,6 +2581,61 @@ mod tests {
     }
 
     #[test]
+    fn routing_amend_event_does_not_break_task_pairing() {
+        let s = root_session();
+        record_user(&s, "investigate");
+        record_assistant(&s, "infer-1", "delegating");
+        s.record_event(
+            crate::db::session_log::SessionEventKind::SubagentSpawned,
+            Some("Build"),
+            Some("task-1"),
+            &json!({
+                "child_agent": "explore",
+                "task_call_id": "task-1",
+                "label": "default",
+                "prompt": "look around"
+            }),
+        )
+        .unwrap();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::SubagentRouting,
+            Some("explore"),
+            Some("task-1"),
+            &json!({
+                "child_agent": "explore",
+                "task_call_id": "task-1",
+                "label": "default",
+                "provider": "lmstudio",
+                "model": "child-model",
+                "trusted_only": false,
+                "model_trusted": true,
+                "routing": { "resolved_model": "child-model" }
+            }),
+        )
+        .unwrap();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::SubagentReport,
+            Some("explore"),
+            Some("task-1"),
+            &json!({ "report": "found three modules" }),
+        )
+        .unwrap();
+        record_assistant(&s, "infer-2", "thanks");
+
+        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let h = r.history;
+        let calls = assistant_calls(&h[1]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "task");
+        assert_eq!(calls[0].id, "task-1");
+        let results = tool_results(&h[2]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "task-1");
+        assert_eq!(tool_result_body(&h[2]), "found three modules");
+        validate_pairing(&h).expect("provider-valid");
+    }
+
+    #[test]
     fn strict_responses_rehydrate_preserves_task_provider_call_identity() {
         let s = root_session();
         record_user(&s, "investigate");

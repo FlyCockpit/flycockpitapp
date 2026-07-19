@@ -727,6 +727,56 @@ impl App {
                     expanded: false,
                 });
             }
+            TurnEvent::SubagentRouting {
+                child,
+                task_call_id,
+                label,
+                trusted_only,
+                model_trusted,
+                routing,
+                ..
+            } => {
+                let update = SubagentRoutingUpdate {
+                    trusted_only,
+                    model_trusted,
+                    routing: subagent_routing_chips_from_value(&routing),
+                };
+                let active_matches = self
+                    .active_subagent_view()
+                    .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
+                let amended = if active_matches {
+                    if let Some(parent) = self.transcript_view_stack.last_mut() {
+                        let amended = amend_subagent_routing_in(
+                            &mut parent.history,
+                            &child,
+                            &task_call_id,
+                            &label,
+                            update.clone(),
+                        );
+                        if amended {
+                            parent
+                                .history_render_versions
+                                .resize(parent.history.len(), 0);
+                            parent
+                                .history_render_fingerprints
+                                .resize(parent.history.len(), 0);
+                        }
+                        amended
+                    } else {
+                        self.amend_subagent_routing(&child, &task_call_id, &label, update.clone())
+                    }
+                } else {
+                    self.amend_subagent_routing(&child, &task_call_id, &label, update.clone())
+                };
+                if !amended {
+                    tracing::debug!(
+                        child,
+                        task_call_id,
+                        label,
+                        "dropped unmatched subagent routing amend"
+                    );
+                }
+            }
             TurnEvent::SubagentReport {
                 agent,
                 task_call_id,
@@ -1519,6 +1569,16 @@ impl App {
         update: SubagentReportUpdate,
     ) {
         settle_subagent_in(&mut self.history, child, task_call_id, label, update);
+    }
+
+    pub(super) fn amend_subagent_routing(
+        &mut self,
+        child: &str,
+        task_call_id: &str,
+        label: &str,
+        update: SubagentRoutingUpdate,
+    ) -> bool {
+        amend_subagent_routing_in(&mut self.history, child, task_call_id, label, update)
     }
 }
 
@@ -2465,6 +2525,13 @@ pub(super) struct SubagentReportUpdate {
     pub(super) routing: SubagentRoutingChips,
 }
 
+#[derive(Clone)]
+pub(super) struct SubagentRoutingUpdate {
+    pub(super) trusted_only: bool,
+    pub(super) model_trusted: bool,
+    pub(super) routing: SubagentRoutingChips,
+}
+
 fn subagent_routing_chips_from_value(value: &serde_json::Value) -> SubagentRoutingChips {
     fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
         value
@@ -2560,4 +2627,35 @@ pub(super) fn settle_subagent_in(
             expanded: auto_expand,
         }),
     }
+}
+
+pub(super) fn amend_subagent_routing_in(
+    history: &mut [HistoryEntry],
+    child: &str,
+    task_call_id: &str,
+    label: &str,
+    update: SubagentRoutingUpdate,
+) -> bool {
+    let Some((entry_trusted_only, entry_model_trusted, entry_routing)) =
+        history.iter_mut().rev().find_map(|entry| match entry {
+            HistoryEntry::Subagent {
+                child: c,
+                task_call_id: call,
+                label: entry_label,
+                trusted_only,
+                model_trusted,
+                routing,
+                ..
+            } if c == child && call == task_call_id && entry_label == label => {
+                Some((trusted_only, model_trusted, routing))
+            }
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    *entry_trusted_only = update.trusted_only;
+    *entry_model_trusted = update.model_trusted;
+    *entry_routing = update.routing;
+    true
 }

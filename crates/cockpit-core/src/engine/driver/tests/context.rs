@@ -24,6 +24,7 @@ async fn prune_targets_foreground_subagent_only() {
         history: dup_read_history(),
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
+        fallback_decision: None,
     });
 
     // Prune the foreground (the subagent on top).

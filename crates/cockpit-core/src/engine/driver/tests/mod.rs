@@ -724,6 +724,7 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
         history,
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
+        fallback_decision: None,
     });
 }
 
@@ -790,6 +791,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
             repair_notes: Vec::new(),
         }),
         deferred_log: crate::engine::deferred::DeferredLog::new(),
+        fallback_decision: None,
     });
 }
 
@@ -1164,6 +1166,7 @@ fn single_noninteractive_completion(
         snapshot: NoninteractiveDelegationSnapshot::empty(),
         shrink: None,
         repair_notes: Vec::new(),
+        child_routing: None,
     }
 }
 

@@ -1321,6 +1321,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | InferenceWarning { session_id, .. }
         | BackupUsed { session_id, .. }
         | SubagentSpawned { session_id, .. }
+        | SubagentRouting { session_id, .. }
         | SubagentReport { session_id, .. }
         | NestedTurn { session_id, .. }
         | Usage { session_id, .. }

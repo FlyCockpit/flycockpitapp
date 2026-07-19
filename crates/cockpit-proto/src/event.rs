@@ -343,6 +343,22 @@ pub enum Event {
         routing: serde_json::Value,
     },
 
+    /// Later routing amend for a spawned subagent once the child model exists.
+    SubagentRouting {
+        session_id: Uuid,
+        task_call_id: String,
+        label: String,
+        child: String,
+        provider: String,
+        model: String,
+        #[serde(default)]
+        trusted_only: bool,
+        #[serde(default)]
+        model_trusted: bool,
+        #[serde(default)]
+        routing: serde_json::Value,
+    },
+
     /// A subagent finished and emitted its report back to the parent.
     SubagentReport {
         session_id: Uuid,

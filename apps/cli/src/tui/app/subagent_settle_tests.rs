@@ -1,4 +1,6 @@
-use super::{SubagentReportUpdate, settle_subagent_in};
+use super::{
+    SubagentReportUpdate, SubagentRoutingUpdate, amend_subagent_routing_in, settle_subagent_in,
+};
 use crate::tui::history::{HistoryEntry, SubagentRoutingChips};
 
 fn running(parent: &str, child: &str) -> HistoryEntry {
@@ -40,11 +42,30 @@ fn report_update(report: impl Into<String>) -> SubagentReportUpdate {
     }
 }
 
+fn routing_update(model: &str) -> SubagentRoutingUpdate {
+    SubagentRoutingUpdate {
+        trusted_only: true,
+        model_trusted: true,
+        routing: SubagentRoutingChips {
+            model: Some(model.into()),
+            location: Some("private_remote".into()),
+            fallback: Some("backup".into()),
+        },
+    }
+}
+
 fn outcome(entry: &HistoryEntry) -> Option<(&str, bool)> {
     match entry {
         HistoryEntry::Subagent {
             outcome: Some(o), ..
         } => Some((o.report.as_str(), o.failed)),
+        _ => None,
+    }
+}
+
+fn routing_model(entry: &HistoryEntry) -> Option<&str> {
+    match entry {
+        HistoryEntry::Subagent { routing, .. } => routing.model.as_deref(),
         _ => None,
     }
 }
@@ -121,6 +142,63 @@ fn report_updates_subagent_trust_metadata() {
         }
         other => panic!("expected subagent, got {other:?}"),
     }
+}
+
+#[test]
+fn routing_amend_updates_inflight_subagent_chips() {
+    let mut history = vec![running("Build", "explore")];
+
+    assert!(amend_subagent_routing_in(
+        &mut history,
+        "explore",
+        "task",
+        "default",
+        routing_update("child-model"),
+    ));
+
+    assert_eq!(history.len(), 1);
+    assert_eq!(routing_model(&history[0]), Some("child-model"));
+    assert_eq!(trust_flags(&history[0]), Some((true, true)));
+}
+
+#[test]
+fn routing_amend_without_entry_is_dropped() {
+    let mut history = vec![running("Build", "explore")];
+
+    assert!(!amend_subagent_routing_in(
+        &mut history,
+        "builder",
+        "missing-task",
+        "default",
+        routing_update("child-model"),
+    ));
+
+    assert_eq!(history.len(), 1);
+    assert_eq!(routing_model(&history[0]), None);
+}
+
+#[test]
+fn routing_amend_after_report_updates_settled_entry() {
+    let mut history = vec![running("Build", "explore")];
+    settle_subagent_in(
+        &mut history,
+        "explore",
+        "task",
+        "default",
+        report_update("all done"),
+    );
+
+    assert!(amend_subagent_routing_in(
+        &mut history,
+        "explore",
+        "task",
+        "default",
+        routing_update("child-model"),
+    ));
+
+    assert_eq!(history.len(), 1);
+    assert_eq!(outcome(&history[0]), Some(("all done", false)));
+    assert_eq!(routing_model(&history[0]), Some("child-model"));
 }
 
 /// A report whose text is the driver's `Error: ` failure encoding

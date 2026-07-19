@@ -543,6 +543,14 @@ impl Model {
     }
 
     pub fn routing_metadata_json(&self, requested_selector: Option<&str>) -> serde_json::Value {
+        self.routing_metadata_json_with_fallback_decision(requested_selector, "none")
+    }
+
+    pub fn routing_metadata_json_with_fallback_decision(
+        &self,
+        requested_selector: Option<&str>,
+        fallback_decision: &str,
+    ) -> serde_json::Value {
         let trust = if self.is_trusted() {
             "trusted"
         } else {
@@ -563,7 +571,7 @@ impl Model {
             "quality_rank": self.quality_rank(),
             "cost_rank": self.cost_rank(),
             "optimization_mode": "exact",
-            "fallback_decision": "none",
+            "fallback_decision": fallback_decision,
             "matched_capabilities": [],
             "subagent_invokable": self.subagent_invokable(),
             "can_delegate": self.can_delegate(),
@@ -3504,6 +3512,24 @@ mod tests {
         assert_eq!(routing["cost_rank"], 3);
         assert_eq!(routing["subagent_invokable"], true);
         assert_eq!(routing["trusted_only"], true);
+    }
+
+    #[test]
+    fn routing_metadata_reports_real_fallback_decision() {
+        let cfg = trust_test_config(true);
+        let flag = TestArc::new(std::sync::atomic::AtomicBool::new(true));
+        let model = Model::from_config_with_env_trusted_only(
+            &cfg,
+            TestArc::new(RedactionTable::empty()),
+            flag,
+            |_| None,
+        )
+        .expect("trusted model should build under trusted-only");
+
+        let routing =
+            model.routing_metadata_json_with_fallback_decision(Some("p:m"), "backup_model_used");
+
+        assert_eq!(routing["fallback_decision"], "backup_model_used");
     }
 
     #[test]

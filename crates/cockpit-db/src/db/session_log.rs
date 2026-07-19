@@ -61,6 +61,8 @@ pub enum SessionEventKind {
     ToolCallCompleted,
     /// A `task` delegation spawned a child fork.
     SubagentSpawned,
+    /// A spawned subagent's resolved child routing became known.
+    SubagentRouting,
     /// A subagent returned its report to the parent.
     SubagentReport,
     /// `/prune` (manual or auto) elided wire-only snapshot bodies.
@@ -138,6 +140,7 @@ impl SessionEventKind {
             SessionEventKind::ToolCallStarted => "tool_call_started",
             SessionEventKind::ToolCallCompleted => "tool_call_completed",
             SessionEventKind::SubagentSpawned => "subagent_spawned",
+            SessionEventKind::SubagentRouting => "subagent_routing",
             SessionEventKind::SubagentReport => "subagent_report",
             SessionEventKind::ContextPruned => "context_pruned",
             SessionEventKind::SessionCompacted => "session_compacted",

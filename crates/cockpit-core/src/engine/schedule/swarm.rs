@@ -165,6 +165,7 @@ async fn run_swarm_loop(
             None,
             None,
             turn_tx,
+            None,
         )
         .await?;
         match outcome {

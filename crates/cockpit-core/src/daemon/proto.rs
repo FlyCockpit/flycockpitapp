@@ -305,6 +305,26 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             model_trusted,
             routing,
         }],
+        TurnEvent::SubagentRouting {
+            task_call_id,
+            label,
+            child,
+            provider,
+            model,
+            trusted_only,
+            model_trusted,
+            routing,
+        } => vec![Event::SubagentRouting {
+            session_id,
+            task_call_id,
+            label,
+            child,
+            provider,
+            model,
+            trusted_only,
+            model_trusted,
+            routing,
+        }],
         TurnEvent::SubagentReport {
             agent,
             task_call_id,
@@ -587,5 +607,64 @@ fn queue_target_to_proto(target: crate::engine::message::QueueTarget) -> QueueTa
         agent: target.agent,
         depth: target.depth,
         task_call_id: target.task_call_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::agent::TurnEvent;
+    use uuid::Uuid;
+
+    #[test]
+    fn subagent_routing_amend_roundtrips_through_proto() {
+        let session_id = Uuid::new_v4();
+        let routing = serde_json::json!({
+            "provider": "test-provider",
+            "resolved_model": "child-model",
+            "fallback_decision": "backup",
+            "location": "private_remote"
+        });
+
+        let out = turn_event_to_proto(
+            TurnEvent::SubagentRouting {
+                task_call_id: "task-1".to_string(),
+                label: "second".to_string(),
+                child: "explore".to_string(),
+                provider: "test-provider".to_string(),
+                model: "child-model".to_string(),
+                trusted_only: true,
+                model_trusted: false,
+                routing: routing.clone(),
+            },
+            session_id,
+        );
+
+        match out.as_slice() {
+            [
+                Event::SubagentRouting {
+                    session_id: actual_session_id,
+                    task_call_id,
+                    label,
+                    child,
+                    provider,
+                    model,
+                    trusted_only,
+                    model_trusted,
+                    routing: actual_routing,
+                },
+            ] => {
+                assert_eq!(*actual_session_id, session_id);
+                assert_eq!(task_call_id, "task-1");
+                assert_eq!(label, "second");
+                assert_eq!(child, "explore");
+                assert_eq!(provider, "test-provider");
+                assert_eq!(model, "child-model");
+                assert!(*trusted_only);
+                assert!(!*model_trusted);
+                assert_eq!(actual_routing, &routing);
+            }
+            other => panic!("expected one SubagentRouting event, got {other:?}"),
+        }
     }
 }

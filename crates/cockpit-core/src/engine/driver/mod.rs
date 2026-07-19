@@ -46,7 +46,9 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
-use crate::engine::agent::{Agent, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup};
+use crate::engine::agent::{
+    Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup,
+};
 use crate::engine::message::{
     Message, UserSubmission, UserSubmissionKind, extract_text, extract_user_text,
 };
@@ -358,6 +360,7 @@ pub struct AgentSession {
     /// it and folds it into the report the parent ingests. The root frame's
     /// buffer is never read (the root has no parent to defer to).
     pub deferred_log: crate::engine::deferred::DeferredLog,
+    pub fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -871,11 +874,156 @@ fn with_model_routing_metadata(
     data
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::engine::driver) struct ChildRoutingMetadata {
+    pub(in crate::engine::driver) provider: String,
+    pub(in crate::engine::driver) model: String,
+    pub(in crate::engine::driver) trusted_only: bool,
+    pub(in crate::engine::driver) model_trusted: bool,
+    pub(in crate::engine::driver) routing: serde_json::Value,
+}
+
+impl ChildRoutingMetadata {
+    pub(in crate::engine::driver) fn from_model(model: &crate::engine::model::Model) -> Self {
+        Self::from_model_with_fallback_decision(model, None)
+    }
+
+    pub(in crate::engine::driver) fn from_model_with_fallback_decision(
+        model: &crate::engine::model::Model,
+        fallback_decision: Option<&crate::engine::agent::BackupFallbackDecision>,
+    ) -> Self {
+        Self {
+            provider: model.provider_id().to_string(),
+            model: model.model_id_ref().to_string(),
+            trusted_only: model.trusted_only_enabled(),
+            model_trusted: model.is_trusted(),
+            routing: model.routing_metadata_json_with_fallback_decision(
+                None,
+                fallback_decision
+                    .map(|decision| decision.routing_value())
+                    .unwrap_or("none"),
+            ),
+        }
+    }
+
+    pub(in crate::engine::driver) fn from_parent_model(
+        model: &crate::engine::model::Model,
+    ) -> Self {
+        Self::from_model(model)
+    }
+
+    pub(in crate::engine::driver) fn with_fallback_decision(
+        mut self,
+        fallback_decision: Option<&crate::engine::agent::BackupFallbackDecision>,
+    ) -> Self {
+        if let Some(decision) = fallback_decision {
+            self.routing["fallback_decision"] = serde_json::json!(decision.routing_value());
+        }
+        self
+    }
+
+    pub(in crate::engine::driver) fn turn_event(
+        &self,
+        child: impl Into<String>,
+        task_call_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> TurnEvent {
+        TurnEvent::SubagentRouting {
+            task_call_id: task_call_id.into(),
+            label: label.into(),
+            child: child.into(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            trusted_only: self.trusted_only,
+            model_trusted: self.model_trusted,
+            routing: self.routing.clone(),
+        }
+    }
+}
+
+fn with_child_routing_metadata(
+    mut data: serde_json::Value,
+    routing: &ChildRoutingMetadata,
+) -> serde_json::Value {
+    data["provider"] = serde_json::json!(routing.provider);
+    data["model"] = serde_json::json!(routing.model);
+    data["trusted_only"] = serde_json::json!(routing.trusted_only);
+    data["model_trusted"] = serde_json::json!(routing.model_trusted);
+    data["routing"] = routing.routing.clone();
+    data
+}
+
+fn subagent_routing_event_data(
+    child: &str,
+    task_call_id: &str,
+    label: &str,
+    routing: &ChildRoutingMetadata,
+) -> serde_json::Value {
+    with_child_routing_metadata(
+        serde_json::json!({
+            "child_agent": child,
+            "task_call_id": task_call_id,
+            "label": label,
+        }),
+        routing,
+    )
+}
+
 /// Inbound channel capacity for job events / commands. Generous; job
 /// lifecycle traffic is tiny.
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    async fn emit_subagent_routing_amend(
+        &self,
+        tx: &mpsc::Sender<TurnEvent>,
+        child_agent: &str,
+        task_call_id: &str,
+        label: &str,
+        routing: &ChildRoutingMetadata,
+    ) {
+        if let Err(e) = self.session.record_event(
+            crate::db::session_log::SessionEventKind::SubagentRouting,
+            Some(child_agent),
+            Some(task_call_id),
+            &subagent_routing_event_data(child_agent, task_call_id, label, routing),
+        ) {
+            tracing::warn!(error = %e, "record subagent_routing event failed");
+        }
+        let _ = tx
+            .send(routing.turn_event(
+                child_agent.to_string(),
+                task_call_id.to_string(),
+                label.to_string(),
+            ))
+            .await;
+    }
+
+    async fn note_backup_fallback_for_active_frame(
+        &mut self,
+        fallback: crate::engine::agent::BackupFallbackDecision,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let amend = self.stack.last_mut().and_then(|frame| {
+            frame.fallback_decision = Some(fallback.clone());
+            frame.answering.as_ref().map(|pending| {
+                (
+                    frame.agent.name.clone(),
+                    pending.call_id.clone(),
+                    ChildRoutingMetadata::from_model_with_fallback_decision(
+                        &frame.agent.model,
+                        Some(&fallback),
+                    ),
+                )
+            })
+        });
+
+        if let Some((child_agent, task_call_id, routing)) = amend {
+            self.emit_subagent_routing_amend(tx, &child_agent, &task_call_id, "default", &routing)
+                .await;
+        }
+    }
+
     // Public default-cap constructor; retained for callers that don't
     // need the explicit-capacity `with_*` variants.
     #[allow(dead_code)]
@@ -929,6 +1077,7 @@ impl Driver {
                     queue_target: frame.queue_target.clone(),
                     answering: frame.answering.clone(),
                     deferred_log: crate::engine::deferred::DeferredLog::new(),
+                    fallback_decision: frame.fallback_decision.clone(),
                 })
                 .collect(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
@@ -1209,6 +1358,7 @@ impl Driver {
                 history: Vec::new(),
                 answering: None,
                 deferred_log: crate::engine::deferred::DeferredLog::new(),
+                fallback_decision: None,
             }],
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -2079,6 +2229,7 @@ impl Driver {
                 .tandem_set
                 .is_enabled()
                 .then(|| self.tandem_set.clone());
+            let mut turn_metadata = BackupTurnMetadata::default();
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
@@ -2107,9 +2258,14 @@ impl Driver {
                     tandem.as_ref(),
                     Some(lifecycle_turn_id.clone()),
                     tx,
+                    Some(&mut turn_metadata),
                 )
                 .await
             };
+            if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                self.note_backup_fallback_for_active_frame(fallback, tx)
+                    .await;
+            }
             let outcome = match turn_result {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::interrupt::is_parked(&e) => {
@@ -4323,11 +4479,15 @@ impl Driver {
             .answering
             .as_ref()
             .and_then(|pending| pending.function_call_id.as_deref());
+        let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
+            &child.agent.model,
+            child.fallback_decision.as_ref(),
+        );
         if let Err(e) = self.session.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
             Some(&child.agent.name),
             task_call_id,
-            &with_model_routing_metadata(
+            &with_child_routing_metadata(
                 subagent_report_event_data(
                     &child.agent.name,
                     task_call_id,
@@ -4336,7 +4496,7 @@ impl Driver {
                     &report,
                     None,
                 ),
-                &child.agent.model,
+                &routing,
             ),
         ) {
             tracing::warn!(error = %e, "record subagent_report event failed");
@@ -4351,9 +4511,9 @@ impl Driver {
                     .unwrap_or_default(),
                 label: "default".to_string(),
                 report: report.clone(),
-                trusted_only: child.agent.model.trusted_only_enabled(),
-                model_trusted: child.agent.model.is_trusted(),
-                routing: child.agent.model.routing_metadata_json(None),
+                trusted_only: routing.trusted_only,
+                model_trusted: routing.model_trusted,
+                routing: routing.routing,
             })
             .await;
         child.answering.map(|pending| {
@@ -4425,11 +4585,15 @@ impl Driver {
                 .answering
                 .as_ref()
                 .and_then(|pending| pending.function_call_id.as_deref());
+            let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
+                &child.agent.model,
+                child.fallback_decision.as_ref(),
+            );
             if let Err(e) = self.session.record_event(
                 crate::db::session_log::SessionEventKind::SubagentReport,
                 Some(&child.agent.name),
                 task_call_id,
-                &with_model_routing_metadata(
+                &with_child_routing_metadata(
                     subagent_report_event_data(
                         &child.agent.name,
                         task_call_id,
@@ -4438,7 +4602,7 @@ impl Driver {
                         &report,
                         None,
                     ),
-                    &child.agent.model,
+                    &routing,
                 ),
             ) {
                 tracing::warn!(error = %e, "record aborted subagent_report event failed");
@@ -4453,9 +4617,9 @@ impl Driver {
                         .unwrap_or_default(),
                     label: "default".to_string(),
                     report: report.clone(),
-                    trusted_only: child.agent.model.trusted_only_enabled(),
-                    model_trusted: child.agent.model.is_trusted(),
-                    routing: child.agent.model.routing_metadata_json(None),
+                    trusted_only: routing.trusted_only,
+                    model_trusted: routing.model_trusted,
+                    routing: routing.routing,
                 })
                 .await;
 
@@ -4826,6 +4990,7 @@ impl Driver {
 
             let attempted_prompt = next_prompt.clone();
             self.publish_active_tool_names();
+            let mut turn_metadata = BackupTurnMetadata::default();
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 // The foreground frame's deferred-log buffer (`plan.md §3d`):
@@ -4861,9 +5026,14 @@ impl Driver {
                     tandem.as_ref(),
                     Some(lifecycle_turn_id.clone()),
                     tx,
+                    Some(&mut turn_metadata),
                 )
                 .await
             };
+            if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                self.note_backup_fallback_for_active_frame(fallback, tx)
+                    .await;
+            }
             // A user ctrl+c (`CancelTurn`) aborts the in-flight inference
             // via `cancel`; `turn` surfaces it as an `InferenceCancelled`
             // sentinel. Unwind cleanly back to idle rather than treating it
@@ -5256,6 +5426,15 @@ impl Driver {
                             continue;
                         }
                     };
+                    let child_routing = ChildRoutingMetadata::from_model(&child.model);
+                    self.emit_subagent_routing_amend(
+                        tx,
+                        &child_agent,
+                        &task_call_id,
+                        "default",
+                        &child_routing,
+                    )
+                    .await;
 
                     // Snapshot the outgoing primary's locks before the
                     // child takes over. If the parent ever resumes (the
@@ -5317,6 +5496,7 @@ impl Driver {
                             repair_notes,
                         }),
                         deferred_log: crate::engine::deferred::DeferredLog::new(),
+                        fallback_decision: None,
                     });
                     self.publish_active_tool_names();
                     let _ = tx

@@ -1881,6 +1881,35 @@ fn subagent_routing_chips_condense_model_and_trust() {
     );
 }
 
+#[test]
+fn fallback_chip_renders_for_non_none_decision() {
+    let mut spans = Vec::new();
+    append_subagent_routing_chips(
+        &mut spans,
+        false,
+        true,
+        &SubagentRoutingChips {
+            model: Some("gpt-5".into()),
+            location: None,
+            fallback: Some("backup".into()),
+        },
+    );
+    assert!(spans_text(&spans).contains("[fallback:backup]"));
+
+    let mut none_spans = Vec::new();
+    append_subagent_routing_chips(
+        &mut none_spans,
+        false,
+        true,
+        &SubagentRoutingChips {
+            model: Some("gpt-5".into()),
+            location: None,
+            fallback: Some("none".into()),
+        },
+    );
+    assert!(!spans_text(&none_spans).contains("[fallback:"));
+}
+
 /// Running: one live line `{parent} delegated to {child}…
 /// (elapsed)`, child name orange, no expand chip.
 #[test]

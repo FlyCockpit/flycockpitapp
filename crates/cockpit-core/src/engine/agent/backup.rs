@@ -1,5 +1,23 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupFallbackDecision {
+    pub primary_model: String,
+    pub error_class: String,
+    pub backup_model: String,
+}
+
+impl BackupFallbackDecision {
+    pub fn routing_value(&self) -> &'static str {
+        "backup"
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupTurnMetadata {
+    pub fallback_decision: Option<BackupFallbackDecision>,
+}
+
 /// Run one turn with per-turn primary-first backup-model fallback
 /// (implementation note).
 ///
@@ -58,6 +76,7 @@ pub async fn turn_with_backup(
     tandem: Option<&crate::engine::schedule::TandemSet>,
     turn_id: Option<String>,
     tx: &mpsc::Sender<TurnEvent>,
+    turn_metadata: Option<&mut BackupTurnMetadata>,
 ) -> Result<TurnOutcome> {
     // Primary attempt. Suppress its own red UI only when a backup is configured
     // (so a qualifying failure can fall back silently); with no backup, let the
@@ -129,6 +148,14 @@ pub async fn turn_with_backup(
     // with a display-only yellow banner (never enters model context), then run
     // the same turn on the backup model. The backup attempt emits its own red
     // error if it ALSO fails (no second banner).
+    if let Some(metadata) = turn_metadata {
+        metadata.fallback_decision = Some(BackupFallbackDecision {
+            primary_model: primary_model_id.clone(),
+            error_class: class.clone(),
+            backup_model: backup.model_id_ref().to_string(),
+        });
+    }
+
     let _ = tx
         .send(TurnEvent::BackupUsed {
             agent: agent.name.clone(),
@@ -725,6 +752,7 @@ mod backup_fallback_tests {
             None,
             None,
             tx,
+            None,
         )
         .await
     }
@@ -966,6 +994,7 @@ mod backup_fallback_tests {
             None,
             None,
             &tx,
+            None,
         )
         .await
         .expect("backup answers");

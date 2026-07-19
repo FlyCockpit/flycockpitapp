@@ -1202,6 +1202,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | InferenceWarning { session_id, .. }
         | BackupUsed { session_id, .. }
         | SubagentSpawned { session_id, .. }
+        | SubagentRouting { session_id, .. }
         | SubagentReport { session_id, .. }
         | NestedTurn { session_id, .. }
         | Usage { session_id, .. }
@@ -1630,6 +1631,26 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             prompt,
             requested_cwd,
             resolved_cwd,
+            trusted_only,
+            model_trusted,
+            routing,
+        },
+        SubagentRouting {
+            task_call_id,
+            label,
+            child,
+            provider,
+            model,
+            trusted_only,
+            model_trusted,
+            routing,
+            ..
+        } => TurnEvent::SubagentRouting {
+            task_call_id,
+            label,
+            child,
+            provider,
+            model,
             trusted_only,
             model_trusted,
             routing,
@@ -2166,6 +2187,51 @@ mod tests {
                 ));
             }
             other => panic!("expected nested turn event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_routing_amend_roundtrips_through_agent_runner() {
+        let sid = uuid::Uuid::new_v4();
+        let routing = serde_json::json!({
+            "provider": "test-provider",
+            "resolved_model": "child-model",
+            "fallback_decision": "backup",
+        });
+        let event = proto::Event::SubagentRouting {
+            session_id: sid,
+            task_call_id: "task-1".into(),
+            label: "second".into(),
+            child: "explore".into(),
+            provider: "test-provider".into(),
+            model: "child-model".into(),
+            trusted_only: true,
+            model_trusted: false,
+            routing: routing.clone(),
+        };
+
+        assert_eq!(event_session(&event), Some(sid));
+        match proto_event_to_turn_event(event) {
+            Some(TurnEvent::SubagentRouting {
+                task_call_id,
+                label,
+                child,
+                provider,
+                model,
+                trusted_only,
+                model_trusted,
+                routing: actual_routing,
+            }) => {
+                assert_eq!(task_call_id, "task-1");
+                assert_eq!(label, "second");
+                assert_eq!(child, "explore");
+                assert_eq!(provider, "test-provider");
+                assert_eq!(model, "child-model");
+                assert!(trusted_only);
+                assert!(!model_trusted);
+                assert_eq!(actual_routing, routing);
+            }
+            other => panic!("expected subagent routing amend, got {other:?}"),
         }
     }
 

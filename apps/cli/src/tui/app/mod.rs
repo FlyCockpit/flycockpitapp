@@ -27,8 +27,9 @@ use events::{
 };
 #[cfg(test)]
 use events::{
-    LOCAL_CMD_DISPLAY_LINES, RunCaptureOptions, SubagentReportUpdate, pick_working_msg,
-    run_capture_with_options, settle_subagent_in, tool_invocation,
+    LOCAL_CMD_DISPLAY_LINES, RunCaptureOptions, SubagentReportUpdate, SubagentRoutingUpdate,
+    amend_subagent_routing_in, pick_working_msg, run_capture_with_options, settle_subagent_in,
+    tool_invocation,
 };
 use input::accepts_key;
 use render::{extract_selection_markdown_source, extract_selection_plaintext, is_edit_tool};

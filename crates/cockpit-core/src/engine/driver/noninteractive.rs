@@ -98,6 +98,7 @@ pub(in crate::engine::driver) struct DelegationChildOutcome {
     pub(in crate::engine::driver) report: String,
     pub(in crate::engine::driver) failed: bool,
     pub(in crate::engine::driver) partial_progress: DelegationPartialProgress,
+    pub(in crate::engine::driver) child_routing: Option<ChildRoutingMetadata>,
 }
 
 impl DelegationChildOutcome {
@@ -106,6 +107,7 @@ impl DelegationChildOutcome {
             report: report.into(),
             failed: false,
             partial_progress: DelegationPartialProgress::default(),
+            child_routing: None,
         }
     }
 
@@ -114,6 +116,7 @@ impl DelegationChildOutcome {
             report: report.into(),
             failed: true,
             partial_progress: DelegationPartialProgress::default(),
+            child_routing: None,
         }
     }
 
@@ -127,7 +130,16 @@ impl DelegationChildOutcome {
             report,
             failed: true,
             partial_progress,
+            child_routing: None,
         }
+    }
+
+    pub(in crate::engine::driver) fn with_child_routing(
+        mut self,
+        child_routing: ChildRoutingMetadata,
+    ) -> Self {
+        self.child_routing = Some(child_routing);
+        self
     }
 }
 
@@ -490,6 +502,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) snapshot: NoninteractiveDelegationSnapshot,
     pub(in crate::engine::driver) shrink: Option<PendingDelegationShrink>,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
+    pub(in crate::engine::driver) child_routing: Option<ChildRoutingMetadata>,
 }
 
 pub(in crate::engine::driver) struct BatchNoninteractiveTask {
@@ -833,6 +846,7 @@ impl Driver {
                 snapshot: NoninteractiveDelegationSnapshot::empty(),
                 shrink: None,
                 repair_notes,
+                child_routing: None,
             });
         }
 
@@ -857,6 +871,7 @@ impl Driver {
                     snapshot: NoninteractiveDelegationSnapshot::empty(),
                     shrink: None,
                     repair_notes,
+                    child_routing: None,
                 });
             }
         };
@@ -952,6 +967,8 @@ impl Driver {
         );
 
         let outcome = if child_agent == "docs" {
+            // The docs pipeline is not a built-in child agent load, so there is
+            // no resolved child model to amend onto the earlier spawn event.
             if resume_handle.is_some() {
                 DelegationChildOutcome::failed(stale_handle_error(&child_agent))
             } else {
@@ -1023,9 +1040,19 @@ impl Driver {
                                     handle: shrink_handle,
                                 }),
                                 repair_notes,
+                                child_routing: None,
                             });
                         }
                     };
+                    let child_routing = ChildRoutingMetadata::from_model(&child.model);
+                    self.emit_subagent_routing_amend(
+                        tx,
+                        &child_agent,
+                        &task_call_id,
+                        "default",
+                        &child_routing,
+                    )
+                    .await;
                     let read_only = crate::engine::builtin::is_read_only_noninteractive(&child);
                     let write_capable = crate::engine::builtin::is_write_capable(&child);
                     if resume_handle.is_some() && write_capable {
@@ -1099,18 +1126,45 @@ impl Driver {
                     .await
                     {
                         Err(e) => {
-                            let (message, history) = e.into_parts();
+                            let (message, history, fallback_decision) = e.into_parts();
                             let partial_progress = partial_progress_from_history(&history);
                             snapshot = NoninteractiveDelegationSnapshot::from_history(history);
+                            let final_child_routing = child_routing
+                                .clone()
+                                .with_fallback_decision(fallback_decision.as_ref());
+                            if fallback_decision.is_some() {
+                                self.emit_subagent_routing_amend(
+                                    tx,
+                                    &child_agent,
+                                    &task_call_id,
+                                    "default",
+                                    &final_child_routing,
+                                )
+                                .await;
+                            }
                             DelegationChildOutcome::failed_with_progress(
                                 format!("Error: {message}"),
                                 partial_progress,
                             )
+                            .with_child_routing(final_child_routing)
                         }
                         Ok(outcome) => {
                             snapshot = NoninteractiveDelegationSnapshot::from_history(
                                 outcome.history.clone(),
                             );
+                            let final_child_routing = child_routing
+                                .clone()
+                                .with_fallback_decision(outcome.fallback_decision.as_ref());
+                            if outcome.fallback_decision.is_some() {
+                                self.emit_subagent_routing_amend(
+                                    tx,
+                                    &child_agent,
+                                    &task_call_id,
+                                    "default",
+                                    &final_child_routing,
+                                )
+                                .await;
+                            }
                             if followup_enabled
                                 && crate::engine::builtin::is_followup_eligible(&child_agent)
                             {
@@ -1131,6 +1185,7 @@ impl Driver {
                                 }
                             }
                             DelegationChildOutcome::ok(outcome.report)
+                                .with_child_routing(final_child_routing)
                         }
                     }
                 }
@@ -1152,6 +1207,7 @@ impl Driver {
                 handle: shrink_handle,
             }),
             repair_notes,
+            child_routing: outcome.child_routing,
         })
     }
 
@@ -1173,6 +1229,7 @@ impl Driver {
             snapshot,
             shrink,
             repair_notes,
+            child_routing,
         } = completion;
 
         let emit_report_event = shrink.is_some();
@@ -1240,45 +1297,43 @@ impl Driver {
             .maybe_scan_task_report(&child_agent, report, tx)
             .await?;
 
+        let report_data = subagent_report_event_data(
+            &child_agent,
+            Some(&task_call_id),
+            task_function_call_id.as_deref(),
+            "default",
+            &report,
+            Some(&partial_progress),
+        );
+        let report_data = match child_routing.as_ref() {
+            Some(routing) => with_child_routing_metadata(report_data, routing),
+            None => {
+                with_model_routing_metadata(report_data, &self.stack.last().unwrap().agent.model)
+            }
+        };
         if let Err(e) = self.session.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
             Some(&child_agent),
             Some(&task_call_id),
-            &with_model_routing_metadata(
-                subagent_report_event_data(
-                    &child_agent,
-                    Some(&task_call_id),
-                    task_function_call_id.as_deref(),
-                    "default",
-                    &report,
-                    Some(&partial_progress),
-                ),
-                &self.stack.last().unwrap().agent.model,
-            ),
+            &report_data,
         ) {
             tracing::warn!(error = %e, "record subagent_report event failed");
         }
+        let fallback_routing =
+            || ChildRoutingMetadata::from_parent_model(&self.stack.last().unwrap().agent.model);
+        let routing = child_routing
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(fallback_routing);
         let _ = tx
             .send(TurnEvent::SubagentReport {
                 agent: child_agent.clone(),
                 task_call_id: task_call_id.clone(),
                 label: "default".to_string(),
                 report: report.clone(),
-                trusted_only: self
-                    .stack
-                    .last()
-                    .unwrap()
-                    .agent
-                    .model
-                    .trusted_only_enabled(),
-                model_trusted: self.stack.last().unwrap().agent.model.is_trusted(),
-                routing: self
-                    .stack
-                    .last()
-                    .unwrap()
-                    .agent
-                    .model
-                    .routing_metadata_json(None),
+                trusted_only: routing.trusted_only,
+                model_trusted: routing.model_trusted,
+                routing: routing.routing,
             })
             .await;
 
@@ -2487,6 +2542,9 @@ impl Driver {
                     {
                         DelegationChildOutcome::failed(err)
                     } else if entry.child_agent == "docs" {
+                        // The docs pipeline bypasses `builtin::load`, so it has
+                        // no resolved child model and intentionally emits no
+                        // routing amend.
                         if entry.resume_handle.is_some() {
                             DelegationChildOutcome::failed(stale_handle_error(&entry.child_agent))
                         } else {
@@ -2539,6 +2597,16 @@ impl Driver {
                                 );
                             }
                         };
+                        let child_routing = ChildRoutingMetadata::from_model(&child.model);
+                        driver
+                            .emit_subagent_routing_amend(
+                                tx,
+                                &entry.child_agent,
+                                &entry_task_call_id,
+                                &entry.label,
+                                &child_routing,
+                            )
+                            .await;
                         let skill_block =
                             driver.seed_skills_block(&entry.skill_seed, &entry.child_agent);
                         let mut brief = compose_subagent_brief(&entry.prompt, &entry_why);
@@ -2600,16 +2668,46 @@ impl Driver {
                                 snapshot = NoninteractiveDelegationSnapshot::from_history(
                                     outcome.history.clone(),
                                 );
+                                let final_child_routing = child_routing
+                                    .clone()
+                                    .with_fallback_decision(outcome.fallback_decision.as_ref());
+                                if outcome.fallback_decision.is_some() {
+                                    driver
+                                        .emit_subagent_routing_amend(
+                                            tx,
+                                            &entry.child_agent,
+                                            &entry_task_call_id,
+                                            &entry.label,
+                                            &final_child_routing,
+                                        )
+                                        .await;
+                                }
                                 DelegationChildOutcome::ok(outcome.report)
+                                    .with_child_routing(final_child_routing)
                             }
                             Err(e) => {
-                                let (message, history) = e.into_parts();
+                                let (message, history, fallback_decision) = e.into_parts();
                                 let partial_progress = partial_progress_from_history(&history);
                                 snapshot = NoninteractiveDelegationSnapshot::from_history(history);
+                                let final_child_routing = child_routing
+                                    .clone()
+                                    .with_fallback_decision(fallback_decision.as_ref());
+                                if fallback_decision.is_some() {
+                                    driver
+                                        .emit_subagent_routing_amend(
+                                            tx,
+                                            &entry.child_agent,
+                                            &entry_task_call_id,
+                                            &entry.label,
+                                            &final_child_routing,
+                                        )
+                                        .await;
+                                }
                                 DelegationChildOutcome::failed_with_progress(
                                     format!("Error: {message}"),
                                     partial_progress,
                                 )
+                                .with_child_routing(final_child_routing)
                             }
                         }
                     };
@@ -2625,45 +2723,41 @@ impl Driver {
                 &outcome.report,
                 outcome.failed,
             );
+            let report_data = subagent_report_event_data(
+                &entry.child_agent,
+                Some(&task_call_id),
+                task_function_call_id.as_deref(),
+                &entry.label,
+                &report,
+                Some(&outcome.partial_progress),
+            );
+            let report_data = match outcome.child_routing.as_ref() {
+                Some(routing) => with_child_routing_metadata(report_data, routing),
+                None => with_model_routing_metadata(
+                    report_data,
+                    &self.stack.last().unwrap().agent.model,
+                ),
+            };
             if let Err(e) = self.session.record_event(
                 crate::db::session_log::SessionEventKind::SubagentReport,
                 Some(&entry.child_agent),
                 Some(&task_call_id),
-                &with_model_routing_metadata(
-                    subagent_report_event_data(
-                        &entry.child_agent,
-                        Some(&task_call_id),
-                        task_function_call_id.as_deref(),
-                        &entry.label,
-                        &report,
-                        Some(&outcome.partial_progress),
-                    ),
-                    &self.stack.last().unwrap().agent.model,
-                ),
+                &report_data,
             ) {
                 tracing::warn!(error = %e, "record batch subagent_report event failed");
             }
+            let routing = outcome.child_routing.as_ref().cloned().unwrap_or_else(|| {
+                ChildRoutingMetadata::from_model(&self.stack.last().unwrap().agent.model)
+            });
             let _ = tx
                 .send(TurnEvent::SubagentReport {
                     agent: entry.child_agent.clone(),
                     task_call_id: task_call_id.clone(),
                     label: entry.label.clone(),
                     report: report.clone(),
-                    trusted_only: self
-                        .stack
-                        .last()
-                        .unwrap()
-                        .agent
-                        .model
-                        .trusted_only_enabled(),
-                    model_trusted: self.stack.last().unwrap().agent.model.is_trusted(),
-                    routing: self
-                        .stack
-                        .last()
-                        .unwrap()
-                        .agent
-                        .model
-                        .routing_metadata_json(None),
+                    trusted_only: routing.trusted_only,
+                    model_trusted: routing.model_trusted,
+                    routing: routing.routing,
                 })
                 .await;
             children.push(BatchChildCompletion {
@@ -3373,21 +3467,41 @@ pub(crate) struct NoninteractiveOutcome {
     /// persisted as a handle for read-only noninteractive subagents in
     /// normal mode.
     pub history: Vec<Message>,
+    pub fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
 }
 
 #[derive(Debug)]
 pub(crate) struct NoninteractiveRunError {
     source: anyhow::Error,
     history: Vec<Message>,
+    fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
 }
 
 impl NoninteractiveRunError {
-    fn new(source: anyhow::Error, history: Vec<Message>) -> Self {
-        Self { source, history }
+    fn new(
+        source: anyhow::Error,
+        history: Vec<Message>,
+        fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
+    ) -> Self {
+        Self {
+            source,
+            history,
+            fallback_decision,
+        }
     }
 
-    fn into_parts(self) -> (String, Vec<Message>) {
-        (format!("{:#}", self.source), self.history)
+    fn into_parts(
+        self,
+    ) -> (
+        String,
+        Vec<Message>,
+        Option<crate::engine::agent::BackupFallbackDecision>,
+    ) {
+        (
+            format!("{:#}", self.source),
+            self.history,
+            self.fallback_decision,
+        )
     }
 }
 
@@ -3444,6 +3558,7 @@ pub(crate) async fn run_noninteractive_resumable(
     // so it answers with full knowledge of what it already did (GOALS §3c).
     let mut history: Vec<Message> = prior_history;
     let mut next_prompt = Message::user(brief);
+    let mut fallback_decision: Option<crate::engine::agent::BackupFallbackDecision> = None;
     // A noninteractive subagent's own deferred-log (`plan.md §3d`). The
     // bundled leaves (explore/docs) lack `defer_to_orchestrator`, so this
     // stays empty for them; a custom subagent that holds the tool gets its
@@ -3473,6 +3588,7 @@ pub(crate) async fn run_noninteractive_resumable(
         }
         // Per-round id, shared with this turn's tandem shadows.
         let call_id = uuid::Uuid::new_v4();
+        let mut turn_metadata = BackupTurnMetadata::default();
         // Model-comparison tandem (shadow) set for this leaf subagent turn
         // (`builder`/`explore`/`docs`, `model-comparison-tandem-
         // inference.md`). Passed into `turn`, which dispatches the shadows from
@@ -3506,6 +3622,7 @@ pub(crate) async fn run_noninteractive_resumable(
             tandem.as_ref(),
             None,
             &child_tx,
+            Some(&mut turn_metadata),
         );
         let outcome_future = async {
             if let Some(target) = &steer_target {
@@ -3516,11 +3633,23 @@ pub(crate) async fn run_noninteractive_resumable(
             }
         };
         let outcome = match outcome_future.await {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                    fallback_decision = Some(fallback);
+                }
+                outcome
+            }
             Err(error) => {
+                if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                    fallback_decision = Some(fallback);
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
-                return Err(NoninteractiveRunError::new(error, history));
+                return Err(NoninteractiveRunError::new(
+                    error,
+                    history,
+                    fallback_decision,
+                ));
             }
         };
         match outcome {
@@ -3536,14 +3665,22 @@ pub(crate) async fn run_noninteractive_resumable(
                 // (envelope-holding agents only — the `docs` pipeline keeps its
                 // plain answer). `None` selects the fallback path.
                 let report = assemble_subagent_report(&agent, &history, &deferred_log, None);
-                return Ok(NoninteractiveOutcome { report, history });
+                return Ok(NoninteractiveOutcome {
+                    report,
+                    history,
+                    fallback_decision,
+                });
             }
             TurnOutcome::Return { fields } => {
                 drop(child_tx);
                 let _ = forwarder.await;
                 let report =
                     assemble_subagent_report(&agent, &history, &deferred_log, Some(&fields));
-                return Ok(NoninteractiveOutcome { report, history });
+                return Ok(NoninteractiveOutcome {
+                    report,
+                    history,
+                    fallback_decision,
+                });
             }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
@@ -3565,6 +3702,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         agent.name
                     ),
                     history,
+                    fallback_decision,
                 ));
             }
         }
@@ -3577,5 +3715,6 @@ pub(crate) async fn run_noninteractive_resumable(
             agent.name
         ),
         history,
+        fallback_decision,
     ))
 }

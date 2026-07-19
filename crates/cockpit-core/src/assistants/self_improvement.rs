@@ -187,6 +187,7 @@ async fn run_review_turn(
             None,
             None,
             tx,
+            None,
         )
         .await?;
         match outcome {

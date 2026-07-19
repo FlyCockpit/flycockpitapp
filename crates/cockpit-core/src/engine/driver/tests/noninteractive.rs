@@ -1,5 +1,197 @@
 use super::*;
 
+fn exact_model_selector(model: &str) -> crate::engine::model_roles::DelegationModelSelector {
+    crate::engine::model_roles::DelegationModelSelector::Exact {
+        selector: format!("lmstudio:{model}"),
+        required_capabilities: Vec::new(),
+        min_context_tokens: None,
+    }
+}
+
+fn root_child_cwd(driver: &Driver) -> ChildCwd {
+    ChildCwd {
+        requested: None,
+        resolved: driver.cwd.clone(),
+    }
+}
+
+fn write_delegated_model_config(driver: &Driver, models: &[&str]) {
+    let config_dir = driver.cwd.join(".cockpit");
+    let providers_dir = config_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.json"),
+        r#"{
+          "agent_chooses_subagent_model": true,
+          "active_model": { "provider": "lmstudio", "model": "local" }
+        }"#,
+    )
+    .unwrap();
+    let models_json = models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "id": model,
+                "subagent_invokable": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        providers_dir.join("lmstudio.json"),
+        serde_json::json!({
+            "url": test_provider_base_url(),
+            "models": models_json,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn failing_provider_base_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let body = r#"{"error":{"message":"server failed"}}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+            let _ = std::io::Write::flush(&mut stream);
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+fn write_delegated_model_config_with_backup(driver: &Driver, primary_url: &str, backup_url: &str) {
+    let config_dir = driver.cwd.join(".cockpit");
+    let providers_dir = config_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.json"),
+        r#"{
+          "agent_chooses_subagent_model": true,
+          "active_model": { "provider": "lmstudio", "model": "local" }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        providers_dir.join("lmstudio.json"),
+        serde_json::json!({
+            "url": test_provider_base_url(),
+            "models": [{ "id": "local" }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        providers_dir.join("flaky.json"),
+        serde_json::json!({
+            "url": primary_url,
+            "backup": { "provider": "reliable", "model": "backup-model" },
+            "models": [{ "id": "child-flaky", "subagent_invokable": true }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        providers_dir.join("reliable.json"),
+        serde_json::json!({
+            "url": backup_url,
+            "models": [{ "id": "backup-model", "subagent_invokable": true }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {
+    driver
+        .persist_delegation_payload(
+            task_call_id,
+            Some(&format!("fn-{task_call_id}")),
+            "Build",
+            label,
+            child_agent,
+            &format!("{label} prompt"),
+        )
+        .unwrap();
+}
+
+fn single_task(
+    driver: &Driver,
+    child_agent: &str,
+    task_call_id: &str,
+    model: Option<crate::engine::model_roles::DelegationModelSelector>,
+    resume_handle: Option<&str>,
+) -> SingleNoninteractiveTask {
+    SingleNoninteractiveTask {
+        child_agent: child_agent.to_string(),
+        brief: "look around".to_string(),
+        model,
+        remaining_depth: Some(0),
+        why: "test".to_string(),
+        resume_handle: resume_handle.map(str::to_string),
+        child_cwd: root_child_cwd(driver),
+        granted_tools: Vec::new(),
+        prefill_seeds: Vec::new(),
+        todo_ids: Vec::new(),
+        skill_seed: Vec::new(),
+        child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        repair_notes: Vec::new(),
+        task_call_id: task_call_id.to_string(),
+        task_function_call_id: Some(format!("fn-{task_call_id}")),
+    }
+}
+
+fn batch_entry(
+    label: &str,
+    child_agent: &str,
+    model: Option<crate::engine::model_roles::DelegationModelSelector>,
+) -> crate::engine::agent::BatchTaskEntry {
+    crate::engine::agent::BatchTaskEntry {
+        label: label.to_string(),
+        child_agent: child_agent.to_string(),
+        prompt: format!("{label} prompt"),
+        model,
+        remaining_depth: Some(0),
+        resume_handle: None,
+        cwd: None,
+        granted_tools: Vec::new(),
+        seeds: Vec::new(),
+        todo_ids: Vec::new(),
+        skill_seed: Vec::new(),
+        output_dir: None,
+    }
+}
+
+fn drain_turn_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+fn child_routing_for(model: &str) -> ChildRoutingMetadata {
+    ChildRoutingMetadata {
+        provider: "lmstudio".to_string(),
+        model: model.to_string(),
+        trusted_only: false,
+        model_trusted: true,
+        routing: serde_json::json!({
+            "provider": "lmstudio",
+            "resolved_model": model,
+            "fallback_decision": "none",
+        }),
+    }
+}
+
 #[tokio::test]
 async fn noninteractive_event_forwarder_wraps_child_events() {
     let (child_tx, child_rx) = mpsc::channel(8);
@@ -60,6 +252,259 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
         other => panic!("expected nested tool start, got {other:?}"),
     }
     assert!(parent_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn noninteractive_single_spawn_amends_with_child_routing() {
+    let (mut driver, _tmp) = test_driver(8);
+    write_delegated_model_config(&driver, &["local", "child-single"]);
+    seed_task_delegation(&driver, "task-single-routing", "default");
+    seed_task_payload(&driver, "task-single-routing", "default", "explore");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+    let completion = driver
+        .execute_single_noninteractive_task(
+            single_task(
+                &driver,
+                "explore",
+                "task-single-routing",
+                Some(exact_model_selector("child-single")),
+                None,
+            ),
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion.child_routing.as_ref().unwrap().model,
+        "child-single"
+    );
+    let events = drain_turn_events(&mut rx);
+    let spawn_idx = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-single-routing"))
+        .expect("spawn event");
+    let routing_idx = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::SubagentRouting { task_call_id, .. } if task_call_id == "task-single-routing"))
+        .expect("routing amend event");
+    assert!(spawn_idx < routing_idx);
+    match &events[routing_idx] {
+        TurnEvent::SubagentRouting {
+            child,
+            task_call_id,
+            label,
+            model,
+            routing,
+            ..
+        } => {
+            assert_eq!(child, "explore");
+            assert_eq!(task_call_id, "task-single-routing");
+            assert_eq!(label, "default");
+            assert_eq!(model, "child-single");
+            assert_eq!(routing["resolved_model"], "child-single");
+            assert_ne!(routing["resolved_model"], "local");
+        }
+        other => panic!("expected SubagentRouting, got {other:?}"),
+    }
+}
+
+#[test]
+fn noninteractive_single_fallback_amends_and_reports_backup_decision() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (mut driver, _tmp) = test_driver(8);
+                    let primary_url = failing_provider_base_url();
+                    let backup_url = test_provider_base_url();
+                    write_delegated_model_config_with_backup(&driver, &primary_url, &backup_url);
+                    seed_task_delegation(&driver, "task-single-fallback", "default");
+                    seed_task_payload(&driver, "task-single-fallback", "default", "explore");
+                    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+
+                    let completion = driver
+                        .execute_single_noninteractive_task(
+                            single_task(
+                                &driver,
+                                "explore",
+                                "task-single-fallback",
+                                Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+                                    selector: "flaky:child-flaky".to_string(),
+                                    required_capabilities: Vec::new(),
+                                    min_context_tokens: None,
+                                }),
+                                None,
+                            ),
+                            &tx,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+
+                    let routing = completion.child_routing.as_ref().unwrap();
+                    assert_eq!(routing.model, "child-flaky");
+                    assert_eq!(routing.routing["fallback_decision"], "backup");
+
+                    let events = drain_turn_events(&mut rx);
+                    let routing_events = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            TurnEvent::SubagentRouting {
+                                task_call_id,
+                                routing,
+                                ..
+                            } if task_call_id == "task-single-fallback" => Some(routing),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(routing_events.len(), 2);
+                    assert_eq!(routing_events[0]["fallback_decision"], "none");
+                    assert_eq!(routing_events[1]["fallback_decision"], "backup");
+
+                    let _ = driver
+                        .finalize_single_noninteractive_task(completion, &tx, true)
+                        .await
+                        .unwrap();
+                    let report_event = driver
+                        .session
+                        .db
+                        .list_session_events(driver.session.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|event| {
+                            event.kind == "subagent_report"
+                                && event.call_id.as_deref() == Some("task-single-fallback")
+                        })
+                        .expect("durable subagent_report event");
+                    assert_eq!(report_event.data["routing"]["fallback_decision"], "backup");
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn noninteractive_batch_spawn_amends_each_child_routing() {
+    let (mut driver, _tmp) = test_driver(8);
+    write_delegated_model_config(&driver, &["local", "child-first", "child-second"]);
+    seed_batch_task_delegation(&driver, "task-batch-routing", &["first", "second"]);
+    seed_task_payload(&driver, "task-batch-routing", "first", "explore");
+    seed_task_payload(&driver, "task-batch-routing", "second", "scout");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let task = BatchNoninteractiveTask {
+        entries: vec![
+            batch_entry(
+                "first",
+                "explore",
+                Some(exact_model_selector("child-first")),
+            ),
+            batch_entry(
+                "second",
+                "scout",
+                Some(exact_model_selector("child-second")),
+            ),
+        ],
+        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-batch-routing".to_string(),
+        task_function_call_id: Some("fn-task-batch-routing".to_string()),
+    };
+
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 2);
+
+    let events = drain_turn_events(&mut rx);
+    let mut amends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::SubagentRouting {
+                task_call_id,
+                label,
+                child,
+                model,
+                routing,
+                ..
+            } if task_call_id == "task-batch-routing" => Some((
+                label.as_str(),
+                child.as_str(),
+                model.as_str(),
+                routing.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    amends.sort_by_key(|(label, _, _, _)| *label);
+
+    assert_eq!(amends.len(), 2);
+    assert_eq!(amends[0].0, "first");
+    assert_eq!(amends[0].1, "explore");
+    assert_eq!(amends[0].2, "child-first");
+    assert_eq!(amends[0].3["resolved_model"], "child-first");
+    assert_eq!(amends[1].0, "second");
+    assert_eq!(amends[1].1, "scout");
+    assert_eq!(amends[1].2, "child-second");
+    assert_eq!(amends[1].3["resolved_model"], "child-second");
+}
+
+#[tokio::test]
+async fn interactive_spawn_amends_with_child_routing() {
+    let (driver, _tmp) = test_driver(8);
+    write_delegated_model_config(&driver, &["local", "interactive-child"]);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let child = driver
+        .load_interactive_child_or_tool_error(InteractiveChildLoadRequest {
+            child_agent: "explore",
+            granted_tools: Vec::new(),
+            model: Some(exact_model_selector("interactive-child")),
+            child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            task_call_id: "task-interactive-routing",
+            task_function_call_id: Some("fn-task-interactive-routing".to_string()),
+            repair_notes: &[],
+        })
+        .unwrap();
+    let child_routing = ChildRoutingMetadata::from_model(&child.model);
+
+    driver
+        .emit_subagent_routing_amend(
+            &tx,
+            "explore",
+            "task-interactive-routing",
+            "default",
+            &child_routing,
+        )
+        .await;
+
+    let events = drain_turn_events(&mut rx);
+    match events.as_slice() {
+        [
+            TurnEvent::SubagentRouting {
+                child,
+                task_call_id,
+                label,
+                model,
+                routing,
+                ..
+            },
+        ] => {
+            assert_eq!(child, "explore");
+            assert_eq!(task_call_id, "task-interactive-routing");
+            assert_eq!(label, "default");
+            assert_eq!(model, "interactive-child");
+            assert_eq!(routing["resolved_model"], "interactive-child");
+        }
+        other => panic!("expected one interactive routing amend, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -388,6 +833,7 @@ async fn noninteractive_single_inline_result_shape_is_unchanged() {
                 snapshot: NoninteractiveDelegationSnapshot::empty(),
                 shrink: None,
                 repair_notes: Vec::new(),
+                child_routing: None,
             },
             &tx,
             true,
@@ -420,6 +866,7 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
                 snapshot: NoninteractiveDelegationSnapshot::empty(),
                 shrink: Some(pending_test_shrink()),
                 repair_notes: Vec::new(),
+                child_routing: None,
             },
             &tx,
             true,
@@ -485,6 +932,220 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
 }
 
 #[tokio::test]
+async fn noninteractive_report_stamps_child_model() {
+    let (mut driver, _tmp) = test_driver(8);
+    seed_task_delegation(&driver, "task-single-child-report", "default");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let result = driver
+        .finalize_single_noninteractive_task(
+            SingleNoninteractiveCompletion {
+                child_agent: "explore".to_string(),
+                task_call_id: "task-single-child-report".to_string(),
+                task_function_call_id: Some("fn-single-child-report".to_string()),
+                report: "single report".to_string(),
+                failed: false,
+                partial_progress: DelegationPartialProgress::default(),
+                seeds: Vec::new(),
+                new_handle: None,
+                snapshot: NoninteractiveDelegationSnapshot::empty(),
+                shrink: Some(pending_test_shrink()),
+                repair_notes: Vec::new(),
+                child_routing: Some(child_routing_for("child-report")),
+            },
+            &tx,
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tool_result_id(&result), "task-single-child-report");
+    let events = drain_turn_events(&mut rx);
+    let live_report = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::SubagentReport {
+                task_call_id,
+                routing,
+                ..
+            } if task_call_id == "task-single-child-report" => Some(routing),
+            _ => None,
+        })
+        .expect("live subagent_report event");
+    assert_eq!(live_report["resolved_model"], "child-report");
+    assert_ne!(live_report["resolved_model"], "local");
+
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|event| {
+            event.kind == "subagent_report"
+                && event.call_id.as_deref() == Some("task-single-child-report")
+        })
+        .expect("durable subagent_report event");
+    assert_eq!(event.data["model"], "child-report");
+    assert_eq!(event.data["routing"]["resolved_model"], "child-report");
+    assert_ne!(event.data["routing"]["resolved_model"], "local");
+}
+
+#[tokio::test]
+async fn noninteractive_batch_report_stamps_child_model() {
+    let (mut driver, _tmp) = test_driver(8);
+    write_delegated_model_config(&driver, &["local", "batch-child-report"]);
+    seed_batch_task_delegation(&driver, "task-batch-child-report", &["first"]);
+    seed_task_payload(&driver, "task-batch-child-report", "first", "explore");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let task = BatchNoninteractiveTask {
+        entries: vec![batch_entry(
+            "first",
+            "explore",
+            Some(exact_model_selector("batch-child-report")),
+        )],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-batch-child-report".to_string(),
+        task_function_call_id: Some("fn-task-batch-child-report".to_string()),
+    };
+
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 1);
+    let events = drain_turn_events(&mut rx);
+    let live_report = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::SubagentReport {
+                task_call_id,
+                label,
+                routing,
+                ..
+            } if task_call_id == "task-batch-child-report" && label == "first" => Some(routing),
+            _ => None,
+        })
+        .expect("live batch subagent_report event");
+    assert_eq!(live_report["resolved_model"], "batch-child-report");
+    assert_ne!(live_report["resolved_model"], "local");
+
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|event| {
+            event.kind == "subagent_report"
+                && event.call_id.as_deref() == Some("task-batch-child-report")
+                && event.data["label"] == "first"
+        })
+        .expect("durable batch subagent_report event");
+    assert_eq!(event.data["model"], "batch-child-report");
+    assert_eq!(
+        event.data["routing"]["resolved_model"],
+        "batch-child-report"
+    );
+    assert_ne!(event.data["routing"]["resolved_model"], "local");
+}
+
+#[tokio::test]
+async fn docs_pipeline_emits_no_routing_amend() {
+    let (mut driver, _tmp) = test_driver(8);
+    seed_task_delegation(&driver, "task-docs-routing", "default");
+    seed_task_payload(&driver, "task-docs-routing", "default", "docs");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+    let completion = driver
+        .execute_single_noninteractive_task(
+            single_task(
+                &driver,
+                "docs",
+                "task-docs-routing",
+                Some(exact_model_selector("docs-child")),
+                Some("stale-docs-handle"),
+            ),
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    driver
+        .finalize_single_noninteractive_task(completion, &tx, true)
+        .await
+        .unwrap();
+
+    let events = drain_turn_events(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-docs-routing"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::SubagentRouting { task_call_id, .. } if task_call_id == "task-docs-routing"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::SubagentReport { task_call_id, .. } if task_call_id == "task-docs-routing"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn spawn_load_failure_emits_no_amend_but_still_reports() {
+    let (mut driver, _tmp) = test_driver(8);
+    seed_task_delegation(&driver, "task-load-failure", "default");
+    seed_task_payload(&driver, "task-load-failure", "default", "missing-agent");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+    let completion = driver
+        .execute_single_noninteractive_task(
+            single_task(
+                &driver,
+                "missing-agent",
+                "task-load-failure",
+                Some(exact_model_selector("missing-child")),
+                None,
+            ),
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(completion.failed);
+    driver
+        .finalize_single_noninteractive_task(completion, &tx, true)
+        .await
+        .unwrap();
+
+    let events = drain_turn_events(&mut rx);
+    let spawn_idx = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-load-failure"))
+        .expect("spawn event");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::SubagentRouting { task_call_id, .. } if task_call_id == "task-load-failure"))
+    );
+    let report_idx = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::SubagentReport { task_call_id, .. } if task_call_id == "task-load-failure"))
+        .expect("report event");
+    assert!(spawn_idx < report_idx);
+}
+
+#[tokio::test]
 async fn noninteractive_single_result_includes_task_repair_notes() {
     let (mut driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -505,6 +1166,7 @@ async fn noninteractive_single_result_includes_task_repair_notes() {
                     "dropped `action` (incompatible with fresh delegation) — treating as fresh spawn of `agent=explore`"
                         .to_string(),
                 ],
+                child_routing: None,
             },
             &tx,
             true,

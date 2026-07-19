@@ -180,6 +180,7 @@ fn update_live_foreground(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.foreground_target.clone();
         }
+        TurnEvent::SubagentRouting { .. } => {}
         TurnEvent::SubagentReport {
             agent,
             task_call_id,
@@ -262,4 +263,3 @@ pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig
         configured
     }
 }
-

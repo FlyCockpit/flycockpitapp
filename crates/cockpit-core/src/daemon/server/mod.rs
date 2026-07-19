@@ -651,6 +651,22 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scrub_option_string(resolved_cwd, redact);
             scrub_json_strings(routing, redact);
         }
+        proto::Event::SubagentRouting {
+            session_id: _,
+            task_call_id: _,
+            label,
+            child: _,
+            provider,
+            model,
+            trusted_only: _,
+            model_trusted: _,
+            routing,
+        } => {
+            scrub_string(label, redact);
+            scrub_string(provider, redact);
+            scrub_string(model, redact);
+            scrub_json_strings(routing, redact);
+        }
         proto::Event::SubagentReport {
             session_id: _,
             agent: _,

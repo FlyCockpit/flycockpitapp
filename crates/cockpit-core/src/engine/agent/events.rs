@@ -261,6 +261,19 @@ pub enum TurnEvent {
         model_trusted: bool,
         routing: serde_json::Value,
     },
+    /// A later amend to a subagent spawn once the child model has been loaded
+    /// and its resolved routing is knowable. Lifecycle consumers keep using
+    /// `SubagentSpawned` as the pairing anchor.
+    SubagentRouting {
+        task_call_id: String,
+        label: String,
+        child: String,
+        provider: String,
+        model: String,
+        trusted_only: bool,
+        model_trusted: bool,
+        routing: serde_json::Value,
+    },
     /// A subagent's final text. Delivered back to the parent as the
     /// tool result for its outstanding `task` call.
     SubagentReport {

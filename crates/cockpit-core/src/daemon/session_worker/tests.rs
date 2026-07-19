@@ -994,6 +994,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routing_amend_does_not_alter_foreground_state() {
+        let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+        let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
+            "Build",
+        )));
+        let spawn = TurnEvent::SubagentSpawned {
+            parent: "Build".into(),
+            child: "explore".into(),
+            task_call_id: "task-1".into(),
+            label: "default".into(),
+            prompt: "look around".into(),
+            requested_cwd: None,
+            resolved_cwd: None,
+            trusted_only: false,
+            model_trusted: false,
+            routing: serde_json::json!({ "resolved_model": "parent-model" }),
+        };
+        let amend = TurnEvent::SubagentRouting {
+            task_call_id: "task-1".into(),
+            label: "default".into(),
+            child: "explore".into(),
+            provider: "lmstudio".into(),
+            model: "child-model".into(),
+            trusted_only: true,
+            model_trusted: true,
+            routing: serde_json::json!({ "resolved_model": "child-model" }),
+        };
+        let report = TurnEvent::SubagentReport {
+            agent: "explore".into(),
+            task_call_id: "task-1".into(),
+            label: "default".into(),
+            report: "done".into(),
+            trusted_only: true,
+            model_trusted: true,
+            routing: serde_json::json!({ "resolved_model": "child-model" }),
+        };
+
+        update_live_foreground(&foreground, &target, &spawn);
+        let after_spawn = foreground.lock().unwrap().snapshot();
+        update_live_foreground(&foreground, &target, &amend);
+        let after_amend = foreground.lock().unwrap().snapshot();
+        assert_eq!(after_amend.active_agent_path, after_spawn.active_agent_path);
+        assert_eq!(after_amend.active_subagent, after_spawn.active_subagent);
+        assert_eq!(after_amend.foreground_target, after_spawn.foreground_target);
+
+        update_live_foreground(&foreground, &target, &report);
+        let after_report = foreground.lock().unwrap().snapshot();
+        assert_eq!(after_report.active_agent_path, ["Build"]);
+        assert!(after_report.active_subagent.is_none());
+        assert_eq!(after_report.foreground_target.agent, "Build");
+        assert_eq!(after_report.foreground_target.depth, 0);
+    }
+
     /// §6.5: the sandbox-unavailable `TurnEvent` maps to the wire broadcast
     /// carrying the session_id + the verbatim diagnosed remedy.
     #[test]

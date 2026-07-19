@@ -33,7 +33,8 @@ pub(crate) use oauth_flow::{
     OAuthFlowState, OAuthProvider, prepare_grok_browser_start,
 };
 use oauth_flow::{
-    OAuthFlowView, handle_oauth_flow_key, oauth_setup_lines, render_oauth_body, render_oauth_setup,
+    OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend,
+    oauth_setup_lines, render_oauth_body,
 };
 
 use chrono::Utc;
@@ -69,7 +70,7 @@ pub(super) use row_editor::{
 
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
-use super::shell::selected_line_from_marker;
+use super::shell::{push_wrapped_text, selected_line_from_marker};
 use super::{Nav, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
 #[cfg(test)]
 use super::{Page, TestPageRef};
@@ -568,6 +569,22 @@ fn register_visible_link_regions(
     }
 }
 
+fn wrap_oauth_render_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut wrapped = Vec::new();
+    let width = width.max(1);
+    for line in lines {
+        if line.spans.len() == 1 {
+            let span = &line.spans[0];
+            if UnicodeWidthStr::width(span.content.as_ref()) > usize::from(width) {
+                push_wrapped_text(&mut wrapped, width, span.content.as_ref(), span.style);
+                continue;
+            }
+        }
+        wrapped.push(line);
+    }
+    wrapped
+}
+
 fn oauth_link_target(flow: OAuthFlowView<'_>) -> Option<(&str, &str)> {
     match flow {
         OAuthFlowView::OAuth(state) if state.provider == OAuthProvider::Grok => {
@@ -656,14 +673,6 @@ pub(super) fn oauth_setup_confirming_logged_in(
     paste_focused: bool,
 ) -> bool {
     logged_in && !in_progress && !paste_focused
-}
-
-pub(super) fn oauth_setup_help_text(logged_in_confirmation: bool) -> &'static str {
-    if logged_in_confirmation {
-        "enter: continue  esc: back"
-    } else {
-        "↑/↓  enter: choose  s: skip/continue  esc: back"
-    }
 }
 
 fn oauth_option_cursor_prev(cursor: usize, len: usize) -> usize {
@@ -1122,16 +1131,17 @@ impl SettingsCx {
                 self.handle_copilot_setup_key(key, state, parent)
             }
             ProvidersPage::OAuthSetup { state, parent } => {
-                let (close, action) = handle_oauth_flow_key(key, state);
-                self.pending_oauth_action = action;
-                if close {
-                    let owned = std::mem::replace(
-                        parent,
-                        Box::new(EditState::new(String::new(), ProviderEntry::default())),
-                    );
-                    Nav::Replace(super::providers_page(ProvidersPage::Edit(*owned)))
-                } else {
-                    Nav::Stay
+                let outcome = handle_oauth_flow_key(key, state, OAuthHost::Standalone);
+                self.pending_oauth_action = outcome.action;
+                match outcome.nav {
+                    OAuthNav::Stay => Nav::Stay,
+                    OAuthNav::Back | OAuthNav::Confirm => {
+                        let owned = std::mem::replace(
+                            parent,
+                            Box::new(EditState::new(String::new(), ProviderEntry::default())),
+                        );
+                        Nav::Replace(super::providers_page(ProvidersPage::Edit(*owned)))
+                    }
                 }
             }
         }
@@ -1437,36 +1447,28 @@ impl SettingsCx {
                 _ => {}
             },
             Some("grok-oauth" | "codex-oauth") => {
-                let (close, should_save) = {
+                let nav = {
                     let state = s
                         .oauth_auth
                         .as_mut()
                         .expect("OAuth descriptor step initializes state");
-                    let (close, action) = handle_oauth_flow_key(key, state);
-                    self.pending_oauth_action = action;
-                    let should_save = (matches!(key.code, KeyCode::Char('s'))
-                        && !state.paste_focused)
-                        || (matches!(key.code, KeyCode::Enter)
-                            && OAuthFlowView::OAuth(state).confirming())
-                        || (matches!(key.code, KeyCode::Enter)
-                            && ((state.provider == OAuthProvider::Grok
-                                && state.cursor == 2
-                                && !state.paste_focused)
-                                || (state.provider == OAuthProvider::Codex
-                                    && state.cursor == 1
-                                    && state.device_login().is_none())));
-                    (close, should_save)
+                    let outcome = handle_oauth_flow_key(key, state, OAuthHost::AddWizard);
+                    self.pending_oauth_action = outcome.action;
+                    outcome.nav
                 };
-                if close {
-                    s.run.return_to("url").expect("provider URL step exists");
-                    s.oauth_auth = None;
-                    return Nav::Stay;
-                }
-                if should_save {
-                    let template = s.template.expect("template chosen");
-                    let id = s.id_field.text().trim().to_string();
-                    let entry = provider_entry_from_add(s, template, Vec::new());
-                    self.save_and_fetch_provider(s, id, entry, template);
+                match nav {
+                    OAuthNav::Stay => {}
+                    OAuthNav::Back => {
+                        s.run.return_to("url").expect("provider URL step exists");
+                        s.oauth_auth = None;
+                        return Nav::Stay;
+                    }
+                    OAuthNav::Confirm => {
+                        let template = s.template.expect("template chosen");
+                        let id = s.id_field.text().trim().to_string();
+                        let entry = provider_entry_from_add(s, template, Vec::new());
+                        self.save_and_fetch_provider(s, id, entry, template);
+                    }
                 }
             }
             Some("test-key-choice") => {
@@ -2345,7 +2347,7 @@ impl SettingsCx {
                 self.render_copilot_setup(frame, area, state)
             }
             ProvidersPage::OAuthSetup { state, .. } => {
-                render_oauth_setup(frame, area, OAuthFlowView::OAuth(state), links)
+                self.render_oauth_setup(frame, area, state, links)
             }
         }
     }
@@ -2440,7 +2442,7 @@ impl SettingsCx {
     }
 
     fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
-        let lines = oauth_setup_lines(OAuthFlowView::Copilot(s));
+        let lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_lines(
             frame,
@@ -2449,6 +2451,31 @@ impl SettingsCx {
             lines,
             selected_line,
         );
+    }
+
+    fn render_oauth_setup(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        s: &OAuthFlowState,
+        links: Option<&mut crate::tui::links::LinkRegistry>,
+    ) {
+        let flow = OAuthFlowView::OAuth(s);
+        let mut lines =
+            wrap_oauth_render_lines(oauth_setup_lines(flow, OAuthHost::Standalone), area.width);
+        let link_regions = prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref())
+            .unwrap_or_default();
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states
+            .render_lines(frame, area, "providers:oauth-setup", lines, selected_line);
+        if let Some(links) = links {
+            register_visible_link_regions(
+                links,
+                area,
+                self.scroll_states.offset_for("providers:oauth-setup"),
+                link_regions,
+            );
+        }
     }
 
     fn render_add(
@@ -2585,7 +2612,11 @@ impl SettingsCx {
                     ),
                 ]));
                 lines.push(Line::default());
-                render_oauth_body(&mut lines, OAuthFlowView::Copilot(state));
+                render_oauth_body(
+                    &mut lines,
+                    OAuthFlowView::Copilot(state),
+                    OAuthHost::AddWizard,
+                );
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
                     "After this step we'll fetch the model list automatically. \
@@ -2606,7 +2637,11 @@ impl SettingsCx {
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                render_oauth_body(&mut lines, OAuthFlowView::OAuth(state));
+                render_oauth_body(
+                    &mut lines,
+                    OAuthFlowView::OAuth(state),
+                    OAuthHost::AddWizard,
+                );
             }
             Some("test-key-choice") => {
                 lines.push(Line::from(Span::styled(
@@ -2686,6 +2721,9 @@ impl SettingsCx {
             .then(|| s.oauth_auth.as_deref())
             .flatten()
             .map(OAuthFlowView::OAuth);
+        if oauth_flow.is_some() {
+            lines = wrap_oauth_render_lines(lines, area.width);
+        }
         let link_regions = oauth_flow
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
             .unwrap_or_default();
@@ -3853,22 +3891,11 @@ impl SettingsPage for ProvidersPage {
                 {
                     OAuthProvider::Grok => {
                         let state = s.oauth_auth.as_ref().expect("OAuth state");
-                        if state.paste_focused {
-                            return "type/paste code  enter: submit  esc: options";
-                        }
-                        oauth_setup_help_text(oauth_setup_confirming_logged_in(
-                            state.logged_in,
-                            state.pending,
-                            state.paste_focused,
-                        ))
+                        oauth_help_legend(OAuthHost::AddWizard, state)
                     }
                     OAuthProvider::Codex => {
                         let state = s.oauth_auth.as_ref().expect("OAuth state");
-                        oauth_setup_help_text(oauth_setup_confirming_logged_in(
-                            state.logged_in,
-                            state.polling,
-                            false,
-                        ))
+                        oauth_help_legend(OAuthHost::AddWizard, state)
                     }
                 },
                 Some("saving" | "fetching" | "test-key") => "(in progress)  esc: cancel",
@@ -3927,13 +3954,9 @@ impl SettingsPage for ProvidersPage {
                 "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel"
             }
             ProvidersPage::CopilotSetup { .. } => "enter: apply  esc: cancel",
-            ProvidersPage::OAuthSetup { state, .. } if state.paste_focused => {
-                "type/paste code  enter: submit  esc: options"
+            ProvidersPage::OAuthSetup { state, .. } => {
+                oauth_help_legend(OAuthHost::Standalone, state)
             }
-            ProvidersPage::OAuthSetup { state, .. } => match state.provider {
-                OAuthProvider::Grok => "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  esc: back",
-                OAuthProvider::Codex => "↑/↓/Tab/Shift+Tab  enter: choose  esc: back",
-            },
         }
     }
 

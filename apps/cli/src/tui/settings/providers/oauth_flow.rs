@@ -185,6 +185,69 @@ impl OAuthEffects {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OAuthHost {
+    Standalone,
+    AddWizard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OAuthNav {
+    Stay,
+    Back,
+    Confirm,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OAuthKeyOutcome {
+    pub(super) nav: OAuthNav,
+    pub(super) action: Option<OAuthFlowRequest>,
+}
+
+impl OAuthKeyOutcome {
+    fn stay(action: Option<OAuthFlowRequest>) -> Self {
+        Self {
+            nav: OAuthNav::Stay,
+            action,
+        }
+    }
+
+    fn back(action: Option<OAuthFlowRequest>) -> Self {
+        Self {
+            nav: OAuthNav::Back,
+            action,
+        }
+    }
+
+    fn confirm() -> Self {
+        Self {
+            nav: OAuthNav::Confirm,
+            action: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthOption {
+    Login,
+    ManualPaste,
+    Poll,
+    SkipContinue,
+    Continue,
+}
+
+impl OAuthOption {
+    fn label(self) -> &'static str {
+        match self {
+            OAuthOption::Login => "log in",
+            OAuthOption::ManualPaste => "manual paste",
+            OAuthOption::Poll => "poll for approval",
+            OAuthOption::SkipContinue => "skip / continue",
+            OAuthOption::Continue => "continue",
+        }
+    }
+}
+
 pub(crate) fn prepare_grok_browser_start(
     login: xai_oauth::ManualLogin,
     effects: OAuthEffects,
@@ -316,14 +379,8 @@ impl OAuthFlowState {
         }
     }
 
-    pub(super) fn option_count(&self) -> usize {
-        if self.confirming() {
-            return 1;
-        }
-        match self.shape {
-            FlowShape::BrowserCallback => 3usize.saturating_sub(usize::from(self.pending)),
-            FlowShape::DeviceCode => 2,
-        }
+    pub(super) fn option_count(&self, host: OAuthHost) -> usize {
+        oauth_options(self, host).len()
     }
 
     pub(super) fn authorize_url(&self) -> Option<&str> {
@@ -471,7 +528,7 @@ impl OAuthFlowView<'_> {
     }
 }
 
-pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>) -> Vec<Line<'static>> {
+pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>, host: OAuthHost) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let title = match flow {
         OAuthFlowView::Copilot(_) => "Set up GitHub Copilot auth",
@@ -485,77 +542,65 @@ pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>) -> Vec<Line<'static>> {
         Style::default().add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::default());
-    render_oauth_body(&mut lines, flow);
+    render_oauth_body(&mut lines, flow, host);
     lines
 }
 
-pub(super) fn render_oauth_setup(
-    frame: &mut Frame,
-    area: Rect,
+pub(super) fn render_oauth_body(
+    lines: &mut Vec<Line<'static>>,
     flow: OAuthFlowView<'_>,
-    links: Option<&mut crate::tui::links::LinkRegistry>,
+    host: OAuthHost,
 ) {
-    let mut lines = oauth_setup_lines(flow);
-    let link_regions = super::prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref())
-        .unwrap_or_default();
-    frame.render_widget(Paragraph::new(lines), area);
-    if let Some(links) = links {
-        super::register_visible_link_regions(links, area, 0, link_regions);
-    }
-}
-
-pub(super) fn render_oauth_body(lines: &mut Vec<Line<'static>>, flow: OAuthFlowView<'_>) {
     match flow {
         OAuthFlowView::Copilot(s) => render_copilot_body(lines, s),
-        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host),
     }
 }
 
 pub(super) fn handle_oauth_flow_key(
     key: KeyEvent,
     s: &mut OAuthFlowState,
-) -> (bool, Option<OAuthFlowRequest>) {
-    handle_oauth_flow_key_with(key, s, OAuthEffects::production())
+    host: OAuthHost,
+) -> OAuthKeyOutcome {
+    handle_oauth_flow_key_with(key, s, host, OAuthEffects::production())
 }
 
 pub(super) fn handle_oauth_flow_key_with(
     key: KeyEvent,
     s: &mut OAuthFlowState,
+    host: OAuthHost,
     effects: OAuthEffects,
-) -> (bool, Option<OAuthFlowRequest>) {
+) -> OAuthKeyOutcome {
     if s.provider == OAuthProvider::Grok && s.paste_focused {
         match key.code {
             KeyCode::Esc => {
                 s.paste_focused = false;
-                return (false, None);
+                return OAuthKeyOutcome::stay(None);
             }
             KeyCode::Enter => {
                 let OAuthSession::Browser { login, .. } = &s.session else {
                     s.status = Some(Err("manual OAuth session was not initialized".into()));
                     s.paste_focused = false;
-                    return (false, None);
+                    return OAuthKeyOutcome::stay(None);
                 };
                 let input = s.manual_input.text().to_string();
                 if input.trim().is_empty() {
                     s.status = Some(Err("paste callback URL or code first".to_string()));
-                    return (false, None);
+                    return OAuthKeyOutcome::stay(None);
                 }
                 s.pending = true;
                 s.status = Some(Ok("Completing xAI OAuth login...".to_string()));
-                return (
-                    false,
-                    Some(OAuthFlowRequest {
-                        provider: OAuthProvider::Grok,
-                        op: OAuthFlowOp::Complete {
-                            login: login.clone(),
-                            input,
-                        },
-                    }),
-                );
+                return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                    provider: OAuthProvider::Grok,
+                    op: OAuthFlowOp::Complete {
+                        login: login.clone(),
+                        input,
+                    },
+                }));
             }
             _ => {
                 s.manual_input.handle_key(key);
-                return (false, None);
+                return OAuthKeyOutcome::stay(None);
             }
         }
     }
@@ -564,7 +609,7 @@ pub(super) fn handle_oauth_flow_key_with(
         (OAuthProvider::Grok, KeyCode::Char('c')) => {
             let url = s.authorize_url().map(ToOwned::to_owned);
             copy_oauth_url_with(url.as_deref(), &mut s.status, effects.copy);
-            return (false, None);
+            return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
             if s.ssh {
@@ -585,12 +630,12 @@ pub(super) fn handle_oauth_flow_key_with(
                     s.status = Some(Err(e.to_string()));
                 }
             }
-            return (false, None);
+            return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
             let code = s.device_login().map(|login| login.user_code.clone());
             copy_oauth_url_with(code.as_deref(), &mut s.status, effects.copy);
-            return (false, None);
+            return OAuthKeyOutcome::stay(None);
         }
         _ => {}
     }
@@ -598,119 +643,218 @@ pub(super) fn handle_oauth_flow_key_with(
     if s.provider == OAuthProvider::Grok && s.pending && matches!(key.code, KeyCode::Esc) {
         s.pending = false;
         s.status = Some(Ok("OAuth login cancelled".to_string()));
-        return (
-            false,
-            Some(OAuthFlowRequest {
-                provider: OAuthProvider::Grok,
-                op: OAuthFlowOp::Cancel,
-            }),
-        );
+        return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+            provider: OAuthProvider::Grok,
+            op: OAuthFlowOp::Cancel,
+        }));
     }
     if s.provider == OAuthProvider::Codex && s.polling && matches!(key.code, KeyCode::Esc) {
         s.polling = false;
         s.status = Some(Ok("Codex OAuth polling cancelled".to_string()));
-        return (
-            false,
-            Some(OAuthFlowRequest {
-                provider: OAuthProvider::Codex,
-                op: OAuthFlowOp::Cancel,
-            }),
-        );
+        return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+            provider: OAuthProvider::Codex,
+            op: OAuthFlowOp::Cancel,
+        }));
     }
 
     match key.code {
-        KeyCode::Esc => (
-            true,
-            Some(OAuthFlowRequest {
-                provider: s.provider,
-                op: OAuthFlowOp::Cancel,
-            }),
-        ),
+        KeyCode::Esc => OAuthKeyOutcome::back(Some(OAuthFlowRequest {
+            provider: s.provider,
+            op: OAuthFlowOp::Cancel,
+        })),
         KeyCode::Up | KeyCode::Char('k') => {
-            s.cursor = oauth_option_cursor_prev(s.cursor, s.option_count());
-            (false, None)
+            s.cursor = oauth_option_cursor_prev(s.cursor, s.option_count(host));
+            OAuthKeyOutcome::stay(None)
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            s.cursor = oauth_option_cursor_next(s.cursor, s.option_count());
-            (false, None)
+            s.cursor = oauth_option_cursor_next(s.cursor, s.option_count(host));
+            OAuthKeyOutcome::stay(None)
         }
-        KeyCode::Enter => handle_oauth_enter(s),
-        _ => (false, None),
+        KeyCode::Enter => handle_oauth_enter(s, host),
+        KeyCode::Char('s') if host == OAuthHost::AddWizard => OAuthKeyOutcome::confirm(),
+        _ => OAuthKeyOutcome::stay(None),
     }
 }
 
-fn handle_oauth_enter(s: &mut OAuthFlowState) -> (bool, Option<OAuthFlowRequest>) {
-    if s.confirming() {
+fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcome {
+    let Some(option) = selected_oauth_option(s, host) else {
         s.cursor = 0;
-        return (false, None);
+        return OAuthKeyOutcome::stay(None);
+    };
+
+    match (s.provider, option) {
+        (_, OAuthOption::Continue | OAuthOption::SkipContinue) => OAuthKeyOutcome::confirm(),
+        (OAuthProvider::Grok, OAuthOption::ManualPaste) => {
+            s.paste_focused = true;
+            s.manual_input.set("");
+            OAuthKeyOutcome::stay(None)
+        }
+        (OAuthProvider::Grok, OAuthOption::Login) => {
+            s.pending = true;
+            s.paste_focused = false;
+            s.manual_input.set("");
+            s.status = Some(Ok(if s.cursor == 0 && !s.ssh {
+                "Preparing xAI OAuth login...".to_string()
+            } else if s.ssh {
+                "SSH detected; browser auto-open is unavailable here".to_string()
+            } else {
+                "Preparing manual xAI OAuth login...".to_string()
+            }));
+            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                provider: OAuthProvider::Grok,
+                op: OAuthFlowOp::Begin,
+            }))
+        }
+        (OAuthProvider::Codex, OAuthOption::Login) => {
+            s.polling = true;
+            s.status = Some(Ok("Requesting Codex device code...".to_string()));
+            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                provider: OAuthProvider::Codex,
+                op: OAuthFlowOp::Begin,
+            }))
+        }
+        (OAuthProvider::Codex, OAuthOption::Poll) => {
+            let Some(login) = s.device_login().cloned() else {
+                s.polling = true;
+                s.status = Some(Ok("Requesting Codex device code...".to_string()));
+                return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                    provider: OAuthProvider::Codex,
+                    op: OAuthFlowOp::Begin,
+                }));
+            };
+            s.polling = true;
+            s.status = Some(Ok("Waiting for Codex approval...".to_string()));
+            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                provider: OAuthProvider::Codex,
+                op: OAuthFlowOp::Poll(login),
+            }))
+        }
+        _ => OAuthKeyOutcome::stay(None),
+    }
+}
+
+fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAuthOption> {
+    let count = s.option_count(host);
+    if count == 0 {
+        s.cursor = 0;
+        return None;
+    }
+    if s.cursor >= count {
+        s.cursor = count - 1;
+    }
+    oauth_options(s, host).get(s.cursor).copied()
+}
+
+fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOption> {
+    let mut opts = Vec::new();
+    if s.confirming() {
+        opts.push(OAuthOption::Continue);
+        return opts;
     }
     match s.provider {
         OAuthProvider::Grok => {
             if s.pending {
-                if s.cursor == 0 {
-                    s.paste_focused = true;
-                    s.manual_input.set("");
-                }
-                return (false, None);
+                opts.push(OAuthOption::ManualPaste);
+            } else {
+                opts.push(OAuthOption::Login);
+                opts.push(OAuthOption::ManualPaste);
             }
-            if s.cursor == 1 && s.has_browser_session() {
-                s.paste_focused = true;
-                s.manual_input.set("");
-                return (false, None);
-            }
-            if s.cursor == 0 || s.cursor == 1 {
-                s.pending = true;
-                s.paste_focused = false;
-                s.manual_input.set("");
-                s.status = Some(Ok(if s.cursor == 0 && !s.ssh {
-                    "Preparing xAI OAuth login...".to_string()
-                } else if s.ssh {
-                    "SSH detected; browser auto-open is unavailable here".to_string()
-                } else {
-                    "Preparing manual xAI OAuth login...".to_string()
-                }));
-                return (
-                    false,
-                    Some(OAuthFlowRequest {
-                        provider: OAuthProvider::Grok,
-                        op: OAuthFlowOp::Begin,
-                    }),
-                );
-            }
-            (false, None)
         }
         OAuthProvider::Codex => {
-            if s.cursor == 0 {
-                if s.polling {
-                    return (false, None);
-                }
-                if let Some(login) = s.device_login().cloned() {
-                    s.polling = true;
-                    s.status = Some(Ok("Waiting for Codex approval...".to_string()));
-                    return (
-                        false,
-                        Some(OAuthFlowRequest {
-                            provider: OAuthProvider::Codex,
-                            op: OAuthFlowOp::Poll(login),
-                        }),
-                    );
-                }
-                s.polling = true;
-                s.status = Some(Ok("Requesting Codex device code...".to_string()));
-                return (
-                    false,
-                    Some(OAuthFlowRequest {
-                        provider: OAuthProvider::Codex,
-                        op: OAuthFlowOp::Begin,
-                    }),
-                );
+            if s.device_login().is_some() {
+                opts.push(OAuthOption::Poll);
+            } else {
+                opts.push(OAuthOption::Login);
             }
-            (false, None)
+        }
+    }
+    if host == OAuthHost::AddWizard {
+        opts.push(OAuthOption::SkipContinue);
+    }
+    opts
+}
+
+fn rendered_cursor(s: &OAuthFlowState, host: OAuthHost) -> usize {
+    s.cursor.min(s.option_count(host).saturating_sub(1))
+}
+
+pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static str {
+    if s.provider == OAuthProvider::Grok && s.paste_focused {
+        return "type/paste code  enter: submit  esc: options";
+    }
+    match (
+        host,
+        s.provider,
+        s.confirming(),
+        s.pending,
+        s.polling,
+        s.authorize_url().is_some(),
+        s.device_login().is_some(),
+    ) {
+        (OAuthHost::Standalone, OAuthProvider::Grok, true, _, _, _, _) => {
+            "enter: continue  esc: back"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Grok, true, _, _, _, _) => {
+            "enter: continue  s: skip/continue  esc: back"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Codex, true, _, _, _, _) => {
+            "enter: continue  esc: back"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Codex, true, _, _, _, _) => {
+            "enter: continue  s: skip/continue  esc: back"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Grok, false, true, _, true, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  esc: cancel login"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Grok, false, true, _, false, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel login"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Grok, false, true, _, true, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  s: skip/continue  esc: cancel login"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Grok, false, true, _, false, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  s: skip/continue  esc: cancel login"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Grok, false, false, _, true, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  esc: back"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Grok, false, false, _, false, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  esc: back"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Grok, false, false, _, true, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy URL  s: skip/continue  esc: back"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Grok, false, false, _, false, _) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  s: skip/continue  esc: back"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Codex, false, _, true, _, true) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy  y: copy code  esc: cancel login"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Codex, false, _, true, _, false) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel login"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Codex, false, _, true, _, true) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy  y: copy code  s: skip/continue  esc: cancel login"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Codex, false, _, true, _, false) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  s: skip/continue  esc: cancel login"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Codex, false, _, false, _, true) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy  y: copy code  esc: back"
+        }
+        (OAuthHost::Standalone, OAuthProvider::Codex, false, _, false, _, false) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  esc: back"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Codex, false, _, false, _, true) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  c: copy  y: copy code  s: skip/continue  esc: back"
+        }
+        (OAuthHost::AddWizard, OAuthProvider::Codex, false, _, false, _, false) => {
+            "↑/↓/Tab/Shift+Tab  enter: choose  s: skip/continue  esc: back"
         }
     }
 }
 
-fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState) {
+fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, host: OAuthHost) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
@@ -774,19 +918,11 @@ fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState) {
         return;
     }
 
-    let opts: &[&str] = match s.provider {
-        OAuthProvider::Grok if s.confirming() => &["continue"],
-        OAuthProvider::Grok if s.pending => &["paste code manually", "skip / continue"],
-        OAuthProvider::Grok => &["log in", "manual paste", "skip / continue"],
-        OAuthProvider::Codex if s.confirming() => &["continue"],
-        OAuthProvider::Codex if s.device_login().is_some() => {
-            &["poll for approval", "skip / continue"]
-        }
-        OAuthProvider::Codex => &["log in", "skip / continue"],
-    };
-    for (i, label) in opts.iter().enumerate() {
-        let marker = if i == s.cursor { "▸ " } else { "  " };
-        let style = if i == s.cursor {
+    let cursor = rendered_cursor(s, host);
+    for (i, option) in oauth_options(s, host).iter().enumerate() {
+        let label = option.label();
+        let marker = if i == cursor { "▸ " } else { "  " };
+        let style = if i == cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)

@@ -3372,7 +3372,10 @@ mod tests {
         let mut add = providers::AddState::new();
         add.enter_oauth_for_test(codex);
         d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
-        assert_eq!(d.help_text(), "enter: continue  esc: back");
+        assert_eq!(
+            d.help_text(),
+            "enter: continue  s: skip/continue  esc: back"
+        );
 
         let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
         grok.logged_in = false;
@@ -3381,7 +3384,7 @@ mod tests {
         d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
         assert_eq!(
             d.help_text(),
-            "↑/↓  enter: choose  s: skip/continue  esc: back"
+            "↑/↓/Tab/Shift+Tab  enter: choose  s: skip/continue  esc: back"
         );
     }
 

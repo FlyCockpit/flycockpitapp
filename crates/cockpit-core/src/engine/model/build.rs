@@ -1,4 +1,5 @@
 use super::*;
+use rig::providers::{anthropic, chatgpt, openai};
 
 impl Model {
     /// Resolve the active model from the user's config + credentials and

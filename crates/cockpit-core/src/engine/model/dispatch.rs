@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt;
 
 impl Model {
     /// One-shot, non-streaming, no-tools text completion. Used by

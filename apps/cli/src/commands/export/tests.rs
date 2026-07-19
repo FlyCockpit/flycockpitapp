@@ -1508,6 +1508,173 @@ fn export_tool_lifecycle_events_distinguish_start_and_completion() {
 }
 
 #[test]
+fn export_includes_notice_events() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    session
+        .record_event(
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &json!({ "text": "start" }),
+        )
+        .unwrap();
+    session
+        .record_notice(Some("Build"), "Model fallback applied.", "engine_turn")
+        .unwrap();
+    session
+        .record_event(
+            SessionEventKind::AssistantMessage,
+            Some("Build"),
+            None,
+            &json!({ "text": "done" }),
+        )
+        .unwrap();
+
+    let target = db.get_session(session.id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, session.id).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let events = zip_events(&zip);
+    let event_types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(event_types, ["user_message", "notice", "assistant_message"]);
+    let notice = events
+        .iter()
+        .find(|event| event["type"] == "notice")
+        .expect("notice event present");
+    assert_eq!(notice["data"]["text"], "Model fallback applied.");
+    assert_eq!(notice["data"]["severity"], "info");
+    assert_eq!(notice["data"]["source"], "engine_turn");
+}
+
+#[test]
+fn export_labels_orphaned_tool_call_started() {
+    let db = Db::open_in_memory().unwrap();
+    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let sid = s.session_id;
+    db.insert_session_event(
+        sid,
+        SessionEventKind::ToolCallStarted,
+        Some("Build"),
+        Some("tc-open"),
+        &json!({
+            "tool": "bash",
+            "original_input": {"command": "sleep 10"},
+            "wire_input": {"command": "sleep 10"},
+            "recovery_kind": "clean",
+            "recovery_stage": null,
+        }),
+    )
+    .unwrap();
+
+    let target = db.get_session(sid).unwrap().unwrap();
+    let bundle = collect_bundle(&db, sid).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let events = zip_events(&zip);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "tool_call_started")
+        .expect("started event present");
+    assert_eq!(started["data"]["orphaned"], true);
+}
+
+#[test]
+fn export_does_not_label_completed_tool_call_started() {
+    let db = Db::open_in_memory().unwrap();
+    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let sid = s.session_id;
+    db.insert_session_event(
+        sid,
+        SessionEventKind::ToolCallStarted,
+        Some("Build"),
+        Some("tc-done"),
+        &json!({
+            "tool": "bash",
+            "original_input": {"command": "true"},
+            "wire_input": {"command": "true"},
+            "recovery_kind": "clean",
+            "recovery_stage": null,
+        }),
+    )
+    .unwrap();
+    db.insert_session_event(
+        sid,
+        SessionEventKind::ToolCallCompleted,
+        Some("Build"),
+        Some("tc-done"),
+        &json!({
+            "tool": "bash",
+            "status": "completed",
+            "dispatched": true,
+            "hard_fail": false,
+            "output": "",
+            "truncated": false,
+            "duration_ms": 1,
+        }),
+    )
+    .unwrap();
+
+    let target = db.get_session(sid).unwrap().unwrap();
+    let bundle = collect_bundle(&db, sid).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let events = zip_events(&zip);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "tool_call_started")
+        .expect("started event present");
+    assert!(started["data"].get("orphaned").is_none());
+}
+
+#[test]
+fn export_orphan_detection_is_bundle_scoped() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = db.create_session("p", "/proj", "Build").unwrap();
+    let child = db.create_fork(parent.session_id, None).unwrap();
+    db.insert_session_event(
+        parent.session_id,
+        SessionEventKind::ToolCallStarted,
+        Some("Build"),
+        Some("tc-cross"),
+        &json!({
+            "tool": "bash",
+            "original_input": {"command": "true"},
+            "wire_input": {"command": "true"},
+            "recovery_kind": "clean",
+            "recovery_stage": null,
+        }),
+    )
+    .unwrap();
+    db.insert_session_event(
+        child.session_id,
+        SessionEventKind::ToolCallCompleted,
+        Some("Build"),
+        Some("tc-cross"),
+        &json!({
+            "tool": "bash",
+            "status": "completed",
+            "dispatched": true,
+            "hard_fail": false,
+            "output": "",
+            "truncated": false,
+            "duration_ms": 1,
+        }),
+    )
+    .unwrap();
+
+    let target = db.get_session(parent.session_id).unwrap().unwrap();
+    let bundle = collect_bundle(&db, parent.session_id).unwrap();
+    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let events = zip_events(&zip);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "tool_call_started")
+        .expect("started event present");
+    assert!(started["data"].get("orphaned").is_none());
+}
+
+#[test]
 fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
     let db = Db::open_in_memory().unwrap();
     let s = db.create_session("p", "/proj", "Build").unwrap();

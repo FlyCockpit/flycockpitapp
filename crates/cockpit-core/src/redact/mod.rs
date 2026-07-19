@@ -811,6 +811,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
         "crates/cockpit-core/src/daemon/server/dispatch.rs",
         "crates/cockpit-core/src/daemon/server/mod.rs",
+        "crates/cockpit-core/src/daemon/session_worker/mod.rs",
         "crates/cockpit-core/src/daemon/session_worker/run.rs",
         "crates/cockpit-core/src/embeddings.rs",
         "crates/cockpit-core/src/engine/driver/mod.rs",

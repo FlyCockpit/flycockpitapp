@@ -8,7 +8,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`
 - Client boundary: `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`
 - Off machine: `apps/cli/src/commands/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
-- Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/run.rs`
+- Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`
 - Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
 <!-- scrub-inventory:end -->
 
@@ -35,6 +35,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 
 ## Session-worker persist path
 
+- `crates/cockpit-core/src/daemon/session_worker/mod.rs`: durable notice events are scrubbed through the current session redaction table before they are stored.
 - `crates/cockpit-core/src/daemon/session_worker/run.rs`: persisted worker result data is scrubbed through the current session redaction table before it is stored.
 
 ## Core scrub entry points

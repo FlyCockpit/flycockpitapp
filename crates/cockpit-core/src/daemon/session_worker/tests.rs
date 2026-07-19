@@ -307,6 +307,149 @@ mod tests {
         assert!(!persisted.scrub("worker-secret").contains("worker-secret"));
     }
 
+    fn persisted_notice_text(session: &Session) -> String {
+        let events = session.db.list_session_events(session.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "notice");
+        events[0].data["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn engine_notice_is_recorded_as_durable_session_event() {
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            PathBuf::from("/proj"),
+            "Build",
+        )
+        .unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let table = Arc::new(RedactionTable::empty());
+        let mut events = proto::turn_event_to_proto(
+            TurnEvent::Notice {
+                text: "Engine notice text.".to_string(),
+            },
+            session.id,
+        );
+        assert_eq!(events.len(), 1);
+
+        send_session_event(
+            &session,
+            &event_tx,
+            &table,
+            events.pop().unwrap(),
+            NoticeSource::EngineTurn,
+        );
+
+        let rows = session.db.list_session_events(session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "notice");
+        assert_eq!(rows[0].data["text"], "Engine notice text.");
+        assert_eq!(rows[0].data["source"], "engine_turn");
+        assert_eq!(rows[0].data["severity"], "info");
+    }
+
+    #[test]
+    fn notice_is_recorded_exactly_once_across_both_paths() {
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            PathBuf::from("/proj"),
+            "Build",
+        )
+        .unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let table = Arc::new(RedactionTable::empty());
+        let events = proto::turn_event_to_proto(
+            TurnEvent::Notice {
+                text: "Single notice.".to_string(),
+            },
+            session.id,
+        );
+
+        for event in events {
+            send_session_event(&session, &event_tx, &table, event, NoticeSource::EngineTurn);
+        }
+
+        let rows = session.db.list_session_events(session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "notice");
+        assert_eq!(rows[0].data["text"], "Single notice.");
+    }
+
+    #[test]
+    fn daemon_direct_notice_is_recorded_as_durable_session_event() {
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            PathBuf::from("/proj"),
+            "Build",
+        )
+        .unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let table = Arc::new(RedactionTable::empty());
+
+        send_session_event(
+            &session,
+            &event_tx,
+            &table,
+            proto::Event::Notice {
+                session_id: session.id,
+                text: "Daemon warning.".to_string(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+
+        let rows = session.db.list_session_events(session.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "notice");
+        assert_eq!(rows[0].data["text"], "Daemon warning.");
+        assert_eq!(rows[0].data["source"], "daemon_direct");
+        assert_eq!(rows[0].data["severity"], "warning");
+    }
+
+    #[test]
+    fn sessionless_notice_is_dropped_without_error() {
+        let table = RedactionTable::empty();
+        record_notice_event_with_agent(
+            None,
+            None,
+            &table,
+            &proto::Event::Notice {
+                session_id: Uuid::new_v4(),
+                text: "Sessionless notice.".to_string(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+    }
+
+    #[test]
+    fn recorded_notice_text_is_redacted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::config::extended::RedactConfig::default();
+        cfg.denylist = vec!["session-secret-token".to_string()];
+        let table = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Build",
+        )
+        .unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+
+        send_session_event(
+            &session,
+            &event_tx,
+            &table,
+            proto::Event::Notice {
+                session_id: session.id,
+                text: "Provider returned session-secret-token".to_string(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+
+        let text = persisted_notice_text(&session);
+        assert!(!text.contains("session-secret-token"));
+        assert!(text.contains("REDACTED"));
+    }
+
     #[test]
     fn session_driver_failed_event_is_latched() {
         let (event_tx, mut event_rx) = broadcast::channel(8);

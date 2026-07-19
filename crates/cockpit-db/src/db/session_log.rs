@@ -121,6 +121,10 @@ pub enum SessionEventKind {
     /// A user promoted or attempted to promote a queued resource-scheduler
     /// request. Data/export only.
     ResourcePromotion,
+    /// A user-visible notice emitted by the engine or daemon. Carries
+    /// redacted `text`, typed `severity`, and stable `source` metadata so
+    /// exports preserve diagnostic warnings that were previously UI-only.
+    Notice,
 }
 
 impl SessionEventKind {
@@ -148,6 +152,7 @@ impl SessionEventKind {
             SessionEventKind::AutoPruneDiagnostic => "auto_prune_diagnostic",
             SessionEventKind::GoalProgressDiagnostic => "goal_progress_diagnostic",
             SessionEventKind::ResourcePromotion => "resource_promotion",
+            SessionEventKind::Notice => "notice",
         }
     }
 }
@@ -730,6 +735,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "permission_decision");
         assert_eq!(events[0].data, data);
+    }
+
+    #[test]
+    fn notice_event_kind_wire_string_is_notice() {
+        assert_eq!(SessionEventKind::Notice.as_str(), "notice");
     }
 
     #[test]

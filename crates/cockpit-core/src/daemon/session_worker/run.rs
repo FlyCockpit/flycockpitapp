@@ -81,7 +81,8 @@ fn finish_parked_replay_completion(
             interrupt_id = %completion.interrupt_id,
             "parked interrupt replay failed"
         );
-        send_current_event(
+        send_current_session_event(
+            session,
             event_tx,
             redaction,
             proto::Event::Notice {
@@ -91,6 +92,7 @@ fn finish_parked_replay_completion(
                     completion.interrupt_id
                 ),
             },
+            NoticeSource::DaemonDirect,
         );
         interrupts.emit_queue_state();
         return;
@@ -235,26 +237,30 @@ async fn run_worker(
             Some(row) => match crate::assistants::identity::load_for_session(&session.db, &row) {
                 Ok(load) => {
                     for text in &load.notices {
-                        send_current_event(
+                        send_current_session_event(
+                            &session,
                             &event_tx,
                             &redaction,
                             proto::Event::Notice {
                                 session_id,
                                 text: text.clone(),
                             },
+                            NoticeSource::DaemonDirect,
                         );
                     }
                     Some(load.system_prefix)
                 }
                 Err(error) => {
                     tracing::warn!(%error, assistant = %row.name, "loading assistant identity failed");
-                    send_current_event(
+                    send_current_session_event(
+                        &session,
                         &event_tx,
                         &redaction,
                         proto::Event::Notice {
                             session_id,
                             text: format!("Assistant identity could not be loaded: {error}"),
                         },
+                        NoticeSource::DaemonDirect,
                     );
                     None
                 }
@@ -349,6 +355,7 @@ async fn run_worker(
     let foreground_for_forward = foreground.clone();
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
+    let session_for_forward = session.clone();
     // The lock authority + the interactive-client count, for the
     // `AgentIdle`-with-zero-clients release edge
     // (implementation note). When a turn finishes and no
@@ -424,7 +431,13 @@ async fn run_worker(
                 _ => {}
             }
             // `send` returns `Err` only when there are no subscribers — that's fine.
-            send_current_event(&event_tx_for_forward, &redaction_for_forward, ev);
+            send_current_session_event(
+                &session_for_forward,
+                &event_tx_for_forward,
+                &redaction_for_forward,
+                ev,
+                NoticeSource::EngineTurn,
+            );
         };
 
         let mut coalescer = StreamDeltaCoalescer::default();
@@ -611,7 +624,8 @@ async fn run_worker(
                 } else {
                     state.short_id.clone()
                 };
-                send_current_event(
+                send_current_session_event(
+                    &session,
                     &event_tx,
                     &redaction,
                     proto::Event::Notice {
@@ -621,12 +635,14 @@ async fn run_worker(
                             state.detail
                         ),
                     },
+                    NoticeSource::DaemonDirect,
                 );
             } else {
                 tracing::error!(error = %e, session_id = %session_id,
                     "resume rehydration failed; the transcript could not be rebuilt into a \
                      provider-valid conversation");
-                send_current_event(
+                send_current_session_event(
+                    &session,
                     &event_tx,
                     &redaction,
                     proto::Event::Notice {
@@ -636,6 +652,7 @@ async fn run_worker(
                          Start a new session to continue."
                         ),
                     },
+                    NoticeSource::DaemonDirect,
                 );
             }
             None
@@ -646,7 +663,8 @@ async fn run_worker(
     {
         // Continuity preserved, just less pruned — surface a non-fatal
         // warning (never a silent drop to a fresh context).
-        send_current_event(
+        send_current_session_event(
+            &session,
             &event_tx,
             &redaction,
             proto::Event::Notice {
@@ -655,6 +673,7 @@ async fn run_worker(
                    (unpruned) prior context instead."
                     .to_string(),
             },
+            NoticeSource::DaemonDirect,
         );
     }
     if let Some(r) = &rehydrated
@@ -665,7 +684,8 @@ async fn run_worker(
         // visibly (alongside any ledger-fallback notice above), never a
         // silent alteration of the resumed context.
         let n = r.heals.len();
-        send_current_event(
+        send_current_session_event(
+            &session,
             &event_tx,
             &redaction,
             proto::Event::Notice {
@@ -674,6 +694,7 @@ async fn run_worker(
                     "Resume: {n} incomplete tool call(s) were stubbed to rebuild the conversation."
                 ),
             },
+            NoticeSource::DaemonDirect,
         );
     }
 
@@ -705,7 +726,8 @@ async fn run_worker(
                                 "marking unrecoverable interrupt failed"
                             );
                         }
-                        send_current_event(
+                        send_current_session_event(
+                            &session,
                             &event_tx,
                             &redaction,
                             proto::Event::Notice {
@@ -721,6 +743,7 @@ async fn run_worker(
                                     ),
                                 },
                             },
+                            NoticeSource::DaemonDirect,
                         );
                     }
                     _ => {}
@@ -856,7 +879,8 @@ async fn run_worker(
                     } else {
                         state.failing_tool_call_ids.join(", ")
                     };
-                    send_current_event(
+                    send_current_session_event(
+                        &session,
                         &event_tx,
                         &redaction,
                         proto::Event::Notice {
@@ -866,6 +890,7 @@ async fn run_worker(
                                 state.failure_kind, ids
                             ),
                         },
+                        NoticeSource::DaemonDirect,
                     );
                     let _ = respond_to.send((
                         proto::QueueItem {
@@ -1147,7 +1172,8 @@ async fn run_worker(
                     }
                     let Some(payload) = row.parked.clone() else {
                         let _ = session.db.mark_interrupt_interrupted(interrupt_id);
-                        send_current_event(
+                        send_current_session_event(
+                            &session,
                             &event_tx,
                             &redaction,
                             proto::Event::Notice {
@@ -1156,6 +1182,7 @@ async fn run_worker(
                                     "Interrupted parked request {interrupt_id}: missing replay payload."
                                 ),
                             },
+                            NoticeSource::DaemonDirect,
                         );
                         interrupts.emit_queue_state();
                         continue;
@@ -1284,10 +1311,12 @@ async fn run_worker(
                         ) {
                             tracing::warn!(%error, %session_id, "record resume repair provenance failed");
                         }
-                        send_current_event(
+                        send_current_session_event(
+                            &session,
                             &event_tx,
                             &redaction,
                             proto::Event::Notice { session_id, text },
+                            NoticeSource::DaemonDirect,
                         );
                         let _ = respond_to.send(Ok(()));
                     }
@@ -1461,7 +1490,8 @@ async fn run_worker(
                         }
                         for path in table.unsupported_files() {
                             if unsupported_redaction_notified.insert(path.clone()) {
-                                send_current_event(
+                                send_current_session_event(
+                                    &session,
                                     &event_tx,
                                     &redaction,
                                     proto::Event::Notice {
@@ -1471,6 +1501,7 @@ async fn run_worker(
                                             path.display()
                                         ),
                                     },
+                                    NoticeSource::DaemonDirect,
                                 );
                             }
                         }
@@ -1585,7 +1616,8 @@ async fn run_worker(
                         Err(e) => {
                             // A misconfigured tandem provider/model is skipped
                             // with a notice rather than failing the toggle.
-                            send_current_event(
+                            send_current_session_event(
+                                &session,
                                 &event_tx,
                                 &redaction,
                                 proto::Event::Notice {
@@ -1594,6 +1626,7 @@ async fn run_worker(
                                         "model-comparison: skipping `{provider}/{model_id}` — {e:#}"
                                     ),
                                 },
+                                NoticeSource::DaemonDirect,
                             );
                         }
                     }

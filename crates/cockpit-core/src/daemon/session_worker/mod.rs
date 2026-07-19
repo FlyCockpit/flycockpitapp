@@ -178,6 +178,90 @@ fn event_from_pending_delta(pending: PendingDelta) -> proto::Event {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeSource {
+    EngineTurn,
+    DaemonDirect,
+}
+
+impl NoticeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            NoticeSource::EngineTurn => "engine_turn",
+            NoticeSource::DaemonDirect => "daemon_direct",
+        }
+    }
+}
+
+fn record_notice_event_with_agent(
+    session: Option<&Session>,
+    agent: Option<&str>,
+    redact: &RedactionTable,
+    event: &proto::Event,
+    source: NoticeSource,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let proto::Event::Notice { text, .. } = event else {
+        return;
+    };
+    let scrubbed = redact.scrub(text);
+    if let Err(error) = session.record_notice(agent, &scrubbed, source.as_str()) {
+        tracing::warn!(
+            %error,
+            session_id = %session.id,
+            source = source.as_str(),
+            "recording notice event failed"
+        );
+    }
+}
+
+fn send_current_session_event(
+    session: &Session,
+    tx: &EventSender,
+    redact: &SharedRedactionTable,
+    event: proto::Event,
+    source: NoticeSource,
+) {
+    let table = current_redaction(redact);
+    send_session_event(session, tx, &table, event, source);
+}
+
+fn send_current_session_event_with_agent(
+    session: &Session,
+    agent: Option<&str>,
+    tx: &EventSender,
+    redact: &SharedRedactionTable,
+    event: proto::Event,
+    source: NoticeSource,
+) {
+    let table = current_redaction(redact);
+    send_session_event_with_agent(session, agent, tx, &table, event, source);
+}
+
+fn send_session_event(
+    session: &Session,
+    tx: &EventSender,
+    redact: &Arc<RedactionTable>,
+    event: proto::Event,
+    source: NoticeSource,
+) {
+    send_session_event_with_agent(session, None, tx, redact, event, source);
+}
+
+fn send_session_event_with_agent(
+    session: &Session,
+    agent: Option<&str>,
+    tx: &EventSender,
+    redact: &Arc<RedactionTable>,
+    event: proto::Event,
+    source: NoticeSource,
+) {
+    record_notice_event_with_agent(Some(session), agent, redact, &event, source);
+    send_event(tx, redact, event);
+}
+
 /// Inbound work-queue capacity. Generous — user messages, cancels,
 /// and resolves are tiny.
 const WORK_QUEUE_CAPACITY: usize = 64;
@@ -232,7 +316,8 @@ async fn refresh_redaction_for_turn(
             }
             for path in table.unsupported_files() {
                 if unsupported_notified.insert(path.clone()) {
-                    send_event(
+                    send_session_event(
+                        session,
                         event_tx,
                         &table,
                         proto::Event::Notice {
@@ -242,6 +327,7 @@ async fn refresh_redaction_for_turn(
                                 path.display()
                             ),
                         },
+                        NoticeSource::DaemonDirect,
                     );
                 }
             }

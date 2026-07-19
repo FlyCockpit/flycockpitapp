@@ -349,6 +349,21 @@ impl Session {
             .context("inserting session_event")
     }
 
+    /// Record a durable user-visible notice. Notice emit sites stay UI-facing;
+    /// this helper is the single writer that makes the notice exportable.
+    pub fn record_notice(&self, agent: Option<&str>, text: &str, source: &str) -> Result<i64> {
+        self.record_event(
+            crate::db::session_log::SessionEventKind::Notice,
+            agent,
+            None,
+            &serde_json::json!({
+                "text": text,
+                "severity": notice_severity(text),
+                "source": source,
+            }),
+        )
+    }
+
     /// Record a `context_pruned` timeline event (session-log-export Part
     /// C). Fired by the real `/prune` path (manual + cache-cold auto): a
     /// wire-only snapshot dedup that elided superseded tool-result bodies.
@@ -588,5 +603,72 @@ impl Session {
     /// it with the provider's figure.
     pub fn set_last_usage_estimate(&self, usage: crate::tokens::TokenUsage) {
         *self.last_usage.lock().unwrap() = Some(usage);
+    }
+}
+
+fn notice_severity(text: &str) -> &'static str {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("failed")
+        || lower.contains("failure")
+        || lower.contains("error")
+        || lower.contains("denied")
+        || lower.contains("rejected")
+    {
+        "failure"
+    } else if lower.contains("warning")
+        || lower.contains("warn")
+        || lower.contains("unsupported")
+        || lower.contains("repair required")
+        || lower.contains("missing")
+    {
+        "warning"
+    } else {
+        "info"
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+    use crate::db::Db;
+
+    #[test]
+    fn notice_records_typed_severity_and_source() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db, std::path::PathBuf::from("/proj"), "Build").unwrap();
+
+        session
+            .record_notice(
+                Some("Build"),
+                "Resume repair required before continuing.",
+                "daemon_direct",
+            )
+            .unwrap();
+
+        let events = session.db.list_session_events(session.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "notice");
+        assert_eq!(events[0].agent.as_deref(), Some("Build"));
+        assert_eq!(
+            events[0].data["text"],
+            "Resume repair required before continuing."
+        );
+        assert_eq!(events[0].data["severity"], "warning");
+        assert_eq!(events[0].data["source"], "daemon_direct");
+    }
+
+    #[test]
+    fn unclassified_notice_defaults_to_info_and_is_not_dropped() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db, std::path::PathBuf::from("/proj"), "Build").unwrap();
+
+        session
+            .record_notice(None, "Background refresh finished.", "engine_turn")
+            .unwrap();
+
+        let events = session.db.list_session_events(session.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["severity"], "info");
+        assert_eq!(events[0].data["source"], "engine_turn");
     }
 }

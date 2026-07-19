@@ -15,7 +15,10 @@
 //! ```text
 //! cockpit-session-<short_id>.zip
 //! ├── manifest.json          # session metadata + fork tree
-//! ├── events.json            # ONE unified seq-sorted timeline (all sessions)
+//! ├── events.json            # ONE unified seq-sorted timeline (all sessions),
+//! │                           # including notice rows; orphaned
+//! │                           # tool_call_started rows carry
+//! │                           # data.orphaned=true
 //! ├── tool_outputs/
 //! │   └── {seq:05}_{short_id}_{tool_call_id}.json
 //! ├── compressed_tool_results/
@@ -453,6 +456,14 @@ fn build_zip_with_options_and_env(
         }
     }
     let mut event_values: Vec<Value> = Vec::with_capacity(all_events.len());
+    let mut completed_tool_calls: HashMap<String, usize> = HashMap::new();
+    for ev in &all_events {
+        if ev.kind == "tool_call_completed"
+            && let Some(call_id) = ev.call_id.as_deref()
+        {
+            *completed_tool_calls.entry(call_id.to_string()).or_default() += 1;
+        }
+    }
     for ev in &all_events {
         let short = short_ids
             .get(&ev.session_id)
@@ -468,6 +479,21 @@ fn build_zip_with_options_and_env(
             "call_id": ev.call_id,
             "data": ev.data,
         });
+        if ev.kind == "tool_call_started"
+            && let Some(call_id) = ev.call_id.as_deref()
+            && let Some(data) = value["data"].as_object_mut()
+        {
+            let has_completion = match completed_tool_calls.get_mut(call_id) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if !has_completion {
+                data.insert("orphaned".into(), json!(true));
+            }
+        }
         if ev.kind == "tool_call"
             && let Some(call_id) = ev.call_id.as_deref()
             && let Some(identity) = tool_identity_by_call.get(&(ev.session_id, call_id.to_string()))

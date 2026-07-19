@@ -514,13 +514,16 @@ impl SessionWorkerHandle {
     }
 
     pub fn broadcast_notice(&self, text: String) {
-        send_current_event(
+        send_current_session_event_with_agent(
+            &self.session,
+            Some(&self.active_agent_name),
             &self.event_tx,
             &self.redaction,
             proto::Event::Notice {
                 session_id: self.session_id,
                 text,
             },
+            NoticeSource::DaemonDirect,
         );
     }
 

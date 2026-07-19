@@ -12,84 +12,87 @@ publish = false
 [features]
 test-support = []
 
+[lints]
+workspace = true
+
 [dependencies]
-tokio = { version = "1.52", features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread", "macros", "process", "io-util", "fs",
     "net", "signal", "time", "sync",
 ] }
-async-trait = "0.1"
-futures = "0.3"
-bytes = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
-rig = { version = "0.38", package = "rig-core", features = ["image"] }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+image = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+rig = { workspace = true }
+tokio-tungstenite = { workspace = true }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-proto = { path = "../cockpit-proto" }
-rusqlite = { version = "0.40", features = ["bundled"] }
-sqlite-vec = "0.1.10-alpha.4"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-lsp-types = "0.97"
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+zip = { workspace = true }
+tokio-util = { workspace = true }
+lsp-types = { workspace = true }
 flycockpit-relay-protocol = { path = "../relay-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
-toml = "1"
-jsonschema = { version = "0.46", default-features = false }
-dirs = "6"
-shellexpand = "3"
-walkdir = "2"
-ignore = "0.4"
-globset = "0.4"
-notify = "8"
-grep-searcher = "0.1"
-grep-regex = "0.1"
-grep-matcher = "0.1"
-brush-parser = "0.4"
-zerobox = "0.3"
-aho-corasick = "1"
-dotenvy = "0.15"
-tiktoken-rs = "0.12"
-keepawake = "0.6"
-base64 = "0.22"
-sha2 = "0.11"
-rand = "0.10"
-urlencoding = "2"
-which = "8"
-monty = { git = "https://github.com/pydantic/monty.git", rev = "4cae0789864668b6b642a02c1b06d352f5a67313" }
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+jsonschema = { workspace = true }
+dirs = { workspace = true }
+shellexpand = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+notify = { workspace = true }
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
+brush-parser = { workspace = true }
+zerobox = { workspace = true }
+aho-corasick = { workspace = true }
+dotenvy = { workspace = true }
+tiktoken-rs = { workspace = true }
+keepawake = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+urlencoding = { workspace = true }
+which = { workspace = true }
+monty = { workspace = true }
+chrono = { workspace = true }
 uuid = { workspace = true }
-anyhow = "1"
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-tempfile = "3"
-regex = "1"
-unicode-width = "0.2"
-csv = "1"
-similar = "3"
-tree-sitter = "0.26"
-tree-sitter-highlight = "0.26.10"
-tree-sitter-rust = "0.24"
-tree-sitter-typescript = "0.23"
-tree-sitter-javascript = "0.25"
-tree-sitter-python = "0.25"
-tree-sitter-go = "0.25"
-tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
-rayon = "1"
-firecrawl = "2"
-jsonc-parser = { version = "0.33.0", default-features = false }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+regex = { workspace = true }
+unicode-width = { workspace = true }
+csv = { workspace = true }
+similar = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+rayon = { workspace = true }
+firecrawl = { workspace = true }
+jsonc-parser = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
+zbus = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-tokio = { version = "1.52", features = ["test-util"] }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

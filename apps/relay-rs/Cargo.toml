@@ -6,23 +6,26 @@ rust-version = "1.95"
 license = "Apache-2.0"
 publish = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "flycockpit-relay"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
-base64 = "0.22"
+base64 = { workspace = true }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
-futures = "0.3"
+futures = { workspace = true }
 flycockpit-relay-protocol = { path = "../../crates/relay-protocol" }
 jsonwebtoken = "9"
 redis = { version = "0.32", features = ["tokio-comp"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

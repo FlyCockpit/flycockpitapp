@@ -5,19 +5,22 @@ edition = "2024"
 rust-version = "1.95"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
-anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+anyhow = { workspace = true }
+chrono = { workspace = true }
 cockpit-db = { path = "../cockpit-db" }
-dirs = "6"
-libc = "0.2"
-reqwest = { version = "0.13", default-features = false }
+dirs = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.11"
-tokio = { version = "1.52", features = ["rt"] }
-tracing = "0.1"
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

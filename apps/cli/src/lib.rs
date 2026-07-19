@@ -27,7 +27,20 @@ use std::process::ExitCode;
 
 use crate::cli::{Cli, Command};
 
-const TOKIO_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// Worker stack size for the tokio runtime, in place of tokio's 2 MiB
+/// default. Measured necessary (workspace-lints-and-dep-unification,
+/// 2026-07-19, Linux x86_64, debug profile): with the default 2 MiB stack,
+/// the daemon aborts with `thread 'tokio-rt-worker' has overflowed its
+/// stack` (SIGSEGV `SEGV_ACCERR` on the guard page, then SIGABRT) while
+/// polling the session-worker turn started by the first `send_user_message`
+/// of a session — reproducible via every `daemon_lifecycle_replay`
+/// integration test. The worker futures are already heap-allocated at their
+/// spawn boundaries (`Box::pin` in `daemon/session_worker/{handle,run}.rs`);
+/// the overflow is poll-stack depth, not future size. Probe runs
+/// (`thread_stack_size` at 2/2.5/3/4/8 MiB) show the suite fails at 2 MiB
+/// and passes at >= 2.5 MiB, so 4 MiB is the smallest sufficient
+/// power-of-two, with ~60% headroom over the observed requirement.
+const TOKIO_WORKER_STACK_SIZE: usize = 4 * 1024 * 1024;
 
 pub mod manpages {
     use std::fs;

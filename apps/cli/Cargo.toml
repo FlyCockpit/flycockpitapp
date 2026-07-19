@@ -17,6 +17,9 @@ publish = false
 [package.metadata.dist]
 dist = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "cockpit"
 path = "src/main.rs"
@@ -28,13 +31,13 @@ clap_complete = "4.6"
 clap_mangen = "0.2"
 
 # Async runtime
-tokio = { version = "1.52", features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread", "macros", "process", "io-util", "fs",
     "net", "signal", "time", "sync",
 ] }
-async-trait = "0.1"
-futures = "0.3"
-bytes = "1"
+async-trait = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
 
 # TUI
 ratatui = "0.30"
@@ -55,7 +58,7 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # to a vision model (composer-paste-handling). PNG-only feature set keeps
 # the build lean; we never decode other formats ourselves (arboard hands
 # us raw RGBA, we only encode).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 # Best-effort native desktop notifications for the attention subsystem on
 # local sessions (zbus/D-Bus on Linux via the default `z` feature, the native
 # notification centre on macOS/Windows). Fired on a detached thread with all
@@ -74,13 +77,13 @@ vt100 = "0.16"
 tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
 
 # HTTP / providers
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 # Provider layer — used as request-builder primitives, not as an agent framework.
 # The crate was renamed to `rig_core` in 0.37 (was `rig` through 0.36); we
 # rename it back to `rig` via the `package` key so the existing
 # `use rig::…` imports keep working.
-rig = { version = "0.38", package = "rig-core", features = ["image"] }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+rig = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 # Storage
 cockpit-core = { path = "../../crates/cockpit-core" }
@@ -89,8 +92,8 @@ cockpit-db = { path = "../../crates/cockpit-db" }
 cockpit-proto = { path = "../../crates/cockpit-proto" }
 # rusqlite 0.40 has no separate `fts5` feature; bundled SQLite includes FTS5
 # and the knowledge sidecar tests create/query an FTS5 virtual table.
-rusqlite = { version = "0.40", features = ["bundled"] }
-sqlite-vec = "0.1.10-alpha.4"
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
 
 # Session-log export archive writer (`cockpit export <session>` → .zip,
 # session-log-export Part D). `default-features = false` + only `deflate`
@@ -98,15 +101,15 @@ sqlite-vec = "0.1.10-alpha.4"
 # set of JSON files from in-memory bytes via `ZipWriter` + `start_file` +
 # `write_all` + `finish` (API verified against zip 8.6 docs + a compile
 # probe; kcl lacks the `zip` package).
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { workspace = true }
 
 # Codec helpers for the NDJSON daemon wire protocol.
 # `Framed<UnixStream, LinesCodec>` lifts a byte stream into a
 # `Sink<String> + Stream<Item = String>` we can layer serde on top of.
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { workspace = true }
 # Language Server Protocol client payload types. cockpit hand-rolls the
 # stdio JSON-RPC transport and uses this crate only for protocol structs.
-lsp-types = "0.97"
+lsp-types = { workspace = true }
 
 # Serialization
 flycockpit-relay-protocol = { path = "../../crates/relay-protocol" }
@@ -114,10 +117,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # YAML syntax validation for native write tools. `serde_yaml` 0.9 is archived,
 # but YAML syntax is stable and this existing dependency is sufficient here.
-serde_yaml = "0.9"
+serde_yaml = { workspace = true }
 # TOML parsing for env-file format auto-detection (§7). Used to walk a
 # matched env file's leaf string scalars as redaction candidates.
-toml = "1"
+toml = { workspace = true }
 
 # JSON Schema validation — drives the §12 validate-then-repair layer.
 # Each tool's `parameters()` schema is compiled once and reused to
@@ -126,15 +129,15 @@ toml = "1"
 # false` drops the optria/format-assertion + CLI extras we don't use,
 # keeping the dependency surface (and the schemas we validate against,
 # all hand-authored object schemas) minimal.
-jsonschema = { version = "0.46", default-features = false }
+jsonschema = { workspace = true }
 
 # Filesystem helpers
-dirs = "6"
-shellexpand = "3"
-walkdir = "2"
-ignore = "0.4"
-globset = "0.4"
-notify = "8"
+dirs = { workspace = true }
+shellexpand = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+notify = { workspace = true }
 
 # Native (no-subprocess) content search for the sandboxed `grep` tool
 # (docs-agent decision 2). The ripgrep library crates run a regex search
@@ -142,9 +145,9 @@ notify = "8"
 # access: `grep-regex` builds the matcher, `grep-searcher` drives the
 # line-by-line search, `grep-matcher` is the shared matcher trait the
 # Sink consumes.
-grep-searcher = "0.1"
-grep-regex = "0.1"
-grep-matcher = "0.1"
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
 
 # Shell-command classification for the command-approval subsystem
 # (sandboxing part 1). A real bash-grammar AST (from the brush shell) —
@@ -154,7 +157,7 @@ grep-matcher = "0.1"
 # `shell-words`) can't answer compound-vs-simple; `conch-parser` is
 # unmaintained; `yash-syntax` is GPL-incompatible. We parse in `sh_mode`
 # because `bash.rs` executes commands via `sh -c`.
-brush-parser = "0.4"
+brush-parser = { workspace = true }
 
 # Filesystem sandboxing engine for the `bash` tool (sandboxing part 2).
 # Linux/macOS/WSL only — `Sandbox::...prepare()`
@@ -166,16 +169,16 @@ brush-parser = "0.4"
 # zerobox. Linux re-entry requires `arg0::dispatch_linux_sandbox_helper`
 # early in `main` + a PATH-prepend helper guard kept alive for the
 # process lifetime.
-zerobox = "0.3"
+zerobox = { workspace = true }
 
 # Secret scanning / redaction
-aho-corasick = "1"
-dotenvy = "0.15"
+aho-corasick = { workspace = true }
+dotenvy = { workspace = true }
 
 # Tokenizer (cl100k_base) — used as the fallback counter when the
 # active provider doesn't expose its own. Singleton-backed; the BPE
 # vocab is built once on first call.
-tiktoken-rs = "0.12"
+tiktoken-rs = { workspace = true }
 
 # Cross-platform sleep-assertion crate for `/caffeinate` (daemon holds
 # the assertion). Pure-Rust: `SetThreadExecutionState` (Windows),
@@ -187,18 +190,18 @@ tiktoken-rs = "0.12"
 # default) causes to be ignored on lid close — so on Linux we add our
 # own `handle-lid-switch` inhibitor (see `daemon::caffeinate::linux`)
 # using the same zbus version to keep one zbus in the tree.
-keepawake = "0.6"
+keepawake = { workspace = true }
 
 # OAuth device-code flow (Codex login). PKCE = SHA-256 + URL-safe base64
 # (no padding); `urlencoding` is just for the form-encoded body of the
 # RFC 8628 token exchange step.
-base64 = "0.22"
-sha2 = "0.11"
-rand = "0.10"
-urlencoding = "2"
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+urlencoding = { workspace = true }
 
 # Subprocess discovery (Windows: gitbash, on every platform: harness commands)
-which = "8"
+which = { workspace = true }
 
 # Monty — the embedded Python sandbox VM that backs monty-mode MCP.
 # Pure-Rust (ruff parser + VM), edition 2024 / MSRV 1.95;
@@ -206,28 +209,28 @@ which = "8"
 # snapshot/resume async dispatch + resource limits (memory/time/stack)
 # let the `mcp` tool run model-authored Python with zero filesystem,
 # network, or env access — only the host-provided mcp.search/mcp.invoke.
-monty = { git = "https://github.com/pydantic/monty.git", rev = "4cae0789864668b6b642a02c1b06d352f5a67313" }
+monty = { workspace = true }
 
 # Time / IDs
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+chrono = { workspace = true }
 uuid = { workspace = true }
 
 # Errors / logging
-anyhow = "1"
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Misc
-tempfile = "3"
-regex = "1"
-unicode-width = "0.2"
+tempfile = { workspace = true }
+regex = { workspace = true }
+unicode-width = { workspace = true }
 # CSV output for `cockpit stats --format=csv`. Used only as
 # a writer over an in-memory buffer; no parsing or serde-record paths.
-csv = "1"
+csv = { workspace = true }
 # Diff rendering for the edit/write tool entries in the TUI history
 # pane (tui.diff_style). Provides line+intraline diff primitives.
-similar = "3"
+similar = { workspace = true }
 
 # Codebase-intelligence outline index. `tree-sitter` core
 # parses; the grammar crates supply per-language `LANGUAGE` consts. The
@@ -236,19 +239,19 @@ similar = "3"
 # `LanguageFn` ABI), not on `tree-sitter` core directly, so there's a
 # single core in the tree. `rayon` drives the parallel parse; the serial
 # SQLite write goes through the bundled `rusqlite` connection.
-tree-sitter = "0.26"
-tree-sitter-highlight = "0.26.10"
-tree-sitter-rust = "0.24"
-tree-sitter-typescript = "0.23"
-tree-sitter-javascript = "0.25"
-tree-sitter-python = "0.25"
-tree-sitter-go = "0.25"
-tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
-rayon = "1"
-firecrawl = "2"
+tree-sitter = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+rayon = { workspace = true }
+firecrawl = { workspace = true }
 # In-process JSONC syntax validation for writeunlock/editunlock data files.
-jsonc-parser = { version = "0.33.0", default-features = false }
+jsonc-parser = { workspace = true }
 
 # Linux-only: logind `handle-lid-switch` inhibitor lock for
 # `/caffeinate` lid-close survival (the high-level inhibitor logind
@@ -257,17 +260,17 @@ jsonc-parser = { version = "0.33.0", default-features = false }
 # single zbus. Held on a dedicated thread alongside the keepawake
 # assertion (see `daemon::caffeinate`).
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
+zbus = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
+assert_cmd = { workspace = true }
 cockpit-core = { path = "../../crates/cockpit-core", features = ["test-support"] }
-predicates = "3"
-tempfile = "3"
+predicates = { workspace = true }
+tempfile = { workspace = true }
 # `test-util` enables `tokio::time::{pause, advance}` for deterministic
 # timer tests (e.g. the ephemeral idle watchdog) without sleeping real
 # wall-clock. Dev-only: it never reaches the released binary.
-tokio = { version = "1.52", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }

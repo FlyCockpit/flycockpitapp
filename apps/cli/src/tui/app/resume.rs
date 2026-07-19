@@ -32,7 +32,7 @@ impl App {
                 );
             }
         } else {
-            self.send_daemon_request(request);
+            self.send_daemon_request("question", request, ControlApplied::None);
         }
         self.question_dialog_btw = false;
         self.install_pending_btw_interrupt();
@@ -76,9 +76,11 @@ impl App {
     /// `Pruned` + refreshed `ContextProjection` events render the result.
     pub(super) fn commit_prune(&mut self) {
         self.pending_prune_confirm = false;
-        if !self.send_daemon_request(crate::daemon::proto::Request::Prune) {
-            self.push_plain("/prune: no daemon connection — cannot prune.".to_string());
-        }
+        self.send_daemon_request(
+            "/prune",
+            crate::daemon::proto::Request::Prune,
+            ControlApplied::None,
+        );
     }
 
     /// Cancel an armed `/prune`.
@@ -402,9 +404,13 @@ impl App {
             }
             Some("repair") => {
                 self.push_plain("/resume: applying explicit synthetic repair.".to_string());
-                self.send_daemon_request(crate::daemon::proto::Request::RepairResume {
-                    session_id: pending.state.session_id,
-                });
+                self.send_daemon_request(
+                    "/resume",
+                    crate::daemon::proto::Request::RepairResume {
+                        session_id: pending.state.session_id,
+                    },
+                    ControlApplied::None,
+                );
             }
             Some("export") => {
                 let label = if pending.state.short_id.is_empty() {

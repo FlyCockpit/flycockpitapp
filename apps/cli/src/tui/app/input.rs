@@ -10,7 +10,7 @@ use crate::tui::composer::{FindSpec, Operator, Register, VimMode};
 use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
-use super::{App, LocalChoiceSelection, Overlay, TranscriptFind};
+use super::{App, ControlApplied, LocalChoiceSelection, Overlay, TranscriptFind};
 use crate::daemon::proto::{self, Request, Response};
 use crate::engine::message::{QueueItemStatus, QueuedUserMessage};
 use crate::tui::settings::Dialog;
@@ -417,10 +417,8 @@ impl App {
                 self.sync_mouse_capture_from_dialog();
                 self.reload_launch_info();
                 self.reload_tui_config();
-            } else if let Some(req) = self.dialog.take_daemon_request()
-                && !self.send_daemon_request(req)
-            {
-                self.push_plain("⚠ daemon is not connected; LSP action was not sent".to_string());
+            } else if let Some(req) = self.dialog.take_daemon_request() {
+                self.send_daemon_request("/settings", req, ControlApplied::None);
             }
             self.drain_oauth_actions();
             // Provider editors can persist credentials without closing the
@@ -3631,9 +3629,11 @@ mod queued_message_edit_tests {
     ) -> AgentRunner {
         let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
         let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
         AgentRunner {
             input_tx,
             record_tx,
+            control_tx,
             attached_request_tx,
             events: Arc::new(Mutex::new(Vec::new())),
             event_notify: Arc::new(tokio::sync::Notify::new()),
@@ -4038,10 +4038,12 @@ mod paste_routing_tests {
 
     fn runner_with_input_tx(input_tx: mpsc::Sender<UserSubmission>) -> AgentRunner {
         let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
         let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         AgentRunner {
             input_tx,
             record_tx,
+            control_tx,
             attached_request_tx,
             events: Arc::new(Mutex::new(Vec::new())),
             event_notify: Arc::new(tokio::sync::Notify::new()),

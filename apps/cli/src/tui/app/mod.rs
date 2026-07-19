@@ -92,8 +92,10 @@ use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-use crate::engine::TurnEvent;
 use crate::engine::message::{QueueTarget, QueuedUserMessage};
+use crate::engine::{
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
+};
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
@@ -131,6 +133,8 @@ pub(super) struct FooterHitArea {
 
 #[cfg(test)]
 mod auth_failure_recovery_tests;
+#[cfg(test)]
+mod control_request_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
@@ -233,6 +237,23 @@ impl FooterModePicker {
 pub(super) struct PendingAgentSwitchLog {
     confirmation_index: usize,
     target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingControlRequest {
+    label: String,
+    applied: ControlApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlApplied {
+    None,
+    CacheBreakWarning,
+    PrimaryAgentSwitch { name: String },
+    Multireview { kickoff: String },
+    QuickActiveModel { provider: String, model: String },
+    ScheduleCancel { command: String, job_id: String },
+    PinContext { text: String },
 }
 
 const FOOTER_MODE_ORDER: [crate::config::extended::LlmMode; 3] = [
@@ -1496,6 +1517,9 @@ pub struct App {
     pub(super) footer_picker_row_hits: Vec<FooterPickerRowHit>,
     /// Mutable confirmation row for rapid agent switching before the next turn.
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
+    /// TUI-issued daemon control requests awaiting a response-bearing ack.
+    pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
+    pub(super) next_control_request_seq: u64,
     /// The live set of wire-side elided tool-result `call_id`s on the
     /// foreground agent (from the daemon's `Pruned` event). The scrollback
     /// renderer dims any boxed tool call whose `call_id` is in here —
@@ -2473,6 +2497,8 @@ impl App {
             footer_mode_picker: None,
             footer_picker_row_hits: Vec::new(),
             pending_agent_switch_log: None,
+            pending_control_requests: HashMap::new(),
+            next_control_request_seq: 0,
             elided_event_ids: std::collections::HashSet::new(),
             pending_compact: None,
             pending_prune_confirm: false,

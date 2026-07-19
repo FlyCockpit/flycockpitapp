@@ -1438,8 +1438,8 @@ impl App {
 
     /// `/schedule` (GOALS §22): list active scheduled tasks, or `/schedule
     /// cancel <id>` to cancel one (the human-side cancel affordance — these
-    /// run on the user's dime). Cancellation rides the same fire-and-forget
-    /// request channel the autocomplete tally uses.
+    /// run on the user's dime). Cancellation uses the response-bearing control
+    /// channel so delivery and daemon rejection are visible.
     pub(super) fn handle_schedule_command(&mut self, args: &str) {
         let args = args.trim();
         if let Some(rest) = args.strip_prefix("cancel") {
@@ -1448,21 +1448,16 @@ impl App {
                 self.push_plain("/schedule: usage `/schedule cancel <id>`".to_string());
                 return;
             }
-            let sent = match self.agent_runner.as_ref() {
-                Some(Ok(runner)) => runner
-                    .record_tx
-                    .try_send(crate::daemon::proto::Request::CancelSchedule {
-                        job_id: job_id.to_string(),
-                    })
-                    .is_ok(),
-                _ => false,
-            };
-            let line = if sent {
-                format!("/schedule: cancel requested for `{job_id}`")
-            } else {
-                format!("/schedule: no daemon connection — cannot cancel `{job_id}`")
-            };
-            self.push_plain(line);
+            self.send_daemon_request(
+                "/schedule",
+                crate::daemon::proto::Request::CancelSchedule {
+                    job_id: job_id.to_string(),
+                },
+                ControlApplied::ScheduleCancel {
+                    command: "/schedule".to_string(),
+                    job_id: job_id.to_string(),
+                },
+            );
             return;
         }
         // Bare `/schedule`: list.
@@ -1562,18 +1557,11 @@ impl App {
             self.push_plain(format!("Already in `{}` LLM mode", target.as_str()));
             return;
         }
-        let sent =
-            self.send_daemon_request(crate::daemon::proto::Request::SetLlmMode { mode: requested });
-        if !sent {
-            self.push_plain(
-                "Send a message first to start a session, then switch LLM mode".to_string(),
-            );
-            return;
-        }
-        // Cache-break warning via the shared helper (silent on no-cache).
-        if let Some(warning) = self.cache_break_warning() {
-            self.push_plain(warning);
-        }
+        self.send_daemon_request(
+            "/llm-mode",
+            crate::daemon::proto::Request::SetLlmMode { mode: requested },
+            ControlApplied::CacheBreakWarning,
+        );
         // The `LlmModeChanged` event pushes the "Switched to …" confirmation
         // once the daemon applies it.
     }
@@ -1739,12 +1727,14 @@ impl App {
                 (None, Some(enabled))
             }
         };
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox {
-            mode,
-            container_network_enabled: network,
-        }) {
-            self.push_plain("/sandbox: no daemon connection".to_string());
-        }
+        self.send_daemon_request(
+            "/sandbox",
+            crate::daemon::proto::Request::SetSandbox {
+                mode,
+                container_network_enabled: network,
+            },
+            ControlApplied::None,
+        );
     }
 
     /// `/sandbox-escalate [allow|disallow]`: session-only switch for whether
@@ -1763,11 +1753,11 @@ impl App {
                 ));
             }
             Ok(SandboxEscalationCommand::Set(enabled)) => {
-                if !self.send_daemon_request(crate::daemon::proto::Request::SetSandboxEscalation {
-                    enabled,
-                }) {
-                    self.push_plain("/sandbox-escalate: no daemon connection".to_string());
-                }
+                self.send_daemon_request(
+                    "/sandbox-escalate",
+                    crate::daemon::proto::Request::SetSandboxEscalation { enabled },
+                    ControlApplied::None,
+                );
             }
             Err(other) => {
                 self.push_plain(format!(
@@ -1810,9 +1800,11 @@ impl App {
                 return;
             }
         };
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetPreflight { enabled }) {
-            self.push_plain("/preflight: no daemon connection".to_string());
-        }
+        self.send_daemon_request(
+            "/preflight",
+            crate::daemon::proto::Request::SetPreflight { enabled },
+            ControlApplied::None,
+        );
     }
 
     /// `/trusted-only [on|off|default on|default off]`: require trusted
@@ -1850,9 +1842,11 @@ impl App {
             ));
             return;
         }
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetTrustedOnly { enabled }) {
-            self.push_plain("/trusted-only: no daemon connection".to_string());
-        }
+        self.send_daemon_request(
+            "/trusted-only",
+            crate::daemon::proto::Request::SetTrustedOnly { enabled },
+            ControlApplied::None,
+        );
     }
 
     /// `/toggle-redaction [env|file|ssh]` (alias `/toggle-redact`): flip a
@@ -1898,9 +1892,11 @@ impl App {
                 return;
             }
         };
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetCaffeinate { mode }) {
-            self.push_plain("/caffeinate: no daemon connection".to_string());
-        }
+        self.send_daemon_request(
+            "/caffeinate",
+            crate::daemon::proto::Request::SetCaffeinate { mode },
+            ControlApplied::None,
+        );
     }
 
     pub(super) fn handle_pin_context_command(&mut self, args: &str) {
@@ -1912,15 +1908,15 @@ impl App {
             );
             return;
         }
-        if self.send_daemon_request(crate::daemon::proto::Request::Pin {
-            text: text.to_string(),
-        }) {
-            self.push_plain(format!(
-                "/pin-context: pinned (survives /compact verbatim): {text}"
-            ));
-        } else {
-            self.push_plain("/pin-context: no daemon connection — cannot pin.".to_string());
-        }
+        self.send_daemon_request(
+            "/pin-context",
+            crate::daemon::proto::Request::Pin {
+                text: text.to_string(),
+            },
+            ControlApplied::PinContext {
+                text: text.to_string(),
+            },
+        );
     }
 
     /// `/copy [format]` — copy the last assistant response (message text,

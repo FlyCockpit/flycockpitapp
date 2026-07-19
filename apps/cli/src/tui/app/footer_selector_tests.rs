@@ -5,7 +5,8 @@ use super::{
 use crate::config::extended::LlmMode;
 use crate::daemon::proto::Request;
 use crate::engine::message::UserSubmission;
-use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
+use crate::engine::{ControlRequestId, ControlRequestOutcome, TurnEvent};
+use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
 use crate::tui::settings::Dialog;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -35,12 +36,21 @@ fn click(column: u16, row: u16) -> MouseEvent {
     }
 }
 
-fn runner_with_record_tx(record_tx: mpsc::Sender<Request>) -> AgentRunner {
+fn app(tmp: &tempfile::TempDir) -> App {
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.dialog = Dialog::None;
+    app
+}
+
+fn runner_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> AgentRunner {
     let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(8);
+    let (record_tx, _record_rx) = mpsc::channel(1);
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     AgentRunner {
         input_tx,
         record_tx,
+        control_tx,
         attached_request_tx,
         events: Arc::new(Mutex::new(Vec::new())),
         event_notify: Arc::new(tokio::sync::Notify::new()),
@@ -64,18 +74,11 @@ fn runner_with_record_tx(record_tx: mpsc::Sender<Request>) -> AgentRunner {
     }
 }
 
-fn app(tmp: &tempfile::TempDir) -> App {
-    let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
-    app.dialog = Dialog::None;
-    app
-}
-
-fn app_with_runner(tmp: &tempfile::TempDir) -> (App, mpsc::Receiver<Request>) {
+fn app_with_runner(tmp: &tempfile::TempDir) -> (App, mpsc::Receiver<ControlRequest>) {
     let mut app = app(tmp);
-    let (record_tx, record_rx) = mpsc::channel(8);
-    app.agent_runner = Some(Ok(runner_with_record_tx(record_tx)));
-    (app, record_rx)
+    let (control_tx, control_rx) = mpsc::channel(8);
+    app.agent_runner = Some(Ok(runner_with_control_tx(control_tx)));
+    (app, control_rx)
 }
 
 fn write_model_config(root: &std::path::Path) {
@@ -175,7 +178,7 @@ fn quick_dialog_space_stages_without_daemon_request_enter_commits() {
         !matches!(app.overlay, Overlay::Quick(_)),
         "Enter closes after commit"
     );
-    match rx.try_recv().expect("quick commit sends a request") {
+    match rx.try_recv().expect("quick commit sends a request").request {
         Request::SetSessionLlmMode { mode } => {
             assert_eq!(mode, crate::config::extended::LlmMode::Normal);
         }
@@ -216,7 +219,7 @@ fn footer_mouse_capture_gates_footer_hits_and_second_click_opens() {
 #[test]
 fn agent_picker_mouse_row_commits_through_set_agent() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut app, mut record_rx) = app_with_runner(&tmp);
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
     app.mouse_capture = true;
     app.footer_agent_picker = Some(FooterAgentPicker::new("Build", vec!["Build".to_string()]));
     app.footer_picker_row_hits = vec![FooterPickerRowHit {
@@ -229,7 +232,7 @@ fn agent_picker_mouse_row_commits_through_set_agent() {
 
     assert!(app.footer_agent_picker.is_none());
     assert!(matches!(
-        record_rx.try_recv().unwrap(),
+        control_rx.try_recv().unwrap().request,
         Request::SetAgent { name } if name == "Build"
     ));
 }
@@ -237,7 +240,7 @@ fn agent_picker_mouse_row_commits_through_set_agent() {
 #[test]
 fn mode_picker_mouse_row_commits_through_llm_mode_path() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut app, mut record_rx) = app_with_runner(&tmp);
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
     app.mouse_capture = true;
     app.llm_mode = LlmMode::Normal;
     app.footer_mode_picker = Some(FooterModePicker::new(LlmMode::Normal));
@@ -251,7 +254,7 @@ fn mode_picker_mouse_row_commits_through_llm_mode_path() {
 
     assert!(app.footer_mode_picker.is_none());
     assert!(matches!(
-        record_rx.try_recv().unwrap(),
+        control_rx.try_recv().unwrap().request,
         Request::SetLlmMode {
             mode: Some(LlmMode::Frontier)
         }
@@ -261,19 +264,27 @@ fn mode_picker_mouse_row_commits_through_llm_mode_path() {
 #[test]
 fn agent_switch_success_lines_coalesce_until_locked() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut app, mut record_rx) = app_with_runner(&tmp);
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
 
     app.swap_primary_agent("Build");
     app.swap_primary_agent("Custom");
 
     assert!(matches!(
-        record_rx.try_recv().unwrap(),
+        control_rx.try_recv().unwrap().request,
         Request::SetAgent { name } if name == "Build"
     ));
     assert!(matches!(
-        record_rx.try_recv().unwrap(),
+        control_rx.try_recv().unwrap().request,
         Request::SetAgent { name } if name == "Custom"
     ));
+    app.apply_event(TurnEvent::ControlRequestFinished {
+        request_id: ControlRequestId(1),
+        outcome: ControlRequestOutcome::Applied,
+    });
+    app.apply_event(TurnEvent::ControlRequestFinished {
+        request_id: ControlRequestId(2),
+        outcome: ControlRequestOutcome::Applied,
+    });
     assert_eq!(
         plain_lines(&app)
             .into_iter()
@@ -284,6 +295,14 @@ fn agent_switch_success_lines_coalesce_until_locked() {
 
     app.lock_pending_agent_switch_log();
     app.swap_primary_agent("Build");
+    assert!(matches!(
+        control_rx.try_recv().unwrap().request,
+        Request::SetAgent { name } if name == "Build"
+    ));
+    app.apply_event(TurnEvent::ControlRequestFinished {
+        request_id: ControlRequestId(3),
+        outcome: ControlRequestOutcome::Applied,
+    });
     assert_eq!(
         plain_lines(&app)
             .into_iter()

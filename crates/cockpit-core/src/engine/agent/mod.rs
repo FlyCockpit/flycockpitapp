@@ -49,7 +49,9 @@ pub(crate) mod tool_dispatch;
 mod turn_phases;
 
 pub use backup::{BackupFallbackDecision, BackupTurnMetadata, turn_with_backup};
-pub use events::{IdleReason, TurnEvent};
+pub use events::{
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, TurnEvent,
+};
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
 

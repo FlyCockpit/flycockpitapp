@@ -2,11 +2,35 @@ use super::*;
 
 pub use crate::daemon::proto::IdleReason;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ControlRequestId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRequestNotDelivered {
+    NoRunner,
+    ChannelFull,
+    ChannelClosed,
+    RunnerTeardown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlRequestOutcome {
+    NotDelivered(ControlRequestNotDelivered),
+    Rejected(String),
+    Applied,
+}
+
 /// Events the agent emits during a turn. The driver forwards these to
 /// the TUI for display; the persistence layer can subscribe to the
 /// same channel.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
+    /// TUI-local result for a response-bearing control request sent to the
+    /// attached daemon session. It is not forwarded over the daemon event bus.
+    ControlRequestFinished {
+        request_id: ControlRequestId,
+        outcome: ControlRequestOutcome,
+    },
     InterruptDecision {
         session_id: uuid::Uuid,
         interrupt_id: uuid::Uuid,

@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use super::{App, DispatchOutcome, SideConversation};
 use crate::engine::message::UserSubmission;
-use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
+use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
 use crate::tui::history::HistoryEntry;
 
 fn runner_with_sender(
@@ -23,10 +23,21 @@ fn runner_with_channels(
     record_tx: mpsc::Sender<crate::daemon::proto::Request>,
     events: Arc<Mutex<Vec<crate::engine::TurnEvent>>>,
 ) -> AgentRunner {
+    let (control_tx, _control_rx) = mpsc::channel(1);
+    runner_with_all_channels(input_tx, record_tx, control_tx, events)
+}
+
+fn runner_with_all_channels(
+    input_tx: mpsc::Sender<UserSubmission>,
+    record_tx: mpsc::Sender<crate::daemon::proto::Request>,
+    control_tx: mpsc::Sender<ControlRequest>,
+    events: Arc<Mutex<Vec<crate::engine::TurnEvent>>>,
+) -> AgentRunner {
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     AgentRunner {
         input_tx,
         record_tx,
+        control_tx,
         attached_request_tx,
         events,
         event_notify: Arc::new(tokio::sync::Notify::new()),
@@ -135,12 +146,14 @@ fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
     }
 }
 
-fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<crate::daemon::proto::Request> {
+fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest> {
     let (input_tx, _input_rx) = mpsc::channel(1);
-    let (record_tx, record_rx) = mpsc::channel(4);
-    app.agent_runner = Some(Ok(runner_with_channels(
+    let (record_tx, _record_rx) = mpsc::channel(4);
+    let (control_tx, control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
         input_tx,
         record_tx,
+        control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
     app.pending_new_session = true;
@@ -174,7 +187,7 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<crate::daemon::
         cache_creation_input_tokens: 4,
     });
     app.estimate_at_last_usage = 99;
-    record_rx
+    control_rx
 }
 
 #[test]
@@ -242,24 +255,26 @@ fn session_switch_busy_guard_interrupts_only_when_busy() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (input_tx, _input_rx) = mpsc::channel(1);
-    let (record_tx, mut record_rx) = mpsc::channel(4);
-    app.agent_runner = Some(Ok(runner_with_channels(
+    let (record_tx, _record_rx) = mpsc::channel(4);
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
         input_tx,
         record_tx,
+        control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
 
     app.busy = false;
     app.cancel_outgoing_turn_if_busy();
-    assert!(record_rx.try_recv().is_err());
+    assert!(control_rx.try_recv().is_err());
 
     app.busy = true;
     app.cancel_outgoing_turn_if_busy();
     assert!(matches!(
-        record_rx.try_recv(),
+        control_rx.try_recv().map(|request| request.request),
         Ok(crate::daemon::proto::Request::CancelTurn)
     ));
-    assert!(record_rx.try_recv().is_err(), "only one cancel is sent");
+    assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
 }
 
 #[test]
@@ -283,7 +298,7 @@ fn new_session_without_pending_does_not_clear_or_request_redraw() {
 fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    let mut record_rx = seed_new_session_reset_state(&mut app);
+    let mut control_rx = seed_new_session_reset_state(&mut app);
 
     let changed = app
         .maybe_service_new_session_with_clear(|| {
@@ -295,10 +310,10 @@ fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
 
     assert!(changed, "serviced /new must request a follow-up redraw");
     assert!(matches!(
-        record_rx.try_recv(),
+        control_rx.try_recv().map(|request| request.request),
         Ok(crate::daemon::proto::Request::CancelTurn)
     ));
-    assert!(record_rx.try_recv().is_err(), "only one cancel is sent");
+    assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
     assert!(!app.pending_new_session);
     assert!(app.history.is_empty());
     assert!(app.queue.is_empty());
@@ -548,8 +563,7 @@ fn multireview_set_agent_failure_shows_guidance_without_token_warning() {
             matches!(
                 entry,
                 HistoryEntry::Plain { line }
-                    if line.contains("Send a message first")
-                        && line.contains("`/multireview`")
+                    if line == "/multireview: send a message first to start a session"
             )
         }),
         "start-session-first guidance remains visible"
@@ -575,19 +589,25 @@ fn multireview_kickoff_queue_full_reconciles_user_row_and_ends_span() {
     input_tx
         .try_send(UserSubmission::text("already queued".to_string()))
         .unwrap();
-    let (record_tx, mut record_rx) = mpsc::channel(4);
-    app.agent_runner = Some(Ok(runner_with_channels(
+    let (record_tx, _record_rx) = mpsc::channel(4);
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
         input_tx,
         record_tx,
+        control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
 
     app.start_multireview("kickoff".to_string());
 
     assert!(matches!(
-        record_rx.try_recv(),
+        control_rx.try_recv().map(|request| request.request),
         Ok(crate::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
     ));
+    app.apply_event(crate::engine::TurnEvent::ControlRequestFinished {
+        request_id: crate::engine::ControlRequestId(1),
+        outcome: crate::engine::ControlRequestOutcome::Applied,
+    });
     assert!(
         app.history.iter().any(|entry| {
             matches!(
@@ -614,14 +634,24 @@ fn multireview_kickoff_closed_reconciles_user_row_and_ends_span() {
     let (input_tx, input_rx) = mpsc::channel(1);
     drop(input_rx);
     let (record_tx, _record_rx) = mpsc::channel(4);
-    app.agent_runner = Some(Ok(runner_with_channels(
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
         input_tx,
         record_tx,
+        control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
 
     app.start_multireview("kickoff".to_string());
 
+    assert!(matches!(
+        control_rx.try_recv().map(|request| request.request),
+        Ok(crate::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+    ));
+    app.apply_event(crate::engine::TurnEvent::ControlRequestFinished {
+        request_id: crate::engine::ControlRequestId(1),
+        outcome: crate::engine::ControlRequestOutcome::Applied,
+    });
     assert!(newest_user_failed(&app));
     assert!(error_lines(&app).iter().any(
         |line| line.starts_with("/multireview") && line.contains("driver task has exited")
@@ -634,19 +664,25 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (input_tx, mut input_rx) = mpsc::channel(1);
-    let (record_tx, mut record_rx) = mpsc::channel(4);
-    app.agent_runner = Some(Ok(runner_with_channels(
+    let (record_tx, _record_rx) = mpsc::channel(4);
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
         input_tx,
         record_tx,
+        control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
 
     app.start_multireview("kickoff".to_string());
 
     assert!(matches!(
-        record_rx.try_recv(),
+        control_rx.try_recv().map(|request| request.request),
         Ok(crate::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
     ));
+    app.apply_event(crate::engine::TurnEvent::ControlRequestFinished {
+        request_id: crate::engine::ControlRequestId(1),
+        outcome: crate::engine::ControlRequestOutcome::Applied,
+    });
     let submission = input_rx.try_recv().expect("kickoff submitted");
     assert_eq!(submission.text, "kickoff");
     assert!(

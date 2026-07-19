@@ -22,7 +22,9 @@ use uuid::Uuid;
 use crate::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
 use crate::daemon::image_upload::upload_submission_images;
 use crate::daemon::proto::{self, ErrorCode, Request, Response};
-use crate::engine::TurnEvent;
+use crate::engine::{
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
+};
 
 /// The three 30-day autocomplete count maps fetched at session start.
 /// `models` and `slash` are global; `tags` is scoped to this session's
@@ -40,6 +42,11 @@ pub struct AttachedRequest {
     pub response_tx: oneshot::Sender<Result<Response, String>>,
 }
 
+pub struct ControlRequest {
+    pub request: Request,
+    pub response_tx: oneshot::Sender<Result<Response, String>>,
+}
+
 pub struct AgentRunner {
     /// Send user submissions here (text + any pasted image parts). Each
     /// becomes one `SendUserMessage` request; the daemon's queue-folding
@@ -47,6 +54,9 @@ pub struct AgentRunner {
     pub input_tx: mpsc::Sender<crate::engine::message::UserSubmission>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
     pub record_tx: mpsc::Sender<Request>,
+    /// Response-bearing control requests from TUI commands. Kept separate
+    /// from telemetry so a full usage queue cannot block control-plane state.
+    pub control_tx: mpsc::Sender<ControlRequest>,
     /// Response-bearing requests sent over the already-attached daemon client.
     pub attached_request_tx: mpsc::Sender<AttachedRequest>,
     /// Drained per tick into [`crate::tui::app::App::history`].
@@ -513,6 +523,7 @@ fn try_spawn_inner(
 
     let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlRequest>(32);
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel::<AttachedRequest>(32);
     let events = Arc::new(Mutex::new(Vec::new()));
     let event_notify = Arc::new(Notify::new());
@@ -609,6 +620,22 @@ fn try_spawn_inner(
                 if let Err(e) = client.request(req).await {
                     tracing::warn!(error = ?e, "record_usage transport failed");
                 }
+            }
+        }));
+    }
+
+    // Outbound: response-bearing TUI control requests. They are isolated from
+    // telemetry, so a saturated usage channel cannot drop operator commands.
+    {
+        let current_client = current_client.clone();
+        client_tasks.push(tokio::spawn(async move {
+            while let Some(control_request) = control_rx.recv().await {
+                let client = current_client.read().await.clone();
+                let response = client
+                    .request_ok(control_request.request)
+                    .await
+                    .map_err(|e| format!("daemon request: {e}"));
+                let _ = control_request.response_tx.send(response);
             }
         }));
     }
@@ -764,6 +791,7 @@ fn try_spawn_inner(
     Ok(AgentRunner {
         input_tx,
         record_tx,
+        control_tx,
         attached_request_tx,
         events,
         event_notify,
@@ -789,6 +817,54 @@ fn try_spawn_inner(
 
 pub(crate) fn incompatible_protocol_chip() -> &'static str {
     "daemon speaks an incompatible protocol; relaunch / upgrade cockpit"
+}
+
+pub fn send_control_request(
+    control_tx: &mpsc::Sender<ControlRequest>,
+    events: &Arc<Mutex<Vec<TurnEvent>>>,
+    event_notify: &Arc<Notify>,
+    request_id: ControlRequestId,
+    req: Request,
+) -> Result<(), ControlRequestNotDelivered> {
+    let (response_tx, response_rx) = oneshot::channel();
+    match control_tx.try_send(ControlRequest {
+        request: req,
+        response_tx,
+    }) {
+        Ok(()) => {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let events = events.clone();
+                let event_notify = event_notify.clone();
+                handle.spawn(async move {
+                    let outcome = match response_rx.await {
+                        Ok(Ok(Response::Ack)) => ControlRequestOutcome::Applied,
+                        Ok(Ok(other)) => ControlRequestOutcome::Rejected(format!(
+                            "unexpected daemon response: {other:?}"
+                        )),
+                        Ok(Err(error)) => ControlRequestOutcome::Rejected(error),
+                        Err(_) => ControlRequestOutcome::NotDelivered(
+                            ControlRequestNotDelivered::RunnerTeardown,
+                        ),
+                    };
+                    push_turn_event(
+                        &events,
+                        &event_notify,
+                        TurnEvent::ControlRequestFinished {
+                            request_id,
+                            outcome,
+                        },
+                    );
+                });
+            }
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Err(ControlRequestNotDelivered::ChannelFull)
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(ControlRequestNotDelivered::ChannelClosed)
+        }
+    }
 }
 
 /// Pre-flight sizing for the fresh-chat context indicator (Feature 1).
@@ -2039,12 +2115,14 @@ mod tests {
     ) -> AgentRunner {
         let (input_tx, _input_rx) = mpsc::channel(1);
         let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
         let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         let mut client_tasks = ClientTasks::default();
         client_tasks.push(handle);
         AgentRunner {
             input_tx,
             record_tx,
+            control_tx,
             attached_request_tx,
             events,
             event_notify: Arc::new(Notify::new()),

@@ -40,12 +40,14 @@ impl App {
     }
 
     /// Send the daemon a `CancelTurn` for the attached session (GOALS
-    /// §3a). Fire-and-forget over the runner's request channel — same
-    /// path `/schedule cancel` uses. No-op (and harmless) when no runner is
-    /// connected. The daemon aborts the in-flight inference and kills any
-    /// running `bash` subprocess; the resulting `AgentIdle` clears `busy`.
-    pub(super) fn interrupt_agent(&self) {
-        self.send_daemon_request(crate::daemon::proto::Request::CancelTurn);
+    /// §3a). The daemon aborts the in-flight inference and kills any running
+    /// `bash` subprocess; the resulting `AgentIdle` clears `busy`.
+    pub(super) fn interrupt_agent(&mut self) {
+        self.send_daemon_request(
+            "interrupt",
+            crate::daemon::proto::Request::CancelTurn,
+            ControlApplied::None,
+        );
     }
 
     /// Show the transient "press ctrl+c again to exit" hint. Reuses the

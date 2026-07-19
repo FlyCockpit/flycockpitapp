@@ -223,7 +223,7 @@ impl App {
             }
             Some(_) => return,
         };
-        self.send_daemon_request(request);
+        self.send_daemon_request("/resume", request, ControlApplied::None);
     }
 
     pub(super) fn show_goal_status(&mut self) {
@@ -342,19 +342,19 @@ impl App {
         }
     }
 
-    /// Send a `CancelSchedule` for one job over the runner's record channel —
-    /// the same fire-and-forget path `/schedule cancel` uses. `cmd` is the
-    /// command label for the rendered line.
+    /// Send a `CancelSchedule` for one job over the response-bearing control
+    /// channel. `cmd` is the command label for the rendered line.
     pub(super) fn cancel_schedule(&mut self, job_id: &str, cmd: &str) {
-        let sent = self.send_daemon_request(crate::daemon::proto::Request::CancelSchedule {
-            job_id: job_id.to_string(),
-        });
-        let line = if sent {
-            format!("{cmd}: cancel requested for `{job_id}`")
-        } else {
-            format!("{cmd}: no daemon connection — cannot cancel `{job_id}`")
-        };
-        self.push_plain(line);
+        self.send_daemon_request(
+            cmd,
+            crate::daemon::proto::Request::CancelSchedule {
+                job_id: job_id.to_string(),
+            },
+            ControlApplied::ScheduleCancel {
+                command: cmd.to_string(),
+                job_id: job_id.to_string(),
+            },
+        );
     }
 
     /// Bare `/stop`: count the current-session jobs and arm the `[y/N]`

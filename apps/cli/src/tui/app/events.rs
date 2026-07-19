@@ -98,6 +98,12 @@ impl App {
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
         match event {
+            TurnEvent::ControlRequestFinished {
+                request_id,
+                outcome,
+            } => {
+                self.apply_control_request_outcome(request_id, outcome);
+            }
             TurnEvent::InterruptDecision {
                 session_id,
                 interrupt_id,

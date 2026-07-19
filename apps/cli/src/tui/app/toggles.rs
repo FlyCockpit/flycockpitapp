@@ -10,13 +10,15 @@ impl App {
         scan_dotenv: Option<bool>,
         scan_ssh_keys: Option<bool>,
     ) {
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetRedaction {
-            scan_environment,
-            scan_dotenv,
-            scan_ssh_keys,
-        }) {
-            self.push_plain("/toggle-redaction: no daemon connection".to_string());
-        }
+        self.send_daemon_request(
+            "/toggle-redaction",
+            crate::daemon::proto::Request::SetRedaction {
+                scan_environment,
+                scan_dotenv,
+                scan_ssh_keys,
+            },
+            ControlApplied::None,
+        );
     }
 
     /// Open the bare-`/toggle-redaction` multiselect: one checkbox per source
@@ -199,8 +201,10 @@ impl App {
             .filter_map(|id| id.parse::<usize>().ok())
             .filter_map(|i| options.get(i).cloned())
             .collect();
-        if !self.send_daemon_request(crate::daemon::proto::Request::SetTandemModels { models }) {
-            self.push_plain("/model-comparison: no daemon connection".to_string());
-        }
+        self.send_daemon_request(
+            "/model-comparison",
+            crate::daemon::proto::Request::SetTandemModels { models },
+            ControlApplied::None,
+        );
     }
 }

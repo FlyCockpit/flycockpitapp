@@ -32,6 +32,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             active_interrupt_id,
             pending_count,
         }],
+        TurnEvent::ControlRequestFinished { .. } => vec![],
         TurnEvent::ThinkingStarted { agent, turn_id } => {
             vec![Event::ThinkingStarted {
                 session_id,

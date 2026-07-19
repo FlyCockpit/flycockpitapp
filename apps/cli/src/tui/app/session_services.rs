@@ -19,13 +19,14 @@ impl App {
         self.pending_git_blocks.clear();
         self.accepted_tags.clear();
         self.pending_edit_args.clear();
+        self.pending_control_requests.clear();
         self.pin_count = 0;
         self.pin_count_session = None;
         self.pinned_seqs_cache.clear();
         self.pinned_seqs_session = None;
     }
 
-    pub(super) fn cancel_outgoing_turn_if_busy(&self) {
+    pub(super) fn cancel_outgoing_turn_if_busy(&mut self) {
         if self.busy {
             self.interrupt_agent();
         }

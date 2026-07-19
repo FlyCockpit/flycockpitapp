@@ -25,16 +25,15 @@ impl App {
             ));
             return;
         }
-        let sent = self.send_daemon_request(crate::daemon::proto::Request::SetAgent {
-            name: name.to_string(),
-        });
-        if sent {
-            self.record_primary_switch_confirmation(name);
-        } else {
-            self.push_plain(
-                "Send a message first to start a session, then switch agents".to_string(),
-            );
-        }
+        self.send_daemon_request(
+            "/agent",
+            crate::daemon::proto::Request::SetAgent {
+                name: name.to_string(),
+            },
+            ControlApplied::PrimaryAgentSwitch {
+                name: name.to_string(),
+            },
+        );
     }
 
     pub(super) fn record_primary_switch_confirmation(&mut self, name: &str) {
@@ -70,31 +69,13 @@ impl App {
     }
 
     pub(super) fn start_multireview(&mut self, kickoff: String) {
-        let sent = self.send_daemon_request(crate::daemon::proto::Request::SetAgent {
-            name: "Multireview".to_string(),
-        });
-        if !sent {
-            self.push_plain(
-                "Send a message first to start a session, then run `/multireview`".to_string(),
-            );
-            return;
-        }
-        self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
-        self.begin_working_span();
-        let submission = crate::engine::message::UserSubmission {
-            kind: crate::engine::message::UserSubmissionKind::User,
-            text: kickoff.clone(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            images: Vec::new(),
-            forced_skill: None,
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            queue_target: None,
-        };
-        self.dispatch_optimistic_user_submission(kickoff, submission, "/multireview", true, &[]);
+        self.send_daemon_request(
+            "/multireview",
+            crate::daemon::proto::Request::SetAgent {
+                name: "Multireview".to_string(),
+            },
+            ControlApplied::Multireview { kickoff },
+        );
     }
 
     /// `Shift+Tab` — advance the active primary to the next agent in the
@@ -266,7 +247,11 @@ impl App {
             format!("{provider}/{model}"),
             None,
         );
-        self.send_daemon_request(crate::daemon::proto::Request::SetActiveModel { provider, model });
+        self.send_daemon_request(
+            "/model",
+            crate::daemon::proto::Request::SetActiveModel { provider, model },
+            ControlApplied::None,
+        );
     }
 
     pub(super) fn cycle_footer_model(&mut self, forward: bool) {
@@ -322,43 +307,48 @@ impl App {
     }
 
     pub(super) fn apply_quick_commit(&mut self, commit: crate::tui::quick_dialog::QuickCommit) {
-        let mut any_failed = false;
         if let Some(mode) = commit.llm_mode {
-            if self.send_daemon_request(crate::daemon::proto::Request::SetSessionLlmMode { mode }) {
-                if let Some(warning) = self.cache_break_warning() {
-                    self.push_plain(warning);
-                }
-            } else {
-                any_failed = true;
-            }
+            self.send_daemon_request(
+                "/quick",
+                crate::daemon::proto::Request::SetSessionLlmMode { mode },
+                ControlApplied::CacheBreakWarning,
+            );
         }
-        if let Some((enabled, default_depth)) = commit.recursion
-            && !self.send_daemon_request(crate::daemon::proto::Request::SetDelegationRecursion {
-                enabled,
-                default_depth,
-            })
-        {
-            any_failed = true;
+        if let Some((enabled, default_depth)) = commit.recursion {
+            self.send_daemon_request(
+                "/quick",
+                crate::daemon::proto::Request::SetDelegationRecursion {
+                    enabled,
+                    default_depth,
+                },
+                ControlApplied::None,
+            );
         }
-        if let Some(enabled) = commit.trusted_only
-            && !self.send_daemon_request(crate::daemon::proto::Request::SetTrustedOnly {
-                enabled: Some(enabled),
-            })
-        {
-            any_failed = true;
+        if let Some(enabled) = commit.trusted_only {
+            self.send_daemon_request(
+                "/quick",
+                crate::daemon::proto::Request::SetTrustedOnly {
+                    enabled: Some(enabled),
+                },
+                ControlApplied::None,
+            );
         }
-        if (commit.sandbox_mode.is_some() || commit.container_network_enabled.is_some())
-            && !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox {
-                mode: commit.sandbox_mode,
-                container_network_enabled: commit.container_network_enabled,
-            })
-        {
-            any_failed = true;
+        if commit.sandbox_mode.is_some() || commit.container_network_enabled.is_some() {
+            self.send_daemon_request(
+                "/quick",
+                crate::daemon::proto::Request::SetSandbox {
+                    mode: commit.sandbox_mode,
+                    container_network_enabled: commit.container_network_enabled,
+                },
+                ControlApplied::None,
+            );
         }
-        if let Some(mode) = commit.approval_mode
-            && !self.send_daemon_request(crate::daemon::proto::Request::SetApprovalMode { mode })
-        {
-            any_failed = true;
+        if let Some(mode) = commit.approval_mode {
+            self.send_daemon_request(
+                "/quick",
+                crate::daemon::proto::Request::SetApprovalMode { mode },
+                ControlApplied::None,
+            );
         }
         if let Some((provider, model)) = commit.active_model {
             self.record_usage(
@@ -366,18 +356,14 @@ impl App {
                 format!("{provider}/{model}"),
                 None,
             );
-            if self.send_daemon_request(crate::daemon::proto::Request::SetActiveModel {
-                provider: provider.clone(),
-                model: model.clone(),
-            }) {
-                self.launch.active_model = Some((provider.clone(), model.clone()));
-                self.push_plain(format!("/quick: active model is now {provider}/{model}"));
-            } else {
-                any_failed = true;
-            }
-        }
-        if any_failed {
-            self.push_plain("/quick: send a message first to start a session".to_string());
+            self.send_daemon_request(
+                "/quick",
+                crate::daemon::proto::Request::SetActiveModel {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                },
+                ControlApplied::QuickActiveModel { provider, model },
+            );
         }
     }
 
@@ -407,14 +393,122 @@ impl App {
         }
     }
 
-    /// Send a fire-and-forget daemon request over the runner's record
-    /// channel (same path `/schedule cancel` uses). Returns whether a runner
-    /// was connected to receive it.
-    pub(super) fn send_daemon_request(&self, req: crate::daemon::proto::Request) -> bool {
-        match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.record_tx.try_send(req).is_ok(),
-            _ => false,
+    pub(super) fn send_daemon_request(
+        &mut self,
+        label: &str,
+        req: crate::daemon::proto::Request,
+        applied: ControlApplied,
+    ) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            self.report_control_not_delivered(label, ControlRequestNotDelivered::NoRunner);
+            return;
+        };
+        self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
+        let request_id = ControlRequestId(self.next_control_request_seq);
+        self.pending_control_requests.insert(
+            request_id,
+            PendingControlRequest {
+                label: label.to_string(),
+                applied,
+            },
+        );
+        let result = agent_runner::send_control_request(
+            &runner.control_tx,
+            &runner.events,
+            &runner.event_notify,
+            request_id,
+            req,
+        );
+        if let Err(reason) = result {
+            self.pending_control_requests.remove(&request_id);
+            self.report_control_not_delivered(label, reason);
         }
+    }
+
+    pub(super) fn apply_control_request_outcome(
+        &mut self,
+        request_id: ControlRequestId,
+        outcome: ControlRequestOutcome,
+    ) {
+        let Some(pending) = self.pending_control_requests.remove(&request_id) else {
+            return;
+        };
+        match outcome {
+            ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
+            ControlRequestOutcome::Rejected(error) => self.push_plain(format!(
+                "{}: daemon rejected request: {error}",
+                pending.label
+            )),
+            ControlRequestOutcome::NotDelivered(reason) => {
+                self.report_control_not_delivered(&pending.label, reason);
+            }
+        }
+    }
+
+    fn apply_control_success(&mut self, applied: ControlApplied) {
+        match applied {
+            ControlApplied::None => {}
+            ControlApplied::CacheBreakWarning => {
+                if let Some(warning) = self.cache_break_warning() {
+                    self.push_plain(warning);
+                }
+            }
+            ControlApplied::PrimaryAgentSwitch { name } => {
+                self.record_primary_switch_confirmation(&name);
+            }
+            ControlApplied::Multireview { kickoff } => {
+                self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
+                self.begin_working_span();
+                let submission = crate::engine::message::UserSubmission {
+                    kind: crate::engine::message::UserSubmissionKind::User,
+                    text: kickoff.clone(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    images: Vec::new(),
+                    forced_skill: None,
+                    origin_principal: None,
+                    job_id: None,
+                    preflight_cleaned: None,
+                    queue_item_ids: Vec::new(),
+                    queue_target: None,
+                };
+                self.dispatch_optimistic_user_submission(
+                    kickoff,
+                    submission,
+                    "/multireview",
+                    true,
+                    &[],
+                );
+            }
+            ControlApplied::QuickActiveModel { provider, model } => {
+                self.launch.active_model = Some((provider.clone(), model.clone()));
+                self.push_plain(format!("/quick: active model is now {provider}/{model}"));
+            }
+            ControlApplied::ScheduleCancel { command, job_id } => {
+                self.push_plain(format!("{command}: cancel requested for `{job_id}`"));
+            }
+            ControlApplied::PinContext { text } => {
+                self.push_plain(format!(
+                    "/pin-context: pinned (survives /compact verbatim): {text}"
+                ));
+            }
+        }
+    }
+
+    fn report_control_not_delivered(&mut self, label: &str, reason: ControlRequestNotDelivered) {
+        let message = match reason {
+            ControlRequestNotDelivered::NoRunner => {
+                format!("{label}: send a message first to start a session")
+            }
+            ControlRequestNotDelivered::ChannelFull => {
+                format!("{label}: request not sent - daemon control queue is full; try again")
+            }
+            ControlRequestNotDelivered::ChannelClosed
+            | ControlRequestNotDelivered::RunnerTeardown => {
+                format!("{label}: request not sent - daemon control channel closed; try again")
+            }
+        };
+        self.push_plain(message);
     }
 
     /// The anti-misfire lockout to stamp on a question dialog about to be

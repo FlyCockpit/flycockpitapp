@@ -6,6 +6,8 @@ pub(super) use async_trait::async_trait;
 pub(super) use ignore::WalkBuilder;
 pub(super) use serde::Deserialize;
 pub(super) use serde_json::Value;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 pub(super) use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 pub(super) use crate::intel::budget::{BudgetedWriter, retained_truncated_body};
@@ -19,7 +21,34 @@ pub(super) use crate::intel::{DepEdge, FileMetaRow, Index, SymbolRow};
 pub(super) const SEARCH_TOKEN_CAP: usize = 4000;
 pub(super) const STRUCT_TOKEN_CAP: usize = 3000;
 
+#[cfg(test)]
+static TEST_INDEX_ALLOWLIST: OnceLock<Mutex<Option<(String, Vec<String>)>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_index_allowlist(root: Option<String>, allow: Option<Vec<String>>) {
+    *TEST_INDEX_ALLOWLIST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = root.zip(allow);
+}
+
+#[cfg(test)]
+fn test_index_allowlist(root: &Path) -> Option<Vec<String>> {
+    TEST_INDEX_ALLOWLIST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|(expected, allow)| {
+            (root.to_string_lossy().as_ref() == expected).then(|| allow.clone())
+        })
+}
+
 pub(super) fn index_of(ctx: &ToolCtx) -> Index {
+    #[cfg(test)]
+    let mut allow = test_index_allowlist(&ctx.session.project_root)
+        .unwrap_or_else(|| crate::config::extended::resolve_gitignore_allow(&ctx.cwd));
+    #[cfg(not(test))]
     let mut allow = crate::config::extended::resolve_gitignore_allow(&ctx.cwd);
     allow.extend(ctx.session.gitignore_session_allow());
     Index::with_allowlist(
@@ -257,30 +286,13 @@ pub(super) fn forward_deps(
 #[derive(Debug, Clone)]
 pub(super) struct FsFileMeta {
     pub rel: String,
-    pub abs: PathBuf,
     pub size: u64,
     pub mtime: Option<std::time::SystemTime>,
-}
-
-/// Gitignore-aware list of `(rel, abs, size)` for every tracked file.
-pub(super) fn list_files(root: &Path) -> Vec<(String, PathBuf, u64)> {
-    list_file_metas_from(root, root)
-        .into_iter()
-        .map(|file| (file.rel, file.abs, file.size))
-        .collect()
 }
 
 /// Gitignore-aware list of file metadata for every tracked file.
 pub(super) fn list_file_metas(root: &Path) -> Vec<FsFileMeta> {
     list_file_metas_from(root, root)
-}
-
-/// Gitignore-aware list rooted at `root/subdir`, with paths relative to `root`.
-pub(super) fn list_files_under(root: &Path, subdir: &str) -> Vec<(String, PathBuf, u64)> {
-    list_file_metas_from(root, &root.join(subdir))
-        .into_iter()
-        .map(|file| (file.rel, file.abs, file.size))
-        .collect()
 }
 
 fn list_file_metas_from(root: &Path, walk_root: &Path) -> Vec<FsFileMeta> {
@@ -305,7 +317,6 @@ fn list_file_metas_from(root: &Path, walk_root: &Path) -> Vec<FsFileMeta> {
         let meta = dent.metadata().ok();
         out.push(FsFileMeta {
             rel: rel.to_string_lossy().replace('\\', "/"),
-            abs,
             size: meta.as_ref().map_or(0, std::fs::Metadata::len),
             mtime: meta.and_then(|m| m.modified().ok()),
         });

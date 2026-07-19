@@ -1257,7 +1257,7 @@ mod llm_mode_tests {
     fn definition_of_intel_tools_steer_in_defensive_mode() {
         // (tool, distinctive defensive-only substring from its spec'd prose).
         let cases: Vec<(Arc<dyn Tool>, &str)> = vec![
-            (Arc::new(tools::intel::TreeTool), "your FIRST move"),
+            (Arc::new(tools::intel::TreeTool), "Prefer it early"),
             (
                 Arc::new(tools::intel::SearchTool),
                 "When you would reach for `rg`/`grep`",

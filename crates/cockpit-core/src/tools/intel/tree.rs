@@ -46,8 +46,8 @@ impl Tool for TreeTool {
     fn defensive_description(&self) -> Option<String> {
         Some(
             "Map the codebase from cockpit's index: every file with language, size, lines, and \
-             symbol count (scope with `path`). This is your FIRST move in any repo you don't \
-             already know — call it before reading or searching anything. It lists discovered \
+             symbol count (scope with `path`). Prefer it early in any repo you don't \
+             already know to choose precise files before reading or searching. It lists discovered \
              files; if the result is empty, treat the diagnostic as a project-root/cwd or `path` \
              filter problem and recover with its hint. Use it instead of `ls`/`find` in `bash`. After it: \
              `read` a specific file, or `outline` it for its shape."
@@ -72,27 +72,25 @@ impl Tool for TreeTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let index = index_of(ctx);
-        index.ensure_fresh().await?;
         let (filter, canonical_args) = tree_filter_path(&args, ctx);
+        let index = index_of(ctx);
+        let mut entries = index.ensure_fresh_scoped(filter.as_deref()).await?;
 
         // Indexed files (with symbol counts) keyed by path.
         let indexed: HashMap<String, (String, i64, Option<i64>, i64)> = index
-            .tree_rows()?
+            .tree_rows_scoped(filter.as_deref())?
             .into_iter()
             .map(|(p, lang, size, lines, syms)| (p, (lang, size, lines, syms)))
             .collect();
 
-        // The on-disk gitignore walk is the authority for which files
-        // exist (it sees unknown-language files the index doesn't store).
-        let mut entries = match filter.as_deref() {
-            Some(subdir) => list_files_under(&ctx.session.project_root, subdir),
-            None => list_files(&ctx.session.project_root),
-        };
-        entries.sort();
+        // The freshness scan is the on-disk authority and also sees
+        // unknown-language files the index doesn't store.
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
 
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
-        for (rel, _abs, size) in &entries {
+        for entry in &entries {
+            let rel = &entry.path;
+            let size = entry.size;
             let lang = Language::from_path(Path::new(rel));
             let line = match indexed.get(rel) {
                 Some((lang_str, _indexed_size, Some(lines), syms)) => {

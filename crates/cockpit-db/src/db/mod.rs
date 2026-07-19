@@ -368,6 +368,17 @@ impl Db {
         self.path.as_deref()
     }
 
+    /// Stable identity for cache partitioning across cloned handles.
+    pub fn identity_key(&self) -> String {
+        if let Some(path) = &self.path {
+            return format!("file:{}", path.display());
+        }
+        if let Some(memory) = &self.memory {
+            return format!("memory:{:p}", Arc::as_ptr(memory));
+        }
+        "unknown".to_string()
+    }
+
     /// Return the exact squashed-schema identity recorded in SQLite.
     pub fn schema_version(&self) -> Result<i64> {
         self.read_blocking(sqlite_schema_version)

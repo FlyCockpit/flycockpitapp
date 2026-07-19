@@ -20,6 +20,7 @@ pub mod thin;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
@@ -44,6 +45,8 @@ const CHUNK: usize = 200;
 /// ToolStart; this is the Phase-1 progress signal).
 const COLD_THRESHOLD: usize = 100;
 
+const FRESHNESS_CACHE_TTL_SECS: i64 = 5;
+
 /// Version for indexer logic that changes indexed output without file content changes.
 pub(crate) const INTEL_INDEX_LOGIC_VERSION: i64 = 1;
 
@@ -51,6 +54,7 @@ pub(crate) const INTEL_INDEX_LOGIC_VERSION: i64 = 1;
 pub struct Index {
     db: Db,
     root: PathBuf,
+    db_key: String,
     /// Absolute `root` as the string stored in the `root` column.
     root_key: String,
     /// Effective gitignore read-allowlist globs
@@ -69,6 +73,222 @@ struct DiskFile {
     language: Language,
     mtime_ns: i64,
     size: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskMetaRow {
+    pub path: String,
+    pub language: String,
+    pub size: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct FreshnessCacheKey {
+    db_key: String,
+    root_key: String,
+    allow_key: String,
+    scope: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FreshnessCacheEntry {
+    stored_at: i64,
+    disk: Vec<DiskMetaRow>,
+}
+
+static FRESHNESS_CACHE: OnceLock<Mutex<HashMap<FreshnessCacheKey, FreshnessCacheEntry>>> =
+    OnceLock::new();
+
+fn freshness_cache() -> &'static Mutex<HashMap<FreshnessCacheKey, FreshnessCacheEntry>> {
+    FRESHNESS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+static TEST_WALK_COUNT: OnceLock<
+    Mutex<Option<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>,
+> = OnceLock::new();
+#[cfg(test)]
+static TEST_RECOMPUTE_COUNT: OnceLock<
+    Mutex<Option<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>,
+> = OnceLock::new();
+#[cfg(test)]
+static TEST_NOW_SECS: OnceLock<Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicI64>>>> =
+    OnceLock::new();
+
+fn normalize_scope(scope: Option<&str>) -> Option<String> {
+    let scope = scope?.trim().trim_matches('/').trim_start_matches("./");
+    if scope.is_empty() || scope == "." {
+        return None;
+    }
+    Some(scope.replace('\\', "/").trim_end_matches('/').to_string())
+}
+
+fn invalid_scope(scope: &str) -> bool {
+    Path::new(scope).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
+fn path_in_scope(path: &str, scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    path == scope || path.starts_with(&format!("{scope}/"))
+}
+
+fn disk_meta_rows(disk: &[DiskFile]) -> Vec<DiskMetaRow> {
+    disk.iter()
+        .map(|file| DiskMetaRow {
+            path: file.rel.clone(),
+            language: file.language.as_str().to_string(),
+            size: file.size,
+        })
+        .collect()
+}
+
+fn allow_key(allow: &[String]) -> String {
+    let mut allow = allow.to_vec();
+    allow.sort();
+    allow.join("\n")
+}
+
+fn freshness_cache_get(
+    db_key: &str,
+    root_key: &str,
+    allow_key: &str,
+    scope: Option<&str>,
+    now: i64,
+) -> Option<Vec<DiskMetaRow>> {
+    let cache = freshness_cache().lock().ok()?;
+    let exact = FreshnessCacheKey {
+        db_key: db_key.to_string(),
+        root_key: root_key.to_string(),
+        allow_key: allow_key.to_string(),
+        scope: scope.map(str::to_string),
+    };
+    if let Some(entry) = cache.get(&exact)
+        && now.saturating_sub(entry.stored_at) <= FRESHNESS_CACHE_TTL_SECS
+    {
+        return Some(entry.disk.clone());
+    }
+    if scope.is_some() {
+        let unscoped = FreshnessCacheKey {
+            db_key: db_key.to_string(),
+            root_key: root_key.to_string(),
+            allow_key: allow_key.to_string(),
+            scope: None,
+        };
+        if let Some(entry) = cache.get(&unscoped)
+            && now.saturating_sub(entry.stored_at) <= FRESHNESS_CACHE_TTL_SECS
+        {
+            return Some(
+                entry
+                    .disk
+                    .iter()
+                    .filter(|row| path_in_scope(&row.path, scope))
+                    .cloned()
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+fn freshness_cache_store(
+    db_key: &str,
+    root_key: &str,
+    allow_key: &str,
+    scope: Option<&str>,
+    now: i64,
+    disk: Vec<DiskMetaRow>,
+) {
+    let Ok(mut cache) = freshness_cache().lock() else {
+        return;
+    };
+    cache.insert(
+        FreshnessCacheKey {
+            db_key: db_key.to_string(),
+            root_key: root_key.to_string(),
+            allow_key: allow_key.to_string(),
+            scope: scope.map(str::to_string),
+        },
+        FreshnessCacheEntry {
+            stored_at: now,
+            disk,
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn clear_freshness_cache() {
+    if let Ok(mut cache) = freshness_cache().lock() {
+        cache.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_walk_counter(
+    root_key: Option<String>,
+    counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) {
+    *TEST_WALK_COUNT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = root_key.zip(counter);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_recompute_counter(
+    root_key: Option<String>,
+    counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) {
+    *TEST_RECOMPUTE_COUNT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = root_key.zip(counter);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_now(now: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>) {
+    *TEST_NOW_SECS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = now;
+}
+
+fn record_disk_walk(root: &Path) {
+    #[cfg(not(test))]
+    let _ = root;
+    #[cfg(test)]
+    if let Some((expected_root, counter)) = TEST_WALK_COUNT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        && root.to_string_lossy().as_ref() == expected_root
+    {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn record_recompute_centrality(root_key: &str) {
+    #[cfg(not(test))]
+    let _ = root_key;
+    #[cfg(test)]
+    if let Some((expected_root, counter)) = TEST_RECOMPUTE_COUNT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        && root_key == expected_root
+    {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// The parsed result for one file, ready for serial write.
@@ -126,9 +346,11 @@ impl Index {
     /// Build an index handle for `root` with no gitignore allowlist.
     pub fn new(db: Db, root: PathBuf) -> Self {
         let root_key = root.to_string_lossy().into_owned();
+        let db_key = db.identity_key();
         Self {
             db,
             root,
+            db_key,
             root_key,
             gitignore_allow: Vec::new(),
         }
@@ -148,23 +370,61 @@ impl Index {
     /// re-indexes new/stale files. Disk walking, hashing, and parsing run
     /// off the DB writer; the writer only owns short metadata/chunk writes.
     pub async fn ensure_fresh(&self) -> Result<()> {
+        self.ensure_fresh_scoped(None).await.map(|_| ())
+    }
+
+    pub async fn ensure_fresh_scoped(&self, scope: Option<&str>) -> Result<Vec<DiskMetaRow>> {
+        let scope = normalize_scope(scope);
+        let now = now_secs();
+        let allow_key = allow_key(&self.gitignore_allow);
+        if let Some(cached) = freshness_cache_get(
+            &self.db_key,
+            &self.root_key,
+            &allow_key,
+            scope.as_deref(),
+            now,
+        ) {
+            return Ok(cached);
+        }
+
         let root = self.root.clone();
         let root_key = self.root_key.clone();
         let allow = self.gitignore_allow.clone();
-        let disk = tokio::task::spawn_blocking(move || scan_disk(&root, &allow))
-            .await
-            .context("intel scan worker joined")??;
+        let scan_scope = scope.clone();
+        let disk =
+            tokio::task::spawn_blocking(move || scan_disk(&root, &allow, scan_scope.as_deref()))
+                .await
+                .context("intel scan worker joined")??;
         let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
+        let disk_meta = disk_meta_rows(&disk);
 
         let read_root_key = root_key.clone();
-        let (indexed, logic_version_current) = self
+        let read_scope = scope.clone();
+        let (indexed, logic_version_current, indexed_paths_for_resolution) = self
             .db
             .read(move |conn| {
-                let indexed = load_indexed(conn, &read_root_key)?;
+                let indexed = load_indexed(conn, &read_root_key, read_scope.as_deref())?;
+                let indexed_paths_for_resolution = if read_scope.is_some() {
+                    load_indexed_paths(conn, &read_root_key)?
+                } else {
+                    HashSet::new()
+                };
                 let version = load_index_logic_version(conn, &read_root_key)?;
-                Ok((indexed, version == Some(INTEL_INDEX_LOGIC_VERSION)))
+                Ok((
+                    indexed,
+                    version == Some(INTEL_INDEX_LOGIC_VERSION),
+                    indexed_paths_for_resolution,
+                ))
             })
             .await?;
+        let mut resolution_paths = disk_paths.clone();
+        if scope.is_some() {
+            resolution_paths.extend(
+                indexed_paths_for_resolution
+                    .into_iter()
+                    .filter(|path| !path_in_scope(path, scope.as_deref())),
+            );
+        }
         let work = tokio::task::spawn_blocking(move || {
             plan_fresh_work(disk, indexed, logic_version_current)
         })
@@ -185,12 +445,22 @@ impl Index {
 
         if work.to_index.is_empty() {
             let write_version = !logic_version_current;
-            if removed_any || write_version {
+            let module_prefix = if removed_any {
+                let module_root = self.root.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || go_module_prefix(&module_root))
+                        .await
+                        .context("intel module-prefix worker joined")?,
+                )
+            } else {
+                None
+            };
+            if write_version || removed_any {
                 let write_root_key = root_key.clone();
                 self.db
                     .write(move |conn| {
-                        if removed_any {
-                            callgraph::recompute_centrality(conn, &write_root_key)?;
+                        if let Some(module_prefix) = module_prefix.as_deref() {
+                            refresh_dep_resolutions(conn, &write_root_key, module_prefix)?;
                         }
                         if write_version {
                             store_index_logic_version(conn, &write_root_key)?;
@@ -199,7 +469,15 @@ impl Index {
                     })
                     .await?;
             }
-            return Ok(());
+            freshness_cache_store(
+                &self.db_key,
+                &self.root_key,
+                &allow_key,
+                scope.as_deref(),
+                now,
+                disk_meta.clone(),
+            );
+            return Ok(disk_meta);
         }
         if work.to_index.len() >= COLD_THRESHOLD {
             tracing::info!(files = work.to_index.len(), "intel: cold-indexing");
@@ -209,21 +487,20 @@ impl Index {
         let module_prefix = tokio::task::spawn_blocking(move || go_module_prefix(&module_root))
             .await
             .context("intel module-prefix worker joined")?;
-        let now = now_secs();
         for chunk in work.to_index.chunks(CHUNK) {
             let chunk = chunk.to_vec();
             let parsed = tokio::task::spawn_blocking(move || parse_files_capped(chunk))
                 .await
                 .context("intel parse worker joined")??;
             let write_root_key = root_key.clone();
-            let write_disk_paths = disk_paths.clone();
+            let write_resolution_paths = resolution_paths.clone();
             let write_module_prefix = module_prefix.clone();
             self.db
                 .write(move |conn| {
                     write_chunk(
                         conn,
                         &write_root_key,
-                        &write_disk_paths,
+                        &write_resolution_paths,
                         &write_module_prefix,
                         &parsed,
                         now,
@@ -236,14 +513,22 @@ impl Index {
         let write_version = !logic_version_current;
         self.db
             .write(move |conn| {
-                callgraph::recompute_centrality(conn, &write_root_key)?;
+                refresh_dep_resolutions(conn, &write_root_key, &module_prefix)?;
                 if write_version {
                     store_index_logic_version(conn, &write_root_key)?;
                 }
                 Ok(())
             })
             .await?;
-        Ok(())
+        freshness_cache_store(
+            &self.db_key,
+            &self.root_key,
+            &allow_key,
+            scope.as_deref(),
+            now,
+            disk_meta.clone(),
+        );
+        Ok(disk_meta)
     }
 
     // ---- query methods (each assumes ensure_fresh already ran) --------
@@ -251,29 +536,15 @@ impl Index {
     /// All known files for `tree`, ordered by path. Large files are indexed
     /// for visibility but carry no stored line count.
     pub fn tree_rows(&self) -> Result<Vec<TreeRow>> {
+        self.tree_rows_scoped(None)
+    }
+
+    /// All known files for `tree` within an optional path prefix, ordered by path.
+    pub fn tree_rows_scoped(&self, scope: Option<&str>) -> Result<Vec<TreeRow>> {
         let root_key = self.root_key.clone();
-        self.db.read_blocking(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT f.path, f.language, f.size, f.lines, COUNT(s.name) \
-                 FROM intel_files f \
-                 LEFT JOIN intel_symbols s ON s.root = f.root AND s.path = f.path \
-                 WHERE f.root = ?1 \
-                 GROUP BY f.root, f.path, f.language, f.size, f.lines \
-                 ORDER BY f.path",
-            )?;
-            let rows = stmt
-                .query_map([&root_key], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        let scope = normalize_scope(scope);
+        self.db
+            .read_blocking(move |conn| Ok(tree_rows_query(conn, &root_key, scope.as_deref())?))
     }
 
     /// All indexed files with metadata needed by `context_pack`, ordered by path.
@@ -430,8 +701,11 @@ impl Index {
     /// empty map, which the ranking treats as no signal (unranked order).
     pub fn centrality_scores(&self) -> Result<HashMap<String, f64>> {
         let root_key = self.root_key.clone();
-        self.db
-            .read_blocking(|conn| Ok(callgraph::load_centrality(conn, &root_key)?))
+        self.db.write_blocking(move |conn| {
+            record_recompute_centrality(&root_key);
+            callgraph::recompute_centrality(conn, &root_key)?;
+            Ok(callgraph::load_centrality(conn, &root_key)?)
+        })
     }
 
     /// Resolve `name` (+ optional `path`/`kind` disambiguators, matching
@@ -618,6 +892,46 @@ fn query_symbols(
     Ok(rows)
 }
 
+fn prefix_like_pattern(scope: &str) -> String {
+    format!("{}/%", escape_like(scope))
+}
+
+fn tree_rows_query(
+    conn: &Connection,
+    root_key: &str,
+    scope: Option<&str>,
+) -> rusqlite::Result<Vec<TreeRow>> {
+    let select = "SELECT f.path, f.language, f.size, f.lines, COUNT(s.name) \
+         FROM intel_files f \
+         LEFT JOIN intel_symbols s ON s.root = f.root AND s.path = f.path";
+    let group = " GROUP BY f.root, f.path, f.language, f.size, f.lines ORDER BY f.path";
+    let sql = match scope {
+        Some(_) => format!(
+            "{select} WHERE f.root = ?1 AND (f.path = ?2 OR f.path LIKE ?3 ESCAPE '\\'){group}"
+        ),
+        None => format!("{select} WHERE f.root = ?1{group}"),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |r: &rusqlite::Row<'_>| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    };
+    let rows = if let Some(scope) = scope {
+        let pattern = prefix_like_pattern(scope);
+        stmt.query_map(params![root_key, scope, pattern], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map([root_key], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
+}
+
 /// Escape `%`, `_` and `\` for a `LIKE … ESCAPE '\'` prefix match.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -734,11 +1048,19 @@ fn parse_files_capped(files: Vec<DiskFile>) -> Result<Vec<ParsedFile>> {
 /// supplementary gitignore-off pass, so allowlisted-but-gitignored files
 /// surface in `search`/`tree`/`outline`/`symbol_find`
 /// (implementation note).
-fn scan_disk(root: &Path, gitignore_allow: &[String]) -> Result<Vec<DiskFile>> {
+fn scan_disk(
+    root: &Path,
+    gitignore_allow: &[String],
+    scope: Option<&str>,
+) -> Result<Vec<DiskFile>> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    if scope.is_some_and(invalid_scope) {
+        return Ok(out);
+    }
+    let walk_root = scope.map_or_else(|| root.to_path_buf(), |scope| root.join(scope));
 
-    let mut walker = WalkBuilder::new(root);
+    let mut walker = WalkBuilder::new(&walk_root);
     walker
         .hidden(true)
         .git_ignore(true)
@@ -747,6 +1069,7 @@ fn scan_disk(root: &Path, gitignore_allow: &[String]) -> Result<Vec<DiskFile>> {
         .parents(true)
         .require_git(false)
         .follow_links(false);
+    record_disk_walk(root);
     for dent in walker.build().flatten() {
         if !dent.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -764,7 +1087,7 @@ fn scan_disk(root: &Path, gitignore_allow: &[String]) -> Result<Vec<DiskFile>> {
     if !gitignore_allow.is_empty() {
         let matcher = crate::gitignore::build_allowlist_matcher(root, gitignore_allow);
         if !matcher.is_empty() {
-            let mut wide = WalkBuilder::new(root);
+            let mut wide = WalkBuilder::new(&walk_root);
             wide.hidden(false)
                 .git_ignore(false)
                 .git_global(false)
@@ -774,6 +1097,7 @@ fn scan_disk(root: &Path, gitignore_allow: &[String]) -> Result<Vec<DiskFile>> {
                 .follow_links(false);
             // Skip the `.git` dir explicitly (gitignore-off walks descend it).
             wide.filter_entry(|dent| dent.file_name() != ".git");
+            record_disk_walk(root);
             for dent in wide.build().flatten() {
                 if !dent.file_type().is_some_and(|t| t.is_file()) {
                     continue;
@@ -830,11 +1154,31 @@ fn store_index_logic_version(conn: &Connection, root_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_indexed(conn: &Connection, root_key: &str) -> Result<IndexedMap> {
-    let mut stmt =
-        conn.prepare("SELECT path, mtime_ns, size, content_hash FROM intel_files WHERE root = ?1")?;
-    let rows = stmt
-        .query_map([root_key], |r| {
+fn load_indexed(conn: &Connection, root_key: &str, scope: Option<&str>) -> Result<IndexedMap> {
+    let sql = match scope {
+        Some(_) => {
+            "SELECT path, mtime_ns, size, content_hash FROM intel_files \
+             WHERE root = ?1 AND (path = ?2 OR path LIKE ?3 ESCAPE '\\')"
+        }
+        None => "SELECT path, mtime_ns, size, content_hash FROM intel_files WHERE root = ?1",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let map = |r: &rusqlite::Row<'_>| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ),
+        ))
+    };
+    let rows = if let Some(scope) = scope {
+        let pattern = prefix_like_pattern(scope);
+        stmt.query_map(params![root_key, scope, pattern], map)?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?
+    } else {
+        stmt.query_map([root_key], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 (
@@ -844,7 +1188,16 @@ fn load_indexed(conn: &Connection, root_key: &str) -> Result<IndexedMap> {
                 ),
             ))
         })?
-        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+    Ok(rows)
+}
+
+fn load_indexed_paths(conn: &Connection, root_key: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM intel_files WHERE root = ?1")?;
+    let rows = stmt
+        .query_map([root_key], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
     Ok(rows)
 }
 
@@ -973,6 +1326,55 @@ fn write_chunk(
     Ok(())
 }
 
+fn refresh_dep_resolutions(conn: &Connection, root_key: &str, module_prefix: &str) -> Result<()> {
+    let existing = load_indexed_paths(conn, root_key)?;
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT d.importer, f.language, d.raw_target, d.line \
+             FROM intel_deps d \
+             JOIN intel_files f ON f.root = d.root AND f.path = d.importer \
+             WHERE d.root = ?1 \
+             ORDER BY d.importer, d.line",
+        )?;
+        stmt.query_map([root_key], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut update = tx.prepare(
+            "UPDATE intel_deps \
+             SET importee = ?1 \
+             WHERE root = ?2 AND importer = ?3 AND raw_target = ?4 AND line = ?5",
+        )?;
+        for (importer, language, raw_target, line) in rows {
+            let importee = resolve::resolve(
+                Language::from_stored(&language),
+                &importer,
+                &raw_target,
+                &existing,
+                module_prefix,
+            );
+            update.execute(rusqlite::params![
+                importee, root_key, importer, raw_target, line
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 // ---- small helpers ---------------------------------------------------------
 
 fn line_count_bytes(bytes: &[u8]) -> usize {
@@ -1018,6 +1420,15 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 }
 
 fn now_secs() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW_SECS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
+        return now.load(std::sync::atomic::Ordering::SeqCst);
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1042,6 +1453,10 @@ fn go_module_prefix(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicUsize, Ordering},
+    };
 
     fn write_file(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);
@@ -1167,6 +1582,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_fresh_scoped_walks_only_the_subtree() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "a/one.rs", "pub fn one() {}\n");
+        write_file(&root, "b/two.rs", "pub fn two() {}\n");
+
+        let index = Index::new(db, root);
+        let disk = index.ensure_fresh_scoped(Some("a")).await.unwrap();
+
+        assert_eq!(
+            disk.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec!["a/one.rs"]
+        );
+        assert_eq!(index.symbol_find("one", true, None).unwrap().len(), 1);
+        assert!(
+            index.symbol_find("two", true, None).unwrap().is_empty(),
+            "scoped refresh must not index files outside the scoped subtree"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_scoped_does_not_delete_rows_outside_scope() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "a/one.rs", "pub fn one() {}\n");
+        write_file(&root, "b/two.rs", "pub fn two() {}\n");
+
+        let index = Index::new(db, root.clone());
+        index.ensure_fresh().await.unwrap();
+        clear_freshness_cache();
+
+        std::fs::remove_file(root.join("a/one.rs")).unwrap();
+        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+
+        assert!(
+            index.symbol_find("one", true, None).unwrap().is_empty(),
+            "deleted file inside the scoped subtree should be removed"
+        );
+        assert_eq!(
+            index.symbol_find("two", true, None).unwrap().len(),
+            1,
+            "scoped refresh must not delete indexed rows outside the subtree"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_scoped_preserves_deps_to_indexed_files_outside_scope() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(
+            &root,
+            "src/app.ts",
+            "import { helper } from '../shared/util';\nexport function main() {\n  helper();\n}\n",
+        );
+        write_file(&root, "shared/util.ts", "export function helper() {}\n");
+
+        let index = Index::new(db, root.clone());
+        index.ensure_fresh().await.unwrap();
+        assert!(
+            index
+                .dep_edges()
+                .unwrap()
+                .iter()
+                .any(|edge| edge.importer == "src/app.ts"
+                    && edge.importee.as_deref() == Some("shared/util.ts")),
+            "full index should resolve the cross-subtree import before scoped refresh"
+        );
+
+        clear_freshness_cache();
+        write_file(
+            &root,
+            "src/app.ts",
+            "import { helper } from '../shared/util';\nexport function main() {\n  helper();\n}\nexport const changed = true;\n",
+        );
+        index.ensure_fresh_scoped(Some("src")).await.unwrap();
+
+        assert!(
+            index
+                .dep_edges()
+                .unwrap()
+                .iter()
+                .any(|edge| edge.importer == "src/app.ts"
+                    && edge.importee.as_deref() == Some("shared/util.ts")),
+            "scoped reindex must keep dependency resolution to indexed files outside the scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn unscoped_refresh_repairs_scoped_first_unresolved_deps() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(
+            &root,
+            "src/app.ts",
+            "import { helper } from '../shared/util';\nexport function main() {\n  helper();\n}\n",
+        );
+        write_file(&root, "shared/util.ts", "export function helper() {}\n");
+
+        let index = Index::new(db, root);
+        index.ensure_fresh_scoped(Some("src")).await.unwrap();
+        assert!(
+            index.dep_edges().unwrap().iter().any(|edge| {
+                edge.importer == "src/app.ts"
+                    && edge.raw_target == "../shared/util"
+                    && edge.importee.is_none()
+            }),
+            "a scoped-first refresh cannot resolve a not-yet-indexed out-of-scope target"
+        );
+
+        clear_freshness_cache();
+        index.ensure_fresh().await.unwrap();
+
+        assert!(
+            index
+                .dep_edges()
+                .unwrap()
+                .iter()
+                .any(|edge| edge.importer == "src/app.ts"
+                    && edge.importee.as_deref() == Some("shared/util.ts")),
+            "unscoped refresh should repair unresolved scoped-first dependency edges"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_rows_prefix_filter_is_applied_in_sql() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+        write_file(&root, "src/nested/mod.rs", "pub fn nested() {}\n");
+        write_file(&root, "tests/outside.rs", "pub fn outside() {}\n");
+
+        let index = Index::new(db, root);
+        index.ensure_fresh().await.unwrap();
+
+        let rows = index.tree_rows_scoped(Some("src")).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(path, _, _, _, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs", "src/nested/mod.rs"]
+        );
+        assert!(
+            index
+                .tree_rows_scoped(Some("tests"))
+                .unwrap()
+                .iter()
+                .all(|(path, _, _, _, _)| path.starts_with("tests/"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_within_ttl_skips_the_disk_walk() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "a/one.rs", "pub fn one() {}\n");
+        let root_key = root.to_string_lossy().into_owned();
+        let now = Arc::new(AtomicI64::new(100));
+        let walks = Arc::new(AtomicUsize::new(0));
+        set_test_now(Some(now.clone()));
+        set_test_walk_counter(Some(root_key), Some(walks.clone()));
+        let index = Index::new(db, root);
+
+        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "same-scope refresh within the TTL should use the cached disk snapshot"
+        );
+        now.store(106, Ordering::SeqCst);
+        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+
+        set_test_now(None);
+        set_test_walk_counter(None, None);
+        clear_freshness_cache();
+    }
+
+    #[tokio::test]
+    async fn scoped_refresh_does_not_satisfy_unscoped_call() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "a/one.rs", "pub fn one() {}\n");
+        write_file(&root, "b/two.rs", "pub fn two() {}\n");
+        let root_key = root.to_string_lossy().into_owned();
+        let now = Arc::new(AtomicI64::new(100));
+        let walks = Arc::new(AtomicUsize::new(0));
+        set_test_now(Some(now));
+        set_test_walk_counter(Some(root_key), Some(walks.clone()));
+        let index = Index::new(db, root);
+
+        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+        index.ensure_fresh().await.unwrap();
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            2,
+            "a scoped cache hit must not satisfy an unscoped refresh"
+        );
+
+        set_test_now(None);
+        set_test_walk_counter(None, None);
+        clear_freshness_cache();
+    }
+
+    #[tokio::test]
     async fn index_logic_version_controls_unchanged_file_reindex() {
         let db = Db::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1194,6 +1830,7 @@ mod tests {
         })
         .await
         .unwrap();
+        clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
         assert_eq!(
             indexed_language(&db, &root_key, "Dockerfile.dev"),
@@ -1211,6 +1848,7 @@ mod tests {
         })
         .await
         .unwrap();
+        clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
         assert_eq!(
             indexed_language(&db, &root_key, "Dockerfile.dev"),
@@ -1261,6 +1899,7 @@ mod tests {
         .await
         .unwrap();
 
+        clear_freshness_cache();
         index_a.ensure_fresh().await.unwrap();
         assert_eq!(
             indexed_language(&db, &root_key_a, "Dockerfile.dev"),
@@ -1281,6 +1920,7 @@ mod tests {
             "root A version write must not satisfy root B"
         );
 
+        clear_freshness_cache();
         index_b.ensure_fresh().await.unwrap();
         assert_eq!(
             indexed_language(&db, &root_key_b, "Dockerfile.dev"),
@@ -1342,6 +1982,7 @@ mod tests {
         // Edit a.rs (add a symbol) then DELETE b.rs.
         write_file(&root, "a.rs", "pub fn alpha() {}\npub fn alpha2() {}\n");
         std::fs::remove_file(root.join("b.rs")).unwrap();
+        clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
 
         // b.rs: no stale file or symbol rows.
@@ -1372,6 +2013,7 @@ mod tests {
             "lib.rs",
             "pub fn target() {}\npub fn caller() {\n    target();\n}\n",
         );
+        clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
 
         // Centrality now reflects the new edge — no stale zero.
@@ -1402,6 +2044,7 @@ mod tests {
 
         // Delete the only caller; the score must drop (no stale edge).
         std::fs::remove_file(root.join("caller.rs")).unwrap();
+        clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
         let after = index
             .centrality_scores()

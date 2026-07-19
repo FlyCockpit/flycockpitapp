@@ -1,8 +1,14 @@
 use super::*;
 use crate::engine::tool::Tool;
+use crate::intel::{clear_freshness_cache, set_test_recompute_counter, set_test_walk_counter};
 use crate::tools::common::test_ctx;
+use crate::tools::intel::common::set_test_index_allowlist;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
@@ -265,6 +271,72 @@ async fn tree_root_like_paths_normalize_to_repo_root_listing() {
             tree.content
         );
     }
+}
+
+#[tokio::test]
+async fn unscoped_tree_call_walks_the_filesystem_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
+    write(tmp.path(), "README.md", "# repo\n");
+    let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+
+    // Warm the index, then clear the short-lived scan cache so this call
+    // must refresh from disk. Force an empty allowlist for this root so the
+    // gitignore re-include pass does not add a legitimate second traversal.
+    let index = crate::intel::Index::new(db, ctx.session.project_root.clone());
+    index.ensure_fresh().await.unwrap();
+    clear_freshness_cache();
+    let walks = Arc::new(AtomicUsize::new(0));
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+    set_test_index_allowlist(Some(root_key.clone()), Some(Vec::new()));
+    set_test_walk_counter(Some(root_key), Some(walks.clone()));
+
+    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+    assert!(tree.content.contains("src/lib.rs"), "{}", tree.content);
+    assert_eq!(
+        walks.load(Ordering::SeqCst),
+        1,
+        "warm unscoped TreeTool::call should do exactly one filesystem traversal"
+    );
+    set_test_walk_counter(None, None);
+    set_test_index_allowlist(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn tree_call_does_not_recompute_centrality_inline() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
+    let ctx = test_ctx(tmp.path());
+    let recomputes = Arc::new(AtomicUsize::new(0));
+    set_test_recompute_counter(
+        Some(ctx.session.project_root.to_string_lossy().into_owned()),
+        Some(recomputes.clone()),
+    );
+
+    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+    assert!(tree.content.contains("src/lib.rs"), "{}", tree.content);
+    assert_eq!(
+        recomputes.load(Ordering::SeqCst),
+        0,
+        "tree should not recompute callgraph centrality on its read path"
+    );
+    set_test_recompute_counter(None, None);
+    clear_freshness_cache();
+}
+
+#[test]
+fn tree_defensive_description_does_not_mandate_first_call() {
+    let description = TreeTool.defensive_description().unwrap();
+
+    assert!(!description.contains("FIRST move"), "{description}");
+    assert!(
+        !description.contains("call it before reading or searching anything"),
+        "{description}"
+    );
+    assert!(description.contains("Prefer it early"), "{description}");
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use super::noninteractive::SubagentFailureEnvelope;
 use super::*;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -54,6 +55,14 @@ pub(crate) fn resolve_backup_model_for(
     build_backup_model(&providers, model)
 }
 
+pub(crate) fn resolve_failover_models_for(
+    cwd: &std::path::Path,
+    model: &crate::engine::model::Model,
+) -> Vec<Arc<crate::engine::model::Model>> {
+    let providers = crate::secret_ref::load_effective(cwd);
+    build_failover_models(&providers, model)
+}
+
 /// Resolve the per-`(provider, model)` backup against an already-loaded
 /// providers config and build it, inheriting `model`'s shutdown gate. Split
 /// from [`resolve_backup_model_for`] so the test-injected config path can reuse
@@ -81,6 +90,77 @@ pub(crate) fn build_backup_model(
         None => built,
     };
     Some(Arc::new(built))
+}
+
+pub(crate) fn build_failover_models(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+) -> Vec<Arc<crate::engine::model::Model>> {
+    let configured_backup = providers.resolve_backup(model.provider_id(), model.model_id_ref());
+    let mut refs = Vec::new();
+    if let Some(backup) = configured_backup.as_ref() {
+        refs.push((backup.provider.clone(), backup.model.clone(), true));
+    }
+
+    let mut discovered = Vec::new();
+    for (provider_id, provider) in &providers.providers {
+        for entry in &provider.models {
+            if provider_id == model.provider_id() && entry.id == model.model_id_ref() {
+                continue;
+            }
+            if !providers.resolve_subagent_invokable(provider_id, &entry.id) {
+                continue;
+            }
+            if model.trusted_only_enabled()
+                && !providers.resolve_trust(provider_id, &entry.id).is_trusted()
+            {
+                continue;
+            }
+            if configured_backup
+                .as_ref()
+                .is_some_and(|backup| backup.provider == *provider_id && backup.model == entry.id)
+            {
+                continue;
+            }
+            discovered.push((
+                provider_id.clone(),
+                entry.id.clone(),
+                providers.resolve_trust(provider_id, &entry.id).is_trusted(),
+                providers.resolve_quality_rank(provider_id, &entry.id),
+                providers.resolve_cost_rank(provider_id, &entry.id),
+            ));
+        }
+    }
+    discovered.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| a.4.cmp(&b.4))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    for (provider, model_id, _, _, _) in discovered {
+        refs.push((provider, model_id, false));
+    }
+
+    refs.into_iter()
+        .take(crate::engine::agent::MAX_FAILOVER_CANDIDATES.saturating_sub(1))
+        .filter_map(|(provider, model_id, _configured)| {
+            let built = crate::engine::model::Model::for_provider_trusted_only(
+                providers,
+                &provider,
+                &model_id,
+                model.session_redact_table(),
+                model.trusted_only_flag(),
+            )
+            .ok()?;
+            let built = built.with_shutdown_gate(model.shutdown_gate());
+            let built = match model.config_path() {
+                Some(path) => built.with_config_path(path.to_path_buf()),
+                None => built,
+            };
+            Some(Arc::new(built))
+        })
+        .collect()
 }
 
 /// Assemble a finished delegated subagent's report. Every delegated subagent
@@ -307,6 +387,38 @@ pub(super) fn render_failed_subagent_report(
         }
     }
     out
+}
+
+pub(super) fn render_failed_subagent_failure(
+    envelope: &SubagentFailureEnvelope,
+    progress: &DelegationPartialProgress,
+) -> String {
+    let attempts = envelope.fallback_tried.len().max(1);
+    let mut out = format!(
+        "Subagent failed after {attempts} model attempt(s). Terminal failure: {}/{} {class} after {elapsed_ms}ms. Suggested action (advisory): {action}.",
+        envelope.provider,
+        envelope.model,
+        class = envelope.error_class,
+        elapsed_ms = envelope.elapsed_ms,
+        action = envelope.suggested_action,
+    );
+    if !envelope.fallback_tried.is_empty() {
+        out.push_str("\n\nFallback chain:");
+        for attempt in &envelope.fallback_tried {
+            let class = attempt.error_class.as_deref().unwrap_or("none");
+            out.push_str(&format!(
+                "\n- {}/{}: {} ({class})",
+                attempt.provider, attempt.model, attempt.outcome
+            ));
+        }
+    }
+    if !envelope.detail.trim().is_empty()
+        && let Some(snippet) = crate::text::bounded_snippet(&envelope.detail, 300)
+    {
+        out.push_str("\n\nDetail: ");
+        out.push_str(&snippet);
+    }
+    render_failed_subagent_report(&out, progress)
 }
 
 fn is_verification_command(command: &str) -> bool {

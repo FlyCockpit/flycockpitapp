@@ -1163,6 +1163,7 @@ fn single_noninteractive_completion(
         task_function_call_id: Some(format!("fn-{task_call_id}")),
         report: report.to_string(),
         failed: false,
+        failure: None,
         partial_progress: DelegationPartialProgress::default(),
         seeds: Vec::new(),
         new_handle: None,

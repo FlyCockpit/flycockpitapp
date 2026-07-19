@@ -1,10 +1,13 @@
 use std::fmt;
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures::StreamExt;
 use rig::providers::{anthropic, chatgpt, openai};
 
 use super::wire::{normalize_openai_usage_aliases_bytes, take_normalized_sse_lines};
+
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
 // Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
@@ -17,10 +20,16 @@ pub(super) type ChatGptResponsesModel = chatgpt::ResponsesCompletionModel<UsageA
 pub(super) type AnthropicCompletionModel =
     anthropic::completion::CompletionModel<UsageAliasHttpClient>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct UsageAliasHttpClient {
     client: reqwest::Client,
     extra_headers: Vec<(String, String)>,
+}
+
+impl Default for UsageAliasHttpClient {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl fmt::Debug for UsageAliasHttpClient {
@@ -34,8 +43,12 @@ impl fmt::Debug for UsageAliasHttpClient {
 impl UsageAliasHttpClient {
     pub(super) fn new(extra_headers: Vec<(String, String)>) -> Self {
         let extra_headers = with_canonical_user_agent(extra_headers);
+        let client = reqwest::Client::builder()
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             extra_headers,
         }
     }

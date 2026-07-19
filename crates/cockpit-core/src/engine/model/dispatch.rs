@@ -273,6 +273,7 @@ impl Model {
                 phase: "utility_dispatch".to_string(),
                 class: "utility_timeout".to_string(),
                 elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                retry_attempts: 1,
                 detail: format!(
                     "{site:?} utility request exceeded {}ms {:?} budget",
                     site.timeout().as_millis(),
@@ -480,6 +481,7 @@ impl Model {
         // `first_token` once then failed at `dispatched` on retry still
         // records `first_token`.
         let phase = std::sync::atomic::AtomicU8::new(InferencePhase::Prep.rank());
+        let retry_attempts = std::sync::atomic::AtomicU32::new(0);
         // Time-to-first-token (ms from dispatch), recorded by the drain on
         // the attempt that ultimately succeeds; `0` means no token arrived.
         let first_token_ms = std::sync::atomic::AtomicU64::new(0);
@@ -538,6 +540,7 @@ impl Model {
                 let mut approved_swap = false;
                 loop {
                     let attempt = || async {
+                        retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let wire_tools = wire_schema::definitions_for_wire(endpoint, tools);
                         let wire_tools = wire_tools.as_ref();
                         // Build the OpenAI-compat agent against the *current*
@@ -740,6 +743,7 @@ impl Model {
                 // into top-level `instructions`, posts `/responses`, streams,
                 // and aggregates Responses API tool/reasoning/usage chunks.
                 let attempt = || async {
+                    retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let wire_tools = wire_schema::definitions_for_wire(
                         crate::config::providers::WireApi::Responses,
                         tools,
@@ -785,6 +789,7 @@ impl Model {
             } => {
                 // Native Anthropic: no wire-API selector, single retry unit.
                 let attempt = || async {
+                    retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let agent = build_anthropic_agent(model.clone(), system, tools, &params);
                     drain_completion_stream(
                         agent,
@@ -868,6 +873,9 @@ impl Model {
                     phase: phase.as_str().to_string(),
                     class: class.as_str(),
                     elapsed_ms,
+                    retry_attempts: retry_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .max(1),
                     detail,
                 }))
             }
@@ -919,6 +927,7 @@ impl Model {
                     phase: "prep".to_string(),
                     class: "missing_tool_entitlement".to_string(),
                     elapsed_ms: 0,
+                    retry_attempts: 1,
                     detail: format!(
                         "client-side tools require entitlement `{entitlement}`; primary model was blocked before network dispatch. Enable the entitlement in provider/model settings or choose a non-multi-agent model."
                     ),
@@ -930,6 +939,7 @@ impl Model {
                 phase: "prep".to_string(),
                 class: "client_side_tools_unsupported".to_string(),
                 elapsed_ms: 0,
+                retry_attempts: 1,
                 detail: "client-side tools are unsupported for this model; primary model was blocked before network dispatch. Choose a tool-compatible model or configure a compatible backup model."
                     .to_string(),
             })),
@@ -1006,6 +1016,7 @@ impl Model {
                             phase: InferencePhase::Prep.as_str().to_string(),
                             class: "responses_tool_identity".to_string(),
                             elapsed_ms: prep_started.elapsed().as_millis() as u64,
+                            retry_attempts: 1,
                             detail: err.to_string(),
                         }));
                     }

@@ -4615,6 +4615,7 @@ mod render_history_spacing_tests {
             task_call_id: "call-1".to_string(),
             label: "default".to_string(),
             report: "done".to_string(),
+            failed: false,
             trusted_only: false,
             model_trusted: true,
             routing: serde_json::Value::Null,

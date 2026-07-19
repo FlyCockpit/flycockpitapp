@@ -36,6 +36,17 @@ fn running_labeled(parent: &str, child: &str, task_call_id: &str, label: &str) -
 fn report_update(report: impl Into<String>) -> SubagentReportUpdate {
     SubagentReportUpdate {
         report: report.into(),
+        failed: false,
+        trusted_only: false,
+        model_trusted: false,
+        routing: SubagentRoutingChips::default(),
+    }
+}
+
+fn failed_report_update(report: impl Into<String>) -> SubagentReportUpdate {
+    SubagentReportUpdate {
+        report: report.into(),
+        failed: true,
         trusted_only: false,
         model_trusted: false,
         routing: SubagentRoutingChips::default(),
@@ -125,6 +136,7 @@ fn report_updates_subagent_trust_metadata() {
         "default",
         SubagentReportUpdate {
             report: "all done".into(),
+            failed: false,
             trusted_only: true,
             model_trusted: true,
             routing: SubagentRoutingChips {
@@ -201,10 +213,10 @@ fn routing_amend_after_report_updates_settled_entry() {
     assert_eq!(routing_model(&history[0]), Some("child-model"));
 }
 
-/// A report whose text is the driver's `Error: ` failure encoding
-/// settles as a failure (failed=true) rather than a normal report.
+/// Failure state is carried by the typed report field. A successful report may
+/// legitimately start with `Error: ` without being marked failed.
 #[test]
-fn error_prefixed_report_settles_as_failure() {
+fn subagent_failure_detected_from_typed_field_not_prefix() {
     let mut history = vec![running("Build", "explore")];
     settle_subagent_in(
         &mut history,
@@ -213,7 +225,19 @@ fn error_prefixed_report_settles_as_failure() {
         "default",
         report_update("Error: it broke"),
     );
-    assert_eq!(outcome(&history[0]), Some(("Error: it broke", true)));
+    assert_eq!(outcome(&history[0]), Some(("Error: it broke", false)));
+    assert_eq!(outcome_status(&history[0]), None);
+    assert!(!expanded(&history[0]));
+
+    let mut history = vec![running("Build", "explore")];
+    settle_subagent_in(
+        &mut history,
+        "explore",
+        "task",
+        "default",
+        failed_report_update("model request failed"),
+    );
+    assert_eq!(outcome(&history[0]), Some(("model request failed", true)));
     assert_eq!(
         outcome_status(&history[0]),
         Some("explore stopped with an error")

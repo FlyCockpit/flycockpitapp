@@ -65,9 +65,7 @@ impl Model {
         )?;
         let cache = cfg.resolve_cache(&active.provider, &active.model);
         let timeout = cfg.resolve_timeout(&active.provider, &active.model);
-        let hard_timeout_on_stall = cfg
-            .resolve_backup(&active.provider, &active.model)
-            .is_some();
+        let hard_timeout_on_stall = true;
         let wire_api = cfg.resolve_wire_api(&active.provider, &active.model);
         let wire_api_explicit = cfg.is_wire_api_explicit(&active.provider, &active.model);
         let client_side_tools =
@@ -208,7 +206,7 @@ impl Model {
             Self::ensure_trusted_only_build_allowed(cfg, provider_id, model_id, &trusted_only)?;
         let cache = cfg.resolve_cache(provider_id, model_id);
         let timeout = cfg.resolve_timeout(provider_id, model_id);
-        let hard_timeout_on_stall = cfg.resolve_backup(provider_id, model_id).is_some();
+        let hard_timeout_on_stall = true;
         let wire_api = cfg.resolve_wire_api(provider_id, model_id);
         let wire_api_explicit = cfg.is_wire_api_explicit(provider_id, model_id);
         let client_side_tools = cfg.resolve_effective_client_side_tools(provider_id, model_id);

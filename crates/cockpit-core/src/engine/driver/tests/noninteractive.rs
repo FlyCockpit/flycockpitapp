@@ -1,5 +1,147 @@
 use super::*;
 
+#[test]
+fn child_failure_carries_structured_envelope_to_parent() {
+    let fallback_tried = vec![crate::engine::agent::FailoverAttempt {
+        provider: "flaky".to_string(),
+        model: "primary".to_string(),
+        error_class: Some("network".to_string()),
+        outcome: "failed",
+    }];
+    let error = NoninteractiveRunError::new(
+        anyhow::Error::new(crate::engine::model::InferenceFailure {
+            provider: "flaky".to_string(),
+            model: "primary".to_string(),
+            phase: "dispatched".to_string(),
+            class: "network".to_string(),
+            elapsed_ms: 37,
+            retry_attempts: 3,
+            detail: "connection refused".to_string(),
+        }),
+        Vec::new(),
+        None,
+        fallback_tried.clone(),
+    );
+    let (_message, _history, _fallback_decision, envelope) = error.into_parts();
+    let envelope = envelope.expect("typed failure envelope");
+    let outcome = DelegationChildOutcome::failed_with_envelope(
+        envelope.clone(),
+        DelegationPartialProgress::default(),
+    );
+    let carried = outcome.failure.expect("typed failure envelope");
+    assert_eq!(carried.provider, "flaky");
+    assert_eq!(carried.model, "primary");
+    assert_eq!(carried.error_class, "network");
+    assert_eq!(carried.elapsed_ms, 37);
+    assert_eq!(carried.fallback_tried, fallback_tried);
+    assert_eq!(carried.suggested_action, "retry_or_choose_another_model");
+}
+
+#[test]
+fn failover_walk_completes_before_parent_sees_envelope() {
+    let fallback_tried = vec![
+        crate::engine::agent::FailoverAttempt {
+            provider: "dead".to_string(),
+            model: "primary".to_string(),
+            error_class: Some("timeout_ttft".to_string()),
+            outcome: "failed",
+        },
+        crate::engine::agent::FailoverAttempt {
+            provider: "dead2".to_string(),
+            model: "backup".to_string(),
+            error_class: Some("http_500".to_string()),
+            outcome: "failed",
+        },
+        crate::engine::agent::FailoverAttempt {
+            provider: "healthy".to_string(),
+            model: "fallback".to_string(),
+            error_class: Some("timeout_idle".to_string()),
+            outcome: "failed",
+        },
+    ];
+    let error = NoninteractiveRunError::new(
+        anyhow::Error::new(crate::engine::model::InferenceFailure {
+            provider: "healthy".to_string(),
+            model: "fallback".to_string(),
+            phase: "first_token".to_string(),
+            class: "timeout_idle".to_string(),
+            elapsed_ms: 120_000,
+            retry_attempts: 1,
+            detail: String::new(),
+        }),
+        Vec::new(),
+        None,
+        fallback_tried,
+    );
+    let (_message, _history, _fallback_decision, envelope) = error.into_parts();
+    let envelope = envelope.expect("typed envelope");
+    let outcome = DelegationChildOutcome::failed_with_envelope(
+        envelope,
+        DelegationPartialProgress::default(),
+    );
+    assert_eq!(
+        outcome
+            .failure
+            .as_ref()
+            .expect("typed envelope")
+            .fallback_tried
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn child_routing_metadata_carries_fallback_chain() {
+    let decision = crate::engine::agent::BackupFallbackDecision {
+        primary_model: "primary".to_string(),
+        error_class: "timeout_ttft".to_string(),
+        backup_model: "healthy".to_string(),
+        fallback_tried: vec![
+            crate::engine::agent::FailoverAttempt {
+                provider: "dead".to_string(),
+                model: "primary".to_string(),
+                error_class: Some("timeout_ttft".to_string()),
+                outcome: "failed",
+            },
+            crate::engine::agent::FailoverAttempt {
+                provider: "healthy".to_string(),
+                model: "healthy".to_string(),
+                error_class: None,
+                outcome: "succeeded",
+            },
+        ],
+    };
+    let routing = ChildRoutingMetadata {
+        provider: "healthy".to_string(),
+        model: "healthy".to_string(),
+        trusted_only: false,
+        model_trusted: true,
+        routing: serde_json::json!({ "fallback_decision": "none" }),
+    }
+    .with_fallback_decision(Some(&decision));
+    assert_eq!(routing.routing["fallback_decision"], "backup");
+    assert_eq!(routing.routing["fallback_tried"][0]["model"], "primary");
+    assert_eq!(routing.routing["fallback_tried"][1]["outcome"], "succeeded");
+}
+
+#[test]
+fn delegation_retry_budget_bounds_a_spinning_parent() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver.reset_delegation_retry_budget();
+
+    for _ in 0..DELEGATION_RETRY_BUDGET_PER_TURN {
+        driver
+            .consume_delegation_retry_budget()
+            .expect("within budget");
+    }
+
+    let refusal = driver
+        .consume_delegation_retry_budget()
+        .expect_err("budget should reject the next task call");
+    assert!(refusal.contains("budget exhausted"), "{refusal}");
+    assert!(refusal.contains("task"), "{refusal}");
+}
+
 fn exact_model_selector(model: &str) -> crate::engine::model_roles::DelegationModelSelector {
     crate::engine::model_roles::DelegationModelSelector::Exact {
         selector: format!("lmstudio:{model}"),
@@ -311,7 +453,7 @@ async fn noninteractive_single_spawn_amends_with_child_routing() {
 }
 
 #[test]
-fn noninteractive_single_fallback_amends_and_reports_backup_decision() {
+fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
@@ -348,8 +490,16 @@ fn noninteractive_single_fallback_amends_and_reports_backup_decision() {
                         .unwrap();
 
                     let routing = completion.child_routing.as_ref().unwrap();
+                    assert!(!completion.failed);
                     assert_eq!(routing.model, "child-flaky");
                     assert_eq!(routing.routing["fallback_decision"], "backup");
+                    assert_eq!(routing.routing["fallback_tried"][0]["model"], "child-flaky");
+                    assert_eq!(routing.routing["fallback_tried"][0]["outcome"], "failed");
+                    assert_eq!(
+                        routing.routing["fallback_tried"][1]["model"],
+                        "backup-model"
+                    );
+                    assert_eq!(routing.routing["fallback_tried"][1]["outcome"], "succeeded");
 
                     let events = drain_turn_events(&mut rx);
                     let routing_events = events
@@ -366,6 +516,14 @@ fn noninteractive_single_fallback_amends_and_reports_backup_decision() {
                     assert_eq!(routing_events.len(), 2);
                     assert_eq!(routing_events[0]["fallback_decision"], "none");
                     assert_eq!(routing_events[1]["fallback_decision"], "backup");
+                    assert_eq!(
+                        routing_events[1]["fallback_tried"][0]["model"],
+                        "child-flaky"
+                    );
+                    assert_eq!(
+                        routing_events[1]["fallback_tried"][1]["model"],
+                        "backup-model"
+                    );
 
                     let _ = driver
                         .finalize_single_noninteractive_task(completion, &tx, true)
@@ -383,6 +541,14 @@ fn noninteractive_single_fallback_amends_and_reports_backup_decision() {
                         })
                         .expect("durable subagent_report event");
                     assert_eq!(report_event.data["routing"]["fallback_decision"], "backup");
+                    assert_eq!(
+                        report_event.data["routing"]["fallback_tried"][0]["model"],
+                        "child-flaky"
+                    );
+                    assert_eq!(
+                        report_event.data["routing"]["fallback_tried"][1]["outcome"],
+                        "succeeded"
+                    );
                 });
         })
         .unwrap()
@@ -827,6 +993,7 @@ async fn noninteractive_single_inline_result_shape_is_unchanged() {
                 task_function_call_id: Some("fn-single".to_string()),
                 report: "single report".to_string(),
                 failed: false,
+                failure: None,
                 partial_progress: DelegationPartialProgress::default(),
                 seeds: Vec::new(),
                 new_handle: None,
@@ -860,6 +1027,7 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
                 task_function_call_id: Some("fn-single".to_string()),
                 report: "single report".to_string(),
                 failed: false,
+                failure: None,
                 partial_progress: DelegationPartialProgress::default(),
                 seeds: Vec::new(),
                 new_handle: None,
@@ -944,6 +1112,7 @@ async fn noninteractive_report_stamps_child_model() {
                 task_function_call_id: Some("fn-single-child-report".to_string()),
                 report: "single report".to_string(),
                 failed: false,
+                failure: None,
                 partial_progress: DelegationPartialProgress::default(),
                 seeds: Vec::new(),
                 new_handle: None,
@@ -1157,6 +1326,7 @@ async fn noninteractive_single_result_includes_task_repair_notes() {
                 task_function_call_id: Some("fn-single".to_string()),
                 report: "single report".to_string(),
                 failed: false,
+                failure: None,
                 partial_progress: DelegationPartialProgress::default(),
                 seeds: Vec::new(),
                 new_handle: None,

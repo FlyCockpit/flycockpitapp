@@ -325,6 +325,7 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
         phase: "stream".to_string(),
         class: "http_429".to_string(),
         elapsed_ms: 42,
+        retry_attempts: 1,
         detail: "rate limited".to_string(),
     };
 
@@ -416,6 +417,7 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         phase: "dispatch".to_string(),
         class: "rate_limit_exceeded".to_string(),
         elapsed_ms: 7,
+        retry_attempts: 1,
         detail: "quota exhausted".to_string(),
     };
 
@@ -663,6 +665,7 @@ async fn failed_turn_recovery_records_retry_context_and_progress() {
         phase: "first_token".into(),
         class: "network".into(),
         elapsed_ms: 42_000,
+        retry_attempts: 1,
         detail: "HTTP 503 Service Unavailable".into(),
     };
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);

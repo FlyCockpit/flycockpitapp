@@ -104,7 +104,8 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
         .map(|reason| reason.as_str())
         .unwrap_or("none");
 
-    let (providers, provider_failures) = provider_lines(&providers, &extended);
+    let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
+    let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
     Ok(DiagnosticsSnapshot {
         session: session_label(input.session_id, input.session_short_id.as_deref()),
         active_agent: input.active_agent.clone(),
@@ -189,6 +190,7 @@ fn workspace_trust_mode(cwd: &Path) -> String {
 fn provider_lines(
     cfg: &crate::config::providers::ProvidersConfig,
     extended: &crate::config::extended::ExtendedConfig,
+    delegation_enabled: bool,
 ) -> (Vec<String>, bool) {
     let trusted_only = extended.trusted_only;
     let mut out = Vec::new();
@@ -209,6 +211,7 @@ fn provider_lines(
         out.push("no providers configured; run: cockpit provider add".to_string());
         return (out, true);
     }
+    let mut total_invokable = 0usize;
     for (id, provider) in &cfg.providers {
         let fetch = provider
             .last_model_fetch
@@ -226,6 +229,15 @@ fn provider_lines(
             .iter()
             .filter(|model| cfg.resolve_subagent_invokable(id, &model.id))
             .count();
+        let eligible_subagent_count = provider
+            .models
+            .iter()
+            .filter(|model| {
+                cfg.resolve_subagent_invokable(id, &model.id)
+                    && (!trusted_only || cfg.resolve_trust(id, &model.id).is_trusted())
+            })
+            .count();
+        total_invokable += eligible_subagent_count;
         let can_delegate_count = provider
             .models
             .iter()
@@ -299,7 +311,41 @@ fn provider_lines(
         failed |= credential_failed;
         out.push(credential);
     }
+    match (delegation_enabled, total_invokable) {
+        (true, 0) => {
+            out.push(
+                "subagent failover coverage: FAILED; delegation is available but no eligible subagent-invokable models are configured"
+                    .to_string(),
+            );
+            failed = true;
+        }
+        (false, 0) => out.push(
+            "subagent failover coverage: informational; delegation is unavailable and no subagent-invokable models are configured"
+                .to_string(),
+        ),
+        (true, 1) => out.push(
+            "subagent failover coverage: WARNING; exactly one eligible subagent-invokable model is configured, so delegation has no model failover"
+                .to_string(),
+        ),
+        _ => out.push(format!(
+            "subagent failover coverage: {total_invokable} eligible subagent-invokable models"
+        )),
+    }
+    out.push("subagent failover reachability: not probed in this snapshot; run online `cockpit doctor` network checks for provider reachability".to_string());
     (out, failed)
+}
+
+fn delegation_enabled_for_coverage(
+    cfg: &crate::config::providers::ProvidersConfig,
+    _extended: &crate::config::extended::ExtendedConfig,
+    input: &DiagnosticsInput,
+) -> bool {
+    let active_can_delegate = input
+        .active_model
+        .as_ref()
+        .map(|(provider, model)| cfg.resolve_can_delegate(provider, model))
+        .unwrap_or(true);
+    active_can_delegate && agent_has_tool(&input.cwd, &input.active_agent, "task")
 }
 
 fn credential_line(
@@ -452,7 +498,12 @@ async fn provider_network_lines(
         );
     }
     let mut results = futures::stream::iter(cfg.providers.iter().enumerate().map(
-        |(idx, (id, provider))| async move {
+        |(idx, (id, provider))| {
+            let has_invokable_models = provider
+                .models
+                .iter()
+                .any(|model| cfg.resolve_subagent_invokable(id, &model.id));
+            async move {
         let Some(template_id) = provider.effective_template(id) else {
             return (
                 idx,
@@ -480,9 +531,20 @@ async fn provider_network_lines(
                 format!(
                     "{id}: reachable · credentials REJECTED ({}) — run: cockpit provider add {template_id}",
                     one_line(&error)
-                ),
-                true,
             ),
+            true,
+            ),
+            Err(crate::providers::auth_check::AuthCheckError::Network(error))
+                if has_invokable_models =>
+            {
+                (
+                    format!(
+                        "{id}: WARNING unreachable for subagent failover ({}) — check network/proxy; run: cockpit provider add {template_id}",
+                        one_line(&error)
+                    ),
+                    false,
+                )
+            }
             Err(crate::providers::auth_check::AuthCheckError::Network(error)) => (
                 format!(
                     "{id}: UNREACHABLE ({}) — check network/proxy; run: cockpit provider add {template_id}",
@@ -499,6 +561,7 @@ async fn provider_network_lines(
             ),
         };
         (idx, line, failed)
+            }
         },
     ))
     .buffer_unordered(4)
@@ -835,6 +898,111 @@ mod tests {
         assert!(rendered.contains("can-delegate 1/3"), "{rendered}");
     }
 
+    fn coverage_cfg(model: crate::config::providers::ModelEntry) -> ProvidersConfig {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "p".to_string(),
+            ProviderEntry {
+                url: "https://p.example/v1".to_string(),
+                auth: Some(AuthKind::None),
+                models: vec![model],
+                ..ProviderEntry::default()
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn doctor_fails_when_delegation_enabled_and_no_invokable_models() {
+        let cfg = coverage_cfg(crate::config::providers::ModelEntry {
+            id: "m".to_string(),
+            can_delegate: Some(true),
+            ..Default::default()
+        });
+        let (lines, failed) = provider_lines(
+            &cfg,
+            &crate::config::extended::ExtendedConfig::default(),
+            true,
+        );
+        let rendered = lines.join("\n");
+        assert!(failed, "{rendered}");
+        assert!(
+            rendered.contains("subagent failover coverage: FAILED"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_fail_when_delegation_disabled_and_no_invokable_models() {
+        let cfg = coverage_cfg(crate::config::providers::ModelEntry {
+            id: "m".to_string(),
+            can_delegate: Some(false),
+            ..Default::default()
+        });
+        let (lines, failed) = provider_lines(
+            &cfg,
+            &crate::config::extended::ExtendedConfig::default(),
+            false,
+        );
+        let rendered = lines.join("\n");
+        assert!(!failed, "{rendered}");
+        assert!(
+            rendered.contains("subagent failover coverage: informational"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn doctor_warns_but_does_not_fail_with_single_invokable_model() {
+        let cfg = coverage_cfg(crate::config::providers::ModelEntry {
+            id: "m".to_string(),
+            can_delegate: Some(true),
+            subagent_invokable: Some(true),
+            ..Default::default()
+        });
+        let (lines, failed) = provider_lines(
+            &cfg,
+            &crate::config::extended::ExtendedConfig::default(),
+            true,
+        );
+        let rendered = lines.join("\n");
+        assert!(!failed, "{rendered}");
+        assert!(
+            rendered.contains("subagent failover coverage: WARNING"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn doctor_offline_skips_invokable_reachability_probe() {
+        let mut cfg = coverage_cfg(crate::config::providers::ModelEntry {
+            id: "m".to_string(),
+            can_delegate: Some(true),
+            subagent_invokable: Some(true),
+            ..Default::default()
+        });
+        cfg.providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(crate::config::providers::ModelEntry {
+                id: "n".to_string(),
+                subagent_invokable: Some(true),
+                ..Default::default()
+            });
+        let (lines, failed) = provider_lines(
+            &cfg,
+            &crate::config::extended::ExtendedConfig::default(),
+            true,
+        );
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("subagent failover reachability: not probed"),
+            "{rendered}"
+        );
+        assert!(!failed, "{rendered}");
+    }
+
     #[test]
     fn doctor_reports_computer_use() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1000,6 +1168,18 @@ mod tests {
         cfg
     }
 
+    fn network_cfg_with_invokable(base_url: String) -> ProvidersConfig {
+        let mut cfg = network_cfg(base_url);
+        cfg.providers.get_mut("zai-test").unwrap().models.push(
+            crate::config::providers::ModelEntry {
+                id: "child".to_string(),
+                subagent_invokable: Some(true),
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
     #[tokio::test]
     async fn doctor_network_states_and_mutates_nothing() {
         let ok_url = one_shot_server("200 OK", r#"{"ok":true}"#).await;
@@ -1036,6 +1216,20 @@ mod tests {
         assert_eq!(lines, ["network checks: skipped (--offline)"]);
     }
 
+    #[tokio::test]
+    async fn doctor_unreachable_invokable_host_warns_without_failing() {
+        let cfg = network_cfg_with_invokable("http://127.0.0.1:9/v1".to_string());
+        let (lines, failed) = provider_network_lines(&cfg, false).await;
+
+        assert!(!failed, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("WARNING unreachable for subagent failover")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn doctor_git_states() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1067,8 +1261,11 @@ mod tests {
                 ..ProviderEntry::default()
             },
         );
-        let (_lines, failed) =
-            provider_lines(&cfg, &crate::config::extended::ExtendedConfig::default());
+        let (_lines, failed) = provider_lines(
+            &cfg,
+            &crate::config::extended::ExtendedConfig::default(),
+            false,
+        );
         assert!(!failed);
     }
 

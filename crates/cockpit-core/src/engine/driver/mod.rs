@@ -37,7 +37,10 @@ pub(crate) use noninteractive::{NoninteractiveSteerTarget, run_noninteractive};
 use queue::*;
 use reports::*;
 #[allow(unused_imports)]
-pub(crate) use reports::{build_backup_model, resolve_backup_model_for};
+pub(crate) use reports::{
+    build_backup_model, build_failover_models, resolve_backup_model_for,
+    resolve_failover_models_for,
+};
 use skills_seed::SkillPair;
 
 use std::{collections::HashSet, path::PathBuf, pin::Pin, sync::Arc};
@@ -426,6 +429,7 @@ pub struct Driver {
     /// Maximum root-agent `Continue` cycles allowed per user message
     /// before the driver pauses for confirmation. `0` means unlimited.
     pub max_primary_rounds: u32,
+    delegation_retry_budget_remaining: usize,
     /// Config opt-in for schedule `limit=0` loops. Even when true, an
     /// interactive session approval is still required once per session.
     pub allow_unbounded_schedule_loops: bool,
@@ -905,17 +909,21 @@ impl ChildRoutingMetadata {
         model: &crate::engine::model::Model,
         fallback_decision: Option<&crate::engine::agent::BackupFallbackDecision>,
     ) -> Self {
+        let mut routing = model.routing_metadata_json_with_fallback_decision(
+            None,
+            fallback_decision
+                .map(|decision| decision.routing_value())
+                .unwrap_or("none"),
+        );
+        if let Some(decision) = fallback_decision {
+            routing["fallback_tried"] = serde_json::json!(decision.fallback_tried);
+        }
         Self {
             provider: model.provider_id().to_string(),
             model: model.model_id_ref().to_string(),
             trusted_only: model.trusted_only_enabled(),
             model_trusted: model.is_trusted(),
-            routing: model.routing_metadata_json_with_fallback_decision(
-                None,
-                fallback_decision
-                    .map(|decision| decision.routing_value())
-                    .unwrap_or("none"),
-            ),
+            routing,
         }
     }
 
@@ -931,6 +939,7 @@ impl ChildRoutingMetadata {
     ) -> Self {
         if let Some(decision) = fallback_decision {
             self.routing["fallback_decision"] = serde_json::json!(decision.routing_value());
+            self.routing["fallback_tried"] = serde_json::json!(decision.fallback_tried);
         }
         self
     }
@@ -1097,6 +1106,7 @@ impl Driver {
             time_injection_interval_minutes: self.time_injection_interval_minutes,
             loop_guard_threshold: self.loop_guard_threshold,
             max_primary_rounds: self.max_primary_rounds,
+            delegation_retry_budget_remaining: self.delegation_retry_budget_remaining,
             allow_unbounded_schedule_loops: self.allow_unbounded_schedule_loops,
             unbounded_schedule_loops_approved: self.unbounded_schedule_loops_approved,
             schedule,
@@ -1386,6 +1396,7 @@ impl Driver {
             time_injection_interval_minutes: 5,
             loop_guard_threshold: crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
             max_primary_rounds: 0,
+            delegation_retry_budget_remaining: DELEGATION_RETRY_BUDGET_PER_TURN,
             allow_unbounded_schedule_loops: false,
             unbounded_schedule_loops_approved: false,
             schedule,
@@ -2065,6 +2076,20 @@ impl Driver {
         }
     }
 
+    fn reset_delegation_retry_budget(&mut self) {
+        self.delegation_retry_budget_remaining = DELEGATION_RETRY_BUDGET_PER_TURN;
+    }
+
+    fn consume_delegation_retry_budget(&mut self) -> std::result::Result<(), String> {
+        if self.delegation_retry_budget_remaining == 0 {
+            return Err(format!(
+                "Error: delegation retry budget exhausted before accepting another task call (limit {DELEGATION_RETRY_BUDGET_PER_TURN} per parent turn). Stop re-issuing `task` calls and summarize the failure to the user."
+            ));
+        }
+        self.delegation_retry_budget_remaining -= 1;
+        Ok(())
+    }
+
     /// Lower the global injection-block threshold by one level (toward
     /// `off`) and persist it to a global config dir. Returns the new
     /// threshold. The write target is the first existing/home global
@@ -2276,6 +2301,7 @@ impl Driver {
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_model_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
@@ -2298,6 +2324,7 @@ impl Driver {
             self.publish_active_tool_names();
             let is_root = self.stack.len() == 1;
             let backup_model = self.resolve_backup_model(&agent.model);
+            let fallback_models = self.resolve_failover_models(&agent.model);
             let call_id = uuid::Uuid::new_v4();
             let context_usage = self.context_usage_snapshot();
             let tandem = self
@@ -2311,6 +2338,7 @@ impl Driver {
                 turn_with_backup(
                     &agent,
                     backup_model.as_ref(),
+                    &fallback_models,
                     &mut top.history,
                     next_prompt.clone(),
                     self.session.clone(),
@@ -4142,6 +4170,17 @@ impl Driver {
         resolve_backup_model_for(&self.cwd, model)
     }
 
+    fn resolve_failover_models(
+        &self,
+        model: &crate::engine::model::Model,
+    ) -> Vec<Arc<crate::engine::model::Model>> {
+        #[cfg(test)]
+        if let Some((providers, _, _)) = &self.test_providers_override {
+            return build_failover_models(providers, model);
+        }
+        resolve_failover_models_for(&self.cwd, model)
+    }
+
     /// Load the layered providers config plus the session's active
     /// (provider, model). `None` when no model is selected or the config
     /// can't be loaded — callers fall back to conservative defaults. Same
@@ -4590,6 +4629,7 @@ impl Driver {
                     .unwrap_or_default(),
                 label: "default".to_string(),
                 report: report.clone(),
+                failed: false,
                 trusted_only: routing.trusted_only,
                 model_trusted: routing.model_trusted,
                 routing: routing.routing,
@@ -4696,6 +4736,7 @@ impl Driver {
                         .unwrap_or_default(),
                     label: "default".to_string(),
                     report: report.clone(),
+                    failed: true,
                     trusted_only: routing.trusted_only,
                     model_trusted: routing.model_trusted,
                     routing: routing.routing,
@@ -4791,6 +4832,7 @@ impl Driver {
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_model_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
@@ -5071,6 +5113,7 @@ impl Driver {
             let attempted_prompt = next_prompt.clone();
             self.publish_active_tool_names();
             let mut turn_metadata = BackupTurnMetadata::default();
+            let fallback_models = self.resolve_failover_models(&agent.model);
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 // The foreground frame's deferred-log buffer (`plan.md §3d`):
@@ -5080,6 +5123,7 @@ impl Driver {
                 turn_with_backup(
                     &agent,
                     backup_model.as_ref(),
+                    &fallback_models,
                     &mut top.history,
                     next_prompt.clone(),
                     self.session.clone(),
@@ -5281,6 +5325,7 @@ impl Driver {
                                     return Ok(());
                                 };
                                 self.record_queued_user_fold(&prepared, tx).await;
+                                self.reset_delegation_retry_budget();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         kind: UserSubmissionKind::User,
@@ -5347,6 +5392,7 @@ impl Driver {
                                     continue;
                                 };
                                 self.record_queued_user_fold(&prepared, tx).await;
+                                self.reset_delegation_retry_budget();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         kind: UserSubmissionKind::User,
@@ -5389,6 +5435,14 @@ impl Driver {
                     task_call_id,
                     task_function_call_id,
                 } => {
+                    if let Err(err) = self.consume_delegation_retry_budget() {
+                        next_prompt = Message::tool_result_with_call_id(
+                            task_call_id,
+                            task_function_call_id,
+                            prepend_task_repair_notes(err, &repair_notes),
+                        );
+                        continue;
+                    }
                     let child_recursion =
                         match self.resolve_task_recursion(&child_agent, remaining_depth, &model) {
                             Ok(ctx) => ctx,
@@ -5628,6 +5682,14 @@ impl Driver {
                     task_call_id,
                     task_function_call_id,
                 } => {
+                    if let Err(err) = self.consume_delegation_retry_budget() {
+                        next_prompt = Message::tool_result_with_call_id(
+                            task_call_id,
+                            task_function_call_id,
+                            prepend_task_repair_notes(err, &repair_notes),
+                        );
+                        continue;
+                    }
                     let child_recursion =
                         match self.resolve_task_recursion(&child_agent, remaining_depth, &model) {
                             Ok(ctx) => ctx,
@@ -5684,6 +5746,14 @@ impl Driver {
                     task_call_id,
                     task_function_call_id,
                 } => {
+                    if let Err(err) = self.consume_delegation_retry_budget() {
+                        next_prompt = Message::tool_result_with_call_id(
+                            task_call_id,
+                            task_function_call_id,
+                            prepend_task_repair_notes(err, &repair_notes),
+                        );
+                        continue;
+                    }
                     let mut child_cwds = Vec::with_capacity(entries.len());
                     let mut cwd_error = None;
                     for entry in &entries {
@@ -6300,6 +6370,11 @@ fn is_continue_command(text: &str) -> bool {
 /// exploration work needs headroom; 64 turns bounds runaway loops
 /// without cutting legitimate work short.
 pub(crate) const EXPLORE_MAX_TURNS: usize = 64;
+
+/// Per-parent-turn cap on accepted `task` delegations. This bounds a weak
+/// parent model that keeps re-issuing delegation after child failures; each
+/// batch consumes one unit so siblings in a batch do not starve one another.
+pub(crate) const DELEGATION_RETRY_BUDGET_PER_TURN: usize = 4;
 
 /// Token cap on the seeded read-only results a re-queryable subagent injects
 /// into its caller's transcript (GOALS §3c). Seeds are real injected context,

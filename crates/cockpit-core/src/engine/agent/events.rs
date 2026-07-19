@@ -316,6 +316,7 @@ pub enum TurnEvent {
         task_call_id: String,
         label: String,
         report: String,
+        failed: bool,
         trusted_only: bool,
         model_trusted: bool,
         routing: serde_json::Value,

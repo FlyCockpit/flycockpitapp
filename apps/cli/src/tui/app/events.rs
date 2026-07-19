@@ -797,6 +797,7 @@ impl App {
                 task_call_id,
                 label,
                 report,
+                failed,
                 trusted_only,
                 model_trusted,
                 routing,
@@ -804,6 +805,7 @@ impl App {
                 self.pop_agent_path_for_report(&agent);
                 let update = SubagentReportUpdate {
                     report,
+                    failed,
                     trusted_only,
                     model_trusted,
                     routing: subagent_routing_chips_from_value(&routing),
@@ -2554,6 +2556,7 @@ pub(super) fn xml_escape(s: &str) -> String {
 #[derive(Clone)]
 pub(super) struct SubagentReportUpdate {
     pub(super) report: String,
+    pub(super) failed: bool,
     pub(super) trusted_only: bool,
     pub(super) model_trusted: bool,
     pub(super) routing: SubagentRoutingChips,
@@ -2592,11 +2595,11 @@ pub(super) fn settle_subagent_in(
 ) {
     let SubagentReportUpdate {
         report,
+        failed,
         trusted_only,
         model_trusted,
         routing,
     } = update;
-    let failed = report.starts_with("Error: ");
     let status = classify_subagent_status(child, &report, failed);
     let auto_expand = status.is_some();
     let found = history.iter_mut().rev().find_map(|entry| match entry {

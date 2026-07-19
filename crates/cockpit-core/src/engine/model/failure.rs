@@ -141,6 +141,7 @@ pub struct InferenceFailure {
     pub phase: String,
     pub class: String,
     pub elapsed_ms: u64,
+    pub retry_attempts: u32,
     /// Human-readable underlying reason (the source error's message), shown
     /// in the inline error alongside provider/model. Empty for a pure
     /// timeout (the class + ceiling already say everything).

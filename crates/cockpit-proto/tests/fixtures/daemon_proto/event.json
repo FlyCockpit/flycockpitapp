@@ -651,6 +651,7 @@
   "subagent_report": {
     "data": {
       "agent": "agent-fixture",
+      "failed": false,
       "label": "label-fixture",
       "model_trusted": true,
       "report": "report-fixture",

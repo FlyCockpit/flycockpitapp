@@ -683,6 +683,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             task_call_id: _,
             label,
             report,
+            failed: _,
             trusted_only: _,
             model_trusted: _,
             routing,

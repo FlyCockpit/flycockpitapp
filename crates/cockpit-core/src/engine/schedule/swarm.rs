@@ -131,11 +131,14 @@ async fn run_swarm_loop(
     // (implementation note): `Swarm` is in scope, so the
     // child inherits the same mechanism, resolved against the model it runs on.
     let backup_model = crate::engine::driver::resolve_backup_model_for(&ctx.cwd, &agent.model);
+    let fallback_models =
+        crate::engine::driver::resolve_failover_models_for(&ctx.cwd, &agent.model);
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome = crate::engine::agent::turn_with_backup(
             &agent,
             backup_model.as_ref(),
+            &fallback_models,
             &mut history,
             next_prompt,
             ctx.session.clone(),

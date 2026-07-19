@@ -48,7 +48,10 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod turn_phases;
 
-pub use backup::{BackupFallbackDecision, BackupTurnMetadata, turn_with_backup};
+pub use backup::{
+    BackupFallbackDecision, BackupTurnMetadata, FailoverAttempt, MAX_FAILOVER_CANDIDATES,
+    suggested_action_for_failure_class, turn_with_backup,
+};
 pub use events::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, TurnEvent,
 };

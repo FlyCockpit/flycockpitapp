@@ -672,10 +672,10 @@ default_const!(default_auto_prune_prunable_pct, u8, 30);
 /// - `idle_secs` — idle/inter-token warning: notify if the gap between two
 ///   streamed tokens exceeds this. Default 90s.
 ///
-/// Without a resolved backup model these thresholds only warn and the stream
-/// keeps waiting. With a resolved backup model they are hard timeout points:
-/// the primary attempt fails with `timeout_ttft` / `timeout_idle` so backup
-/// fallback can answer the turn.
+/// These thresholds warn and then hard-fail the current attempt with
+/// `timeout_ttft` / `timeout_idle`. That unified default keeps failover
+/// available for both interactive turns and delegated children instead of
+/// letting a stalled stream wait forever.
 ///
 /// There is deliberately **no** overall wall-clock cap: a response that keeps
 /// producing tokens is never killed for taking long in total.
@@ -2021,12 +2021,14 @@ impl ProvidersConfig {
             .unwrap_or_else(|| entry.timeout.clone())
     }
 
-    /// Resolve the effective backup-model fallback for `(provider, model)`:
-    /// the model-level override if present, else the provider-level config,
-    /// else `None` (no fallback → hard-fail per the inference-timeout work).
-    /// Drives the per-turn primary-first fallback in the driver
-    /// (implementation note). The returned reference may
-    /// name a *different* provider than the one passed in.
+    /// Resolve the explicitly configured first fallback for `(provider,
+    /// model)`: the model-level override if present, else the provider-level
+    /// config, else `None`. Delegated turns now continue with a bounded
+    /// chained walk over other `subagent_invokable` models after this explicit
+    /// backup. That deliberately overturns the old single-backup rule: a user
+    /// with one dead invokable model otherwise got no unattended failover and a
+    /// multi-minute stall. The returned reference may name a different
+    /// provider than the one passed in.
     pub fn resolve_backup(&self, provider: &str, model: &str) -> Option<BackupConfig> {
         let entry = self.providers.get(provider)?;
         entry

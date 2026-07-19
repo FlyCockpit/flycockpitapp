@@ -120,6 +120,31 @@ fn failed_subagent_before_first_tool_has_no_partial_progress() {
 }
 
 #[test]
+fn failed_report_renders_compact_deterministic_prose() {
+    let envelope = SubagentFailureEnvelope {
+        provider: "flaky".to_string(),
+        model: "bad-model".to_string(),
+        error_class: "timeout_ttft".to_string(),
+        elapsed_ms: 120_000,
+        fallback_tried: vec![crate::engine::agent::FailoverAttempt {
+            provider: "flaky".to_string(),
+            model: "bad-model".to_string(),
+            error_class: Some("timeout_ttft".to_string()),
+            outcome: "failed",
+        }],
+        suggested_action: "retry_or_choose_another_model".to_string(),
+        detail: "no first token".to_string(),
+    };
+    let progress = DelegationPartialProgress::default();
+    let first = render_failed_subagent_failure(&envelope, &progress);
+    let second = render_failed_subagent_failure(&envelope, &progress);
+    assert_eq!(first, second);
+    assert!(!first.contains('{'), "{first}");
+    assert!(!first.contains('}'), "{first}");
+    assert!(first.contains("Suggested action (advisory)"), "{first}");
+}
+
+#[test]
 fn spawn_gate_clamps_to_ceiling_and_requires_output_dir() {
     // Depth ceiling (GOALS §24): at the ceiling the spawn is refused and
     // the branch does its own work (clamp, don't crash). Below it, the

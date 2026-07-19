@@ -81,6 +81,38 @@ pub(in crate::engine::driver) struct DelegationPartialProgress {
     pub(in crate::engine::driver) dirty_owned_changes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(in crate::engine::driver) struct SubagentFailureEnvelope {
+    pub(in crate::engine::driver) provider: String,
+    pub(in crate::engine::driver) model: String,
+    pub(in crate::engine::driver) error_class: String,
+    pub(in crate::engine::driver) elapsed_ms: u64,
+    pub(in crate::engine::driver) fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
+    pub(in crate::engine::driver) suggested_action: String,
+    pub(in crate::engine::driver) detail: String,
+}
+
+impl SubagentFailureEnvelope {
+    fn from_error(
+        source: &anyhow::Error,
+        fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
+    ) -> Option<Self> {
+        let failure = crate::engine::model::as_inference_failure(source)?;
+        Some(Self {
+            provider: failure.provider.clone(),
+            model: failure.model.clone(),
+            error_class: failure.class.clone(),
+            elapsed_ms: failure.elapsed_ms,
+            fallback_tried,
+            suggested_action: crate::engine::agent::suggested_action_for_failure_class(
+                &failure.class,
+            )
+            .to_string(),
+            detail: failure.detail.clone(),
+        })
+    }
+}
+
 impl DelegationPartialProgress {
     pub(in crate::engine::driver) fn is_empty(&self) -> bool {
         self.files_read.is_empty()
@@ -97,6 +129,7 @@ impl DelegationPartialProgress {
 pub(in crate::engine::driver) struct DelegationChildOutcome {
     pub(in crate::engine::driver) report: String,
     pub(in crate::engine::driver) failed: bool,
+    pub(in crate::engine::driver) failure: Option<SubagentFailureEnvelope>,
     pub(in crate::engine::driver) partial_progress: DelegationPartialProgress,
     pub(in crate::engine::driver) child_routing: Option<ChildRoutingMetadata>,
 }
@@ -106,6 +139,7 @@ impl DelegationChildOutcome {
         Self {
             report: report.into(),
             failed: false,
+            failure: None,
             partial_progress: DelegationPartialProgress::default(),
             child_routing: None,
         }
@@ -115,6 +149,7 @@ impl DelegationChildOutcome {
         Self {
             report: report.into(),
             failed: true,
+            failure: None,
             partial_progress: DelegationPartialProgress::default(),
             child_routing: None,
         }
@@ -129,6 +164,21 @@ impl DelegationChildOutcome {
         Self {
             report,
             failed: true,
+            failure: None,
+            partial_progress,
+            child_routing: None,
+        }
+    }
+
+    pub(in crate::engine::driver) fn failed_with_envelope(
+        envelope: SubagentFailureEnvelope,
+        partial_progress: DelegationPartialProgress,
+    ) -> Self {
+        let report = render_failed_subagent_failure(&envelope, &partial_progress);
+        Self {
+            report,
+            failed: true,
+            failure: Some(envelope),
             partial_progress,
             child_routing: None,
         }
@@ -496,6 +546,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
     pub(in crate::engine::driver) report: String,
     pub(in crate::engine::driver) failed: bool,
+    pub(in crate::engine::driver) failure: Option<SubagentFailureEnvelope>,
     pub(in crate::engine::driver) partial_progress: DelegationPartialProgress,
     pub(in crate::engine::driver) seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub(in crate::engine::driver) new_handle: Option<String>,
@@ -840,6 +891,7 @@ impl Driver {
                 task_function_call_id,
                 report: err,
                 failed: true,
+                failure: None,
                 partial_progress: DelegationPartialProgress::default(),
                 seeds: Vec::new(),
                 new_handle: None,
@@ -865,6 +917,7 @@ impl Driver {
                     task_function_call_id,
                     report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
                     failed: true,
+                    failure: None,
                     partial_progress: DelegationPartialProgress::default(),
                     seeds: Vec::new(),
                     new_handle: None,
@@ -1031,6 +1084,7 @@ impl Driver {
                                 task_function_call_id,
                                 report: format!("Error: {e:#}"),
                                 failed: true,
+                                failure: None,
                                 partial_progress: DelegationPartialProgress::default(),
                                 seeds: Vec::new(),
                                 new_handle: None,
@@ -1126,7 +1180,8 @@ impl Driver {
                     .await
                     {
                         Err(e) => {
-                            let (message, history, fallback_decision) = e.into_parts();
+                            let (message, history, fallback_decision, failure_envelope) =
+                                e.into_parts();
                             let partial_progress = partial_progress_from_history(&history);
                             snapshot = NoninteractiveDelegationSnapshot::from_history(history);
                             let final_child_routing = child_routing
@@ -1142,11 +1197,17 @@ impl Driver {
                                 )
                                 .await;
                             }
-                            DelegationChildOutcome::failed_with_progress(
-                                format!("Error: {message}"),
-                                partial_progress,
-                            )
-                            .with_child_routing(final_child_routing)
+                            let outcome = match failure_envelope {
+                                Some(envelope) => DelegationChildOutcome::failed_with_envelope(
+                                    envelope,
+                                    partial_progress,
+                                ),
+                                None => DelegationChildOutcome::failed_with_progress(
+                                    format!("Error: {message}"),
+                                    partial_progress,
+                                ),
+                            };
+                            outcome.with_child_routing(final_child_routing)
                         }
                         Ok(outcome) => {
                             snapshot = NoninteractiveDelegationSnapshot::from_history(
@@ -1198,6 +1259,7 @@ impl Driver {
             task_function_call_id,
             report: outcome.report,
             failed: outcome.failed,
+            failure: outcome.failure,
             partial_progress: outcome.partial_progress,
             seeds,
             new_handle,
@@ -1223,6 +1285,7 @@ impl Driver {
             task_function_call_id,
             report,
             failed,
+            failure,
             partial_progress,
             seeds,
             new_handle,
@@ -1297,7 +1360,7 @@ impl Driver {
             .maybe_scan_task_report(&child_agent, report, tx)
             .await?;
 
-        let report_data = subagent_report_event_data(
+        let mut report_data = subagent_report_event_data(
             &child_agent,
             Some(&task_call_id),
             task_function_call_id.as_deref(),
@@ -1305,6 +1368,10 @@ impl Driver {
             &report,
             Some(&partial_progress),
         );
+        if let Some(failure) = failure.as_ref() {
+            report_data["failure"] = serde_json::to_value(failure)
+                .unwrap_or_else(|_| serde_json::json!({ "serialization_error": true }));
+        }
         let report_data = match child_routing.as_ref() {
             Some(routing) => with_child_routing_metadata(report_data, routing),
             None => {
@@ -1331,6 +1398,7 @@ impl Driver {
                 task_call_id: task_call_id.clone(),
                 label: "default".to_string(),
                 report: report.clone(),
+                failed,
                 trusted_only: routing.trusted_only,
                 model_trusted: routing.model_trusted,
                 routing: routing.routing,
@@ -2686,7 +2754,8 @@ impl Driver {
                                     .with_child_routing(final_child_routing)
                             }
                             Err(e) => {
-                                let (message, history, fallback_decision) = e.into_parts();
+                                let (message, history, fallback_decision, failure_envelope) =
+                                    e.into_parts();
                                 let partial_progress = partial_progress_from_history(&history);
                                 snapshot = NoninteractiveDelegationSnapshot::from_history(history);
                                 let final_child_routing = child_routing
@@ -2703,11 +2772,19 @@ impl Driver {
                                         )
                                         .await;
                                 }
-                                DelegationChildOutcome::failed_with_progress(
-                                    format!("Error: {message}"),
-                                    partial_progress,
-                                )
-                                .with_child_routing(final_child_routing)
+                                let outcome = match failure_envelope {
+                                    Some(envelope) => {
+                                        DelegationChildOutcome::failed_with_envelope(
+                                            envelope,
+                                            partial_progress,
+                                        )
+                                    }
+                                    None => DelegationChildOutcome::failed_with_progress(
+                                        format!("Error: {message}"),
+                                        partial_progress,
+                                    ),
+                                };
+                                outcome.with_child_routing(final_child_routing)
                             }
                         }
                     };
@@ -2723,7 +2800,7 @@ impl Driver {
                 &outcome.report,
                 outcome.failed,
             );
-            let report_data = subagent_report_event_data(
+            let mut report_data = subagent_report_event_data(
                 &entry.child_agent,
                 Some(&task_call_id),
                 task_function_call_id.as_deref(),
@@ -2731,6 +2808,10 @@ impl Driver {
                 &report,
                 Some(&outcome.partial_progress),
             );
+            if let Some(failure) = outcome.failure.as_ref() {
+                report_data["failure"] = serde_json::to_value(failure)
+                    .unwrap_or_else(|_| serde_json::json!({ "serialization_error": true }));
+            }
             let report_data = match outcome.child_routing.as_ref() {
                 Some(routing) => with_child_routing_metadata(report_data, routing),
                 None => with_model_routing_metadata(
@@ -2755,6 +2836,7 @@ impl Driver {
                     task_call_id: task_call_id.clone(),
                     label: entry.label.clone(),
                     report: report.clone(),
+                    failed: outcome.failed,
                     trusted_only: routing.trusted_only,
                     model_trusted: routing.model_trusted,
                     routing: routing.routing,
@@ -3475,32 +3557,46 @@ pub(crate) struct NoninteractiveRunError {
     source: anyhow::Error,
     history: Vec<Message>,
     fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
+    fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
 }
 
 impl NoninteractiveRunError {
-    fn new(
+    pub(in crate::engine::driver) fn new(
         source: anyhow::Error,
         history: Vec<Message>,
         fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
+        fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
     ) -> Self {
         Self {
             source,
             history,
             fallback_decision,
+            fallback_tried,
         }
     }
 
-    fn into_parts(
+    pub(in crate::engine::driver) fn into_parts(
         self,
     ) -> (
         String,
         Vec<Message>,
         Option<crate::engine::agent::BackupFallbackDecision>,
+        Option<SubagentFailureEnvelope>,
     ) {
+        let fallback_tried = if self.fallback_tried.is_empty() {
+            self.fallback_decision
+                .as_ref()
+                .map(|decision| decision.fallback_tried.clone())
+                .unwrap_or_default()
+        } else {
+            self.fallback_tried
+        };
+        let envelope = SubagentFailureEnvelope::from_error(&self.source, fallback_tried);
         (
             format!("{:#}", self.source),
             self.history,
             self.fallback_decision,
+            envelope,
         )
     }
 }
@@ -3554,11 +3650,13 @@ pub(crate) async fn run_noninteractive_resumable(
     // fixed for the subagent's lifetime, and resolution is per-turn-equivalent
     // (the subagent always tries its primary model first each turn).
     let backup_model = resolve_backup_model_for(&cwd, &agent.model);
+    let fallback_models = resolve_failover_models_for(&cwd, &agent.model);
     // Rehydration: a follow-up starts from the subagent's prior transcript,
     // so it answers with full knowledge of what it already did (GOALS §3c).
     let mut history: Vec<Message> = prior_history;
     let mut next_prompt = Message::user(brief);
     let mut fallback_decision: Option<crate::engine::agent::BackupFallbackDecision> = None;
+    let mut fallback_tried: Vec<crate::engine::agent::FailoverAttempt> = Vec::new();
     // A noninteractive subagent's own deferred-log (`plan.md §3d`). The
     // bundled leaves (explore/docs) lack `defer_to_orchestrator`, so this
     // stays empty for them; a custom subagent that holds the tool gets its
@@ -3597,6 +3695,7 @@ pub(crate) async fn run_noninteractive_resumable(
         let turn_future = turn_with_backup(
             &agent,
             backup_model.as_ref(),
+            &fallback_models,
             &mut history,
             next_prompt,
             session.clone(),
@@ -3634,12 +3733,18 @@ pub(crate) async fn run_noninteractive_resumable(
         };
         let outcome = match outcome_future.await {
             Ok(outcome) => {
+                if !turn_metadata.fallback_tried.is_empty() {
+                    fallback_tried = turn_metadata.fallback_tried.clone();
+                }
                 if let Some(fallback) = turn_metadata.fallback_decision.take() {
                     fallback_decision = Some(fallback);
                 }
                 outcome
             }
             Err(error) => {
+                if !turn_metadata.fallback_tried.is_empty() {
+                    fallback_tried = turn_metadata.fallback_tried.clone();
+                }
                 if let Some(fallback) = turn_metadata.fallback_decision.take() {
                     fallback_decision = Some(fallback);
                 }
@@ -3649,6 +3754,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     error,
                     history,
                     fallback_decision,
+                    fallback_tried,
                 ));
             }
         };
@@ -3703,6 +3809,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     ),
                     history,
                     fallback_decision,
+                    fallback_tried,
                 ));
             }
         }
@@ -3716,5 +3823,6 @@ pub(crate) async fn run_noninteractive_resumable(
         ),
         history,
         fallback_decision,
+        fallback_tried,
     ))
 }

@@ -165,6 +165,7 @@ async fn run_review_turn(
         let outcome = turn_with_backup(
             &agent,
             None,
+            &[],
             &mut history,
             next_prompt,
             session.clone(),

@@ -381,6 +381,8 @@ pub enum Event {
         label: String,
         report: String,
         #[serde(default)]
+        failed: bool,
+        #[serde(default)]
         trusted_only: bool,
         #[serde(default)]
         model_trusted: bool,

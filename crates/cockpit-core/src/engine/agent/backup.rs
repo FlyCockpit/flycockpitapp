@@ -1,10 +1,45 @@
 use super::*;
 
+/// Maximum models attempted for one logical turn, including the primary.
+///
+/// The cap is deliberately small: failover is for provider/model outages, not
+/// for scanning the entire catalog while a parent model keeps issuing work.
+pub const MAX_FAILOVER_CANDIDATES: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FailoverAttempt {
+    pub provider: String,
+    pub model: String,
+    pub error_class: Option<String>,
+    pub outcome: &'static str,
+}
+
+impl FailoverAttempt {
+    pub fn failed(model: &Model, error_class: impl Into<String>) -> Self {
+        Self {
+            provider: model.provider_id().to_string(),
+            model: model.model_id_ref().to_string(),
+            error_class: Some(error_class.into()),
+            outcome: "failed",
+        }
+    }
+
+    pub fn succeeded(model: &Model) -> Self {
+        Self {
+            provider: model.provider_id().to_string(),
+            model: model.model_id_ref().to_string(),
+            error_class: None,
+            outcome: "succeeded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupFallbackDecision {
     pub primary_model: String,
     pub error_class: String,
     pub backup_model: String,
+    pub fallback_tried: Vec<FailoverAttempt>,
 }
 
 impl BackupFallbackDecision {
@@ -13,9 +48,22 @@ impl BackupFallbackDecision {
     }
 }
 
+pub fn suggested_action_for_failure_class(class: &str) -> &'static str {
+    match class {
+        "timeout_ttft" | "timeout_idle" | "network" => "retry_or_choose_another_model",
+        "missing_tool_entitlement" | "client_side_tools_unsupported" => {
+            "change_model_or_disable_tool"
+        }
+        class if class.starts_with("http_5") => "retry_later_or_choose_another_model",
+        class if class.starts_with("http_4") => "check_configuration_or_credentials",
+        _ => "inspect_failure",
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackupTurnMetadata {
     pub fallback_decision: Option<BackupFallbackDecision>,
+    pub fallback_tried: Vec<FailoverAttempt>,
 }
 
 /// Run one turn with per-turn primary-first backup-model fallback
@@ -48,6 +96,7 @@ pub struct BackupTurnMetadata {
 pub async fn turn_with_backup(
     agent: &Agent,
     backup_model: Option<&Arc<Model>>,
+    fallback_models: &[Arc<Model>],
     history: &mut Vec<Message>,
     prompt: Message,
     session: Arc<Session>,
@@ -76,125 +125,136 @@ pub async fn turn_with_backup(
     tandem: Option<&crate::engine::schedule::TandemSet>,
     turn_id: Option<String>,
     tx: &mpsc::Sender<TurnEvent>,
-    turn_metadata: Option<&mut BackupTurnMetadata>,
+    mut turn_metadata: Option<&mut BackupTurnMetadata>,
 ) -> Result<TurnOutcome> {
-    // Primary attempt. Suppress its own red UI only when a backup is configured
-    // (so a qualifying failure can fall back silently); with no backup, let the
-    // primary emit the red error itself — the failure is already final.
-    let primary_result = turn(
-        agent,
-        &agent.model,
-        history,
-        prompt.clone(),
-        session.clone(),
-        locks.clone(),
-        redact.clone(),
-        cwd.clone(),
-        interrupts.clone(),
-        cancel.clone(),
-        approver.clone(),
-        lsp.clone(),
-        resource_scheduler.clone(),
-        loop_guard_threshold,
-        is_root,
-        skill_write_origin,
-        review_cage.clone(),
-        context_usage,
-        deferred_log.clone(),
-        seeds.clone(),
-        backup_model.is_none(), // emit_inference_error_ui
-        call_id,
-        tandem,
-        turn_id.clone(),
-        tx,
-    )
-    .await;
-
-    let err = match primary_result {
-        ok @ Ok(_) => return ok,
-        Err(e) => e,
-    };
-
-    // Only a terminal `InferenceFailure` is a fallback candidate. A clean
-    // cancel / drain unwind, or any other error, propagates unchanged.
-    let Some(failure) = crate::engine::model::as_inference_failure(&err) else {
-        return Err(err);
-    };
-    let class = failure.class.clone();
-    let primary_model_id = failure.model.clone();
-
-    // No backup, or this failure class doesn't engage one: the failure is
-    // final. The primary attempt suppressed its red UI (a backup *was*
-    // configured) but the class doesn't qualify — re-emit it now so the user
-    // still sees what failed, then return.
-    let Some(backup) = backup_model else {
-        return Err(err);
-    };
-    if !crate::engine::model::failure_engages_backup(&class) {
-        let _ = tx
-            .send(TurnEvent::InferenceFailed {
-                agent: agent.name.clone(),
-                provider: failure.provider.clone(),
-                model: failure.model.clone(),
-                error_class: failure.class.clone(),
-                detail: failure.detail.clone(),
-                auth_failure: crate::engine::model::auth_failure_kind(failure),
-            })
-            .await;
-        return Err(err);
+    let mut candidates: Vec<&Arc<Model>> = Vec::with_capacity(1 + fallback_models.len());
+    if let Some(backup) = backup_model {
+        candidates.push(backup);
     }
-
-    // The failure qualifies and a backup is configured: announce the fallback
-    // with a display-only yellow banner (never enters model context), then run
-    // the same turn on the backup model. The backup attempt emits its own red
-    // error if it ALSO fails (no second banner).
-    if let Some(metadata) = turn_metadata {
-        metadata.fallback_decision = Some(BackupFallbackDecision {
-            primary_model: primary_model_id.clone(),
-            error_class: class.clone(),
-            backup_model: backup.model_id_ref().to_string(),
+    for model in fallback_models {
+        if candidates.len() + 1 >= MAX_FAILOVER_CANDIDATES {
+            break;
+        }
+        let duplicate = candidates.iter().any(|candidate| {
+            candidate.provider_id() == model.provider_id()
+                && candidate.model_id_ref() == model.model_id_ref()
         });
+        if !duplicate {
+            candidates.push(model);
+        }
     }
 
-    let _ = tx
-        .send(TurnEvent::BackupUsed {
-            agent: agent.name.clone(),
-            primary_model: primary_model_id,
-            error_class: class,
-            backup_model: backup.model_id_ref().to_string(),
-        })
+    let mut fallback_tried = Vec::new();
+    let mut first_failure: Option<(String, String)> = None;
+    let mut attempt_index = 0usize;
+    loop {
+        let current_model: &Model = if attempt_index == 0 {
+            &agent.model
+        } else {
+            candidates[attempt_index - 1].as_ref()
+        };
+        let has_later_candidate = attempt_index < candidates.len();
+        let emit_failure_ui = !has_later_candidate;
+        let attempt_result = turn(
+            agent,
+            current_model,
+            history,
+            prompt.clone(),
+            session.clone(),
+            locks.clone(),
+            redact.clone(),
+            cwd.clone(),
+            interrupts.clone(),
+            cancel.clone(),
+            approver.clone(),
+            lsp.clone(),
+            resource_scheduler.clone(),
+            loop_guard_threshold,
+            is_root,
+            skill_write_origin,
+            review_cage.clone(),
+            context_usage,
+            deferred_log.clone(),
+            seeds.clone(),
+            emit_failure_ui,
+            call_id,
+            if attempt_index == 0 { tandem } else { None },
+            turn_id.clone(),
+            tx,
+        )
         .await;
 
-    turn(
-        agent,
-        backup,
-        history,
-        prompt,
-        session,
-        locks,
-        redact,
-        cwd,
-        interrupts,
-        cancel,
-        approver,
-        lsp,
-        resource_scheduler,
-        loop_guard_threshold,
-        is_root,
-        skill_write_origin,
-        review_cage,
-        context_usage,
-        deferred_log,
-        seeds,
-        true, // backup failure is final → emit the red error
-        call_id,
-        // Backup attempt: never double-shadow — the primary attempt already
-        // dispatched this call's tandems.
-        None,
-        turn_id,
-        tx,
-    )
-    .await
+        match attempt_result {
+            Ok(outcome) => {
+                if attempt_index > 0 {
+                    fallback_tried.push(FailoverAttempt::succeeded(current_model));
+                    if let Some(metadata) = turn_metadata.as_deref_mut() {
+                        metadata.fallback_tried = fallback_tried.clone();
+                        if let Some((primary_model, error_class)) = first_failure {
+                            metadata.fallback_decision = Some(BackupFallbackDecision {
+                                primary_model,
+                                error_class,
+                                backup_model: current_model.model_id_ref().to_string(),
+                                fallback_tried,
+                            });
+                        }
+                    }
+                }
+                return Ok(outcome);
+            }
+            Err(err) => {
+                let Some(failure) = crate::engine::model::as_inference_failure(&err) else {
+                    return Err(err);
+                };
+                let class = failure.class.clone();
+                fallback_tried.push(FailoverAttempt::failed(current_model, class.clone()));
+                if first_failure.is_none() {
+                    first_failure = Some((failure.model.clone(), class.clone()));
+                }
+                let can_advance = crate::engine::model::failure_engages_backup(&class)
+                    && attempt_index < candidates.len();
+                if !can_advance {
+                    if !emit_failure_ui {
+                        let _ = tx
+                            .send(TurnEvent::InferenceFailed {
+                                agent: agent.name.clone(),
+                                provider: failure.provider.clone(),
+                                model: failure.model.clone(),
+                                error_class: failure.class.clone(),
+                                detail: failure.detail.clone(),
+                                auth_failure: crate::engine::model::auth_failure_kind(failure),
+                            })
+                            .await;
+                    }
+                    if let Some(metadata) = turn_metadata.as_deref_mut() {
+                        metadata.fallback_tried = fallback_tried.clone();
+                        if attempt_index > 0
+                            && let Some((primary_model, error_class)) = first_failure
+                        {
+                            metadata.fallback_decision = Some(BackupFallbackDecision {
+                                primary_model,
+                                error_class,
+                                backup_model: current_model.model_id_ref().to_string(),
+                                fallback_tried,
+                            });
+                        }
+                    }
+                    return Err(err);
+                }
+
+                let next_model = candidates[attempt_index].as_ref();
+                let _ = tx
+                    .send(TurnEvent::BackupUsed {
+                        agent: agent.name.clone(),
+                        primary_model: failure.model.clone(),
+                        error_class: class,
+                        backup_model: next_model.model_id_ref().to_string(),
+                    })
+                    .await;
+                attempt_index += 1;
+            }
+        }
+    }
 }
 
 /// Settle the dispatch-time inference record to its terminal status and
@@ -364,12 +424,12 @@ fn inference_failure_diagnostics(
         provider_status,
         provider_body_snippet,
         retry_attempts: serde_json::json!({
-            "known": false,
-            "reason": "retry layer currently reports only terminal outcome"
+            "known": true,
+            "attempts": failure.retry_attempts,
         }),
         retry_final_decision,
         classification_rationale,
-        recommended_action: "retry_same_turn",
+        recommended_action: suggested_action_for_failure_class(&failure.class),
     }
 }
 
@@ -405,6 +465,7 @@ mod inference_outcome_tests {
             phase: "dispatched".into(),
             class: class.into(),
             elapsed_ms: 1,
+            retry_attempts: 1,
             detail: detail.into(),
         });
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(4);
@@ -474,6 +535,7 @@ mod inference_outcome_tests {
             phase: "dispatched".into(),
             class: "timeout_ttft".into(),
             elapsed_ms: 120_000,
+            retry_attempts: 1,
             detail: String::new(),
         })
         .context("completion call for agent `builder`");
@@ -519,7 +581,10 @@ mod inference_outcome_tests {
             fail.data["classification_rationale"],
             "time_to_first_token_timeout"
         );
-        assert_eq!(fail.data["recommended_action"], "retry_same_turn");
+        assert_eq!(
+            fail.data["recommended_action"],
+            "retry_or_choose_another_model"
+        );
 
         // The red inline error was emitted to the UI.
         let mut saw_red = false;
@@ -530,6 +595,60 @@ mod inference_outcome_tests {
             }
         }
         assert!(saw_red, "a red InferenceFailed event must reach the UI");
+    }
+
+    #[test]
+    fn recommended_action_is_derived_from_failure_class() {
+        assert_ne!(
+            suggested_action_for_failure_class("timeout_ttft"),
+            suggested_action_for_failure_class("http_400")
+        );
+        assert_ne!(
+            suggested_action_for_failure_class("http_400"),
+            "retry_same_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_failure_reports_real_retry_attempts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = in_memory_session(tmp.path());
+        let call_id = Uuid::new_v4();
+        let payload = serde_json::json!({ "model": "mock-model" });
+        session
+            .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .unwrap();
+        let err = anyhow::Error::new(InferenceFailure {
+            provider: "mock-provider".into(),
+            model: "mock-model".into(),
+            phase: "dispatched".into(),
+            class: "network".into(),
+            elapsed_ms: 42,
+            retry_attempts: 3,
+            detail: "connection refused".into(),
+        });
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(4);
+        record_inference_outcome(
+            InferenceOutcomeRecord {
+                session: session.clone(),
+                call_id,
+                dispatch_payload: &payload,
+                agent_name: "builder",
+                wire_api: "responses",
+                routing_metadata: serde_json::json!({}),
+                emit_inference_error_ui: false,
+                tx: &tx,
+            },
+            &err,
+        )
+        .await;
+        let events = session.db.list_session_events(session.id).unwrap();
+        let fail = events
+            .iter()
+            .find(|e| e.kind == "inference_failure")
+            .expect("inference failure event");
+        assert_eq!(fail.data["retry_attempts"]["known"], true);
+        assert_eq!(fail.data["retry_attempts"]["attempts"], 3);
     }
 
     #[tokio::test]
@@ -587,7 +706,9 @@ mod inference_outcome_tests {
 #[cfg(test)]
 mod backup_fallback_tests {
     use super::*;
-    use crate::config::providers::{BackupConfig, ProviderEntry, ProvidersConfig, TimeoutConfig};
+    use crate::config::providers::{
+        BackupConfig, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig, TimeoutConfig,
+    };
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -595,6 +716,10 @@ mod backup_fallback_tests {
     /// A local server that returns a deterministic HTTP 500. Returns the bound
     /// `base_url` (`http://127.0.0.1:PORT/v1`).
     async fn failing_server() -> String {
+        failing_server_with_status(500).await
+    }
+
+    async fn failing_server_with_status(status: u16) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -604,7 +729,7 @@ mod backup_fallback_tests {
                     let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
                     let body = r#"{"error":{"message":"server failed"}}"#;
                     let resp = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -680,6 +805,17 @@ mod backup_fallback_tests {
         }
     }
 
+    fn provider_with_model(url: &str, model: &str) -> ProviderEntry {
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: model.to_string(),
+                subagent_invokable: Some(true),
+                ..ModelEntry::default()
+            }],
+            ..provider_at(url)
+        }
+    }
+
     /// Build a minimal `Agent` carrying `model` and no tools (so a text-only
     /// turn ends as `Done`).
     fn agent_with(model: Arc<Model>) -> Agent {
@@ -730,6 +866,7 @@ mod backup_fallback_tests {
         turn_with_backup(
             agent,
             backup,
+            &[],
             &mut Vec::new(),
             Message::user("hi"),
             session,
@@ -847,6 +984,240 @@ mod backup_fallback_tests {
         );
     }
 
+    #[tokio::test]
+    async fn failover_walk_stops_at_candidate_cap() {
+        let failing_url = failing_server().await;
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "flaky".into(),
+            provider_with_model(&failing_url, "primary-model"),
+        );
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "flaky",
+                "primary-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+        let mut fallbacks = Vec::new();
+        for idx in 0..(MAX_FAILOVER_CANDIDATES + 2) {
+            let provider = format!("dead-{idx}");
+            cfg.providers.insert(
+                provider.clone(),
+                provider_with_model(&failing_url, &format!("dead-model-{idx}")),
+            );
+            fallbacks.push(Arc::new(
+                Model::for_provider(
+                    &cfg,
+                    &provider,
+                    &format!("dead-model-{idx}"),
+                    std::sync::Arc::new(RedactionTable::empty()),
+                )
+                .unwrap(),
+            ));
+        }
+
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        let mut metadata = BackupTurnMetadata::default();
+        let result = turn_with_backup(
+            &agent,
+            None,
+            &fallbacks,
+            &mut Vec::new(),
+            Message::user("hi"),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            crate::engine::seed_collector::SeedCollector::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            &tx,
+            Some(&mut metadata),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(metadata.fallback_tried.len(), MAX_FAILOVER_CANDIDATES);
+    }
+
+    #[test]
+    fn failover_walk_orders_by_trust_then_rank_after_configured_backup() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "primary".into(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                backup: Some(BackupConfig {
+                    provider: "explicit".into(),
+                    model: "explicit-model".into(),
+                }),
+                ..ProviderEntry::default()
+            },
+        );
+        cfg.providers.insert(
+            "explicit".into(),
+            provider_with_model("http://localhost:2/v1", "explicit-model"),
+        );
+        let mut trusted_low = provider_with_model("http://localhost:3/v1", "trusted-low");
+        trusted_low.trust = Some(ModelTrust::Trusted);
+        trusted_low.quality_rank = Some(1);
+        cfg.providers.insert("trusted-low".into(), trusted_low);
+        let mut trusted_high = provider_with_model("http://localhost:4/v1", "trusted-high");
+        trusted_high.trust = Some(ModelTrust::Trusted);
+        trusted_high.quality_rank = Some(10);
+        cfg.providers.insert("trusted-high".into(), trusted_high);
+        let mut untrusted_best = provider_with_model("http://localhost:5/v1", "untrusted-best");
+        untrusted_best.quality_rank = Some(100);
+        cfg.providers
+            .insert("untrusted-best".into(), untrusted_best);
+
+        let primary = Model::for_provider(
+            &cfg,
+            "primary",
+            "primary-model",
+            std::sync::Arc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        let fallbacks = crate::engine::driver::build_failover_models(&cfg, &primary);
+        let ids = fallbacks
+            .iter()
+            .map(|model| format!("{}:{}", model.provider_id(), model.model_id_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "explicit:explicit-model",
+                "trusted-high:trusted-high",
+                "trusted-low:trusted-low"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_4xx_does_not_advance_failover_walk() {
+        let primary_url = failing_server_with_status(400).await;
+        let backup_url = sse_server("from-backup").await;
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("bad".into(), provider_at(&primary_url));
+        cfg.providers
+            .insert("reliable".into(), provider_at(&backup_url));
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "bad",
+                "primary-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let backup = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "reliable",
+                "backup-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let mut metadata = BackupTurnMetadata::default();
+        let result = turn_with_backup(
+            &agent,
+            Some(&backup),
+            &[],
+            &mut Vec::new(),
+            Message::user("hi"),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            crate::engine::seed_collector::SeedCollector::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            &tx,
+            Some(&mut metadata),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(metadata.fallback_tried.len(), 1);
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::BackupUsed { .. }))
+        );
+    }
+
+    #[test]
+    fn failover_walk_never_promotes_untrusted_under_trusted_only() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "primary".into(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                trust: Some(ModelTrust::Trusted),
+                ..ProviderEntry::default()
+            },
+        );
+        let mut trusted = provider_with_model("http://localhost:2/v1", "trusted");
+        trusted.trust = Some(ModelTrust::Trusted);
+        cfg.providers.insert("trusted".into(), trusted);
+        cfg.providers.insert(
+            "untrusted".into(),
+            provider_with_model("http://localhost:3/v1", "untrusted"),
+        );
+        let primary = Model::for_provider_trusted_only(
+            &cfg,
+            "primary",
+            "primary-model",
+            std::sync::Arc::new(RedactionTable::empty()),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .unwrap();
+        let fallbacks = crate::engine::driver::build_failover_models(&cfg, &primary);
+        assert!(
+            fallbacks
+                .iter()
+                .all(|model| model.provider_id() != "untrusted")
+        );
+        assert!(
+            fallbacks
+                .iter()
+                .any(|model| model.provider_id() == "trusted")
+        );
+    }
+
     /// A primary stream that never produces a first token times out only
     /// because a backup is configured, and the existing backup wrapper answers
     /// the turn with the backup model.
@@ -934,6 +1305,110 @@ mod backup_fallback_tests {
         );
     }
 
+    async fn assert_stall_hard_fails_and_engages_backup() {
+        let primary_url = silent_server().await;
+        let backup_url = sse_server("from-backup").await;
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("flaky".into(), provider_at(&primary_url));
+        cfg.providers
+            .insert("reliable".into(), provider_at(&backup_url));
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "flaky",
+                "primary-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let backup = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "reliable",
+                "backup-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        run(
+            &agent,
+            Some(&backup),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            &tx,
+        )
+        .await
+        .expect("backup answers stalled child");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TurnEvent::BackupUsed { error_class, .. } if error_class == "timeout_ttft"
+        )));
+    }
+
+    #[tokio::test]
+    async fn delegated_child_stall_hard_fails_and_engages_failover() {
+        assert_stall_hard_fails_and_engages_backup().await;
+    }
+
+    #[tokio::test]
+    async fn interactive_turn_stall_hard_fails_and_engages_backup() {
+        assert_stall_hard_fails_and_engages_backup().await;
+    }
+
+    #[tokio::test]
+    async fn connect_failure_surfaces_as_network_class_before_ttft_budget() {
+        let backup_url = sse_server("from-backup").await;
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("down".into(), provider_at("http://127.0.0.1:9/v1"));
+        cfg.providers
+            .insert("reliable".into(), provider_at(&backup_url));
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "down",
+                "primary-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let backup = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "reliable",
+                "backup-model",
+                std::sync::Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        run(
+            &agent,
+            Some(&backup),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            &tx,
+        )
+        .await
+        .expect("backup answers connection failure");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TurnEvent::BackupUsed { error_class, .. } if error_class == "network"
+        )));
+    }
+
     /// The yellow banner is display-only and never enters model context: it
     /// rides a `TurnEvent`, not the history `Vec<Message>` the model is sent.
     #[tokio::test]
@@ -972,6 +1447,7 @@ mod backup_fallback_tests {
         let _ = turn_with_backup(
             &agent,
             Some(&backup),
+            &[],
             &mut history,
             Message::user("hi"),
             session,

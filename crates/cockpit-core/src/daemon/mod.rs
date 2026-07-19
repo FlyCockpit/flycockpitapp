@@ -24,6 +24,7 @@
 
 pub mod caffeinate;
 pub mod client;
+pub mod config_source;
 pub mod connector;
 pub mod ephemeral_guard;
 pub mod fs_api;
@@ -944,6 +945,7 @@ pub(crate) fn boot_in_process_with_db(
         locks,
         paths,
         terminal::test_host_factory(),
+        config_source::ConfigSource::fixed(Default::default(), Default::default()),
     ));
     server::register_in_process_context(ctx.clone());
     Ok(ctx)

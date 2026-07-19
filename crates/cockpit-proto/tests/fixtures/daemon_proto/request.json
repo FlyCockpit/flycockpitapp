@@ -81,6 +81,13 @@
   "compact": {
     "request": "compact"
   },
+  "create_btw_fork": {
+    "params": {
+      "parent_session_id": "11111111-1111-4111-8111-111111111111",
+      "tangent": true
+    },
+    "request": "create_btw_fork"
+  },
   "daemon_status": {
     "request": "daemon_status"
   },
@@ -96,6 +103,12 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "discard_session"
+  },
+  "end_btw_fork": {
+    "params": {
+      "parent_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "end_btw_fork"
   },
   "finish_attachment_upload": {
     "params": {

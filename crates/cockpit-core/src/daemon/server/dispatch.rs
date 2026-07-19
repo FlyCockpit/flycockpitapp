@@ -421,10 +421,10 @@ async fn handle_request(
         } => {
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
-            let config = crate::config::trust::with_workspace_trust_policy(
-                att.handle.trust_policy.clone(),
-                || crate::config::extended::load_for_cwd(cwd),
-            );
+            let (_, config) = ctx
+                .config_source()
+                .load_with_trust(cwd, &att.handle.trust_policy)
+                .map_err(internal)?;
             let message = ctx
                 .registry
                 .lsp_manager()
@@ -560,10 +560,10 @@ async fn handle_request(
             // discovery used by the `skill` tool and auto-select path.
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
-            let extended = crate::config::trust::with_workspace_trust_policy(
-                att.handle.trust_policy.clone(),
-                || crate::config::extended::load_for_cwd(cwd),
-            );
+            let (_, extended) = ctx
+                .config_source()
+                .load_with_trust(cwd, &att.handle.trust_policy)
+                .map_err(internal)?;
             let active_tools = att.handle.active_tool_names();
             let activation = crate::skills::ActivationContext::from_tool_names(
                 active_tools.iter().map(String::as_str),
@@ -606,7 +606,7 @@ async fn handle_request(
 
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
-            validate_set_agent(att, &name)?;
+            validate_set_agent(ctx, att, &name)?;
             att.handle
                 .send_work(SessionWork::SetAgent { name })
                 .await
@@ -893,7 +893,7 @@ async fn handle_request(
                 .as_deref()
                 .zip(model.as_deref())
                 .and_then(|(provider, model)| {
-                    let cfg = crate::secret_ref::load_effective(cwd);
+                    let (cfg, _) = ctx.config_source().load(cwd).ok()?;
                     cfg.resolve_model_system_prompt(provider, model).map(|prompt| {
                         crate::tokens::scaled_estimate(prompt, strategy, scale)
                     })
@@ -989,8 +989,8 @@ fn set_caffeinate(
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     let configs = match attached_policy {
-        Some(policy) => load_configs_with_trust(&cfg_root, &policy),
-        None => load_configs(&cfg_root),
+        Some(policy) => ctx.config_source().load_with_trust(&cfg_root, &policy),
+        None => ctx.config_source().load(&cfg_root),
     };
     let scope: InhibitScope = match configs {
         Ok((_, extended)) => extended.tui.sleep_scope().into(),
@@ -1171,7 +1171,9 @@ async fn attach(
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have
     // already performed the post-claim DB read-through.
-    let (_, extended_cfg) = load_configs_with_trust(&handle.project_root, &handle.trust_policy)
+    let (_, extended_cfg) = ctx
+        .config_source()
+        .load_with_trust(&handle.project_root, &handle.trust_policy)
         .map_err(internal)?;
 
     if session_id.is_none()

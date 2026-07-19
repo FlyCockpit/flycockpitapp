@@ -22,8 +22,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
-use crate::config::providers::ProvidersConfig;
-use crate::config::trust::WorkspaceTrustPolicy;
 use crate::daemon::DaemonPaths;
 use crate::daemon::principal::{self, ClientPrincipal, SessionAccess};
 use crate::daemon::proto::{
@@ -1322,6 +1320,11 @@ pub struct DaemonContext {
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
     credential_store_path: Option<PathBuf>,
+    /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
+    /// the single route by which request handling resolves layered
+    /// provider/extended config. Shared with the registry so attach-create,
+    /// resume, and worker startup all consult the same source.
+    config_source: crate::daemon::config_source::ConfigSource,
 }
 
 impl DaemonContext {
@@ -1348,6 +1351,7 @@ impl DaemonContext {
         locks: Arc<LockManager>,
         paths: DaemonPaths,
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+        config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
@@ -1360,8 +1364,13 @@ impl DaemonContext {
                 ExtendedConfig::default().resource_scheduler,
             ))
         });
-        let registry =
-            SessionRegistry::new(db.clone(), locks, shutdown.clone(), resource_scheduler);
+        let registry = SessionRegistry::new(
+            db.clone(),
+            locks,
+            shutdown.clone(),
+            resource_scheduler,
+            config_source.clone(),
+        );
         let (client_count, _) = tokio::sync::watch::channel(0usize);
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
@@ -1396,7 +1405,17 @@ impl DaemonContext {
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
             connector_wake,
             credential_store_path: None,
+            config_source,
         }
+    }
+
+    /// The daemon's config-resolution seam
+    /// (`daemon-trust-test-isolation.md`). Request handlers resolve layered
+    /// config through this — never directly from disk discovery — so tests
+    /// inject configs by parameter instead of relying on the machine's live
+    /// `~/.config/cockpit`.
+    pub(crate) fn config_source(&self) -> &crate::daemon::config_source::ConfigSource {
+        &self.config_source
     }
 
     #[cfg(test)]
@@ -1573,7 +1592,13 @@ pub(crate) fn boot_with_db(
     timer.phase("lock_manager");
     run_boot_housekeeping(&db);
     timer.phase("prune_and_sweep");
-    let ctx = DaemonContext::new(db, locks, paths, terminal_factory);
+    let ctx = DaemonContext::new(
+        db,
+        locks,
+        paths,
+        terminal_factory,
+        crate::daemon::config_source::ConfigSource::production(),
+    );
     Ok(ctx)
 }
 

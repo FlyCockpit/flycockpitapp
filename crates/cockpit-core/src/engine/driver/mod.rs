@@ -3902,7 +3902,8 @@ impl Driver {
     /// Load the layered providers config plus the session's active
     /// (provider, model). `None` when no model is selected or the config
     /// can't be loaded — callers fall back to conservative defaults. Same
-    /// first-hit rule as `daemon::server::load_configs`.
+    /// first-hit rule as the daemon's production
+    /// `daemon::config_source::ConfigSource`.
     fn active_providers_config(
         &self,
     ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {

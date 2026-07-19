@@ -309,7 +309,50 @@ mod tests {
         assert!(rendered.contains("[redacted]"), "{rendered}");
     }
 
+    /// Stub config seam (`daemon-trust-test-isolation.md`): a minimal
+    /// in-memory providers config (one loopback provider with an active
+    /// model, mirroring the session-worker tests' `write_model_config`) so
+    /// attach resolves a model deterministically regardless of what lives in
+    /// the developer's `~/.config/cockpit`. Tests that want specific
+    /// provider/model configs inject them through
+    /// [`test_ctx_with_config_source`] instead.
+    fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
+        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".to_string(),
+                models: vec![ModelEntry {
+                    id: "stub-model".to_string(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig {
+                providers,
+                active_model: Some(ActiveModelRef {
+                    provider: "lmstudio".to_string(),
+                    model: "stub-model".to_string(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                }),
+                ..crate::config::providers::ProvidersConfig::default()
+            },
+            crate::config::extended::ExtendedConfig::default(),
+        )
+    }
+
     fn test_ctx() -> Arc<DaemonContext> {
+        test_ctx_with_config_source(stub_config_source())
+    }
+
+    fn test_ctx_with_config_source(
+        config_source: crate::daemon::config_source::ConfigSource,
+    ) -> Arc<DaemonContext> {
         let db = Db::open_in_memory().expect("in-memory db");
         let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
         let paths = DaemonPaths {
@@ -317,7 +360,13 @@ mod tests {
             pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
             ephemeral: true,
         };
-        Arc::new(DaemonContext::new(db, locks, paths, crate::daemon::terminal::test_host_factory()))
+        Arc::new(DaemonContext::new(
+            db,
+            locks,
+            paths,
+            crate::daemon::terminal::test_host_factory(),
+            config_source,
+        ))
     }
 
     fn persistent_test_ctx() -> Arc<DaemonContext> {
@@ -328,7 +377,13 @@ mod tests {
             pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
             ephemeral: false,
         };
-        Arc::new(DaemonContext::new(db, locks, paths, crate::daemon::terminal::test_host_factory()))
+        Arc::new(DaemonContext::new(
+            db,
+            locks,
+            paths,
+            crate::daemon::terminal::test_host_factory(),
+            stub_config_source(),
+        ))
     }
 
     fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
@@ -339,7 +394,16 @@ mod tests {
             pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
             ephemeral: false,
         };
-        Arc::new(DaemonContext::new(db, locks, paths, crate::daemon::terminal::test_host_factory()).with_credential_store_path(path))
+        Arc::new(
+            DaemonContext::new(
+                db,
+                locks,
+                paths,
+                crate::daemon::terminal::test_host_factory(),
+                stub_config_source(),
+            )
+            .with_credential_store_path(path),
+        )
     }
 
     fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
@@ -350,7 +414,16 @@ mod tests {
             pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
             ephemeral: true,
         };
-        Arc::new(DaemonContext::new(db, locks, paths, crate::daemon::terminal::test_host_factory()).with_credential_store_path(path))
+        Arc::new(
+            DaemonContext::new(
+                db,
+                locks,
+                paths,
+                crate::daemon::terminal::test_host_factory(),
+                stub_config_source(),
+            )
+            .with_credential_store_path(path),
+        )
     }
 
     fn remote_state_with_grants(
@@ -722,6 +795,7 @@ mod tests {
                 ephemeral: false,
             },
             crate::daemon::terminal::test_host_factory(),
+            stub_config_source(),
         );
         assert!(persistent.registry.resource_scheduler().is_some());
 
@@ -736,6 +810,7 @@ mod tests {
                 ephemeral: true,
             },
             crate::daemon::terminal::test_host_factory(),
+            stub_config_source(),
         );
         assert!(ephemeral.registry.resource_scheduler().is_none());
     }
@@ -4085,7 +4160,9 @@ mod tests {
         };
         let result = dispatch_matrix_request(&ctx, request).await;
         match kind {
-            "discard_session" | "share_session" => {
+            // `btw_end` is an idempotent no-op on a parent with no live fork
+            // (`Db::end_btw_fork` returns `Ok(false)`), same as discard/share.
+            "discard_session" | "share_session" | "btw_end" => {
                 assert!(matches!(result.expect("invalid state is typed no-op"), Response::Ack));
             }
             _ => {
@@ -4948,6 +5025,13 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::SetSandboxEscalation { enabled: false },
+                kind: "set_sandbox_escalation",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::SetPreflight {
                     enabled: Some(true),
                 },
@@ -5098,10 +5182,113 @@ mod tests {
             },
         ];
 
+        // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
+        // single variant list below feeds both an exhaustive `match` with no
+        // wildcard arm — so adding a `Request` variant without listing it
+        // here is a *compile* error naming the uncovered variant — and the
+        // expected-coverage set, so there is no hand-bumped count literal to
+        // go stale.
+        macro_rules! request_variants {
+            ($($variant:ident),* $(,)?) => {
+                fn request_variant_name(request: &Request) -> &'static str {
+                    match request {
+                        $(Request::$variant { .. } => stringify!($variant),)*
+                    }
+                }
+                const REQUEST_VARIANT_NAMES: &[&str] = &[$(stringify!($variant)),*];
+            };
+        }
+        request_variants!(
+            Attach,
+            SubagentTranscript,
+            SendUserMessage,
+            SteerDelegation,
+            BeginAttachmentUpload,
+            UploadAttachmentChunk,
+            FinishAttachmentUpload,
+            CancelAttachmentUpload,
+            RemoveQueuedUserMessage,
+            RemoveNewestQueuedUserMessage,
+            RemoveEditableQueuedUserMessages,
+            ResumePausedWork,
+            CancelPausedWork,
+            RepairResume,
+            CancelTurn,
+            FsList,
+            FsStat,
+            FsRead,
+            FsWrite,
+            FsCreateDir,
+            FsRename,
+            FsDelete,
+            GitStatus,
+            GitDiffFile,
+            OpenTerminal,
+            AttachTerminal,
+            TerminalInput,
+            TerminalResize,
+            CloseTerminal,
+            LspControl,
+            ResolveInterrupt,
+            ListSessions,
+            ReadSessionMessages,
+            SessionLiveStatus,
+            ArchiveSession,
+            UnarchiveSession,
+            ForkSession,
+            DiscardSession,
+            CreateBtwFork,
+            EndBtwFork,
+            RenameSession,
+            ShareSession,
+            RecordSessionNote,
+            DeleteSession,
+            ListSkills,
+            ResourceSnapshot,
+            PromoteResource,
+            ListAgents,
+            ListModels,
+            SetActiveModel,
+            SetAgent,
+            SetLlmMode,
+            SetSessionLlmMode,
+            SetApprovalMode,
+            SetDelegationRecursion,
+            SetSandbox,
+            SetSandboxEscalation,
+            SetPreflight,
+            SetTrustedOnly,
+            SetRedaction,
+            SetTandemModels,
+            SetCaffeinate,
+            CancelSchedule,
+            Prune,
+            Compact,
+            Pin,
+            StoreFlycockpitCredential,
+            ClearFlycockpitCredential,
+            DaemonStatus,
+            RefreshEnv,
+            RecordUsage,
+            GetUsageCounts,
+            GuidanceEstimate,
+            StopDaemon,
+        );
+
+        let covered: HashSet<&'static str> = cases
+            .iter()
+            .map(|case| request_variant_name(&case.request))
+            .collect();
+        for variant in REQUEST_VARIANT_NAMES {
+            assert!(
+                covered.contains(variant),
+                "Request::{variant} has no CommandMetadataCase — add one to this test"
+            );
+        }
         assert_eq!(
             cases.len(),
-            71,
-            "every Request variant has one metadata case"
+            REQUEST_VARIANT_NAMES.len(),
+            "every Request variant has exactly one metadata case"
         );
         let mut kinds = HashSet::new();
         for case in cases {
@@ -6778,6 +6965,85 @@ mod tests {
         }
     }
 
+    /// Regression (`daemon-trust-test-isolation.md`): daemon attach resolves
+    /// the session's model from the [`ConfigSource`] injected through the
+    /// `DaemonContext` constructor — never from the machine's live layered
+    /// config. On a machine whose `~/.config/cockpit` enables trusted-only
+    /// with an untrusted active model (the exact condition that redded the
+    /// dispatch-matrix tests), this passes only if the attach path consults
+    /// the seam.
+    #[tokio::test]
+    async fn attach_resolves_model_from_injected_config_source() {
+        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".to_string(),
+                models: vec![ModelEntry {
+                    id: "injected-model".to_string(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let providers_cfg = crate::config::providers::ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".to_string(),
+                model: "injected-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers_cfg,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+
+        let mut state = ClientState::detached_for_test();
+        let response = handle_request(
+            Request::Attach {
+                session_id: None,
+                since_seq: None,
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                no_sandbox: false,
+                interactive: true,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("attach resolves the injected model without reading live config");
+        match response {
+            Response::Attached { .. } => {}
+            other => panic!("expected Attached, got {other:?}"),
+        }
+
+        let att = state.attached.as_ref().expect("client is attached");
+        assert_eq!(
+            att.handle.active_model_selection(),
+            (
+                Some("lmstudio".to_string()),
+                Some("injected-model".to_string())
+            ),
+            "session active model must match the injected config source"
+        );
+    }
+
     #[tokio::test]
     async fn server_answers_too_new_request_with_protocol_version_error() {
         let ctx = test_ctx();
@@ -6877,7 +7143,9 @@ mod tests {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         };
 
-        let (_, extended) = load_configs_with_trust(ignored.path(), &session_policy).unwrap();
+        let (_, extended) = crate::daemon::config_source::ConfigSource::production()
+            .load_with_trust(ignored.path(), &session_policy)
+            .unwrap();
 
         assert_ne!(extended.max_primary_rounds, 77);
         crate::config::trust::clear_runtime_policy_for_tests();

@@ -1019,6 +1019,10 @@ mod tests {
                 locks,
                 paths,
                 crate::daemon::terminal::test_host_factory(),
+                crate::daemon::config_source::ConfigSource::fixed(
+                    Default::default(),
+                    Default::default(),
+                ),
             )),
         )
     }

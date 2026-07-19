@@ -76,6 +76,11 @@ struct Inner {
     /// Daemon-global event bus, installed once by [`DaemonContext`]. Workers
     /// use it for singular global recomputes derived from per-session events.
     global_bus: Mutex<Option<EventSender>>,
+    /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`).
+    /// Production wires [`ConfigSource::production`] once at daemon startup;
+    /// tests inject fixed configs so no attach/resume/worker path consults
+    /// the machine's live layered config.
+    config_source: crate::daemon::config_source::ConfigSource,
 }
 
 struct WorkerState {
@@ -323,6 +328,7 @@ impl SessionRegistry {
         locks: Arc<LockManager>,
         shutdown: ShutdownSignal,
         resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+        config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -338,6 +344,7 @@ impl SessionRegistry {
                 worker_joins: Mutex::new(HashMap::new()),
                 shutdown,
                 global_bus: Mutex::new(None),
+                config_source,
             }),
         }
     }
@@ -408,8 +415,10 @@ impl SessionRegistry {
             bail!("attach requires either session_id or project_root");
         };
         let trust_policy = resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root)?;
-        let (providers_cfg, extended_cfg) =
-            crate::daemon::server::load_configs_with_trust(&project_root, &trust_policy)?;
+        let (providers_cfg, extended_cfg) = self
+            .inner
+            .config_source
+            .load_with_trust(&project_root, &trust_policy)?;
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written. The worker persists it on the first user message.
@@ -453,8 +462,10 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
         let trust_policy =
             resolve_workspace_trust_policy_from_db(&self.inner.db, &session.project_root)?;
-        let (providers_cfg, extended_cfg) =
-            crate::daemon::server::load_configs_with_trust(&session.project_root, &trust_policy)?;
+        let (providers_cfg, extended_cfg) = self
+            .inner
+            .config_source
+            .load_with_trust(&session.project_root, &trust_policy)?;
         // Resume keeps the running worker's model; an override only seeds
         // a newly-created session (matched by the server's gating). Plan
         // attribution is likewise create-only.
@@ -607,10 +618,9 @@ impl SessionRegistry {
         // is discoverable (the fallback still works, it just isn't persisted).
         let config_path = providers_cfg.active_model.as_ref().and_then(|active| {
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-                crate::config::dirs::config_write_target_for_provider(
-                    &project_root,
-                    &active.provider,
-                )
+                self.inner
+                    .config_source
+                    .config_write_target_for_provider(&project_root, &active.provider)
             })
         });
         let model = resolve_session_worker_model(
@@ -1116,7 +1126,16 @@ mod tests {
         // a throwaway in-memory DB so construction never hits user state.
         let db = Db::open_in_memory().expect("in-memory db");
         let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
-        SessionRegistry::new(db, locks, ShutdownSignal::new(), None)
+        SessionRegistry::new(
+            db,
+            locks,
+            ShutdownSignal::new(),
+            None,
+            crate::daemon::config_source::ConfigSource::fixed(
+                ProvidersConfig::default(),
+                ExtendedConfig::default(),
+            ),
+        )
     }
 
     fn test_session(reg: &SessionRegistry) -> Arc<Session> {
@@ -2010,7 +2029,16 @@ mod tests {
             .expect("session")
             .session_id;
         let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
-        let reg = SessionRegistry::new(db, locks.clone(), ShutdownSignal::new(), None);
+        let reg = SessionRegistry::new(
+            db,
+            locks.clone(),
+            ShutdownSignal::new(),
+            None,
+            crate::daemon::config_source::ConfigSource::fixed(
+                ProvidersConfig::default(),
+                ExtendedConfig::default(),
+            ),
+        );
 
         let tmp = tempfile::TempDir::new().unwrap();
         let keep = tmp.path().join("keep.rs");

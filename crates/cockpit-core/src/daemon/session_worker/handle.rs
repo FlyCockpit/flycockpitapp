@@ -568,6 +568,13 @@ impl SessionWorkerHandle {
         self.session.short_id.clone()
     }
 
+    /// The session's active (provider, model) selection. Test observability
+    /// for the daemon config seam (`daemon-trust-test-isolation.md`).
+    #[cfg(test)]
+    pub(crate) fn active_model_selection(&self) -> (Option<String>, Option<String>) {
+        (self.session.active_provider(), self.session.active_model())
+    }
+
     /// Broadcast the session's current gitignore read-allowlist over the
     /// per-session event bus (implementation note).
     /// Called on attach so a late/reconnecting client — and any second

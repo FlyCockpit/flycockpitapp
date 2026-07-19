@@ -474,13 +474,18 @@ fn require_attached(state: &ClientState) -> std::result::Result<&AttachedSession
     })
 }
 
-fn validate_set_agent(att: &AttachedSession, name: &str) -> std::result::Result<(), ErrorPayload> {
-    let (cfg, ownable) =
+fn validate_set_agent(
+    ctx: &DaemonContext,
+    att: &AttachedSession,
+    name: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let (_, cfg) = ctx
+        .config_source()
+        .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
+        .map_err(internal)?;
+    let ownable =
         crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
-            (
-                crate::config::extended::load_for_cwd(&att.handle.project_root),
-                crate::agents::chat_ownable_primaries(&att.handle.project_root),
-            )
+            crate::agents::chat_ownable_primaries(&att.handle.project_root)
         });
     validate_set_agent_name(name, cfg.experimental_mode, &ownable)
 }
@@ -599,19 +604,3 @@ mod sessions_activity_tests {
     }
 }
 
-/// Read the effective layered provider/model and former-`ExtendedConfig` keys
-/// out of `config.json` (GOALS §2a). This mirrors
-/// `tui::agent_runner::load_providers` / `load_extended` so the in-process and
-/// daemon-mediated paths see identical config behavior.
-fn load_configs(cwd: &Path) -> Result<(ProvidersConfig, ExtendedConfig)> {
-    let providers = crate::secret_ref::load_effective(cwd);
-    let extended = crate::config::extended::load_for_cwd(cwd);
-    Ok((providers, extended))
-}
-
-pub(crate) fn load_configs_with_trust(
-    cwd: &Path,
-    policy: &WorkspaceTrustPolicy,
-) -> Result<(ProvidersConfig, ExtendedConfig)> {
-    crate::config::trust::with_workspace_trust_policy(policy.clone(), || load_configs(cwd))
-}

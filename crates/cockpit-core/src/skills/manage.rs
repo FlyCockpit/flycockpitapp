@@ -10,6 +10,7 @@ use super::{
     validate_managed_skill_contents, validate_support_relative,
 };
 use crate::config::extended::SkillsConfig;
+use crate::db::skill_usage::{SkillCreatedBy, SkillUsageSeed};
 
 const PROVENANCE_FILE: &str = ".cockpit-provenance.json";
 const PREVIEW_CHARS: usize = 800;
@@ -47,6 +48,8 @@ pub struct SkillManageArgs {
     pub replace_all: bool,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default)]
+    pub absorbed_into: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,10 +83,19 @@ enum SkillProtection {
     HubInstalled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillLifecycleMetadata {
+    pub created_by: SkillCreatedBy,
+    pub pinned: bool,
+    pub protected: bool,
+    pub created_at: i64,
+}
+
 pub struct SkillMutationService<'a> {
     cwd: &'a Path,
     config: &'a SkillsConfig,
     origin: SkillWriteOrigin,
+    db: Option<&'a crate::db::Db>,
 }
 
 impl<'a> SkillMutationService<'a> {
@@ -92,11 +104,17 @@ impl<'a> SkillMutationService<'a> {
             cwd,
             config,
             origin: SkillWriteOrigin::Foreground,
+            db: None,
         }
     }
 
     pub fn with_origin(mut self, origin: SkillWriteOrigin) -> Self {
         self.origin = origin;
+        self
+    }
+
+    pub fn with_db(mut self, db: &'a crate::db::Db) -> Self {
+        self.db = Some(db);
         self
     }
 
@@ -113,6 +131,14 @@ impl<'a> SkillMutationService<'a> {
             SkillManageAction::RemoveFile => self.remove_file(args),
         }?;
         if result.changed {
+            if let Err(error) = self.record_usage(args) {
+                tracing::warn!(
+                    error = %error,
+                    skill = %args.name,
+                    action = ?args.action,
+                    "skill usage ledger update failed"
+                );
+            }
             super::invalidate_catalog_cache(self.cwd, self.config);
         }
         Ok(result)
@@ -208,12 +234,44 @@ impl<'a> SkillMutationService<'a> {
         if target.pinned {
             bail!("pinned skill `{}` may not be deleted by tools", args.name);
         }
+        if let Some(db) = self.db
+            && db
+                .get_skill_usage(&args.name)?
+                .is_some_and(|row| row.pinned)
+        {
+            bail!("pinned skill `{}` may not be deleted by tools", args.name);
+        }
+        let absorbed_into = args
+            .absorbed_into
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context(
+                "delete requires `absorbed_into=<existing skill>` for guarded consolidation",
+            )?;
+        if absorbed_into == args.name {
+            bail!("`absorbed_into` must name a different existing umbrella skill");
+        }
+        let skills = super::discover(self.cwd, self.config)?;
+        let umbrella = find_by_name(&skills, absorbed_into)
+            .with_context(|| format!("absorbed_into skill `{absorbed_into}` does not exist"))?;
+        let umbrella_package = umbrella
+            .source
+            .parent()
+            .context("absorbed_into SKILL.md has no package directory")?;
+        if std::fs::symlink_metadata(umbrella_package)?
+            .file_type()
+            .is_symlink()
+        {
+            bail!("refusing consolidation into a symlinked skill package");
+        }
         if std::fs::symlink_metadata(&target.package)?
             .file_type()
             .is_symlink()
         {
             bail!("refusing to delete a symlinked skill package");
         }
+        validate_consolidation_forward(&target.skill, umbrella)?;
         let parent = target
             .package
             .parent()
@@ -225,7 +283,10 @@ impl<'a> SkillMutationService<'a> {
             let _ = std::fs::rename(&tombstone, &target.package);
             return Err(error).context("removing staged skill package");
         }
-        Ok(changed(format!("Deleted skill `{}`", args.name)))
+        Ok(changed(format!(
+            "Deleted skill `{}` after consolidation into `{absorbed_into}`",
+            args.name
+        )))
     }
 
     fn write_file(&self, args: &SkillManageArgs) -> Result<SkillMutationResult> {
@@ -384,6 +445,44 @@ impl<'a> SkillMutationService<'a> {
         bytes.push(b'\n');
         atomic_write(&package.join(PROVENANCE_FILE), &bytes)
     }
+
+    fn record_usage(&self, args: &SkillManageArgs) -> Result<()> {
+        let Some(db) = self.db else {
+            return Ok(());
+        };
+        if matches!(args.action, SkillManageAction::Delete) {
+            return Ok(());
+        }
+        let target = self.resolve_target(&args.name)?;
+        let seed = usage_seed_for_skill(&target.skill)?;
+        let now = chrono::Utc::now().timestamp();
+        match args.action {
+            SkillManageAction::Create => {
+                db.ensure_skill_usage(seed, now)?;
+            }
+            SkillManageAction::Patch
+            | SkillManageAction::Edit
+            | SkillManageAction::WriteFile
+            | SkillManageAction::RemoveFile => {
+                db.record_skill_patch(seed, now)?;
+            }
+            SkillManageAction::Delete => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_consolidation_forward(deleted: &Skill, umbrella: &Skill) -> Result<()> {
+    let umbrella_raw = std::fs::read_to_string(&umbrella.source)
+        .with_context(|| format!("reading umbrella skill {}", umbrella.source.display()))?;
+    if !umbrella_raw.contains(&deleted.frontmatter.name) {
+        bail!(
+            "absorbed_into skill `{}` must reference absorbed skill `{}` before delete",
+            umbrella.frontmatter.name,
+            deleted.frontmatter.name
+        );
+    }
+    Ok(())
 }
 
 struct ManagedTarget {
@@ -568,6 +667,63 @@ fn read_provenance(package: &Path) -> Result<Option<SkillProvenance>> {
     }
 }
 
+pub fn lifecycle_metadata_for_skill(skill: &Skill) -> Result<SkillLifecycleMetadata> {
+    let package = skill
+        .source
+        .parent()
+        .context("SKILL.md has no package directory")?;
+    let provenance = read_provenance(package)?;
+    let created_by = provenance
+        .as_ref()
+        .map(|p| created_by_from_origin(p.created_origin))
+        .unwrap_or(SkillCreatedBy::Foreground);
+    let pinned = provenance.as_ref().is_some_and(|value| value.pinned)
+        || frontmatter_flag(&skill.frontmatter, "pinned");
+    let protected = provenance
+        .as_ref()
+        .and_then(|value| value.protection)
+        .or_else(|| frontmatter_protection(&skill.frontmatter))
+        .is_some()
+        || package
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if name == ".hub"));
+    let created_at = provenance
+        .as_ref()
+        .and_then(|p| p.writes.iter().map(|w| w.unix_seconds as i64).min())
+        .or_else(|| {
+            std::fs::metadata(&skill.source)
+                .ok()
+                .and_then(|m| m.created().or_else(|_| m.modified()).ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        })
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    Ok(SkillLifecycleMetadata {
+        created_by,
+        pinned,
+        protected,
+        created_at,
+    })
+}
+
+pub fn usage_seed_for_skill(skill: &Skill) -> Result<SkillUsageSeed> {
+    let metadata = lifecycle_metadata_for_skill(skill)?;
+    Ok(SkillUsageSeed {
+        name: skill.frontmatter.name.clone(),
+        source_path: skill.source.display().to_string(),
+        created_by: metadata.created_by,
+        created_at: metadata.created_at,
+        pinned: metadata.pinned,
+    })
+}
+
+fn created_by_from_origin(origin: SkillWriteOrigin) -> SkillCreatedBy {
+    match origin {
+        SkillWriteOrigin::Foreground => SkillCreatedBy::Foreground,
+        SkillWriteOrigin::BackgroundReview => SkillCreatedBy::Background,
+    }
+}
+
 fn frontmatter_flag(frontmatter: &SkillFrontmatter, key: &str) -> bool {
     yaml_bool(frontmatter.extra.get(key)) || yaml_bool(frontmatter.metadata.extra.get(key))
 }
@@ -655,6 +811,7 @@ mod tests {
             new_string: None,
             replace_all: false,
             path: None,
+            absorbed_into: None,
         }
     }
 
@@ -664,6 +821,76 @@ mod tests {
 
     fn manifest(root: &Path, name: &str) -> PathBuf {
         root.join(name).join("SKILL.md")
+    }
+
+    #[test]
+    fn consolidation_delete_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let cfg = config(&root);
+        let svc = service(tmp.path(), &cfg);
+        svc.apply(&create_args("umbrella")).unwrap();
+        svc.apply(&create_args("specific")).unwrap();
+
+        let mut bare = create_args("specific");
+        bare.action = SkillManageAction::Delete;
+        bare.description = None;
+        bare.content = None;
+        let err = svc.apply(&bare).unwrap_err();
+        assert!(err.to_string().contains("absorbed_into"));
+        assert!(root.join("specific/SKILL.md").is_file());
+
+        let mut still_invalid = bare.clone();
+        still_invalid.absorbed_into = Some("umbrella".to_string());
+        let err = svc.apply(&still_invalid).unwrap_err();
+        assert!(err.to_string().contains("must reference absorbed skill"));
+        assert!(root.join("specific/SKILL.md").is_file());
+
+        let mut forward = create_args("umbrella");
+        forward.action = SkillManageAction::Patch;
+        forward.description = None;
+        forward.content = None;
+        forward.old_string = Some("Follow these steps.".to_string());
+        forward.new_string =
+            Some("Follow these steps.\nForward absorbed skill: specific.".to_string());
+        svc.apply(&forward).unwrap();
+
+        let mut valid = bare;
+        valid.absorbed_into = Some("umbrella".to_string());
+        let out = svc.apply(&valid).unwrap();
+        assert!(out.message.contains("consolidation into `umbrella`"));
+        assert!(!root.join("specific").exists());
+        assert!(root.join("umbrella/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn db_pinned_skill_delete_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let cfg = config(&root);
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let svc = service(tmp.path(), &cfg).with_db(&db);
+        svc.apply(&create_args("umbrella")).unwrap();
+        svc.apply(&create_args("pinned-db")).unwrap();
+
+        let mut forward = create_args("umbrella");
+        forward.action = SkillManageAction::Patch;
+        forward.description = None;
+        forward.content = None;
+        forward.old_string = Some("Follow these steps.".to_string());
+        forward.new_string =
+            Some("Follow these steps.\nForward absorbed skill: pinned-db.".to_string());
+        svc.apply(&forward).unwrap();
+        db.set_skill_usage_pinned("pinned-db", true, 100).unwrap();
+
+        let mut delete = create_args("pinned-db");
+        delete.action = SkillManageAction::Delete;
+        delete.description = None;
+        delete.content = None;
+        delete.absorbed_into = Some("umbrella".to_string());
+        let err = svc.apply(&delete).unwrap_err();
+        assert!(err.to_string().contains("pinned skill"));
+        assert!(root.join("pinned-db/SKILL.md").is_file());
     }
 
     #[test]
@@ -715,10 +942,20 @@ mod tests {
         svc.apply(&remove).unwrap();
         assert!(!root.join("roundtrip/references/guide.md").exists());
 
+        svc.apply(&create_args("roundtrip-umbrella")).unwrap();
+        let mut forward = create_args("roundtrip-umbrella");
+        forward.action = SkillManageAction::Patch;
+        forward.description = None;
+        forward.content = None;
+        forward.old_string = Some("Follow these steps.".to_string());
+        forward.new_string =
+            Some("Follow these steps.\nForward absorbed skill: roundtrip.".to_string());
+        svc.apply(&forward).unwrap();
         let mut delete = create_args("roundtrip");
         delete.action = SkillManageAction::Delete;
         delete.description = None;
         delete.content = None;
+        delete.absorbed_into = Some("roundtrip-umbrella".to_string());
         svc.apply(&delete).unwrap();
         assert!(!root.join("roundtrip").exists());
     }

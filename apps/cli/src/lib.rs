@@ -625,6 +625,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
         Some(Command::Schedule(sub)) => commands::schedule::run(sub).await,
+        Some(Command::Skill(sub)) => commands::skill::run(sub).await,
         Some(Command::Trust(sub)) => commands::trust::run(sub).await,
         Some(Command::Export(args)) => commands::export::run(args).await,
         Some(Command::Import(args)) => commands::import::run(args).await,

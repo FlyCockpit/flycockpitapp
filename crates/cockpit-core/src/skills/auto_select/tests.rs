@@ -682,6 +682,8 @@ fn already_injected_skill_excluded_before_catalog() {
         auto_bang_commands: false,
         ancestor_walk: false,
         write_approval: false,
+        prune_builtins: false,
+        consolidate: false,
     };
 
     // With firecrawl already injected this session, it is gone from the
@@ -986,6 +988,8 @@ fn disable_model_invocation_excluded_from_catalog() {
         auto_bang_commands: false,
         ancestor_walk: false,
         write_approval: false,
+        prune_builtins: false,
+        consolidate: false,
     };
     let catalog = auto_select_catalog(tmp.path(), &cfg);
     assert!(catalog.contains("plain"), "got {catalog:?}");
@@ -1009,6 +1013,8 @@ fn user_invocable_false_stays_in_catalog() {
         auto_bang_commands: false,
         ancestor_walk: false,
         write_approval: false,
+        prune_builtins: false,
+        consolidate: false,
     };
     let catalog = auto_select_catalog(tmp.path(), &cfg);
     assert!(

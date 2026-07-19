@@ -1007,6 +1007,18 @@ pub struct SkillsConfig {
     /// the exact tool arguments until approval.
     #[serde(default)]
     pub write_approval: bool,
+
+    /// Allow the skill curator to lifecycle bundled or hub-installed skills.
+    /// Off by default: built-in and hub material is normally treated as
+    /// package-owned and skipped by deterministic pruning.
+    #[serde(default)]
+    pub prune_builtins: bool,
+
+    /// Enable model-assisted skill consolidation during curator runs. The
+    /// deterministic stale/archive phase remains always available; this flag
+    /// only opts into the guarded LLM review phase.
+    #[serde(default)]
+    pub consolidate: bool,
 }
 
 impl SkillsConfig {

@@ -90,6 +90,7 @@ pub mod run;
 pub mod schedule;
 pub mod session;
 pub mod setup;
+pub mod skill;
 pub mod stats;
 pub mod sync;
 pub mod trust;

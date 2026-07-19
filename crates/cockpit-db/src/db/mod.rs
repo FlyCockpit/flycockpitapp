@@ -46,6 +46,7 @@ pub mod session_plan_docs;
 pub mod session_search;
 pub mod sessions;
 pub mod skill_pairs;
+pub mod skill_usage;
 pub mod sql;
 pub mod stats;
 pub mod subagent_handles;
@@ -79,7 +80,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// is intentionally strict until the first public release: developers move a
 /// stale database aside and let Cockpit recreate it rather than running a
 /// compatibility migration.
-pub const EXPECTED_SCHEMA_VERSION: i64 = 3;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 4;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

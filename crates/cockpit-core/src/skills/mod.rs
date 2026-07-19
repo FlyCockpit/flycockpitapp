@@ -48,6 +48,7 @@ use crate::config::extended::SkillsConfig;
 use crate::redact::RedactionTable;
 
 pub mod auto_select;
+pub mod curator;
 pub mod manage;
 
 const TRANSCRIPT_SOURCE: &str =
@@ -1128,6 +1129,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk: false,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
@@ -1153,6 +1156,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk: false,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
@@ -1178,6 +1183,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk: false,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
@@ -1222,6 +1229,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk: false,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
 
@@ -1241,6 +1250,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk: false,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         };
         let policy = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -1267,6 +1278,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk: false,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         };
         let policy = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -1289,6 +1302,8 @@ mod tests {
             auto_bang_commands: false,
             ancestor_walk,
             write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
         }
     }
 

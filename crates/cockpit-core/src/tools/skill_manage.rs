@@ -76,6 +76,7 @@ impl Tool for SkillManageTool {
         }
         let result = SkillMutationService::new(&ctx.cwd, &extended.skills)
             .with_origin(ctx.skill_write_origin)
+            .with_db(&ctx.session.db)
             .apply(&args)?;
         Ok(ToolOutput::text(result.message))
     }
@@ -156,7 +157,8 @@ fn skill_manage_schema(defensive: bool) -> Value {
             "old_string": { "type": "string", "description": "Fuzzy find text required for patch" },
             "new_string": { "type": "string", "description": "Replacement text for patch; empty deletes the span" },
             "replace_all": { "type": "boolean", "description": "Replace every fuzzy match instead of requiring uniqueness" },
-            "path": { "type": "string", "description": "Support path under references/, templates/, scripts/, or assets/" }
+            "path": { "type": "string", "description": "Support path under references/, templates/, scripts/, or assets/" },
+            "absorbed_into": { "type": "string", "description": "Required for delete: existing umbrella skill that absorbed the deleted skill" }
         },
         "required": ["action", "name"],
         "additionalProperties": false

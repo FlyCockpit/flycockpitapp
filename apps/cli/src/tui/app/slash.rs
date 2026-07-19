@@ -291,6 +291,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "curator",
+        description: "Manage skill curation (arg: status/run/pin/unpin/restore/rollback)",
+        takes_args: true,
+        run: run_curator,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "diff",
         description: "Browse a read-only diff pane (arg: worktree/staged/last; bare = worktree)",
         takes_args: true,
@@ -1044,6 +1052,11 @@ fn run_skill(app: &mut App, args: &str) -> bool {
     false
 }
 
+fn run_curator(app: &mut App, args: &str) -> bool {
+    app.handle_curator_command(args);
+    false
+}
+
 fn run_skills(app: &mut App, _: &str) -> bool {
     app.overlay = Overlay::Skills(crate::tui::skills_pane::SkillsPane::open(&app.launch.cwd));
     false
@@ -1267,6 +1280,92 @@ impl App {
             true,
             &[],
         );
+    }
+
+    pub(super) fn handle_curator_command(&mut self, args: &str) {
+        let result = (|| -> anyhow::Result<String> {
+            let db = crate::db::Db::open_default()?;
+            let cfg = crate::config::extended::load_for_cwd(&self.launch.cwd).skills;
+            let curator =
+                crate::skills::curator::SkillCurator::new(db, self.launch.cwd.clone(), cfg);
+            let mut parts = args.split_whitespace();
+            match parts.next().unwrap_or("status") {
+                "status" => {
+                    let status = curator.status()?;
+                    Ok(format!(
+                        "/curator: {} skills, {} snapshots",
+                        status.skills.len(),
+                        status.snapshots.len()
+                    ))
+                }
+                "run" => {
+                    let mut options = crate::skills::curator::CuratorRunOptions::default();
+                    for part in parts {
+                        match part {
+                            "--dry-run" => options.dry_run = true,
+                            "--consolidate" => options.consolidate = true,
+                            other => anyhow::bail!("unknown curator run option `{other}`"),
+                        }
+                    }
+                    Ok(format!("/curator: {}", curator.run(options)?.summary()))
+                }
+                "pin" => {
+                    let name = parts.next().context("usage: /curator pin <name>")?;
+                    curator.pin(name, true)?;
+                    Ok(format!("/curator: pinned {name}"))
+                }
+                "unpin" => {
+                    let name = parts.next().context("usage: /curator unpin <name>")?;
+                    curator.pin(name, false)?;
+                    Ok(format!("/curator: unpinned {name}"))
+                }
+                "restore" => {
+                    let name = parts.next().context("usage: /curator restore <name>")?;
+                    curator.restore(name)?;
+                    Ok(format!("/curator: restored {name}"))
+                }
+                "rollback" => {
+                    let mut list = false;
+                    let mut id: Option<String> = None;
+                    while let Some(part) = parts.next() {
+                        match part {
+                            "--list" => list = true,
+                            "--id" => {
+                                id = Some(
+                                    parts
+                                        .next()
+                                        .context("usage: /curator rollback --id <id>")?
+                                        .to_string(),
+                                );
+                            }
+                            other => anyhow::bail!("unknown curator rollback option `{other}`"),
+                        }
+                    }
+                    if list {
+                        let lines = curator
+                            .snapshots()?
+                            .into_iter()
+                            .map(|s| format!("{} {}", s.id, s.reason))
+                            .collect::<Vec<_>>();
+                        return Ok(if lines.is_empty() {
+                            "/curator: no snapshots".to_string()
+                        } else {
+                            format!("/curator snapshots:\n{}", lines.join("\n"))
+                        });
+                    }
+                    let restored = curator.rollback(id.as_deref())?;
+                    Ok(format!("/curator: rolled back to {}", restored.id))
+                }
+                _ => Ok(
+                    "/curator: usage status | run [--dry-run] [--consolidate] | pin <name> | unpin <name> | restore <name> | rollback [--list|--id <id>]"
+                        .to_string(),
+                ),
+            }
+        })();
+        match result {
+            Ok(message) => self.push_plain(message),
+            Err(error) => self.push_plain(format!("/curator: {error:#}")),
+        }
     }
 
     fn handle_goal_command(&mut self, args: &str) {

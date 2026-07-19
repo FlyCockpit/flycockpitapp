@@ -113,6 +113,10 @@ pub enum Command {
     #[command(subcommand)]
     Schedule(ScheduleCommand),
 
+    /// Manage Agent Skills.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+
     /// Manage workspace trust decisions.
     #[command(subcommand)]
     Trust(TrustCommand),
@@ -275,6 +279,58 @@ pub struct ScheduleListArgs {
     /// Exact owner filter, e.g. assistant:alice or system:dreamer.
     #[arg(long, value_name = "OWNER")]
     pub owner: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Inspect and run the skill curator.
+    #[command(subcommand)]
+    Curator(SkillCuratorCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCuratorCommand {
+    /// Show skill lifecycle and snapshot state.
+    Status,
+    /// Run deterministic curation now.
+    Run(SkillCuratorRunArgs),
+    /// Exempt a skill from curator transitions and tool deletion.
+    Pin {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Clear a curator pin.
+    Unpin {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Restore an archived skill by name.
+    Restore {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Roll back the skill tree to a recorded snapshot.
+    Rollback(SkillCuratorRollbackArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SkillCuratorRunArgs {
+    /// Preview transitions without mutating files or DB state.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Opt into guarded LLM consolidation planning for this run.
+    #[arg(long)]
+    pub consolidate: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SkillCuratorRollbackArgs {
+    /// List available snapshots instead of restoring one.
+    #[arg(long, conflicts_with = "id")]
+    pub list: bool,
+    /// Restore a specific snapshot id. Defaults to the newest prior snapshot.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

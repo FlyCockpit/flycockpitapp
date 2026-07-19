@@ -15,7 +15,7 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 
 -- ---- assistants ------------------------------------------------------------
 
@@ -1163,6 +1163,41 @@ CREATE TABLE skill_pairs (
 
 CREATE INDEX idx_skill_pairs_session_owner
     ON skill_pairs(session_id, owner, intentional_steer);
+
+-- ---- skill_usage -------------------------------------------------------------------------------
+-- Durable Agent Skills usage/lifecycle ledger. Source paths remain text so
+-- global, project, hub, and future package stores can share one table.
+
+CREATE TABLE skill_usage (
+    name             TEXT    PRIMARY KEY,
+    source_path      TEXT    NOT NULL,
+    archive_path     TEXT,
+    created_by       TEXT    NOT NULL CHECK (created_by IN ('foreground', 'background')),
+    use_count        INTEGER NOT NULL DEFAULT 0,
+    view_count       INTEGER NOT NULL DEFAULT 0,
+    last_used_at     INTEGER,
+    last_viewed_at   INTEGER,
+    patch_count      INTEGER NOT NULL DEFAULT 0,
+    last_patched_at  INTEGER,
+    created_at       INTEGER NOT NULL,
+    state            TEXT    NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'stale', 'archived')),
+    pinned           INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    archived_at      INTEGER,
+    updated_at       INTEGER NOT NULL
+);
+
+CREATE INDEX idx_skill_usage_state_activity
+    ON skill_usage(state, pinned, created_by, last_used_at, created_at);
+
+CREATE TABLE skill_curator_snapshots (
+    id         TEXT    PRIMARY KEY,
+    path       TEXT    NOT NULL,
+    reason     TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_skill_curator_snapshots_created
+    ON skill_curator_snapshots(created_at DESC, id DESC);
 
 -- ---- retention_meta -------------------------------------------------------------------------------
 -- Global metadata for DB retention housekeeping.

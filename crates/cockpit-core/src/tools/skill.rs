@@ -88,6 +88,7 @@ impl Tool for SkillTool {
             &activation,
             &ctx.env_overlay,
             store.as_ref(),
+            Some(&ctx.session.db),
         )?;
         if let Some(cage) = &ctx.review_cage {
             cage.record_skill_view(name);
@@ -125,6 +126,7 @@ fn load_skill_into_output(
         &activation,
         &std::sync::RwLock::new(std::collections::HashMap::new()),
         None,
+        None,
     )
 }
 
@@ -138,6 +140,7 @@ fn load_skill_for_session(
     activation: &crate::skills::ActivationContext,
     env_overlay: &std::sync::RwLock<std::collections::HashMap<String, String>>,
     store: Option<&crate::credentials::CredentialStore>,
+    db: Option<&crate::db::Db>,
 ) -> Result<ToolOutput> {
     let skills =
         crate::skills::discover_for_session(cwd, &extended.skills, activation).unwrap_or_default();
@@ -170,6 +173,7 @@ fn load_skill_for_session(
     if let Some(path) = path {
         let body = crate::skills::load_support_file(skill, std::path::Path::new(path))
             .map_err(|e| invalid_input(format!("loading support file `{path}`: {e}")))?;
+        record_skill_view(db, skill, name);
         return Ok(ToolOutput::text(format!(
             "Skill `{name}` support file `{path}`:\n\n{body}{setup_note}"
         )));
@@ -177,11 +181,21 @@ fn load_skill_for_session(
 
     let body = crate::skills::load_body(skill)
         .map_err(|e| anyhow::anyhow!("loading skill `{name}`: {e}"))?;
+    record_skill_view(db, skill, name);
     let rendered =
         crate::skills::render_body(&body, cwd, extended.skills.auto_bang_commands, redact);
     Ok(ToolOutput::text(format!(
         "Skill `{name}`:\n\n{rendered}{setup_note}"
     )))
+}
+
+fn record_skill_view(db: Option<&crate::db::Db>, skill: &crate::skills::Skill, name: &str) {
+    if let Some(db) = db
+        && let Ok(seed) = crate::skills::manage::usage_seed_for_skill(skill)
+        && let Err(error) = db.record_skill_use(seed, true, chrono::Utc::now().timestamp())
+    {
+        tracing::warn!(error = %error, skill = %name, "recording skill use failed");
+    }
 }
 
 /// Resolve declared skill credentials through the existing named-secret store
@@ -242,9 +256,75 @@ mod tests {
                 auto_bang_commands: auto_bang,
                 ancestor_walk: false,
                 write_approval: false,
+                prune_builtins: false,
+                consolidate: false,
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn usage_ledger_counts_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(
+            &scan,
+            "ledger",
+            "---\nname: ledger\ndescription: ledger skill\n---\n",
+            "Track this load.",
+        );
+        std::fs::create_dir_all(scan.join("ledger").join("references")).unwrap();
+        std::fs::write(
+            scan.join("ledger").join("references/support.md"),
+            "Support load.",
+        )
+        .unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let extended = cfg_for(&scan, false);
+
+        load_skill_for_session(
+            "ledger",
+            None,
+            tmp.path(),
+            &extended,
+            &no_redact(tmp.path()),
+            &crate::skills::ActivationContext::default(),
+            &ctx.env_overlay,
+            None,
+            Some(&db),
+        )
+        .unwrap();
+        load_skill_for_session(
+            "ledger",
+            None,
+            tmp.path(),
+            &extended,
+            &no_redact(tmp.path()),
+            &crate::skills::ActivationContext::default(),
+            &ctx.env_overlay,
+            None,
+            Some(&db),
+        )
+        .unwrap();
+        load_skill_for_session(
+            "ledger",
+            Some("references/support.md"),
+            tmp.path(),
+            &extended,
+            &no_redact(tmp.path()),
+            &crate::skills::ActivationContext::default(),
+            &ctx.env_overlay,
+            None,
+            Some(&db),
+        )
+        .unwrap();
+
+        let row = db.get_skill_usage("ledger").unwrap().unwrap();
+        assert_eq!(row.use_count, 3);
+        assert_eq!(row.view_count, 3);
+        assert!(row.last_used_at.is_some());
+        assert!(row.last_viewed_at.is_some());
     }
 
     #[test]
@@ -363,6 +443,7 @@ mod tests {
             &activation,
             &overlay,
             None,
+            None,
         )
         .unwrap();
         assert!(out.content.contains("Reference body"));
@@ -375,6 +456,7 @@ mod tests {
             &no_redact(tmp.path()),
             &activation,
             &overlay,
+            None,
             None,
         )
         .unwrap_err();
@@ -410,6 +492,7 @@ mod tests {
             &activation,
             &overlay,
             Some(&store),
+            None,
         )
         .unwrap();
         assert_eq!(

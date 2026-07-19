@@ -89,6 +89,16 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "last_model_fetch",
 ];
 
+const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
+    "trust",
+    "subagent_invokable",
+    "can_delegate",
+    "default_thinking_mode",
+    "mode",
+    "system_prompt",
+    "capability_overrides",
+];
+
 const KNOWN_PROVIDER_TEMPLATE_IDS: &[&str] = &[
     "openai-compatible",
     "openai",
@@ -2039,16 +2049,50 @@ impl ProvidersConfig {
     /// Resolve product trust for `(provider, model)`: model override,
     /// provider default, then conservative `untrusted`.
     pub fn resolve_trust(&self, provider: &str, model: &str) -> ModelTrust {
-        let Some(entry) = self.providers.get(provider) else {
-            return ModelTrust::Untrusted;
-        };
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .and_then(|m| m.trust)
-            .or(entry.trust)
+        self.providers
+            .get(provider)
+            .and_then(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .find(|m| m.id == model)
+                    .and_then(|m| m.trust)
+            })
+            .unwrap_or_else(|| self.provider_trust_default(provider))
+    }
+
+    pub fn provider_trust_default(&self, provider: &str) -> ModelTrust {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.trust)
             .unwrap_or(ModelTrust::Untrusted)
+    }
+
+    pub fn provider_subagent_invokable_default(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.subagent_invokable)
+            .unwrap_or(false)
+    }
+
+    pub fn provider_can_delegate_default(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.can_delegate)
+            .unwrap_or(true)
+    }
+
+    pub fn provider_default_thinking_mode_default(&self, provider: &str) -> Option<ThinkingMode> {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.default_thinking_mode)
+    }
+
+    pub fn provider_mode_default(&self, provider: &str, global: LlmMode) -> LlmMode {
+        self.providers
+            .get(provider)
+            .and_then(|entry| entry.mode)
+            .unwrap_or(global)
     }
 
     #[allow(dead_code)]
@@ -2092,29 +2136,15 @@ impl ProvidersConfig {
 
     #[allow(dead_code)]
     pub fn resolve_subagent_invokable(&self, provider: &str, model: &str) -> bool {
-        let Some(entry) = self.providers.get(provider) else {
-            return false;
-        };
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
+        self.model_entry(provider, model)
             .and_then(|m| m.subagent_invokable)
-            .or(entry.subagent_invokable)
-            .unwrap_or(false)
+            .unwrap_or_else(|| self.provider_subagent_invokable_default(provider))
     }
 
     pub fn resolve_can_delegate(&self, provider: &str, model: &str) -> bool {
-        let Some(entry) = self.providers.get(provider) else {
-            return true;
-        };
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
+        self.model_entry(provider, model)
             .and_then(|m| m.can_delegate)
-            .or(entry.can_delegate)
-            .unwrap_or(true)
+            .unwrap_or_else(|| self.provider_can_delegate_default(provider))
     }
 
     pub fn resolve_computer_use_catalog(
@@ -2152,13 +2182,9 @@ impl ProvidersConfig {
         provider: &str,
         model: &str,
     ) -> Option<ThinkingMode> {
-        let entry = self.providers.get(provider)?;
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
+        self.model_entry(provider, model)
             .and_then(|m| m.default_thinking_mode)
-            .or(entry.default_thinking_mode)
+            .or_else(|| self.provider_default_thinking_mode_default(provider))
     }
 
     /// Resolve how a leading inline `<think>…</think>` block is **classified**
@@ -2451,16 +2477,9 @@ impl ProvidersConfig {
     /// `llm_mode` passed in by the caller. `None` at a scope means "inherit"
     /// (implementation note).
     pub fn resolve_mode(&self, provider: &str, model: &str, global: LlmMode) -> LlmMode {
-        let Some(entry) = self.providers.get(provider) else {
-            return global;
-        };
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
+        self.model_entry(provider, model)
             .and_then(|m| m.mode)
-            .or(entry.mode)
-            .unwrap_or(global)
+            .unwrap_or_else(|| self.provider_mode_default(provider, global))
     }
 
     /// Resolve configured wire endpoint authority for `(provider, model)`.

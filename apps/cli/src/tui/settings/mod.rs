@@ -2297,8 +2297,9 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
             step.prompt.to_string(),
             Style::default().fg(Color::White),
         )));
-        if !step.help.is_empty() {
-            lines.push(Line::from(Span::styled(step.help.to_string(), muted)));
+        let help = run.help();
+        if !help.is_empty() {
+            lines.push(Line::from(Span::styled(help.into_owned(), muted)));
         }
         lines.push(Line::default());
         match &step.kind {
@@ -2347,8 +2348,8 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     let marker = if index == *cursor { "▸ " } else { "  " };
                     let checked = prefill_values
                         .as_ref()
-                        .map(|values| values.iter().any(|value| value == option.id))
-                        .unwrap_or_else(|| multi.contains(option.id));
+                        .map(|values| values.iter().any(|value| value == option.id.as_ref()))
+                        .unwrap_or_else(|| multi.contains(option.id.as_ref()));
                     let check = if checked { "[x]" } else { "[ ]" };
                     let style = if index == *cursor {
                         selected

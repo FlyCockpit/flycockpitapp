@@ -2164,23 +2164,23 @@ mod tests {
     struct TestModelResponse {
         status: u16,
         headers: Vec<(&'static str, &'static str)>,
-        body: &'static str,
+        body: String,
     }
 
     impl TestModelResponse {
-        fn ok(body: &'static str) -> Self {
+        fn ok(body: impl Into<String>) -> Self {
             Self {
                 status: 200,
                 headers: Vec::new(),
-                body,
+                body: body.into(),
             }
         }
 
-        fn status(status: u16, body: &'static str) -> Self {
+        fn status(status: u16, body: impl Into<String>) -> Self {
             Self {
                 status,
                 headers: Vec::new(),
-                body,
+                body: body.into(),
             }
         }
 
@@ -2233,7 +2233,7 @@ mod tests {
                     raw.push_str("\r\n");
                 }
                 raw.push_str("\r\n");
-                raw.push_str(response.body);
+                raw.push_str(&response.body);
                 socket.write_all(raw.as_bytes()).await.unwrap();
             }
             requests
@@ -2242,7 +2242,9 @@ mod tests {
         (format!("http://{addr}/v1"), handle)
     }
 
-    async fn serve_models_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    async fn serve_models_once(
+        body: impl Into<String>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let (base, handle) = serve_model_responses(vec![TestModelResponse::ok(body)]).await;
         let handle =
             tokio::spawn(
@@ -2509,7 +2511,6 @@ mod tests {
     async fn oversized_success_response_body_errors_before_parse() {
         let mut body = String::from(r#"{"data":[]}"#);
         body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
-        let body: &'static str = Box::leak(body.into_boxed_str());
         let (base_url, request_handle) = serve_models_once(body).await;
         let entry = ProviderEntry {
             url: base_url.clone(),

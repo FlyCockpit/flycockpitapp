@@ -616,17 +616,8 @@ const PINS: KeyGroup = KeyGroup {
 /// `keybindings()` descriptor so the source of truth lives next to the
 /// handler (data-driven, no prose duplication).
 #[cfg(test)]
-pub fn groups_for(context: KeyContext) -> Vec<KeyGroup> {
+fn groups_for(context: KeyContext) -> Vec<OwnedKeyGroup> {
     groups_for_owned(context, true)
-        .into_iter()
-        .map(|group| {
-            let leaked: &'static [KeyBinding] = Box::leak(group.bindings.into_boxed_slice());
-            KeyGroup {
-                title: group.title,
-                bindings: leaked,
-            }
-        })
-        .collect()
 }
 
 fn groups_for_owned(context: KeyContext, keyboard_enhancement_active: bool) -> Vec<OwnedKeyGroup> {
@@ -953,12 +944,18 @@ mod tests {
             "approval shows numbered selection keys"
         );
         assert_eq!(
-            dialog_which_key_bindings(true),
-            groups_for(KeyContext::QuestionDialog)[0].bindings
+            dialog_which_key_bindings(true).as_slice(),
+            groups_for(KeyContext::QuestionDialog)[0]
+                .bindings
+                .as_slice()
         );
         assert_eq!(
-            groups_for(KeyContext::ApprovalDialog)[0].bindings,
-            groups_for(KeyContext::QuestionDialog)[0].bindings
+            groups_for(KeyContext::ApprovalDialog)[0]
+                .bindings
+                .as_slice(),
+            groups_for(KeyContext::QuestionDialog)[0]
+                .bindings
+                .as_slice()
         );
     }
 

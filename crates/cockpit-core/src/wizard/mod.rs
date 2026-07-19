@@ -3,6 +3,7 @@
 //! Renderers own terminal/TUI concerns. [`WizardRun`] only validates answers,
 //! records navigation, selects branches, and applies descriptor write hooks.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
@@ -13,9 +14,9 @@ pub const MODEL_WIZARD_ID: &str = "model";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
+    pub id: Cow<'static, str>,
+    pub label: Cow<'static, str>,
+    pub description: Cow<'static, str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,12 +44,14 @@ pub type PrefillHook = fn(&WizardRun) -> Option<WizardAnswer>;
 pub type ValidationHook = fn(&WizardRun, &WizardAnswer) -> std::result::Result<(), String>;
 pub type WriteHook = fn(&WizardRun, &WizardAnswer) -> std::result::Result<(), String>;
 pub type BranchHook = fn(&WizardRun, &WizardAnswer) -> Option<&'static str>;
+pub type HelpHook = fn(&WizardRun) -> Option<String>;
 
 #[derive(Clone)]
 pub struct StepDescriptor {
     pub id: &'static str,
     pub prompt: &'static str,
     pub help: &'static str,
+    pub help_hook: Option<HelpHook>,
     pub kind: StepKind,
     pub default_answer: Option<WizardAnswer>,
     pub prefill: Option<PrefillHook>,
@@ -90,6 +93,7 @@ pub struct WizardDescriptor {
 pub(crate) struct ModelWizardContext {
     default_provider: Option<String>,
     default_model_ref: Option<String>,
+    provider_trust_defaults: BTreeMap<String, crate::config::providers::ModelTrust>,
     models: BTreeMap<String, ModelWizardPrefill>,
 }
 
@@ -170,6 +174,18 @@ impl WizardRun {
             .cloned()
             .or_else(|| step.prefill.and_then(|prefill| prefill(self)))
             .or_else(|| step.default_answer.clone())
+    }
+
+    pub fn help(&self) -> Cow<'_, str> {
+        let Some(step) = self.current_step() else {
+            return Cow::Borrowed("");
+        };
+        if let Some(help_hook) = step.help_hook
+            && let Some(help) = help_hook(self)
+        {
+            return Cow::Owned(help);
+        }
+        Cow::Borrowed(step.help)
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -307,13 +323,21 @@ pub fn model_descriptor_for_config_with_global(
     cfg: &crate::config::providers::ProvidersConfig,
     global_mode: crate::config::extended::LlmMode,
 ) -> WizardDescriptor {
+    model_descriptor_with_selection(cfg, global_mode, None)
+}
+
+pub fn model_descriptor_with_selection(
+    cfg: &crate::config::providers::ProvidersConfig,
+    global_mode: crate::config::extended::LlmMode,
+    preselect: Option<(&str, &str)>,
+) -> WizardDescriptor {
     let provider_options = cfg
         .providers
         .keys()
         .map(|id| SelectOption {
-            id: leak_static(id.clone()),
-            label: leak_static(id.clone()),
-            description: "Configure a model from this provider",
+            id: id.clone().into(),
+            label: id.clone().into(),
+            description: "Configure a model from this provider".into(),
         })
         .collect();
     let mut model_options = Vec::new();
@@ -326,13 +350,13 @@ pub fn model_descriptor_for_config_with_global(
                 .map(|name| format!("{name} ({provider_id}:{})", model.id))
                 .unwrap_or_else(|| id.clone());
             model_options.push(SelectOption {
-                id: leak_static(id),
-                label: leak_static(label),
-                description: "Configure this exact provider/model pair",
+                id: id.into(),
+                label: label.into(),
+                description: "Configure this exact provider/model pair".into(),
             });
         }
     }
-    let model_context = model_wizard_context(cfg, global_mode);
+    let model_context = model_wizard_context(cfg, global_mode, preselect);
     WizardDescriptor {
         id: MODEL_WIZARD_ID,
         title: "Configure model",
@@ -344,6 +368,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "provider",
                 prompt: "Choose a provider",
                 help: "Pick the provider that owns the model you want to configure.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: provider_options,
                 },
@@ -357,6 +382,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "model",
                 prompt: "Choose a model",
                 help: "Model ids are provider-qualified as provider:model.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: model_options,
                 },
@@ -370,22 +396,23 @@ pub fn model_descriptor_for_config_with_global(
                 id: "class",
                 prompt: "Model class",
                 help: "Writes a model-level class override only when it differs from the inherited answer.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: "defensive",
-                            label: "defensive",
-                            description: "Small/defensive model class",
+                            id: "defensive".into(),
+                            label: "defensive".into(),
+                            description: "Small/defensive model class".into(),
                         },
                         SelectOption {
-                            id: "normal",
-                            label: "normal",
-                            description: "Default strong-model class",
+                            id: "normal".into(),
+                            label: "normal".into(),
+                            description: "Default strong-model class".into(),
                         },
                         SelectOption {
-                            id: "frontier",
-                            label: "frontier",
-                            description: "Top-tier/frontier class",
+                            id: "frontier".into(),
+                            label: "frontier".into(),
+                            description: "Top-tier/frontier class".into(),
                         },
                     ],
                 },
@@ -399,17 +426,19 @@ pub fn model_descriptor_for_config_with_global(
                 id: "trust",
                 prompt: "Provider trust",
                 help: "provider default is shown by inheritance. untrusted: cockpit redacts known secrets from requests · trusted: requests are sent unredacted.",
+                help_hook: Some(model_trust_help),
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: "untrusted",
-                            label: "untrusted",
-                            description: "Redact known secrets before requests",
+                            id: "untrusted".into(),
+                            label: "untrusted".into(),
+                            description: "Redact known secrets before requests".into(),
                         },
                         SelectOption {
-                            id: "trusted",
-                            label: "trusted",
-                            description: "Self-hosted/trusted endpoint; send requests unredacted",
+                            id: "trusted".into(),
+                            label: "trusted".into(),
+                            description: "Self-hosted/trusted endpoint; send requests unredacted"
+                                .into(),
                         },
                     ],
                 },
@@ -423,27 +452,28 @@ pub fn model_descriptor_for_config_with_global(
                 id: "capabilities",
                 prompt: "Input and request capabilities",
                 help: "Leave detected values unchanged to keep Auto. Toggle only values you know are wrong.",
+                help_hook: None,
                 kind: StepKind::MultiToggle {
                     options: vec![
                         SelectOption {
-                            id: "images",
-                            label: "image input",
-                            description: "Supports image input parts",
+                            id: "images".into(),
+                            label: "image input".into(),
+                            description: "Supports image input parts".into(),
                         },
                         SelectOption {
-                            id: "tools",
-                            label: "tool calling",
-                            description: "Supports tool/function calling",
+                            id: "tools".into(),
+                            label: "tool calling".into(),
+                            description: "Supports tool/function calling".into(),
                         },
                         SelectOption {
-                            id: "reasoning",
-                            label: "reasoning",
-                            description: "Supports reasoning/thinking controls",
+                            id: "reasoning".into(),
+                            label: "reasoning".into(),
+                            description: "Supports reasoning/thinking controls".into(),
                         },
                         SelectOption {
-                            id: "structured_outputs",
-                            label: "structured outputs",
-                            description: "Supports JSON-schema structured outputs",
+                            id: "structured_outputs".into(),
+                            label: "structured outputs".into(),
+                            description: "Supports JSON-schema structured outputs".into(),
                         },
                     ],
                 },
@@ -457,6 +487,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "context-tokens",
                 prompt: "Context window tokens",
                 help: "Blank keeps Auto. Enter a number only when detection/defaults are wrong.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: None,
                 prefill: Some(model_context_tokens_prefill),
@@ -468,6 +499,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "max-output-tokens",
                 prompt: "Max output tokens",
                 help: "Blank keeps Auto. Enter a number only when detection/defaults are wrong.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: None,
                 prefill: Some(model_max_output_tokens_prefill),
@@ -479,32 +511,33 @@ pub fn model_descriptor_for_config_with_global(
                 id: "thinking",
                 prompt: "Default thinking mode",
                 help: "Active /model selections still win. This model default is used only when the active selection does not pin thinking.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: "inherit",
-                            label: "inherit",
-                            description: "No model-level default",
+                            id: "inherit".into(),
+                            label: "inherit".into(),
+                            description: "No model-level default".into(),
                         },
                         SelectOption {
-                            id: "off",
-                            label: "off",
-                            description: "Disable legacy thinking mode",
+                            id: "off".into(),
+                            label: "off".into(),
+                            description: "Disable legacy thinking mode".into(),
                         },
                         SelectOption {
-                            id: "low",
-                            label: "low",
-                            description: "Low thinking mode",
+                            id: "low".into(),
+                            label: "low".into(),
+                            description: "Low thinking mode".into(),
                         },
                         SelectOption {
-                            id: "medium",
-                            label: "medium",
-                            description: "Medium thinking mode",
+                            id: "medium".into(),
+                            label: "medium".into(),
+                            description: "Medium thinking mode".into(),
                         },
                         SelectOption {
-                            id: "high",
-                            label: "high",
-                            description: "High thinking mode",
+                            id: "high".into(),
+                            label: "high".into(),
+                            description: "High thinking mode".into(),
                         },
                     ],
                 },
@@ -518,17 +551,18 @@ pub fn model_descriptor_for_config_with_global(
                 id: "subagent-flags",
                 prompt: "Subagent behavior",
                 help: "Toggle whether this model can be spawned as a subagent and whether it can spawn subagents.",
+                help_hook: None,
                 kind: StepKind::MultiToggle {
                     options: vec![
                         SelectOption {
-                            id: "subagent_invokable",
-                            label: "spawn as subagent",
-                            description: "This model may be selected for subagents",
+                            id: "subagent_invokable".into(),
+                            label: "spawn as subagent".into(),
+                            description: "This model may be selected for subagents".into(),
                         },
                         SelectOption {
-                            id: "can_delegate",
-                            label: "can spawn subagents",
-                            description: "This model receives delegation affordances",
+                            id: "can_delegate".into(),
+                            label: "can spawn subagents".into(),
+                            description: "This model receives delegation affordances".into(),
                         },
                     ],
                 },
@@ -542,6 +576,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "default-model",
                 prompt: "Make this the active/default model?",
                 help: "Affects future model resolution; it does not hijack existing live sessions.",
+                help_hook: None,
                 kind: StepKind::Confirm,
                 default_answer: None,
                 prefill: Some(model_make_default_prefill),
@@ -553,17 +588,18 @@ pub fn model_descriptor_for_config_with_global(
                 id: "system-prompt-choice",
                 prompt: "Model-specific system prompt",
                 help: "Skip, or enter model-specific instructions applied to new root sessions.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: "skip",
-                            label: "skip",
-                            description: "Leave model-specific instructions unchanged",
+                            id: "skip".into(),
+                            label: "skip".into(),
+                            description: "Leave model-specific instructions unchanged".into(),
                         },
                         SelectOption {
-                            id: "set",
-                            label: "set prompt",
-                            description: "Enter model-specific instructions now",
+                            id: "set".into(),
+                            label: "set prompt".into(),
+                            description: "Enter model-specific instructions now".into(),
                         },
                     ],
                 },
@@ -577,6 +613,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "system-prompt",
                 prompt: "System prompt text",
                 help: "Blank clears the model-specific prompt.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: None,
                 prefill: Some(model_system_prompt_prefill),
@@ -588,6 +625,7 @@ pub fn model_descriptor_for_config_with_global(
                 id: "model-save",
                 prompt: "Apply model settings",
                 help: "Only changed model-scope values are written.",
+                help_hook: None,
                 kind: StepKind::Action {
                     progress: "Applying model settings…",
                 },
@@ -604,16 +642,22 @@ pub fn model_descriptor_for_config_with_global(
 fn model_wizard_context(
     cfg: &crate::config::providers::ProvidersConfig,
     global_mode: crate::config::extended::LlmMode,
+    preselect: Option<(&str, &str)>,
 ) -> ModelWizardContext {
     use crate::config::providers::CapabilityStatus;
 
     let mut default_provider = None;
     let mut default_model_ref = None;
+    let mut provider_trust_defaults = BTreeMap::new();
     let mut models = BTreeMap::new();
     for (provider_id, provider) in &cfg.providers {
         if default_provider.is_none() {
             default_provider = Some(provider_id.clone());
         }
+        provider_trust_defaults.insert(
+            provider_id.clone(),
+            cfg.provider_trust_default(provider_id.as_str()),
+        );
         for model in &provider.models {
             let model_ref = format!("{provider_id}:{}", model.id);
             if default_model_ref.is_none() {
@@ -665,9 +709,17 @@ fn model_wizard_context(
             }
         }
     }
+    if let Some((provider, model)) = preselect {
+        let model_ref = format!("{provider}:{model}");
+        if models.contains_key(&model_ref) {
+            default_provider = Some(provider.to_string());
+            default_model_ref = Some(model_ref);
+        }
+    }
     ModelWizardContext {
         default_provider,
         default_model_ref,
+        provider_trust_defaults,
         models,
     }
 }
@@ -682,9 +734,9 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
     let template_options = TEMPLATES
         .iter()
         .map(|template| SelectOption {
-            id: template.id,
-            label: template.display,
-            description: template.hint.unwrap_or("Provider template"),
+            id: template.id.into(),
+            label: template.display.into(),
+            description: template.hint.unwrap_or("Provider template").into(),
         })
         .collect();
     WizardDescriptor {
@@ -698,6 +750,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "template",
                 prompt: "Choose a provider template",
                 help: "The template pre-fills the provider id, URL, and authentication shape.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: template_options,
                 },
@@ -711,6 +764,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "id",
                 prompt: "Provider id",
                 help: "Use lowercase letters, digits, `-`, or `_`.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: None,
                 prefill: Some(provider_id_prefill),
@@ -722,6 +776,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "url",
                 prompt: "Base URL",
                 help: "The endpoint must start with http:// or https://.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: None,
                 prefill: Some(provider_url_prefill),
@@ -738,22 +793,24 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "auth-method",
                 prompt: "How do you want to provide the API key?",
                 help: "Paste stores the key in Cockpit's credential store; env var keeps a $VAR reference; advanced opens raw headers.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: "paste-key",
-                            label: "Paste key",
-                            description: "Store a masked key as a $secret: reference",
+                            id: "paste-key".into(),
+                            label: "Paste key".into(),
+                            description: "Store a masked key as a $secret: reference".into(),
                         },
                         SelectOption {
-                            id: "env-var",
-                            label: "Use env var",
-                            description: "Write a $VAR reference and keep the key in your shell",
+                            id: "env-var".into(),
+                            label: "Use env var".into(),
+                            description: "Write a $VAR reference and keep the key in your shell"
+                                .into(),
                         },
                         SelectOption {
-                            id: "advanced-headers",
-                            label: "Advanced headers",
-                            description: "Edit HTTP headers directly",
+                            id: "advanced-headers".into(),
+                            label: "Advanced headers".into(),
+                            description: "Edit HTTP headers directly".into(),
                         },
                     ],
                 },
@@ -767,6 +824,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "api-key",
                 prompt: "Paste API key",
                 help: "Input is masked. Surrounding whitespace is trimmed before storage.",
+                help_hook: None,
                 kind: StepKind::Secret,
                 default_answer: None,
                 prefill: None,
@@ -778,6 +836,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "env-var",
                 prompt: "Environment variable name",
                 help: "The provider header will reference this variable with $VAR.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: None,
                 prefill: Some(provider_env_var_prefill),
@@ -804,6 +863,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "saving",
                 prompt: "Save provider",
                 help: "The provider is written atomically at this step.",
+                help_hook: None,
                 kind: StepKind::Action {
                     progress: "Saving provider…",
                 },
@@ -817,17 +877,18 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "test-key-choice",
                 prompt: "Test key now?",
                 help: "Default: test now. Choose skip-test to save without validation.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: "test",
-                            label: "Test key",
-                            description: "Validate credentials now",
+                            id: "test".into(),
+                            label: "Test key".into(),
+                            description: "Validate credentials now".into(),
                         },
                         SelectOption {
-                            id: "skip-test",
-                            label: "Skip test",
-                            description: "Save now and validate on first use",
+                            id: "skip-test".into(),
+                            label: "Skip test".into(),
+                            description: "Save now and validate on first use".into(),
                         },
                     ],
                 },
@@ -842,6 +903,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "test-skipped",
                 prompt: "key saved but unverified — it will be tested on your first message.",
                 help: "Continue to finish provider setup.",
+                help_hook: None,
                 kind: StepKind::Info,
                 default_answer: None,
                 prefill: None,
@@ -854,6 +916,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 id: "done",
                 prompt: "Provider setup complete",
                 help: "Continue to return to the provider list.",
+                help_hook: None,
                 kind: StepKind::Info,
                 default_answer: None,
                 prefill: None,
@@ -883,27 +946,28 @@ pub fn security_descriptor_for_config(
                 id: "sandbox",
                 prompt: "How should Cockpit confine shell commands by default?",
                 help: "Keep the host shell sandbox unless you specifically need container isolation or unconfined commands. `off` means commands the model runs are unconfined.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: sandbox_mode_id(current.sandbox.default_mode),
-                            label: "Keep current sandbox setting",
-                            description: "Recommended default is sandbox. Commands run inside the OS shell sandbox when available.",
+                            id: sandbox_mode_id(current.sandbox.default_mode).into(),
+                            label: "Keep current sandbox setting".into(),
+                            description: "Recommended default is sandbox. Commands run inside the OS shell sandbox when available.".into(),
                         },
                         SelectOption {
-                            id: "container",
-                            label: "container",
-                            description: "Run commands in a Docker/Podman container. Shown even if docker/podman is not found.",
+                            id: "container".into(),
+                            label: "container".into(),
+                            description: "Run commands in a Docker/Podman container. Shown even if docker/podman is not found.".into(),
                         },
                         SelectOption {
-                            id: "container-readonly",
-                            label: "container-readonly",
-                            description: "Run in a container with the project mounted read-only.",
+                            id: "container-readonly".into(),
+                            label: "container-readonly".into(),
+                            description: "Run in a container with the project mounted read-only.".into(),
                         },
                         SelectOption {
-                            id: "off",
-                            label: "off",
-                            description: "Unconfined: commands the model runs are not sandboxed.",
+                            id: "off".into(),
+                            label: "off".into(),
+                            description: "Unconfined: commands the model runs are not sandboxed.".into(),
                         },
                     ],
                 },
@@ -919,22 +983,23 @@ pub fn security_descriptor_for_config(
                 id: "approval",
                 prompt: "How should gated commands and network calls be approved?",
                 help: "Manual asks every time. Auto uses the utility-model safety gate for safe calls and asks on unsafe or unavailable. Yolo runs gated calls unprompted. Remembered command/path grants can be once, session, project, or global; project/global grants are machine-local.",
+                help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
-                            id: current.default_approval_mode.as_str(),
-                            label: "Keep current approval mode",
-                            description: "Recommended default is manual. You approve every gated command, web fetch, and MCP call.",
+                            id: current.default_approval_mode.as_str().into(),
+                            label: "Keep current approval mode".into(),
+                            description: "Recommended default is manual. You approve every gated command, web fetch, and MCP call.".into(),
                         },
                         SelectOption {
-                            id: "auto",
-                            label: "auto",
-                            description: "Use the utility-model safety gate for safe calls; ask when unsafe or unavailable.",
+                            id: "auto".into(),
+                            label: "auto".into(),
+                            description: "Use the utility-model safety gate for safe calls; ask when unsafe or unavailable.".into(),
                         },
                         SelectOption {
-                            id: "yolo",
-                            label: "yolo",
-                            description: "Runs gated commands and network calls unprompted.",
+                            id: "yolo".into(),
+                            label: "yolo".into(),
+                            description: "Runs gated commands and network calls unprompted.".into(),
                         },
                     ],
                 },
@@ -950,6 +1015,7 @@ pub fn security_descriptor_for_config(
                 id: "trusted-only",
                 prompt: "Require trusted providers/models only?",
                 help: "Trusted-only blocks untrusted provider/model choices. Trusted providers can receive original text; untrusted providers receive redacted text.",
+                help_hook: None,
                 kind: StepKind::Confirm,
                 default_answer: Some(WizardAnswer::Confirm(current.trusted_only)),
                 prefill: None,
@@ -961,6 +1027,7 @@ pub fn security_descriptor_for_config(
                 id: "redaction",
                 prompt: "Minimum secret length for redaction",
                 help: "For untrusted models, Cockpit redacts known secrets from your environment and Cockpit's secret store. Keep 8 unless short secrets are common in your workflow.",
+                help_hook: None,
                 kind: StepKind::Text,
                 default_answer: Some(WizardAnswer::Text(
                     current.redact.min_secret_length.to_string(),
@@ -974,6 +1041,7 @@ pub fn security_descriptor_for_config(
                 id: "workspace-trust",
                 prompt: "Workspace trust is per project. Use `cockpit trust set <path> --mode trust|ignore-config|untrusted` to change it.",
                 help: "Trust allows project config. Ignore-config opens the workspace without project config. Untrusted blocks the workspace.",
+                help_hook: None,
                 kind: StepKind::Info,
                 default_answer: None,
                 prefill: None,
@@ -985,6 +1053,7 @@ pub fn security_descriptor_for_config(
                 id: "security-save",
                 prompt: "Apply security settings",
                 help: "Only values that differ from the starting effective configuration are written.",
+                help_hook: None,
                 kind: StepKind::Action {
                     progress: "Applying security settings…",
                 },
@@ -1209,6 +1278,7 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
         id,
         prompt,
         help: progress,
+        help_hook: None,
         kind: StepKind::Action { progress },
         default_answer: None,
         prefill: None,
@@ -1219,10 +1289,6 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
             _ => action_to_saving,
         }),
     }
-}
-
-fn leak_static(value: String) -> &'static str {
-    Box::leak(value.into_boxed_str())
 }
 
 fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
@@ -1551,6 +1617,15 @@ fn model_prefill(run: &WizardRun) -> Option<&ModelWizardPrefill> {
         .get(&format!("{provider}:{model}"))
 }
 
+fn model_trust_help(run: &WizardRun) -> Option<String> {
+    let provider = model_provider_answer(run)?;
+    let trust = *model_context(run)?.provider_trust_defaults.get(&provider)?;
+    Some(format!(
+        "provider default: {} · untrusted: cockpit redacts known secrets from requests · trusted: requests are sent unredacted.",
+        model_trust_id(trust)
+    ))
+}
+
 fn model_provider_prefill(run: &WizardRun) -> Option<WizardAnswer> {
     model_context(run)?
         .default_provider
@@ -1762,6 +1837,7 @@ mod tests {
                     id: "start",
                     prompt: "start",
                     help: "",
+                    help_hook: None,
                     kind: StepKind::Select { options: vec![] },
                     default_answer: None,
                     prefill: None,
@@ -1773,6 +1849,7 @@ mod tests {
                     id: "slow",
                     prompt: "slow",
                     help: "",
+                    help_hook: None,
                     kind: StepKind::Text,
                     default_answer: None,
                     prefill: None,
@@ -1784,6 +1861,7 @@ mod tests {
                     id: "finish",
                     prompt: "finish",
                     help: "",
+                    help_hook: None,
                     kind: StepKind::Info,
                     default_answer: None,
                     prefill: None,
@@ -1793,6 +1871,206 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn model_test_config() -> crate::config::providers::ProvidersConfig {
+        let mut cfg = crate::config::providers::ProvidersConfig::default();
+        let mut provider_p = crate::config::providers::ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            ..Default::default()
+        };
+        provider_p
+            .models
+            .push(crate::config::providers::ModelEntry {
+                id: "m1".to_string(),
+                ..Default::default()
+            });
+        let mut provider_q = crate::config::providers::ProviderEntry {
+            url: "http://localhost:2/v1".to_string(),
+            trust: Some(crate::config::providers::ModelTrust::Trusted),
+            ..Default::default()
+        };
+        provider_q
+            .models
+            .push(crate::config::providers::ModelEntry {
+                id: "qm".to_string(),
+                ..Default::default()
+            });
+        cfg.providers.insert("p".to_string(), provider_p);
+        cfg.providers.insert("q".to_string(), provider_q);
+        cfg.active_model = Some(crate::config::providers::ActiveModelRef {
+            provider: "p".to_string(),
+            model: "m1".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        });
+        cfg
+    }
+
+    fn prefill_hook(_: &WizardRun) -> Option<WizardAnswer> {
+        Some(WizardAnswer::Text("hook".to_string()))
+    }
+
+    fn prefill_test_descriptor() -> WizardDescriptor {
+        WizardDescriptor {
+            id: "prefill-test",
+            title: "Prefill Test",
+            description: "Prefill test",
+            write_policy: WritePolicy::CommitAtEnd,
+            model_context: None,
+            steps: vec![
+                StepDescriptor {
+                    id: "value",
+                    prompt: "value",
+                    help: "",
+                    help_hook: None,
+                    kind: StepKind::Text,
+                    default_answer: Some(WizardAnswer::Text("default".to_string())),
+                    prefill: Some(prefill_hook),
+                    validate: None,
+                    write: None,
+                    branch: None,
+                },
+                StepDescriptor {
+                    id: "done",
+                    prompt: "done",
+                    help: "",
+                    help_hook: None,
+                    kind: StepKind::Info,
+                    default_answer: None,
+                    prefill: None,
+                    validate: None,
+                    write: None,
+                    branch: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn model_wizard_preselection_prefills_provider_and_model() {
+        let cfg = model_test_config();
+        let descriptor = model_descriptor_with_selection(
+            &cfg,
+            crate::config::extended::LlmMode::Normal,
+            Some(("q", "qm")),
+        );
+        let mut run = WizardRun::new(descriptor).unwrap();
+
+        assert_eq!(run.prefill(), Some(WizardAnswer::Select("q".to_string())));
+        run.submit(WizardAnswer::Select("q".to_string())).unwrap();
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("q:qm".to_string()))
+        );
+    }
+
+    #[test]
+    fn model_wizard_unknown_preselection_falls_back() {
+        let cfg = model_test_config();
+        let descriptor = model_descriptor_with_selection(
+            &cfg,
+            crate::config::extended::LlmMode::Normal,
+            Some(("q", "missing")),
+        );
+        let mut run = WizardRun::new(descriptor).unwrap();
+
+        assert_eq!(run.prefill(), Some(WizardAnswer::Select("p".to_string())));
+        run.submit(WizardAnswer::Select("p".to_string())).unwrap();
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("p:m1".to_string()))
+        );
+    }
+
+    #[test]
+    fn trust_step_help_shows_resolved_provider_default() {
+        let cfg = model_test_config();
+        let descriptor =
+            model_descriptor_for_config_with_global(&cfg, crate::config::extended::LlmMode::Normal);
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("q".to_string())).unwrap();
+        run.submit(WizardAnswer::Select("q:qm".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("normal".to_string()))
+            .unwrap();
+        assert!(run.help().contains("provider default: trusted"));
+
+        let descriptor =
+            model_descriptor_for_config_with_global(&cfg, crate::config::extended::LlmMode::Normal);
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("p".to_string())).unwrap();
+        run.submit(WizardAnswer::Select("p:m1".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("normal".to_string()))
+            .unwrap();
+        assert!(run.help().contains("provider default: untrusted"));
+    }
+
+    #[test]
+    fn prefill_hook_wins_over_default_answer() {
+        let run = WizardRun::new(prefill_test_descriptor()).unwrap();
+
+        assert_eq!(run.prefill(), Some(WizardAnswer::Text("hook".to_string())));
+    }
+
+    #[test]
+    fn saved_answer_wins_over_prefill_hook() {
+        let mut run = WizardRun::new(prefill_test_descriptor()).unwrap();
+
+        run.submit(WizardAnswer::Text("saved".to_string())).unwrap();
+        assert!(run.back());
+        assert_eq!(run.prefill(), Some(WizardAnswer::Text("saved".to_string())));
+    }
+
+    #[test]
+    fn provider_wizard_prefill_precedence_regression() {
+        let mut run = WizardRun::new(provider_descriptor_with_template(Some("openai"))).unwrap();
+
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("openai".to_string()))
+        );
+        run.submit(WizardAnswer::Select("openai".to_string()))
+            .unwrap();
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Text("openai".to_string()))
+        );
+    }
+
+    #[test]
+    fn security_wizard_prefills_current_config() {
+        let current = crate::config::extended::ExtendedConfig {
+            sandbox: crate::config::extended::SandboxConfig {
+                default_mode: crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+                ..Default::default()
+            },
+            default_approval_mode: crate::config::extended::ApprovalMode::Yolo,
+            trusted_only: true,
+            redact: crate::config::extended::RedactConfig {
+                min_secret_length: 17,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut run = WizardRun::new(security_descriptor_for_config(&current)).unwrap();
+
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("container-readonly".to_string()))
+        );
+        run.submit(WizardAnswer::Select("container-readonly".to_string()))
+            .unwrap();
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("yolo".to_string()))
+        );
+        run.submit(WizardAnswer::Select("yolo".to_string()))
+            .unwrap();
+        assert_eq!(run.prefill(), Some(WizardAnswer::Confirm(true)));
+        run.submit(WizardAnswer::Confirm(true)).unwrap();
+        assert_eq!(run.prefill(), Some(WizardAnswer::Text("17".to_string())));
     }
 
     #[test]

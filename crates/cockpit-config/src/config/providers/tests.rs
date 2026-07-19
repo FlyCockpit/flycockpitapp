@@ -49,6 +49,49 @@ fn capture_warn_logs(f: impl FnOnce()) -> String {
 }
 
 #[test]
+fn provider_default_resolvers_match_model_resolvers_without_overrides() {
+    let mut cfg = ProvidersConfig::default();
+    let mut provider = ProviderEntry {
+        url: "https://example.test/v1".to_string(),
+        trust: Some(ModelTrust::Trusted),
+        subagent_invokable: Some(true),
+        can_delegate: Some(false),
+        default_thinking_mode: Some(ThinkingMode::High),
+        mode: Some(LlmMode::Frontier),
+        ..Default::default()
+    };
+    provider.models.push(ModelEntry {
+        id: "m".to_string(),
+        ..Default::default()
+    });
+    cfg.providers.insert("p".to_string(), provider);
+    let global = LlmMode::Normal;
+
+    assert_eq!(cfg.resolve_trust("p", "m"), cfg.provider_trust_default("p"));
+    assert_eq!(
+        cfg.resolve_subagent_invokable("p", "m"),
+        cfg.provider_subagent_invokable_default("p")
+    );
+    assert_eq!(
+        cfg.resolve_can_delegate("p", "m"),
+        cfg.provider_can_delegate_default("p")
+    );
+    assert_eq!(
+        cfg.resolve_default_thinking_mode("p", "m"),
+        cfg.provider_default_thinking_mode_default("p")
+    );
+    assert_eq!(
+        cfg.resolve_mode("p", "m", global),
+        cfg.provider_mode_default("p", global)
+    );
+
+    assert_eq!(cfg.provider_trust_default("missing"), ModelTrust::Untrusted);
+    assert!(!cfg.provider_subagent_invokable_default("missing"));
+    assert!(cfg.provider_can_delegate_default("missing"));
+    assert_eq!(cfg.provider_mode_default("missing", global), global);
+}
+
+#[test]
 fn round_trips_a_provider_entry() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

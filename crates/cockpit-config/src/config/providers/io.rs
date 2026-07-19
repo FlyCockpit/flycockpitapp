@@ -287,6 +287,52 @@ impl ConfigDoc {
         self.persist_provider_raw(provider_id, provider)
     }
 
+    pub fn write_model_wizard_fields(
+        &mut self,
+        provider_id: &str,
+        model: &ModelEntry,
+    ) -> Result<()> {
+        let mut provider = self.provider_raw_object(provider_id)?;
+        let models = provider
+            .entry("models".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !models.is_array() {
+            *models = Value::Array(Vec::new());
+        }
+        let models = models.as_array_mut().expect("models reset to array");
+        let serialized = serde_json::to_value(model).context("serializing model wizard fields")?;
+        let Value::Object(serialized) = serialized else {
+            unreachable!("ModelEntry serializes to object");
+        };
+        let mut found = false;
+        for raw_model in models.iter_mut() {
+            let Some(model_obj) = raw_model.as_object_mut() else {
+                continue;
+            };
+            if model_obj.get("id").and_then(Value::as_str) == Some(model.id.as_str()) {
+                for key in MODEL_WIZARD_MODEL_FIELD_KEYS {
+                    model_obj.remove(*key);
+                    if let Some(value) = serialized.get(*key) {
+                        model_obj.insert((*key).to_string(), value.clone());
+                    }
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            let mut model_obj = Map::new();
+            model_obj.insert("id".to_string(), Value::String(model.id.clone()));
+            for key in MODEL_WIZARD_MODEL_FIELD_KEYS {
+                if let Some(value) = serialized.get(*key) {
+                    model_obj.insert((*key).to_string(), value.clone());
+                }
+            }
+            models.push(Value::Object(model_obj));
+        }
+        self.persist_provider_raw(provider_id, provider)
+    }
+
     fn persist_raw(&self) -> Result<()> {
         let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
         if let Some(parent) = self.path.parent() {

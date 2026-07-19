@@ -8,7 +8,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::cli::SetupArgs;
-use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
+use crate::config::dirs::{
+    CONFIG_FILE, config_write_target_for_provider, most_specific_config_write_target,
+};
 use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::{ConfigDoc, HeaderSpec, ModelMergePolicy, OnUnlistedModelsFetch};
 use crate::providers::models_fetch::{self, FetchOutcome};
@@ -91,13 +93,18 @@ pub(crate) fn descriptor_for_cwd(id: &str, cwd: &std::path::Path) -> Option<Wiza
         return Some(crate::wizard::security_descriptor_for_config(&current));
     }
     if id == crate::wizard::MODEL_WIZARD_ID {
-        let current = ConfigDoc::load_effective(cwd);
-        let global = crate::config::extended::load_for_cwd(cwd).llm_mode;
-        return Some(crate::wizard::model_descriptor_for_config_with_global(
-            &current, global,
-        ));
+        return Some(model_descriptor_for_cwd(cwd, None));
     }
     crate::wizard::descriptor(id)
+}
+
+pub(crate) fn model_descriptor_for_cwd(
+    cwd: &std::path::Path,
+    preselect: Option<(&str, &str)>,
+) -> WizardDescriptor {
+    let current = ConfigDoc::load_effective(cwd);
+    let global = crate::config::extended::load_for_cwd(cwd).llm_mode;
+    crate::wizard::model_descriptor_with_selection(&current, global, preselect)
 }
 
 pub(crate) trait TerminalIo {
@@ -248,7 +255,7 @@ pub(crate) async fn run_terminal_wizard(
                     _ => Vec::new(),
                 };
                 for option in options {
-                    let check = if default.iter().any(|value| value == option.id) {
+                    let check = if default.iter().any(|value| value == option.id.as_ref()) {
                         "[x]"
                     } else {
                         "[ ]"
@@ -286,6 +293,10 @@ fn write_select(
     options: &[crate::wizard::SelectOption],
 ) -> io::Result<()> {
     io.write_line(prompt)?;
+    let help = run.help();
+    if !help.is_empty() {
+        io.write_line(help.as_ref())?;
+    }
     if let Some(WizardAnswer::Select(current)) = run.answer(run.current_step_id().unwrap_or("")) {
         io.write_line(&format!("Current: {current}"))?;
     }
@@ -707,12 +718,11 @@ pub(crate) fn apply_model_answers(
     run: &WizardRun,
 ) -> Result<Option<PathBuf>> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
-    let target = most_specific_config_write_target(cwd)
-        .unwrap_or_else(|| cwd.join(".cockpit").join(CONFIG_FILE));
-    let mut doc = ConfigDoc::load(&target)?;
-    let mut cfg = doc.providers();
-    let effective = cfg.clone();
-    let mut base = cfg.clone();
+    let model_target = config_write_target_for_provider(cwd, &provider_id).ok_or_else(|| {
+        anyhow!("provider `{provider_id}` config is not writable; cannot save model settings")
+    })?;
+    let effective = ConfigDoc::load_effective(cwd);
+    let mut base = effective.clone();
     if let Some(model) = base.providers.get_mut(&provider_id).and_then(|provider| {
         provider
             .models
@@ -724,41 +734,47 @@ pub(crate) fn apply_model_answers(
     let base_capabilities = base.resolve_capabilities(&provider_id, &model_id);
     let current_capabilities = effective.resolve_capabilities(&provider_id, &model_id);
     let global_mode = crate::config::extended::load_for_cwd(cwd).llm_mode;
-    let provider_read = cfg
+    let provider_read = effective
         .providers
         .get(&provider_id)
         .with_context(|| format!("provider `{provider_id}` not found"))?;
-    let model_read = provider_read
+    provider_read
         .models
         .iter()
         .find(|model| model.id == model_id)
         .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
-    let provider_mode = provider_read.mode;
-    let provider_trust = provider_read.trust;
-    let provider_subagent = provider_read.subagent_invokable;
-    let provider_can_delegate = provider_read.can_delegate;
-    let provider_default_thinking = provider_read.default_thinking_mode;
-    let inherited_mode = provider_mode.unwrap_or(global_mode);
-    let current_mode = model_read.mode.unwrap_or(inherited_mode);
-    let inherited_trust = provider_trust.unwrap_or(crate::config::providers::ModelTrust::Untrusted);
-    let current_trust = model_read.trust.unwrap_or(inherited_trust);
-    let inherited_thinking = provider_default_thinking;
-    let current_thinking = model_read.default_thinking_mode.or(inherited_thinking);
-    let inherited_subagent = provider_subagent.unwrap_or(false);
-    let current_subagent = model_read.subagent_invokable.unwrap_or(inherited_subagent);
-    let inherited_can_delegate = provider_can_delegate.unwrap_or(true);
-    let current_can_delegate = model_read.can_delegate.unwrap_or(inherited_can_delegate);
+    let inherited_mode = effective.provider_mode_default(&provider_id, global_mode);
+    let current_mode = effective.resolve_mode(&provider_id, &model_id, global_mode);
+    let inherited_trust = effective.provider_trust_default(&provider_id);
+    let current_trust = effective.resolve_trust(&provider_id, &model_id);
+    let inherited_thinking = effective.provider_default_thinking_mode_default(&provider_id);
+    let current_thinking = effective.resolve_default_thinking_mode(&provider_id, &model_id);
+    let inherited_subagent = effective.provider_subagent_invokable_default(&provider_id);
+    let current_subagent = effective.resolve_subagent_invokable(&provider_id, &model_id);
+    let inherited_can_delegate = effective.provider_can_delegate_default(&provider_id);
+    let current_can_delegate = effective.resolve_can_delegate(&provider_id, &model_id);
 
-    let provider = cfg
-        .providers
-        .get_mut(&provider_id)
-        .with_context(|| format!("provider `{provider_id}` not found"))?;
+    let mut model_doc = ConfigDoc::load(&model_target)?;
+    let mut layer_cfg = model_doc.providers();
+    let provider = layer_cfg.providers.entry(provider_id.clone()).or_default();
+    let model_index = if let Some(index) = provider
+        .models
+        .iter()
+        .position(|model| model.id == model_id)
+    {
+        index
+    } else {
+        provider.models.push(crate::config::providers::ModelEntry {
+            id: model_id.clone(),
+            ..Default::default()
+        });
+        provider.models.len() - 1
+    };
     let model = provider
         .models
-        .iter_mut()
-        .find(|model| model.id == model_id)
-        .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
-    let mut changed = false;
+        .get_mut(model_index)
+        .expect("model index was just resolved");
+    let mut model_changed = false;
 
     if let Some(selected) = model_class_answer(run) {
         let next = if selected == current_mode {
@@ -770,7 +786,7 @@ pub(crate) fn apply_model_answers(
         };
         if model.mode != next {
             model.mode = next;
-            changed = true;
+            model_changed = true;
         }
     }
 
@@ -784,7 +800,7 @@ pub(crate) fn apply_model_answers(
         };
         if model.trust != next {
             model.trust = next;
-            changed = true;
+            model_changed = true;
         }
     }
 
@@ -797,7 +813,7 @@ pub(crate) fn apply_model_answers(
     );
     if model.capability_overrides.images != next_images {
         model.capability_overrides.images = next_images;
-        changed = true;
+        model_changed = true;
     }
     let next_tools = capability_status_override(
         selected_capabilities.contains("tools"),
@@ -807,7 +823,7 @@ pub(crate) fn apply_model_answers(
     );
     if model.capability_overrides.tool_calling != next_tools {
         model.capability_overrides.tool_calling = next_tools;
-        changed = true;
+        model_changed = true;
     }
     let next_reasoning = capability_status_override(
         selected_capabilities.contains("reasoning"),
@@ -817,7 +833,7 @@ pub(crate) fn apply_model_answers(
     );
     if model.capability_overrides.reasoning != next_reasoning {
         model.capability_overrides.reasoning = next_reasoning;
-        changed = true;
+        model_changed = true;
     }
     let next_structured = capability_status_override(
         selected_capabilities.contains("structured_outputs"),
@@ -827,7 +843,7 @@ pub(crate) fn apply_model_answers(
     );
     if model.capability_overrides.structured_outputs != next_structured {
         model.capability_overrides.structured_outputs = next_structured;
-        changed = true;
+        model_changed = true;
     }
 
     if let Some(value) = model_context_tokens_answer(run) {
@@ -839,7 +855,7 @@ pub(crate) fn apply_model_answers(
         );
         if model.capability_overrides.context_tokens != next {
             model.capability_overrides.context_tokens = next;
-            changed = true;
+            model_changed = true;
         }
     }
     if let Some(value) = model_max_output_tokens_answer(run) {
@@ -851,7 +867,7 @@ pub(crate) fn apply_model_answers(
         );
         if model.capability_overrides.max_output_tokens != next {
             model.capability_overrides.max_output_tokens = next;
-            changed = true;
+            model_changed = true;
         }
     }
 
@@ -865,7 +881,7 @@ pub(crate) fn apply_model_answers(
         };
         if model.default_thinking_mode != next {
             model.default_thinking_mode = next;
-            changed = true;
+            model_changed = true;
         }
     }
 
@@ -880,7 +896,7 @@ pub(crate) fn apply_model_answers(
     };
     if model.subagent_invokable != next_subagent {
         model.subagent_invokable = next_subagent;
-        changed = true;
+        model_changed = true;
     }
     let can_delegate_value = selected_subagent.contains("can_delegate");
     let next_can_delegate = if can_delegate_value == current_can_delegate {
@@ -892,34 +908,49 @@ pub(crate) fn apply_model_answers(
     };
     if model.can_delegate != next_can_delegate {
         model.can_delegate = next_can_delegate;
-        changed = true;
+        model_changed = true;
     }
 
-    if model_make_default_answer(run) {
-        let next = crate::config::providers::ActiveModelRef {
+    let next_active =
+        model_make_default_answer(run).then(|| crate::config::providers::ActiveModelRef {
             provider: provider_id.clone(),
             model: model_id.clone(),
             reasoning_effort: None,
             thinking_mode: None,
-        };
-        if cfg.active_model.as_ref() != Some(&next) {
-            cfg.active_model = Some(next);
-            changed = true;
-        }
-    }
+        });
+    let active_changed = next_active
+        .as_ref()
+        .is_some_and(|active| effective.active_model.as_ref() != Some(active));
 
     if let Some(next) = model_system_prompt_answer(run)
         && model.system_prompt != next
     {
         model.system_prompt = next;
-        changed = true;
+        model_changed = true;
     }
 
-    if !changed {
+    if !model_changed && !active_changed {
         return Ok(None);
     }
-    doc.write(&cfg)?;
-    Ok(Some(target))
+
+    if model_changed {
+        model_doc.write_model_wizard_fields(&provider_id, model)?;
+    }
+
+    let mut saved = model_changed.then_some(model_target);
+    if let Some(next) = next_active
+        && active_changed
+    {
+        let active_target = most_specific_config_write_target(cwd)
+            .ok_or_else(|| anyhow!("config is not writable; cannot save active_model"))?;
+        let mut active_doc = ConfigDoc::load(&active_target)?;
+        active_doc.write_active_model(Some(&next))?;
+        if saved.is_none() {
+            saved = Some(active_target);
+        }
+    }
+
+    Ok(saved)
 }
 
 fn capability_bool_override(
@@ -986,7 +1017,7 @@ impl TerminalActionHandler for ProviderSetupActions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::dirs::COCKPIT_CONFIG_ENV;
+    use crate::config::dirs::{COCKPIT_CONFIG_ENV, test_support::IsolatedCockpitHome};
 
     #[derive(Default)]
     struct ScriptIo {
@@ -1131,6 +1162,33 @@ mod tests {
         path
     }
 
+    fn write_model_wizard_provider_at(config_path: &std::path::Path) -> PathBuf {
+        let Some(parent) = config_path.parent() else {
+            panic!("config target has no parent");
+        };
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(config_path, r#"{"llm_mode":"defensive"}"#).unwrap();
+        let mut cfg = crate::config::providers::ProvidersConfig::default();
+        let mut provider = crate::config::providers::ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            subagent_invokable: Some(true),
+            can_delegate: Some(true),
+            ..Default::default()
+        };
+        provider.models.push(crate::config::providers::ModelEntry {
+            id: "m".to_string(),
+            capabilities: crate::config::providers::ModelCapabilities {
+                images: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        cfg.providers.insert("p".to_string(), provider);
+        let mut doc = ConfigDoc::load(config_path).unwrap();
+        doc.write(&cfg).unwrap();
+        crate::config::providers::provider_file_path_for_config(config_path, "p").unwrap()
+    }
+
     fn submit_model_wizard_until_save(
         run: &mut WizardRun,
         capabilities: Vec<&str>,
@@ -1212,12 +1270,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(&tmp.path().join("global-config.json"));
         let path = write_model_wizard_provider(tmp.path());
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&path, "p").unwrap();
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
         let mut run = WizardRun::new(descriptor).unwrap();
         submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
 
         let saved = apply_model_answers(tmp.path(), &run).unwrap();
-        assert_eq!(saved.as_deref(), Some(path.as_path()));
+        assert_eq!(saved.as_deref(), Some(provider_path.as_path()));
         let cfg = ConfigDoc::load_effective(tmp.path());
         let model_entry = cfg.providers["p"]
             .models
@@ -1353,13 +1413,15 @@ mod tests {
             Some(crate::config::providers::ModelTrust::Trusted);
         doc.write(&cfg).unwrap();
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
-        let trust = descriptor
-            .steps
-            .iter()
-            .find(|step| step.id == "trust")
-            .unwrap();
-        assert!(trust.help.contains("provider default"));
         let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("p".to_string())).unwrap();
+        run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
+        run.submit(WizardAnswer::Select("defensive".to_string()))
+            .unwrap();
+        assert!(run.help().contains("provider default: trusted"));
+        run.back();
+        run.back();
+        run.back();
         submit_model_wizard_until_save(
             &mut run,
             vec![],
@@ -1373,6 +1435,126 @@ mod tests {
             .find(|model| model.id == "m")
             .unwrap();
         assert_eq!(model.trust, None);
+    }
+
+    #[test]
+    fn model_wizard_saves_model_from_outer_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _setup_env_lock = crate::test_env::lock();
+        let _env = IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let project = tmp.path().join("repo");
+        let project_config = project.join(".cockpit/config.json");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        let home_config = tmp.path().join("home/.config/cockpit/config.json");
+        let home_provider = write_model_wizard_provider_at(&home_config);
+        std::fs::write(&project_config, "{}").unwrap();
+
+        let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
+        let mut run = WizardRun::new(descriptor).unwrap();
+        submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
+
+        let saved = apply_model_answers(&project, &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(home_provider.as_path()));
+        let home_cfg = ConfigDoc::load(&home_config).unwrap().providers();
+        let model = home_cfg.providers["p"]
+            .models
+            .iter()
+            .find(|model| model.id == "m")
+            .unwrap();
+        assert_eq!(model.mode, Some(crate::config::extended::LlmMode::Frontier));
+        assert_eq!(
+            model.trust,
+            Some(crate::config::providers::ModelTrust::Trusted)
+        );
+        assert_eq!(model.capability_overrides.images, Some(true));
+        assert!(
+            !crate::config::providers::provider_file_path_for_config(&project_config, "p")
+                .unwrap()
+                .exists()
+        );
+        let project_cfg = ConfigDoc::load(&project_config).unwrap().providers();
+        assert_eq!(project_cfg.active_model.as_ref().unwrap().provider, "p");
+        assert_eq!(project_cfg.active_model.as_ref().unwrap().model, "m");
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn model_wizard_partial_overlay_layer_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _setup_env_lock = crate::test_env::lock();
+        let _env = IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let project = tmp.path().join("repo");
+        let project_config = project.join(".cockpit/config.json");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        let home_config = tmp.path().join("home/.config/cockpit/config.json");
+        let home_provider = write_model_wizard_provider_at(&home_config);
+        let before_home = std::fs::read_to_string(&home_provider).unwrap();
+        std::fs::write(&project_config, "{}").unwrap();
+        let project_provider =
+            crate::config::providers::provider_file_path_for_config(&project_config, "p").unwrap();
+        std::fs::create_dir_all(project_provider.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_provider,
+            r#"{"models":[{"id":"other","trust":"trusted"}]}"#,
+        )
+        .unwrap();
+
+        let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
+        let mut run = WizardRun::new(descriptor).unwrap();
+        submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
+
+        let saved = apply_model_answers(&project, &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(project_provider.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(&home_provider).unwrap(),
+            before_home
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_provider).unwrap()).unwrap();
+        let models = raw["models"].as_array().unwrap();
+        assert!(models.iter().any(|model| model["id"] == "other"));
+        let overlay = models.iter().find(|model| model["id"] == "m").unwrap();
+        assert_eq!(overlay["mode"], "frontier");
+        assert_eq!(overlay["trust"], "trusted");
+        assert_eq!(overlay["capability_overrides"]["images"], true);
+        assert!(raw.get("url").is_none());
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn model_wizard_unwritable_layer_errors_cleanly() {
+        let mut cfg = crate::config::providers::ProvidersConfig::default();
+        let mut provider = crate::config::providers::ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            ..Default::default()
+        };
+        provider.models.push(crate::config::providers::ModelEntry {
+            id: "m".to_string(),
+            ..Default::default()
+        });
+        cfg.providers.insert("bad/provider".to_string(), provider);
+        let descriptor = crate::wizard::model_descriptor_with_selection(
+            &cfg,
+            crate::config::extended::LlmMode::Normal,
+            Some(("bad/provider", "m")),
+        );
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("bad/provider".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("bad/provider:m".to_string()))
+            .unwrap();
+
+        let error = apply_model_answers(std::path::Path::new("."), &run)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("bad/provider"));
+        assert!(error.contains("writable"));
+        assert!(!error.contains("not found"));
     }
 
     #[test]

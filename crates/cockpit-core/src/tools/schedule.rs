@@ -2,14 +2,10 @@
 //!
 //! ## Cache-safety
 //!
-//! The `schedule` meta-tool's schema is **fixed and minimal** (`action` +
-//! `args`). It never changes across a conversation, so the serialized
-//! tools array is byte-stable and capability growth never busts the
-//! prompt cache. Branches are enabled by two cache-safe moves elsewhere:
-//! the dispatcher (driver) starts accepting the action, and an appended
-//! **hint message** tells the model the action is available (appended
-//! messages extend the cached prefix; they don't reserialize the tools
-//! block).
+//! The `schedule` meta-tool's schema is fixed for a build and advertises a
+//! closed union of supported per-action `args`. It changes only when schedule
+//! capabilities change, matching the cache-bust profile of any other tool
+//! schema change.
 //!
 //! ## Two tool surfaces
 //!
@@ -31,41 +27,41 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::engine::agent::TurnEvent;
+use crate::engine::schedule::schemas::schema_for;
 use crate::engine::schedule::spec::{
     ScheduleAction, SpawnRequest, parse_action, parse_background_start, parse_loop_start,
 };
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
-/// The fixed minimal schema for the `schedule` meta-tool. **Byte-stable** for
-/// the conversation's lifetime — see the module docs and the
-/// `tools_array_is_byte_stable` test in [`crate::engine::driver`].
+/// The fixed schema for the `schedule` meta-tool.
 pub const SCHEDULE_DESCRIPTION: &str = "Schedule async work: loop.start{prompt,interval,limit?,...}, loop.cancel{job_id}, background.start{command,cwd?}, background.tail{job_id,lines?}, background.cancel{job_id}, list{} (limit=1=timer)";
 
 /// The defensive (`LlmMode::Defensive`) `schedule` description
 /// (implementation note): explicit steering for the
-/// weak-model target. Same fixed `action`+`args` schema — only the prose
-/// is richer. Call `schedule` directly as a native tool with an `action`
-/// argument; do not route it through MCP.
+/// weak-model target. Same schema shape — only the prose is richer. Call
+/// `schedule` directly as a native tool with an `action` argument; do not
+/// route it through MCP.
 pub const SCHEDULE_DESCRIPTION_DEFENSIVE: &str = "Run work in the background or on a recurring schedule so the conversation isn't blocked waiting. Call `schedule` directly as a native tool (an `action` argument), not through MCP. Pick the kind of work with `action`: `loop.start` runs a prompt repeatedly on an interval (set `limit=1` for a single delayed/one-shot timer), `loop.cancel` stops a running loop, `background.start` launches a long task that runs detached, `background.tail` shows that task's latest output, `background.cancel` stops it, and `list` shows what is currently scheduled. Put the per-action details in `args`. Use this for things like polling a build, watching for a condition, or kicking off something slow you'll check later — not for ordinary step-by-step work, which you should just do directly.";
 
 /// Build the `schedule` meta-tool's JSON schema. Kept in a free function so
-/// the byte-stability test can assert on it directly. The schema is
-/// byte-stable for cache safety regardless of `llm_mode`; see
-/// [`schedule_parameters_defensive`] for the verbose-description variant.
+/// tests can assert on it directly; see [`schedule_parameters_defensive`] for
+/// the verbose-description variant.
 pub fn schedule_parameters() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
+                "enum": ScheduleAction::ALL.map(ScheduleAction::as_str),
                 "description": "Branch: loop.start/loop.cancel/background.start/background.tail/background.cancel/list"
             },
             "args": {
-                "type": "object",
+                "anyOf": schedule_args_any_of(),
                 "description": "Per-action arguments"
             }
         },
-        "required": ["action"]
+        "required": ["action"],
+        "additionalProperties": false
     })
 }
 
@@ -78,15 +74,21 @@ pub fn schedule_parameters_defensive() -> Value {
         "properties": {
             "action": {
                 "type": "string",
+                "enum": ScheduleAction::ALL.map(ScheduleAction::as_str),
                 "description": "Which scheduled-work operation to perform: `loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, or `list`"
             },
             "args": {
-                "type": "object",
+                "anyOf": schedule_args_any_of(),
                 "description": "The arguments for the chosen `action` (e.g. the prompt + interval for `loop.start`, the job id for a cancel/tail); omit for `list`"
             }
         },
-        "required": ["action"]
+        "required": ["action"],
+        "additionalProperties": false
     })
+}
+
+fn schedule_args_any_of() -> Vec<Value> {
+    ScheduleAction::ALL.into_iter().map(schema_for).collect()
 }
 
 /// The main-context `schedule` meta-tool. Structural: intercepted by the
@@ -342,6 +344,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn remove_descriptions(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("description");
+                for child in object.values_mut() {
+                    remove_descriptions(child);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    remove_descriptions(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The core caching invariant (GOALS §22): the serialized tools array
     /// containing the `schedule` meta-tool is **byte-identical** no matter
     /// which branches have been exercised. Branch-enabling is an appended
@@ -388,6 +407,56 @@ mod tests {
             serde_json::to_string(&schedule_parameters()).unwrap(),
             serde_json::to_string(&schedule_parameters()).unwrap()
         );
+    }
+
+    #[test]
+    fn public_schema_is_a_closed_discriminated_union() {
+        let schema = schedule_parameters();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!([
+                "loop.start",
+                "loop.cancel",
+                "background.start",
+                "background.tail",
+                "background.cancel",
+                "list"
+            ])
+        );
+
+        let variants = schema["properties"]["args"]["anyOf"].as_array().unwrap();
+        assert_eq!(variants.len(), ScheduleAction::ALL.len());
+        for (action, variant) in ScheduleAction::ALL.into_iter().zip(variants) {
+            assert_eq!(
+                variant["type"],
+                "object",
+                "{} args schema is an object",
+                action.as_str()
+            );
+            assert_eq!(
+                variant["additionalProperties"],
+                false,
+                "{} args schema is closed",
+                action.as_str()
+            );
+            assert!(
+                variant.get("properties").is_some(),
+                "{} args schema declares properties",
+                action.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn defensive_and_terse_schemas_agree_on_shape() {
+        let mut terse = schedule_parameters();
+        let mut defensive = schedule_parameters_defensive();
+        remove_descriptions(&mut terse);
+        remove_descriptions(&mut defensive);
+        assert_eq!(terse, defensive);
     }
 
     /// The `schedule` description must name every action plus that action's

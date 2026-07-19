@@ -50,6 +50,10 @@ const SEED_TOOLS: &[&str] = &[
     "impact",
 ];
 
+pub fn read_only_seed_tool_names() -> Vec<&'static str> {
+    SEED_TOOLS.iter().copied().chain(["grep", "glob"]).collect()
+}
+
 fn is_seed_tool(name: &str) -> bool {
     SEED_TOOLS.contains(&name)
 }

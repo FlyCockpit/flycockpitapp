@@ -99,14 +99,7 @@ impl TaskTool {
         );
         let seed_schema = serde_json::json!({
             "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "tool": { "type": "string" },
-                    "args": { "type": "object" }
-                },
-                "required": ["tool", "args"]
-            },
+            "items": crate::tools::seed::seed_item_schema(),
             "description": "Read-only tool calls re-executed in the child's cwd and pre-loaded into its context; omit otherwise"
         });
         let model_selector_schema = serde_json::json!({
@@ -536,6 +529,24 @@ mod tests {
                     .contains("Required for query and steer")
             );
             assert!(schema.get("oneOf").is_none(), "schema must not use oneOf");
+        }
+    }
+
+    #[test]
+    fn task_seed_schema_matches_seed_tool_schema() {
+        let tool = TaskTool::with_subagents(&["explore", "builder"]);
+        let expected = crate::tools::seed::seed_item_schema();
+
+        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+            let payload = &schema["properties"]["payload"];
+            assert_eq!(
+                payload["properties"]["seed"]["items"], expected,
+                "delegate seed item schema must match the seed tool schema"
+            );
+            assert_eq!(
+                payload["items"]["properties"]["seed"]["items"], expected,
+                "batch seed item schema must match the seed tool schema"
+            );
         }
     }
 

@@ -26,6 +26,15 @@ pub enum ScheduleAction {
 }
 
 impl ScheduleAction {
+    pub const ALL: [Self; 6] = [
+        Self::LoopStart,
+        Self::LoopCancel,
+        Self::BackgroundStart,
+        Self::BackgroundTail,
+        Self::BackgroundCancel,
+        Self::List,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ScheduleAction::LoopStart => "loop.start",

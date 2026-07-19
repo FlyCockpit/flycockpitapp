@@ -126,14 +126,14 @@ impl Driver {
     /// (GOALS §22), which is why the engine routes `schedule` calls back via
     /// [`TurnOutcome::ScheduleAction`] rather than dispatching them inline.
     ///
-    /// The per-action schemas ([`crate::engine::schedule::schemas`]) are hidden
-    /// from the model; the public `schedule` schema stays `{action, args}`. We
-    /// validate the per-action `args` against its hidden schema, repair on
-    /// failure through the same [`crate::engine::repair::repair`] machinery
-    /// the top-level tool dispatcher uses, then hand the (possibly-repaired)
-    /// `args` to the [`crate::engine::schedule::spec`] parser. A repair that
-    /// can't validate falls through to the parser, which produces the same
-    /// error wording it does today (out of scope to improve here).
+    /// The public `schedule` schema and this dispatcher both derive per-action
+    /// `args` shapes from [`crate::engine::schedule::schemas`]. We validate the
+    /// selected action's `args`, repair on failure through the same
+    /// [`crate::engine::repair::repair`] machinery the top-level tool
+    /// dispatcher uses, then hand the (possibly-repaired) `args` to the
+    /// [`crate::engine::schedule::spec`] parser. A repair that can't validate
+    /// falls through to the parser, which produces the same error wording it
+    /// does today (out of scope to improve here).
     pub(in crate::engine::driver) async fn dispatch_schedule_action_repaired(
         &mut self,
         args: &serde_json::Value,
@@ -145,7 +145,7 @@ impl Driver {
         let (action, mut action_args) = split_action(args)?;
 
         // Per-action validate → repair → re-validate (§12), keyed by the
-        // hidden per-action schema. A clean call is byte-identical; a
+        // selected action's schema. A clean call is byte-identical; a
         // repairable malformation (e.g. `limit:"1"`) is coerced; an
         // unrecoverable call still flows to the parser below (same error).
         let schema = schema_for(action);

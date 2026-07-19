@@ -48,6 +48,31 @@ fn bash_description_mentions_cap_and_tmpdir_redirection() {
     assert!(defensive.contains("persistent workspace artifact"));
 }
 
+#[test]
+fn resources_schema_is_closed_and_matches_scheduler_permits() {
+    let expected: Vec<String> = crate::config::extended::ResourceSchedulerPoolsConfig::default()
+        .as_map()
+        .into_keys()
+        .collect();
+    let tool = BashTool::new();
+
+    for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        let resources = &schema["properties"]["resources"];
+        assert_eq!(resources["type"], "object");
+        assert_eq!(resources["additionalProperties"], false);
+
+        let properties = resources["properties"].as_object().unwrap();
+        let actual: Vec<String> = properties.keys().cloned().collect();
+        assert_eq!(actual, expected);
+
+        for name in &expected {
+            let permit = &properties[name];
+            assert_eq!(permit["type"], "integer", "{name} permit type");
+            assert_eq!(permit["minimum"], 0, "{name} permit minimum");
+        }
+    }
+}
+
 /// A turn-cancel (ctrl+c) terminates a long-running `bash` command
 /// promptly — the tool returns the cancelled marker in well under the
 /// command's natural runtime — and the killed command's *descendant*

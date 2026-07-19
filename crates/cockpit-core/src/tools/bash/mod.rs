@@ -157,7 +157,7 @@ impl Tool for BashTool {
                 "cwd":        { "type": "string", "description": "Working directory; defaults to session cwd" },
                 "timeout_ms": { "type": "integer", "description": "Hard timeout in ms (max 600000)" },
                 "queue_timeout_ms": { "type": "integer", "description": "Optional timeout in ms while waiting for resource scheduler permits" },
-                "resources": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 }, "description": "Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}" }
+                "resources": resources_schema("Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}")
             },
             "required": ["command"]
         })
@@ -172,7 +172,7 @@ impl Tool for BashTool {
                 "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
                 "timeout_ms": { "type": "integer", "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, maximum 600000. Raise it for long builds/test runs" },
                 "queue_timeout_ms": { "type": "integer", "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
-                "resources": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 }, "description": "Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work" }
+                "resources": resources_schema("Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work")
             },
             "required": ["command"]
         }))
@@ -181,6 +181,26 @@ impl Tool for BashTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         call_bash_inner(&self.prelude, args, ctx, BashRunOptions::default()).await
     }
+}
+
+fn resources_schema(description: &str) -> Value {
+    let mut properties = serde_json::Map::new();
+    for name in resource_permit_names() {
+        properties.insert(name, serde_json::json!({ "type": "integer", "minimum": 0 }));
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+        "description": description
+    })
+}
+
+fn resource_permit_names() -> Vec<String> {
+    crate::config::extended::ResourceSchedulerPoolsConfig::default()
+        .as_map()
+        .into_keys()
+        .collect()
 }
 
 #[derive(Debug, Clone, Default)]

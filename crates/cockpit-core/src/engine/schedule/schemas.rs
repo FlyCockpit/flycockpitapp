@@ -1,30 +1,28 @@
 //! Per-action JSON Schemas for the `schedule` meta-tool sub-args.
 //!
-//! These schemas are **hidden from the model** — the public `schedule` tool
-//! schema stays `{action: string, args: object}` (byte-stable, no
-//! prompt-cache bust on capability growth; token economy, §10). They exist
-//! solely so the dispatcher can run the §12 validate-then-repair contract on
-//! the per-action `args` object before handing it to the [`super::spec`]
-//! parser — the same coercions (notably string→int) the top-level tool
-//! dispatcher gets, applied to `schedule` sub-args (the §22 meta-tool's
-//! "actions appear contextually" affordance is preserved).
+//! These schemas are the single source of truth for both the public
+//! `schedule.args` union and the dispatcher's §12 validate-then-repair pass
+//! before handing per-action `args` to the [`super::spec`] parser. The same
+//! coercions (notably string→int) the top-level tool dispatcher gets are
+//! applied to `schedule` sub-args (the §22 meta-tool's "actions appear
+//! contextually" affordance is preserved).
 //!
 //! The schemas are deliberately *loose* where `spec.rs` is tolerant by
 //! design: `interval` accepts a number **or** a duration string (`"30s"`),
-//! and the schemas never re-impose required-field rules the parser doesn't —
-//! the parser remains the single source of truth for cross-field invariants
-//! (timer == `limit==1`, `limit==0` == unbounded, the interval floor). What
-//! the schema buys is the disagreeing-path signal the repair catalog needs:
-//! a `limit:"1"` is flagged as a type mismatch at `limit`, the
-//! `parse_stringified_number` repair fires, and the parser then sees a real
-//! integer instead of erroring on a string.
+//! and the parser remains the single source of truth for cross-field
+//! invariants (timer == `limit==1`, `limit==0` == unbounded, the interval
+//! floor). What the schema buys is the strict public object shape plus the
+//! disagreeing-path signal the repair catalog needs: a `limit:"1"` is
+//! flagged as a type mismatch at `limit`, the `parse_stringified_number`
+//! repair fires, and the parser then sees a real integer instead of erroring
+//! on a string.
 
 use serde_json::{Value, json};
 
 use super::spec::ScheduleAction;
 
-/// The hidden per-action schema for `action`'s sub-`args`. Used only for the
-/// dispatcher's validate-then-repair pass; never advertised to the model.
+/// The per-action schema for `action`'s sub-`args`. Used by the public
+/// `schedule.args` union and the dispatcher's validate-then-repair pass.
 ///
 /// `list` carries an empty-object schema (no args) so the validate+repair
 /// pass still runs, just trivially.
@@ -43,37 +41,48 @@ pub fn schema_for(action: ScheduleAction) -> Value {
                 "limit": { "type": "integer", "minimum": 0 },
                 "keep_in_context": { "type": "boolean" },
                 "independent": { "type": "boolean" }
-            }
+            },
+            "required": ["interval", "prompt"],
+            "additionalProperties": false
         }),
         ScheduleAction::LoopCancel => json!({
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" }
-            }
+            },
+            "required": ["job_id"],
+            "additionalProperties": false
         }),
         ScheduleAction::BackgroundStart => json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string" },
                 "cwd": { "type": "string" }
-            }
+            },
+            "required": ["command"],
+            "additionalProperties": false
         }),
         ScheduleAction::BackgroundTail => json!({
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
                 "lines": { "type": "integer", "minimum": 1 }
-            }
+            },
+            "required": ["job_id"],
+            "additionalProperties": false
         }),
         ScheduleAction::BackgroundCancel => json!({
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" }
-            }
+            },
+            "required": ["job_id"],
+            "additionalProperties": false
         }),
         ScheduleAction::List => json!({
             "type": "object",
             "properties": {},
+            "required": [],
             "additionalProperties": false
         }),
     }

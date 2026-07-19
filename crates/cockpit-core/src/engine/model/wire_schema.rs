@@ -41,7 +41,51 @@ pub(super) fn definitions_for_wire<'a>(
 pub(crate) fn for_responses(schema: &Value) -> Value {
     let mut transformed = schema.clone();
     make_optional_properties_nullable(&mut transformed);
+    close_object_schemas(&mut transformed);
     transformed
+}
+
+fn close_object_schemas(schema: &mut Value) {
+    let Value::Object(object) = schema else {
+        return;
+    };
+
+    if is_object_schema(object) {
+        object
+            .entry("properties".to_string())
+            .or_insert_with(|| json!({}));
+        object.insert("additionalProperties".to_string(), Value::Bool(false));
+    }
+
+    if let Some(Value::Object(properties)) = object.get_mut("properties") {
+        for property in properties.values_mut() {
+            close_object_schemas(property);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        close_object_schemas(items);
+    }
+    if let Some(Value::Object(definitions)) = object.get_mut("$defs") {
+        for definition in definitions.values_mut() {
+            close_object_schemas(definition);
+        }
+    }
+    for combinator in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(variants)) = object.get_mut(combinator) {
+            for variant in variants {
+                close_object_schemas(variant);
+            }
+        }
+    }
+}
+
+fn is_object_schema(object: &serde_json::Map<String, Value>) -> bool {
+    object.contains_key("properties")
+        || matches!(object.get("type"), Some(Value::String(kind)) if kind == "object")
+        || object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("object")))
 }
 
 fn make_optional_properties_nullable(schema: &mut Value) {
@@ -302,6 +346,41 @@ mod tests {
         explicitly_allows_null(schema)
     }
 
+    fn open_object_violations(schema: &Value, path: &str, out: &mut Vec<String>) {
+        let Some(object) = schema.as_object() else {
+            return;
+        };
+        if is_object_schema(object) {
+            if !object.contains_key("properties") {
+                out.push(format!("{path}: object schema has no properties"));
+            }
+            if let Some(additional) = object.get("additionalProperties")
+                && additional != &Value::Bool(false)
+            {
+                out.push(format!(
+                    "{path}: additionalProperties must be false, got {additional}"
+                ));
+            }
+        }
+        for key in ["properties", "$defs"] {
+            if let Some(entries) = object.get(key).and_then(Value::as_object) {
+                for (name, child) in entries {
+                    open_object_violations(child, &format!("{path}.{key}.{name}"), out);
+                }
+            }
+        }
+        if let Some(items) = object.get("items") {
+            open_object_violations(items, &format!("{path}.items"), out);
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(variants) = object.get(key).and_then(Value::as_array) {
+                for (index, variant) in variants.iter().enumerate() {
+                    open_object_violations(variant, &format!("{path}.{key}[{index}]"), out);
+                }
+            }
+        }
+    }
+
     #[test]
     fn optional_fields_gain_null_arm_recursively() {
         let canonical = task_schema();
@@ -391,7 +470,7 @@ mod tests {
         let Some(object) = schema.as_object() else {
             return;
         };
-        if object.contains_key("properties") || object.get("type") == Some(&json!("object")) {
+        if is_object_schema(object) {
             assert_eq!(
                 object.get("additionalProperties"),
                 Some(&Value::Bool(false))
@@ -532,6 +611,105 @@ mod tests {
             assert_objects_are_closed(&strict.parameters);
             assert_eq!(tool.parameters(), canonical, "canonical schema mutated");
         }
+    }
+
+    #[test]
+    fn nullable_object_arm_is_closed() {
+        let canonical = json!({
+            "type": "object",
+            "properties": {
+                "args": {
+                    "type": "object",
+                    "description": "x"
+                }
+            },
+            "required": []
+        });
+
+        let transformed = for_responses(&canonical);
+        let args = &transformed["properties"]["args"];
+
+        assert!(has_null_type(args));
+        assert_eq!(args["type"], json!(["object", "null"]));
+        assert_eq!(args["properties"], json!({}));
+        assert_eq!(args["additionalProperties"], false);
+    }
+
+    #[test]
+    fn schedule_schema_survives_rig_sanitize() {
+        for schema in [
+            crate::tools::schedule::schedule_parameters(),
+            crate::tools::schedule::schedule_parameters_defensive(),
+        ] {
+            let transformed = for_responses(&schema);
+            let strict = rig::providers::openai::responses_api::ResponsesToolDefinition::function(
+                "schedule",
+                "schedule",
+                transformed,
+            );
+            assert_objects_are_closed(&strict.parameters);
+        }
+    }
+
+    #[test]
+    fn no_builtin_tool_schema_has_an_open_object() {
+        let mut violations = Vec::new();
+        for tool in crate::engine::builtin::invariant_builtin_tools() {
+            open_object_violations(
+                &tool.parameters(),
+                &format!("{}.parameters", tool.name()),
+                &mut violations,
+            );
+            if let Some(defensive) = tool.defensive_parameters() {
+                open_object_violations(
+                    &defensive,
+                    &format!("{}.defensive_parameters", tool.name()),
+                    &mut violations,
+                );
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "open object schemas are not strict-wire compatible:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn open_object_violation_detector_rejects_free_form_shapes() {
+        let mut violations = Vec::new();
+        open_object_violations(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "args": { "type": "object" }
+                }
+            }),
+            "missing-properties",
+            &mut violations,
+        );
+        open_object_violations(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "resources": {
+                        "type": "object",
+                        "additionalProperties": { "type": "integer" }
+                    }
+                }
+            }),
+            "map-object",
+            &mut violations,
+        );
+
+        assert_eq!(
+            violations,
+            vec![
+                "missing-properties.properties.args: object schema has no properties",
+                "map-object.properties.resources: object schema has no properties",
+                "map-object.properties.resources: additionalProperties must be false, got {\"type\":\"integer\"}",
+            ]
+        );
     }
 
     #[test]

@@ -16,10 +16,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::db::seed_tools::SeedTool;
-use crate::engine::compact::is_read_only_seed_tool;
+use crate::engine::compact::{is_read_only_seed_tool, read_only_seed_tool_names};
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
 pub struct SeedEmitTool;
@@ -35,20 +35,7 @@ impl Tool for SeedEmitTool {
     }
 
     fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "tool": {
-                    "type": "string",
-                    "description": "Read-only tool name (read/grep/glob/intel search)"
-                },
-                "args": {
-                    "type": "object",
-                    "description": "Args for that tool (file path, line range, query)"
-                }
-            },
-            "required": ["tool", "args"]
-        })
+        seed_item_schema()
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -81,9 +68,117 @@ impl Tool for SeedEmitTool {
     }
 }
 
+pub(crate) fn seed_item_schema() -> Value {
+    let arms: Vec<Value> = read_only_seed_tool_schemas()
+        .into_iter()
+        .map(|(tool, args)| {
+            json!({
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "const": tool
+                    },
+                    "args": args
+                },
+                "required": ["tool", "args"],
+                "additionalProperties": false
+            })
+        })
+        .collect();
+
+    json!({
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "enum": read_only_seed_tool_names(),
+                "description": "Read-only tool name (read/grep/glob/intel search)"
+            },
+            "args": seed_args_schema()
+        },
+        "required": ["tool", "args"],
+        "additionalProperties": false,
+        "anyOf": arms
+    })
+}
+
+pub(crate) fn seed_args_schema() -> Value {
+    let arms: Vec<Value> = read_only_seed_tool_schemas()
+        .into_iter()
+        .map(|(_, args)| args)
+        .collect();
+    json!({
+        "anyOf": arms,
+        "description": "Args for that read-only tool (file path, line range, query)"
+    })
+}
+
+fn read_only_seed_tool_schemas() -> Vec<(&'static str, Value)> {
+    let mut schemas = vec![
+        crate::tools::read::ReadTool.parameters(),
+        crate::tools::intel::OutlineTool.parameters(),
+        crate::tools::intel::SymbolFindTool.parameters(),
+        crate::tools::intel::WordTool.parameters(),
+        crate::tools::intel::DepsTool.parameters(),
+        crate::tools::intel::CircularTool.parameters(),
+        crate::tools::intel::TreeTool.parameters(),
+        crate::tools::intel::SearchTool.parameters(),
+        crate::tools::intel::ImpactTool.parameters(),
+        crate::tools::grep::GrepTool.parameters(),
+        crate::tools::glob::GlobTool.parameters(),
+    ];
+    let names = read_only_seed_tool_names();
+    assert_eq!(
+        schemas.len(),
+        names.len(),
+        "seed schema tool list must match read_only_seed_tool_names"
+    );
+    for schema in &mut schemas {
+        close_schema_object(schema);
+    }
+    names.into_iter().zip(schemas).collect()
+}
+
+fn close_schema_object(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("properties")
+        || object.get("type") == Some(&json!("object"))
+        || object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("object")))
+    {
+        object.insert("additionalProperties".to_string(), Value::Bool(false));
+    }
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for property in properties.values_mut() {
+            close_schema_object(property);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        close_schema_object(items);
+    }
+    if let Some(definitions) = object.get_mut("$defs").and_then(Value::as_object_mut) {
+        for definition in definitions.values_mut() {
+            close_schema_object(definition);
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(variants) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for variant in variants {
+                close_schema_object(variant);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn queues_a_read_only_seed() {
@@ -127,5 +222,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("args"), "{err}");
+    }
+
+    #[test]
+    fn seed_item_schema_is_closed_and_discriminated_by_tool() {
+        let schema = seed_item_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["tool", "args"]));
+        assert_eq!(schema["properties"]["args"], seed_args_schema());
+
+        let arms = schema["anyOf"].as_array().unwrap();
+        assert_eq!(arms.len(), read_only_seed_tool_names().len());
+        for (tool, arm) in read_only_seed_tool_names().into_iter().zip(arms) {
+            assert_eq!(arm["type"], "object");
+            assert_eq!(arm["additionalProperties"], false);
+            assert_eq!(arm["required"], json!(["tool", "args"]));
+            assert_eq!(arm["properties"]["tool"]["const"], tool);
+            assert_eq!(
+                arm["properties"]["args"]["additionalProperties"], false,
+                "{tool} args schema is closed"
+            );
+        }
+
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({
+            "tool": "read",
+            "args": { "path": "src/lib.rs" }
+        })));
+        assert!(!validator.is_valid(&json!({
+            "tool": "read",
+            "args": { "pattern": "needle" }
+        })));
     }
 }

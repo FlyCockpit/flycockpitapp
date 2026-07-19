@@ -830,6 +830,38 @@ impl Model {
         state.explicit = providers.is_wire_api_explicit(provider_id, model_id);
     }
 
+    pub(crate) fn with_live_wire_api(mut self, donor: &Self) -> Self {
+        let Model::OpenAi {
+            live_wire_api: fresh_live_wire_api,
+            ..
+        } = &mut self
+        else {
+            return self;
+        };
+        let Model::OpenAi {
+            live_wire_api: donor_live_wire_api,
+            ..
+        } = donor
+        else {
+            return self;
+        };
+        let (configured, explicit) = {
+            let fresh_state = fresh_live_wire_api
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (fresh_state.configured, fresh_state.explicit)
+        };
+        {
+            let mut donor_state = donor_live_wire_api
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            donor_state.configured = configured;
+            donor_state.explicit = explicit;
+        }
+        *fresh_live_wire_api = donor_live_wire_api.clone();
+        self
+    }
+
     pub(crate) fn resolve_live_wire_api_for_base_url(
         &self,
         base_url: &str,
@@ -879,7 +911,7 @@ impl Model {
         }
     }
 
-    fn confirmed_wire_api_for_base_url(
+    pub(crate) fn confirmed_wire_api_for_base_url(
         &self,
         base_url: &str,
     ) -> Option<crate::config::providers::WireApi> {
@@ -894,7 +926,7 @@ impl Model {
             .copied()
     }
 
-    fn confirm_wire_api_for_base_url(
+    pub(crate) fn confirm_wire_api_for_base_url(
         &self,
         base_url: &str,
         endpoint: crate::config::providers::WireApi,

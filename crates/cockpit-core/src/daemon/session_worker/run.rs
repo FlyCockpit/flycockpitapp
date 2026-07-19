@@ -974,28 +974,6 @@ async fn run_worker(
                     ));
                     break WorkerStop::DriverFailed;
                 }
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::RefreshActiveModel,
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    let _ = respond_to.send((
-                        proto::QueueItem {
-                            id: Uuid::nil(),
-                            status: proto::QueueItemStatus::Folding,
-                            text: String::new(),
-                            display_text: None,
-                            target: proto::QueueTarget::default(),
-                        },
-                        Vec::new(),
-                    ));
-                    break WorkerStop::DriverFailed;
-                }
                 let max_rounds = max_primary_rounds_for(&project_root);
                 if !send_driver_control_or_fail(
                     &driver_control_tx,

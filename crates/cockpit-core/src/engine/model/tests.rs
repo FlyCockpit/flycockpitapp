@@ -3815,6 +3815,78 @@ fn resolve_live_endpoint_precedence_order() {
     );
 }
 
+#[test]
+fn with_live_wire_api_preserves_session_confirmed_and_reseeds_config() {
+    let url = "http://localhost:1234/v1";
+    let running = openai_model_at_with_wire(url, WireApi::Auto, false);
+    running.confirm_wire_api_for_base_url(url, WireApi::Responses);
+
+    let explicit_rebuild =
+        openai_model_at_with_wire(url, WireApi::Completions, true).with_live_wire_api(&running);
+    assert_eq!(
+        explicit_rebuild.confirmed_wire_api_for_base_url(url),
+        Some(WireApi::Responses),
+        "donating the cell must preserve session-confirmed endpoints"
+    );
+    assert_eq!(
+        explicit_rebuild.resolve_live_wire_api_for_base_url(url),
+        WireApi::Completions,
+        "fresh explicit config must reseed the donated cell and win"
+    );
+
+    let auto_rebuild =
+        openai_model_at_with_wire(url, WireApi::Auto, false).with_live_wire_api(&explicit_rebuild);
+    assert_eq!(
+        auto_rebuild.confirmed_wire_api_for_base_url(url),
+        Some(WireApi::Responses)
+    );
+    assert_eq!(
+        auto_rebuild.resolve_live_wire_api_for_base_url(url),
+        WireApi::Responses,
+        "removing the explicit pin lets the session confirmation resurface"
+    );
+
+    let chatgpt_donor = build_chatgpt_model(
+        "chatgpt",
+        &crate::providers::models_fetch::ResolvedRequest {
+            base_url: url.to_string(),
+            headers: vec![
+                crate::providers::models_fetch::ResolvedHeader {
+                    name: "Authorization".into(),
+                    value: "Bearer test-token".into(),
+                },
+                crate::providers::models_fetch::ResolvedHeader {
+                    name: "chatgpt-account-id".into(),
+                    value: "acct-test".into(),
+                },
+            ],
+        },
+        "gpt-5",
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        false,
+        None,
+        0,
+        0,
+        false,
+        trust_flag_off(),
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+    )
+    .expect("chatgpt donor builds from fake resolved auth");
+    let unchanged_rebuild = openai_model_at_with_wire(url, WireApi::Completions, true)
+        .with_live_wire_api(&chatgpt_donor);
+    assert_eq!(
+        unchanged_rebuild.confirmed_wire_api_for_base_url(url),
+        None,
+        "a donor without a live wire-api cell must leave the fresh cell untouched"
+    );
+    assert_eq!(
+        unchanged_rebuild.resolve_live_wire_api_for_base_url(url),
+        WireApi::Completions
+    );
+}
+
 #[tokio::test]
 async fn confirmed_swap_suppresses_prompt_on_later_turns() {
     use crate::config::providers::WireApi;

@@ -145,8 +145,8 @@ pub enum DriverControl {
     /// implementation note). The driver builds the new
     /// [`Model`](crate::engine::model::Model) for `(provider, model)` from the
     /// layered config — threading the session's effective redaction table
-    /// ([`Self::redact`]) and inheriting the current model's shutdown gate +
-    /// wire-API self-heal target — then rebuilds the **root primary** under it
+    /// ([`Self::redact`]) and inheriting the current model's shutdown gate —
+    /// then rebuilds the **root primary** under it
     /// at the idle boundary, so the next outbound request routes to the new
     /// model. Breaking the prompt cache is expected (new model = new cache
     /// key). On an unconfigured/bad target it **fails loudly** via
@@ -154,10 +154,6 @@ pub enum DriverControl {
     /// no-op). The session's persisted active-model row is updated only on a
     /// successful build, so config + live routing never diverge.
     SetActiveModel { provider: String, model: String },
-    /// Rebuild the current root model from config + the session env overlay at
-    /// the next safe boundary. Used after attach-time `RefreshEnv` so exported
-    /// provider keys affect the next inference without daemon-global `setenv`.
-    RefreshActiveModel,
     /// Set the session's model-comparison tandem (shadow) set
     /// (`/model-comparison`, implementation note).
     /// The session worker builds a [`Model`](crate::engine::model::Model) for
@@ -539,6 +535,10 @@ pub struct Driver {
     /// the rewrite" notice. Surfaced at most once per driver so a model
     /// that keeps mangling control tokens doesn't spam the transcript.
     preflight_guard_logged: bool,
+    /// Last active-model refresh failure surfaced to the user. Refresh runs at
+    /// every turn start, so identical config errors warn every time but produce
+    /// only one transcript notice until a success clears the dedupe key.
+    active_model_refresh_failure_notice: Option<String>,
     current_lifecycle_turn_id: Option<String>,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
     /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
@@ -1119,6 +1119,7 @@ impl Driver {
             preflight_override: self.preflight_override,
             delegation_recursion_override: self.delegation_recursion_override,
             preflight_guard_logged: self.preflight_guard_logged,
+            active_model_refresh_failure_notice: self.active_model_refresh_failure_notice.clone(),
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
             approver: self.approver.clone(),
@@ -1399,6 +1400,7 @@ impl Driver {
             preflight_override: None,
             delegation_recursion_override: None,
             preflight_guard_logged: false,
+            active_model_refresh_failure_notice: None,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             approver: None,
@@ -1481,6 +1483,49 @@ impl Driver {
         }
         if let Some(model) = &self.model_override {
             model.refresh_wire_api_config(&providers);
+        }
+    }
+
+    /// Refresh the root primary model from layered config at the start of each
+    /// turn. Only the root frame is rebuilt: deeper interactive frames, tandem
+    /// models, and `model_override` intentionally keep their build-time model
+    /// identity for their lifetime so running work does not change capability
+    /// or cost underneath it. The live safety subset for those pinned models
+    /// remains refreshed elsewhere (`trusted_only`, redaction, and wire API).
+    async fn refresh_active_model_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        let Some(root_frame) = self.stack.first() else {
+            return;
+        };
+        let running = root_frame.agent.model.clone();
+        let provider = running.provider_id().to_string();
+        let model = running.model_id_ref().to_string();
+        match self.build_live_model_for_running(&running, &provider, &model) {
+            Ok(new_model) => {
+                let rebuilt = self.rebuild_frame_with_model(0, Arc::new(new_model));
+                self.stack[0].agent = Arc::new(rebuilt);
+                self.schedule.set_agent(self.stack[0].agent.clone());
+                self.active_model_refresh_failure_notice = None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider,
+                    model,
+                    error = %e,
+                    "refreshing active model from config failed"
+                );
+                let notice = format!(
+                    "Refreshing the active model from config failed — {e:#}. \
+                     Keeping the previous model active."
+                );
+                if self.active_model_refresh_failure_notice.as_deref() != Some(notice.as_str()) {
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: notice.clone(),
+                        })
+                        .await;
+                    self.active_model_refresh_failure_notice = Some(notice);
+                }
+            }
         }
     }
 
@@ -2203,6 +2248,7 @@ impl Driver {
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.refresh_redaction_table_for_turn(tx).await;
+        self.refresh_active_model_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
@@ -2835,16 +2881,6 @@ impl Driver {
             }
             DriverControl::SetActiveModel { provider, model } => {
                 self.set_active_model_live(&provider, &model, tx).await;
-            }
-            DriverControl::RefreshActiveModel => {
-                let provider = self.stack[0].agent.model.provider_id().to_string();
-                let model = self.stack[0].agent.model.model_id_ref().to_string();
-                let Ok(new_model) = self.build_live_model(&provider, &model) else {
-                    return;
-                };
-                let rebuilt = self.rebuild_frame_with_model(0, Arc::new(new_model));
-                self.stack[0].agent = Arc::new(rebuilt);
-                self.schedule.set_agent(self.stack[0].agent.clone());
             }
         }
     }
@@ -4713,6 +4749,7 @@ impl Driver {
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.refresh_redaction_table_for_turn(tx).await;
+        self.refresh_active_model_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,

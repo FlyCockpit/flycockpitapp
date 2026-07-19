@@ -6,7 +6,7 @@ use super::*;
 /// `(provider, model)` from the layered config, threading the session's
 /// effective redaction table (`self.redact`) so the new model keeps the
 /// non-bypassable scrub chokepoint (GOALS §7), and inheriting the current
-/// model's shutdown gate + wire-API self-heal target. On success it rebuilds
+/// model's shutdown gate. On success it rebuilds
 /// the **root primary** under the new model — preserving the root history so
 /// the same conversation continues — persists the session's active-model row,
 /// and refreshes the prunable projection. On any failure (provider not
@@ -27,8 +27,8 @@ impl Driver {
         if current.provider_id() == provider && current.model_id_ref() == model {
             return;
         }
-        // The new model inherits the running model's shutdown gate (so a daemon
-        // drain still refuses its dispatch) and wire-API self-heal target.
+        // The new model inherits the running model's shutdown gate so a daemon
+        // drain still refuses its dispatch.
         let new_model = match self.build_live_model(provider, model) {
             Ok(m) => Arc::new(m),
             Err(e) => {
@@ -62,21 +62,37 @@ impl Driver {
 
     /// Build a fresh [`Model`](crate::engine::model::Model) for `(provider,
     /// model)` from the layered config (honoring the test-injected config in
-    /// tests), threading the session's effective redaction table and inheriting
-    /// the running model's shutdown gate + wire-API self-heal target. The new
-    /// model's reasoning params are re-resolved from the config's active-model
-    /// thinking mode and ride on the rebuilt root agent (see
-    /// [`Self::rebuild_root_with_model`]). Errors propagate so the caller can
-    /// surface them (unconfigured provider / bad id / missing key).
+    /// tests), threading the session's effective redaction table, inheriting
+    /// the running model's shutdown gate, and preserving the running
+    /// wire-API self-heal state only for same-identity refresh rebuilds. The
+    /// new model's reasoning params are re-resolved from the config's
+    /// active-model thinking mode and ride on the rebuilt root agent. Errors
+    /// propagate so the caller can surface them (unconfigured provider / bad
+    /// id / missing key).
     pub(in crate::engine::driver) fn build_live_model(
         &self,
         provider: &str,
         model: &str,
     ) -> Result<crate::engine::model::Model> {
+        let running = self
+            .stack
+            .last()
+            .expect("stack never empty")
+            .agent
+            .model
+            .clone();
+        self.build_live_model_for_running(&running, provider, model)
+    }
+
+    pub(in crate::engine::driver) fn build_live_model_for_running(
+        &self,
+        running: &crate::engine::model::Model,
+        provider: &str,
+        model: &str,
+    ) -> Result<crate::engine::model::Model> {
         let providers = self.live_providers_config()?;
-        let running = &self.stack.last().expect("stack never empty").agent.model;
         let env_overlay = self.stack[0].agent.env_overlay.clone();
-        let built = crate::engine::model::Model::for_provider_with_env_trusted_only(
+        let mut built = crate::engine::model::Model::for_provider_with_env_trusted_only(
             &providers,
             provider,
             model,
@@ -91,6 +107,9 @@ impl Driver {
             },
         )?
         .with_shutdown_gate(running.shutdown_gate());
+        if running.provider_id() == provider && running.model_id_ref() == model {
+            built = built.with_live_wire_api(running);
+        }
         let built = match running.config_path() {
             Some(path) => built.with_config_path(path.to_path_buf()),
             None => built,

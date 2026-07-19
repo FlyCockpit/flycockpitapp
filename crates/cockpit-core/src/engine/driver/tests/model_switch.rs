@@ -206,3 +206,160 @@ async fn live_model_switch_same_model_is_noop() {
         "a same-model re-select emits nothing"
     );
 }
+
+#[test]
+fn refresh_rebuild_inherits_wire_state_only_for_same_identity() {
+    use crate::config::providers::WireApi;
+
+    let (driver, _tmp) = model_switch_driver();
+    let running = driver.stack[0].agent.model.clone();
+    running.confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
+
+    let same = driver
+        .build_live_model_for_running(&running, "provider-a", "model-a")
+        .expect("same model rebuild succeeds");
+    assert_eq!(
+        same.confirmed_wire_api_for_base_url("http://localhost:1/v1"),
+        Some(WireApi::Responses),
+        "same-identity refresh must inherit the session-confirmed endpoint"
+    );
+
+    let switched = driver
+        .build_live_model_for_running(&running, "provider-b", "model-b")
+        .expect("different model build succeeds");
+    assert_eq!(
+        switched.confirmed_wire_api_for_base_url("http://localhost:1/v1"),
+        None,
+        "a genuine model switch must not inherit endpoint confirmations"
+    );
+}
+
+#[tokio::test]
+async fn refresh_preserves_confirmed_endpoint_without_probe_cache() {
+    use crate::config::providers::WireApi;
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.stack[0]
+        .agent
+        .model
+        .confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
+
+    driver.refresh_active_model_for_turn(&tx).await;
+
+    let refreshed = &driver.stack[0].agent.model;
+    assert_eq!(
+        refreshed.confirmed_wire_api_for_base_url("http://localhost:1/v1"),
+        Some(WireApi::Responses)
+    );
+    assert_eq!(
+        refreshed.resolve_live_wire_api_for_base_url("http://localhost:1/v1"),
+        WireApi::Responses,
+        "the preserved session confirmation must route the refreshed model"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "successful refresh must not emit a notice"
+    );
+}
+
+#[tokio::test]
+async fn explicit_config_endpoint_beats_stale_confirmation_after_refresh() {
+    use crate::config::providers::WireApi;
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    driver.stack[0]
+        .agent
+        .model
+        .confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    cfg.providers
+        .get_mut("provider-a")
+        .expect("provider-a exists")
+        .wire_api = WireApi::Completions;
+
+    driver.refresh_active_model_for_turn(&tx).await;
+
+    let refreshed = &driver.stack[0].agent.model;
+    assert_eq!(
+        refreshed.confirmed_wire_api_for_base_url("http://localhost:1/v1"),
+        Some(WireApi::Responses),
+        "the stale confirmation is preserved for the session"
+    );
+    assert_eq!(
+        refreshed.resolve_live_wire_api_for_base_url("http://localhost:1/v1"),
+        WireApi::Completions,
+        "but the fresh explicit config pin wins over it"
+    );
+}
+
+#[tokio::test]
+async fn refresh_failure_is_loud_and_deduped() {
+    use crate::config::providers::WireApi;
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let before = Arc::as_ptr(&driver.stack[0].agent.model);
+    driver.stack[0]
+        .agent
+        .model
+        .confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
+    driver.test_providers_override = Some((
+        crate::config::providers::ProvidersConfig::default(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+
+    driver.refresh_active_model_for_turn(&tx).await;
+    assert_eq!(
+        Arc::as_ptr(&driver.stack[0].agent.model),
+        before,
+        "failed refresh must keep the previous model active"
+    );
+    assert_eq!(
+        driver.stack[0]
+            .agent
+            .model
+            .confirmed_wire_api_for_base_url("http://localhost:1/v1"),
+        Some(WireApi::Responses),
+        "failed refresh must preserve the current model's confirmed endpoint state"
+    );
+    match rx.try_recv().expect("first failure emits a notice") {
+        TurnEvent::Notice { text } => assert!(
+            text.contains("Refreshing the active model from config failed")
+                && text.contains("Keeping the previous model active"),
+            "unexpected notice text: {text}"
+        ),
+        other => panic!("expected a Notice, got {other:?}"),
+    }
+
+    driver.refresh_active_model_for_turn(&tx).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "identical consecutive refresh failures should dedupe notices"
+    );
+
+    driver.test_providers_override = Some((
+        two_model_providers_config(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+    driver.refresh_active_model_for_turn(&tx).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "successful refresh should not emit a notice"
+    );
+
+    driver.test_providers_override = Some((
+        crate::config::providers::ProvidersConfig::default(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+    driver.refresh_active_model_for_turn(&tx).await;
+    rx.try_recv()
+        .expect("success clears the dedupe key so the next failure re-notifies");
+}

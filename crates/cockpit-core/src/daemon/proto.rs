@@ -598,6 +598,22 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             session_id,
             target: queue_target_to_proto(target),
         }],
+        TurnEvent::ActiveModelState {
+            provider,
+            model,
+            config_provider,
+            config_model,
+            diverged,
+            generation,
+        } => vec![Event::ActiveModelState {
+            session_id,
+            provider,
+            model,
+            config_provider,
+            config_model,
+            diverged,
+            generation,
+        }],
         TurnEvent::ConnectorStatus { .. } => vec![],
     }
 }

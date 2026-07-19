@@ -77,6 +77,8 @@ pub enum Response {
         foreground_target: Option<QueueTarget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_subagent: Option<ActiveSubagent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_model_state: Option<ActiveModelState>,
         history: Vec<HistoryEntry>,
         #[serde(default)]
         paused_work: Vec<PausedWorkSummary>,
@@ -334,6 +336,19 @@ pub enum Response {
     PausedWork {
         items: Vec<PausedWorkSummary>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveModelState {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_model: Option<String>,
+    pub diverged: bool,
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

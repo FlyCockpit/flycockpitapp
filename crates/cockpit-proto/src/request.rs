@@ -457,6 +457,10 @@ pub enum Request {
     SetActiveModel {
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_mode: Option<String>,
     },
 
     /// Swap which built-in or user agent owns the conversation.

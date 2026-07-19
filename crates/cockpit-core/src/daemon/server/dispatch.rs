@@ -632,10 +632,20 @@ async fn handle_request(
         Request::ListAgents => Err(not_implemented("ListAgents")),
         Request::ListModels { .. } => Err(not_implemented("ListModels")),
 
-        Request::SetActiveModel { provider, model } => {
+        Request::SetActiveModel {
+            provider,
+            model,
+            reasoning_effort,
+            thinking_mode,
+        } => {
             let att = require_attached(state)?;
             att.handle
-                .send_work(SessionWork::SetActiveModel { provider, model })
+                .send_work(SessionWork::SetActiveModel {
+                    provider,
+                    model,
+                    reasoning_effort,
+                    thinking_mode,
+                })
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
@@ -1208,7 +1218,7 @@ async fn attach(
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have
     // already performed the post-claim DB read-through.
-    let (_, extended_cfg) = ctx
+    let (providers_cfg, extended_cfg) = ctx
         .config_source()
         .load_with_trust(&handle.project_root, &handle.trust_policy)
         .map_err(internal)?;
@@ -1265,6 +1275,25 @@ async fn attach(
     // persist) and has no `sessions` row yet, so `get_session` would miss.
     let project_id = handle.project_id();
     let short_id = handle.short_id();
+    let (session_active_provider, session_active_model) = handle.active_model_selection();
+    let config_active = providers_cfg.active_model.as_ref();
+    let active_model_state = match (session_active_provider, session_active_model) {
+        (Some(provider), Some(model)) => {
+            let config_provider = config_active.map(|active| active.provider.clone());
+            let config_model = config_active.map(|active| active.model.clone());
+            let diverged = config_provider.as_deref() != Some(provider.as_str())
+                || config_model.as_deref() != Some(model.as_str());
+            Some(proto::ActiveModelState {
+                provider,
+                model,
+                config_provider,
+                config_model,
+                diverged,
+                generation: 0,
+            })
+        }
+        _ => None,
+    };
 
     state.pending_uploads.clear();
     state.ready_attachments.clear();
@@ -1389,6 +1418,7 @@ async fn attach(
         active_agent_path: foreground.active_agent_path,
         foreground_target: Some(foreground.foreground_target),
         active_subagent: foreground.active_subagent,
+        active_model_state,
         history,
         paused_work,
         repair_required: state

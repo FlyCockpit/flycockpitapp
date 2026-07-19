@@ -1,5 +1,4 @@
 use super::{App, HistoryEntry, Overlay};
-use crate::config::providers::ConfigDoc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use std::fs;
 
@@ -24,7 +23,7 @@ fn write_config(path: &std::path::Path) {
 }
 
 #[test]
-fn model_picker_save_failure_stays_open_without_success_side_effects() {
+fn model_picker_selection_closes_without_local_config_write() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
@@ -38,24 +37,56 @@ fn model_picker_save_failure_stays_open_without_success_side_effects() {
         crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
             .expect("model picker opens from valid config"),
     );
-    fs::write(&config_path, "{not json").unwrap();
     let history_len = app.history.len();
     let usage_len = app.pending_usage.len();
 
     let exit = app.handle_key(press(KeyCode::Enter));
 
     assert!(!exit);
-    let Overlay::ModelPicker(picker) = &app.overlay else {
-        panic!("picker remains open");
-    };
-    assert!(!picker.is_done());
-    assert_eq!(app.history.len(), history_len);
-    assert_eq!(app.pending_usage.len(), usage_len);
-    assert!(!app.usage_models.contains_key("p/a"));
+    assert!(!matches!(app.overlay, Overlay::ModelPicker(_)));
+    assert!(app.history.len() > history_len);
+    assert_eq!(app.pending_usage.len(), usage_len + 1);
+    assert_eq!(app.usage_models.get("p/a"), Some(&1));
+    let active = crate::config::providers::ConfigDoc::load(&config_path)
+        .unwrap()
+        .providers()
+        .active_model;
+    assert_eq!(active, None);
 }
 
 #[test]
-fn model_picker_save_success_closes_and_records_summary() {
+fn chrome_active_model_unchanged_on_rejected_switch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let cockpit = tmp.path().join(".cockpit");
+    fs::create_dir(&cockpit).unwrap();
+    let config_path = cockpit.join("config.json");
+    write_config(&config_path);
+
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.launch.active_model = Some(("old-provider".to_string(), "old-model".to_string()));
+    app.overlay = Overlay::ModelPicker(
+        crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
+            .expect("model picker opens from valid config"),
+    );
+
+    let exit = app.handle_key(press(KeyCode::Enter));
+
+    assert!(!exit);
+    assert_eq!(
+        app.launch.active_model,
+        Some(("old-provider".to_string(), "old-model".to_string()))
+    );
+    let active = crate::config::providers::ConfigDoc::load(&config_path)
+        .unwrap()
+        .providers()
+        .active_model;
+    assert_eq!(active, None);
+}
+
+#[test]
+fn model_picker_selection_records_summary() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
@@ -87,11 +118,50 @@ fn model_picker_save_success_closes_and_records_summary() {
         "expected model summary line, got {:?}",
         app.history.last()
     );
-    let active = ConfigDoc::load(&config_path)
+    let active = crate::config::providers::ConfigDoc::load(&config_path)
         .unwrap()
         .providers()
-        .active_model
-        .expect("active model persisted");
-    assert_eq!(active.provider, "p");
-    assert_eq!(active.model, "a");
+        .active_model;
+    assert_eq!(active, None);
+}
+
+#[test]
+fn chrome_renders_session_derived_active_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let cockpit = tmp.path().join(".cockpit");
+    fs::create_dir(&cockpit).unwrap();
+    write_config(&cockpit.join("config.json"));
+
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.apply_event(crate::engine::TurnEvent::ActiveModelState {
+        provider: "p".to_string(),
+        model: "a".to_string(),
+        config_provider: Some("other".to_string()),
+        config_model: Some("old".to_string()),
+        diverged: true,
+        generation: 2,
+    });
+
+    assert_eq!(
+        app.launch.active_model,
+        Some(("p".to_string(), "a".to_string()))
+    );
+    assert!(app.launch.active_model_diverged);
+
+    app.apply_event(crate::engine::TurnEvent::ActiveModelState {
+        provider: "stale".to_string(),
+        model: "stale".to_string(),
+        config_provider: None,
+        config_model: None,
+        diverged: false,
+        generation: 1,
+    });
+
+    assert_eq!(
+        app.launch.active_model,
+        Some(("p".to_string(), "a".to_string()))
+    );
+    assert!(app.launch.active_model_diverged);
 }

@@ -1093,6 +1093,7 @@ struct StartupBackground {
 #[allow(private_interfaces)]
 pub struct App {
     pub(super) launch: LaunchInfo,
+    pub(super) active_model_state_generation: u64,
     pub(super) composer: Composer,
     /// User's vim_mode setting (hint/enabled/disabled). Drives whether
     /// the Normal-mode hint chip is shown.
@@ -2391,6 +2392,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let mut app = Self {
             launch,
+            active_model_state_generation: 0,
             composer,
             vim_setting,
             thinking_setting,

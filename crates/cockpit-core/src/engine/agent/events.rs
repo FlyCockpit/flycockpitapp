@@ -48,6 +48,17 @@ pub enum TurnEvent {
     ForegroundInputTarget {
         target: crate::engine::message::QueueTarget,
     },
+    /// Authoritative active model state after a daemon-owned switch attempt or
+    /// same-model reselect. TUI chrome is driven from this snapshot instead of
+    /// local config writes.
+    ActiveModelState {
+        provider: String,
+        model: String,
+        config_provider: Option<String>,
+        config_model: Option<String>,
+        diverged: bool,
+        generation: u64,
+    },
     /// Model inference started; nothing has been emitted yet. The TUI
     /// shows a "Thinking…" placeholder until the first text delta
     /// arrives. Fires once per round-trip; also fires before reasoning-

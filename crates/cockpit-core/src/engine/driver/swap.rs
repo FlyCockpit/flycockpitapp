@@ -18,18 +18,33 @@ impl Driver {
         &mut self,
         provider: &str,
         model: &str,
+        reasoning_effort: Option<String>,
+        thinking_mode: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        // A no-op when the requested model is already the active one — never
-        // rebuild (and bust the cache) for a same-model re-select.
-        let active_idx = self.stack.len().saturating_sub(1);
+        let target = crate::config::providers::ActiveModelRef {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reasoning_effort: reasoning_effort
+                .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
+            thinking_mode: thinking_mode.and_then(|value| {
+                serde_json::from_value::<crate::config::providers::ThinkingMode>(
+                    serde_json::Value::String(value),
+                )
+                .ok()
+            }),
+        };
+        let old_session_provider = self.session.active_provider();
+        let old_session_model = self.session.active_model();
+        let active_idx = 0;
         let current = &self.stack[active_idx].agent.model;
         if current.provider_id() == provider && current.model_id_ref() == model {
+            self.emit_active_model_state(tx).await;
             return;
         }
         // The new model inherits the running model's shutdown gate so a daemon
         // drain still refuses its dispatch.
-        let new_model = match self.build_live_model(provider, model) {
+        let new_model = match self.build_live_model(&target) {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 // Fail loudly, keep the current model active.
@@ -41,23 +56,69 @@ impl Driver {
                         ),
                     })
                     .await;
+                self.emit_active_model_state(tx).await;
                 return;
             }
         };
-        let rebuilt = self.rebuild_frame_with_model(active_idx, new_model);
-        self.stack[active_idx].agent = Arc::new(rebuilt);
-        if active_idx == 0 {
-            // The job authority's fork context is rooted on the root agent;
-            // rebind it when the root model changes.
-            self.schedule.set_agent(self.stack[0].agent.clone());
-            if let Err(e) = self.session.set_active_model(provider, model) {
-                tracing::warn!(error = %e, "persisting active model after live switch failed");
-            }
+        let rebuilt = Arc::new(self.rebuild_frame_with_model(active_idx, new_model));
+        if let Err(e) = self.persist_active_model_session(provider, model) {
+            self.session
+                .restore_active_model_memory(old_session_provider, old_session_model);
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "Model switch to `{provider}/{model}` failed — {e:#}. \
+                         Keeping the current model active."
+                    ),
+                })
+                .await;
+            self.emit_active_model_state(tx).await;
+            return;
         }
+        if let Err(e) = self.write_active_model_config(&target) {
+            if let (Some(old_provider), Some(old_model)) = (
+                old_session_provider.as_deref(),
+                old_session_model.as_deref(),
+            ) {
+                if let Err(restore_error) =
+                    self.persist_active_model_session(old_provider, old_model)
+                {
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: format!(
+                                "Model switch to `{provider}/{model}` failed — {e:#}. \
+                                 Restoring the previous session model also failed — \
+                                 {restore_error:#}. The config and session may diverge."
+                            ),
+                        })
+                        .await;
+                    self.emit_active_model_state(tx).await;
+                    return;
+                }
+            } else {
+                self.session
+                    .restore_active_model_memory(old_session_provider, old_session_model);
+            }
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "Model switch to `{provider}/{model}` failed — {e:#}. \
+                         Keeping the current model active."
+                    ),
+                })
+                .await;
+            self.emit_active_model_state(tx).await;
+            return;
+        }
+        self.stack[active_idx].agent = rebuilt;
+        // The job authority's fork context is rooted on the root agent;
+        // rebind it when the root model changes.
+        self.schedule.set_agent(self.stack[0].agent.clone());
         tracing::info!(provider, model, "active model switched live");
         // The model changed, so the prefix cache key changes — refresh the
         // prunable projection the chrome shows (cache-cold reflects the bust).
         self.emit_context_projection(tx).await;
+        self.emit_active_model_state(tx).await;
     }
 
     /// Build a fresh [`Model`](crate::engine::model::Model) for `(provider,
@@ -71,17 +132,16 @@ impl Driver {
     /// id / missing key).
     pub(in crate::engine::driver) fn build_live_model(
         &self,
-        provider: &str,
-        model: &str,
+        active: &crate::config::providers::ActiveModelRef,
     ) -> Result<crate::engine::model::Model> {
         let running = self
             .stack
-            .last()
+            .first()
             .expect("stack never empty")
             .agent
             .model
             .clone();
-        self.build_live_model_for_running(&running, provider, model)
+        self.build_live_model_for_running_with_active(&running, active)
     }
 
     pub(in crate::engine::driver) fn build_live_model_for_running(
@@ -90,12 +150,27 @@ impl Driver {
         provider: &str,
         model: &str,
     ) -> Result<crate::engine::model::Model> {
-        let providers = self.live_providers_config()?;
+        let active = crate::config::providers::ActiveModelRef {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        };
+        self.build_live_model_for_running_with_active(running, &active)
+    }
+
+    fn build_live_model_for_running_with_active(
+        &self,
+        running: &crate::engine::model::Model,
+        active: &crate::config::providers::ActiveModelRef,
+    ) -> Result<crate::engine::model::Model> {
+        let mut providers = self.live_providers_config()?;
+        providers.active_model = Some(active.clone());
         let env_overlay = self.stack[0].agent.env_overlay.clone();
         let mut built = crate::engine::model::Model::for_provider_with_env_trusted_only(
             &providers,
-            provider,
-            model,
+            &active.provider,
+            &active.model,
             self.redact.clone(),
             running.trusted_only_flag(),
             move |name| {
@@ -107,7 +182,7 @@ impl Driver {
             },
         )?
         .with_shutdown_gate(running.shutdown_gate());
-        if running.provider_id() == provider && running.model_id_ref() == model {
+        if running.provider_id() == active.provider && running.model_id_ref() == active.model {
             built = built.with_live_wire_api(running);
         }
         let built = match running.config_path() {
@@ -115,6 +190,70 @@ impl Driver {
             None => built,
         };
         Ok(built)
+    }
+
+    fn live_config_active_model(&self) -> Option<crate::config::providers::ActiveModelRef> {
+        self.live_providers_config().ok()?.active_model
+    }
+
+    fn write_active_model_config(
+        &mut self,
+        active: &crate::config::providers::ActiveModelRef,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self.test_fail_next_active_model_config_write {
+            self.test_fail_next_active_model_config_write = false;
+            anyhow::bail!("test injected active model config write failure");
+        }
+        #[cfg(test)]
+        if let Some((providers, provider, model)) = self.test_providers_override.as_mut() {
+            providers.active_model = Some(active.clone());
+            *provider = active.provider.clone();
+            *model = active.model.clone();
+            return Ok(());
+        }
+        let path =
+            crate::config::dirs::config_write_target_for_provider(&self.cwd, &active.provider)
+                .or_else(|| crate::config::dirs::most_specific_config_write_target(&self.cwd))
+                .context("no cockpit config found — run `/settings` to create one")?;
+        let mut doc = crate::config::providers::ConfigDoc::load(&path)?;
+        doc.write_active_model(Some(active))
+    }
+
+    fn persist_active_model_session(&mut self, provider: &str, model: &str) -> Result<()> {
+        #[cfg(test)]
+        if self.test_fail_next_active_model_session_persist {
+            self.test_fail_next_active_model_session_persist = false;
+            anyhow::bail!("test injected active model session persist failure");
+        }
+        self.session.set_active_model(provider, model)
+    }
+
+    async fn emit_active_model_state(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        self.active_model_state_generation = self.active_model_state_generation.saturating_add(1);
+        let config = self.live_config_active_model();
+        let provider = self
+            .session
+            .active_provider()
+            .unwrap_or_else(|| self.stack[0].agent.model.provider_id().to_string());
+        let model = self
+            .session
+            .active_model()
+            .unwrap_or_else(|| self.stack[0].agent.model.model_id_ref().to_string());
+        let config_provider = config.as_ref().map(|active| active.provider.clone());
+        let config_model = config.as_ref().map(|active| active.model.clone());
+        let diverged = config_provider.as_deref() != Some(provider.as_str())
+            || config_model.as_deref() != Some(model.as_str());
+        let _ = tx
+            .send(TurnEvent::ActiveModelState {
+                provider,
+                model,
+                config_provider,
+                config_model,
+                diverged,
+                generation: self.active_model_state_generation,
+            })
+            .await;
     }
 
     /// Swap the root-frame agent to `name` in place, preserving the root

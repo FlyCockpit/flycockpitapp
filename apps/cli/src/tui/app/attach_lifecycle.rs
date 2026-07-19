@@ -155,6 +155,14 @@ impl App {
             merge_counts(&mut self.usage_tags, &r.usage.tags);
             self.project_id = Some(r.project_id.clone());
             self.foreground_input_target = r.foreground_target.clone();
+            if let Some(state) = &r.active_model_state {
+                self.apply_active_model_state(
+                    state.provider.clone(),
+                    state.model.clone(),
+                    state.diverged,
+                    state.generation,
+                );
+            }
             self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
             // Flush records buffered before the runner existed,
             // backfilling tag project ids now that we know the project.

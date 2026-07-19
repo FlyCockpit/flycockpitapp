@@ -573,7 +573,6 @@ impl SessionWorkerHandle {
 
     /// The session's active (provider, model) selection. Test observability
     /// for the daemon config seam (`daemon-trust-test-isolation.md`).
-    #[cfg(test)]
     pub(crate) fn active_model_selection(&self) -> (Option<String>, Option<String>) {
         (self.session.active_provider(), self.session.active_model())
     }
@@ -760,6 +759,8 @@ pub enum SessionWork {
     SetActiveModel {
         provider: String,
         model: String,
+        reasoning_effort: Option<String>,
+        thinking_mode: Option<String>,
     },
     SetAgent {
         name: String,

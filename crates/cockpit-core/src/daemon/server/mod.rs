@@ -225,6 +225,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             active_agent_path: _,
             foreground_target: _,
             active_subagent,
+            active_model_state: _,
             history,
             paused_work,
             repair_required,
@@ -384,6 +385,15 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::ForegroundInputTarget {
             session_id: _,
             target: _,
+        }
+        | proto::Event::ActiveModelState {
+            session_id: _,
+            provider: _,
+            model: _,
+            config_provider: _,
+            config_model: _,
+            diverged: _,
+            generation: _,
         }
         | proto::Event::PreflightStarted { session_id: _ }
         | proto::Event::UserMessageRetracted { session_id: _ }

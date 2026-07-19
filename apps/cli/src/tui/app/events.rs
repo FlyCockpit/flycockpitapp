@@ -215,6 +215,15 @@ impl App {
                 self.foreground_input_target = Some(target);
                 self.refresh_skill_commands();
             }
+            TurnEvent::ActiveModelState {
+                provider,
+                model,
+                diverged,
+                generation,
+                ..
+            } => {
+                self.apply_active_model_state(provider, model, diverged, generation);
+            }
             TurnEvent::ThinkingStarted { agent, turn_id } => {
                 // Note: a `ThinkingStarted` does NOT clear the reconnect
                 // status. It fires once at turn start, before the retry loop
@@ -1421,6 +1430,40 @@ impl App {
                 };
             }
         }
+    }
+
+    pub(super) fn apply_active_model_state(
+        &mut self,
+        provider: String,
+        model: String,
+        diverged: bool,
+        generation: u64,
+    ) {
+        if generation < self.active_model_state_generation {
+            return;
+        }
+        self.active_model_state_generation = generation;
+        let providers = crate::secret_ref::load_effective(&self.launch.cwd);
+        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
+        self.launch.provider_line = format!("{provider} / {model}");
+        self.launch.active_model = Some((provider.clone(), model.clone()));
+        self.launch.active_model_diverged = diverged;
+        self.launch.active_model_is_favorite = providers
+            .providers
+            .get(&provider)
+            .and_then(|entry| entry.models.iter().find(|entry| entry.id == model))
+            .map(|entry| entry.favorite)
+            .unwrap_or(false);
+        self.launch.active_model_is_trusted =
+            providers.resolve_trust(&provider, &model).is_trusted();
+        let capabilities = providers.resolve_capabilities(&provider, &model);
+        self.launch.active_model_max_context = capabilities.context_tokens;
+        self.launch.active_model_supports_images = capabilities.images == Some(true);
+        self.llm_mode = resolve_tui_llm_mode(
+            self.launch.active_model.as_ref(),
+            extended.llm_mode,
+            &providers,
+        );
     }
 
     /// Find the most-recent tool call with `call_id` — in a `ToolBox` or

@@ -1308,18 +1308,28 @@ async fn run_worker(
                     }
                 }
             }
-            SessionWork::SetActiveModel { provider, model } => {
+            SessionWork::SetActiveModel {
+                provider,
+                model,
+                reasoning_effort,
+                thinking_mode,
+            } => {
                 // Mid-session model switch (implementation note):
-                // route the new `(provider, model)` to the running driver, which
-                // rebuilds the active primary under the new model at the idle
-                // boundary so the next request routes there. The driver persists
-                // the session's active-model row only on a successful build (and
-                // surfaces a loud `Notice` on an unconfigured/bad target, keeping
-                // the current model active), so config + live routing never
-                // diverge — the worker no longer pre-commits it here.
+                // route the new `(provider, model)` to the running driver. The
+                // driver owns the whole daemon-side transaction: build first,
+                // then session/config persistence, then the root-primary swap
+                // and authoritative active-model state event. Legitimate
+                // config/session drift (for example an on-disk edit while the
+                // session is live) is reported back to every attached client
+                // instead of being silently reconciled here.
                 if !send_driver_control_or_fail(
                     &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetActiveModel { provider, model },
+                    crate::engine::driver::DriverControl::SetActiveModel {
+                        provider,
+                        model,
+                        reasoning_effort,
+                        thinking_mode,
+                    },
                     &event_tx,
                     &redaction,
                     session_id,

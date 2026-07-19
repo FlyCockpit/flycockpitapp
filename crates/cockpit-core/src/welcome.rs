@@ -52,6 +52,8 @@ pub struct LaunchInfo {
     /// Currently selected (provider_id, model_id). None when nothing
     /// has been picked yet.
     pub active_model: Option<(String, String)>,
+    /// True when the session row and config `active_model` do not match.
+    pub active_model_diverged: bool,
     /// True when the active model has `favorite: true` in config.
     pub active_model_is_favorite: bool,
     /// True when the active provider/model resolves to `trust: "trusted"`.
@@ -157,6 +159,7 @@ fn build_launch_info(
         session_short_id: None,
         provider_line,
         active_model,
+        active_model_diverged: false,
         active_model_is_favorite,
         active_model_is_trusted,
         active_model_max_context,

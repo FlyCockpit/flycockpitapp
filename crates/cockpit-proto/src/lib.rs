@@ -692,7 +692,7 @@ impl DelegationSteerResult {
 }
 
 mod response;
-pub use response::{BtwForkInfo, Response};
+pub use response::{ActiveModelState, BtwForkInfo, Response};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeRepairState {

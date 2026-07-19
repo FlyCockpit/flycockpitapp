@@ -92,6 +92,8 @@ async fn live_model_switch_routes_next_request_to_new_model() {
             DriverControl::SetActiveModel {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
             },
             &tx,
         )
@@ -132,12 +134,114 @@ async fn live_model_switch_routes_next_request_to_new_model() {
         driver.session.active_provider().as_deref(),
         Some("provider-b")
     );
+    assert_config_active_model(&driver, "provider-b", "model-b");
+}
+
+/// A successful switch commits both durable authorities and routes the next
+/// inference through the newly selected root model.
+#[tokio::test]
+async fn live_model_switch_commits_config_and_session_together() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
+    assert_disk_config_active_model(tmp.path(), "provider-b", "model-b");
+    drain_until_active_model_state(&mut rx);
+}
+
+/// A switch requested while a child frame is foregrounded is applied to the
+/// root primary and never to the transient child frame.
+#[tokio::test]
+async fn live_model_switch_from_subagent_frame_applies_to_root() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    push_test_child(&mut driver, Vec::new());
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.stack[1].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[1].agent.model.model_id_ref(), "model-a");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
+    assert_config_active_model(&driver, "provider-b", "model-b");
+}
+
+/// Reasoning effort and thinking mode selected by the client survive the
+/// daemon-side config write.
+#[tokio::test]
+async fn live_model_switch_persists_requested_reasoning_options() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: Some("xhigh".into()),
+                thinking_mode: Some("high".into()),
+            },
+            &tx,
+        )
+        .await;
+
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override");
+    let active = cfg.active_model.as_ref().expect("active model written");
+    assert_eq!(active.provider, "provider-b");
+    assert_eq!(active.model, "model-b");
+    assert_eq!(
+        active
+            .reasoning_effort
+            .as_ref()
+            .map(|effort| effort.value.as_str()),
+        Some("xhigh")
+    );
+    assert_eq!(
+        active.thinking_mode,
+        Some(crate::config::providers::ThinkingMode::High)
+    );
 }
 
 /// Switching to an unconfigured model surfaces a loud `Notice` error and
-/// leaves the prior model (and the persisted active-model row) active.
+/// leaves the prior model active in live routing, session storage, and config.
 #[tokio::test]
-async fn live_model_switch_to_unconfigured_keeps_current_model() {
+async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
@@ -146,6 +250,8 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
             DriverControl::SetActiveModel {
                 provider: "provider-c".into(), // never configured
                 model: "model-c".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
             },
             &tx,
         )
@@ -174,21 +280,128 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
         driver.session.active_provider().as_deref(),
         Some("provider-a")
     );
+    assert_config_active_model(&driver, "provider-a", "model-a");
+    drain_until_active_model_state(&mut rx);
+}
+
+/// A session-row persistence failure aborts before config commit and restores
+/// the live root model and in-memory session state.
+#[tokio::test]
+async fn live_model_switch_session_persist_failure_rolls_back() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.test_fail_next_active_model_session_persist = true;
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_notice_contains(&mut rx, "session persist failure");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_config_active_model(&driver, "provider-a", "model-a");
+    drain_until_active_model_state(&mut rx);
+}
+
+/// A config write failure rolls the session row back and keeps the live root
+/// model on the previous provider/model pair.
+#[tokio::test]
+async fn live_model_switch_config_write_failure_rolls_back() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.test_fail_next_active_model_config_write = true;
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_notice_contains(&mut rx, "config write failure");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_config_active_model(&driver, "provider-a", "model-a");
+    drain_until_active_model_state(&mut rx);
+}
+
+/// The legacy unconfigured-target regression remains: the active model is
+/// unchanged and the user sees an explicit failure notice.
+#[tokio::test]
+async fn live_model_switch_to_unconfigured_keeps_current_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-c".into(),
+                model: "model-c".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_notice_contains(&mut rx, "provider-c");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_config_active_model(&driver, "provider-a", "model-a");
+    drain_until_active_model_state(&mut rx);
 }
 
 /// Re-selecting the already-active model is a no-op — no rebuild, no
 /// cache-busting churn, no error.
 #[tokio::test]
-async fn live_model_switch_same_model_is_noop() {
+async fn live_model_switch_same_model_emits_state_without_rebuild() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let before = Arc::as_ptr(&driver.stack[0].agent);
+    if let Some((cfg, _, _)) = driver.test_providers_override.as_mut() {
+        cfg.active_model = Some(crate::config::providers::ActiveModelRef {
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        });
+    }
 
     driver
         .run_control(
             DriverControl::SetActiveModel {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
             },
             &tx,
         )
@@ -200,11 +413,170 @@ async fn live_model_switch_same_model_is_noop() {
         before,
         "re-selecting the active model must not rebuild the primary"
     );
-    // No notice, no projection event.
+    match rx
+        .try_recv()
+        .expect("same-model re-select emits authoritative state")
+    {
+        TurnEvent::ActiveModelState {
+            provider,
+            model,
+            config_provider,
+            config_model,
+            diverged,
+            generation,
+        } => {
+            assert_eq!(provider, "provider-a");
+            assert_eq!(model, "model-a");
+            assert_eq!(config_provider.as_deref(), Some("provider-b"));
+            assert_eq!(config_model.as_deref(), Some("model-b"));
+            assert!(diverged);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("expected ActiveModelState, got {other:?}"),
+    }
     assert!(
         rx.try_recv().is_err(),
-        "a same-model re-select emits nothing"
+        "same-model re-select emits no notice or projection"
     );
+}
+
+/// Same-model selection preserves the historical no-op invariant.
+#[tokio::test]
+async fn live_model_switch_same_model_is_noop() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let before = Arc::as_ptr(&driver.stack[0].agent);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(Arc::as_ptr(&driver.stack[0].agent), before);
+    drain_until_active_model_state(&mut rx);
+}
+
+/// A successful switch emits the authoritative daemon-to-client state event.
+#[tokio::test]
+async fn live_model_switch_emits_active_model_state_event() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    let event = drain_until_active_model_state(&mut rx);
+    match event {
+        TurnEvent::ActiveModelState {
+            provider,
+            model,
+            config_provider,
+            config_model,
+            diverged,
+            generation,
+        } => {
+            assert_eq!(provider, "provider-b");
+            assert_eq!(model, "model-b");
+            assert_eq!(config_provider.as_deref(), Some("provider-b"));
+            assert_eq!(config_model.as_deref(), Some("model-b"));
+            assert!(!diverged);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("expected ActiveModelState, got {other:?}"),
+    }
+}
+
+fn assert_config_active_model(driver: &Driver, provider: &str, model: &str) {
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override");
+    let active = cfg.active_model.as_ref().expect("active model written");
+    assert_eq!(active.provider, provider);
+    assert_eq!(active.model, model);
+}
+
+fn assert_notice_contains(rx: &mut mpsc::Receiver<TurnEvent>, expected: &str) {
+    match rx.try_recv().expect("expected user-visible failure notice") {
+        TurnEvent::Notice { text } => {
+            assert!(
+                text.contains(expected) && text.contains("failed"),
+                "notice should contain `{expected}` and `failed`: {text}"
+            );
+        }
+        other => panic!("expected Notice, got {other:?}"),
+    }
+}
+
+fn drain_until_active_model_state(rx: &mut mpsc::Receiver<TurnEvent>) -> TurnEvent {
+    loop {
+        let event = rx.try_recv().expect("expected ActiveModelState event");
+        if matches!(event, TurnEvent::ActiveModelState { .. }) {
+            return event;
+        }
+    }
+}
+
+fn model_switch_driver_with_disk_config() -> (Driver, tempfile::TempDir) {
+    let (mut driver, tmp) = model_switch_driver();
+    write_two_model_config(tmp.path(), "provider-a", "model-a");
+    driver.test_providers_override = None;
+    (driver, tmp)
+}
+
+fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
+    let cockpit = root.join(".cockpit");
+    std::fs::create_dir_all(&cockpit).unwrap();
+    let config_path = cockpit.join("config.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    for (id, model_id, url) in [
+        ("provider-a", "model-a", "http://localhost:1/v1"),
+        ("provider-b", "model-b", "http://localhost:2/v1"),
+    ] {
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, id).unwrap();
+        std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            provider_path,
+            format!(r#"{{"url":"{url}","models":[{{"id":"{model_id}"}}]}}"#),
+        )
+        .unwrap();
+    }
+    crate::config::providers::ConfigDoc::load(&config_path)
+        .unwrap()
+        .write_active_model(Some(&crate::config::providers::ActiveModelRef {
+            provider: provider.into(),
+            model: model.into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        }))
+        .unwrap();
+}
+
+fn assert_disk_config_active_model(root: &std::path::Path, provider: &str, model: &str) {
+    let active = crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
+        .unwrap()
+        .providers()
+        .active_model
+        .expect("active model written");
+    assert_eq!(active.provider, provider);
+    assert_eq!(active.model, model);
 }
 
 #[test]

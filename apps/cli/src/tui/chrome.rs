@@ -132,6 +132,13 @@ pub fn left_status(
                 selected_style(model_style, selected == Some(FooterControl::Model)),
             ),
         );
+        if info.active_model_diverged {
+            push_span(
+                &mut spans,
+                &mut col,
+                Span::styled(" != config".to_string(), Style::default().fg(WARNING_TEXT)),
+            );
+        }
         hits.push(FooterHit {
             control: FooterControl::Model,
             start,
@@ -327,6 +334,7 @@ mod tests {
             session_short_id: None,
             provider_line: String::new(),
             active_model: Some(("openai".into(), "gpt-test".into())),
+            active_model_diverged: false,
             active_model_is_favorite: true,
             active_model_is_trusted: false,
             active_model_max_context: None,
@@ -423,6 +431,34 @@ mod tests {
             .find(|span| span.content == "openai/gpt-test")
             .expect("active model span present");
         assert_eq!(model.style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn chrome_shows_active_model_divergence_badge() {
+        let mut info = launch_info("Build");
+        info.active_model_diverged = true;
+
+        let spans = left_status(
+            &info,
+            LlmMode::Defensive,
+            std::slice::from_ref(&info.agent_name),
+            None,
+            true,
+        )
+        .spans;
+
+        assert!(spans.iter().any(|span| span.content == " != config"));
+
+        info.active_model_diverged = false;
+        let spans = left_status(
+            &info,
+            LlmMode::Defensive,
+            std::slice::from_ref(&info.agent_name),
+            None,
+            true,
+        )
+        .spans;
+        assert!(!spans.iter().any(|span| span.content == " != config"));
     }
 
     #[test]

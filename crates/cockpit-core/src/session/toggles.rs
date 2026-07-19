@@ -204,6 +204,15 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn restore_active_model_memory(
+        &self,
+        provider: Option<String>,
+        model: Option<String>,
+    ) {
+        *self.provider.lock().unwrap() = provider;
+        *self.model.lock().unwrap() = model;
+    }
+
     pub fn set_active_agent(&self, agent: &str) -> Result<()> {
         if self.stage_pending_row(|row| {
             row.active_agent = agent.to_string();

@@ -41,6 +41,20 @@ pub enum Event {
         target: QueueTarget,
     },
 
+    /// Authoritative daemon-owned active model state for one session. The
+    /// client renders this instead of assuming a requested switch succeeded.
+    ActiveModelState {
+        session_id: Uuid,
+        provider: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_model: Option<String>,
+        diverged: bool,
+        generation: u64,
+    },
+
     /// Model inference started. TUI shows `Thinking…` until the first
     /// `AssistantTextDelta` arrives.
     ThinkingStarted {

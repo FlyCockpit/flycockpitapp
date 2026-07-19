@@ -75,6 +75,9 @@ pub struct AgentRunner {
     /// Queue-edit foreground target from the attach snapshot. Live updates
     /// arrive as `TurnEvent::ForegroundInputTarget`.
     pub foreground_target: Option<crate::engine::message::QueueTarget>,
+    /// Authoritative active-model snapshot from `Attach`, used to seed chrome
+    /// before any later live active-model event arrives.
+    pub active_model_state: Option<proto::ActiveModelState>,
     /// This session's full id. Shown in the startup graphic and printed on
     /// exit (session-id-display-and-lazy-persist). Assigned by the daemon at
     /// attach, before the `sessions` row is persisted.
@@ -404,6 +407,7 @@ fn try_spawn_inner(
                 active_agent_name,
                 active_agent_path,
                 foreground_target,
+                active_model_state,
                 project_id,
                 history,
                 paused_work,
@@ -418,6 +422,7 @@ fn try_spawn_inner(
                     active_agent,
                     active_agent_path,
                     foreground_target,
+                    active_model_state,
                     project_id,
                     history,
                     paused_work,
@@ -432,6 +437,7 @@ fn try_spawn_inner(
                     active_agent,
                     active_agent_path,
                     foreground_target,
+                    active_model_state,
                     project_id,
                     history,
                     paused_work,
@@ -487,6 +493,7 @@ fn try_spawn_inner(
                 active_agent_name,
                 active_agent_path,
                 foreground_target,
+                active_model_state,
                 project_id,
                 usage,
                 skill_inventory_names,
@@ -508,6 +515,7 @@ fn try_spawn_inner(
         initial_active_agent,
         active_agent_path,
         foreground_target,
+        active_model_state,
         project_id,
         usage,
         initial_skill_names,
@@ -799,6 +807,7 @@ fn try_spawn_inner(
         active_agent_path,
         skill_inventory_names,
         foreground_target: foreground_target.map(queue_target_from_proto),
+        active_model_state,
         session_id,
         short_id,
         project_id,
@@ -1255,6 +1264,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         ThinkingStarted { session_id, .. }
         | QueueUpdated { session_id, .. }
         | ForegroundInputTarget { session_id, .. }
+        | ActiveModelState { session_id, .. }
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
@@ -1551,6 +1561,22 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         },
         ForegroundInputTarget { target, .. } => TurnEvent::ForegroundInputTarget {
             target: queue_target_from_proto(target),
+        },
+        ActiveModelState {
+            provider,
+            model,
+            config_provider,
+            config_model,
+            diverged,
+            generation,
+            ..
+        } => TurnEvent::ActiveModelState {
+            provider,
+            model,
+            config_provider,
+            config_model,
+            diverged,
+            generation,
         },
         SessionPersistFailed { error, .. } => TurnEvent::SessionPersistFailed { error },
         SessionDriverFailed { error, .. } => TurnEvent::SessionDriverFailed { error },
@@ -2130,6 +2156,7 @@ mod tests {
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            active_model_state: None,
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),

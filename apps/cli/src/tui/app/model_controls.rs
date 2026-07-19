@@ -232,26 +232,33 @@ impl App {
     }
 
     pub(super) fn close_model_picker(&mut self, accepted: bool) {
+        let selected = match std::mem::take(&mut self.overlay) {
+            Overlay::ModelPicker(picker) if accepted => picker.selected_active_model(),
+            other => {
+                self.overlay = other;
+                None
+            }
+        };
         self.overlay = Overlay::None;
-        self.reload_launch_info();
-        if accepted && let Some((p, m)) = self.launch.active_model.clone() {
-            self.notify_active_model_selected(p, m);
+        if let Some(active) = selected {
+            self.notify_active_model_selected(active);
         }
         let line = self.model_summary_history_line();
         self.push_plain(line);
     }
 
-    pub(super) fn notify_active_model_selected(&mut self, provider: String, model: String) {
+    pub(super) fn notify_active_model_selected(
+        &mut self,
+        active: crate::config::providers::ActiveModelRef,
+    ) {
+        let provider = active.provider.clone();
+        let model = active.model.clone();
         self.record_usage(
             crate::daemon::proto::UsageKind::Model,
             format!("{provider}/{model}"),
             None,
         );
-        self.send_daemon_request(
-            "/model",
-            crate::daemon::proto::Request::SetActiveModel { provider, model },
-            ControlApplied::None,
-        );
+        self.send_daemon_request("/model", active_model_request(active), ControlApplied::None);
     }
 
     pub(super) fn cycle_footer_model(&mut self, forward: bool) {
@@ -260,9 +267,10 @@ impl App {
             &self.usage_models,
             forward,
         ) {
-            Ok(Some((provider, model))) => {
-                self.reload_launch_info();
-                self.notify_active_model_selected(provider.clone(), model.clone());
+            Ok(Some(active)) => {
+                let provider = active.provider.clone();
+                let model = active.model.clone();
+                self.notify_active_model_selected(active);
                 self.push_plain(format!("/model: active model is now {provider}/{model} ★"));
             }
             Ok(None) => {
@@ -358,10 +366,12 @@ impl App {
             );
             self.send_daemon_request(
                 "/quick",
-                crate::daemon::proto::Request::SetActiveModel {
+                active_model_request(crate::config::providers::ActiveModelRef {
                     provider: provider.clone(),
                     model: model.clone(),
-                },
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                }),
                 ControlApplied::QuickActiveModel { provider, model },
             );
         }
@@ -481,7 +491,6 @@ impl App {
                 );
             }
             ControlApplied::QuickActiveModel { provider, model } => {
-                self.launch.active_model = Some((provider.clone(), model.clone()));
                 self.push_plain(format!("/quick: active model is now {provider}/{model}"));
             }
             ControlApplied::ScheduleCancel { command, job_id } => {
@@ -539,5 +548,20 @@ impl App {
     pub(super) fn fresh_dialog_lockout(&mut self) -> Duration {
         self.composer_active_since_dialog = false;
         Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms)
+    }
+}
+
+fn active_model_request(
+    active: crate::config::providers::ActiveModelRef,
+) -> crate::daemon::proto::Request {
+    crate::daemon::proto::Request::SetActiveModel {
+        provider: active.provider,
+        model: active.model,
+        reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
+        thinking_mode: active.thinking_mode.and_then(|mode| {
+            serde_json::to_value(mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+        }),
     }
 }

@@ -8,13 +8,14 @@
 //! If the chosen model carries rich reasoning-effort capabilities, a
 //! follow-up "level" picker appears using the provider-native values. Legacy
 //! `thinking_modes` still get their original `off` / `low` / `medium` /
-//! `high` picker. The result is written to `active_model` in config.json.
+//! `high` picker. The result is sent to the daemon, which owns the active
+//! model transaction and config write.
 //!
 //! The dialog is independent of `tui/settings.rs` to keep that file's
 //! state machine focused on settings editing.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -25,7 +26,6 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::config::dirs::{
     COCKPIT_CONFIG_ENV, config_file_paths_for_load, config_write_target_for_provider,
-    most_specific_config_write_target,
 };
 use crate::config::providers::{
     ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry, ProviderEntry,
@@ -47,7 +47,6 @@ const PICK_FIXED_CHROME: usize = 2;
 const PICK_ERROR_LINES: usize = 2;
 
 pub struct ModelPickerDialog {
-    cwd: PathBuf,
     cfg: ProvidersConfig,
     entries: Vec<Entry>,
     active_model: Option<(String, String)>,
@@ -243,7 +242,6 @@ impl ModelPickerDialog {
             initial_pick_position(&entries, active_model.as_ref(), "", MODEL_WINDOW);
 
         Ok(Self {
-            cwd: cwd.to_path_buf(),
             cfg,
             entries,
             active_model,
@@ -471,34 +469,18 @@ impl ModelPickerDialog {
         reasoning_effort: Option<ActiveReasoningEffort>,
         thinking_mode: Option<ThinkingMode>,
     ) -> bool {
-        let previous = self.cfg.active_model.clone();
         self.cfg.active_model = Some(ActiveModelRef {
             provider: provider_id,
             model: model_id,
             reasoning_effort,
             thinking_mode,
         });
-        if let Err(e) = self.save() {
-            self.cfg.active_model = previous;
-            self.error = Some(format!("save failed: {e}"));
-            self.done = false;
-            return false;
-        }
         self.done = true;
         true
     }
 
-    fn save(&mut self) -> Result<(), String> {
-        let Some(active) = self.cfg.active_model.clone() else {
-            return Ok(());
-        };
-        let path = config_write_target_for_provider(&self.cwd, &active.provider)
-            .or_else(|| most_specific_config_write_target(&self.cwd))
-            .ok_or_else(|| "no cockpit config found — run `/settings` to create one".to_string())?;
-        let mut doc = ConfigDoc::load(&path).map_err(|e| e.to_string())?;
-        doc.write_active_model(Some(&active))
-            .map_err(|e| e.to_string())?;
-        Ok(())
+    pub fn selected_active_model(&self) -> Option<ActiveModelRef> {
+        self.done.then(|| self.cfg.active_model.clone()).flatten()
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -913,7 +895,7 @@ pub fn cycle_active_favorite(
     cwd: &Path,
     counts: &HashMap<String, u64>,
     forward: bool,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<ActiveModelRef>, String> {
     ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
     let cfg = crate::secret_ref::load_effective(cwd);
     let active = cfg
@@ -958,13 +940,7 @@ pub fn cycle_active_favorite(
         reasoning_effort: None,
         thinking_mode: None,
     };
-    let path = config_write_target_for_provider(cwd, &active.provider)
-        .or_else(|| most_specific_config_write_target(cwd))
-        .ok_or_else(|| "no cockpit config found — run `/settings` to create one".to_string())?;
-    let mut doc = ConfigDoc::load(&path).map_err(|e| e.to_string())?;
-    doc.write_active_model(Some(&active))
-        .map_err(|e| e.to_string())?;
-    Ok(Some((active.provider, active.model)))
+    Ok(Some(active))
 }
 
 fn ensure_config_reachable(cwd: &Path) -> Result<(), String> {
@@ -1002,7 +978,6 @@ mod tests {
     fn empty_dialog() -> ModelPickerDialog {
         // Build a dialog with no entries — exercises only key routing.
         ModelPickerDialog {
-            cwd: PathBuf::from("/tmp/cockpit.test"),
             cfg: ProvidersConfig::default(),
             entries: Vec::new(),
             active_model: None,
@@ -1112,7 +1087,6 @@ mod tests {
 
     fn dialog_with(entries: Vec<Entry>) -> ModelPickerDialog {
         ModelPickerDialog {
-            cwd: PathBuf::from("/tmp/cockpit.test"),
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
@@ -1125,9 +1099,8 @@ mod tests {
         }
     }
 
-    fn dialog_with_cwd(cwd: PathBuf, entries: Vec<Entry>) -> ModelPickerDialog {
+    fn dialog_with_cwd(_cwd: std::path::PathBuf, entries: Vec<Entry>) -> ModelPickerDialog {
         ModelPickerDialog {
-            cwd,
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
@@ -1286,23 +1259,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_save_keeps_picker_open_with_error() {
+    fn selection_closes_without_writing_config() {
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
-        fs::write(cockpit.join("config.json"), "{not json").unwrap();
+        let config_path = cockpit.join("config.json");
+        fs::write(&config_path, "{not json").unwrap();
         let mut d = dialog_with_cwd(tmp.path().to_path_buf(), vec![entry("a")]);
 
-        assert!(!d.handle_key(press(KeyCode::Enter)));
+        assert!(d.handle_key(press(KeyCode::Enter)));
 
-        assert!(!d.is_done());
-        assert_eq!(d.cfg.active_model, None);
-        let err = d.error.as_deref().unwrap_or_default();
-        assert!(err.contains("save failed"), "got: {err}");
+        assert!(d.is_done());
+        let active = d.selected_active_model().expect("selected active model");
+        assert_eq!(active.provider, "p");
+        assert_eq!(active.model, "a");
+        assert_eq!(d.error, None);
+        assert!(ConfigDoc::load(&config_path).is_err());
     }
 
     #[test]
-    fn successful_save_closes_and_marks_done() {
+    fn successful_selection_closes_and_marks_done() {
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
@@ -1322,10 +1298,11 @@ mod tests {
 
         assert!(d.is_done());
         assert_eq!(d.error, None);
-        let saved = ConfigDoc::load(&config_path).unwrap().providers();
-        let active = saved.active_model.expect("active model persisted");
+        let active = d.selected_active_model().expect("selected active model");
         assert_eq!(active.provider, "p");
         assert_eq!(active.model, "a");
+        let saved = ConfigDoc::load(&config_path).unwrap().providers();
+        assert_eq!(saved.active_model, None);
     }
 
     #[test]
@@ -1356,14 +1333,18 @@ mod tests {
         let next = cycle_active_favorite(tmp.path(), &HashMap::new(), true)
             .unwrap()
             .expect("next favorite");
-        assert_eq!(next, ("p".to_string(), "c".to_string()));
-        let saved = ConfigDoc::load(&config_path).unwrap().providers();
-        assert_eq!(saved.active_model.unwrap().model, "c");
+        assert_eq!(next.provider, "p");
+        assert_eq!(next.model, "c");
+        ConfigDoc::load(&config_path)
+            .unwrap()
+            .write_active_model(Some(&next))
+            .unwrap();
 
         let prev = cycle_active_favorite(tmp.path(), &HashMap::new(), false)
             .unwrap()
             .expect("previous favorite");
-        assert_eq!(prev, ("p".to_string(), "a".to_string()));
+        assert_eq!(prev.provider, "p");
+        assert_eq!(prev.model, "a");
     }
 
     /// The think step is a non-typing list: `j`/`k` (and arrows) navigate
@@ -1430,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_reasoning_selection_persists_native_value() {
+    fn model_picker_commit_preserves_reasoning_and_thinking() {
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
@@ -1449,8 +1430,7 @@ mod tests {
         assert!(!d.handle_key(press(KeyCode::Enter)));
         assert!(d.handle_key(press(KeyCode::Enter)));
 
-        let saved = ConfigDoc::load(&config_path).unwrap().providers();
-        let active = saved.active_model.expect("active model persisted");
+        let active = d.selected_active_model().expect("selected active model");
         assert_eq!(active.provider, "p");
         assert_eq!(active.model, "codex");
         assert_eq!(
@@ -1458,6 +1438,21 @@ mod tests {
             "xhigh"
         );
         assert_eq!(active.thinking_mode, None);
+
+        let mut legacy = entry("legacy");
+        legacy.thinking_modes = vec![ThinkingMode::Off, ThinkingMode::Low, ThinkingMode::High];
+        let mut d = dialog_with_cwd(tmp.path().to_path_buf(), vec![legacy]);
+
+        assert!(!d.handle_key(press(KeyCode::Enter)));
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Down));
+        assert!(d.handle_key(press(KeyCode::Enter)));
+
+        let active = d.selected_active_model().expect("selected active model");
+        assert_eq!(active.provider, "p");
+        assert_eq!(active.model, "legacy");
+        assert_eq!(active.reasoning_effort, None);
+        assert_eq!(active.thinking_mode, Some(ThinkingMode::High));
     }
 
     #[test]
@@ -1488,8 +1483,7 @@ mod tests {
             Step::Pick => {}
             _ => panic!("fallback model should not open a reasoning step"),
         }
-        let saved = ConfigDoc::load(&config_path).unwrap().providers();
-        let active = saved.active_model.expect("active model persisted");
+        let active = d.selected_active_model().expect("selected active model");
         assert_eq!(active.reasoning_effort, None);
         assert_eq!(active.thinking_mode, None);
     }
@@ -1499,7 +1493,6 @@ mod tests {
         let (cursor, scroll) =
             initial_pick_position(&entries, active_model.as_ref(), "", MODEL_WINDOW);
         ModelPickerDialog {
-            cwd: PathBuf::from("/tmp/cockpit.test"),
             cfg: ProvidersConfig::default(),
             entries,
             active_model,

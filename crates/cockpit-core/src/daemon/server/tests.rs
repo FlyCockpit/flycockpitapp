@@ -1796,7 +1796,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn dispatch_matrix_mutating_cases_traverse_socket_path() {
+    async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
         assert_dispatch_matrix_coverage_complete();
         for case in mutating_dispatch_happy_cases() {
             assert_mutating_happy_socket_case(case).await;
@@ -2332,6 +2332,8 @@ mod tests {
             "set_active_model" => Request::SetActiveModel {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
             },
             "set_agent" => Request::SetAgent {
                 name: "Build".into(),
@@ -3299,6 +3301,8 @@ mod tests {
             "set_active_model" => Request::SetActiveModel {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
             },
             "set_agent" => Request::SetAgent {
                 name: "Build".into(),
@@ -3439,9 +3443,19 @@ mod tests {
                         assert_eq!(interrupt_id, Uuid::from_u128(2));
                         assert!(matches!(response, proto::ResolveResponse::Cancel));
                     }
-                    ("set_active_model", SessionWork::SetActiveModel { provider, model }) => {
+                    (
+                        "set_active_model",
+                        SessionWork::SetActiveModel {
+                            provider,
+                            model,
+                            reasoning_effort,
+                            thinking_mode,
+                        },
+                    ) => {
                         assert_eq!(provider, "openai");
                         assert_eq!(model, "gpt-5");
+                        assert_eq!(reasoning_effort, None);
+                        assert_eq!(thinking_mode, None);
                     }
                     ("set_agent", SessionWork::SetAgent { name }) => {
                         assert_eq!(name, "Build");
@@ -3542,6 +3556,8 @@ mod tests {
             "set_active_model" => Request::SetActiveModel {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
             },
             "set_agent" => Request::SetAgent {
                 name: "Build".into(),
@@ -5073,6 +5089,8 @@ mod tests {
                 request: Request::SetActiveModel {
                     provider: "openai".into(),
                     model: "gpt".into(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
                 },
                 kind: "set_active_model",
                 session_id: Some(attached_session_id),
@@ -7145,7 +7163,16 @@ mod tests {
         .await
         .expect("attach resolves the injected model without reading live config");
         match response {
-            Response::Attached { .. } => {}
+            Response::Attached {
+                active_model_state: Some(active),
+                ..
+            } => {
+                assert_eq!(active.provider, "lmstudio");
+                assert_eq!(active.model, "injected-model");
+                assert_eq!(active.config_provider.as_deref(), Some("lmstudio"));
+                assert_eq!(active.config_model.as_deref(), Some("injected-model"));
+                assert!(!active.diverged);
+            }
             other => panic!("expected Attached, got {other:?}"),
         }
 

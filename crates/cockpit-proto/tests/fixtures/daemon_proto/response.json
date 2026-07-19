@@ -32,6 +32,14 @@
         "parent": "Build",
         "task_call_id": "task-1"
       },
+      "active_model_state": {
+        "config_model": "model-fixture",
+        "config_provider": "provider-fixture",
+        "diverged": false,
+        "generation": 0,
+        "model": "model-fixture",
+        "provider": "provider-fixture"
+      },
       "compatible": true,
       "daemon_version": "daemon_version-fixture",
       "env_baseline": {

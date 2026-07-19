@@ -190,6 +190,7 @@ mod tests {
             session_short_id: None,
             provider_line: "anthropic / claude".to_string(),
             active_model: None,
+            active_model_diverged: false,
             active_model_is_favorite: false,
             active_model_is_trusted: false,
             active_model_max_context: None,

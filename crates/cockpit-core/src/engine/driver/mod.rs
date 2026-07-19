@@ -151,9 +151,14 @@ pub enum DriverControl {
     /// model. Breaking the prompt cache is expected (new model = new cache
     /// key). On an unconfigured/bad target it **fails loudly** via
     /// [`TurnEvent::Notice`] and keeps the current model active (never a silent
-    /// no-op). The session's persisted active-model row is updated only on a
-    /// successful build, so config + live routing never diverge.
-    SetActiveModel { provider: String, model: String },
+    /// no-op). The daemon-owned transaction writes the session row and config
+    /// after a successful build; failures restore the prior live model.
+    SetActiveModel {
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+        thinking_mode: Option<String>,
+    },
     /// Set the session's model-comparison tandem (shadow) set
     /// (`/model-comparison`, implementation note).
     /// The session worker builds a [`Model`](crate::engine::model::Model) for
@@ -539,6 +544,7 @@ pub struct Driver {
     /// every turn start, so identical config errors warn every time but produce
     /// only one transcript notice until a success clears the dedupe key.
     active_model_refresh_failure_notice: Option<String>,
+    active_model_state_generation: u64,
     current_lifecycle_turn_id: Option<String>,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
     /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
@@ -681,6 +687,10 @@ pub struct Driver {
     /// test machine's on-disk config layers. Never set in production.
     #[cfg(test)]
     test_providers_override: Option<(crate::config::providers::ProvidersConfig, String, String)>,
+    #[cfg(test)]
+    test_fail_next_active_model_session_persist: bool,
+    #[cfg(test)]
+    test_fail_next_active_model_config_write: bool,
     /// Hermetic compact-utility inference seam. Tests capture invocation mode,
     /// prompt, and revision history without opening a socket.
     #[cfg(test)]
@@ -1120,6 +1130,7 @@ impl Driver {
             delegation_recursion_override: self.delegation_recursion_override,
             preflight_guard_logged: self.preflight_guard_logged,
             active_model_refresh_failure_notice: self.active_model_refresh_failure_notice.clone(),
+            active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
             approver: self.approver.clone(),
@@ -1138,6 +1149,11 @@ impl Driver {
             tandem_set: self.tandem_set.clone(),
             #[cfg(test)]
             test_providers_override: self.test_providers_override.clone(),
+            #[cfg(test)]
+            test_fail_next_active_model_session_persist: self
+                .test_fail_next_active_model_session_persist,
+            #[cfg(test)]
+            test_fail_next_active_model_config_write: self.test_fail_next_active_model_config_write,
             #[cfg(test)]
             test_compact_brief_calls: self.test_compact_brief_calls.clone(),
             redaction_scan_environment_override: self.redaction_scan_environment_override,
@@ -1401,6 +1417,7 @@ impl Driver {
             delegation_recursion_override: None,
             preflight_guard_logged: false,
             active_model_refresh_failure_notice: None,
+            active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             approver: None,
@@ -1419,6 +1436,10 @@ impl Driver {
             tandem_set: crate::engine::schedule::TandemSet::default(),
             #[cfg(test)]
             test_providers_override: None,
+            #[cfg(test)]
+            test_fail_next_active_model_session_persist: false,
+            #[cfg(test)]
+            test_fail_next_active_model_config_write: false,
             #[cfg(test)]
             test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             redaction_scan_environment_override: None,
@@ -2880,8 +2901,14 @@ impl Driver {
             DriverControl::SetMaxPrimaryRounds { max_rounds } => {
                 self.set_max_primary_rounds(max_rounds);
             }
-            DriverControl::SetActiveModel { provider, model } => {
-                self.set_active_model_live(&provider, &model, tx).await;
+            DriverControl::SetActiveModel {
+                provider,
+                model,
+                reasoning_effort,
+                thinking_mode,
+            } => {
+                self.set_active_model_live(&provider, &model, reasoning_effort, thinking_mode, tx)
+                    .await;
             }
         }
     }

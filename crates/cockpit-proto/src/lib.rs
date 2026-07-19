@@ -880,7 +880,17 @@ pub enum HistoryEntry {
         seq: i64,
         agent: String,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_child_index: Option<i64>,
         tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_server: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_builtin: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_kind: Option<String>,
         original_input: Value,
         wire_input: Value,
         recovery_kind: Option<String>,

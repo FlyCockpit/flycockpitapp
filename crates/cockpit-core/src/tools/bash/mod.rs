@@ -26,7 +26,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::engine::TurnEvent;
-use crate::engine::tool::{ResourceMeta, Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
+use crate::engine::tool::{
+    ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolOutput, ToolOutputSidecar,
+    ToolPresentation, single_line_preview, string_field,
+};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 mod boundary;
@@ -176,6 +179,16 @@ impl Tool for BashTool {
             },
             "required": ["command"]
         }))
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let cmd = string_field(args, "command").unwrap_or_default();
+        ToolPresentation::with_parts(
+            Some("🔧"),
+            self.name(),
+            single_line_preview(&cmd, TOOL_PRESENTATION_SUMMARY_CHARS),
+            cmd,
+        )
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

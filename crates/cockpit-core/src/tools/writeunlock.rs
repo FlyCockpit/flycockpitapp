@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
 pub struct WriteunlockTool;
@@ -61,6 +61,11 @@ impl Tool for WriteunlockTool {
             },
             "required": ["path", "content"]
         }))
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let (summary, full_input) = path_or_readable_args(args);
+        ToolPresentation::with_parts(Some("🔓"), "writeunlock", summary, full_input)
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

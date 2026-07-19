@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::db::session_log::SessionEventKind;
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::ToolFailKind;
-use crate::engine::tool::{ContextUsageSnapshot, ToolCtx};
+use crate::engine::tool::{ContextUsageSnapshot, ToolCtx, ToolPresentation, readable_args};
 use crate::mcp::catalog::SearchHit;
 use crate::mcp::protocol::{
     ToolDescriptor, sanitize_tool_description, sanitize_tool_descriptor, sanitize_tool_name,
@@ -503,10 +503,17 @@ type BuiltinHandler =
 struct BuiltinFunction {
     name: &'static str,
     description: &'static str,
+    presentation: BuiltinPresentation,
     input_schema: fn() -> Value,
     availability: fn(&HostContext) -> Availability,
     check_availability_on_invoke: bool,
     handler: BuiltinHandler,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinPresentation {
+    pub glyph: &'static str,
+    pub label: &'static str,
 }
 
 impl BuiltinFunction {
@@ -517,6 +524,25 @@ impl BuiltinFunction {
             input_schema: (self.input_schema)(),
         })
     }
+}
+
+pub fn builtin_presentations() -> Vec<(&'static str, BuiltinPresentation)> {
+    registry()
+        .into_iter()
+        .map(|func| (func.name, func.presentation))
+        .collect()
+}
+
+pub fn presentation(tool: &str, args: &Value) -> Option<ToolPresentation> {
+    let func = registry().into_iter().find(|func| func.name == tool)?;
+    let display_args = args.get("args").unwrap_or(args);
+    let (summary, full_input) = readable_args(display_args);
+    Some(ToolPresentation::with_parts(
+        Some(func.presentation.glyph),
+        func.presentation.label,
+        summary,
+        full_input,
+    ))
 }
 
 pub fn is_builtin_server(server: &str) -> bool {
@@ -587,6 +613,10 @@ fn registry() -> Vec<BuiltinFunction> {
         BuiltinFunction {
             name: "rename_session",
             description: "Set an auto-generated session title when this session needs one",
+            presentation: BuiltinPresentation {
+                glyph: "🏷️",
+                label: "rename_session",
+            },
             input_schema: rename_session_schema,
             availability: rename_session_availability,
             check_availability_on_invoke: false,
@@ -595,6 +625,10 @@ fn registry() -> Vec<BuiltinFunction> {
         BuiltinFunction {
             name: "request_compact",
             description: "Schedule compaction of the root context at the next safe boundary",
+            presentation: BuiltinPresentation {
+                glyph: "🧹",
+                label: "request_compact",
+            },
             input_schema: empty_object_schema,
             availability: |_ctx| Availability::available(),
             check_availability_on_invoke: true,
@@ -603,6 +637,10 @@ fn registry() -> Vec<BuiltinFunction> {
         BuiltinFunction {
             name: "context_usage",
             description: "Return the turn-start context-pressure snapshot for this agent frame",
+            presentation: BuiltinPresentation {
+                glyph: "📊",
+                label: "context_usage",
+            },
             input_schema: empty_object_schema,
             availability: |_ctx| Availability::available(),
             check_availability_on_invoke: true,
@@ -753,6 +791,10 @@ fn register_test_builtin(funcs: &mut Vec<BuiltinFunction>) {
     funcs.push(BuiltinFunction {
         name: "test_count",
         description: "Count test values",
+        presentation: BuiltinPresentation {
+            glyph: "🧪",
+            label: "test_count",
+        },
         input_schema: || {
             serde_json::json!({
                 "type": "object",

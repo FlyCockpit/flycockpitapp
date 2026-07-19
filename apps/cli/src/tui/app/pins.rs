@@ -818,6 +818,7 @@ mod tests {
                 result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
+                mcp_child: None,
             }],
             view_offset: 0,
             follow: true,

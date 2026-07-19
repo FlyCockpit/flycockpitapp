@@ -425,7 +425,19 @@ fn history_snapshot_from_events_conn(
                             seq: ev.seq,
                             agent: tc.agent.clone(),
                             call_id: call_id.to_string(),
+                            parent_call_id: tc.parent_call_id.clone(),
+                            parent_child_index: tc.parent_child_index,
                             tool: tc.tool.clone(),
+                            mcp_server: tc.mcp_server.clone(),
+                            mcp_builtin: ev
+                                .data
+                                .get("mcp_builtin")
+                                .and_then(serde_json::Value::as_bool),
+                            mcp_kind: ev
+                                .data
+                                .get("mcp_kind")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
                             original_input: tc.original_input_json.clone(),
                             wire_input: tc.wire_input_json.clone(),
                             recovery_kind: recovery_kind.map(|s| s.into_owned()),
@@ -466,7 +478,30 @@ fn history_snapshot_from_events_conn(
                             seq: ev.seq,
                             agent: ev.agent.clone().unwrap_or_default(),
                             call_id: call_id.to_string(),
+                            parent_call_id: ev
+                                .data
+                                .get("parent_call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            parent_child_index: ev
+                                .data
+                                .get("parent_child_index")
+                                .and_then(serde_json::Value::as_i64),
                             tool,
+                            mcp_server: ev
+                                .data
+                                .get("mcp_server")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            mcp_builtin: ev
+                                .data
+                                .get("mcp_builtin")
+                                .and_then(serde_json::Value::as_bool),
+                            mcp_kind: ev
+                                .data
+                                .get("mcp_kind")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
                             original_input,
                             wire_input,
                             recovery_kind: None,
@@ -684,7 +719,19 @@ pub fn subagent_history_snapshot_conn(
                             seq: ev.seq,
                             agent: tc.agent.clone(),
                             call_id: call_id.to_string(),
+                            parent_call_id: tc.parent_call_id.clone(),
+                            parent_child_index: tc.parent_child_index,
                             tool: tc.tool.clone(),
+                            mcp_server: tc.mcp_server.clone(),
+                            mcp_builtin: ev
+                                .data
+                                .get("mcp_builtin")
+                                .and_then(serde_json::Value::as_bool),
+                            mcp_kind: ev
+                                .data
+                                .get("mcp_kind")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
                             original_input: tc.original_input_json.clone(),
                             wire_input: tc.wire_input_json.clone(),
                             recovery_kind: recovery_kind.map(|s| s.into_owned()),
@@ -723,7 +770,30 @@ pub fn subagent_history_snapshot_conn(
                             seq: ev.seq,
                             agent: ev.agent.clone().unwrap_or_default(),
                             call_id: call_id.to_string(),
+                            parent_call_id: ev
+                                .data
+                                .get("parent_call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            parent_child_index: ev
+                                .data
+                                .get("parent_child_index")
+                                .and_then(serde_json::Value::as_i64),
                             tool,
+                            mcp_server: ev
+                                .data
+                                .get("mcp_server")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            mcp_builtin: ev
+                                .data
+                                .get("mcp_builtin")
+                                .and_then(serde_json::Value::as_bool),
+                            mcp_kind: ev
+                                .data
+                                .get("mcp_kind")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
                             original_input,
                             wire_input,
                             recovery_kind: None,

@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::ops::Range;
 
 use crate::db::tool_calls::Recovery;
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
 pub struct EditunlockTool;
@@ -84,6 +84,11 @@ impl Tool for EditunlockTool {
             },
             "required": ["path", "old_string", "new_string"]
         }))
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let (summary, full_input) = path_or_readable_args(args);
+        ToolPresentation::with_parts(Some("🔓"), "editunlock", summary, full_input)
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

@@ -11,7 +11,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::config::extended::{WebConfig, WebProvider};
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{
+    TOOL_PRESENTATION_FULL_CHARS, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolOutput,
+    ToolPresentation, bounded_preview, invalid_input, readable_args, single_line_preview,
+    string_field,
+};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 use crate::tools::custom::{CustomBashTool, ToolTemplateProvenance, WEBFETCH, WEBSEARCH};
 
@@ -245,6 +249,16 @@ impl Tool for WebSearchTool {
         }))
     }
 
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let query = string_field(args, "query").unwrap_or_else(|| readable_args(args).1);
+        ToolPresentation::with_parts(
+            None,
+            self.name(),
+            single_line_preview(&query, TOOL_PRESENTATION_SUMMARY_CHARS),
+            bounded_preview(&query, TOOL_PRESENTATION_FULL_CHARS),
+        )
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let query = required_non_empty_string(&args, "query")?;
         let limit = search_limit(args.get("limit"));
@@ -320,6 +334,15 @@ impl Tool for WebFetchTool {
             },
             "required": ["url"]
         }))
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        string_field(args, "url")
+            .map(|url| ToolPresentation::with_parts(None, self.name(), url.clone(), url))
+            .unwrap_or_else(|| {
+                let (summary, full_input) = readable_args(args);
+                ToolPresentation::with_parts(None, self.name(), summary, full_input)
+            })
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

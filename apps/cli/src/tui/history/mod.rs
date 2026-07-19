@@ -18,6 +18,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::extended::ThinkingDisplay;
+use crate::engine::tool::ToolPresentation;
 use crate::tui::markdown;
 #[cfg(test)]
 use crate::tui::message_block::wrap_lines_to_width_reserving_first;
@@ -395,6 +396,15 @@ pub enum ToolCallState {
     BadCall,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpChildMeta {
+    pub parent_call_id: String,
+    pub parent_child_index: i64,
+    pub server: Option<String>,
+    pub builtin: Option<bool>,
+    pub kind: Option<String>,
+}
+
 /// One tool call inside a [`HistoryEntry::ToolBox`].
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -419,6 +429,7 @@ pub struct ToolCall {
     /// `hint: <text>` line beneath the command output (wire-vs-user split,
     /// GOALS §14 — this is the user-side surface). `None` when no rule fired.
     pub hint: Option<String>,
+    pub mcp_child: Option<McpChildMeta>,
 }
 
 /// Max tool-call rows a collapsed [`HistoryEntry::ToolBox`] shows
@@ -688,14 +699,24 @@ fn tool_state_str(state: ToolCallState) -> &'static str {
 /// the `/export` transcript: the original (user-facing) input + the
 /// recovery state, never the wire form (GOALS §14).
 fn tool_call_json(c: &ToolCall) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "call_id": c.call_id,
         "tool": c.tool,
         "summary": c.summary,
         "input": c.full_input,
         "output": c.output,
         "state": tool_state_str(c.state),
-    })
+    });
+    if let Some(meta) = &c.mcp_child {
+        value["mcp_child"] = serde_json::json!({
+            "parent_call_id": meta.parent_call_id,
+            "parent_child_index": meta.parent_child_index,
+            "server": meta.server,
+            "builtin": meta.builtin,
+            "kind": meta.kind,
+        });
+    }
+    value
 }
 
 /// Export the live TUI transcript (`App.history`) as an ordered array of
@@ -1115,7 +1136,7 @@ pub fn render_entry(
             // content (the box's sidebar+space is 2 cells wide).
             let avail = tool_summary_budget(tool, width as usize, 2, emojis);
             let mut spans = vec![Span::raw("  ".to_string())];
-            spans.extend(tool_call_spans(
+            spans.extend(tool_line_spans(
                 tool,
                 &truncate(summary, avail),
                 *state,
@@ -2464,24 +2485,99 @@ fn append_subagent_routing_chips(
     }
 }
 
+pub fn resolve_tool_presentation(
+    tool: &str,
+    args: &serde_json::Value,
+    mcp_child: Option<&McpChildMeta>,
+) -> ToolPresentation {
+    if let Some(meta) = mcp_child {
+        if meta.builtin == Some(true)
+            && meta.server.as_deref() == Some(crate::mcp::builtin::BUILTIN_SERVER_ID)
+            && let Some(presentation) = crate::mcp::builtin::presentation(tool, args)
+        {
+            return presentation;
+        }
+        return mcp_child_presentation(tool, args, meta);
+    }
+    crate::engine::tool::known_tool_presentation(tool, args)
+}
+
+fn mcp_child_presentation(
+    tool: &str,
+    args: &serde_json::Value,
+    meta: &McpChildMeta,
+) -> ToolPresentation {
+    let server_tool = meta
+        .server
+        .as_deref()
+        .filter(|server| !server.is_empty())
+        .map(|server| format!("{server}.{tool}"))
+        .unwrap_or_else(|| tool.to_string());
+    let (args_summary, args_full) = crate::engine::tool::readable_args(
+        args.get("args")
+            .filter(|_| meta.kind.as_deref() == Some("invoke"))
+            .unwrap_or(args),
+    );
+    let summary = match meta.kind.as_deref() {
+        Some("cap") => args
+            .get("unrecorded_dispatches")
+            .and_then(serde_json::Value::as_i64)
+            .map(|count| format!("{count} unrecorded MCP dispatches"))
+            .unwrap_or_else(|| "MCP child dispatches truncated".to_string()),
+        Some("search") => {
+            if args_summary.is_empty() {
+                "search".to_string()
+            } else {
+                format!("search {args_summary}")
+            }
+        }
+        Some("describe") => format!("describe {server_tool}"),
+        Some("invoke") if args_summary.is_empty() => server_tool.clone(),
+        Some("invoke") => format!("{server_tool} {args_summary}"),
+        _ if args_summary.is_empty() => server_tool.clone(),
+        _ => format!("{server_tool} {args_summary}"),
+    };
+    let full_input = if args_full.is_empty() {
+        server_tool.clone()
+    } else {
+        format!("{server_tool}\n{args_full}")
+    };
+    ToolPresentation::with_parts(None, "mcp", summary, full_input)
+}
+
 /// `(glyph, label)` for a tool's rendered line. `glyph` is an emoji
 /// padded to a fixed display-column width ([`TOOL_GLYPH_COLUMN`]) when
 /// `emojis` is on, empty otherwise; `label` is the verb shown bold
-/// before the `:`. With emojis on, the lock / unlock emoji conveys the
-/// lock state so the lock variants collapse to the base verb
-/// (`readlock` → `read`); with emojis off the full tool name is kept so
-/// the lock state stays legible.
+/// before the `:`.
 pub fn tool_glyph_label(tool: &str, emojis: bool) -> (String, String) {
-    let (glyph, label): (&str, &str) = match tool {
-        "bash" => ("🔧", "bash"),
-        "read" => ("📖", "read"),
-        "readlock" => ("🔒", if emojis { "read" } else { "readlock" }),
-        "unlock" => ("🔓", "unlock"),
-        "write" => ("📝", "write"),
-        "writeunlock" => ("🔓", if emojis { "write" } else { "writeunlock" }),
-        "edit" => ("📝", "edit"),
-        "editunlock" => ("🔓", if emojis { "edit" } else { "editunlock" }),
-        other => ("", other),
+    let presentation = resolve_tool_presentation(tool, &serde_json::Value::Null, None);
+    format_tool_glyph_label(&presentation, emojis)
+}
+
+fn tool_call_glyph_label(call: &ToolCall, emojis: bool) -> (String, String) {
+    let presentation = resolve_tool_presentation(
+        &call.tool,
+        &serde_json::Value::Null,
+        call.mcp_child.as_ref(),
+    );
+    format_tool_glyph_label(&presentation, emojis)
+}
+
+fn format_tool_glyph_label(presentation: &ToolPresentation, emojis: bool) -> (String, String) {
+    let glyph = presentation.glyph.unwrap_or("");
+    let label = if emojis {
+        if presentation.label == "unlock" {
+            &presentation.label
+        } else {
+            presentation
+                .label
+                .strip_suffix("unlock")
+                .or_else(|| presentation.label.strip_suffix("lock"))
+                .filter(|label| !label.is_empty())
+                .unwrap_or(&presentation.label)
+        }
+    } else {
+        &presentation.label
     };
     let glyph = if emojis && !glyph.is_empty() {
         // Pad to a fixed display width so every label lines up at the
@@ -2518,7 +2614,25 @@ fn tool_uses_read_output_renderer(tool: &str) -> bool {
 
 /// Spans for one tool-call line: `[glyph] label: summary`, the label
 /// bold and the whole line tinted by `state`.
-fn tool_call_spans(
+fn tool_call_spans(call: &ToolCall, text: &str, emojis: bool) -> Vec<Span<'static>> {
+    let (glyph, label) = tool_call_glyph_label(call, emojis);
+    let style = tool_state_style(call.state);
+    let mut spans = Vec::new();
+    if !glyph.is_empty() {
+        spans.push(Span::raw(glyph));
+    }
+    spans.push(Span::styled(
+        format!("{label}:"),
+        style.add_modifier(Modifier::BOLD),
+    ));
+    if !text.is_empty() {
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(text.to_string(), style));
+    }
+    spans
+}
+
+fn tool_line_spans(
     tool: &str,
     text: &str,
     state: ToolCallState,
@@ -2545,6 +2659,12 @@ fn tool_call_spans(
 /// `indent`, the glyph, the bold `label`, and the `": "` separator.
 fn tool_summary_budget(tool: &str, width: usize, indent: usize, emojis: bool) -> usize {
     let (glyph, label) = tool_glyph_label(tool, emojis);
+    let prefix = indent + glyph.width() + label.width() + 2;
+    width.saturating_sub(prefix).max(8)
+}
+
+fn tool_call_summary_budget(call: &ToolCall, width: usize, indent: usize, emojis: bool) -> usize {
+    let (glyph, label) = tool_call_glyph_label(call, emojis);
     let prefix = indent + glyph.width() + label.width() + 2;
     width.saturating_sub(prefix).max(8)
 }
@@ -2701,14 +2821,36 @@ fn render_toolbox(
     let any_expanded = calls.iter().any(|call| call.expanded);
     let call_body_width = (width as usize).saturating_sub(2).max(1);
 
+    let child_count = |parent: &ToolCall| -> usize {
+        calls
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .mcp_child
+                    .as_ref()
+                    .is_some_and(|meta| meta.parent_call_id == parent.call_id)
+            })
+            .count()
+    };
     let render_collapsed_call = |call: &ToolCall| {
-        let budget = tool_summary_budget(&call.tool, width as usize, 2, emojis);
-        let mut spans = tool_call_spans(
-            &call.tool,
-            &truncate(&call.summary, budget),
-            call.state,
-            emojis,
-        );
+        let is_child = call.mcp_child.is_some();
+        let indent = if is_child { 4 } else { 2 };
+        let summary = if call.tool == "mcp" {
+            let count = child_count(call);
+            if count > 0 {
+                format!("{count} MCP dispatch{}", if count == 1 { "" } else { "es" })
+            } else {
+                call.summary.clone()
+            }
+        } else {
+            call.summary.clone()
+        };
+        let budget = tool_call_summary_budget(call, width as usize, indent, emojis);
+        let mut spans = Vec::new();
+        if is_child {
+            spans.push(Span::raw("  ".to_string()));
+        }
+        spans.extend(tool_call_spans(call, &truncate(&summary, budget), emojis));
         if elided.contains(&call.call_id) {
             spans.push(Span::styled(
                 "  (pruned)".to_string(),
@@ -2739,15 +2881,19 @@ fn render_toolbox(
             let is_elided = elided.contains(&call.call_id);
             let input_lines: Vec<&str> = call.full_input.split('\n').collect();
             let first = input_lines.first().copied().unwrap_or("");
-            let mut first_spans = tool_call_spans(&call.tool, first, call.state, emojis);
+            let mut first_spans = tool_call_spans(call, first, emojis);
+            let child_indent = if call.mcp_child.is_some() { 2 } else { 0 };
+            if child_indent > 0 {
+                first_spans.insert(0, Span::raw(" ".repeat(child_indent)));
+            }
             if is_elided {
                 first_spans.push(Span::styled(
                     "  (pruned — superseded by a newer read)".to_string(),
                     Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
                 ));
             }
-            let (glyph, label) = tool_glyph_label(&call.tool, emojis);
-            let label_indent = glyph.width() + label.width() + 2;
+            let (glyph, label) = tool_call_glyph_label(call, emojis);
+            let label_indent = child_indent + glyph.width() + label.width() + 2;
             let input_style = tool_state_style(call.state);
             push_wrapped_toolbox_input_row(
                 &mut content,
@@ -2759,13 +2905,21 @@ fn render_toolbox(
                 input_style,
             );
             for cont in input_lines.iter().skip(1) {
+                let cont_spans = if child_indent > 0 {
+                    vec![
+                        Span::raw(" ".repeat(child_indent)),
+                        Span::styled((*cont).to_string(), input_style),
+                    ]
+                } else {
+                    vec![Span::styled((*cont).to_string(), input_style)]
+                };
                 push_wrapped_toolbox_input_row(
                     &mut content,
                     &mut tool_call_rows,
-                    Line::from(vec![Span::styled((*cont).to_string(), input_style)]),
+                    Line::from(cont_spans),
                     call_index,
                     call_body_width,
-                    0,
+                    child_indent,
                     input_style,
                 );
             }
@@ -2941,6 +3095,7 @@ fn compact_tool_call(
         result_offset,
         state: ToolCallState::Success,
         hint: None,
+        mcp_child: None,
     }
 }
 

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::agent::TurnEvent;
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::locks::AcquireWait;
 use crate::tools::common::resolve;
 use crate::tools::read::ReadOutcome;
@@ -63,6 +63,11 @@ impl Tool for ReadlockTool {
             },
             "required": ["path"]
         }))
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let (summary, full_input) = path_or_readable_args(args);
+        ToolPresentation::with_parts(Some("🔒"), "readlock", summary, full_input)
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

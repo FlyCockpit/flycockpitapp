@@ -74,6 +74,111 @@ pub enum ToolEffect {
     Dynamic,
 }
 
+pub const TOOL_PRESENTATION_SUMMARY_CHARS: usize = 240;
+pub const TOOL_PRESENTATION_FULL_CHARS: usize = 2_000;
+
+/// Display-neutral tool-call presentation.
+///
+/// Core owns the semantic choice of label, glyph key, and argument summary.
+/// TUI code maps these plain strings onto terminal spans, colors, widths, and
+/// glyph padding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPresentation {
+    pub glyph: Option<&'static str>,
+    pub label: String,
+    pub summary: String,
+    pub full_input: String,
+}
+
+impl ToolPresentation {
+    pub fn default_for(tool: &str, args: &Value) -> Self {
+        let (summary, full_input) = readable_args(args);
+        Self {
+            glyph: None,
+            label: tool.to_string(),
+            summary,
+            full_input,
+        }
+    }
+
+    pub fn with_parts(
+        glyph: Option<&'static str>,
+        label: impl Into<String>,
+        summary: impl Into<String>,
+        full_input: impl Into<String>,
+    ) -> Self {
+        Self {
+            glyph,
+            label: label.into(),
+            summary: summary.into(),
+            full_input: full_input.into(),
+        }
+    }
+}
+
+pub fn readable_args(args: &Value) -> (String, String) {
+    (
+        crate::text::format_args(
+            args,
+            crate::text::ArgFormatOptions::history(TOOL_PRESENTATION_SUMMARY_CHARS, false),
+        ),
+        crate::text::format_args(
+            args,
+            crate::text::ArgFormatOptions::history(TOOL_PRESENTATION_FULL_CHARS, true),
+        ),
+    )
+}
+
+pub fn path_or_readable_args(args: &Value) -> (String, String) {
+    string_field(args, "path")
+        .map(|path| (path.clone(), path))
+        .unwrap_or_else(|| readable_args(args))
+}
+
+pub fn string_field(args: &Value, key: &str) -> Option<String> {
+    args.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+pub fn single_line_preview(s: &str, limit: usize) -> String {
+    let mut first = s.lines().next().unwrap_or("").to_string();
+    if s.contains('\n') {
+        first.push_str(" …");
+    }
+    bounded_preview(&first, limit)
+}
+
+pub fn bounded_preview(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        return s.to_string();
+    }
+    let take = limit.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
+pub fn known_tool_presentation(tool: &str, args: &Value) -> ToolPresentation {
+    use crate::tools;
+    match tool {
+        "bash" => tools::bash::BashTool::new().presentation(args),
+        "read" => tools::read::ReadTool.presentation(args),
+        "readlock" => tools::readlock::ReadlockTool.presentation(args),
+        "unlock" => tools::unlock::UnlockTool.presentation(args),
+        "writeunlock" => tools::writeunlock::WriteunlockTool.presentation(args),
+        "editunlock" => tools::editunlock::EditunlockTool.presentation(args),
+        "websearch" => tools::web::WebSearchTool.presentation(args),
+        "webfetch" => tools::web::WebFetchTool.presentation(args),
+        // Legacy restored rows may carry the pre-unlock display names. They
+        // are not current Tool implementors, so keep their old presentation
+        // through the same display-neutral data path.
+        "write" | "edit" => {
+            let (summary, full_input) = path_or_readable_args(args);
+            ToolPresentation::with_parts(Some("📝"), tool, summary, full_input)
+        }
+        _ => ToolPresentation::default_for(tool, args),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewCage {
     state: Arc<Mutex<ReviewCageState>>,
@@ -229,6 +334,10 @@ pub trait Tool: Send + Sync {
     /// proven read-only by that tool's own policy.
     fn effect(&self) -> ToolEffect {
         ToolEffect::Dynamic
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        ToolPresentation::default_for(self.name(), args)
     }
 
     /// JSON Schema for the arguments. Returning `Value::Null` means "no
@@ -1596,5 +1705,64 @@ mod llm_mode_tests {
         }
 
         assert_eq!(Unknown.effect(), ToolEffect::Dynamic);
+    }
+
+    #[test]
+    fn presentation_seam_has_a_default() {
+        struct DefaultPresentationTool;
+        #[async_trait]
+        impl Tool for DefaultPresentationTool {
+            fn name(&self) -> &str {
+                "plain"
+            }
+
+            fn description(&self) -> &str {
+                "plain test tool"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+
+            async fn call(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        struct CustomPresentationTool;
+        #[async_trait]
+        impl Tool for CustomPresentationTool {
+            fn name(&self) -> &str {
+                "custom"
+            }
+
+            fn description(&self) -> &str {
+                "custom test tool"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+
+            fn presentation(&self, args: &serde_json::Value) -> ToolPresentation {
+                let (summary, full_input) = readable_args(args);
+                ToolPresentation::with_parts(Some("★"), "custom_label", summary, full_input)
+            }
+
+            async fn call(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        let args = serde_json::json!({ "path": "src/lib.rs" });
+        let default = DefaultPresentationTool.presentation(&args);
+        assert_eq!(default.glyph, None);
+        assert_eq!(default.label, "plain");
+        assert_eq!(default.summary, "path=\"src/lib.rs\"");
+
+        let custom = CustomPresentationTool.presentation(&args);
+        assert_eq!(custom.glyph, Some("★"));
+        assert_eq!(custom.label, "custom_label");
+        assert_eq!(custom.summary, "path=\"src/lib.rs\"");
     }
 }

@@ -167,6 +167,7 @@ fn user_typed_skill_row_is_distinct_no_injected_label() {
             result_offset: 0,
             state: crate::tui::history::ToolCallState::Success,
             hint: None,
+            mcp_child: None,
         }],
         view_offset: 0,
         follow: true,

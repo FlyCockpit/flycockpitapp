@@ -470,7 +470,9 @@ impl App {
                     self.pending_edit_args.insert(call_id, captured);
                     return;
                 }
-                let (summary, full_input) = tool_invocation(&tool, &args);
+                let mcp_child = mcp_child_meta_from_args(&args);
+                let (summary, full_input) =
+                    tool_invocation_with_meta(&tool, &args, mcp_child.as_ref());
                 // Write tools are conceptually diffs too — render them as
                 // a standalone line that breaks the box (no diff body
                 // until the engine surfaces pre-write content).
@@ -489,11 +491,12 @@ impl App {
                     summary,
                     full_input,
                     output: String::new(),
-                    expanded: false,
+                    expanded: mcp_child_expanded_by_default(mcp_child.as_ref()),
                     result_offset: 0,
                     state: ToolCallState::Processing,
                     // Populated at ToolEnd from the engine's `hint` field.
                     hint: None,
+                    mcp_child,
                 };
                 // Append to the open box (a run of consecutive boxable
                 // calls), or start a new one. Anything non-boxable
@@ -1640,64 +1643,62 @@ fn is_write_tool(tool: &str) -> bool {
     matches!(tool, "write" | "writeunlock")
 }
 
-const TOOL_ARG_SUMMARY_CHARS: usize = 240;
-const TOOL_ARG_FULL_CHARS: usize = 2_000;
+#[cfg(test)]
+const TOOL_ARG_SUMMARY_CHARS: usize = crate::engine::tool::TOOL_PRESENTATION_SUMMARY_CHARS;
 
 /// `(collapsed_summary, full_input)` for a tool call. The summary is a
 /// single line (path, first line of a command, URL); `full_input` is the
 /// complete invocation text shown when a box is expanded.
+#[cfg(test)]
 pub(super) fn tool_invocation(tool: &str, args: &serde_json::Value) -> (String, String) {
-    let field = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    match tool {
-        "bash" => {
-            let cmd = field("command").unwrap_or_default();
-            let first = cmd.lines().next().unwrap_or("").to_string();
-            let summary = if cmd.contains('\n') {
-                format!("{first} …")
-            } else {
-                first
-            };
-            (summary, cmd)
-        }
-        "read" | "readlock" | "unlock" | "write" | "writeunlock" | "edit" | "editunlock" => {
-            if let Some(path) = field("path") {
-                (path.clone(), path)
-            } else {
-                readable_args(args)
-            }
-        }
-        "webfetch" => {
-            if let Some(url) = field("url") {
-                (url.clone(), url)
-            } else {
-                readable_args(args)
-            }
-        }
-        "websearch" => {
-            let q = field("query").unwrap_or_else(|| readable_args(args).1);
-            (
-                single_line_preview(&q, TOOL_ARG_SUMMARY_CHARS),
-                bounded_preview(&q, TOOL_ARG_FULL_CHARS),
-            )
-        }
-        _ => {
-            let (summary, full) = readable_args(args);
-            (summary, full)
-        }
-    }
+    let meta = mcp_child_meta_from_args(args);
+    tool_invocation_with_meta(tool, args, meta.as_ref())
 }
 
-fn readable_args(args: &serde_json::Value) -> (String, String) {
-    (
-        crate::text::format_args(
-            args,
-            crate::text::ArgFormatOptions::history(TOOL_ARG_SUMMARY_CHARS, false),
-        ),
-        crate::text::format_args(
-            args,
-            crate::text::ArgFormatOptions::history(TOOL_ARG_FULL_CHARS, true),
-        ),
+fn tool_invocation_with_meta(
+    tool: &str,
+    args: &serde_json::Value,
+    meta: Option<&crate::tui::history::McpChildMeta>,
+) -> (String, String) {
+    let presentation = crate::tui::history::resolve_tool_presentation(tool, args, meta);
+    (presentation.summary, presentation.full_input)
+}
+
+fn mcp_child_meta_from_args(args: &serde_json::Value) -> Option<crate::tui::history::McpChildMeta> {
+    mcp_child_meta_from_fields(
+        args.get("parent_call_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        args.get("parent_child_index")
+            .and_then(serde_json::Value::as_i64),
+        args.get("mcp_server")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        args.get("mcp_builtin").and_then(serde_json::Value::as_bool),
+        args.get("mcp_kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     )
+}
+
+fn mcp_child_meta_from_fields(
+    parent_call_id: Option<String>,
+    parent_child_index: Option<i64>,
+    server: Option<String>,
+    builtin: Option<bool>,
+    kind: Option<String>,
+) -> Option<crate::tui::history::McpChildMeta> {
+    Some(crate::tui::history::McpChildMeta {
+        parent_call_id: parent_call_id?,
+        parent_child_index: parent_child_index?,
+        server,
+        builtin,
+        kind,
+    })
+}
+
+fn mcp_child_expanded_by_default(meta: Option<&crate::tui::history::McpChildMeta>) -> bool {
+    meta.is_some_and(|meta| meta.kind.as_deref() == Some("invoke"))
 }
 
 #[cfg(test)]
@@ -1706,24 +1707,6 @@ fn readable_arg_value(value: &serde_json::Value, limit: usize, multiline: bool) 
         value,
         crate::text::ArgFormatOptions::history(limit, multiline),
     )
-}
-
-fn single_line_preview(s: &str, limit: usize) -> String {
-    let mut first = s.lines().next().unwrap_or("").to_string();
-    if s.contains('\n') {
-        first.push_str(" …");
-    }
-    bounded_preview(&first, limit)
-}
-
-fn bounded_preview(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        return s.to_string();
-    }
-    let take = limit.saturating_sub(1);
-    let mut out: String = s.chars().take(take).collect();
-    out.push('…');
-    out
 }
 
 fn extract_edit_args(args: &serde_json::Value) -> Option<PendingEditArgs> {
@@ -1766,6 +1749,8 @@ pub(super) fn wire_history_to_entries(
 ) -> Vec<HistoryEntry> {
     use crate::daemon::proto::HistoryEntry as Wire;
     let mut out: Vec<HistoryEntry> = Vec::new();
+    let mut pending_mcp_children: std::collections::BTreeMap<String, Vec<ToolCall>> =
+        std::collections::BTreeMap::new();
     for entry in wire {
         match entry {
             Wire::InterruptDecision { decision, .. } => {
@@ -1834,7 +1819,12 @@ pub(super) fn wire_history_to_entries(
             }
             Wire::ToolCall {
                 call_id,
+                parent_call_id,
+                parent_child_index,
                 tool,
+                mcp_server,
+                mcp_builtin,
+                mcp_kind,
                 original_input,
                 output,
                 hard_fail,
@@ -1842,10 +1832,18 @@ pub(super) fn wire_history_to_entries(
                 ..
             } => {
                 let state = restored_tool_state(hard_fail);
+                let mcp_child = mcp_child_meta_from_fields(
+                    parent_call_id,
+                    parent_child_index,
+                    mcp_server,
+                    mcp_builtin,
+                    mcp_kind,
+                );
                 // The user transcript renders the original (pre-repair) input
                 // (GOALS §14); the same `tool_invocation` the live path uses
                 // builds the collapsed summary + expanded body.
-                let (summary, full_input) = tool_invocation(&tool, &original_input);
+                let (summary, full_input) =
+                    tool_invocation_with_meta(&tool, &original_input, mcp_child.as_ref());
 
                 // Edit tools render as a diff (breaks the box), exactly like the
                 // live `ToolStart`+`ToolEnd` pair. When the original args don't
@@ -1878,29 +1876,37 @@ pub(super) fn wire_history_to_entries(
                     summary,
                     full_input,
                     output,
-                    expanded: false,
+                    expanded: mcp_child_expanded_by_default(mcp_child.as_ref()),
                     result_offset: 0,
                     state,
                     hint,
+                    mcp_child,
                 };
-                // Coalesce consecutive boxable calls into one `ToolBox`,
-                // matching the live grouping (a non-box entry breaks the run).
-                if let Some(HistoryEntry::ToolBox {
-                    calls,
-                    view_offset,
-                    follow,
-                    ..
-                }) = out.last_mut()
-                {
-                    calls.push(call);
-                    *view_offset =
-                        crate::tui::history::toolbox_top(calls.len(), *view_offset, *follow);
-                } else {
-                    out.push(HistoryEntry::ToolBox {
-                        calls: vec![call],
-                        view_offset: 0,
-                        follow: true,
+                if let Some(meta) = call.mcp_child.as_ref() {
+                    if attach_mcp_child_call(&mut out, call.clone()) {
+                        continue;
+                    }
+                    pending_mcp_children
+                        .entry(meta.parent_call_id.clone())
+                        .or_default()
+                        .push(call);
+                    continue;
+                }
+                let parent_id = call.call_id.clone();
+                push_boxable_call(&mut out, call);
+                if let Some(mut children) = pending_mcp_children.remove(&parent_id) {
+                    children.sort_by_key(|child| {
+                        child
+                            .mcp_child
+                            .as_ref()
+                            .map(|meta| meta.parent_child_index)
+                            .unwrap_or(i64::MAX)
                     });
+                    for child in children {
+                        if !attach_mcp_child_call(&mut out, child.clone()) {
+                            push_boxable_call(&mut out, child);
+                        }
+                    }
                 }
             }
             Wire::InferenceError {
@@ -1959,7 +1965,81 @@ pub(super) fn wire_history_to_entries(
             }),
         }
     }
+    for (_parent, mut children) in pending_mcp_children {
+        children.sort_by_key(|child| {
+            child
+                .mcp_child
+                .as_ref()
+                .map(|meta| meta.parent_child_index)
+                .unwrap_or(i64::MAX)
+        });
+        for child in children {
+            push_boxable_call(&mut out, child);
+        }
+    }
     out
+}
+
+fn push_boxable_call(out: &mut Vec<HistoryEntry>, call: ToolCall) {
+    if let Some(HistoryEntry::ToolBox {
+        calls,
+        view_offset,
+        follow,
+        ..
+    }) = out.last_mut()
+    {
+        calls.push(call);
+        *view_offset = crate::tui::history::toolbox_top(calls.len(), *view_offset, *follow);
+    } else {
+        out.push(HistoryEntry::ToolBox {
+            calls: vec![call],
+            view_offset: 0,
+            follow: true,
+        });
+    }
+}
+
+fn attach_mcp_child_call(out: &mut [HistoryEntry], child: ToolCall) -> bool {
+    let Some(parent_call_id) = child
+        .mcp_child
+        .as_ref()
+        .map(|meta| meta.parent_call_id.as_str())
+    else {
+        return false;
+    };
+    for entry in out.iter_mut().rev() {
+        let HistoryEntry::ToolBox {
+            calls,
+            view_offset,
+            follow,
+        } = entry
+        else {
+            continue;
+        };
+        let Some(parent_index) = calls
+            .iter()
+            .position(|candidate| candidate.call_id == parent_call_id)
+        else {
+            continue;
+        };
+        let insert_at = calls
+            .iter()
+            .enumerate()
+            .skip(parent_index + 1)
+            .take_while(|(_, candidate)| {
+                candidate
+                    .mcp_child
+                    .as_ref()
+                    .is_some_and(|meta| meta.parent_call_id == parent_call_id)
+            })
+            .map(|(idx, _)| idx + 1)
+            .last()
+            .unwrap_or(parent_index + 1);
+        calls.insert(insert_at, child);
+        *view_offset = crate::tui::history::toolbox_top(calls.len(), *view_offset, *follow);
+        return true;
+    }
+    false
 }
 
 /// Playful "agent is working" lines. The animated, width-3-padded
@@ -2808,5 +2888,172 @@ mod tests {
         assert_eq!(read_multiline_summary, default_multiline_summary);
         assert_eq!(read_multiline_full, default_multiline_full);
         assert!(read_multiline_full.contains('\n'));
+    }
+
+    #[test]
+    fn migrated_tool_summaries_are_byte_identical() {
+        let cases = [
+            (
+                "bash",
+                json!({ "command": "echo one\necho two" }),
+                "echo one …",
+                "echo one\necho two",
+            ),
+            (
+                "read",
+                json!({ "path": "src/lib.rs" }),
+                "src/lib.rs",
+                "src/lib.rs",
+            ),
+            (
+                "write",
+                json!({ "path": "src/lib.rs" }),
+                "src/lib.rs",
+                "src/lib.rs",
+            ),
+            (
+                "edit",
+                json!({ "path": "src/lib.rs" }),
+                "src/lib.rs",
+                "src/lib.rs",
+            ),
+            (
+                "webfetch",
+                json!({ "url": "https://example.com/docs" }),
+                "https://example.com/docs",
+                "https://example.com/docs",
+            ),
+            (
+                "websearch",
+                json!({ "query": "first line\nsecond line" }),
+                "first line …",
+                "first line\nsecond line",
+            ),
+        ];
+
+        for (tool, args, expected_summary, expected_full) in cases {
+            let (summary, full_input) = tool_invocation(tool, &args);
+            assert_eq!(summary, expected_summary, "{tool} summary changed");
+            assert_eq!(full_input, expected_full, "{tool} full input changed");
+        }
+    }
+
+    #[test]
+    fn restored_session_reconstructs_children() {
+        let child = crate::daemon::proto::HistoryEntry::ToolCall {
+            seq: 1,
+            agent: "Build".into(),
+            call_id: "outer:mcp:0".into(),
+            parent_call_id: Some("outer".into()),
+            parent_child_index: Some(0),
+            tool: "rename_session".into(),
+            mcp_server: Some("cockpit".into()),
+            mcp_builtin: Some(true),
+            mcp_kind: Some("invoke".into()),
+            original_input: json!({
+                "server": "cockpit",
+                "tool": "rename_session",
+                "args": { "name": "Test session" }
+            }),
+            wire_input: json!({
+                "server": "cockpit",
+                "tool": "rename_session",
+                "args": { "name": "Test session" }
+            }),
+            recovery_kind: None,
+            recovery_stage: None,
+            output: "{\"renamed\":true}".into(),
+            hard_fail: false,
+            truncated: false,
+            hint: None,
+        };
+        let parent = crate::daemon::proto::HistoryEntry::ToolCall {
+            seq: 2,
+            agent: "Build".into(),
+            call_id: "outer".into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            tool: "mcp".into(),
+            mcp_server: None,
+            mcp_builtin: None,
+            mcp_kind: None,
+            original_input: json!({ "script": "mcp.invoke('cockpit', 'rename_session', {'name': 'Test session'})" }),
+            wire_input: json!({ "script": "mcp.invoke('cockpit', 'rename_session', {'name': 'Test session'})" }),
+            recovery_kind: None,
+            recovery_stage: None,
+            output: "{\"renamed\":true}".into(),
+            hard_fail: false,
+            truncated: false,
+            hint: None,
+        };
+
+        let restored = wire_history_to_entries(vec![child, parent]);
+        let HistoryEntry::ToolBox { calls, .. } = &restored[0] else {
+            panic!("expected toolbox, got {:?}", restored[0]);
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "outer");
+        assert_eq!(calls[1].tool, "rename_session");
+        assert_eq!(
+            calls[1]
+                .mcp_child
+                .as_ref()
+                .map(|meta| meta.parent_call_id.as_str()),
+            Some("outer")
+        );
+
+        let live = HistoryEntry::ToolBox {
+            calls: calls.clone(),
+            view_offset: 0,
+            follow: true,
+        };
+        let restored_lines = crate::tui::history::render_entry(
+            &restored[0],
+            100,
+            crate::config::extended::ThinkingDisplay::Condensed,
+            crate::tui::history::MarkdownOpts::default(),
+            crate::config::extended::DiffStyle::default(),
+            false,
+            &std::collections::HashSet::new(),
+            0,
+            None,
+        )
+        .lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+        let live_lines = crate::tui::history::render_entry(
+            &live,
+            100,
+            crate::config::extended::ThinkingDisplay::Condensed,
+            crate::tui::history::MarkdownOpts::default(),
+            crate::config::extended::DiffStyle::default(),
+            false,
+            &std::collections::HashSet::new(),
+            0,
+            None,
+        )
+        .lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(restored_lines, live_lines);
+        assert!(
+            restored_lines
+                .iter()
+                .any(|line| line.contains("rename_session: name=\"Test session\"")),
+            "{restored_lines:?}"
+        );
     }
 }

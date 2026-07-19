@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput};
+use crate::engine::tool::{
+    Tool, ToolCtx, ToolEffect, ToolOutput, ToolPresentation, path_or_readable_args,
+};
 use crate::tools::common::{READ_LINE_CAP, looks_binary, read_slice, resolve, truncation_marker};
 
 pub struct ReadTool;
@@ -74,6 +76,11 @@ impl Tool for ReadTool {
             },
             "required": ["path"]
         }))
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let (summary, full_input) = path_or_readable_args(args);
+        ToolPresentation::with_parts(Some("📖"), self.name(), summary, full_input)
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

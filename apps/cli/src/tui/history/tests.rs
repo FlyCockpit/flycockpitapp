@@ -61,6 +61,7 @@ fn export_transcript_is_ordered_user_facing_turns() {
                 result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
+                mcp_child: None,
             }],
             view_offset: 0,
             follow: true,
@@ -1029,13 +1030,461 @@ fn mk_call(tool: &str, summary: &str, state: ToolCallState) -> ToolCall {
         result_offset: 0,
         state,
         hint: None,
+        mcp_child: None,
     }
+}
+
+fn mcp_child_meta(
+    parent_call_id: &str,
+    index: i64,
+    server: Option<&str>,
+    builtin: Option<bool>,
+    kind: &str,
+) -> McpChildMeta {
+    McpChildMeta {
+        parent_call_id: parent_call_id.to_string(),
+        parent_child_index: index,
+        server: server.map(str::to_string),
+        builtin,
+        kind: Some(kind.to_string()),
+    }
+}
+
+fn child_call(
+    parent_call_id: &str,
+    index: i64,
+    server: Option<&str>,
+    builtin: Option<bool>,
+    kind: &str,
+    tool: &str,
+    args: serde_json::Value,
+    output: &str,
+    state: ToolCallState,
+) -> ToolCall {
+    let meta = mcp_child_meta(parent_call_id, index, server, builtin, kind);
+    let presentation = resolve_tool_presentation(tool, &args, Some(&meta));
+    ToolCall {
+        call_id: format!("{parent_call_id}:mcp:{index}"),
+        tool: tool.to_string(),
+        summary: presentation.summary,
+        full_input: presentation.full_input,
+        output: output.to_string(),
+        expanded: kind == "invoke",
+        result_offset: 0,
+        state,
+        hint: None,
+        mcp_child: Some(meta),
+    }
+}
+
+fn rendered_text(rendered: &Rendered) -> Vec<String> {
+    rendered.lines.iter().map(line_text).collect()
 }
 
 /// No wire-side elisions — the default for tests that don't exercise
 /// the prune-dimming path.
 fn no_elided() -> HashSet<String> {
     HashSet::new()
+}
+
+#[test]
+fn render_toolbox_smoke() {
+    let calls = vec![mk_call("bash", "echo ok", ToolCallState::Success)];
+    let rendered = render_toolbox(&calls, 0, true, 80, false, &no_elided());
+
+    assert_eq!(line_text(&rendered.lines[0]), "│ bash: echo ok");
+}
+
+#[test]
+fn builtin_child_renders_as_first_class_tool_call() {
+    let parent = mk_call("mcp", "script=\"opaque python\"", ToolCallState::Success);
+    let child = child_call(
+        &parent.call_id,
+        0,
+        Some("cockpit"),
+        Some(true),
+        "invoke",
+        "rename_session",
+        serde_json::json!({
+            "server": "cockpit",
+            "tool": "rename_session",
+            "args": { "name": "Test session" }
+        }),
+        "{\"renamed\":true}",
+        ToolCallState::Success,
+    );
+
+    let lines = rendered_text(&render_toolbox(
+        &[parent, child],
+        0,
+        true,
+        100,
+        false,
+        &no_elided(),
+    ));
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("rename_session: name=\"Test session\"")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("mcp: cockpit.rename_session")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn external_child_renders_as_mcp_call() {
+    let parent = mk_call("mcp", "script=\"opaque python\"", ToolCallState::Success);
+    let child = child_call(
+        &parent.call_id,
+        0,
+        Some("github"),
+        Some(false),
+        "invoke",
+        "create_issue",
+        serde_json::json!({
+            "server": "github",
+            "tool": "create_issue",
+            "args": { "title": "Bug" }
+        }),
+        "{\"number\":1234}",
+        ToolCallState::Success,
+    );
+
+    let lines = rendered_text(&render_toolbox(
+        &[parent, child],
+        0,
+        true,
+        100,
+        false,
+        &no_elided(),
+    ));
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("mcp: github.create_issue")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line == "│   title=\"Bug\""),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("create_issue:")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn builtin_functions_have_glyph_and_label_entries() {
+    let presentations = crate::mcp::builtin::builtin_presentations();
+    for name in ["rename_session", "request_compact", "context_usage"] {
+        let Some((_name, presentation)) = presentations
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+        else {
+            panic!("{name} missing from builtin presentation registry");
+        };
+        assert!(!presentation.glyph.is_empty(), "{name} missing glyph");
+        assert_eq!(presentation.label, name);
+    }
+}
+
+#[test]
+fn mcp_call_without_children_renders_as_today() {
+    let call = mk_call(
+        "mcp",
+        "script=\"mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})\"",
+        ToolCallState::Success,
+    );
+
+    let lines = rendered_text(&render_toolbox(&[call], 0, true, 120, false, &no_elided()));
+
+    assert_eq!(
+        lines,
+        vec![
+            "│ mcp: script=\"mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})\""
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn search_and_describe_children_collapse_by_default() {
+    let parent = mk_call("mcp", "script=\"mcp work\"", ToolCallState::Success);
+    let search = child_call(
+        &parent.call_id,
+        0,
+        None,
+        None,
+        "search",
+        "mcp.search",
+        serde_json::json!({ "query": "issues" }),
+        "search output should be hidden",
+        ToolCallState::Success,
+    );
+    let describe = child_call(
+        &parent.call_id,
+        1,
+        Some("github"),
+        Some(false),
+        "describe",
+        "create_issue",
+        serde_json::json!({ "server": "github", "tool": "create_issue" }),
+        "describe output should be hidden",
+        ToolCallState::Success,
+    );
+    let invoke = child_call(
+        &parent.call_id,
+        2,
+        Some("github"),
+        Some(false),
+        "invoke",
+        "create_issue",
+        serde_json::json!({ "server": "github", "tool": "create_issue", "args": {"title": "Bug"} }),
+        "invoke output is visible",
+        ToolCallState::Success,
+    );
+
+    assert!(!search.expanded);
+    assert!(!describe.expanded);
+    assert!(invoke.expanded);
+    let lines = rendered_text(&render_toolbox(
+        &[parent, search, describe, invoke],
+        0,
+        true,
+        100,
+        false,
+        &no_elided(),
+    ));
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("search query=\"issues\""))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("describe github.create_issue"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("invoke output is visible"))
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("search output should be hidden"))
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("describe output should be hidden"))
+    );
+}
+
+#[test]
+fn failed_child_shows_failure_and_reason() {
+    let parent = mk_call("mcp", "script=\"mcp work\"", ToolCallState::Success);
+    let mut failed = child_call(
+        &parent.call_id,
+        0,
+        Some("cockpit"),
+        Some(true),
+        "invoke",
+        "rename_session",
+        serde_json::json!({
+            "server": "cockpit",
+            "tool": "rename_session",
+            "args": { "name": "Blocked" }
+        }),
+        "builtin MCP tool `cockpit.rename_session` is not available",
+        ToolCallState::BadCall,
+    );
+    failed.expanded = true;
+    let success = child_call(
+        &parent.call_id,
+        1,
+        Some("cockpit"),
+        Some(true),
+        "invoke",
+        "context_usage",
+        serde_json::json!({ "server": "cockpit", "tool": "context_usage", "args": {} }),
+        "{\"snapshot\":\"turn_start\"}",
+        ToolCallState::Success,
+    );
+
+    let rendered = render_toolbox(
+        &[parent, failed, success],
+        0,
+        true,
+        100,
+        false,
+        &no_elided(),
+    );
+    let lines = rendered_text(&rendered);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("rename_session: name=\"Blocked\""))
+    );
+    assert!(lines.iter().any(|line| line.contains("not available")));
+    assert!(lines.iter().any(|line| line.contains("context_usage:")));
+    let failed_header = rendered
+        .lines
+        .iter()
+        .find(|line| line_text(line).contains("rename_session:"))
+        .expect("failed child header");
+    assert!(
+        failed_header
+            .spans
+            .iter()
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+        "{failed_header:?}"
+    );
+}
+
+#[test]
+fn sidebar_glyphs_correct_with_children() {
+    let parent = mk_call("mcp", "script=\"mcp work\"", ToolCallState::Success);
+    let child = child_call(
+        &parent.call_id,
+        0,
+        Some("cockpit"),
+        Some(true),
+        "invoke",
+        "context_usage",
+        serde_json::json!({ "server": "cockpit", "tool": "context_usage", "args": {} }),
+        "{}",
+        ToolCallState::Success,
+    );
+    let lines = rendered_text(&render_toolbox(
+        &[parent, child],
+        0,
+        true,
+        100,
+        false,
+        &no_elided(),
+    ));
+
+    assert!(lines.first().unwrap().starts_with('╭'), "{lines:?}");
+    assert!(lines.last().unwrap().starts_with('╰'), "{lines:?}");
+    for line in lines.iter().skip(1).take(lines.len().saturating_sub(2)) {
+        assert!(line.starts_with('│'), "{lines:?}");
+    }
+
+    let single = rendered_text(&render_toolbox(
+        &[mk_call("bash", "ls", ToolCallState::Success)],
+        0,
+        true,
+        80,
+        false,
+        &no_elided(),
+    ));
+    assert!(single[0].starts_with('│'), "{single:?}");
+}
+
+#[test]
+fn child_summary_budget_uses_child_prefix_width() {
+    let parent = mk_call("mcp", "script=\"mcp work\"", ToolCallState::Success);
+    let child = child_call(
+        &parent.call_id,
+        0,
+        Some("github"),
+        Some(false),
+        "invoke",
+        "create_issue",
+        serde_json::json!({ "server": "github", "tool": "create_issue", "args": {"title": "A very long issue title"} }),
+        "{}",
+        ToolCallState::Success,
+    );
+
+    let parent_budget = tool_call_summary_budget(&parent, 40, 2, false);
+    let child_budget = tool_call_summary_budget(&child, 40, 4, false);
+
+    assert!(child_budget < parent_budget);
+}
+
+#[test]
+fn truncated_children_are_announced() {
+    let parent = mk_call("mcp", "script=\"mcp work\"", ToolCallState::Success);
+    let cap = child_call(
+        &parent.call_id,
+        50,
+        None,
+        None,
+        "cap",
+        "mcp.child_events_truncated",
+        serde_json::json!({ "unrecorded_dispatches": 7 }),
+        "{\"message\":\"7 further MCP dispatches were not recorded\"}",
+        ToolCallState::Success,
+    );
+
+    let lines = rendered_text(&render_toolbox(
+        &[parent, cap],
+        0,
+        true,
+        100,
+        false,
+        &no_elided(),
+    ));
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("7 unrecorded MCP dispatches")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn no_closed_match_on_tool_name_decides_presentation() {
+    let history_source = include_str!("mod.rs");
+    let events_source = include_str!("../app/events.rs");
+
+    assert!(!history_source.contains("match tool {"));
+    assert!(!events_source.contains("match tool {"));
+    let (glyph, label) = tool_glyph_label("unknown_tool", true);
+    assert!(glyph.is_empty());
+    assert_eq!(label, "unknown_tool");
+}
+
+#[test]
+fn builtin_and_tool_presentation_resolve_through_one_interface() {
+    let builtin_meta = mcp_child_meta("parent", 0, Some("cockpit"), Some(true), "invoke");
+    let builtin = resolve_tool_presentation(
+        "rename_session",
+        &serde_json::json!({
+            "server": "cockpit",
+            "tool": "rename_session",
+            "args": { "name": "Test session" }
+        }),
+        Some(&builtin_meta),
+    );
+    let native = resolve_tool_presentation(
+        "bash",
+        &serde_json::json!({ "command": "cargo test" }),
+        None,
+    );
+    let not_tool = crate::engine::tool::known_tool_presentation(
+        "rename_session",
+        &serde_json::json!({ "name": "Test session" }),
+    );
+
+    assert_eq!(builtin.label, "rename_session");
+    assert!(builtin.glyph.is_some());
+    assert_eq!(native.label, "bash");
+    assert_eq!(native.glyph, Some("🔧"));
+    assert_eq!(not_tool.glyph, None);
 }
 
 /// `pinned-messages`: the relocated controls ride an agent reply's
@@ -1177,6 +1626,7 @@ fn glyph_label_collapses_lock_variants_only_with_emoji() {
     // label collapses to the base verb.
     assert_eq!(tool_glyph_label("readlock", true).1, "read");
     assert_eq!(tool_glyph_label("writeunlock", true).1, "write");
+    assert_eq!(tool_glyph_label("unlock", true).1, "unlock");
     // Emoji off: keep the full tool name so the lock state is legible.
     assert_eq!(tool_glyph_label("readlock", false).1, "readlock");
     assert_eq!(tool_glyph_label("writeunlock", false).1, "writeunlock");
@@ -1246,15 +1696,11 @@ fn collapsed_tool_summary_fits_pane_for_every_tool() {
             "edit",
             "editunlock",
         ] {
+            let call = mk_call(tool, &summary, ToolCallState::Success);
             // Mirror render_toolbox's collapsed row: indent 2 (sidebar
             // glyph + space), then glyph + bold label + ": " + summary.
-            let budget = tool_summary_budget(tool, width, 2, /* emojis */ true);
-            let spans = tool_call_spans(
-                tool,
-                &truncate(&summary, budget),
-                ToolCallState::Success,
-                /* emojis */ true,
-            );
+            let budget = tool_call_summary_budget(&call, width, 2, /* emojis */ true);
+            let spans = tool_call_spans(&call, &truncate(&summary, budget), /* emojis */ true);
             // The leading sidebar glyph (1) + its space (1) = 2 columns.
             let line_cols: usize = 2 + spans.iter().map(|s| s.content.width()).sum::<usize>();
             assert!(

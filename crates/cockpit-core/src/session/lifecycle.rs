@@ -41,6 +41,28 @@ impl Session {
         Ok(session)
     }
 
+    /// Create a brand-new assistant session held in memory only. Mirrors
+    /// [`Self::create_deferred`], but carries `assistant_name` in the pending
+    /// row so the eventual first user message persists the assistant session
+    /// atomically with the rest of the deferred session metadata.
+    pub fn create_assistant_deferred(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        assistant_name: &str,
+    ) -> Result<Self> {
+        let project_id = project_id_for(&project_root);
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let mut row = db
+            .new_assistant_session_row(&project_id, &project_root_str, active_agent, assistant_name)
+            .context("building deferred assistant session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let session = Self::from_row(db, project_root, row.clone())?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
     /// Write the deferred `sessions` row if it hasn't been written yet, and
     /// return `true` when this call performed the write
     /// (session-id-display-and-lazy-persist). Idempotent: a no-op (returns

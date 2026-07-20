@@ -356,6 +356,51 @@ async fn handle_request(
             Ok(Response::GoalCleared { cleared })
         }
 
+        Request::ListAssistants => {
+            let assistants = ctx
+                .db
+                .list_assistants()
+                .map_err(internal)?
+                .into_iter()
+                .map(assistant_to_proto)
+                .collect();
+            Ok(Response::Assistants { assistants })
+        }
+
+        Request::CreateAssistantSession {
+            name,
+            project_root,
+            no_sandbox,
+            env_snapshot,
+        } => {
+            let env_snapshot = env_snapshot
+                .map(EnvSnapshot::from_wire)
+                .unwrap_or_else(|| {
+                    ctx.env_baseline
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                });
+            let handle = ctx
+                .registry
+                .create_assistant_session(&name, PathBuf::from(project_root), no_sandbox, env_snapshot)
+                .await
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: e.to_string(),
+                })?;
+            Ok(Response::AssistantSessionCreated {
+                session: proto::AssistantSessionCreated {
+                    session_id: handle.session_id,
+                    short_id: handle.short_id(),
+                    project_root: handle.project_root.display().to_string(),
+                    project_id: handle.project_id(),
+                    assistant_name: name,
+                    active_agent: handle.active_agent_name,
+                },
+            })
+        }
+
         Request::CancelTurn => {
             let att = require_attached(state)?;
             att.handle
@@ -1719,6 +1764,16 @@ fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSumm
         last_read_at: goal.last_read_at,
         created_at: goal.created_at,
         updated_at: goal.updated_at,
+    }
+}
+
+fn assistant_to_proto(row: crate::db::assistants::AssistantRow) -> proto::AssistantSummary {
+    proto::AssistantSummary {
+        name: row.name,
+        created_at: row.created_at,
+        home_dir: row.home_dir,
+        config_json: row.config_json,
+        content_hash: row.content_hash,
     }
 }
 

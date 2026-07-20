@@ -284,6 +284,14 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
         proto::Response::GoalCleared { cleared: _ } => {}
+        proto::Response::Assistants { assistants } => {
+            for assistant in assistants {
+                scrub_assistant_summary(assistant, redact);
+            }
+        }
+        proto::Response::AssistantSessionCreated { session } => {
+            scrub_assistant_session_created(session, redact);
+        }
         proto::Response::Forked {
             session_id: _,
             short_id: _,
@@ -1068,6 +1076,38 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
     scrub_string(project_id, redact);
     scrub_string(objective, redact);
     scrub_option_string(context, redact);
+}
+
+fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &RedactionTable) {
+    let proto::AssistantSummary {
+        name,
+        created_at: _,
+        home_dir,
+        config_json,
+        content_hash,
+    } = assistant;
+    scrub_string(name, redact);
+    scrub_string(home_dir, redact);
+    scrub_string(config_json, redact);
+    scrub_string(content_hash, redact);
+}
+
+fn scrub_assistant_session_created(
+    session: &mut proto::AssistantSessionCreated,
+    redact: &RedactionTable,
+) {
+    let proto::AssistantSessionCreated {
+        session_id: _,
+        short_id: _,
+        project_root,
+        project_id,
+        assistant_name,
+        active_agent,
+    } = session;
+    scrub_string(project_root, redact);
+    scrub_string(project_id, redact);
+    scrub_string(assistant_name, redact);
+    scrub_string(active_agent, redact);
 }
 
 fn scrub_stats_rollup(rollup: &mut proto::StatsRollup, redact: &RedactionTable) {

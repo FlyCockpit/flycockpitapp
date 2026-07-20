@@ -250,6 +250,58 @@ mod tests {
         assert!(rollup.language.languages.is_empty());
     }
 
+    #[tokio::test]
+    async fn assistant_rpc_creates_session_via_registry() {
+        let ctx = test_ctx();
+        let assistant_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        create_test_assistant(&ctx, &assistant_home, "helper-bot");
+        let mut state = owner_state();
+
+        let response = handle_request(Request::ListAssistants, &mut state, &ctx)
+            .await
+            .expect("list assistants");
+        let Response::Assistants { assistants } = response else {
+            panic!("expected Assistants response");
+        };
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].name, "helper-bot");
+
+        let response = handle_request(
+            Request::CreateAssistantSession {
+                name: "helper-bot".into(),
+                project_root: project.path().to_string_lossy().into_owned(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("create assistant session");
+        let Response::AssistantSessionCreated { session } = response else {
+            panic!("expected AssistantSessionCreated response");
+        };
+        assert_eq!(session.assistant_name, "helper-bot");
+        assert_eq!(session.active_agent, "helper-bot");
+        assert!(
+            ctx.registry
+                .active_session_ids()
+                .contains(&session.session_id),
+            "created assistant session is live in the registry"
+        );
+        assert!(
+            ctx.db.get_session(session.session_id).unwrap().is_none(),
+            "created assistant session is deferred until first user message"
+        );
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -1171,6 +1223,7 @@ mod tests {
             | ("list_scheduled_jobs", "owner_only", false)
             | ("list_agents", "owner_only", false)
             | ("list_models", "owner_only", false)
+            | ("list_assistants", "owner_only", false)
             | ("get_usage_counts", "owner_only", false)
             | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
             (_, _, true) => DispatchMatrixClass::Mutating,
@@ -1301,6 +1354,7 @@ mod tests {
             MutatingDispatchCase { kind: "repair_resume", effect_class: DriverForwarded, observation: "SessionWork::RepairResume delivered to attached worker" },
             MutatingDispatchCase { kind: "set_goal_status", effect_class: Durable, observation: "session goal status changes" },
             MutatingDispatchCase { kind: "clear_goal", effect_class: Durable, observation: "session goal is closed" },
+            MutatingDispatchCase { kind: "create_assistant_session", effect_class: Durable, observation: "deferred assistant session worker is registered" },
             MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
             MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
             MutatingDispatchCase { kind: "fs_create_dir", effect_class: Durable, observation: "directory created under project root" },
@@ -1497,6 +1551,7 @@ mod tests {
             | "cancel_attachment_upload"
             | "goal_status"
             | "clear_goal"
+            | "list_assistants"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "fs_list"
@@ -1542,6 +1597,7 @@ mod tests {
             | "delete_scheduled_job"
             | "set_scheduled_job_enabled"
             | "run_scheduled_job"
+            | "create_assistant_session"
             | "store_flycockpit_credential"
             | "clear_flycockpit_credential"
             | "set_goal_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
@@ -1595,6 +1651,8 @@ mod tests {
             authz_session_reader("goal_status"),
             authz_session_writer("set_goal_status"),
             authz_session_writer("clear_goal"),
+            authz_owner_only("list_assistants"),
+            authz_owner_only("create_assistant_session"),
             authz_session_writer("cancel_turn"),
             authz_project_files("fs_list"),
             authz_project_files("fs_stat"),
@@ -2348,6 +2406,13 @@ mod tests {
                 status: proto::GoalStatus::Paused,
             },
             "clear_goal" => Request::ClearGoal { session_id },
+            "list_assistants" => Request::ListAssistants,
+            "create_assistant_session" => Request::CreateAssistantSession {
+                name: "missing-assistant".into(),
+                project_root: root,
+                no_sandbox: false,
+                env_snapshot: None,
+            },
             "cancel_turn" => Request::CancelTurn,
             "fs_list" => Request::FsList {
                 project_root: root,
@@ -3139,6 +3204,7 @@ mod tests {
                 assert_paused_work_mutating_happy(case.kind).await;
             }
             "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
+            "create_assistant_session" => assert_create_assistant_session_happy().await,
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -3246,6 +3312,22 @@ mod tests {
                 assert!(ctx.db.paused_session_work_all().unwrap().is_empty());
             }
             "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
+            "create_assistant_session" => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::CreateAssistantSession {
+                        name: "missing-assistant".into(),
+                        project_root: "/repo".into(),
+                        no_sandbox: false,
+                        env_snapshot: None,
+                    },
+                )
+                .await
+                .expect_err("missing assistant rejects session creation");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+                assert!(ctx.registry.active_session_ids().is_empty());
+            }
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -4279,6 +4361,66 @@ mod tests {
         }
     }
 
+    fn create_test_assistant(
+        ctx: &Arc<DaemonContext>,
+        tmp: &tempfile::TempDir,
+        name: &str,
+    ) -> crate::db::assistants::AssistantRow {
+        crate::assistants::create_assistant(
+            &ctx.db,
+            crate::assistants::CreateAssistantSpec {
+                name: name.to_string(),
+                description: "test assistant".to_string(),
+                mode: crate::agents::AgentMode::Primary,
+                tools: None,
+                model: None,
+                prompt: "You are a test assistant.".to_string(),
+                home_dir: tmp.path().join(name),
+            },
+        )
+        .expect("create assistant")
+    }
+
+    #[cfg(unix)]
+    async fn assert_create_assistant_session_happy() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        create_test_assistant(&ctx, &tmp, "helper-bot");
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::CreateAssistantSession {
+                name: "helper-bot".into(),
+                project_root: project.path().to_string_lossy().into_owned(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+        )
+        .await
+        .expect("create assistant session");
+        let Response::AssistantSessionCreated { session } = response else {
+            panic!("expected AssistantSessionCreated");
+        };
+        assert_eq!(session.assistant_name, "helper-bot");
+        assert_eq!(session.active_agent, "helper-bot");
+        assert!(
+            ctx.registry
+                .active_session_ids()
+                .contains(&session.session_id),
+            "assistant session is started through the registry"
+        );
+        assert!(
+            ctx.db.get_session(session.session_id).unwrap().is_none(),
+            "assistant session remains deferred until first user message"
+        );
+    }
+
     #[cfg(unix)]
     async fn assert_session_db_mutating_happy(kind: &str) {
         let ctx = test_ctx();
@@ -5041,6 +5183,25 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::ListAssistants,
+                kind: "list_assistants",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::CreateAssistantSession {
+                    name: "helper-bot".into(),
+                    project_root: project_root.clone(),
+                    no_sandbox: false,
+                    env_snapshot: None,
+                },
+                kind: "create_assistant_session",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::CancelTurn,
                 kind: "cancel_turn",
                 session_id: Some(attached_session_id),
@@ -5693,6 +5854,8 @@ mod tests {
             GoalStatus,
             SetGoalStatus,
             ClearGoal,
+            ListAssistants,
+            CreateAssistantSession,
             CancelTurn,
             FsList,
             FsStat,

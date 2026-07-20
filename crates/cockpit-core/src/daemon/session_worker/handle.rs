@@ -983,7 +983,10 @@ pub fn spawn(
     // (resume) or the configured default (`Auto` unless pinned). The worker
     // re-derives the same value via `resolve_root_agent` and emits
     // `PrimarySwapped` on any later swap, so this is purely the start state.
-    let initial_agent = resolve_root_agent(session_id, &session.db, extended_cfg);
+    let initial_agent = session
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, extended_cfg));
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
     //   (b) else this client passed `--no-sandbox` → OFF for the

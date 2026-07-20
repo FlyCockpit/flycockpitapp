@@ -1037,6 +1037,25 @@ pub struct GoalSummary {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantSummary {
+    pub name: String,
+    pub created_at: i64,
+    pub home_dir: String,
+    pub config_json: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantSessionCreated {
+    pub session_id: Uuid,
+    pub short_id: String,
+    pub project_root: String,
+    pub project_id: String,
+    pub assistant_name: String,
+    pub active_agent: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsRange {

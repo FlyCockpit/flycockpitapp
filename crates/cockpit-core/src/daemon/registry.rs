@@ -449,6 +449,57 @@ impl SessionRegistry {
         )
     }
 
+    /// Create a new assistant session through the normal daemon worker path,
+    /// preserving deferred-persistence semantics. The session row is not
+    /// inserted until the worker receives the first user message.
+    pub async fn create_assistant_session(
+        &self,
+        assistant_name: &str,
+        project_root: PathBuf,
+        client_no_sandbox: bool,
+        env_snapshot: EnvSnapshot,
+    ) -> Result<SessionWorkerHandle> {
+        crate::assistants::validate_assistant_name(assistant_name)?;
+        let row = self
+            .inner
+            .db
+            .get_assistant(assistant_name)?
+            .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
+        crate::assistants::load_from_row(&row)?;
+
+        let trust_policy = resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root)?;
+        let (providers_cfg, extended_cfg) = self
+            .inner
+            .config_source
+            .load_with_trust(&project_root, &trust_policy)?;
+        let session = Session::create_assistant_deferred(
+            self.inner.db.clone(),
+            project_root,
+            assistant_name,
+            assistant_name,
+        )
+        .context("creating assistant session")?;
+        if let Some(active) = &providers_cfg.active_model {
+            session
+                .set_active_model(&active.provider, &active.model)
+                .context("setting active model on new assistant session")?;
+        }
+        let generation = {
+            let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+            next_generation(&mut workers)
+        };
+        self.start_worker(
+            session,
+            &providers_cfg,
+            &extended_cfg,
+            client_no_sandbox,
+            None,
+            trust_policy,
+            env_snapshot,
+            generation,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start_resumed_worker(
         &self,

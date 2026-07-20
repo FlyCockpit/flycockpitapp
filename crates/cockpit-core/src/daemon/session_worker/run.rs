@@ -229,7 +229,10 @@ async fn run_worker(
     // on `Plan` after a `/plan` swap or whichever primary `Auto` handed off
     // to, `plan.md §4.6.d`), falling back to the configured default
     // (`Auto` unless the user pinned another) when it's unset/unknown.
-    let root_agent_name = resolve_root_agent(session_id, &session.db, &extended_cfg);
+    let root_agent_name = session
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, &extended_cfg));
     let assistant_identity_prefix =
         match session.assistant_name.as_deref().and_then(|name| match session.db.get_assistant(name)
         {

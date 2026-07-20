@@ -190,6 +190,20 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// List persisted assistant definitions.
+    ListAssistants,
+
+    /// Create a new assistant session through the daemon registry. The
+    /// session is deferred and is not persisted until its first user message.
+    CreateAssistantSession {
+        name: String,
+        project_root: String,
+        #[serde(default)]
+        no_sandbox: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_snapshot: Option<EnvSnapshotWire>,
+    },
+
     /// Cancel the in-flight model call for the attached session. The
     /// daemon aborts the streaming completion and returns control to
     /// the agent stack so the user can redirect.
@@ -727,6 +741,8 @@ macro_rules! command {
             (Request::GoalStatus { session_id }, "goal_status", session_row_reader(session_id), field(session_id), false, none);
             (Request::SetGoalStatus { session_id, .. }, "set_goal_status", session_row_writer(session_id), field(session_id), true, none);
             (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ListAssistants, "list_assistants", owner_only, none, false, none);
+            (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, none);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, none);
             (Request::FsStat { project_root, .. }, "fs_stat", project_files(project_root), none, false, none);

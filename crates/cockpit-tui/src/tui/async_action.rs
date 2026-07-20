@@ -232,6 +232,21 @@ impl AsyncActionRunner {
         }
     }
 
+    #[cfg(test)]
+    pub fn inject_completed_for_test(
+        &mut self,
+        id: AsyncActionId,
+        kind: AsyncActionKind,
+        payload: Result<AsyncActionPayload, String>,
+    ) {
+        let _ = self.tx.send(CompletedAction {
+            id,
+            generation: 0,
+            kind,
+            payload,
+        });
+    }
+
     pub fn start<F>(
         &mut self,
         kind: AsyncActionKind,

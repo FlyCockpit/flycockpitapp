@@ -1,4 +1,5 @@
 use super::{App, Dialog, SESSION_SWITCH_SPINNER_THRESHOLD};
+use crate::tui::agent_runner::{SessionSwitchOutcome, SessionTarget};
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
@@ -63,6 +64,23 @@ async fn drain_async_actions_until_idle(app: &mut App) {
     panic!("async action did not complete");
 }
 
+fn switch_outcome(session_id: uuid::Uuid, short_id: &str) -> AsyncActionPayload {
+    AsyncActionPayload::SessionSwitched(Box::new(SessionSwitchOutcome {
+        target: SessionTarget::New,
+        session_id,
+        short_id: short_id.to_string(),
+        foreground_target: None,
+        active_model_state: None,
+        project_id: format!("project-{short_id}"),
+        history: Vec::new(),
+        paused_work: Vec::new(),
+        repair_required: None,
+        btw_fork: None,
+        daemon_version: "test".to_string(),
+        daemon_compatible: true,
+    }))
+}
+
 #[tokio::test]
 async fn swap_below_threshold_shows_no_spinner() {
     let started_at = Instant::now()
@@ -116,4 +134,69 @@ async fn new_session_swap_failure_keeps_cleared_history() {
         app.agent_runner.as_ref(),
         Some(Err(error)) if error == "attach failed"
     ));
+}
+
+#[tokio::test]
+async fn new_session_swap_supersedes_in_flight_swap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { std::future::pending::<Result<AsyncActionPayload, String>>().await },
+    );
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { Ok(switch_outcome(second, "second")) },
+    );
+    drain_async_actions_until_idle(&mut app).await;
+
+    assert_eq!(app.launch.session_id, Some(second));
+    assert_ne!(app.launch.session_id, Some(first));
+    assert_eq!(app.launch.session_short_id.as_deref(), Some("second"));
+}
+
+#[tokio::test]
+async fn new_session_swap_discards_stale_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    let stale_session = uuid::Uuid::new_v4();
+    let active_session = uuid::Uuid::new_v4();
+
+    let stale_id = app
+        .async_actions
+        .start(
+            AsyncActionKind::Internal("session.switch"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+            async move { std::future::pending::<Result<AsyncActionPayload, String>>().await },
+        )
+        .id();
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { Ok(switch_outcome(active_session, "active")) },
+    );
+    drain_async_actions_until_idle(&mut app).await;
+    app.async_actions.inject_completed_for_test(
+        stale_id,
+        AsyncActionKind::Internal("session.switch"),
+        Ok(switch_outcome(stale_session, "stale")),
+    );
+    app.drain_async_actions();
+
+    assert_eq!(app.launch.session_id, Some(active_session));
+    assert_ne!(app.launch.session_id, Some(stale_session));
+    assert_eq!(app.launch.session_short_id.as_deref(), Some("active"));
 }

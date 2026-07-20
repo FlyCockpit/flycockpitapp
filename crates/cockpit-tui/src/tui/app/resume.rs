@@ -144,7 +144,7 @@ impl App {
     }
 
     /// Resume `session_id` from the `/sessions` browser. Reuses the
-    /// existing session-switch path (`attach_to_session`) — the runner's
+    /// existing session-switch path — the runner's
     /// event stream + input channel move onto the resumed session, and the
     /// daemon marks it viewed on attach (clearing its unread state).
     pub(super) fn resume_session(&mut self, session_id: uuid::Uuid) {

@@ -46,6 +46,7 @@ pub mod session_log;
 pub mod session_plan_docs;
 pub mod session_search;
 pub mod sessions;
+pub mod shadow_store;
 pub mod skill_pairs;
 pub mod skill_usage;
 pub mod sql;

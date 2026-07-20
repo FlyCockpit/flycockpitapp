@@ -1388,7 +1388,7 @@ impl Driver {
             initial_tools.names(),
             crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
         );
-        Self {
+        let mut driver = Self {
             session,
             locks,
             redact,
@@ -1476,7 +1476,9 @@ impl Driver {
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
             redaction_unsupported_notified: HashSet::new(),
-        }
+        };
+        driver.load_compaction_shadow_from_store();
+        driver
     }
 
     /// Install the plan-level model override (prompt
@@ -1772,6 +1774,7 @@ impl Driver {
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             });
+        self.load_compaction_shadow_from_store();
         Ok(Some(rehydrated))
     }
 

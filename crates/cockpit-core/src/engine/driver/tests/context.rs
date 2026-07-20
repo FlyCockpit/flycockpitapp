@@ -414,6 +414,15 @@ async fn shadow_brief_predrafts() {
         compact_inference_purposes(&driver),
         ["compact_shadow_brief"]
     );
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .unwrap()
+            .is_some(),
+        "ready shadow brief is persisted eagerly"
+    );
 }
 
 #[tokio::test]
@@ -469,6 +478,318 @@ async fn compact_uses_shadow_delta() {
         3,
         "delta sees the shadow's omitted tail plus the new exchange"
     );
+}
+
+#[tokio::test]
+async fn ready_brief_survives_driver_drop() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    append_complete_test_turns(&mut driver, 2);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    record_test_context_tokens(&driver, 5_500);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+
+    let session = driver.session.clone();
+    let locks = driver.locks.clone();
+    let redact = driver.redact.clone();
+    let cwd = driver.cwd.clone();
+    let root = driver.stack[0].agent.clone();
+    assert!(session.db.compaction_shadow(session.id).unwrap().is_some());
+    drop(driver);
+
+    let mut restored = Driver::new(session.clone(), locks, redact, cwd, root);
+    append_complete_test_turns(&mut restored, 3);
+    install_test_providers(
+        &mut restored,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    restored.do_compact(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    let purposes = compact_inference_purposes(&restored);
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|purpose| purpose.as_str() == "compact_shadow_brief")
+            .count(),
+        1
+    );
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|purpose| purpose.as_str() == "compact_brief_delta")
+            .count(),
+        1,
+        "restored ready brief is used for delta compaction"
+    );
+    assert!(!purposes.iter().any(|purpose| purpose == "compact_brief"));
+}
+
+#[tokio::test]
+async fn consumed_brief_is_deleted() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    append_complete_test_turns(&mut driver, 2);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    record_test_context_tokens(&driver, 5_500);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .unwrap()
+            .is_some()
+    );
+
+    let ready = driver
+        .take_fresh_shadow_brief(ContextConfig::default().compact_keep_recent_turns)
+        .await;
+
+    assert!(ready.is_some());
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .unwrap()
+            .is_none(),
+        "consuming a ready shadow deletes its durable row"
+    );
+}
+
+#[tokio::test]
+async fn load_without_row_clears_memory_view() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    driver.shadow_brief_generation = 2;
+    driver.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
+        generation: 2,
+        snapshot_history: vec![Message::user("memory only")],
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        brief: "memory only".to_string(),
+    }));
+
+    driver.load_compaction_shadow_from_store();
+
+    assert!(
+        driver.shadow_brief.is_none(),
+        "missing durable row clears the in-memory view"
+    );
+}
+
+#[tokio::test]
+async fn loaded_brief_generation_is_persisted_and_compared() {
+    let (driver, _tmp) = test_driver_without_network(8);
+    let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
+        generation: 7,
+        snapshot_history: vec![Message::user("snapshot"), Message::assistant("briefed")],
+        snapshot_turns: 1,
+        snapshot_tail_turns: 1,
+        brief: "stored brief".to_string(),
+    });
+    driver
+        .session
+        .db
+        .upsert_compaction_shadow(driver.session.id, &serde_json::to_string(&payload).unwrap())
+        .unwrap();
+
+    let mut restored = Driver::new(
+        driver.session.clone(),
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.stack[0].agent.clone(),
+    );
+
+    assert_eq!(restored.shadow_brief_generation, 7);
+    assert!(matches!(
+        &restored.shadow_brief,
+        Some(ShadowBriefState::Ready(ready)) if ready.brief == "stored brief"
+    ));
+
+    let older = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
+        generation: 6,
+        snapshot_history: vec![Message::user("older")],
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        brief: "older brief".to_string(),
+    });
+    restored
+        .session
+        .db
+        .upsert_compaction_shadow(restored.session.id, &serde_json::to_string(&older).unwrap())
+        .unwrap();
+    restored.shadow_brief_generation = 8;
+    restored.load_compaction_shadow_from_store();
+
+    assert!(restored.shadow_brief.is_none());
+    assert!(
+        restored
+            .session
+            .db
+            .compaction_shadow(restored.session.id)
+            .unwrap()
+            .is_none(),
+        "stored generation behind the live driver is discarded"
+    );
+}
+
+#[tokio::test]
+async fn stale_loaded_brief_is_discarded() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
+        generation: 3,
+        snapshot_history: vec![Message::user("old")],
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        brief: "too old".to_string(),
+    });
+    driver
+        .session
+        .db
+        .upsert_compaction_shadow(driver.session.id, &serde_json::to_string(&payload).unwrap())
+        .unwrap();
+    append_complete_test_turns(&mut driver, 9);
+
+    driver.load_compaction_shadow_from_store();
+
+    assert!(driver.shadow_brief.is_none());
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .unwrap()
+            .is_none(),
+        "stale loaded shadow row is deleted"
+    );
+}
+
+#[tokio::test]
+async fn killswitch_writes_no_rows() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
+        generation: 1,
+        snapshot_history: vec![Message::user("delete me")],
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        brief: "delete me".to_string(),
+    });
+    driver
+        .session
+        .db
+        .upsert_compaction_shadow(driver.session.id, &serde_json::to_string(&payload).unwrap())
+        .unwrap();
+    append_complete_test_turns(&mut driver, 2);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+    record_test_context_tokens(&driver, 5_500);
+
+    assert!(!driver.maybe_shadow_brief(&tx).await);
+
+    assert!(driver.shadow_brief.is_none());
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_session_writes_no_rows() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (parent, _tmp) = test_driver_without_network(8);
+    let row = parent
+        .session
+        .db
+        .create_ephemeral_fork(parent.session.id, None)
+        .unwrap();
+    let session = Arc::new(
+        Session::resume(parent.session.db.clone(), row.session_id)
+            .unwrap()
+            .unwrap(),
+    );
+    let mut driver = Driver::new(
+        session.clone(),
+        parent.locks.clone(),
+        parent.redact.clone(),
+        parent.cwd.clone(),
+        parent.stack[0].agent.clone(),
+    );
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    append_complete_test_turns(&mut driver, 2);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    record_test_context_tokens(&driver, 5_500);
+
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .unwrap()
+            .is_none(),
+        "ephemeral session shadows are not persisted"
+    );
+}
+
+#[tokio::test]
+async fn durable_shadow_payload_round_trips_with_prepared_compaction() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    let payload = DurableCompactionShadow::PreparedCompaction(Box::new(prepared));
+    let encoded = serde_json::to_string(&payload).unwrap();
+    let decoded: DurableCompactionShadow = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, payload);
+}
+
+#[test]
+fn staleness_rule_has_one_implementation() {
+    assert_eq!(shadow_stale_after_turns(0), 8);
+    assert_eq!(shadow_stale_after_turns(3), 8);
+    assert_eq!(shadow_stale_after_turns(8), 12);
 }
 
 #[tokio::test]

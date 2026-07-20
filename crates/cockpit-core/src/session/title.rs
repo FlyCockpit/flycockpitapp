@@ -30,7 +30,21 @@ impl Session {
         Ok(updated)
     }
 
-    #[cfg(test)]
+    /// Apply an explicitly requested generated title only while the session is
+    /// still untitled. The DB update is atomic so competing daemon requests
+    /// produce exactly one winner.
+    pub fn set_explicit_auto_title_if_untitled(&self, title: &str) -> Result<bool> {
+        let updated = self
+            .db
+            .set_explicit_auto_title_if_untitled(self.id, title)
+            .context("setting explicit auto title if untitled")?;
+        if updated {
+            *self.title.lock().unwrap() = Some(title.to_string());
+            *self.user_renamed.lock().unwrap() = false;
+        }
+        Ok(updated)
+    }
+
     pub fn title(&self) -> Option<String> {
         self.title.lock().unwrap().clone()
     }

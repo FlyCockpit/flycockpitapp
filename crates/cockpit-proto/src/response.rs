@@ -145,6 +145,11 @@ pub enum Response {
         session: AssistantSessionCreated,
     },
 
+    AutoTitle {
+        session_id: Uuid,
+        title: String,
+    },
+
     ExportSessionData {
         data: ExportSessionData,
     },

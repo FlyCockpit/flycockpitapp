@@ -292,6 +292,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AssistantSessionCreated { session } => {
             scrub_assistant_session_created(session, redact);
         }
+        proto::Response::AutoTitle {
+            session_id: _,
+            title,
+        } => scrub_string(title, redact),
         proto::Response::ExportSessionData { data } => scrub_export_session_data(data, redact),
         proto::Response::Curator { result } => scrub_curator_result(result, redact),
         proto::Response::Forked {

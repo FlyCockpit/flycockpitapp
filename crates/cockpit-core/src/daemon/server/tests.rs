@@ -382,6 +382,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_title_rpc_generates_title() {
+        let project = tempfile::tempdir().unwrap();
+        let url = auto_title_model_server(Some("Codex Model Fetch".to_string())).await;
+        let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "fetch the codex model list"}),
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("auto title");
+
+        let Response::AutoTitle { session_id, title } = response else {
+            panic!("expected AutoTitle response");
+        };
+        assert_eq!(session_id, session.session_id);
+        assert_eq!(title, "codex-model-fetch");
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("codex-model-fetch"));
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn auto_title_failure_leaves_session_unrenamed() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let mut state = owner_state();
+
+        let err = handle_request(
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("missing utility model rejects");
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert!(row.title.is_none());
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_auto_title_second_attempt_is_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        let url = auto_title_model_server(Some("Concurrent Title".to_string())).await;
+        let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let mut first_state = owner_state();
+        let mut second_state = owner_state();
+        let first_request = Request::AutoTitle {
+            session_id: session.session_id,
+        };
+        let second_request = first_request.clone();
+
+        let (first, second) = tokio::join!(
+            handle_request(first_request, &mut first_state, &ctx),
+            handle_request(second_request, &mut second_state, &ctx),
+        );
+
+        let mut successes = 0;
+        let mut rejections = 0;
+        for result in [first, second] {
+            match result {
+                Ok(Response::AutoTitle { title, .. }) => {
+                    successes += 1;
+                    assert_eq!(title, "concurrent-title");
+                }
+                Err(err)
+                    if err.code == ErrorCode::BadRequest
+                        && err.message.contains("already has a title") =>
+                {
+                    rejections += 1;
+                }
+                other => panic!("unexpected auto-title result: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(rejections, 1);
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("concurrent-title"));
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
     async fn export_rpc_returns_redacted_data() {
         let ctx = test_ctx();
         let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
@@ -836,6 +968,89 @@ mod tests {
             crate::config::providers::ProvidersConfig::default(),
             extended,
         )
+    }
+
+    fn auto_title_config_source(base_url: &str) -> crate::daemon::config_source::ConfigSource {
+        use crate::config::providers::ProviderEntry;
+
+        let extended = crate::config::extended::ExtendedConfig {
+            utility_model: Some("p:m".to_string()),
+            ..crate::config::extended::ExtendedConfig::default()
+        };
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "p".to_string(),
+            ProviderEntry {
+                url: base_url.to_string(),
+                ..ProviderEntry::default()
+            },
+        );
+        crate::daemon::config_source::ConfigSource::fixed(providers, extended)
+    }
+
+    async fn auto_title_model_server(content: Option<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    let s = String::from_utf8_lossy(&buf);
+                    if let Some(idx) = s.find("\r\n\r\n") {
+                        let header = &s[..idx];
+                        let content_len = header
+                            .lines()
+                            .find_map(|line| {
+                                let line = line.to_ascii_lowercase();
+                                line.strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= idx + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let Some(content) = &content else {
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\n\
+                                Content-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    continue;
+                };
+                let escaped = content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                let payload = format!(
+                    "{{\"id\":\"c\",\"object\":\"chat.completion\",\"created\":0,\
+                     \"model\":\"m\",\"system_fingerprint\":null,\
+                     \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\
+                     \"content\":[{{\"type\":\"text\",\"text\":\"{escaped}\"}}]}},\
+                     \"logprobs\":null,\"finish_reason\":\"stop\"}}],\
+                     \"usage\":{{\"prompt_tokens\":1,\"total_tokens\":2,\
+                     \"prompt_tokens_details\":{{\"cached_tokens\":0}}}}}}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{addr}/v1")
     }
 
     fn write_curator_skill(skill_root: &Path, name: &str) {
@@ -1677,6 +1892,7 @@ mod tests {
             MutatingDispatchCase { kind: "set_goal_status", effect_class: Durable, observation: "session goal status changes" },
             MutatingDispatchCase { kind: "clear_goal", effect_class: Durable, observation: "session goal is closed" },
             MutatingDispatchCase { kind: "create_assistant_session", effect_class: Durable, observation: "deferred assistant session worker is registered" },
+            MutatingDispatchCase { kind: "auto_title", effect_class: Durable, observation: "untitled session row receives generated title" },
             MutatingDispatchCase { kind: "curator", effect_class: Durable, observation: "skill curator state changes through daemon-owned DB/filesystem path" },
             MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
             MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
@@ -1922,6 +2138,7 @@ mod tests {
             | "delete_scheduled_job"
             | "set_scheduled_job_enabled"
             | "run_scheduled_job"
+            | "auto_title"
             | "create_assistant_session"
             | "store_flycockpit_credential"
             | "clear_flycockpit_credential"
@@ -1978,6 +2195,7 @@ mod tests {
             authz_session_writer("clear_goal"),
             authz_owner_only("list_assistants"),
             authz_owner_only("create_assistant_session"),
+            authz_session_writer("auto_title"),
             authz_owner_only("export_session_data"),
             authz_owner_only("curator"),
             authz_session_writer("cancel_turn"),
@@ -2740,6 +2958,7 @@ mod tests {
                 no_sandbox: false,
                 env_snapshot: None,
             },
+            "auto_title" => Request::AutoTitle { session_id },
             "export_session_data" => Request::ExportSessionData {
                 session_id,
                 kind: proto::ExportSessionKind::TranscriptJson,
@@ -3542,6 +3761,7 @@ mod tests {
             }
             "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
             "create_assistant_session" => assert_create_assistant_session_happy().await,
+            "auto_title" => assert_auto_title_mutating_happy().await,
             "curator" => assert_curator_mutating_happy().await,
             "archive_session"
             | "unarchive_session"
@@ -3666,6 +3886,7 @@ mod tests {
                 assert_eq!(err.code, ErrorCode::BadRequest);
                 assert!(ctx.registry.active_session_ids().is_empty());
             }
+            "auto_title" => assert_auto_title_mutating_malformed().await,
             "curator" => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
@@ -4774,6 +4995,75 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_auto_title_mutating_happy() {
+        let project = tempfile::tempdir().unwrap();
+        let url = auto_title_model_server(Some("Matrix Title".to_string())).await;
+        let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+        )
+        .await
+        .expect("auto-title happy");
+        let Response::AutoTitle { title, .. } = response else {
+            panic!("expected AutoTitle");
+        };
+        assert_eq!(title, "matrix-title");
+        assert_eq!(
+            ctx.db
+                .get_session(session.session_id)
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("matrix-title")
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_auto_title_mutating_malformed() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let err = dispatch_matrix_request(
+            &ctx,
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+        )
+        .await
+        .expect_err("auto-title missing utility model rejects");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert!(row.title.is_none());
+        assert!(!row.user_renamed);
+    }
+
+    #[cfg(unix)]
     async fn assert_curator_mutating_happy() {
         let project = tempfile::tempdir().unwrap();
         let skill_root = project.path().join(".agents").join("skills");
@@ -5592,6 +5882,15 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::AutoTitle {
+                    session_id: attached_session_id,
+                },
+                kind: "auto_title",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::ExportSessionData {
                     session_id: attached_session_id,
                     kind: proto::ExportSessionKind::DebugBundle,
@@ -6268,6 +6567,7 @@ mod tests {
             ClearGoal,
             ListAssistants,
             CreateAssistantSession,
+            AutoTitle,
             ExportSessionData,
             Curator,
             CancelTurn,

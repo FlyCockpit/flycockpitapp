@@ -612,6 +612,10 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
+    pub fn session(&self) -> Arc<Session> {
+        self.session.clone()
+    }
+
     pub fn broadcast_notice(&self, text: String) {
         send_current_session_event_with_agent(
             &self.session,

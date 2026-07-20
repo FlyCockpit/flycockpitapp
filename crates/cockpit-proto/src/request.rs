@@ -204,6 +204,11 @@ pub enum Request {
         env_snapshot: Option<EnvSnapshotWire>,
     },
 
+    /// Generate and persist a title for an untitled session.
+    AutoTitle {
+        session_id: Uuid,
+    },
+
     /// Return export-ready session data while leaving user-path file writing
     /// to the client.
     ExportSessionData {
@@ -760,6 +765,7 @@ macro_rules! command {
             (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, none);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, none);
             (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, none);
+            (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, none);
             (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, none);
             (Request::Curator { project_root, .. }, "curator", owner_only, none, true, path(project_root));
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);

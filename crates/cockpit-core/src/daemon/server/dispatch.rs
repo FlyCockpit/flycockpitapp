@@ -401,6 +401,8 @@ async fn handle_request(
             })
         }
 
+        Request::AutoTitle { session_id } => auto_title_request(ctx, session_id).await,
+
         Request::ExportSessionData {
             session_id,
             kind,
@@ -1888,6 +1890,80 @@ async fn export_session_data(
         }
     })?;
     Ok(Response::ExportSessionData { data })
+}
+
+async fn auto_title_request(
+    ctx: &Arc<DaemonContext>,
+    session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let live = ctx.registry.live_handle(session_id);
+    let session = if let Some(handle) = live.as_ref() {
+        handle.session()
+    } else {
+        std::sync::Arc::new(
+            crate::session::Session::resume(ctx.db.clone(), session_id)
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?,
+        )
+    };
+
+    if session.title().is_some() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "session already has a title".to_string(),
+        });
+    }
+
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &session.project_root)
+            .map_err(workspace_trust_error)?;
+    let (providers, extended) = ctx
+        .config_source()
+        .load_with_trust(&session.project_root, &trust_policy)
+        .map_err(workspace_trust_error)?;
+    let redact = if let Some(handle) = live {
+        handle.redaction_table()
+    } else {
+        let table = match session.persisted_redaction_table().map_err(internal)? {
+            Some(table) => table,
+            None => crate::redact::RedactionTable::build(&extended.redact, &session.project_root)
+                .map_err(internal)?,
+        };
+        std::sync::Arc::new(table)
+    };
+
+    let title = crate::auto_title::generate_session_title_slug_once(
+        &session,
+        extended,
+        providers,
+        redact,
+        String::new(),
+        crate::session::TitleAction::Explicit,
+    )
+    .await
+    .map_err(|error| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: error.to_string(),
+    })?
+    .ok_or_else(|| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "utility model returned no usable title".to_string(),
+    })?;
+
+    if !session
+        .set_explicit_auto_title_if_untitled(&title)
+        .map_err(internal)?
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "session already has a title".to_string(),
+        });
+    }
+
+    Ok(Response::AutoTitle { session_id, title })
 }
 
 async fn curator_request(

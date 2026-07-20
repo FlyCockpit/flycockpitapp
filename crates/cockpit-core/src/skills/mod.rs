@@ -1199,21 +1199,24 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        invalidate_catalog_cache(tmp.path(), &cfg);
-        reset_discovery_walk_call_count();
-
         let first = discover(tmp.path(), &cfg).unwrap();
-        let first_walks = discovery_walk_call_count();
-        reset_discovery_walk_call_count();
+        std::fs::remove_dir_all(&scan).unwrap();
         let second = discover(tmp.path(), &cfg).unwrap();
 
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert!(first_walks > 0, "cold discovery must walk");
         assert_eq!(
-            discovery_walk_call_count(),
-            0,
-            "cache hit must return before walking scan dirs"
+            first
+                .iter()
+                .map(|s| s.frontmatter.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|s| s.frontmatter.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one"],
+            "cache hit must return cached skills without reading the removed scan dir"
         );
     }
 

@@ -41,7 +41,7 @@ impl Tool for TreeTool {
         "tree"
     }
     fn description(&self) -> &str {
-        "List indexed files with language, size, line count, and symbol count"
+        "List indexed files with metadata; use `outline` for one file's shape and `context_pack` for a broader codebase packet"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

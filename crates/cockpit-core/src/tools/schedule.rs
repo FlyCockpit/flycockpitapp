@@ -34,7 +34,7 @@ use crate::engine::schedule::spec::{
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
 /// The fixed schema for the `schedule` meta-tool.
-pub const SCHEDULE_DESCRIPTION: &str = "Schedule async work: loop.start{prompt,interval,limit?,...}, loop.cancel{job_id}, background.start{command,cwd?}, background.tail{job_id,lines?}, background.cancel{job_id}, list{} (limit=1=timer)";
+pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work without blocking the conversation; choose `action` (`loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, `list`) and put per-action details in `args`; use limit=1 for one-shot timers";
 
 /// The defensive (`LlmMode::Defensive`) `schedule` description
 /// (implementation note): explicit steering for the
@@ -214,7 +214,7 @@ impl Tool for NoteTool {
     }
 
     fn description(&self) -> &str {
-        "Surface a progress note to the human now; it reaches the main conversation only at loop end"
+        "Show the human a live progress note from this background loop; notes join the main conversation when the loop ends"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -461,40 +461,29 @@ mod tests {
         assert_eq!(terse, defensive);
     }
 
-    /// The `schedule` description must name every action plus that action's
-    /// required `args` field(s), so the model is never pointed at a field
-    /// `spec.rs`'s parser rejects. This catches drift between the
-    /// description hints and the parser at `cargo test` time. The
-    /// `(action, &[required fields])` table mirrors the required-vs-optional
-    /// contract in `crate::engine::schedule::spec`.
+    /// The `schedule` description names the action surface but leaves
+    /// per-action field shapes to the machine-readable schema. Keeping field
+    /// names out of the prose prevents a second, drifting schema.
     #[test]
-    fn description_documents_each_action_and_required_fields() {
-        // Required fields per action, matching `spec.rs` exactly:
-        //   loop.start       → prompt, interval
-        //   loop.cancel      → job_id
-        //   background.start → command
-        //   background.tail  → job_id
-        //   background.cancel→ job_id
-        //   list             → (none)
-        let contract: &[(&str, &[&str])] = &[
-            ("loop.start", &["prompt", "interval"]),
-            ("loop.cancel", &["job_id"]),
-            ("background.start", &["command"]),
-            ("background.tail", &["job_id"]),
-            ("background.cancel", &["job_id"]),
-            ("list", &[]),
-        ];
-        for (action, required) in contract {
+    fn description_names_actions_without_parameter_shapes() {
+        for action in [
+            "loop.start",
+            "loop.cancel",
+            "background.start",
+            "background.tail",
+            "background.cancel",
+            "list",
+        ] {
             assert!(
                 SCHEDULE_DESCRIPTION.contains(action),
                 "`schedule` description must name action `{action}`"
             );
-            for field in *required {
-                assert!(
-                    SCHEDULE_DESCRIPTION.contains(field),
-                    "`schedule` description must name `{action}`'s required field `{field}`"
-                );
-            }
+        }
+        for field in ["prompt", "interval", "job_id", "command", "cwd", "lines"] {
+            assert!(
+                !SCHEDULE_DESCRIPTION.contains(field),
+                "`schedule` description should not duplicate schema field `{field}`"
+            );
         }
     }
 

@@ -222,7 +222,7 @@ impl Tool for WebSearchTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Search the web for current information; use webfetch separately for page content."
+            "Use `websearch` when you need current web discovery from a query or recent facts. It returns a bounded result list, not full page content. Do not put URLs here when you already know the page; use `webfetch` for one page's markdown."
                 .to_string(),
         )
     }
@@ -313,7 +313,7 @@ impl Tool for WebFetchTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Fetch an http or https URL and return the page as markdown.".to_string())
+        Some("Use `webfetch` when you already have a specific HTTP/HTTPS URL and need that page's markdown content. Do not use it for discovery or broad current research; start with `websearch` when you need to find candidate pages.".to_string())
     }
 
     fn parameters(&self) -> Value {

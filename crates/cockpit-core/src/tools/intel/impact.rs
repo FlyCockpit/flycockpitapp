@@ -10,7 +10,7 @@ impl Tool for ImpactTool {
         "impact"
     }
     fn description(&self) -> &str {
-        "Show a symbol's callers and the calls in its own body, high-precision name-resolved"
+        "Show one symbol's callers and body calls; for the blast radius of your current git diff, use `change_impact`"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

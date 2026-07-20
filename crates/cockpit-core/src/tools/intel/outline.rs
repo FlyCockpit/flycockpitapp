@@ -10,7 +10,7 @@ impl Tool for OutlineTool {
         "outline"
     }
     fn description(&self) -> &str {
-        "Show a file's symbols and imports in line order; regex fallback for unknown languages"
+        "Show one file's symbols/imports in line order; use `tree` for file lists, `context_pack` for overview, `read` for contents"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

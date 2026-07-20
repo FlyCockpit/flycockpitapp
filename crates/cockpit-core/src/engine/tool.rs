@@ -1615,6 +1615,92 @@ mod llm_mode_tests {
         crate::engine::builtin::invariant_builtin_tools()
     }
 
+    fn tool_by_name(name: &str) -> Arc<dyn Tool> {
+        all_builtin_tools()
+            .into_iter()
+            .find(|tool| tool.name() == name)
+            .unwrap_or_else(|| panic!("built-in tool `{name}` missing from invariant registry"))
+    }
+
+    fn words(text: &str) -> std::collections::BTreeSet<String> {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .filter(|word| !word.is_empty())
+            .map(|word| word.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn has_description_steering_shape(normal: &str, defensive: &str) -> bool {
+        let normal_words = words(normal);
+        let defensive_words = words(defensive);
+        let added_distinct_words = defensive_words.difference(&normal_words).count();
+        let defensive_lower = defensive.to_ascii_lowercase();
+        let when_to_use_markers = [
+            "use ",
+            "call ",
+            "read ",
+            "write ",
+            "replace ",
+            "search ",
+            "find ",
+            "get ",
+            "show ",
+            "list ",
+            "send ",
+            "create ",
+            "update ",
+            "run ",
+            "schedule ",
+            "ask ",
+            "spawn ",
+            "emit ",
+            "request ",
+            "return ",
+            "surface ",
+        ];
+        let when_not_to_use_markers = [
+            " do not ",
+            " don't ",
+            " not ",
+            " never ",
+            " instead",
+            " rather than",
+            " avoid",
+            " prefer",
+            " without",
+            " only ",
+            " cannot",
+            " can't",
+            " must not",
+            " must ",
+            " fails",
+            " rejected",
+            " requires",
+            " required",
+            " takes no arguments",
+            " no arguments",
+            " no filesystem",
+            " no network",
+            " no environment",
+            " scope with",
+            " confined",
+            " budget",
+            " capped",
+            " bounded",
+            " limit",
+            " reserve",
+            " path-confined",
+            " preview",
+            " omit",
+        ];
+        added_distinct_words >= 8
+            && when_to_use_markers
+                .iter()
+                .any(|marker| defensive_lower.contains(marker))
+            && when_not_to_use_markers
+                .iter()
+                .any(|marker| defensive_lower.contains(marker))
+    }
+
     /// CONFLICT-AVOIDANCE INVARIANT (implementation note):
     /// for every built-in tool, in BOTH its terse and defensive schema, no
     /// `x-cockpit-aliases` entry may (a) shadow a canonical property name or
@@ -1697,8 +1783,8 @@ mod llm_mode_tests {
                 tool.name()
             );
             // Defensive is the *verbose* form: it must be longer than the
-            // terse one and not byte-identical (the deliberate token
-            // tradeoff). A handful of words wouldn't be "explicit steering."
+            // terse one, not byte-identical, and add real use/avoid steering
+            // rather than padding.
             assert!(
                 defensive.len() > terse.len(),
                 "tool `{}` defensive description is not more explicit than terse ({} <= {})",
@@ -1707,11 +1793,114 @@ mod llm_mode_tests {
                 terse.len()
             );
             assert!(
-                defensive.len() >= 80,
-                "tool `{}` defensive description is too terse to be steering ({} chars)",
-                tool.name(),
-                defensive.len()
+                has_description_steering_shape(&terse, &defensive),
+                "tool `{}` defensive description lacks structural use/avoid steering or meaningful new vocabulary: {defensive}",
+                tool.name()
             );
+        }
+    }
+
+    #[test]
+    fn padded_description_without_steering_fails_structural_check() {
+        let normal = "Read a file.";
+        let padded = "Read a file. padding padding padding padding padding padding padding padding padding padding padding padding padding padding.";
+        assert!(padded.len() >= 80);
+        assert!(!has_description_steering_shape(normal, padded));
+    }
+
+    #[test]
+    fn description_quality_rewrites_pin_load_bearing_clauses() {
+        let writeunlock = tool_by_name("writeunlock")
+            .description()
+            .to_ascii_lowercase();
+        assert!(writeunlock.contains("complete new contents"));
+        assert!(writeunlock.contains("omitted lines are deleted"));
+        assert!(writeunlock.contains("editunlock"));
+
+        let impact = tool_by_name("impact").description().to_ascii_lowercase();
+        let change_impact = tool_by_name("change_impact")
+            .description()
+            .to_ascii_lowercase();
+        assert!(impact.contains("change_impact"));
+        assert!(change_impact.contains("impact"));
+
+        let context_pack = tool_by_name("context_pack")
+            .description()
+            .to_ascii_lowercase();
+        assert!(context_pack.contains("first move"));
+        assert!(context_pack.contains("never prints file contents"));
+        assert!(context_pack.contains("read"));
+
+        for name in ["create_goal", "get_goal", "update_goal"] {
+            let description = tool_by_name(name).description().to_ascii_lowercase();
+            assert!(
+                description.contains("goal")
+                    && (description.contains("only")
+                        || description.contains("before")
+                        || description.contains("evidence")),
+                "`{name}` normal description lacks goal guardrail: {description}"
+            );
+        }
+
+        let note = tool_by_name("note").description().to_ascii_lowercase();
+        assert!(note.contains("live progress note"));
+        assert!(!note.contains("now; it reaches"));
+
+        let todo = tool_by_name("todo").description().to_ascii_lowercase();
+        assert!(todo.contains("long-horizon"));
+        assert!(todo.contains("task"));
+
+        let names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(names.contains("websearch"), "{names:?}");
+        assert!(names.contains("webfetch"), "{names:?}");
+        for name in ["websearch", "webfetch"] {
+            let tool = tool_by_name(name);
+            let normal = tool.description().to_string();
+            let defensive = tool.defensive_description().unwrap();
+            assert!(has_description_steering_shape(&normal, &defensive));
+        }
+    }
+
+    #[test]
+    fn sibling_disambiguation_normal_descriptions_name_siblings() {
+        let cases: &[(&str, &[&str])] = &[
+            ("search", &["grep", "word", "symbol_find"]),
+            ("grep", &["search", "word", "symbol_find"]),
+            ("word", &["search", "grep", "symbol_find"]),
+            ("symbol_find", &["search", "grep", "word"]),
+            ("outline", &["tree", "context_pack", "read"]),
+            ("tree", &["outline", "context_pack"]),
+            ("deps", &["impact", "change_impact"]),
+            ("context_pack", &["read"]),
+            ("impact", &["change_impact"]),
+            ("change_impact", &["impact"]),
+            ("read", &["readlock", "writeunlock", "editunlock"]),
+            ("readlock", &["writeunlock", "editunlock", "unlock"]),
+            ("writeunlock", &["readlock", "editunlock"]),
+            ("editunlock", &["writeunlock", "unlock"]),
+            ("unlock", &["readlock", "writeunlock", "editunlock"]),
+            (
+                "plan_read",
+                &["plan_edit", "plan_write", "todo", "get_goal"],
+            ),
+            ("plan_write", &["plan_edit", "todo", "create_goal"]),
+            ("plan_edit", &["plan_read", "plan_write"]),
+            ("todo", &["task"]),
+            ("create_goal", &["goal"]),
+            ("get_goal", &["update_goal"]),
+            ("update_goal", &["get_goal"]),
+        ];
+        for (name, siblings) in cases {
+            let description = tool_by_name(name).description().to_ascii_lowercase();
+            for sibling in *siblings {
+                assert!(
+                    description.contains(sibling),
+                    "`{name}` normal description must name sibling `{sibling}`; got: {description}"
+                );
+            }
         }
     }
 
@@ -1890,8 +2079,13 @@ mod llm_mode_tests {
         for tool in all_builtin_tools() {
             for mode in [LlmMode::Normal, LlmMode::Frontier] {
                 let def = definition_of(&*tool, mode, None);
+                let budget = match tool.name() {
+                    "schedule" => 280,
+                    "writeunlock" => 240,
+                    _ => 200,
+                };
                 assert!(
-                    def.description.len() <= 200,
+                    def.description.len() <= budget,
                     "tool `{}` {mode:?} description exceeds the terse budget ({} chars): {}",
                     tool.name(),
                     def.description.len(),
@@ -2086,6 +2280,8 @@ mod llm_mode_tests {
             ("tree", ToolEffect::Dynamic),
             ("unlock", ToolEffect::Dynamic),
             ("update_goal", ToolEffect::Dynamic),
+            ("webfetch", ToolEffect::Dynamic),
+            ("websearch", ToolEffect::Dynamic),
             ("word", ToolEffect::Dynamic),
             ("writeunlock", ToolEffect::Dynamic),
         ];

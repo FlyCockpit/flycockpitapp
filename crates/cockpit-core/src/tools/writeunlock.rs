@@ -23,7 +23,7 @@ impl Tool for WriteunlockTool {
     }
 
     fn description(&self) -> &str {
-        "Use `writeunlock` for new files or full rewrites; existing files require prior read/readlock"
+        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted) and release the lock; new files or full rewrites only; prior read/readlock required for existing files; prefer `editunlock` for small changes"
     }
 
     fn defensive_description(&self) -> Option<String> {

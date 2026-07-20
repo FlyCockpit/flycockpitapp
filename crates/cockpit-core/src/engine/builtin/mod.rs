@@ -853,6 +853,8 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
             Arc::new(tools::schedule::ForkScheduleState::new("test".to_string())),
             tokio::sync::mpsc::channel(1).0,
         )),
+        Arc::new(tools::web::WebSearchTool),
+        Arc::new(tools::web::WebFetchTool),
         Arc::new(tools::mcp_tool::McpTool),
         Arc::new(tools::lsp::LspTool),
         Arc::new(tools::handoff::HandoffTool),

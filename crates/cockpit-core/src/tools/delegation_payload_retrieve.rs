@@ -21,7 +21,8 @@ impl Tool for DelegationPayloadRetrieveTool {
     fn defensive_description(&self) -> Option<String> {
         Some(
             "Retrieve the exact redacted delegation brief stored for this session. \
-             Use the 64-character lowercase sha256 hash from the delegation-payload marker."
+             Use the 64-character lowercase sha256 hash from the delegation-payload marker; \
+             do not guess or shorten the hash, and do not use this for unrelated tool results."
                 .to_string(),
         )
     }

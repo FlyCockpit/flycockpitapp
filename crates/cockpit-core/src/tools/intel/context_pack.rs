@@ -41,7 +41,7 @@ impl Tool for ContextPackTool {
     }
 
     fn description(&self) -> &str {
-        "Return a dense read-only codebase context packet for an overview, file, symbol, or query"
+        "First move in an unfamiliar repo: one compact packet combining files, symbols, imports, deps, and recency for an overview/file/symbol/query; never prints file contents; follow with ranged `read`"
     }
 
     fn defensive_description(&self) -> Option<String> {

@@ -3193,6 +3193,8 @@ mod attention_interrupt_surface_tests;
 #[cfg(test)]
 mod caffeinate_toast_tests;
 #[cfg(test)]
+mod config_snapshot_tests;
+#[cfg(test)]
 mod copy_cmd_tests;
 #[cfg(test)]
 mod ctrl_c_tests;

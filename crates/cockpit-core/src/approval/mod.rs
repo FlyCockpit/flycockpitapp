@@ -781,7 +781,7 @@ pub(crate) fn command_grant_allowed_by_policy(
     if info.wrapper {
         return false;
     }
-    let policy = approval_policy_for(info, store.approval_policy());
+    let policy = approval_policy_for(info, &store.approval_policy());
     store
         .command_grant_scope(&info.key)
         .is_some_and(|scope| scope.within(policy.max_scope))
@@ -848,7 +848,12 @@ mod tests {
         let session =
             crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
         let sid = session.id;
-        let store = GrantStore::new(db.clone(), sid, cwd.to_path_buf());
+        let store = GrantStore::new(
+            db.clone(),
+            sid,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+        );
         let hub = Arc::new(InterruptHub::detached());
         (Approver::new(store, db, sid, "builder", hub), sid)
     }

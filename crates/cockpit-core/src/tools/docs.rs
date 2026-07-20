@@ -406,7 +406,12 @@ mod tests {
     fn approver_for(ctx: &ToolCtx) -> Arc<crate::approval::Approver> {
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
-        let store = crate::approval::store::GrantStore::new(db.clone(), sid, ctx.cwd.clone());
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            sid,
+            ctx.cwd.clone(),
+            ctx.config.clone(),
+        );
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
         Arc::new(crate::approval::Approver::new(
             store,

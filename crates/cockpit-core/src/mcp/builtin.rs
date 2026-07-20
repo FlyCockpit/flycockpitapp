@@ -1252,8 +1252,12 @@ mod tests {
             db.clone(),
             ctx.session.id,
         ));
-        let store =
-            crate::approval::store::GrantStore::new(db.clone(), ctx.session.id, root.to_path_buf());
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
         let approver = Arc::new(crate::approval::Approver::new(
             store,
             db.clone(),

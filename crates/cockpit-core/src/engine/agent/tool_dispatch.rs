@@ -1403,7 +1403,12 @@ mod tests {
     ) -> ToolCtx {
         let mut ctx = tool_ctx(session.clone(), root, tx);
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
-        let store = GrantStore::new(session.db.clone(), session.id, root.to_path_buf());
+        let store = GrantStore::new(
+            session.db.clone(),
+            session.id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
         ctx.approver = Some(Arc::new(Approver::new(
             store,
             session.db.clone(),

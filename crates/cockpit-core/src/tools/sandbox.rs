@@ -497,7 +497,12 @@ mod tests {
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
         let hub = Arc::new(InterruptHub::detached());
-        let store = GrantStore::new(db.clone(), sid, cwd.to_path_buf());
+        let store = GrantStore::new(
+            db.clone(),
+            sid,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+        );
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
@@ -710,7 +715,12 @@ mod tests {
         let ctx = sandboxed_ctx(tmp.path());
         let target = outside.path().join("notes.txt");
         std::fs::write(&target, "notes").unwrap();
-        let store = GrantStore::new(ctx.session.db.clone(), ctx.session.id, ctx.cwd.clone());
+        let store = GrantStore::new(
+            ctx.session.db.clone(),
+            ctx.session.id,
+            ctx.cwd.clone(),
+            ctx.config.clone(),
+        );
         store
             .record_path(
                 outside.path(),

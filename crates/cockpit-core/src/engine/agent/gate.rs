@@ -255,7 +255,12 @@ mod safety_gate_tests {
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
         let approver = if with_approver {
-            let store = GrantStore::new(db.clone(), sid, root.to_path_buf());
+            let store = GrantStore::new(
+                db.clone(),
+                sid,
+                root.to_path_buf(),
+                crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            );
             Some(Arc::new(Approver::new(
                 store,
                 db,

@@ -402,7 +402,12 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     let cfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
     let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
-    let store = GrantStore::new(db.clone(), sid, cwd.to_path_buf());
+    let store = GrantStore::new(
+        db.clone(),
+        sid,
+        cwd.to_path_buf(),
+        crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+    );
     let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
     ToolCtx {
         agent_id: "builder".to_string(),
@@ -455,7 +460,12 @@ fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
         std::fs::create_dir_all(dir).unwrap();
     }
     let ctx = ctx_with_store(&project);
-    let store = GrantStore::new(ctx.session.db.clone(), ctx.session.id, ctx.cwd.clone());
+    let store = GrantStore::new(
+        ctx.session.db.clone(),
+        ctx.session.id,
+        ctx.cwd.clone(),
+        ctx.config.clone(),
+    );
     store
         .record_path(
             &read_dir,

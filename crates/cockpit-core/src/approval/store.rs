@@ -28,13 +28,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use crate::approval::classify::ApprovalKey;
+use crate::approval::classify::{ApprovalKey, RiskTier};
 use crate::config::extended::{ApprovalPolicyConfig, ApprovalPolicyScope};
+use crate::daemon::session_worker::SessionConfigHandle;
 use crate::db::Db;
 use crate::tools::shell_sandbox::SandboxPathAccess;
 
@@ -218,7 +220,32 @@ pub struct GrantStore {
     /// User-level cockpit config dir for `Global`-scope grants. Resolved
     /// once; `None` only if no home/data dir can be located.
     global_dir: Option<PathBuf>,
-    approval_policy: ApprovalPolicyConfig,
+    /// The session's held config, read live for the approval policy. This is
+    /// the session-scoped [`SessionConfigHandle`] seam — the policy is read
+    /// from it per call (in-memory, no disk) so a policy change on a live
+    /// session takes effect without rebuilding the store, and resolution is
+    /// trust-aware (the handle is fed by the daemon's `ConfigSource`, not a
+    /// bare per-cwd disk load).
+    config: SessionConfigHandle,
+    /// The last approval policy that passed validation. A malformed policy on
+    /// re-read is rejected and this value is returned instead, so an
+    /// unreadable/invalid policy can never fall open to a more permissive
+    /// outcome than the last known good one (security requirement).
+    last_good_policy: Mutex<ApprovalPolicyConfig>,
+}
+
+/// Whether an approval policy is well-formed enough to adopt. Scope *values*
+/// are already enum-validated at parse time; the only closed-domain **keys**
+/// are the risk-tier caps (`riskMaxScope`). An unrecognized risk key silently
+/// drops the cap the user intended, which would *widen* the allowed scope — a
+/// fall-open. A policy carrying one is therefore treated as malformed so the
+/// last good policy is kept instead. Program/command keys are an open domain
+/// (any command name) and are not validated.
+fn approval_policy_is_valid(policy: &ApprovalPolicyConfig) -> bool {
+    policy
+        .risk_max_scope
+        .keys()
+        .all(|key| RiskTier::from_policy_key(key).is_some())
 }
 
 impl GrantStore {
@@ -226,12 +253,29 @@ impl GrantStore {
     /// (via [`crate::git::find_worktree_root`], the same resolution the
     /// rest of the app uses) and the global config dir up front. The cwd is
     /// retained as the explicit base for any relative path grant key.
-    pub fn new(db: Db, session_id: uuid::Uuid, cwd: PathBuf) -> Self {
+    /// `config` is the session's held [`SessionConfigHandle`]: the store reads
+    /// the approval policy from it live (no per-call disk read) instead of
+    /// snapshotting it at construction. Session-scoped construction passes the
+    /// worker's live handle; turn-time tool contexts pass `ToolCtx.config`. A
+    /// standalone/no-session caller must pass an explicitly-resolved handle
+    /// (e.g. [`SessionConfigHandle::detached`]) — there is no implicit,
+    /// silently-permissive default policy source.
+    pub fn new(db: Db, session_id: uuid::Uuid, cwd: PathBuf, config: SessionConfigHandle) -> Self {
         let project_root = crate::git::find_worktree_root(&cwd)
             .filter(|root| crate::config::trust::project_config_allowed(&root.join(".cockpit")));
         let project_approvals_dir = project_root.as_deref().and_then(project_approvals_dir);
         let global_dir = global_approvals_dir();
-        let approval_policy = crate::config::extended::load_for_cwd(&cwd).approval_policy;
+        // Seed the last-good policy from the handle's current (already
+        // trust-aware, in-memory) policy if it is well-formed; otherwise the
+        // built-in default baseline. There is no prior "good" value to keep at
+        // construction, so this never reads disk and never falls open beyond
+        // the built-in defaults.
+        let initial = config.extended().approval_policy;
+        let last_good_policy = Mutex::new(if approval_policy_is_valid(&initial) {
+            initial
+        } else {
+            ApprovalPolicyConfig::default()
+        });
         Self {
             db,
             session_id,
@@ -239,7 +283,8 @@ impl GrantStore {
             project_root,
             project_approvals_dir,
             global_dir,
-            approval_policy,
+            config,
+            last_good_policy,
         }
     }
 
@@ -248,8 +293,31 @@ impl GrantStore {
         &self.cwd
     }
 
-    pub fn approval_policy(&self) -> &ApprovalPolicyConfig {
-        &self.approval_policy
+    /// The effective approval policy, read **live** from the session's held
+    /// config on every call (in-memory — no disk read). A policy change made
+    /// during the session is therefore observed without rebuilding the store.
+    ///
+    /// If the live policy is malformed (see [`approval_policy_is_valid`]) the
+    /// last good policy is returned and retained instead — an invalid policy
+    /// never falls open to a more permissive outcome (security requirement).
+    /// A single approval decision reads this once at the start, so a change
+    /// landing mid-decision never re-evaluates an in-flight prompt.
+    pub fn approval_policy(&self) -> ApprovalPolicyConfig {
+        let candidate = self.config.extended().approval_policy;
+        let mut last_good = self
+            .last_good_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if approval_policy_is_valid(&candidate) {
+            *last_good = candidate.clone();
+            candidate
+        } else {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "approval policy is malformed on re-read; keeping the last good policy (not falling open)"
+            );
+            last_good.clone()
+        }
     }
 
     /// Durable scopes where a path grant can actually be recorded for this
@@ -1231,7 +1299,12 @@ mod tests {
         let session =
             crate::session::Session::create(db.clone(), project.to_path_buf(), "builder").unwrap();
         let sid = session.id;
-        let mut store = GrantStore::new(db, sid, project.to_path_buf());
+        let mut store = GrantStore::new(
+            db,
+            sid,
+            project.to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(project),
+        );
         // Force deterministic scopes regardless of the test host's git
         // state: the temp project IS the root, approvals/global are temp dirs.
         point_project_scope(&mut store, project, &global);
@@ -1284,7 +1357,12 @@ mod tests {
 
         // Survives reload: a fresh store over the same DB + dirs sees it.
         let db2 = store.db.clone();
-        let mut reloaded = GrantStore::new(db2, sid, tmp.path().to_path_buf());
+        let mut reloaded = GrantStore::new(
+            db2,
+            sid,
+            tmp.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
         assert!(reloaded.is_command_granted(&info.key));
@@ -1307,7 +1385,12 @@ mod tests {
         let session =
             crate::session::Session::create(db.clone(), project.path().to_path_buf(), "builder")
                 .unwrap();
-        let store = GrantStore::new(db, session.id, project.path().to_path_buf());
+        let store = GrantStore::new(
+            db,
+            session.id,
+            project.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(project.path()),
+        );
         let project_dir = project_approvals_dir(project.path()).unwrap();
         assert_eq!(
             store.project_approvals_dir.as_deref(),
@@ -1363,8 +1446,12 @@ mod tests {
         // grant, because global applies everywhere.
         let other_project = tempfile::tempdir().unwrap();
         let db2 = store.db.clone();
-        let mut elsewhere =
-            GrantStore::new(db2, store.session_id, other_project.path().to_path_buf());
+        let mut elsewhere = GrantStore::new(
+            db2,
+            store.session_id,
+            other_project.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(other_project.path()),
+        );
         point_project_scope(&mut elsewhere, other_project.path(), global.path());
         elsewhere.global_dir = Some(global.path().to_path_buf());
         assert!(elsewhere.is_command_granted(&info.key));
@@ -1401,7 +1488,12 @@ mod tests {
             crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "builder")
                 .unwrap();
         let global = tempfile::tempdir().unwrap();
-        let mut store = GrantStore::new(db, session.id, tmp.path().to_path_buf());
+        let mut store = GrantStore::new(
+            db,
+            session.id,
+            tmp.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         store.global_dir = Some(global.path().to_path_buf());
         let info = cmd_info("cargo", Some("test"), false);
 
@@ -1703,7 +1795,12 @@ mod tests {
             assert!(!store.is_command_granted(&info.key), "scope {scope:?}");
 
             // Reload (fresh store over the same DB + dirs) still sees it.
-            let mut reloaded = GrantStore::new(store.db.clone(), sid, tmp.path().to_path_buf());
+            let mut reloaded = GrantStore::new(
+                store.db.clone(),
+                sid,
+                tmp.path().to_path_buf(),
+                SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            );
             point_project_scope(&mut reloaded, tmp.path(), global.path());
             reloaded.global_dir = Some(global.path().to_path_buf());
             assert!(reloaded.is_command_rejected(&info.key), "reload {scope:?}");
@@ -1933,7 +2030,12 @@ mod tests {
         // A fresh store over the same project dir (a later session) reads
         // the persisted project rule back.
         let db2 = store.db.clone();
-        let mut reloaded = GrantStore::new(db2, sid, tmp.path().to_path_buf());
+        let mut reloaded = GrantStore::new(
+            db2,
+            sid,
+            tmp.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
         assert_eq!(reloaded.loop_rule(&sig), Some(LoopVerdict::Accept));
@@ -1998,7 +2100,12 @@ mod tests {
         let session =
             crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
                 .unwrap();
-        let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
+        let mut store = GrantStore::new(
+            db,
+            session.id,
+            dir.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(dir.path()),
+        );
         point_project_scope(&mut store, dir.path(), dir.path());
         store
             .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
@@ -2044,7 +2151,12 @@ mod tests {
         let session =
             crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
                 .unwrap();
-        let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
+        let mut store = GrantStore::new(
+            db,
+            session.id,
+            dir.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(dir.path()),
+        );
         point_project_scope(&mut store, dir.path(), dir.path());
         store
             .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
@@ -2077,7 +2189,12 @@ mod tests {
         let session =
             crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
                 .unwrap();
-        let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
+        let mut store = GrantStore::new(
+            db,
+            session.id,
+            dir.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(dir.path()),
+        );
         point_project_scope(&mut store, dir.path(), dir.path());
         let path = dir.path().join("data");
         store
@@ -2122,5 +2239,245 @@ mod tests {
             .unwrap();
         assert_eq!(store.loop_rule(&sig_a), Some(LoopVerdict::Accept));
         assert!(store.loop_rule(&sig_b).is_none());
+    }
+
+    // ---- live approval-policy reload (approval-policy-live-reload) --------
+
+    use crate::daemon::session_worker::SessionConfigSnapshot;
+    use std::sync::{Arc, RwLock};
+
+    /// A config snapshot carrying `policy` as the effective approval policy;
+    /// everything else is default. Used to feed a specific policy through a
+    /// live [`SessionConfigHandle`] cell.
+    fn snapshot_with_policy(
+        generation: u64,
+        policy: ApprovalPolicyConfig,
+    ) -> SessionConfigSnapshot {
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.approval_policy = policy;
+        SessionConfigSnapshot::new(
+            generation,
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        )
+    }
+
+    /// Replace the live policy in a shared snapshot cell, as a daemon
+    /// re-resolution (`ReplaceConfigSnapshot`) would for a running session.
+    fn set_cell_policy(
+        cell: &Arc<RwLock<SessionConfigSnapshot>>,
+        generation: u64,
+        policy: ApprovalPolicyConfig,
+    ) {
+        *cell.write().unwrap() = snapshot_with_policy(generation, policy);
+    }
+
+    /// Build an in-memory-backed store whose approval policy is read live from
+    /// the returned shared cell. Mutating the cell simulates a policy change on
+    /// a running session. The `tmp` dir must outlive the store.
+    fn live_policy_store(
+        tmp: &Path,
+        initial: ApprovalPolicyConfig,
+    ) -> (GrantStore, Arc<RwLock<SessionConfigSnapshot>>) {
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), tmp.to_path_buf(), "builder").unwrap();
+        let cell = Arc::new(RwLock::new(snapshot_with_policy(1, initial)));
+        let store = GrantStore::new(
+            db,
+            session.id,
+            tmp.to_path_buf(),
+            SessionConfigHandle::new(cell.clone()),
+        );
+        (store, cell)
+    }
+
+    fn risk_policy(tier_key: &str, scope: ApprovalPolicyScope) -> ApprovalPolicyConfig {
+        let mut policy = ApprovalPolicyConfig::default();
+        policy.risk_max_scope.insert(tier_key.to_string(), scope);
+        policy
+    }
+
+    /// A1: a policy change during a live session is observed by the store
+    /// without rebuilding it.
+    #[test]
+    fn grant_store_observes_policy_change_without_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cell) = live_policy_store(
+            tmp.path(),
+            risk_policy("ordinary", ApprovalPolicyScope::Session),
+        );
+        assert_eq!(
+            store.approval_policy().risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Session),
+        );
+
+        // Change the policy live — no new store is constructed.
+        set_cell_policy(
+            &cell,
+            2,
+            risk_policy("ordinary", ApprovalPolicyScope::Project),
+        );
+        assert_eq!(
+            store.approval_policy().risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Project),
+            "the same store observed the live policy change",
+        );
+    }
+
+    /// A2: the accessor performs no disk read per call (asserted with the
+    /// existing `load_for_cwd` counter).
+    #[test]
+    fn approval_policy_accessor_does_no_disk_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _cell) = live_policy_store(tmp.path(), ApprovalPolicyConfig::default());
+        crate::config::extended::reset_load_for_cwd_call_count();
+        for _ in 0..5 {
+            let _ = store.approval_policy();
+        }
+        assert_eq!(
+            crate::config::extended::load_for_cwd_call_count(),
+            0,
+            "approval_policy() must not read config from disk",
+        );
+    }
+
+    /// A3: resolution is trust-aware — it flows through the in-memory
+    /// `SessionConfigHandle` (fed by the daemon's trust-aware `ConfigSource`
+    /// in production), never a bare `load_for_cwd`. Construction and reads
+    /// perform no bare disk load.
+    #[test]
+    fn grant_store_policy_resolution_is_trust_aware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut policy = ApprovalPolicyConfig::default();
+        policy
+            .program_max_scope
+            .insert("gh".to_string(), ApprovalPolicyScope::Project);
+        let (store, _cell) = live_policy_store(tmp.path(), policy);
+        // The resolution path reads through the handle (fed by the trust-aware
+        // ConfigSource in production), never a bare `load_for_cwd`.
+        crate::config::extended::reset_load_for_cwd_call_count();
+        let resolved = store.approval_policy();
+        assert_eq!(
+            crate::config::extended::load_for_cwd_call_count(),
+            0,
+            "no bare load_for_cwd on the resolution path",
+        );
+        assert_eq!(
+            resolved.program_max_scope.get("gh"),
+            Some(&ApprovalPolicyScope::Project),
+            "the store resolves exactly the policy carried by the handle",
+        );
+    }
+
+    /// A4: an in-flight decision captures the policy once at its start and is
+    /// not re-evaluated when the policy changes mid-decision; the next
+    /// decision observes the new policy.
+    #[test]
+    fn policy_change_does_not_affect_inflight_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cell) = live_policy_store(
+            tmp.path(),
+            risk_policy("ordinary", ApprovalPolicyScope::Session),
+        );
+
+        // The decision reads the policy once at its start.
+        let captured = store.approval_policy();
+
+        // The policy changes live, mid-decision.
+        set_cell_policy(
+            &cell,
+            2,
+            risk_policy("ordinary", ApprovalPolicyScope::Global),
+        );
+
+        // The in-flight decision's captured policy is unaffected...
+        assert_eq!(
+            captured.risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Session),
+        );
+        // ...while the next decision observes the new policy.
+        assert_eq!(
+            store.approval_policy().risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Global),
+        );
+    }
+
+    /// A5: a malformed policy keeps the last good value and never falls open
+    /// to a more permissive outcome. An unrecognized risk-tier key would
+    /// silently drop the intended cap (a fall-open) and is therefore rejected.
+    #[test]
+    fn invalid_policy_keeps_last_good_and_does_not_fall_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Last good policy tightens ordinary commands to Session (narrower
+        // than the built-in default of Global).
+        let (store, cell) = live_policy_store(
+            tmp.path(),
+            risk_policy("ordinary", ApprovalPolicyScope::Session),
+        );
+        assert_eq!(
+            store.approval_policy().risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Session),
+        );
+
+        // A malformed policy lands live: an unknown risk-tier key.
+        set_cell_policy(
+            &cell,
+            2,
+            risk_policy("not-a-tier", ApprovalPolicyScope::Global),
+        );
+
+        let resolved = store.approval_policy();
+        assert_eq!(
+            resolved.risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Session),
+            "malformed policy must keep the last good cap, not fall open",
+        );
+        assert!(
+            !resolved.risk_max_scope.contains_key("not-a-tier"),
+            "the malformed policy must not be adopted",
+        );
+    }
+
+    /// A6: grant-file behavior is unchanged — a direct file deletion (as the
+    /// permissions pane performs) still propagates to the same live store on
+    /// its next check, because grant files are re-read per check.
+    #[test]
+    fn grant_file_changes_still_propagate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("gh", Some("pr"), false);
+        store.record_command(&info, Scope::Project).unwrap();
+        assert!(store.is_command_granted(&info.key));
+
+        // Delete the grant straight from the file, as the permissions pane does.
+        let dir = test_project_dir(&store).to_path_buf();
+        assert!(delete_managed_grant(&dir, ManagedGrantKind::Command, "gh pr").unwrap());
+
+        // The same store sees the deletion on its next check (no rebuild).
+        assert!(!store.is_command_granted(&info.key));
+    }
+
+    /// A7: approval outcomes are unchanged for a static policy. A Session-scope
+    /// grant of an ordinary command is within the default cap (Global) and is
+    /// allowed without a prompt; repeated policy reads are stable.
+    #[test]
+    fn approval_outcomes_unchanged_for_static_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("gh", Some("pr"), false);
+
+        assert!(!crate::approval::command_grant_allowed_by_policy(
+            &store, &info
+        ));
+        store.record_command(&info, Scope::Session).unwrap();
+        assert!(crate::approval::command_grant_allowed_by_policy(
+            &store, &info
+        ));
+
+        // The static policy resolves to the same value on every read.
+        assert_eq!(store.approval_policy(), store.approval_policy());
     }
 }

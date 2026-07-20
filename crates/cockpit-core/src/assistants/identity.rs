@@ -603,6 +603,7 @@ mod tests {
             ctx.session.db.clone(),
             ctx.session.id,
             ctx.cwd.clone(),
+            ctx.config.clone(),
         );
         let approver = Arc::new(crate::approval::Approver::new(
             store,

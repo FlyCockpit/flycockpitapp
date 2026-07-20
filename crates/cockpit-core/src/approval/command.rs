@@ -185,9 +185,15 @@ impl Approver {
             // Nothing to run / can't reason about it → deny, don't guess.
             Classification::Empty | Classification::Unparseable(_) => return Ok(Decision::Deny),
         };
+        // Read the policy once at the start of the decision. The whole
+        // decision — prompt offer, await, and resolution — uses this captured
+        // policy, so a policy change landing mid-decision never re-evaluates
+        // this in-flight prompt under new rules (the next decision reads the
+        // new policy).
+        let policy_cfg = self.store.approval_policy();
         let policies: Vec<ApprovalPromptPolicy> = simple_commands
             .iter()
-            .map(|info| approval_policy_for(info, self.store.approval_policy()))
+            .map(|info| approval_policy_for(info, &policy_cfg))
             .collect();
 
         // Standing reject short-circuit (the mirror of the already-granted

@@ -147,6 +147,21 @@ impl RiskTier {
             RiskTier::Dynamic => "dynamic",
         }
     }
+
+    /// Parse a risk-tier key as it appears in an `approvalPolicy.riskMaxScope`
+    /// map. The key domain is closed (exactly these five tiers); an
+    /// unrecognized key is `None`, which the approval store treats as a
+    /// malformed policy rather than silently ignoring the intended cap.
+    pub fn from_policy_key(key: &str) -> Option<RiskTier> {
+        match key {
+            "ordinary" => Some(RiskTier::Ordinary),
+            "mutating" => Some(RiskTier::Mutating),
+            "destructive" => Some(RiskTier::Destructive),
+            "privileged" => Some(RiskTier::Privileged),
+            "dynamic" => Some(RiskTier::Dynamic),
+            _ => None,
+        }
+    }
 }
 
 /// The store key for a command-key grant: `argv[0]` plus the first

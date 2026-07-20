@@ -356,8 +356,12 @@ mod tests {
         let db = ctx.session.db.clone();
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
         let session_id = ctx.session.id;
-        let store =
-            crate::approval::store::GrantStore::new(db.clone(), session_id, root.to_path_buf());
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            session_id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
         let approver = Arc::new(crate::approval::Approver::new(
             store,
             db.clone(),

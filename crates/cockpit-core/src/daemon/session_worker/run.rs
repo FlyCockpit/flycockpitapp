@@ -576,6 +576,11 @@ async fn run_worker(
         session.db.clone(),
         session_id,
         project_root.clone(),
+        // Live handle over the worker's shared snapshot: the approval policy is
+        // read live and trust-aware (the snapshot is resolved by the daemon's
+        // `ConfigSource`), so a policy change on the running session takes
+        // effect without rebuilding the store.
+        SessionConfigHandle::new(config_snapshot.clone()),
     );
     let approver = Arc::new(crate::approval::Approver::new(
         grant_store,

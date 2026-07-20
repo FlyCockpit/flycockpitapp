@@ -85,10 +85,28 @@ impl App {
         self.reload_launch_info();
         self.reload_tui_config();
 
-        // Drop the runner so the next submit re-attaches the daemon
-        // with `session_id: None`, opening a fresh session.
-        self.agent_runner = None;
-        self.reset_display_attach_backoff();
+        let switch_task = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) if runner.can_switch_session() => {
+                Some(runner.switch_session_task(agent_runner::SessionTarget::New))
+            }
+            _ => None,
+        };
+        if let Some(switch_task) = switch_task {
+            self.async_actions.start(
+                AsyncActionKind::Internal("session.switch"),
+                AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+                async move {
+                    switch_task
+                        .await
+                        .map(|outcome| AsyncActionPayload::SessionSwitched(Box::new(outcome)))
+                },
+            );
+        } else {
+            // No live runner exists, so the next submit/attach path still
+            // creates a fresh session with `session_id: None`.
+            self.agent_runner = None;
+            self.reset_display_attach_backoff();
+        }
         // The fresh session is deferred-persistence until its first message
         // (session-id-display-and-lazy-persist).
         self.current_session_persisted = false;
@@ -115,5 +133,35 @@ impl App {
         }
 
         Ok(true)
+    }
+
+    pub(super) fn apply_session_switch_outcome(
+        &mut self,
+        outcome: agent_runner::SessionSwitchOutcome,
+    ) {
+        if let Some(Ok(runner)) = &mut self.agent_runner {
+            runner.session_id = outcome.session_id;
+            runner.short_id = outcome.short_id.clone();
+            runner.project_id = outcome.project_id.clone();
+            runner.foreground_target = outcome.foreground_target.clone();
+            runner.active_model_state = outcome.active_model_state.clone();
+            runner.history = outcome.history;
+            runner.paused_work = outcome.paused_work;
+            runner.repair_required = outcome.repair_required;
+            runner.btw_fork = outcome.btw_fork;
+        }
+        self.launch.session_id = Some(outcome.session_id);
+        self.launch.session_short_id = Some(outcome.short_id);
+        self.project_id = Some(outcome.project_id);
+        self.foreground_input_target = outcome.foreground_target;
+        if let Some(state) = outcome.active_model_state {
+            self.apply_active_model_state(
+                state.provider,
+                state.model,
+                state.diverged,
+                state.generation,
+            );
+        }
+        self.current_session_persisted = false;
     }
 }

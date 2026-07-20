@@ -3740,6 +3740,9 @@ mod queued_message_edit_tests {
             btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
+            current_client: None,
+            attach_context: None,
+            last_applied_seq: None,
             client_tasks: ClientTasks::default(),
         }
     }
@@ -4155,6 +4158,9 @@ mod paste_routing_tests {
             btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
+            current_client: None,
+            attach_context: None,
+            last_applied_seq: None,
             client_tasks: ClientTasks::default(),
         }
     }

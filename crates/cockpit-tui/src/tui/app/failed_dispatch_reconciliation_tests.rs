@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 
 use super::{App, DispatchOutcome, SideConversation};
 use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
+use crate::tui::async_action::{
+    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
+};
 use crate::tui::history::HistoryEntry;
 use cockpit_core::engine::message::UserSubmission;
 
@@ -58,6 +61,9 @@ fn runner_with_all_channels(
         btw_fork: None,
         daemon_version: "test".to_string(),
         daemon_compatible: true,
+        current_client: None,
+        attach_context: None,
+        last_applied_seq: None,
         client_tasks: ClientTasks::default(),
     }
 }
@@ -703,4 +709,42 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
         "kickoff user row appears as sent"
     );
     assert!(app.busy, "successful dispatch stays busy until AgentIdle");
+}
+
+#[tokio::test]
+async fn submission_during_swap_is_not_sent_to_previous_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let (input_tx, mut input_rx) = mpsc::channel(1);
+    let (record_tx, _record_rx) = mpsc::channel(4);
+    let (control_tx, _control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
+        input_tx,
+        record_tx,
+        control_tx,
+        Arc::new(Mutex::new(Vec::new())),
+    )));
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { std::future::pending::<Result<AsyncActionPayload, String>>().await },
+    );
+
+    let outcome = app.dispatch_optimistic_user_submission(
+        "hello".to_string(),
+        UserSubmission::text("hello".to_string()),
+        "engine",
+        true,
+        &[],
+    );
+
+    assert_eq!(outcome, DispatchOutcome::SessionSwitching);
+    assert!(input_rx.try_recv().is_err());
+    assert!(newest_user_failed(&app));
+    assert!(
+        error_lines(&app).iter().any(|line| {
+            line.starts_with("engine") && line.contains("session switch in progress")
+        })
+    );
+    assert!(!app.busy);
 }

@@ -59,6 +59,7 @@ pub enum AsyncActionPayload {
         active_model: Option<(String, String)>,
         estimate: crate::tui::agent_runner::GuidanceEstimate,
     },
+    SessionSwitched(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
     ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
         org: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
@@ -202,6 +203,10 @@ impl AsyncActionRunner {
 
     pub fn is_pending(&self, id: AsyncActionId) -> bool {
         self.pending.contains_key(&id)
+    }
+
+    pub fn has_pending_kind(&self, kind: &AsyncActionKind) -> bool {
+        self.pending.values().any(|pending| &pending.kind == kind)
     }
 
     pub fn start<F>(

@@ -121,6 +121,9 @@ pub struct AgentRunner {
     pub daemon_version: String,
     /// Whether this client is compatible with the daemon protocol/version.
     pub daemon_compatible: bool,
+    pub(crate) current_client: Option<Arc<RwLock<DaemonClient>>>,
+    pub(crate) attach_context: Option<Arc<RwLock<AttachRequestContext>>>,
+    pub(crate) last_applied_seq: Option<Arc<Mutex<Option<i64>>>>,
     /// Client-side forwarding/event tasks owned by this runner. Dropping a TUI
     /// runner must only tear down this socket-side plumbing; daemon-side
     /// session work keeps running until an explicit daemon request stops it.
@@ -161,6 +164,44 @@ impl AgentRunner {
     pub fn event_notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.event_notify)
     }
+
+    pub fn can_switch_session(&self) -> bool {
+        self.current_client.is_some()
+            && self.attach_context.is_some()
+            && self.last_applied_seq.is_some()
+    }
+
+    pub fn switch_session_task(
+        &self,
+        target: SessionTarget,
+    ) -> impl std::future::Future<Output = Result<SessionSwitchOutcome, String>> + Send + 'static
+    {
+        let current_client = self.current_client.clone();
+        let attach_context = self.attach_context.clone();
+        let last_applied_seq = self.last_applied_seq.clone();
+        let active_agent = Arc::clone(&self.active_agent);
+        let active_agent_path = Arc::clone(&self.active_agent_path);
+        async move {
+            let Some(current_client) = current_client else {
+                return Err("runner has no attached daemon client".to_string());
+            };
+            let Some(attach_context) = attach_context else {
+                return Err("runner has no attach context".to_string());
+            };
+            let Some(last_applied_seq) = last_applied_seq else {
+                return Err("runner has no session sequence state".to_string());
+            };
+            switch_session_inner(
+                current_client,
+                attach_context,
+                last_applied_seq,
+                active_agent,
+                active_agent_path,
+                target,
+            )
+            .await
+        }
+    }
 }
 
 fn push_turn_event(events: &Arc<Mutex<Vec<TurnEvent>>>, notify: &Arc<Notify>, event: TurnEvent) {
@@ -179,11 +220,33 @@ pub(crate) fn drain_turn_events(events: &Arc<Mutex<Vec<TurnEvent>>>) -> Vec<Turn
 }
 
 #[derive(Clone)]
-struct AttachRequestContext {
+pub(crate) struct AttachRequestContext {
     session_id: Uuid,
     project_root: String,
     no_sandbox: bool,
     env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTarget {
+    New,
+    Resume {
+        session_id: Uuid,
+        since_seq: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSwitchOutcome {
+    pub session_id: Uuid,
+    pub short_id: String,
+    pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
+    pub active_model_state: Option<proto::ActiveModelState>,
+    pub project_id: String,
+    pub history: Vec<proto::HistoryEntry>,
+    pub paused_work: Vec<proto::PausedWorkSummary>,
+    pub repair_required: Option<proto::ResumeRepairState>,
+    pub btw_fork: Option<proto::BtwForkInfo>,
 }
 
 #[derive(Clone)]
@@ -302,6 +365,90 @@ fn current_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>) -> Optio
     *last_applied_seq
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+async fn switch_session_inner(
+    current_client: Arc<RwLock<DaemonClient>>,
+    attach_context: Arc<RwLock<AttachRequestContext>>,
+    last_applied_seq: Arc<Mutex<Option<i64>>>,
+    active_agent: Arc<Mutex<String>>,
+    active_agent_path: Arc<Mutex<Vec<String>>>,
+    target: SessionTarget,
+) -> Result<SessionSwitchOutcome, String> {
+    let ctx = attach_context.read().await.clone();
+    let (target_session_id, since_seq) = match target {
+        SessionTarget::New => (None, None),
+        SessionTarget::Resume {
+            session_id,
+            since_seq,
+        } => (Some(session_id), since_seq),
+    };
+    let response = current_client
+        .read()
+        .await
+        .clone()
+        .request(Request::Attach {
+            session_id: target_session_id,
+            since_seq,
+            project_root: Some(ctx.project_root.clone()),
+            no_sandbox: ctx.no_sandbox,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+            env_snapshot: Some(ctx.env_snapshot.clone()),
+            env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+        })
+        .await
+        .map_err(|e| format!("attach: {e}"))?;
+    match response {
+        Ok(Response::Attached {
+            session_id,
+            short_id,
+            active_agent: new_active_agent,
+            active_agent_path: new_active_agent_path,
+            foreground_target,
+            active_model_state,
+            project_id,
+            history,
+            paused_work,
+            repair_required,
+            btw_fork,
+            ..
+        }) => {
+            *active_agent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_active_agent.clone();
+            *active_agent_path
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                if new_active_agent_path.is_empty() {
+                    vec![new_active_agent]
+                } else {
+                    new_active_agent_path
+                };
+            *last_applied_seq
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                history.iter().filter_map(history_entry_seq).max();
+            attach_context.write().await.session_id = session_id;
+            Ok(SessionSwitchOutcome {
+                session_id,
+                short_id,
+                foreground_target: foreground_target.map(queue_target_from_proto),
+                active_model_state,
+                project_id,
+                history,
+                paused_work,
+                repair_required: repair_required.map(|repair| *repair),
+                btw_fork,
+            })
+        }
+        Ok(other) => Err(format!("unexpected attach response: {other:?}")),
+        Err(error) if error.code == ErrorCode::ProtocolVersion => {
+            Err(incompatible_protocol_chip().to_string())
+        }
+        Err(error) => Err(format!("attach: daemon error: {error}")),
+    }
 }
 
 fn is_global_event(event: &proto::Event) -> bool {
@@ -549,14 +696,14 @@ fn try_spawn_inner(
         history.iter().filter_map(history_entry_seq).max(),
     ));
     let current_client = Arc::new(RwLock::new(client));
-    let attach_context = AttachRequestContext {
+    let attach_context = Arc::new(RwLock::new(AttachRequestContext {
         session_id,
         project_root: cwd.to_string_lossy().into_owned(),
         no_sandbox,
         env_snapshot: cockpit_core::env_snapshot::capture_tui_shell_env()
             .0
             .to_wire(),
-    };
+    }));
     let mut client_tasks = ClientTasks::default();
 
     // Outbound: TUI sends a submission (text + any image parts) → upload image
@@ -711,6 +858,7 @@ fn try_spawn_inner(
                     } else if saw_draining {
                         saw_draining = false;
                     }
+                    let session_id = attach_context.read().await.session_id;
                     let incoming = IncomingEventContext {
                         session_id,
                         events: &events,
@@ -720,11 +868,10 @@ fn try_spawn_inner(
                         primary_agent: &primary_agent,
                         last_applied_seq: &last_applied_seq,
                     };
+                    let project_root = attach_context.read().await.project_root.clone();
                     if refresh_skill_inventory
                         && let Ok(Response::Skills { skills }) = client
-                            .request_ok(Request::ListSkills {
-                                project_root: attach_context.project_root.clone(),
-                            })
+                            .request_ok(Request::ListSkills { project_root })
                             .await
                     {
                         *skill_inventory_names.lock().unwrap() = Some(
@@ -752,8 +899,10 @@ fn try_spawn_inner(
                 let mut backoff = ReconnectBackoff::new();
                 loop {
                     tokio::time::sleep(backoff.next_delay()).await;
-                    match reconnect_and_attach(&driver, &attach_context, &last_applied_seq).await {
+                    let attach_snapshot = attach_context.read().await.clone();
+                    match reconnect_and_attach(&driver, &attach_snapshot, &last_applied_seq).await {
                         Ok(attached) => {
+                            let session_id = attach_context.read().await.session_id;
                             let incoming = IncomingEventContext {
                                 session_id,
                                 events: &events,
@@ -824,6 +973,9 @@ fn try_spawn_inner(
         btw_fork,
         daemon_version,
         daemon_compatible,
+        current_client: Some(current_client),
+        attach_context: Some(attach_context),
+        last_applied_seq: Some(last_applied_seq),
         client_tasks,
     })
 }
@@ -2185,6 +2337,9 @@ mod tests {
             btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
+            current_client: None,
+            attach_context: None,
+            last_applied_seq: None,
             client_tasks,
         }
     }

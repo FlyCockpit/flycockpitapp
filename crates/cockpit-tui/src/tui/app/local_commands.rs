@@ -137,6 +137,20 @@ impl App {
             persist_failed: false,
         });
         self.push_tag_call_entries(tag_expansions);
+        if self
+            .async_actions
+            .has_pending_kind(&AsyncActionKind::Internal("session.switch"))
+        {
+            let outcome = DispatchOutcome::SessionSwitching;
+            if owns_working_span {
+                self.fresh_queue_ack = FreshQueueAck::None;
+            }
+            self.reconcile_failed_dispatch(outcome, error_prefix, tag_expansions.len());
+            if owns_working_span && outcome.span_orphaned() {
+                self.end_working_span();
+            }
+            return outcome;
+        }
         self.ensure_agent_runner();
         let outcome = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.input_tx.try_send(submission) {

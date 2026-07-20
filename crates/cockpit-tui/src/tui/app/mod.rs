@@ -1067,6 +1067,9 @@ pub(super) enum DispatchOutcome {
     /// Runner construction failed (`Some(Err(_))`) — e.g. the model
     /// won't resolve, so no worker was ever spawned.
     RunnerFailed,
+    /// A session switch is in flight; sending now would target the outgoing
+    /// daemon attachment.
+    SessionSwitching,
     /// No runner present (`None`) — nothing was started.
     NoRunner,
 }
@@ -1080,6 +1083,7 @@ impl DispatchOutcome {
             DispatchOutcome::QueueFull
                 | DispatchOutcome::DriverClosed
                 | DispatchOutcome::RunnerFailed
+                | DispatchOutcome::SessionSwitching
                 | DispatchOutcome::NoRunner
         )
     }
@@ -1093,6 +1097,9 @@ fn failed_dispatch_line(prefix: &str, outcome: DispatchOutcome) -> String {
         }
         DispatchOutcome::DriverClosed => format!("{prefix}: engine driver task has exited"),
         DispatchOutcome::RunnerFailed => format!("{prefix}: could not start agent runner"),
+        DispatchOutcome::SessionSwitching => {
+            format!("{prefix}: session switch in progress — try again in a moment")
+        }
         DispatchOutcome::NoRunner => format!("{prefix}: no engine runner — cannot start"),
     }
 }

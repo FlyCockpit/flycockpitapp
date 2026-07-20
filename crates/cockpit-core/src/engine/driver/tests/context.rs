@@ -606,6 +606,542 @@ async fn shadow_killswitch_restores_sync() {
     assert_eq!(compact_inference_purposes(&driver), ["compact_brief"]);
 }
 
+fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
+    use crate::engine::message::{AssistantContent, OneOrMany};
+    use rig::message::{ToolCall, ToolFunction};
+
+    let (mut driver, tmp) = test_driver_without_network(8);
+    let old = driver.stack[0].agent.clone();
+    let tools =
+        crate::engine::tool::ToolBox::new().with(std::sync::Arc::new(crate::tools::read::ReadTool));
+    driver.stack[0].agent = std::sync::Arc::new(Agent {
+        name: old.name.clone(),
+        system: old.system.clone(),
+        role_prompt: old.role_prompt.clone(),
+        tools,
+        model: old.model.clone(),
+        params: old.params.clone(),
+        scan_tool_results: old.scan_tool_results,
+        llm_mode: crate::config::extended::LlmMode::Normal,
+        delegated: false,
+        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        env_overlay: old.env_overlay.clone(),
+    });
+    install_test_providers(
+        &mut driver,
+        crate::config::providers::CacheMode::None,
+        crate::config::providers::ContextConfig::default(),
+        100_000,
+    );
+    std::fs::write(driver.cwd.join("seed.txt"), "seed body").unwrap();
+    driver
+        .session
+        .record_tool_call(crate::session::ToolCallRow {
+            event_id: uuid::Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".into(),
+            call_id: "seed-source".into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: crate::session::ToolCallProviderIdentity::default(),
+            tool: "read".into(),
+            path: Some("seed.txt".into()),
+            mcp_server: None,
+            original_input_json: serde_json::json!({ "path": "seed.txt" }),
+            wire_input_json: serde_json::json!({ "path": "seed.txt" }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: "seed body".into(),
+            truncated: false,
+            duration_ms: 1,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            shape_fingerprint: None,
+            hint: None,
+        })
+        .unwrap();
+
+    let original = (0..700)
+        .map(|index| format!("noise line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    driver.stack[0].history = vec![
+        Message::user("run the suite"),
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "bash-condense".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        },
+        Message::tool_result_with_call_id("bash-condense".to_string(), None, original),
+        Message::assistant("suite complete"),
+        Message::user("next step"),
+        Message::assistant("continue"),
+    ];
+    (driver, tmp)
+}
+
+fn compact_ready_without_session_id(event: &TurnEvent) -> serde_json::Value {
+    match event {
+        TurnEvent::CompactReady {
+            handoff,
+            brief,
+            source,
+            trigger_ctx_pct,
+            tokens_before,
+            tokens_after,
+            turns_summarized,
+            tail_kept,
+            tail_trimmed,
+            seed_tool_count,
+            seed_tool_tokens,
+            ..
+        } => serde_json::json!({
+            "handoff": handoff,
+            "brief": brief,
+            "source": source,
+            "trigger_ctx_pct": trigger_ctx_pct,
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+            "turns_summarized": turns_summarized,
+            "tail_kept": tail_kept,
+            "tail_trimmed": tail_trimmed,
+            "seed_tool_count": seed_tool_count,
+            "seed_tool_tokens": seed_tool_tokens,
+        }),
+        other => panic!("expected CompactReady, got {other:?}"),
+    }
+}
+
+fn compact_record_without_session_ids(driver: &Driver) -> serde_json::Value {
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    let mut data = events
+        .iter()
+        .find(|event| event.kind == "session_compacted")
+        .expect("session_compacted event")
+        .data
+        .clone();
+    for key in [
+        "predecessor_session_id",
+        "predecessor_short_id",
+        "successor_session_id",
+        "successor_short_id",
+    ] {
+        data.as_object_mut().unwrap().remove(key);
+    }
+    data
+}
+
+fn test_json_hash(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(serde_json::to_vec(value).unwrap());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[tokio::test]
+async fn prepare_commits_nothing() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    let before_history = serde_json::to_value(&driver.stack[0].history).unwrap();
+    let events_before = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+
+    assert_eq!(
+        serde_json::to_value(&driver.stack[0].history).unwrap(),
+        before_history
+    );
+    assert_eq!(prepared.compressed_entries.len(), 1);
+    assert_eq!(prepared.seed_tools.len(), 1);
+    assert!(
+        driver
+            .session
+            .db
+            .list_compressed_tool_results(driver.session.id)
+            .unwrap()
+            .is_empty(),
+        "prepare must not persist compressed results"
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .take_seed_tools(driver.session.id)
+            .unwrap()
+            .is_empty(),
+        "prepare must not persist seed tools"
+    );
+    let events_after = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    assert_eq!(
+        events_before
+            .iter()
+            .filter(|event| event.kind == "session_compacted")
+            .count(),
+        events_after
+            .iter()
+            .filter(|event| event.kind == "session_compacted")
+            .count(),
+        "prepare must not record a compaction boundary"
+    );
+    assert!(rx.try_recv().is_err(), "prepare emits no UI events");
+}
+
+#[tokio::test]
+async fn prepared_compaction_round_trips_serde() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    let encoded = serde_json::to_string(&prepared).unwrap();
+    let decoded: PreparedCompaction = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, prepared);
+}
+
+#[tokio::test]
+async fn apply_runs_no_inference() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    let before = compact_inference_purposes(&driver);
+
+    driver
+        .apply_prepared_compaction(prepared, &tx)
+        .await
+        .expect("apply succeeds");
+
+    assert_eq!(compact_inference_purposes(&driver), before);
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn apply_rejects_stale_prepared_compaction() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    driver.stack[0].history.push(Message::user("late turn"));
+    let before_apply = serde_json::to_value(&driver.stack[0].history).unwrap();
+
+    let error = driver
+        .apply_prepared_compaction(prepared, &tx)
+        .await
+        .expect_err("stale prepared compaction is rejected");
+
+    assert!(matches!(error, PreparedCompactionApplyError::Stale { .. }));
+    assert_eq!(
+        serde_json::to_value(&driver.stack[0].history).unwrap(),
+        before_apply
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_compressed_tool_results(driver.session.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "session_compacted")
+    );
+    assert!(rx.try_recv().is_err(), "stale apply emits no events");
+}
+
+#[tokio::test]
+async fn apply_of_prepared_matches_synchronous_path() {
+    let (mut split_driver, _tmp_a) = prepare_apply_fixture();
+    let (mut sync_driver, _tmp_b) = prepare_apply_fixture();
+    let (split_tx, mut split_rx) = mpsc::channel::<TurnEvent>(64);
+    let (sync_tx, mut sync_rx) = mpsc::channel::<TurnEvent>(64);
+
+    let prepared = split_driver
+        .prepare_compaction_with_source(&split_tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    split_driver
+        .apply_prepared_compaction(prepared, &split_tx)
+        .await
+        .expect("apply succeeds");
+    sync_driver.do_compact_with_source(&sync_tx, "manual").await;
+    drop(split_tx);
+    drop(sync_tx);
+
+    let mut split_events = Vec::new();
+    while let Some(event) = split_rx.recv().await {
+        split_events.push(event);
+    }
+    let mut sync_events = Vec::new();
+    while let Some(event) = sync_rx.recv().await {
+        sync_events.push(event);
+    }
+    let split_ready = split_events
+        .iter()
+        .find(|event| matches!(event, TurnEvent::CompactReady { .. }))
+        .expect("split CompactReady");
+    let sync_ready = sync_events
+        .iter()
+        .find(|event| matches!(event, TurnEvent::CompactReady { .. }))
+        .expect("sync CompactReady");
+
+    assert_eq!(
+        serde_json::to_value(&split_driver.stack[0].history).unwrap(),
+        serde_json::to_value(&sync_driver.stack[0].history).unwrap()
+    );
+    assert_eq!(
+        compact_ready_without_session_id(split_ready),
+        compact_ready_without_session_id(sync_ready)
+    );
+    assert_eq!(
+        compact_record_without_session_ids(&split_driver),
+        compact_record_without_session_ids(&sync_driver)
+    );
+    assert_eq!(
+        split_driver
+            .session
+            .db
+            .take_seed_tools(split_driver.session.id)
+            .unwrap(),
+        sync_driver
+            .session
+            .db
+            .take_seed_tools(sync_driver.session.id)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn compact_end_to_end_unchanged() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let ready = events
+        .iter()
+        .find(|event| matches!(event, TurnEvent::CompactReady { .. }))
+        .expect("CompactReady emitted");
+    let snapshot = serde_json::json!({
+        "history_hash": test_json_hash(&serde_json::to_value(&driver.stack[0].history).unwrap()),
+        "compact_ready": compact_ready_without_session_id(ready),
+        "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver)),
+        "seed_tools": driver.session.db.take_seed_tools(driver.session.id).unwrap(),
+    });
+    assert_eq!(
+        snapshot,
+        serde_json::json!({
+            "history_hash": "fee7e7228af0fe49c45870e176573494eb0ef492fe1c5bba120d5f53dc8f9392",
+            "compact_ready": {
+                "brief": "test compact brief",
+                "handoff": "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n",
+                "seed_tool_count": 1,
+                "seed_tool_tokens": 6,
+                "source": "manual",
+                "tail_kept": 2,
+                "tail_trimmed": 0,
+                "tokens_after": 2265,
+                "tokens_before": 3642,
+                "trigger_ctx_pct": null,
+                "turns_summarized": 0,
+            },
+            "session_compacted_hash": "5f2084ca68843b30028c5c425693e386d2855d53a7acfae5e892fa2473c04dcb",
+            "seed_tools": [
+                {
+                    "args": {
+                        "path": "seed.txt",
+                    },
+                    "tool": "read",
+                },
+            ],
+        })
+    );
+    assert!(
+        matches!(events.last(), Some(TurnEvent::CompactReady { brief, .. }) if brief == "test compact brief"),
+        "synchronous entry point still emits CompactReady last"
+    );
+    assert!(
+        driver.stack[0]
+            .history
+            .first()
+            .is_some_and(|message| matches!(message, Message::User { .. })),
+        "compacted history still starts with the handoff"
+    );
+    assert_eq!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "session_compacted")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
+    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let apply_trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    driver.test_compaction_apply_trace = Some(apply_trace.clone());
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+
+    driver
+        .apply_prepared_compaction(prepared, &tx)
+        .await
+        .expect("apply succeeds");
+    drop(tx);
+
+    let mut emitted = Vec::new();
+    while let Some(event) = rx.recv().await {
+        emitted.push(event);
+    }
+    let seed_start = emitted
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ToolStart { tool, .. } if tool == "read"))
+        .expect("seed read starts");
+    let seed_end = emitted
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ToolEnd { tool, output, .. } if tool == "read" && output.contains("seed body")))
+        .expect("seed read ends");
+    let ready = emitted
+        .iter()
+        .position(|event| matches!(event, TurnEvent::CompactReady { .. }))
+        .expect("CompactReady emitted");
+    assert!(
+        seed_start < seed_end && seed_end < ready,
+        "seed tools run before CompactReady: {emitted:?}"
+    );
+    assert_eq!(ready, emitted.len() - 1, "CompactReady is last");
+
+    let stored = driver
+        .session
+        .db
+        .list_compressed_tool_results(driver.session.id)
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    let persisted_seeds = driver
+        .session
+        .db
+        .take_seed_tools(driver.session.id)
+        .unwrap();
+    assert_eq!(persisted_seeds.len(), 1);
+    let db_events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    assert!(
+        db_events
+            .iter()
+            .find(|event| event.kind == "session_compacted")
+            .is_some(),
+        "timeline boundary is recorded during apply"
+    );
+    assert_eq!(
+        *apply_trace.lock().unwrap(),
+        [
+            "compressed_results_persisted",
+            "live_history_swapped",
+            "seed_tools_persisted",
+            "timeline_recorded",
+            "seed_tools_ran",
+            "compact_ready_emitted",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rollback_paths_are_gone_because_prepare_is_pure() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    driver.stack[0].history = vec![Message::user("keep me"), Message::assistant("kept")];
+    let before = serde_json::to_value(&driver.stack[0].history).unwrap();
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 0);
+
+    assert!(
+        driver
+            .prepare_compaction_with_source(&tx, "manual")
+            .await
+            .is_err(),
+        "zero-window prepare fails before any apply-phase side effect"
+    );
+
+    assert_eq!(
+        serde_json::to_value(&driver.stack[0].history).unwrap(),
+        before
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_compressed_tool_results(driver.session.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "session_compacted")
+    );
+    assert!(rx.try_recv().is_err(), "failed prepare emits no events");
+}
+
 /// Threshold-branch auto-prune: a WARM cache (ephemeral, just sent) with
 /// ctx% > the prune ctx% (50) AND prunable% > the prunable% (30) prunes
 /// anyway, accepting the cache bust — and the `Pruned` event carries
@@ -681,7 +1217,7 @@ async fn auto_prune_threshold_branch_prunes_warm_cache_with_cache_break() {
 #[tokio::test]
 async fn auto_compact_fires_at_threshold_once() {
     use crate::config::providers::{CacheMode, ContextConfig};
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
     let fixture_model = driver.stack[0].agent.model.clone();
@@ -785,7 +1321,7 @@ async fn auto_compact_fires_at_threshold_once() {
 async fn oversized_compact_handoff_leaves_history_unchanged() {
     use crate::config::providers::{CacheMode, ContextConfig};
 
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     driver.stack[0].history = vec![
         Message::user("retain this exact user turn"),
@@ -794,7 +1330,8 @@ async fn oversized_compact_handoff_leaves_history_unchanged() {
     let before = serde_json::to_value(&driver.stack[0].history).unwrap();
     // The empty planning placeholder fits, while the assembled five-section
     // handoff plus deterministic appendix cannot land below 60% of this tiny
-    // window. This exercises the driver's rollback after prune-first.
+    // window. This exercises the pure prepare failure path after the private
+    // prune-first derivation.
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 40);
 
     driver.do_compact(&tx).await;
@@ -831,7 +1368,7 @@ async fn oversized_compact_handoff_leaves_history_unchanged() {
 async fn zero_window_compact_fails_explicitly_without_mutation() {
     use crate::config::providers::{CacheMode, ContextConfig};
 
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
     driver.stack[0].history = vec![Message::user("keep me"), Message::assistant("kept")];
     let before = serde_json::to_value(&driver.stack[0].history).unwrap();
@@ -853,7 +1390,7 @@ async fn zero_window_compact_fails_explicitly_without_mutation() {
 async fn compact_prune_stage_does_not_mutate_live_history() {
     use crate::config::providers::{CacheMode, ContextConfig};
 
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
     driver.stack[0].history = dup_read_history_big();
     let before = serde_json::to_value(&driver.stack[0].history).unwrap();
@@ -878,7 +1415,7 @@ async fn compact_private_prune_preserves_shell_condensation() {
     use crate::engine::message::{AssistantContent, OneOrMany};
     use rig::message::{ToolCall, ToolFunction};
 
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     let original = (0..700)
         .map(|index| format!("noise line {index}"))
@@ -924,7 +1461,7 @@ async fn compact_private_prune_preserves_shell_condensation() {
 
 #[test]
 fn compact_tail_prompt_uses_durable_session_event_seqs() {
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_without_network(8);
     let agent = driver.active_agent().to_string();
     let mut recorded = Vec::new();
     let mut excluded_skill_seq = None;

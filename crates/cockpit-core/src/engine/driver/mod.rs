@@ -706,6 +706,8 @@ pub struct Driver {
     /// prompt, and revision history without opening a socket.
     #[cfg(test)]
     test_compact_brief_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
+    #[cfg(test)]
+    test_compaction_apply_trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
     redaction_scan_ssh_keys_override: Option<bool>,
@@ -1176,6 +1178,8 @@ impl Driver {
             test_fail_next_model_switch_audit_record: self.test_fail_next_model_switch_audit_record,
             #[cfg(test)]
             test_compact_brief_calls: self.test_compact_brief_calls.clone(),
+            #[cfg(test)]
+            test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
             redaction_scan_ssh_keys_override: self.redaction_scan_ssh_keys_override,
@@ -1466,6 +1470,8 @@ impl Driver {
             test_fail_next_model_switch_audit_record: false,
             #[cfg(test)]
             test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            #[cfg(test)]
+            test_compaction_apply_trace: None,
             redaction_scan_environment_override: None,
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,

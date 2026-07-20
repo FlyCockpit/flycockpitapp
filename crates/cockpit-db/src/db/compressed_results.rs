@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompressedToolResultEntry {
     pub hash: String,
     pub session_id: Uuid,

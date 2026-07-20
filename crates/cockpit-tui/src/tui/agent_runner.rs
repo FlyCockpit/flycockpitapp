@@ -253,6 +253,7 @@ pub enum SessionTarget {
 
 #[derive(Debug, Clone)]
 pub struct SessionSwitchOutcome {
+    pub target: SessionTarget,
     pub session_id: Uuid,
     pub short_id: String,
     pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
@@ -262,6 +263,8 @@ pub struct SessionSwitchOutcome {
     pub paused_work: Vec<proto::PausedWorkSummary>,
     pub repair_required: Option<proto::ResumeRepairState>,
     pub btw_fork: Option<proto::BtwForkInfo>,
+    pub daemon_version: String,
+    pub daemon_compatible: bool,
 }
 
 #[derive(Clone)]
@@ -392,6 +395,7 @@ async fn switch_session_inner(
     target: SessionTarget,
 ) -> Result<SessionSwitchOutcome, String> {
     let ctx = attach_context.read().await.clone();
+    let requested_target = target;
     let (target_session_id, since_seq) = match target {
         SessionTarget::New => (None, None),
         SessionTarget::Resume {
@@ -429,6 +433,8 @@ async fn switch_session_inner(
             paused_work,
             repair_required,
             btw_fork,
+            daemon_version,
+            compatible,
             ..
         }) => Ok(apply_session_switch_attached(
             SessionSwitchAttached {
@@ -443,7 +449,10 @@ async fn switch_session_inner(
                 paused_work,
                 repair_required: repair_required.map(|repair| *repair),
                 btw_fork,
+                daemon_version,
+                daemon_compatible: compatible,
             },
+            requested_target,
             &session_id_state,
             &last_applied_seq,
             &active_agent,
@@ -469,10 +478,13 @@ struct SessionSwitchAttached {
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
     btw_fork: Option<proto::BtwForkInfo>,
+    daemon_version: String,
+    daemon_compatible: bool,
 }
 
 fn apply_session_switch_attached(
     attached: SessionSwitchAttached,
+    target: SessionTarget,
     session_id_state: &Arc<Mutex<Uuid>>,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
     active_agent: &Arc<Mutex<String>>,
@@ -497,6 +509,7 @@ fn apply_session_switch_attached(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = attached.session_id;
     SessionSwitchOutcome {
+        target,
         session_id: attached.session_id,
         short_id: attached.short_id,
         foreground_target: attached.foreground_target.map(queue_target_from_proto),
@@ -506,6 +519,8 @@ fn apply_session_switch_attached(
         paused_work: attached.paused_work,
         repair_required: attached.repair_required,
         btw_fork: attached.btw_fork,
+        daemon_version: attached.daemon_version,
+        daemon_compatible: attached.daemon_compatible,
     }
 }
 
@@ -2498,6 +2513,12 @@ mod tests {
                 paused_work: Vec::new(),
                 repair_required: None,
                 btw_fork: None,
+                daemon_version: "test".to_string(),
+                daemon_compatible: true,
+            },
+            SessionTarget::Resume {
+                session_id: new_session_id,
+                since_seq: Some(2),
             },
             &session_id_state,
             &last_applied_seq,

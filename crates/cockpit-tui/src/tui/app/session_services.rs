@@ -138,6 +138,14 @@ impl App {
         &mut self,
         outcome: agent_runner::SessionSwitchOutcome,
     ) {
+        let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })
+            .then(|| wire_history_to_entries(outcome.history.clone()));
+        let short_id = outcome.short_id.clone();
+        let paused_work = outcome.paused_work.clone();
+        let repair_required = outcome.repair_required.clone();
+        let btw_fork = outcome.btw_fork.clone();
+        let daemon_version = outcome.daemon_version.clone();
+        let daemon_compatible = outcome.daemon_compatible;
         if let Some(Ok(runner)) = &mut self.agent_runner {
             runner.set_session_id(outcome.session_id);
             runner.short_id = outcome.short_id.clone();
@@ -149,8 +157,14 @@ impl App {
             runner.repair_required = outcome.repair_required;
             runner.btw_fork = outcome.btw_fork;
         }
+        if let Some(restored) = resume_history {
+            self.history.clear();
+            self.reset_session_live_state();
+            self.history.extend(restored);
+            self.current_session_persisted = true;
+        }
         self.launch.session_id = Some(outcome.session_id);
-        self.launch.session_short_id = Some(outcome.short_id);
+        self.launch.session_short_id = Some(outcome.short_id.clone());
         self.project_id = Some(outcome.project_id);
         self.foreground_input_target = outcome.foreground_target;
         if let Some(state) = outcome.active_model_state {
@@ -161,6 +175,26 @@ impl App {
                 state.generation,
             );
         }
-        self.current_session_persisted = false;
+        match outcome.target {
+            agent_runner::SessionTarget::New => {
+                self.current_session_persisted = false;
+            }
+            agent_runner::SessionTarget::Resume { session_id, .. } => {
+                if let Some(info) = btw_fork {
+                    self.open_btw_pane_from_info(info, true);
+                }
+                let label = if short_id.is_empty() {
+                    session_id.to_string()
+                } else {
+                    short_id
+                };
+                self.push_plain(format!("/resume: switched to session {label}."));
+                if let Some(repair) = repair_required {
+                    self.maybe_prompt_resume_repair(repair);
+                }
+                self.maybe_prompt_paused_work(session_id, paused_work);
+                self.maybe_show_daemon_version_chip(&daemon_version, daemon_compatible);
+            }
+        }
     }
 }

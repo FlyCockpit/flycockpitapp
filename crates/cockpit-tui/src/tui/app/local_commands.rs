@@ -140,6 +140,9 @@ impl App {
         if self
             .async_actions
             .has_pending_kind(&AsyncActionKind::Internal("session.switch"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.resume"))
         {
             let outcome = DispatchOutcome::SessionSwitching;
             if owns_working_span {

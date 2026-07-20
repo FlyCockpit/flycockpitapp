@@ -156,6 +156,29 @@ impl App {
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
         }
+
+        let switch_task = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) if runner.can_switch_session() => Some(runner.switch_session_task(
+                agent_runner::SessionTarget::Resume {
+                    session_id,
+                    since_seq: None,
+                },
+            )),
+            _ => None,
+        };
+        if let Some(switch_task) = switch_task {
+            self.async_actions.start(
+                AsyncActionKind::Internal("session.resume"),
+                AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+                async move {
+                    switch_task
+                        .await
+                        .map(|outcome| AsyncActionPayload::SessionSwitched(Box::new(outcome)))
+                },
+            );
+            return;
+        }
+
         match agent_runner::attach_to_session(
             &self.launch.cwd,
             session_id,

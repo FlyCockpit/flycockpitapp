@@ -98,21 +98,28 @@ impl App {
                     self.apply_startup_guidance_estimate(cwd, active_model, estimate);
                 }
             }
-            AsyncActionKind::Internal("session.switch") => match result.payload {
-                Ok(AsyncActionPayload::SessionSwitched(outcome)) => {
-                    self.apply_session_switch_outcome(*outcome);
+            AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
+                match result.payload {
+                    Ok(AsyncActionPayload::SessionSwitched(outcome)) => {
+                        self.apply_session_switch_outcome(*outcome);
+                    }
+                    Ok(_) => {
+                        self.agent_runner =
+                            Some(Err("session switch returned unexpected payload".into()));
+                    }
+                    Err(error) => {
+                        let command = if label == "session.resume" {
+                            "/resume"
+                        } else {
+                            "/new"
+                        };
+                        self.agent_runner = Some(Err(error.clone()));
+                        self.history.push(HistoryEntry::CommandError {
+                            line: format!("{command}: {error}"),
+                        });
+                    }
                 }
-                Ok(_) => {
-                    self.agent_runner =
-                        Some(Err("session switch returned unexpected payload".into()));
-                }
-                Err(error) => {
-                    self.agent_runner = Some(Err(error.clone()));
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/new: {error}"),
-                    });
-                }
-            },
+            }
             AsyncActionKind::Refresh("container.availability") => {
                 if let Ok(AsyncActionPayload::ContainerAvailability(availability)) = result.payload
                 {

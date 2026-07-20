@@ -143,6 +143,57 @@ impl App {
                     });
                 }
             },
+            AsyncActionKind::Internal("session.side") => match result.payload {
+                Ok(AsyncActionPayload::SideSessionSwitched {
+                    outcome,
+                    side_short_id,
+                }) => {
+                    self.apply_session_switch_outcome_preserving_history(*outcome, false);
+                    self.push_plain(Self::side_entry_banner(&side_short_id));
+                }
+                Ok(_) => {
+                    self.agent_runner = Some(Err("side switch returned unexpected payload".into()));
+                }
+                Err(error) => {
+                    if let Some(side) = self.side_conversation.take() {
+                        let discard_socket = side.socket.clone();
+                        let discard_session_id = side.side_session_id;
+                        self.restore_side_snapshot(side);
+                        self.async_actions.start_blocking(
+                            AsyncActionKind::DaemonRpc("side.discard"),
+                            AsyncActionPolicy::AllowConcurrent,
+                            move || {
+                                agent_runner::discard_session_blocking(
+                                    &discard_socket,
+                                    discard_session_id,
+                                )
+                                .map(|_| AsyncActionPayload::Unit)
+                            },
+                        );
+                    }
+                    self.history.push(HistoryEntry::CommandError {
+                        line: format!("/side: could not enter side conversation: {error}"),
+                    });
+                }
+            },
+            AsyncActionKind::Internal("session.side.return") => match result.payload {
+                Ok(AsyncActionPayload::SideSessionReturned(outcome)) => {
+                    self.apply_session_switch_outcome_preserving_history(
+                        *outcome,
+                        self.current_session_persisted,
+                    );
+                }
+                Ok(_) => {
+                    self.agent_runner =
+                        Some(Err("side return switch returned unexpected payload".into()));
+                }
+                Err(error) => {
+                    self.agent_runner = Some(Err(error.clone()));
+                    self.history.push(HistoryEntry::CommandError {
+                        line: format!("/side: could not return to main session: {error}"),
+                    });
+                }
+            },
             AsyncActionKind::Refresh("container.availability") => {
                 if let Ok(AsyncActionPayload::ContainerAvailability(availability)) = result.payload
                 {

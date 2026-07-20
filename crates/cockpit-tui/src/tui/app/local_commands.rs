@@ -146,6 +146,12 @@ impl App {
             || self
                 .async_actions
                 .has_pending_kind(&AsyncActionKind::Internal("session.fork"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.side"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.side.return"))
         {
             let outcome = DispatchOutcome::SessionSwitching;
             if owns_working_span {

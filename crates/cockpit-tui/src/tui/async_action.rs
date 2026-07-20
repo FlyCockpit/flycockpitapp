@@ -66,6 +66,11 @@ pub enum AsyncActionPayload {
         fork_short_id: String,
         seed_composer: Option<String>,
     },
+    SideSessionSwitched {
+        outcome: Box<crate::tui::agent_runner::SessionSwitchOutcome>,
+        side_short_id: String,
+    },
+    SideSessionReturned(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
     ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
         org: Option<cockpit_db::org_sync::OrgSyncDisclosure>,

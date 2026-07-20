@@ -148,6 +148,37 @@ impl App {
         self.apply_session_switch_outcome_inner(outcome, false);
     }
 
+    pub(super) fn apply_session_switch_outcome_preserving_history(
+        &mut self,
+        outcome: agent_runner::SessionSwitchOutcome,
+        current_session_persisted: bool,
+    ) {
+        if let Some(Ok(runner)) = &mut self.agent_runner {
+            runner.set_session_id(outcome.session_id);
+            runner.short_id = outcome.short_id.clone();
+            runner.project_id = outcome.project_id.clone();
+            runner.foreground_target = outcome.foreground_target.clone();
+            runner.active_model_state = outcome.active_model_state.clone();
+            runner.history = outcome.history;
+            runner.paused_work = outcome.paused_work;
+            runner.repair_required = outcome.repair_required;
+            runner.btw_fork = outcome.btw_fork;
+        }
+        self.launch.session_id = Some(outcome.session_id);
+        self.launch.session_short_id = Some(outcome.short_id);
+        self.project_id = Some(outcome.project_id);
+        self.foreground_input_target = outcome.foreground_target;
+        if let Some(state) = outcome.active_model_state {
+            self.apply_active_model_state(
+                state.provider,
+                state.model,
+                state.diverged,
+                state.generation,
+            );
+        }
+        self.current_session_persisted = current_session_persisted;
+    }
+
     fn apply_session_switch_outcome_inner(
         &mut self,
         outcome: agent_runner::SessionSwitchOutcome,

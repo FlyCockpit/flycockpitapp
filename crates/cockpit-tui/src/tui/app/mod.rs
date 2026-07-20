@@ -3099,6 +3099,8 @@ impl App {
             AsyncActionKind::Internal("session.switch"),
             AsyncActionKind::Internal("session.resume"),
             AsyncActionKind::Internal("session.fork"),
+            AsyncActionKind::Internal("session.side"),
+            AsyncActionKind::Internal("session.side.return"),
         ];
         self.async_actions.has_pending_not_in(&session_switches)
             || self

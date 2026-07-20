@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
 use crate::daemon::DaemonPaths;
+use crate::daemon::config_source::ConfigSource;
 use crate::daemon::principal::{self, ClientPrincipal, SessionAccess};
 use crate::daemon::proto::{
     self, Body, Envelope, ErrorCode, ErrorPayload, ProtoStream, RecvFrame, Request, Response,
@@ -54,7 +55,10 @@ static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContex
 
 fn build_daemon_redaction_table() -> Arc<RedactionTable> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let cfg = crate::config::extended::load_for_cwd(&cwd).redact;
+    let cfg = ConfigSource::production()
+        .load(&cwd)
+        .map(|(_, extended)| extended.redact)
+        .unwrap_or_default();
     Arc::new(RedactionTable::build(&cfg, &cwd).unwrap_or_else(|error| {
         tracing::warn!(error = %error, "building daemon redaction table failed");
         RedactionTable::empty()
@@ -378,6 +382,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             diff,
             policy: _,
         } => scrub_env_diff_summary(diff, redact),
+        proto::Event::ConfigSnapshot { snapshot: _ } => {}
         proto::Event::QueueUpdated {
             session_id: _,
             queue,
@@ -1831,7 +1836,10 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
 
 fn retention_config() -> RetentionConfig {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    crate::config::extended::load_for_cwd(&cwd).retention
+    ConfigSource::production()
+        .load(&cwd)
+        .map(|(_, extended)| extended.retention)
+        .unwrap_or_default()
 }
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {

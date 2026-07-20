@@ -788,7 +788,8 @@
         {
           "description": "desc",
           "name": "skill",
-          "source": "builtin"
+          "source": "builtin",
+          "user_invocable": true
         }
       ]
     },

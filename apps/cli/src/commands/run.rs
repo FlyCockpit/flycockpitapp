@@ -1295,6 +1295,7 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
 fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     use proto::Event::*;
     Some(match event {
+        ConfigSnapshot { snapshot } => snapshot.session_id,
         ThinkingStarted { session_id, .. }
         | QueueUpdated { session_id, .. }
         | ForegroundInputTarget { session_id, .. }

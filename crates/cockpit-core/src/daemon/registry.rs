@@ -689,6 +689,11 @@ impl SessionRegistry {
             trust_policy,
             Some(cleanup),
             env_snapshot,
+            session_worker::SessionConfigSnapshot::new(
+                0,
+                providers_cfg.clone(),
+                extended_cfg.clone(),
+            ),
         );
 
         crate::sync::lock_or_recover(&self.inner.workers)

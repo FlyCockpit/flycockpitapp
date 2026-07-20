@@ -608,6 +608,18 @@ mod tests {
         let root_b = tmp.path().join("b");
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
+        ctx.db
+            .set_workspace_trust(
+                &root_a,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        ctx.db
+            .set_workspace_trust(
+                &root_b,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
         std::fs::write(root_a.join("readme.md"), "ok").unwrap();
         std::fs::write(root_b.join("readme.md"), "no").unwrap();
 
@@ -1208,6 +1220,7 @@ mod tests {
             MutatingDispatchCase { kind: "store_flycockpit_credential", effect_class: Durable, observation: "credential file is written" },
             MutatingDispatchCase { kind: "clear_flycockpit_credential", effect_class: Durable, observation: "credential store no longer loads a credential" },
             MutatingDispatchCase { kind: "refresh_env", effect_class: InMemory, observation: "attached worker env overlay changes" },
+            MutatingDispatchCase { kind: "refresh_config", effect_class: InMemory, observation: "attached worker config snapshot generation changes" },
             MutatingDispatchCase { kind: "record_usage", effect_class: Durable, observation: "usage count appears in subsequent usage_counts query" },
             MutatingDispatchCase { kind: "stop_daemon", effect_class: InMemory, observation: "shutdown context enters draining phase" },
         ]
@@ -1404,6 +1417,7 @@ mod tests {
             | "store_flycockpit_credential"
             | "clear_flycockpit_credential" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
             "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
+            "list_agents" | "list_models" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
             "send_user_message"
             | "steer_delegation"
             | "remove_queued_user_message"
@@ -1415,8 +1429,6 @@ mod tests {
             | "archive_session"
             | "discard_session"
             | "delete_session"
-            | "list_agents"
-            | "list_models"
             | "set_active_model"
             | "set_agent"
             | "set_llm_mode"
@@ -1426,6 +1438,7 @@ mod tests {
             | "set_trusted_only"
             | "set_redaction"
             | "set_tandem_models"
+            | "refresh_config"
             | "cancel_schedule"
             | "prune"
             | "compact"
@@ -1508,6 +1521,7 @@ mod tests {
             authz_owner_only("store_flycockpit_credential"),
             authz_owner_only("clear_flycockpit_credential"),
             authz_session_writer("refresh_env"),
+            authz_session_writer("refresh_config"),
             authz_owner_only("record_usage"),
             authz_owner_only("get_usage_counts"),
             authz_project_read("guidance_estimate"),
@@ -2138,6 +2152,7 @@ mod tests {
                 | "compact"
                 | "pin"
                 | "refresh_env"
+                | "refresh_config"
         ) || (kind == "list_skills" && level != AuthzLevel::NoAccess)
             || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
     }
@@ -2386,6 +2401,7 @@ mod tests {
             "refresh_env" => Request::RefreshEnv {
                 vars: HashMap::from([("COCKPIT_AUTHZ_MATRIX".into(), "1".into())]),
             },
+            "refresh_config" => Request::RefreshConfig,
             "record_usage" => Request::RecordUsage {
                 kind: proto::UsageKind::Slash,
                 key: "/authz".into(),
@@ -2980,6 +2996,7 @@ mod tests {
             | "set_trusted_only"
             | "set_redaction"
             | "set_tandem_models"
+            | "refresh_config"
             | "cancel_schedule"
             | "prune"
             | "compact"
@@ -3077,6 +3094,7 @@ mod tests {
             | "set_sandbox"
             | "set_sandbox_escalation"
             | "refresh_env"
+            | "refresh_config"
             | "lsp_control"
             | "send_user_message"
             | "remove_queued_user_message"
@@ -3338,6 +3356,7 @@ mod tests {
             "set_tandem_models" => Request::SetTandemModels {
                 models: vec![("openai".into(), "gpt-5".into())],
             },
+            "refresh_config" => Request::RefreshConfig,
             "cancel_schedule" => Request::CancelSchedule {
                 job_id: "job-1".into(),
             },
@@ -3509,6 +3528,10 @@ mod tests {
                     ("set_tandem_models", SessionWork::SetTandemModels { models }) => {
                         assert_eq!(models, vec![("openai".to_string(), "gpt-5".to_string())]);
                     }
+                    ("refresh_config", SessionWork::ReplaceConfigSnapshot { snapshot, respond_to }) => {
+                        assert_eq!(snapshot.generation, 0);
+                        respond_to.send(1).unwrap();
+                    }
                     ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
                         assert_eq!(job_id, "job-1");
                     }
@@ -3608,6 +3631,7 @@ mod tests {
             "refresh_env" => Request::RefreshEnv {
                 vars: HashMap::from([("PATH".into(), "/bin".into())]),
             },
+            "refresh_config" => Request::RefreshConfig,
             "lsp_control" => Request::LspControl {
                 project_root: std::env::temp_dir().to_string_lossy().into_owned(),
                 server_id: "rust-analyzer".into(),
@@ -5286,6 +5310,13 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::RefreshConfig,
+                kind: "refresh_config",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::RecordUsage {
                     kind: proto::UsageKind::Slash,
                     key: "/help".into(),
@@ -5417,6 +5448,7 @@ mod tests {
             ClearFlycockpitCredential,
             DaemonStatus,
             RefreshEnv,
+            RefreshConfig,
             RecordUsage,
             GetUsageCounts,
             GuidanceEstimate,

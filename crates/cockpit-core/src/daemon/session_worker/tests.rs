@@ -286,6 +286,7 @@ mod tests {
             &session,
             session.id,
             tmp.path(),
+            crate::config::extended::RedactConfig::default(),
             &RedactionSourceOverrides::default(),
             &mut notified,
             &redaction,
@@ -1424,6 +1425,311 @@ mod tests {
             locks.holder(&p).is_none(),
             "the last detach releases the session's lock"
         );
+    }
+
+    fn provider_snapshot_config() -> crate::config::providers::ProvidersConfig {
+        use crate::config::providers::{
+            ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry, ProviderModelRef,
+        };
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderEntry {
+                name: Some("OpenAI".to_string()),
+                url: "https://api.openai.example/v1".to_string(),
+                headers: vec![HeaderSpec {
+                    name: "Authorization".to_string(),
+                    value: "Bearer sk-session-secret".to_string(),
+                }],
+                credential_ref: Some("openai-oauth".to_string()),
+                mode: Some(crate::config::extended::LlmMode::Normal),
+                models: vec![ModelEntry {
+                    id: "gpt-test".to_string(),
+                    name: Some("GPT Test".to_string()),
+                    context_length: Some(128_000),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let mut category_defaults = std::collections::BTreeMap::new();
+        category_defaults.insert(
+            "smart_code".to_string(),
+            ProviderModelRef {
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+            },
+        );
+        crate::config::providers::ProvidersConfig {
+            providers,
+            category_defaults,
+            active_model: Some(ActiveModelRef {
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..crate::config::providers::ProvidersConfig::default()
+        }
+    }
+
+    fn snapshot_for_tests() -> SessionConfigSnapshot {
+        let extended = crate::config::extended::ExtendedConfig {
+            llm_mode: crate::config::extended::LlmMode::Defensive,
+            ..crate::config::extended::ExtendedConfig::default()
+        };
+        SessionConfigSnapshot::new(0, provider_snapshot_config(), extended)
+    }
+
+    #[test]
+    fn config_snapshot_push_contains_no_secrets() {
+        let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
+        let encoded = serde_json::to_string(&wire).unwrap();
+        assert!(!encoded.contains("sk-session-secret"), "{encoded}");
+        assert!(!encoded.contains("openai-oauth"), "{encoded}");
+        let provider = wire.providers.providers.get("openai").unwrap();
+        assert!(provider.credential_configured);
+        assert_eq!(provider.headers[0].value, "[redacted]");
+        assert!(provider.entry.headers.is_empty());
+        assert!(provider.entry.credential_ref.is_none());
+    }
+
+    #[test]
+    fn config_snapshot_carries_resolved_provider_view() {
+        let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
+        assert_eq!(
+            wire.providers.active_model.as_ref().unwrap().model,
+            "gpt-test"
+        );
+        let provider = wire.providers.providers.get("openai").unwrap();
+        assert_eq!(provider.entry.url, "https://api.openai.example/v1");
+        assert_eq!(provider.entry.models[0].context_length, Some(128_000));
+    }
+
+    #[test]
+    fn provider_view_covers_all_client_read_fields() {
+        let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
+        let provider = wire.providers.providers.get("openai").unwrap();
+        assert!(wire.providers.active_model.is_some());
+        assert!(wire.providers.category_defaults.contains_key("smart_code"));
+        assert_eq!(provider.entry.name.as_deref(), Some("OpenAI"));
+        assert_eq!(
+            provider.entry.mode,
+            Some(crate::config::extended::LlmMode::Normal)
+        );
+        assert_eq!(provider.entry.models[0].name.as_deref(), Some("GPT Test"));
+        assert!(provider.credential_configured);
+        assert_eq!(provider.headers[0].name, "Authorization");
+    }
+
+    #[test]
+    fn provider_view_requires_no_client_side_secret_resolution() {
+        let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
+        let provider = wire.providers.providers.get("openai").unwrap();
+        assert!(provider.entry.credential_ref.is_none());
+        assert!(provider.entry.headers.is_empty());
+        assert!(provider.credential_configured);
+    }
+
+    #[test]
+    fn config_snapshot_generation_increments_on_reresolve() {
+        let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+        let generation = replace_config_snapshot(
+            &snapshot,
+            SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        );
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn config_snapshot_generation_stable_without_reresolve() {
+        let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+        let before = snapshot.read().unwrap().generation;
+        let _current = snapshot.read().unwrap().clone();
+        assert_eq!(snapshot.read().unwrap().generation, before);
+    }
+
+    #[test]
+    fn invalid_config_reresolve_keeps_last_good_snapshot() {
+        let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+        let failed: anyhow::Result<(
+            crate::config::providers::ProvidersConfig,
+            crate::config::extended::ExtendedConfig,
+        )> = Err(anyhow::anyhow!("bad config"));
+        if let Ok((providers, extended)) = failed {
+            replace_config_snapshot(&snapshot, SessionConfigSnapshot::new(0, providers, extended));
+        }
+        let current = snapshot.read().unwrap();
+        assert_eq!(current.generation, 0);
+        assert!(current.providers.providers.contains_key("openai"));
+    }
+
+    #[test]
+    fn config_reresolve_does_not_mutate_inflight_turn_view() {
+        let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+        let inflight = snapshot.read().unwrap().clone();
+        let updated = crate::config::extended::ExtendedConfig {
+            llm_mode: crate::config::extended::LlmMode::Frontier,
+            ..crate::config::extended::ExtendedConfig::default()
+        };
+        replace_config_snapshot(
+            &snapshot,
+            SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                updated,
+            ),
+        );
+        assert_eq!(
+            inflight.extended.llm_mode,
+            crate::config::extended::LlmMode::Defensive
+        );
+        assert_eq!(
+            snapshot.read().unwrap().extended.llm_mode,
+            crate::config::extended::LlmMode::Frontier
+        );
+    }
+
+    #[test]
+    fn llm_mode_reads_are_consistent_within_a_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_for_tests();
+        let session = Session::create(Db::open_in_memory().unwrap(), tmp.path().to_path_buf(), "Build").unwrap();
+        session.set_active_model("openai", "gpt-test").unwrap();
+        let first =
+            resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
+        let second =
+            resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
+        assert_eq!(first, crate::config::extended::LlmMode::Normal);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn worker_uses_registry_resolved_config_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_for_tests();
+        let session = Session::create(Db::open_in_memory().unwrap(), tmp.path().to_path_buf(), "Build").unwrap();
+        session.set_active_model("openai", "gpt-test").unwrap();
+        crate::config::extended::reset_load_for_cwd_call_count();
+        let _ =
+            resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
+        assert_eq!(crate::config::extended::load_for_cwd_call_count(), 0);
+    }
+
+    #[test]
+    fn attach_delivers_config_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let locks = Arc::new(LockManager::from_db(db).unwrap());
+        let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
+        replace_config_snapshot(
+            &handle.config_snapshot,
+            SessionConfigSnapshot::new(
+                0,
+                provider_snapshot_config(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        );
+        let mut events = handle.subscribe();
+        handle.broadcast_config_snapshot();
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            proto::Event::ConfigSnapshot { snapshot }
+                if snapshot.session_id == handle.session_id && snapshot.generation == 1
+        ));
+    }
+
+    #[test]
+    fn config_reresolve_pushes_to_all_attached_clients() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let locks = Arc::new(LockManager::from_db(db).unwrap());
+        let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
+        let mut a = handle.subscribe();
+        let mut b = handle.subscribe();
+        replace_config_snapshot(
+            &handle.config_snapshot,
+            SessionConfigSnapshot::new(
+                0,
+                provider_snapshot_config(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        );
+        handle.broadcast_config_snapshot();
+        assert!(matches!(
+            a.try_recv().unwrap().event,
+            proto::Event::ConfigSnapshot { snapshot } if snapshot.generation == 1
+        ));
+        assert!(matches!(
+            b.try_recv().unwrap().event,
+            proto::Event::ConfigSnapshot { snapshot } if snapshot.generation == 1
+        ));
+    }
+
+    #[test]
+    fn daemon_config_resolution_goes_through_config_source() {
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let daemon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        let mut files = Vec::new();
+        collect_rs(&daemon_dir, &mut files);
+        let offenders: Vec<String> = files
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some("tests.rs")
+                    && !path.ends_with("config_source.rs")
+            })
+            .flat_map(|path| {
+                let text = std::fs::read_to_string(&path).unwrap();
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        let trimmed = line.trim_start();
+                        !trimmed.starts_with("//")
+                            && (line.contains("load_for_cwd(")
+                                || line.contains("secret_ref::load_effective("))
+                    })
+                    .map(move |(idx, line)| format!("{}:{}:{line}", path.display(), idx + 1))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
+    #[test]
+    fn config_reresolve_rereads_trust_policy() {
+        let dispatch = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/daemon/server/dispatch.rs"),
+        )
+        .unwrap();
+        let refresh = dispatch
+            .split("Request::RefreshConfig =>")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::RecordUsage").next())
+            .expect("RefreshConfig dispatch arm");
+        let trust_pos = refresh
+            .find("resolve_workspace_trust_policy_from_db")
+            .expect("refresh re-reads trust policy");
+        let load_pos = refresh
+            .find("load_with_trust")
+            .expect("refresh loads through ConfigSource with trust");
+        assert!(trust_pos < load_pos, "trust must be re-read before config load");
     }
 }
 #[test]

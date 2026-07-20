@@ -1265,6 +1265,7 @@ fn update_active_agent(
 fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     use proto::Event::*;
     Some(match event {
+        ConfigSnapshot { snapshot } => snapshot.session_id,
         ThinkingStarted { session_id, .. }
         | QueueUpdated { session_id, .. }
         | ForegroundInputTarget { session_id, .. }
@@ -2034,6 +2035,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             interrupt_id,
         },
         InterruptRaised { .. }
+        | ConfigSnapshot { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }

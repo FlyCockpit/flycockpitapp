@@ -18,6 +18,7 @@ const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
 
 pub fn fs_list(
+    ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
     path: &str,
@@ -41,13 +42,14 @@ pub fn fs_list(
             truncated = true;
             break;
         }
-        entries.push(entry_to_wire(principal, &root, entry.path(), name)?);
+        entries.push(entry_to_wire(ctx, principal, &root, entry.path(), name)?);
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Response::FsList { entries, truncated })
 }
 
 pub fn fs_stat(
+    ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
     path: &str,
@@ -58,11 +60,12 @@ pub fn fs_stat(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
-    let entry = entry_to_wire(principal, &root, resolved, name)?;
+    let entry = entry_to_wire(ctx, principal, &root, resolved, name)?;
     Ok(Response::FsStat { entry })
 }
 
 pub fn fs_read(
+    ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
     path: &str,
@@ -73,7 +76,7 @@ pub fn fs_read(
     if resolved.is_dir() {
         return Err(bad_request(format!("`{path}` is a directory")));
     }
-    ensure_read_allowed(principal, &root, &resolved)?;
+    ensure_read_allowed(ctx, principal, &root, &resolved)?;
 
     let bytes = std::fs::read(&resolved).map_err(internal)?;
     let hash = content_hash(&bytes);
@@ -236,6 +239,7 @@ pub fn git_diff_file(project_root: &str, path: &str) -> Result<Response, ErrorPa
 }
 
 fn entry_to_wire(
+    ctx: &DaemonContext,
     principal: &ClientPrincipal,
     root: &Path,
     path: PathBuf,
@@ -251,7 +255,9 @@ fn entry_to_wire(
         .unwrap_or(false);
     let secret_blocked = canonical
         .as_deref()
-        .is_some_and(|p| secret_blocked_for_sharee(principal, root, p));
+        .map(|p| secret_blocked_for_sharee(ctx, principal, root, p))
+        .transpose()?
+        .unwrap_or(false);
     let kind = if is_symlink {
         FsEntryKind::Symlink
     } else if meta.is_dir() {
@@ -312,11 +318,12 @@ fn is_image_path(path: &Path) -> bool {
 }
 
 fn ensure_read_allowed(
+    ctx: &DaemonContext,
     principal: &ClientPrincipal,
     root: &Path,
     path: &Path,
 ) -> Result<(), ErrorPayload> {
-    if secret_blocked_for_sharee(principal, root, path) {
+    if secret_blocked_for_sharee(ctx, principal, root, path)? {
         return Err(ErrorPayload {
             code: ErrorCode::Authorization,
             message: "remote principal cannot read gitignored or dotenv-protected files".into(),
@@ -325,27 +332,43 @@ fn ensure_read_allowed(
     Ok(())
 }
 
-fn secret_blocked_for_sharee(principal: &ClientPrincipal, root: &Path, path: &Path) -> bool {
+fn secret_blocked_for_sharee(
+    ctx: &DaemonContext,
+    principal: &ClientPrincipal,
+    root: &Path,
+    path: &Path,
+) -> Result<bool, ErrorPayload> {
     if principal.is_owner() {
-        return false;
+        return Ok(false);
     }
-    crate::gitignore::is_gitignored(path) || dotenv_pattern_matches(root, path)
+    Ok(crate::gitignore::is_gitignored(path) || dotenv_pattern_matches(ctx, root, path)?)
 }
 
-fn dotenv_pattern_matches(root: &Path, path: &Path) -> bool {
-    let cfg = crate::config::extended::load_for_cwd(root).redact;
+fn dotenv_pattern_matches(
+    ctx: &DaemonContext,
+    root: &Path,
+    path: &Path,
+) -> Result<bool, ErrorPayload> {
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, root)
+        .map_err(internal)?;
+    let cfg = ctx
+        .config_source()
+        .load_with_trust(root, &trust_policy)
+        .map_err(internal)?
+        .1
+        .redact;
     if cfg
         .extra_dotenv_paths
         .iter()
         .any(|extra| std::fs::canonicalize(extra).ok().as_deref() == Some(path))
     {
-        return true;
+        return Ok(true);
     }
     let matcher = crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns);
-    matches!(
+    Ok(matches!(
         matcher.matched_path_or_any_parents(path, path.is_dir()),
         Match::Ignore(_)
-    )
+    ))
 }
 
 fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
@@ -472,6 +495,27 @@ mod tests {
         ClientPrincipal, PrincipalGrant, PrincipalScope, RemotePrincipal,
     };
 
+    fn test_ctx(root: &Path) -> crate::daemon::server::DaemonContext {
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        db.set_workspace_trust(root, crate::db::workspace_trust::WorkspaceTrustMode::Trust)
+            .expect("trust root");
+        let locks = std::sync::Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        crate::daemon::server::DaemonContext::new(
+            db,
+            locks,
+            crate::daemon::DaemonPaths {
+                socket: PathBuf::from("/tmp/cockpit-fs-test.sock"),
+                pid_file: PathBuf::from("/tmp/cockpit-fs-test.pid"),
+                ephemeral: true,
+            },
+            crate::daemon::terminal::test_host_factory(),
+            crate::daemon::config_source::ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        )
+    }
+
     fn remote_project_files(root: &Path) -> ClientPrincipal {
         ClientPrincipal::Remote(RemotePrincipal {
             user_id: "user-1".into(),
@@ -538,28 +582,23 @@ mod tests {
     fn dotenv_file_is_blocked_for_sharee_but_not_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        let ctx = test_ctx(root);
         std::fs::write(root.join(".env"), "SECRET=value").unwrap();
         let path = root.join(".env").canonicalize().unwrap();
-        assert!(secret_blocked_for_sharee(
-            &remote_project_files(root),
-            root,
-            &path
-        ));
-        assert!(!secret_blocked_for_sharee(
-            &ClientPrincipal::owner(),
-            root,
-            &path
-        ));
+        assert!(secret_blocked_for_sharee(&ctx, &remote_project_files(root), root, &path).unwrap());
+        assert!(!secret_blocked_for_sharee(&ctx, &ClientPrincipal::owner(), root, &path).unwrap());
     }
 
     #[test]
     fn gitignored_file_is_flagged_in_listing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        let ctx = test_ctx(root);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(root.join("ignored.txt"), "secret").unwrap();
         let Response::FsList { entries, .. } = fs_list(
+            &ctx,
             &remote_project_files(root),
             root.to_str().unwrap(),
             ".",

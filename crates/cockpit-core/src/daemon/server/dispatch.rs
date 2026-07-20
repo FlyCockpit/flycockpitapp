@@ -339,17 +339,23 @@ async fn handle_request(
             project_root,
             path,
             show_hidden,
-        } => crate::daemon::fs_api::fs_list(&state.principal, &project_root, &path, show_hidden),
+        } => crate::daemon::fs_api::fs_list(
+            ctx,
+            &state.principal,
+            &project_root,
+            &path,
+            show_hidden,
+        ),
 
         Request::FsStat { project_root, path } => {
-            crate::daemon::fs_api::fs_stat(&state.principal, &project_root, &path)
+            crate::daemon::fs_api::fs_stat(ctx, &state.principal, &project_root, &path)
         }
 
         Request::FsRead {
             project_root,
             path,
             base64,
-        } => crate::daemon::fs_api::fs_read(&state.principal, &project_root, &path, base64),
+        } => crate::daemon::fs_api::fs_read(ctx, &state.principal, &project_root, &path, base64),
 
         Request::FsWrite {
             project_root,
@@ -873,6 +879,40 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
+        Request::RefreshConfig => {
+            let att = require_attached(state)?;
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(
+                    &ctx.db,
+                    &att.handle.project_root,
+                )
+                .map_err(internal)?;
+            let (providers, extended) = match ctx
+                .config_source()
+                .load_with_trust(&att.handle.project_root, &trust_policy)
+            {
+                Ok(configs) => configs,
+                Err(error) => {
+                    att.handle.broadcast_notice(format!(
+                        "Config refresh failed; keeping the last good snapshot: {error:#}"
+                    ));
+                    return Ok(Response::Ack);
+                }
+            };
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::ReplaceConfigSnapshot {
+                    snapshot: Box::new(crate::daemon::session_worker::SessionConfigSnapshot::new(
+                        0, providers, extended,
+                    )),
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let _generation = response_rx.await.map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::RecordUsage {
             kind,
             key,
@@ -1303,10 +1343,9 @@ async fn attach(
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have
     // already performed the post-claim DB read-through.
-    let (providers_cfg, extended_cfg) = ctx
-        .config_source()
-        .load_with_trust(&handle.project_root, &handle.trust_policy)
-        .map_err(internal)?;
+    let config_snapshot = handle.config_snapshot();
+    let providers_cfg = config_snapshot.providers.clone();
+    let extended_cfg = config_snapshot.extended.clone();
 
     if session_id.is_none()
         && let Some(tag) = principal.tag()
@@ -1404,6 +1443,7 @@ async fn attach(
         att.handle.broadcast_active_interrupt();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
+        att.handle.broadcast_config_snapshot();
     }
 
     // Full chronological history snapshot (user messages + assistant turns +

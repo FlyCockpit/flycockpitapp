@@ -61,6 +61,43 @@ pub struct EnvSnapshotWire {
     pub vars: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSnapshot {
+    pub session_id: Uuid,
+    pub generation: u64,
+    pub extended: cockpit_config::config::extended::ExtendedConfig,
+    pub providers: ProviderConfigView,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderConfigView {
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderEntryView>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub category_defaults: BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHeaderView {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntryView {
+    pub entry: cockpit_config::config::providers::ProviderEntry,
+    #[serde(default)]
+    pub headers: Vec<ProviderHeaderView>,
+    #[serde(default)]
+    pub credential_configured: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum EnvDriftPolicy {

@@ -182,13 +182,13 @@ pub(crate) fn resolve_root_agent_conn(
 /// rest of the worker.
 fn resolve_effective_llm_mode(
     session: &Session,
-    project_root: &std::path::Path,
+    providers: &crate::config::providers::ProvidersConfig,
     global: crate::config::extended::LlmMode,
 ) -> crate::config::extended::LlmMode {
     let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
         return global;
     };
-    crate::secret_ref::load_effective(project_root).resolve_mode(&provider, &model, global)
+    providers.resolve_mode(&provider, &model, global)
 }
 
 /// Persist a live `/llm-mode` switch to the layered config so a resume
@@ -258,21 +258,17 @@ fn resolve_sandbox_default_with(
 /// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the
 /// layered `config.json` rooted at `project_root`, falling back
 /// to the default when none is configured.
-fn max_concurrent_schedules_for(project_root: &std::path::Path) -> usize {
-    crate::config::extended::load_for_cwd(project_root)
-        .schedule
-        .max_concurrent
+fn max_concurrent_schedules_for(config: &crate::config::extended::ExtendedConfig) -> usize {
+    config.schedule.max_concurrent
 }
 
 /// Resolve the loop-guard threshold (GOALS §1/§12) from the layered
 /// `config.json` rooted at `project_root`, falling back to the
 /// default (2 = fire on the first exact repeat) when none is configured.
-fn loop_guard_threshold_for(project_root: &std::path::Path) -> u32 {
-    crate::config::extended::load_for_cwd(project_root)
-        .loop_guard
-        .effective_threshold()
+fn loop_guard_threshold_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
+    config.loop_guard.effective_threshold()
 }
 
-fn max_primary_rounds_for(project_root: &std::path::Path) -> u32 {
-    crate::config::extended::load_for_cwd(project_root).max_primary_rounds
+fn max_primary_rounds_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
+    config.max_primary_rounds
 }

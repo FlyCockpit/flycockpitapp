@@ -28,6 +28,14 @@ pub enum Event {
         policy: EnvDriftPolicy,
     },
 
+    /// Authoritative daemon-resolved config snapshot for one session. Carries
+    /// the effective extended config plus a provider/model projection whose
+    /// credential-bearing values have already been resolved daemon-side and
+    /// redacted before crossing the wire.
+    ConfigSnapshot {
+        snapshot: Box<ConfigSnapshot>,
+    },
+
     /// Authoritative pending user-message queue snapshot for one session.
     QueueUpdated {
         session_id: Uuid,

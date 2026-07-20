@@ -323,6 +323,9 @@
     },
     "request": "refresh_env"
   },
+  "refresh_config": {
+    "request": "refresh_config"
+  },
   "remove_editable_queued_user_messages": {
     "params": {
       "target_id": "target_id-fixture"

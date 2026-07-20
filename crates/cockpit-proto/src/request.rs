@@ -630,6 +630,11 @@ pub enum Request {
         vars: HashMap<String, String>,
     },
 
+    /// Explicitly re-resolve the attached session's layered config in the
+    /// daemon and push the next [`Event::ConfigSnapshot`] generation. A failed
+    /// re-resolution keeps the last good generation and emits a notice.
+    RefreshConfig,
+
     /// Record one accepted autocomplete pick into the 30-day frequency
     /// tally (GOALS §1; tie-breaker for the model / slash / @-tag
     /// surfaces). Fire-and-forget — acked immediately; no attached
@@ -755,6 +760,7 @@ macro_rules! command {
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, none);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, none);
             (Request::RefreshEnv { .. }, "refresh_env", session_writer, attached, true, none);
+            (Request::RefreshConfig, "refresh_config", session_writer, attached, true, none);
             (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, none);
             (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, false, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, none);

@@ -1109,14 +1109,13 @@ pub fn resolve_gitignore_allow(cwd: &Path) -> Vec<String> {
 /// order; each existing/parseable layer contributes its `gitignore_allow`
 /// entries, de-duplicated in first-seen order.
 fn resolve_gitignore_allow_from_paths(paths: &[PathBuf]) -> Vec<String> {
+    let docs = load_existing_docs_from_paths(paths);
+    resolve_gitignore_allow_from_docs(&docs)
+}
+
+fn resolve_gitignore_allow_from_docs(docs: &[ExtendedConfigDoc]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        let Ok(doc) = ExtendedConfigDoc::load(path) else {
-            continue;
-        };
+    for doc in docs {
         for glob in doc.config().gitignore_allow {
             let glob = glob.trim().to_string();
             if !glob.is_empty() && !out.contains(&glob) {
@@ -1138,19 +1137,19 @@ struct RedactListUnions {
 /// de-duplicated union across config layers. The generic deep-merge engine
 /// replaces arrays; these three fields are explicitly concat/union per GOALS
 /// §2b, mirroring the dedicated `gitignore_allow` override path.
+#[cfg(test)]
 fn resolve_redact_list_unions_from_paths(paths: &[PathBuf]) -> RedactListUnions {
+    let docs = load_existing_docs_from_paths(paths);
+    resolve_redact_list_unions_from_docs(&docs)
+}
+
+fn resolve_redact_list_unions_from_docs(docs: &[ExtendedConfigDoc]) -> RedactListUnions {
     let mut out = RedactListUnions::default();
     let mut denylist_seen: HashSet<String> = HashSet::new();
     let mut allowlist_seen: HashSet<String> = HashSet::new();
     let mut extra_dotenv_paths_seen: HashSet<PathBuf> = HashSet::new();
 
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        let Ok(doc) = ExtendedConfigDoc::load(path) else {
-            continue;
-        };
+    for doc in docs {
         let Some(redact) = doc.raw.get("redact").and_then(Value::as_object) else {
             continue;
         };
@@ -1456,6 +1455,7 @@ fn default_knowledge_inject_max_tokens() -> usize {
 
 thread_local! {
     static LOAD_FOR_CWD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONFIG_LAYER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn reset_load_for_cwd_call_count() {
@@ -1464,6 +1464,14 @@ pub fn reset_load_for_cwd_call_count() {
 
 pub fn load_for_cwd_call_count() -> usize {
     LOAD_FOR_CWD_CALLS.with(std::cell::Cell::get)
+}
+
+pub fn reset_config_layer_read_count() {
+    CONFIG_LAYER_READS.with(|calls| calls.set(0));
+}
+
+pub fn config_layer_read_count() -> usize {
+    CONFIG_LAYER_READS.with(std::cell::Cell::get)
 }
 
 /// Load the effective [`ExtendedConfig`] for `cwd`: all existing
@@ -1481,9 +1489,11 @@ pub fn load_for_cwd_call_count() -> usize {
 pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
-    if let Some(mut cfg) = load_merged_from_paths(&paths) {
-        cfg.gitignore_allow = resolve_gitignore_allow_from_paths(&paths);
-        let redact_unions = resolve_redact_list_unions_from_paths(&paths);
+    let docs = load_existing_docs_from_paths(&paths);
+    if !docs.is_empty() {
+        let mut cfg = load_merged_from_docs(&docs);
+        cfg.gitignore_allow = resolve_gitignore_allow_from_docs(&docs);
+        let redact_unions = resolve_redact_list_unions_from_docs(&docs);
         cfg.redact.denylist = redact_unions.denylist;
         cfg.redact.allowlist = redact_unions.allowlist;
         cfg.redact.extra_dotenv_paths = redact_unions.extra_dotenv_paths;
@@ -1498,32 +1508,39 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
     }
 }
 
-fn load_merged_from_paths(paths: &[PathBuf]) -> Option<ExtendedConfig> {
-    let mut merged =
-        serde_json::to_value(ExtendedConfig::default()).unwrap_or(Value::Object(Map::new()));
-    let mut saw_existing = false;
+fn read_extended_config_doc(path: &Path) -> Result<ExtendedConfigDoc> {
+    CONFIG_LAYER_READS.with(|calls| calls.set(calls.get() + 1));
+    ExtendedConfigDoc::load(path)
+}
+
+fn load_existing_docs_from_paths(paths: &[PathBuf]) -> Vec<ExtendedConfigDoc> {
+    let mut docs = Vec::new();
     for path in paths {
         if !path.exists() {
             continue;
         }
-        match ExtendedConfigDoc::load(path) {
-            Ok(doc) => {
-                saw_existing = true;
-                let layer = doc.raw_for_layer_merge();
-                deep_merge_value(&mut merged, &layer);
-            }
+        match read_extended_config_doc(path) {
+            Ok(doc) => docs.push(doc),
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
             }
         }
     }
-    saw_existing.then(|| {
-        ExtendedConfigDoc {
-            path: PathBuf::from("<merged effective config>"),
-            raw: merged,
-        }
-        .config()
-    })
+    docs
+}
+
+fn load_merged_from_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
+    let mut merged =
+        serde_json::to_value(ExtendedConfig::default()).unwrap_or(Value::Object(Map::new()));
+    for doc in docs {
+        let layer = doc.raw_for_layer_merge();
+        deep_merge_value(&mut merged, &layer);
+    }
+    ExtendedConfigDoc {
+        path: PathBuf::from("<merged effective config>"),
+        raw: merged,
+    }
+    .config()
 }
 
 /// Resolve the explicitly configured computer-use policy across all config

@@ -34,6 +34,13 @@ impl Tool for SeedEmitTool {
         "Hand one directly-relevant read-only result up to your caller; seed nothing that isn't."
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Hand one directly-relevant read-only tool result up to your caller so they receive it as native context after you return. Use only for evidence that directly supports your answer; do not seed unrelated exploration, write tools, bash output, or bulk context."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         seed_item_schema()
     }

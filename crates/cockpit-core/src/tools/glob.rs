@@ -42,7 +42,7 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "List files matching a glob pattern within the package root, gitignore-aware"
+        "List files matching a glob pattern within the current root, gitignore-aware"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -51,13 +51,11 @@ impl Tool for GlobTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "List the files in this package whose paths match a glob pattern, respecting \
-             `.gitignore`. With no shell available, this is how you discover which files exist \
-             and where — use it to find the entry points, modules, or file types of the \
-             dependency you're inspecting before reading them. The walk is hard-confined to the \
-             package root. Use patterns like `**/*.rs` (all Rust files at any depth) or `src/**` \
-             (everything under `src`); scope the walk with `path` when you only care about a \
-             subtree."
+            "List files under the current root whose paths match a glob pattern, respecting \
+             `.gitignore`. Use it to discover which files exist and where before reading them. \
+             The walk is hard-confined to the root. Use patterns like `**/*.rs` (all Rust files \
+             at any depth) or `src/**` (everything under `src`); scope the walk with `path` when \
+             you only care about a subtree."
                 .to_string(),
         )
     }

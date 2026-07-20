@@ -29,7 +29,7 @@
 //! — it stays entirely hardcoded in [`crate::engine::builtin`] and
 //! [`crate::engine::docs_pipeline`] and is never exposed here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -67,6 +67,11 @@ pub struct AgentDef {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// Per-agent tool placement. Omitted tools use the role default; for
+    /// user-authored definitions without a role default, omission means
+    /// [`ToolTier::Builtin`].
+    #[serde(rename = "toolTiers", default)]
+    pub tool_tiers: BTreeMap<String, ToolTier>,
     /// Per-agent tool-description overrides (prompt
     /// `per-agent-tool-definitions.md`): re-word a granted tool's *description*
     /// for **this** agent without touching its ID or schema, so the same tool
@@ -78,7 +83,7 @@ pub struct AgentDef {
     /// start, so the tools array stays byte-stable (cache-safe). Empty / absent
     /// means every tool keeps its base description (byte-identical to today).
     #[serde(default)]
-    pub tool_descriptions: std::collections::BTreeMap<String, ToolDescriptionSpec>,
+    pub tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
     /// Whether this agent's untrusted tool/subagent results are scanned by the
     /// prompt-injection guard before entering parent history. `None` means use
     /// the role/name default.
@@ -109,6 +114,14 @@ pub struct AgentDef {
     /// for diagnostics and override detection.
     #[serde(skip)]
     pub source: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolTier {
+    Builtin,
+    Discoverable,
+    Disabled,
 }
 
 /// A markdown agent's per-agent description override for one tool (prompt
@@ -398,6 +411,9 @@ impl AgentDef {
             let seq: Vec<serde_yaml::Value> = tools.iter().map(|t| t.clone().into()).collect();
             fm.insert("tools".into(), serde_yaml::Value::Sequence(seq));
         }
+        if !self.tool_tiers.is_empty() {
+            fm.insert("toolTiers".into(), serde_yaml::to_value(&self.tool_tiers)?);
+        }
         if !self.tool_descriptions.is_empty() {
             fm.insert(
                 "tool_descriptions".into(),
@@ -463,8 +479,10 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         temperature: Option<f32>,
         #[serde(default)]
         tools: Option<Vec<String>>,
+        #[serde(rename = "toolTiers", default)]
+        tool_tiers: BTreeMap<String, ToolTier>,
         #[serde(default)]
-        tool_descriptions: std::collections::BTreeMap<String, ToolDescriptionSpec>,
+        tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
         #[serde(rename = "scanToolResults", default)]
         scan_tool_results: Option<bool>,
         #[serde(default)]
@@ -497,6 +515,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         model: fm.model,
         temperature: fm.temperature,
         tools: fm.tools,
+        tool_tiers: fm.tool_tiers,
         tool_descriptions: fm.tool_descriptions,
         scan_tool_results: fm.scan_tool_results,
         permission: fm.permission,

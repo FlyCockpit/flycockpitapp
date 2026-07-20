@@ -136,6 +136,7 @@ pub fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantR
         model: spec.model,
         temperature: None,
         tools: spec.tools,
+        tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         permission: None,

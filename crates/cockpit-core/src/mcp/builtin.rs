@@ -74,7 +74,7 @@ impl HostContext {
             root_agent_frame: ctx.root_agent_frame,
             context_usage: ctx.context_usage,
             child_events,
-            builtin_registry: default_registry(),
+            builtin_registry: ctx.mcp_builtin_registry.clone(),
             native_tool_ctx: Some(ctx.clone()),
             scan_tool_results: true,
             #[cfg(test)]
@@ -765,6 +765,7 @@ pub struct ToolOutputBuiltinAdapter {
     tool: Arc<dyn Tool>,
     availability: BuiltinAvailability,
     approval_seam: NativeToolApprovalSeam,
+    direct_call_marker: bool,
 }
 
 impl ToolOutputBuiltinAdapter {
@@ -779,6 +780,7 @@ impl ToolOutputBuiltinAdapter {
                 }
             }),
             approval_seam: NativeToolApprovalSeam::Wired,
+            direct_call_marker: false,
         }
     }
 
@@ -789,6 +791,11 @@ impl ToolOutputBuiltinAdapter {
 
     pub fn with_approval_seam(mut self, seam: NativeToolApprovalSeam) -> Self {
         self.approval_seam = seam;
+        self
+    }
+
+    pub fn with_direct_call_marker(mut self, directly_callable: bool) -> Self {
+        self.direct_call_marker = directly_callable;
         self
     }
 
@@ -803,7 +810,10 @@ impl ToolOutputBuiltinAdapter {
         }
 
         let name = self.tool.name().to_string();
-        let description = self.tool.description().to_string();
+        let mut description = self.tool.description().to_string();
+        if self.direct_call_marker {
+            description.push_str(" Also available as a direct builtin tool; prefer the direct tool for a single call.");
+        }
         let tool_for_schema = self.tool.clone();
         let tool_for_handler = self.tool;
         Ok(BuiltinFunction::new(

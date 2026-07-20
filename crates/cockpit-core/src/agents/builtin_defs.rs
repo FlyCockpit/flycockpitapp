@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use super::{AgentDef, AgentMode, ToolDescriptionSpec};
+use super::{AgentDef, AgentMode, ToolDescriptionSpec, ToolTier};
 
 /// Names of the built-in agents in scope for user editing, in canonical
 /// listing order. Drives the override-resolution, listing, and reset
@@ -150,6 +150,7 @@ fn def_with_normal(
         model: None,
         temperature: None,
         tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+        tool_tiers: std::collections::BTreeMap::<String, ToolTier>::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: Some(super::default_scan_tool_results(name, mode)),
         permission: None,
@@ -169,7 +170,7 @@ fn auto_def() -> AgentDef {
         "Default front-door agent; converses and hands off to `Plan` or `Build` once intent is clear.",
         AgentMode::Primary,
         &[
-            "read", "bash", "search", "skill", "question", "handoff", "mcp",
+            "read", "bash", "search", "lsp", "skill", "question", "handoff", "mcp",
         ],
         crate::engine::builtin::AUTO_PROMPT,
         Some(crate::engine::builtin::AUTO_PROMPT_NORMAL),
@@ -200,6 +201,7 @@ fn build_def() -> AgentDef {
             "search",
             "impact",
             "change_impact",
+            "lsp",
             // write/lock set (arbitrated by the lock authority)
             "readlock",
             "writeunlock",
@@ -281,6 +283,7 @@ fn builder_def() -> AgentDef {
             "search",
             "impact",
             "change_impact",
+            "lsp",
             "question",
             "skill",
             "task",
@@ -382,6 +385,7 @@ fn scout_def() -> AgentDef {
             "search",
             "impact",
             "change_impact",
+            "lsp",
             "spawn",
             "return",
         ],
@@ -454,6 +458,7 @@ fn swarm_def() -> AgentDef {
             "search",
             "impact",
             "change_impact",
+            "lsp",
             // write/lock set (arbitrated by the lock authority)
             "readlock",
             "writeunlock",
@@ -502,6 +507,7 @@ fn bee_def() -> AgentDef {
             "search",
             "impact",
             "change_impact",
+            "lsp",
             "skill",
             "task",
             "spawn",
@@ -531,6 +537,7 @@ fn multireview_def() -> AgentDef {
             "search",
             "impact",
             "change_impact",
+            "lsp",
             "spawn",
             "harness_list",
             "harness_invoke",
@@ -563,11 +570,26 @@ fn docs_resolver_def() -> AgentDef {
 }
 
 fn docs_answerer_def() -> AgentDef {
-    def(
+    let mut def = def(
         "docs-answerer",
         "Internal docs pipeline answerer stage.",
         AgentMode::Subagent,
         &["read", "grep", "glob"],
         crate::engine::builtin::DOCS_ANSWERER_PROMPT,
-    )
+    );
+    def.tool_descriptions.insert(
+        "grep".to_string(),
+        ToolDescriptionSpec::Both(
+            "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
+                .to_string(),
+        ),
+    );
+    def.tool_descriptions.insert(
+        "glob".to_string(),
+        ToolDescriptionSpec::Both(
+            "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
+                .to_string(),
+        ),
+    );
+    def
 }

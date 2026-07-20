@@ -307,7 +307,9 @@ mod typed_args_tests {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
-    /// One-sentence description per GOALS §10. Keep it under ~80 chars.
+    /// One-sentence description per GOALS §10. Keep this terse enough for the
+    /// normal/frontier tool array; the invariant test treats ~200 chars as the
+    /// hard ceiling for built-ins.
     /// This is the **normal** `llm_mode` form (terse, the token-economy
     /// budget the CI check enforces).
     fn description(&self) -> &str;
@@ -315,17 +317,11 @@ pub trait Tool: Send + Sync {
     /// The **defensive** `llm_mode` description: explicit, steering prose
     /// for the weak-model target (implementation note).
     /// `None` (the default) means "no defensive variant — fall back to the
-    /// terse [`Self::description`]." Every *built-in* tool overrides this so
-    /// the full surface is covered (a registry-driven test enforces it);
-    /// the only `None`-keepers are user-config-driven tools (custom-bash),
-    /// whose author owns their wording.
+    /// terse [`Self::description`]." Registry-driven tests enforce defensive
+    /// coverage for built-ins that reach the normal agent surface; dynamic or
+    /// user-authored tools may rely on the terse fallback where that is the
+    /// correct wording.
     fn defensive_description(&self) -> Option<String> {
-        None
-    }
-
-    /// Optional expanded description for the strongest model tier. `None`
-    /// falls back to the normal terse description.
-    fn frontier_description(&self) -> Option<String> {
         None
     }
 
@@ -754,6 +750,10 @@ pub struct ToolCtx {
     /// package activation uses this session-local surface for Hermes
     /// `requires_tools` / `fallback_for_tools` gates.
     pub available_tools: Arc<std::collections::HashSet<String>>,
+    /// Frozen Monty builtin registry for this agent/tool context. It contains
+    /// the host control functions plus native tools made scriptable for the
+    /// session's tool tier placement.
+    pub mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
     /// Whether the calling agent holds the `tree` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests `tree` only when the agent can use it) rather than
@@ -859,12 +859,7 @@ pub fn definition_of(
             tool.defensive_parameters()
                 .unwrap_or_else(|| tool.parameters()),
         ),
-        LlmMode::Normal => (tool.description().to_string(), tool.parameters()),
-        LlmMode::Frontier => (
-            tool.frontier_description()
-                .unwrap_or_else(|| tool.description().to_string()),
-            tool.parameters(),
-        ),
+        LlmMode::Normal | LlmMode::Frontier => (tool.description().to_string(), tool.parameters()),
     };
     // Per-agent axis: an override for the active mode wins over the base
     // description. Schema is intentionally untouched.
@@ -933,6 +928,7 @@ impl Capability {
 #[derive(Default, Clone)]
 pub struct ToolBox {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    mcp_builtin_tools: BTreeMap<String, McpBuiltinToolEntry>,
     /// Per-tool-name description overrides. Empty (the default) means every
     /// tool renders its own base/per-mode description — byte-identical to the
     /// pre-override behavior.
@@ -944,6 +940,27 @@ pub struct ToolBox {
     capability_description_suffixes: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone)]
+struct McpBuiltinToolEntry {
+    tool: Arc<dyn Tool>,
+    directly_callable: bool,
+}
+
+fn is_monty_builtin_adaptable(name: &str) -> bool {
+    !matches!(
+        name,
+        "question"
+            | "handoff"
+            | "return"
+            | "schedule"
+            | "task"
+            | "spawn"
+            | "defer_to_orchestrator"
+            | "start_build"
+            | "mcp"
+    )
+}
+
 impl ToolBox {
     pub fn new() -> Self {
         Self::default()
@@ -951,6 +968,15 @@ impl ToolBox {
 
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.name().to_string();
+        if is_monty_builtin_adaptable(&name) {
+            self.mcp_builtin_tools.insert(
+                name.clone(),
+                McpBuiltinToolEntry {
+                    tool: tool.clone(),
+                    directly_callable: true,
+                },
+            );
+        }
         self.tools.insert(name.clone(), tool);
         self.capability_unavailable.remove(&name);
         self.capability_description_suffixes.remove(&name);
@@ -960,11 +986,52 @@ impl ToolBox {
 
     pub fn without(mut self, name: &str) -> Self {
         self.tools.remove(name);
+        self.mcp_builtin_tools.remove(name);
         self.overrides.remove(name);
         self.capability_unavailable.remove(name);
         self.capability_description_suffixes.remove(name);
         self.definition_cache.lock().unwrap().clear();
         self
+    }
+
+    pub fn with_discoverable_mcp(mut self, tool: Arc<dyn Tool>) -> Self {
+        let name = tool.name().to_string();
+        if is_monty_builtin_adaptable(&name) {
+            self.mcp_builtin_tools.insert(
+                name,
+                McpBuiltinToolEntry {
+                    tool,
+                    directly_callable: false,
+                },
+            );
+        }
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    pub fn mcp_builtin_registry(&self) -> Arc<crate::mcp::builtin::BuiltinRegistry> {
+        let funcs = self
+            .mcp_builtin_tools
+            .iter()
+            .filter(|(name, _entry)| !self.capability_unavailable.contains_key(*name))
+            .filter_map(|(_name, entry)| {
+                let adapter =
+                    crate::mcp::builtin::ToolOutputBuiltinAdapter::new(entry.tool.clone())
+                        .with_direct_call_marker(entry.directly_callable);
+                adapter.into_function().ok()
+            })
+            .collect();
+        Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(funcs))
+    }
+
+    pub(crate) fn discoverable_mcp_tool_names(&self) -> Vec<String> {
+        self.mcp_builtin_tools
+            .iter()
+            .filter(|(name, entry)| {
+                !entry.directly_callable && !self.capability_unavailable.contains_key(*name)
+            })
+            .map(|(name, _entry)| name.clone())
+            .collect()
     }
 
     /// Register a per-agent description override for the tool named `name`.
@@ -998,6 +1065,10 @@ impl ToolBox {
             return None;
         }
         self.tools.get(name)
+    }
+
+    pub fn get_cloned(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.get(name).cloned()
     }
 
     pub fn apply_capabilities(
@@ -1968,6 +2039,7 @@ mod llm_mode_tests {
     fn btw_tool_effect_metadata_complete() {
         let expected = [
             ("bash", ToolEffect::Dynamic),
+            ("add-package", ToolEffect::Dynamic),
             ("change_impact", ToolEffect::Dynamic),
             ("circular", ToolEffect::Dynamic),
             ("context_pack", ToolEffect::Dynamic),
@@ -1985,8 +2057,10 @@ mod llm_mode_tests {
             ("harness_list", ToolEffect::Dynamic),
             ("hot", ToolEffect::Dynamic),
             ("impact", ToolEffect::Dynamic),
+            ("list-packages", ToolEffect::Dynamic),
             ("lsp", ToolEffect::Dynamic),
             ("mcp", ToolEffect::Dynamic),
+            ("note", ToolEffect::Dynamic),
             ("outline", ToolEffect::Dynamic),
             ("plan_edit", ToolEffect::Dynamic),
             ("plan_read", ToolEffect::Dynamic),
@@ -1997,10 +2071,12 @@ mod llm_mode_tests {
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),
+            ("seed", ToolEffect::Dynamic),
             ("session_read", ToolEffect::ReadOnly),
             ("session_search", ToolEffect::ReadOnly),
             ("skill", ToolEffect::Dynamic),
             ("skill_manage", ToolEffect::Dynamic),
+            ("spawn", ToolEffect::Dynamic),
             ("start_build", ToolEffect::Dynamic),
             ("symbol_find", ToolEffect::Dynamic),
             ("task", ToolEffect::Dynamic),

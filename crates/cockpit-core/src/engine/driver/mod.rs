@@ -2272,6 +2272,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             events: Some(tx.clone()),

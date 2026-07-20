@@ -56,6 +56,7 @@ fn create(
         model,
         temperature: None,
         tools,
+        tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         permission: None,

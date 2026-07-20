@@ -34,10 +34,7 @@ impl SpawnTool {
         // One noun-phrase-dense sentence (token economy §10). The
         // dedicated-output-folder guidance is in the description text itself.
         let description = format!(
-            "Fan out a slice of the task to a parallel background `bee` worker \
-             (you are at depth {depth} of ceiling {ceiling}; {remaining} level(s) of recursion left) \
-             — give each child its own dedicated `output_dir` (or a distinct DB path) to save \
-             results into so concurrent branches never write the same file."
+            "Fan out to a parallel `bee` worker (depth {depth} of ceiling {ceiling}; {remaining} recursion left); give each child a dedicated `output_dir` or DB path."
         );
         Self { description }
     }
@@ -51,6 +48,13 @@ impl Tool for SpawnTool {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn defensive_description(&self) -> Option<String> {
+        Some(format!(
+            "{} Use this only when the current slice can be split into independent child work; write a complete brief and a dedicated output_dir for every child.",
+            self.description
+        ))
     }
 
     fn parameters(&self) -> Value {

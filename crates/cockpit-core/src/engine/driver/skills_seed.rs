@@ -214,6 +214,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
+            mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -510,6 +511,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
+            mcp_builtin_registry: child.tools.mcp_builtin_registry(),
             has_tree: child.tools.get("tree").is_some(),
             has_bash: child.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -590,6 +592,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
+            mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
@@ -789,6 +792,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
+            mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this

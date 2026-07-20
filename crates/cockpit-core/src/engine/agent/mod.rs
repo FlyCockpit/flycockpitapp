@@ -100,7 +100,10 @@ pub(crate) fn turn_toolbox(agent: &Agent, session: &Session, cwd: &std::path::Pa
         toolbox = toolbox.without("task").without("spawn");
     }
     toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd);
-    let adverts = crate::tools::mcp_tool::current_mcp_description_adverts(session, cwd);
+    let mut adverts = crate::tools::mcp_tool::discoverable_tool_adverts(&toolbox);
+    adverts.extend(crate::tools::mcp_tool::current_mcp_description_adverts(
+        session, cwd,
+    ));
     crate::tools::mcp_tool::apply_mcp_description_adverts(&mut toolbox, &adverts);
     let env = agent
         .env_overlay

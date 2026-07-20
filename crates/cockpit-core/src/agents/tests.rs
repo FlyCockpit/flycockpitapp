@@ -158,6 +158,34 @@ fn to_markdown_round_trips_through_parse() {
     assert_eq!(parsed.prompt, def.prompt);
 }
 
+#[test]
+fn tool_tier_parse_and_round_trip() {
+    let text = r#"---
+description: Tiered agent
+mode: subagent
+tools: [read, search, skill_manage]
+toolTiers:
+  search: discoverable
+  skill_manage: disabled
+---
+
+Body
+"#;
+    let def = parse_agent(text, "tiered", "tiered.md".into()).unwrap();
+    assert_eq!(
+        def.tool_tiers.get("search"),
+        Some(&crate::agents::ToolTier::Discoverable)
+    );
+    assert_eq!(
+        def.tool_tiers.get("skill_manage"),
+        Some(&crate::agents::ToolTier::Disabled)
+    );
+
+    let md = def.to_markdown().unwrap();
+    let reparsed = parse_agent(&md, "tiered", "tiered.md".into()).unwrap();
+    assert_eq!(reparsed.tool_tiers, def.tool_tiers);
+}
+
 // ── Invariant validation ─────────────────────────────────────────────────
 
 fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
@@ -168,6 +196,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         model: None,
         temperature: None,
         tools: Some(tools.iter().map(|s| s.to_string()).collect()),
+        tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         permission: None,
@@ -227,6 +256,55 @@ fn user_agent_with_sandbox_tool_is_rejected() {
         let msg = format!("{err}");
         assert!(msg.contains(&format!("`{t}`")), "{msg}");
         assert!(msg.contains("docs-answerer-only"), "{msg}");
+    }
+}
+
+#[test]
+fn tool_tier_validation_rejects_non_granted_structural_and_lock_write() {
+    let mut non_granted = def_with_tools("my-agent", &["read"]);
+    non_granted
+        .tool_tiers
+        .insert("search".to_string(), ToolTier::Discoverable);
+    let err = validate_invariants(&non_granted).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`search`"), "{msg}");
+    assert!(msg.contains("does not grant"), "{msg}");
+
+    let mut structural = def_with_tools("my-agent", &["read", "question"]);
+    structural
+        .tool_tiers
+        .insert("question".to_string(), ToolTier::Discoverable);
+    let err = validate_invariants(&structural).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`question`"), "{msg}");
+    assert!(msg.contains("structural"), "{msg}");
+
+    let mut lock_write = def_with_tools("writer", &["read", "writeunlock"]);
+    lock_write
+        .tool_tiers
+        .insert("writeunlock".to_string(), ToolTier::Discoverable);
+    let err = validate_invariants(&lock_write).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`writeunlock`"), "{msg}");
+    assert!(msg.contains("write/lock"), "{msg}");
+}
+
+#[test]
+fn tool_tier_sandbox_only_tools_not_grantable_or_tierable() {
+    for t in SANDBOX_ONLY_TOOLS {
+        let grant = def_with_tools("my-agent", &["read", t]);
+        let err = validate_invariants(&grant).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(&format!("`{t}`")), "{msg}");
+        assert!(msg.contains("docs-answerer-only"), "{msg}");
+
+        let mut tier = def_with_tools("my-agent", &["read"]);
+        tier.tool_tiers
+            .insert((*t).to_string(), ToolTier::Discoverable);
+        let err = validate_invariants(&tier).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(&format!("`{t}`")), "{msg}");
+        assert!(msg.contains("does not grant"), "{msg}");
     }
 }
 

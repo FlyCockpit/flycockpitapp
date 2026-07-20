@@ -38,7 +38,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Regex content search confined to the package root; returns budgeted file:line matches"
+        "Regex content search confined to the current root; returns budgeted file:line matches"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -47,12 +47,11 @@ impl Tool for GrepTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Search file contents for a regular expression within this package's source tree and \
-             get back budgeted file:line matches. You have no shell here, so this is how you find \
-             code: use it to locate where a symbol, string, or pattern appears in the dependency \
-             you're inspecting. The search is hard-confined to the package root — you cannot \
-             reach outside it. Narrow with `path` to one subdirectory or file when you can, and \
-             then `read` the interesting matches for context."
+            "Search file contents for a regular expression within the current root and get back \
+             budgeted file:line matches. Use it to locate where a symbol, string, or pattern \
+             appears. The search is hard-confined to the root — you cannot reach outside it. \
+             Narrow with `path` to one subdirectory or file when you can, then `read` the \
+             interesting matches for context."
                 .to_string(),
         )
     }

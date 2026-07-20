@@ -412,10 +412,14 @@ mod tests {
     use crate::config::dirs::{COCKPIT_CONFIG_ENV, test_support::IsolatedCockpitHome};
     use crate::wizard::WizardAnswer;
 
+    struct EnvSnapshot {
+        name: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
     struct CockpitConfigEnvGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
-        old: Option<std::ffi::OsString>,
-        old_state_home: Option<std::ffi::OsString>,
+        vars: Vec<EnvSnapshot>,
     }
 
     impl CockpitConfigEnvGuard {
@@ -429,29 +433,45 @@ mod tests {
 
         fn set_with_state(path: &std::path::Path, state_home: &std::path::Path) -> Self {
             let guard = crate::test_env::lock();
-            let old = std::env::var_os(COCKPIT_CONFIG_ENV);
-            let old_state_home = std::env::var_os("XDG_STATE_HOME");
+            let vars = snapshot_vars(&[COCKPIT_CONFIG_ENV, "XDG_STATE_HOME"]);
             unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, path) };
             unsafe { std::env::set_var("XDG_STATE_HOME", state_home) };
             Self {
                 _guard: guard,
-                old,
-                old_state_home,
+                vars,
+            }
+        }
+
+        fn clear_config() -> Self {
+            let guard = crate::test_env::lock();
+            let vars = snapshot_vars(&[COCKPIT_CONFIG_ENV]);
+            unsafe { std::env::remove_var(COCKPIT_CONFIG_ENV) };
+            Self {
+                _guard: guard,
+                vars,
             }
         }
     }
 
     impl Drop for CockpitConfigEnvGuard {
         fn drop(&mut self) {
-            match &self.old {
-                Some(value) => unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, value) },
-                None => unsafe { std::env::remove_var(COCKPIT_CONFIG_ENV) },
-            }
-            match &self.old_state_home {
-                Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
-                None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            for snapshot in self.vars.iter().rev() {
+                match &snapshot.old {
+                    Some(value) => unsafe { std::env::set_var(snapshot.name, value) },
+                    None => unsafe { std::env::remove_var(snapshot.name) },
+                }
             }
         }
+    }
+
+    fn snapshot_vars(names: &[&'static str]) -> Vec<EnvSnapshot> {
+        names
+            .iter()
+            .map(|name| EnvSnapshot {
+                name,
+                old: std::env::var_os(name),
+            })
+            .collect()
     }
 
     fn write_model_wizard_provider(cwd: &std::path::Path) -> PathBuf {
@@ -548,6 +568,285 @@ mod tests {
                 .expect("current model wizard step has prefill");
             run.submit(answer).unwrap();
         }
+    }
+
+    fn submit_security_wizard_prefills_until_save(run: &mut WizardRun) {
+        submit_security_wizard_until_save(run, &[]);
+    }
+
+    fn submit_security_wizard_until_save(
+        run: &mut WizardRun,
+        overrides: &[(&'static str, WizardAnswer)],
+    ) {
+        while run.current_step_id() != Some("security-save") {
+            let step_id = run.current_step_id().expect("security wizard step");
+            let answer = overrides
+                .iter()
+                .find_map(|(id, answer)| (*id == step_id).then(|| answer.clone()))
+                .or_else(|| (step_id == "workspace-trust").then_some(WizardAnswer::Acknowledged))
+                .or_else(|| run.prefill())
+                .unwrap_or_else(|| panic!("security wizard step `{step_id}` has no answer"));
+            run.submit(answer).unwrap();
+        }
+    }
+
+    fn security_run_for_cwd(cwd: &std::path::Path) -> WizardRun {
+        let descriptor = descriptor_for_cwd(crate::wizard::SECURITY_WIZARD_ID, cwd).unwrap();
+        WizardRun::new(descriptor).unwrap()
+    }
+
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn trust_policy_for(
+        root: &std::path::Path,
+        mode: crate::db::workspace_trust::WorkspaceTrustMode,
+    ) -> crate::config::trust::WorkspaceTrustPolicy {
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: root.to_path_buf(),
+                root: root.to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode,
+        }
+    }
+
+    #[test]
+    fn security_wizard_all_defaults_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_prefills_until_save(&mut run);
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved, None);
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn security_wizard_writes_only_changed_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_until_save(
+            &mut run,
+            &[(
+                "sandbox",
+                WizardAnswer::Select("container-readonly".to_string()),
+            )],
+        );
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(config_path.as_path()));
+        let raw = read_json(&config_path);
+        assert_eq!(raw["sandbox"]["defaultMode"], "container_readonly");
+        assert!(raw.get("defaultApprovalMode").is_none());
+        assert!(raw.get("trustedOnly").is_none());
+        assert!(raw.get("trusted_only").is_none());
+        assert!(raw.get("redact").is_none());
+    }
+
+    #[test]
+    fn security_wizard_writes_all_four_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_until_save(
+            &mut run,
+            &[
+                ("sandbox", WizardAnswer::Select("container".to_string())),
+                ("approval", WizardAnswer::Select("auto".to_string())),
+                ("trusted-only", WizardAnswer::Confirm(true)),
+                ("redaction", WizardAnswer::Text("24".to_string())),
+            ],
+        );
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(config_path.as_path()));
+        let cfg = crate::config::extended::load_for_cwd(tmp.path());
+        assert_eq!(
+            cfg.sandbox.default_mode,
+            crate::tools::sandbox_mode::SandboxMode::Container
+        );
+        assert_eq!(
+            cfg.default_approval_mode,
+            crate::config::extended::ApprovalMode::Auto
+        );
+        assert!(cfg.trusted_only);
+        assert_eq!(cfg.redact.min_secret_length, 24);
+    }
+
+    #[test]
+    fn security_wizard_off_sandbox_mode_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_until_save(
+            &mut run,
+            &[("sandbox", WizardAnswer::Select("off".to_string()))],
+        );
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(config_path.as_path()));
+        let cfg = crate::config::extended::load_for_cwd(tmp.path());
+        assert_eq!(
+            cfg.sandbox.default_mode,
+            crate::tools::sandbox_mode::SandboxMode::Off
+        );
+    }
+
+    #[test]
+    fn security_wizard_matching_parent_layer_value_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::clear_config();
+        let parent = tmp.path().join("repo");
+        let child = parent.join("child");
+        let parent_config = parent.join(".cockpit/config.json");
+        std::fs::create_dir_all(parent_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(&parent_config, r#"{"trustedOnly":true}"#).unwrap();
+        let before = std::fs::read_to_string(&parent_config).unwrap();
+        let policy = trust_policy_for(
+            &parent,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        );
+        let saved = crate::config::trust::with_workspace_trust_policy(policy, || {
+            let mut run = security_run_for_cwd(&child);
+            submit_security_wizard_prefills_until_save(&mut run);
+
+            apply_security_answers(&child, &run).unwrap()
+        });
+
+        assert_eq!(saved, None);
+        assert_eq!(std::fs::read_to_string(&parent_config).unwrap(), before);
+    }
+
+    #[test]
+    fn security_wizard_write_target_prefers_existing_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::clear_config();
+        let project = tmp.path().join("repo");
+        let project_config = project.join(".cockpit/config.json");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        std::fs::write(&project_config, "{}").unwrap();
+        let policy = trust_policy_for(
+            &project,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        );
+        let saved = crate::config::trust::with_workspace_trust_policy(policy, || {
+            let mut run = security_run_for_cwd(&project);
+            submit_security_wizard_until_save(
+                &mut run,
+                &[("sandbox", WizardAnswer::Select("container".to_string()))],
+            );
+
+            apply_security_answers(&project, &run).unwrap()
+        });
+
+        assert_eq!(saved.as_deref(), Some(project_config.as_path()));
+    }
+
+    #[test]
+    fn security_wizard_write_target_falls_back_to_cwd_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wizard::apply::tests::security_wizard_write_target_falls_back_to_cwd_config_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("COCKPIT_SECURITY_FALLBACK_CWD", &cwd)
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", &state)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove(COCKPIT_CONFIG_ENV)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "fallback child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by security_wizard_write_target_falls_back_to_cwd_config"]
+    fn security_wizard_write_target_falls_back_to_cwd_config_child() {
+        let cwd = std::path::PathBuf::from(
+            std::env::var_os("COCKPIT_SECURITY_FALLBACK_CWD").expect("fallback cwd env var"),
+        );
+        let fallback = cwd.join(".cockpit/config.json");
+        assert!(!fallback.exists());
+        let mut run = security_run_for_cwd(&cwd);
+        submit_security_wizard_until_save(
+            &mut run,
+            &[("sandbox", WizardAnswer::Select("container".to_string()))],
+        );
+
+        let saved = apply_security_answers(&cwd, &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(fallback.as_path()));
+        assert!(fallback.exists());
+    }
+
+    #[test]
+    fn security_wizard_unparseable_min_secret_length_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_prefills_until_save(&mut run);
+        run.answers
+            .insert("redaction", WizardAnswer::Text("not-a-number".to_string()));
+        run.answers
+            .insert("sandbox", WizardAnswer::Select("container".to_string()));
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(config_path.as_path()));
+        let raw = read_json(&config_path);
+        assert_eq!(raw["sandbox"]["defaultMode"], "container");
+        assert!(raw.get("redact").is_none());
+    }
+
+    #[test]
+    fn security_wizard_min_secret_length_trims_whitespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_until_save(
+            &mut run,
+            &[("redaction", WizardAnswer::Text(" 24 ".to_string()))],
+        );
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(config_path.as_path()));
+        let cfg = crate::config::extended::load_for_cwd(tmp.path());
+        assert_eq!(cfg.redact.min_secret_length, 24);
     }
 
     #[test]

@@ -140,6 +140,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_rpc_reads_sets_and_clears() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        ctx.db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship daemon goal rpc",
+                Some("context secret"),
+                Some(100),
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::GoalStatus {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("goal status");
+        let Response::GoalStatus { goal: Some(goal) } = response else {
+            panic!("expected goal status response");
+        };
+        assert_eq!(goal.session_id, session.session_id);
+        assert_eq!(goal.objective, "ship daemon goal rpc");
+        assert_eq!(goal.status, proto::GoalStatus::Active);
+
+        let response = handle_request(
+            Request::SetGoalStatus {
+                session_id: session.session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("pause goal");
+        let Response::GoalUpdated { goal } = response else {
+            panic!("expected goal updated response");
+        };
+        assert_eq!(goal.status, proto::GoalStatus::Paused);
+
+        let response = handle_request(
+            Request::SetGoalStatus {
+                session_id: session.session_id,
+                status: proto::GoalStatus::Active,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("resume goal");
+        let Response::GoalUpdated { goal } = response else {
+            panic!("expected goal updated response");
+        };
+        assert_eq!(goal.status, proto::GoalStatus::Active);
+
+        let response = handle_request(
+            Request::ClearGoal {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("clear goal");
+        assert!(matches!(response, Response::GoalCleared { cleared: true }));
+
+        let response = handle_request(
+            Request::GoalStatus {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("goal status after clear");
+        assert!(matches!(response, Response::GoalStatus { goal: None }));
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -1049,6 +1133,7 @@ mod tests {
             | ("list_sessions", "public_read", false)
             | ("read_session_messages", "custom", false)
             | ("session_live_status", "public_read", false)
+            | ("goal_status", "session_row_reader", false)
             | ("list_skills", "project_read", false)
             | ("daemon_status", "public_read", false)
             | ("guidance_estimate", "project_read", false) => DispatchMatrixClass::Readonly,
@@ -1082,6 +1167,7 @@ mod tests {
         ListSessions,
         ReadSessionMessages,
         SessionLiveStatus,
+        GoalStatus,
         ListSkills,
         DaemonStatus,
         GuidanceEstimate,
@@ -1128,6 +1214,10 @@ mod tests {
             ReadonlyDispatchCase {
                 kind: "session_live_status",
                 case: ReadonlyDispatchCaseKind::SessionLiveStatus,
+            },
+            ReadonlyDispatchCase {
+                kind: "goal_status",
+                case: ReadonlyDispatchCaseKind::GoalStatus,
             },
             ReadonlyDispatchCase {
                 kind: "list_skills",
@@ -1182,6 +1272,8 @@ mod tests {
             MutatingDispatchCase { kind: "resume_paused_work", effect_class: Durable, observation: "paused_session_work status becomes resumed" },
             MutatingDispatchCase { kind: "cancel_paused_work", effect_class: Durable, observation: "paused_session_work status becomes cancelled" },
             MutatingDispatchCase { kind: "repair_resume", effect_class: DriverForwarded, observation: "SessionWork::RepairResume delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_goal_status", effect_class: Durable, observation: "session goal status changes" },
+            MutatingDispatchCase { kind: "clear_goal", effect_class: Durable, observation: "session goal is closed" },
             MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
             MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
             MutatingDispatchCase { kind: "fs_create_dir", effect_class: Durable, observation: "directory created under project root" },
@@ -1376,6 +1468,8 @@ mod tests {
             "attach"
             | "subagent_transcript"
             | "cancel_attachment_upload"
+            | "goal_status"
+            | "clear_goal"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "fs_list"
@@ -1421,7 +1515,8 @@ mod tests {
             | "set_scheduled_job_enabled"
             | "run_scheduled_job"
             | "store_flycockpit_credential"
-            | "clear_flycockpit_credential" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+            | "clear_flycockpit_credential"
+            | "set_goal_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
             "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
             "list_agents" | "list_models" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
             "send_user_message"
@@ -1469,6 +1564,9 @@ mod tests {
             authz_session_writer("resume_paused_work"),
             authz_session_writer("cancel_paused_work"),
             authz_session_writer("repair_resume"),
+            authz_session_reader("goal_status"),
+            authz_session_writer("set_goal_status"),
+            authz_session_writer("clear_goal"),
             authz_session_writer("cancel_turn"),
             authz_project_files("fs_list"),
             authz_project_files("fs_stat"),
@@ -2215,6 +2313,12 @@ mod tests {
             "resume_paused_work" => Request::ResumePausedWork { session_id },
             "cancel_paused_work" => Request::CancelPausedWork { session_id },
             "repair_resume" => Request::RepairResume { session_id },
+            "goal_status" => Request::GoalStatus { session_id },
+            "set_goal_status" => Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            "clear_goal" => Request::ClearGoal { session_id },
             "cancel_turn" => Request::CancelTurn,
             "fs_list" => Request::FsList {
                 project_root: root,
@@ -2592,6 +2696,33 @@ mod tests {
                     assert_eq!(statuses.len(), 1);
                     assert_eq!(statuses[0].session_id, session.session_id);
                 }
+                Self::GoalStatus => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    ctx.db
+                        .create_session_goal(
+                            session.session_id,
+                            &session.project_id,
+                            "ship status rpc",
+                            Some("context"),
+                            Some(100),
+                        )
+                        .unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GoalStatus {
+                            session_id: session.session_id,
+                        },
+                    )
+                    .await
+                    .expect("goal_status happy");
+                    let Response::GoalStatus { goal: Some(goal) } = response else {
+                        panic!("expected GoalStatus with goal");
+                    };
+                    assert_eq!(goal.session_id, session.session_id);
+                    assert_eq!(goal.objective, "ship status rpc");
+                    assert_eq!(goal.status, proto::GoalStatus::Active);
+                }
                 Self::ListSkills => {
                     let ctx = test_ctx();
                     let tmp = tempfile::tempdir().unwrap();
@@ -2791,6 +2922,19 @@ mod tests {
                     };
                     assert!(statuses.is_empty());
                 }
+                Self::GoalStatus => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GoalStatus {
+                            session_id: session.session_id,
+                        },
+                    )
+                    .await
+                    .expect("goal_status without an open goal is typed none");
+                    assert!(matches!(response, Response::GoalStatus { goal: None }));
+                }
                 Self::ListSkills => {
                     let ctx = test_ctx();
                     let tmp = tempfile::tempdir().unwrap();
@@ -2960,6 +3104,7 @@ mod tests {
             "resume_paused_work" | "cancel_paused_work" => {
                 assert_paused_work_mutating_happy(case.kind).await;
             }
+            "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -3066,6 +3211,7 @@ mod tests {
                 assert!(matches!(response, Response::Ack));
                 assert!(ctx.db.paused_session_work_all().unwrap().is_empty());
             }
+            "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -4022,6 +4168,84 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_goal_mutating_happy(kind: &str) {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        ctx.db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship goal rpc",
+                None,
+                Some(100),
+            )
+            .unwrap();
+        let response = dispatch_matrix_request(
+            &ctx,
+            match kind {
+                "set_goal_status" => Request::SetGoalStatus {
+                    session_id: session.session_id,
+                    status: proto::GoalStatus::Paused,
+                },
+                "clear_goal" => Request::ClearGoal {
+                    session_id: session.session_id,
+                },
+                _ => unreachable!(),
+            },
+        )
+        .await
+        .expect("goal mutation");
+        match (kind, response) {
+            ("set_goal_status", Response::GoalUpdated { goal }) => {
+                assert_eq!(goal.session_id, session.session_id);
+                assert_eq!(goal.status, proto::GoalStatus::Paused);
+            }
+            ("clear_goal", Response::GoalCleared { cleared }) => {
+                assert!(cleared);
+                assert!(
+                    ctx.db
+                        .current_session_goal(session.session_id, false)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            _ => panic!("unexpected goal mutation response"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_goal_mutating_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        match kind {
+            "set_goal_status" => {
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::SetGoalStatus {
+                        session_id: session.session_id,
+                        status: proto::GoalStatus::Paused,
+                    },
+                )
+                .await
+                .expect_err("missing open goal rejects status change");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
+            "clear_goal" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ClearGoal {
+                        session_id: session.session_id,
+                    },
+                )
+                .await
+                .expect("missing open goal is a typed no-op");
+                assert!(matches!(response, Response::GoalCleared { cleared: false }));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
     async fn assert_session_db_mutating_happy(kind: &str) {
         let ctx = test_ctx();
         let tmp = tempfile::tempdir().unwrap();
@@ -4755,6 +4979,34 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::GoalStatus {
+                    session_id: attached_session_id,
+                },
+                kind: "goal_status",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::SetGoalStatus {
+                    session_id: attached_session_id,
+                    status: proto::GoalStatus::Paused,
+                },
+                kind: "set_goal_status",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ClearGoal {
+                    session_id: attached_session_id,
+                },
+                kind: "clear_goal",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::CancelTurn,
                 kind: "cancel_turn",
                 session_id: Some(attached_session_id),
@@ -5393,6 +5645,9 @@ mod tests {
             ResumePausedWork,
             CancelPausedWork,
             RepairResume,
+            GoalStatus,
+            SetGoalStatus,
+            ClearGoal,
             CancelTurn,
             FsList,
             FsStat,

@@ -326,6 +326,36 @@ async fn handle_request(
             }
         }
 
+        Request::GoalStatus { session_id } => {
+            ctx.db
+                .refresh_session_goal_usage(session_id)
+                .map_err(internal)?;
+            let goal = ctx
+                .db
+                .current_session_goal(session_id, false)
+                .map_err(internal)?
+                .map(goal_to_proto);
+            Ok(Response::GoalStatus { goal })
+        }
+
+        Request::SetGoalStatus { session_id, status } => {
+            let goal = ctx
+                .db
+                .set_session_goal_status(session_id, status)
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: e.to_string(),
+                })?;
+            Ok(Response::GoalUpdated {
+                goal: goal_to_proto(goal),
+            })
+        }
+
+        Request::ClearGoal { session_id } => {
+            let cleared = ctx.db.clear_session_goal(session_id).map_err(internal)?;
+            Ok(Response::GoalCleared { cleared })
+        }
+
         Request::CancelTurn => {
             let att = require_attached(state)?;
             att.handle
@@ -1652,6 +1682,23 @@ fn active_model_trigger_from_proto(
         proto::ActiveModelSwitchTrigger::Quick => crate::session::ModelSwitchTrigger::Quick,
         proto::ActiveModelSwitchTrigger::Cycle => crate::session::ModelSwitchTrigger::Cycle,
         proto::ActiveModelSwitchTrigger::Daemon => crate::session::ModelSwitchTrigger::Daemon,
+    }
+}
+
+fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSummary {
+    proto::GoalSummary {
+        id: goal.id,
+        session_id: goal.session_id,
+        project_id: goal.project_id,
+        objective: goal.objective,
+        context: goal.context,
+        status: goal.status,
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        blocked_attempts: goal.blocked_attempts,
+        last_read_at: goal.last_read_at,
+        created_at: goal.created_at,
+        updated_at: goal.updated_at,
     }
 }
 

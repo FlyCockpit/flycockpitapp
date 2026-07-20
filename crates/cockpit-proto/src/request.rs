@@ -174,6 +174,22 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// Read the current open goal for a session after refreshing token usage.
+    GoalStatus {
+        session_id: Uuid,
+    },
+
+    /// Pause or resume the current open goal for a session.
+    SetGoalStatus {
+        session_id: Uuid,
+        status: GoalStatus,
+    },
+
+    /// Mark the current open goal complete without requiring model evidence.
+    ClearGoal {
+        session_id: Uuid,
+    },
+
     /// Cancel the in-flight model call for the attached session. The
     /// daemon aborts the streaming completion and returns control to
     /// the agent stack so the user can redirect.
@@ -699,6 +715,9 @@ macro_rules! command {
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, none);
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, none);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, none);
+            (Request::GoalStatus { session_id }, "goal_status", session_row_reader(session_id), field(session_id), false, none);
+            (Request::SetGoalStatus { session_id, .. }, "set_goal_status", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, none);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, none);
             (Request::FsStat { project_root, .. }, "fs_stat", project_files(project_root), none, false, none);

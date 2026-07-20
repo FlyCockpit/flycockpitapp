@@ -124,6 +124,19 @@ pub enum Response {
         seq: i64,
     },
 
+    GoalStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<GoalSummary>,
+    },
+
+    GoalUpdated {
+        goal: GoalSummary,
+    },
+
+    GoalCleared {
+        cleared: bool,
+    },
+
     /// Per-session live status. Answer to [`Request::SessionLiveStatus`].
     /// Only sessions with a live worker appear; everything else is
     /// implicitly not-processing / no-jobs.

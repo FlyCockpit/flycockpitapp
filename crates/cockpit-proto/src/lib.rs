@@ -1015,6 +1015,27 @@ pub use cockpit_db::wire::{
     SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
 
+pub use cockpit_db::db::session_goals::GoalStatus;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalSummary {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub project_id: String,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    pub status: GoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub blocked_attempts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_read_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PausedWorkSummary {
     pub session_id: Uuid,

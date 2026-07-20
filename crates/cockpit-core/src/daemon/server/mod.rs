@@ -277,6 +277,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_session_message(message, redact);
             }
         }
+        proto::Response::GoalStatus { goal } => {
+            if let Some(goal) = goal {
+                scrub_goal_summary(goal, redact);
+            }
+        }
+        proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        proto::Response::GoalCleared { cleared: _ } => {}
         proto::Response::Forked {
             session_id: _,
             short_id: _,
@@ -1040,6 +1047,26 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
     } = summary;
     scrub_string(project_root, redact);
     scrub_option_string(title, redact);
+}
+
+fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
+    let proto::GoalSummary {
+        id: _,
+        session_id: _,
+        project_id,
+        objective,
+        context,
+        status: _,
+        token_budget: _,
+        tokens_used: _,
+        blocked_attempts: _,
+        last_read_at: _,
+        created_at: _,
+        updated_at: _,
+    } = goal;
+    scrub_string(project_id, redact);
+    scrub_string(objective, redact);
+    scrub_option_string(context, redact);
 }
 
 fn scrub_session_message(message: &mut proto::SessionMessage, redact: &RedactionTable) {

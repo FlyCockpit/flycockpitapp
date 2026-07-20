@@ -1845,6 +1845,8 @@ impl ExtendedConfigDoc {
             "embedding_model",
             "commandResourceProfiles",
             "sandbox",
+            "tools",
+            "web",
         ] {
             if serialized.get(key).is_none() {
                 obj.remove(key);

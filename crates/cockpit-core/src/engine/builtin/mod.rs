@@ -461,6 +461,300 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinToolInventoryItem {
+    pub family: &'static str,
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub condition: Option<&'static str>,
+}
+
+/// Read-only inventory of native tool names grouped for UI/settings surfaces.
+///
+/// Keep this list next to [`known_agent_tool_names`] and
+/// [`materialize_tool_by_name`] so agent grants, runtime materialization, and
+/// user-facing inventory drift together instead of each UI re-spelling names.
+pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
+    &[
+        BuiltinToolInventoryItem {
+            family: "Filesystem",
+            name: "read",
+            summary: "Read project files through the sandbox boundary.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Filesystem",
+            name: "grep",
+            summary: "Search file contents with scoped regular expressions.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Filesystem",
+            name: "glob",
+            summary: "Find files by glob pattern.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Shell",
+            name: "bash",
+            summary: "Run shell commands with approval and sandbox checks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Shell",
+            name: "escalate",
+            summary: "Request elevated command or path access from the user.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "readlock",
+            summary: "Acquire a read lock on a project path.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "writeunlock",
+            summary: "Write while releasing daemon-arbitrated file locks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "editunlock",
+            summary: "Edit while releasing daemon-arbitrated file locks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "unlock",
+            summary: "Release held file locks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "context_pack",
+            summary: "Assemble a focused code context bundle.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "tree",
+            summary: "Inspect the project tree with pruning.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "outline",
+            summary: "Summarize symbols in source files.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "symbol_find",
+            summary: "Find symbols across indexed code.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "word",
+            summary: "Search indexed identifiers and words.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "deps",
+            summary: "Inspect package and dependency information.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "hot",
+            summary: "Surface high-centrality code paths.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "circular",
+            summary: "Find circular dependencies.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "search",
+            summary: "Search project code using Cockpit intelligence.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "impact",
+            summary: "Estimate impact for symbols or files.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "change_impact",
+            summary: "Estimate impact for local changes.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Skills",
+            name: "skill",
+            summary: "Run user-invocable skills.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Skills",
+            name: "skill_manage",
+            summary: "Create and manage local skills.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "plan_read",
+            summary: "Read the shared plan document.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "plan_write",
+            summary: "Replace the shared plan document.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "plan_edit",
+            summary: "Patch the shared plan document.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "start_build",
+            summary: "Start a build from the current plan.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "todo",
+            summary: "Update the session todo list.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "todo_read",
+            summary: "Read the session todo list.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "create_goal",
+            summary: "Create a resumable session goal.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "get_goal",
+            summary: "Read the current session goal.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "update_goal",
+            summary: "Update the current session goal.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "session_search",
+            summary: "Search prior persisted sessions.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "session_read",
+            summary: "Read a prior persisted session.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "tool_result_retrieve",
+            summary: "Retrieve an elided tool result.",
+            condition: Some("internal recovery"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "delegation_payload_retrieve",
+            summary: "Retrieve an elided delegation payload.",
+            condition: Some("internal recovery"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "task",
+            summary: "Delegate work to configured subagents.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "spawn",
+            summary: "Spawn a subagent with an explicit role.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "handoff",
+            summary: "Hand off control to another agent.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "return",
+            summary: "Return from a delegated agent.",
+            condition: Some("delegated agents"),
+        },
+        BuiltinToolInventoryItem {
+            family: "MCP",
+            name: "mcp",
+            summary: "Search, describe, and invoke MCP server tools.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "LSP",
+            name: "lsp",
+            summary: "Query language-server diagnostics and navigation.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Harnesses",
+            name: "harness_list",
+            summary: "List external coding harnesses.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Harnesses",
+            name: "harness_invoke",
+            summary: "Invoke an external coding harness.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "question",
+            summary: "Ask the user a structured question.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "schedule",
+            summary: "Schedule follow-up work.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "defer_to_orchestrator",
+            summary: "Defer a decision to the orchestrator.",
+            condition: None,
+        },
+    ]
+}
+
 fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
     &[
         "webfetch",
@@ -473,7 +767,7 @@ fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
     ]
 }
 
-fn is_reserved_custom_tool_name(name: &str) -> bool {
+pub fn is_reserved_custom_tool_name(name: &str) -> bool {
     known_agent_tool_names().contains(&name) || extra_custom_tool_reserved_names().contains(&name)
 }
 
@@ -3008,6 +3302,28 @@ mod tests {
     fn reserved_custom_tool_name_includes_typed_web_tools() {
         assert!(is_reserved_custom_tool_name("webfetch"));
         assert!(is_reserved_custom_tool_name("websearch"));
+    }
+
+    #[test]
+    fn builtin_inventory_tracks_grantable_tool_names() {
+        let inventory = builtin_tool_inventory()
+            .iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::HashSet<_>>();
+        let intentionally_web_section = ["webfetch", "websearch"];
+        for name in known_agent_tool_names() {
+            assert!(
+                inventory.contains(name) || intentionally_web_section.contains(name),
+                "`{name}` is grantable but absent from the builtin inventory"
+            );
+        }
+        for name in inventory {
+            assert!(
+                known_agent_tool_names().contains(&name)
+                    || extra_custom_tool_reserved_names().contains(&name),
+                "`{name}` is inventoried but not backed by a runtime/reserved tool name"
+            );
+        }
     }
 
     /// The per-agent `task` description override (`Build`/`builder`) follows

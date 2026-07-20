@@ -3698,12 +3698,45 @@ fn cursor_down(d: &mut SettingsDialog, n: usize) {
     }
 }
 
-fn tools_setup_row() -> usize {
-    2
+fn tools_page_lines(d: &SettingsDialog) -> Vec<String> {
+    let p = match d.test_page() {
+        TestPageRef::Tools(p) => p,
+        other => panic!("expected Tools, got {other:?}"),
+    };
+    d.build_tools_page_lines(100, p)
+        .iter()
+        .map(line_text)
+        .collect()
 }
 
-fn tools_reset_row() -> usize {
-    tools_setup_row() + 1
+fn set_tools_cursor(d: &mut SettingsDialog, cursor: usize) {
+    match d.test_page_mut() {
+        TestPageMut::Tools(p) => p.cursor = cursor,
+        other => panic!("expected Tools, got {other:?}"),
+    }
+}
+
+fn selected_tools_line_for_cursor(d: &mut SettingsDialog, cursor: usize) -> Option<String> {
+    set_tools_cursor(d, cursor);
+    tools_page_lines(d)
+        .into_iter()
+        .find(|line| line.starts_with("▸ "))
+}
+
+fn tools_cursor_for_label(d: &mut SettingsDialog, label: &str) -> usize {
+    for cursor in 0..200 {
+        if let Some(line) = selected_tools_line_for_cursor(d, cursor)
+            && line.contains(label)
+        {
+            return cursor;
+        }
+    }
+    panic!("no Tools row containing `{label}`");
+}
+
+fn set_tools_cursor_to_label(d: &mut SettingsDialog, label: &str) {
+    let cursor = tools_cursor_for_label(d, label);
+    set_tools_cursor(d, cursor);
 }
 
 #[test]
@@ -3715,6 +3748,8 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
 
     d.extended.web.custom.fetch_command = Some("fetch {url}".into());
     d.extended.web.custom.search_command = Some("search {query}".into());
+    d.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+    d.extended.web.firecrawl_base_url = Some("https://firecrawl.local".into());
     d.extended.tools.insert(
         "my_custom".into(),
         ToolCommandTemplate {
@@ -3724,7 +3759,7 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
         },
     );
 
-    cursor_down(&mut d, tools_reset_row());
+    set_tools_cursor_to_label(&mut d, "[reset to defaults]");
 
     // First activation arms (no change yet).
     d.handle_key(press(KeyCode::Enter));
@@ -3751,11 +3786,27 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
     );
     assert_eq!(d.extended.web.custom.fetch_command, None);
     assert_eq!(d.extended.web.custom.search_command, None);
+    assert_eq!(
+        d.extended.web.provider,
+        cockpit_config::extended::WebProvider::Firecrawl
+    );
+    assert_eq!(d.extended.web.firecrawl_base_url, None);
+    assert!(
+        tools_page_lines(&d)
+            .iter()
+            .any(|line| line.contains("read") && line.contains("sandbox boundary")),
+        "builtin inventory remains rendered"
+    );
     // Persisted to disk.
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
     assert!(!reloaded.tools.contains_key("my_custom"));
     assert_eq!(reloaded.web.custom.fetch_command, None);
     assert_eq!(reloaded.web.custom.search_command, None);
+    assert_eq!(
+        reloaded.web.provider,
+        cockpit_config::extended::WebProvider::Firecrawl
+    );
+    assert_eq!(reloaded.web.firecrawl_base_url, None);
 }
 
 #[test]
@@ -3763,7 +3814,7 @@ fn tools_reset_pending_cancelled_by_navigation() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
-    cursor_down(&mut d, tools_reset_row());
+    set_tools_cursor_to_label(&mut d, "[reset to defaults]");
     d.handle_key(press(KeyCode::Enter)); // arm
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(p.reset.is_pending()),
@@ -3801,6 +3852,7 @@ fn tools_page_wraps_long_values_under_value_column() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
+    d.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
     d.extended.web.custom.fetch_command =
         Some("curl --header very-long-header --max-time 20 --retry 4 -- {url}".into());
 
@@ -3835,83 +3887,219 @@ fn tools_page_wraps_long_values_under_value_column() {
 }
 
 #[test]
-fn tools_web_setup_firecrawl_selects_native_provider_without_touching_templates() {
+fn tools_page_renders_inventory_sections_in_order() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut d);
+    let rendered = tools_page_lines(&d);
+    let web = rendered
+        .iter()
+        .position(|line| line == "Web tools")
+        .unwrap();
+    let builtin = rendered
+        .iter()
+        .position(|line| line == "Built-in tools")
+        .unwrap();
+    let user = rendered
+        .iter()
+        .position(|line| line == "User-defined tools")
+        .unwrap();
+    let mcp = rendered
+        .iter()
+        .position(|line| line == "MCP tools")
+        .unwrap();
+    assert!(web < builtin && builtin < user && user < mcp);
+}
+
+#[test]
+fn tools_page_provider_choice_is_first_navigable_control() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut d);
+    let selected = selected_tools_line_for_cursor(&mut d, 0).expect("selected row");
+    assert!(selected.contains("provider"), "{selected}");
+}
+
+#[test]
+fn tools_page_root_description_matches_inventory_scope() {
+    let nodes = root_nodes();
+    let tools = nodes
+        .iter()
+        .find(|node| node.title == "Tools")
+        .expect("Tools root node");
+    assert!(!tools.description.contains("Custom bash-command tools"));
+    assert!(tools.description.contains("Tool inventory"));
+}
+
+#[test]
+fn tools_page_provider_rows_are_inline_and_provider_specific() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
 
-    cursor_down(&mut d, tools_setup_row());
-    d.handle_key(press(KeyCode::Enter));
-    d.handle_key(press(KeyCode::Enter));
+    let rendered = tools_page_lines(&d);
+    let builtin = rendered
+        .iter()
+        .position(|line| line == "Built-in tools")
+        .unwrap();
+    let firecrawl = rendered[..builtin].join("\n");
+    assert!(firecrawl.contains("provider"));
+    assert!(firecrawl.contains("base url"), "{firecrawl}");
+    assert!(firecrawl.contains("api key"), "{firecrawl}");
+    assert!(!firecrawl.contains("webfetch"), "{firecrawl}");
 
-    assert_eq!(
-        d.extended.web.provider,
-        cockpit_config::extended::WebProvider::Firecrawl
-    );
+    d.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+    let rendered = tools_page_lines(&d);
+    let builtin = rendered
+        .iter()
+        .position(|line| line == "Built-in tools")
+        .unwrap();
+    let custom = rendered[..builtin].join("\n");
+    assert!(custom.contains("webfetch"), "{custom}");
+    assert!(custom.contains("websearch"), "{custom}");
+    assert!(!custom.contains("api key"), "{custom}");
+    assert!(!custom.contains("base url"), "{custom}");
+}
+
+#[test]
+fn tools_page_custom_blank_webfetch_warns_not_registered() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut d);
+    d.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+    d.extended.web.custom.fetch_command = None;
+
+    let blank = tools_page_lines(&d);
+    let webfetch = blank
+        .iter()
+        .find(|line| line.contains("webfetch"))
+        .expect("webfetch row");
     assert!(
-        d.extended.tools.is_empty(),
-        "native Firecrawl does not write CLI templates"
+        webfetch.contains("not registered - no command set"),
+        "{webfetch}"
     );
+
+    d.extended.web.custom.fetch_command = Some("fetch-cli {url}".into());
+    let set = tools_page_lines(&d);
+    let webfetch = set
+        .iter()
+        .find(|line| line.contains("webfetch"))
+        .expect("webfetch row");
+    assert!(!webfetch.contains("not registered"), "{webfetch}");
+}
+
+#[test]
+fn tools_page_builtin_rows_are_read_only() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut d);
+    set_tools_cursor_to_label(&mut d, "read");
+    d.handle_key(press(KeyCode::Enter));
     match d.test_page() {
         TestPageRef::Tools(p) => {
-            assert_eq!(p.setup, Some(tools_page::WebSetupState::FirecrawlDetails));
-            assert_eq!(p.cursor, 0);
+            assert!(p.editing.is_none());
+            assert_eq!(p.status.as_deref(), Some("read-only inventory row"));
         }
         other => panic!("expected Tools, got {other:?}"),
     }
 }
 
 #[test]
-fn tools_web_setup_tinyfish_is_gated_until_key_exists() {
+fn tools_page_add_and_remove_user_defined_tool_persists() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    d.credential_store_path = Some(tmp.path().join("credentials.json"));
     enter_tools_from_root(&mut d);
 
-    cursor_down(&mut d, tools_setup_row());
+    set_tools_cursor_to_label(&mut d, "[+ add tool]");
     d.handle_key(press(KeyCode::Enter));
-    d.handle_key(press(KeyCode::Down));
+    d.paste("my_tool");
     d.handle_key(press(KeyCode::Enter));
+    assert!(d.extended.tools.contains_key("my_tool"));
+    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+    assert!(reloaded.tools.contains_key("my_tool"));
 
-    assert_eq!(
-        d.extended.web.provider,
-        cockpit_config::extended::WebProvider::Firecrawl,
-        "TinyFish selection is blocked without a key"
-    );
-    match d.test_page() {
-        TestPageRef::Tools(p) => assert!(
-            p.status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("TinyFish needs TINYFISH_API_KEY")
-        ),
-        other => panic!("expected Tools, got {other:?}"),
-    }
-
-    let store =
-        cockpit_core::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
-            .unwrap();
-    store
-        .save_record_merged("tinyfish", serde_json::json!({ "api_key": "tf-secret" }))
-        .unwrap();
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(
-        d.extended.web.provider,
-        cockpit_config::extended::WebProvider::Tinyfish
-    );
+    set_tools_cursor_to_label(&mut d, "my_tool");
+    d.handle_key(press(KeyCode::Char('d')));
+    assert!(d.extended.tools.contains_key("my_tool"));
+    d.handle_key(press(KeyCode::Char('d')));
+    assert!(!d.extended.tools.contains_key("my_tool"));
+    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+    assert!(!reloaded.tools.contains_key("my_tool"));
 }
 
 #[test]
-fn tools_web_key_entry_persists_and_renders_masked() {
+fn tools_page_reserved_user_defined_tool_name_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut d);
+
+    set_tools_cursor_to_label(&mut d, "[+ add tool]");
+    d.handle_key(press(KeyCode::Enter));
+    d.paste("webfetch");
+    d.handle_key(press(KeyCode::Enter));
+
+    assert!(!d.extended.tools.contains_key("webfetch"));
+    match d.test_page() {
+        TestPageRef::Tools(p) => {
+            assert!(p.status.as_deref().unwrap_or_default().contains("webfetch"))
+        }
+        other => panic!("expected Tools, got {other:?}"),
+    }
+}
+
+#[test]
+fn tools_page_mcp_section_empty_and_cached_tools_jump_to_mcp() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut d);
+    let empty = tools_page_lines(&d).join("\n");
+    assert!(empty.contains("No MCP servers configured."), "{empty}");
+    assert!(empty.contains("configure in MCP ->"), "{empty}");
+
+    let raw = r#"{"servers":{"docs":{"transport":"streamable","endpoint":"https://example.test/mcp","enabled":true}}}"#;
+    std::fs::write(tmp.path().join("mcp.json"), raw).unwrap();
+    let cfg = cockpit_core::mcp::config::McpConfig::parse(raw).unwrap();
+    let server = cfg.servers.get("docs").unwrap();
+    let cache_dir = tmp.path().join("mcp-cache");
+    cockpit_core::mcp::cache::save_in(
+        &cache_dir,
+        &cockpit_core::mcp::cache::cache_key("docs", server),
+        &[cockpit_core::mcp::protocol::ToolDescriptor {
+            name: "lookup".into(),
+            description: "Find docs\nwith details".into(),
+            input_schema: serde_json::json!({}),
+        }],
+    )
+    .unwrap();
+    d.mcp_cache_dir = Some(cache_dir);
+
+    let cached = tools_page_lines(&d).join("\n");
+    assert!(cached.contains("docs/lookup"), "{cached}");
+    assert!(cached.contains("Find docs"), "{cached}");
+
+    set_tools_cursor_to_label(&mut d, "docs/lookup");
+    d.handle_key(press(KeyCode::Enter));
+    match d.test_page() {
+        TestPageRef::Tools(p) => {
+            assert!(p.editing.is_none());
+            assert_eq!(p.status.as_deref(), Some("read-only inventory row"));
+        }
+        other => panic!("expected Tools, got {other:?}"),
+    }
+
+    set_tools_cursor_to_label(&mut d, "configure in MCP ->");
+    d.handle_key(press(KeyCode::Enter));
+    assert!(matches!(d.test_page(), TestPageRef::Mcp(_)));
+}
+
+#[test]
+fn tools_page_web_key_entry_persists_and_renders_masked() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.credential_store_path = Some(tmp.path().join("credentials.json"));
     enter_tools_from_root(&mut d);
 
-    cursor_down(&mut d, tools_setup_row());
-    d.handle_key(press(KeyCode::Enter));
-    d.handle_key(press(KeyCode::Enter)); // Firecrawl details
-    d.handle_key(press(KeyCode::Down));
+    set_tools_cursor_to_label(&mut d, "api key");
     d.handle_key(press(KeyCode::Enter)); // key field
     d.paste("fc-secret-value");
 
@@ -3941,18 +4129,33 @@ fn tools_web_key_entry_persists_and_renders_masked() {
         store.api_key("firecrawl").as_deref(),
         Some("fc-secret-value")
     );
+
+    let p = match d.test_page() {
+        TestPageRef::Tools(p) => p,
+        other => panic!("expected Tools, got {other:?}"),
+    };
+    let rendered = d
+        .build_tools_page_lines(80, p)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains(secret_display::MASKED_VALUE));
+    assert!(!rendered.contains("fc-secret-value"));
 }
 
 #[test]
-fn tools_web_firecrawl_base_url_validates_and_round_trips() {
+fn tools_page_firecrawl_base_url_validates_and_round_trips() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
 
-    cursor_down(&mut d, tools_setup_row());
-    d.handle_key(press(KeyCode::Enter));
-    d.handle_key(press(KeyCode::Enter)); // Firecrawl details
-    cursor_down(&mut d, 2);
+    set_tools_cursor_to_label(&mut d, "base url");
     d.handle_key(press(KeyCode::Enter));
     d.paste("not-a-url");
     d.handle_key(press(KeyCode::Enter));
@@ -3969,20 +4172,13 @@ fn tools_web_firecrawl_base_url_validates_and_round_trips() {
 }
 
 #[test]
-fn tools_web_setup_custom_commands_edit_typed_fields() {
+fn tools_page_custom_commands_edit_typed_fields() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
+    d.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
 
-    cursor_down(&mut d, tools_setup_row());
-    d.handle_key(press(KeyCode::Enter));
-    cursor_down(&mut d, 2);
-    d.handle_key(press(KeyCode::Enter)); // custom commands
-    assert_eq!(
-        d.extended.web.provider,
-        cockpit_config::extended::WebProvider::Custom
-    );
-
+    set_tools_cursor_to_label(&mut d, "webfetch");
     d.handle_key(press(KeyCode::Enter)); // fetch command
     d.paste("fetch-cli {url}");
     d.handle_key(press(KeyCode::Enter));
@@ -3991,7 +4187,7 @@ fn tools_web_setup_custom_commands_edit_typed_fields() {
         Some("fetch-cli {url}")
     );
 
-    d.handle_key(press(KeyCode::Down));
+    set_tools_cursor_to_label(&mut d, "websearch");
     d.handle_key(press(KeyCode::Enter)); // search command
     d.paste("search-cli {query}");
     d.handle_key(press(KeyCode::Enter));

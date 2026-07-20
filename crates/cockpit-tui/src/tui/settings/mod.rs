@@ -389,6 +389,7 @@ pub struct SettingsCx {
     pub(super) command_installed: fn(&str) -> bool,
     pub(super) env_lookup: fn(&str) -> Option<String>,
     pub(super) credential_store_path: Option<PathBuf>,
+    pub(super) mcp_cache_dir: Option<PathBuf>,
     /// Disclosure produced when a provider save moved literal header values
     /// into the credential store. Consumed by the provider page's status line.
     pub(super) last_secret_notice: Option<String>,
@@ -1282,6 +1283,7 @@ impl SettingsDialog {
                 },
                 env_lookup: |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
                 credential_store_path: None,
+                mcp_cache_dir: None,
                 last_secret_notice: None,
                 pending_daemon_request: None,
                 pending_oauth_action: None,
@@ -1728,12 +1730,11 @@ impl SettingsPage for RootPage {
                         cx.reload_extended();
                         Some(tools_page(ToolsPage {
                             cursor: 0,
-                            setup: None,
                             editing: None,
                             buf: TextField::default(),
-                            edit_target: None,
                             status: None,
                             reset: ResetButton::default(),
+                            delete_pending: None,
                         }))
                     }
                     "Harnesses" => {
@@ -1848,7 +1849,7 @@ fn root_nodes() -> [NavNode; 12] {
         },
         NavNode {
             title: "Tools",
-            description: "Custom bash-command tools (webfetch, websearch, …) the agent can invoke.",
+            description: "Tool inventory and configuration: web providers, builtin tools, user-defined command tools, and MCP catalogs.",
         },
         NavNode {
             title: "Harnesses",

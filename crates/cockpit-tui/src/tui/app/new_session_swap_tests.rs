@@ -4,6 +4,8 @@ use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
 use crate::tui::history::HistoryEntry;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -174,6 +176,28 @@ async fn new_session_swap_failure_keeps_cleared_history() {
         app.agent_runner.as_ref(),
         Some(Err(error)) if error == "attach failed"
     ));
+}
+
+#[tokio::test]
+async fn new_session_swap_draws_before_swap_completes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    app.history.clear();
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { std::future::pending::<Result<AsyncActionPayload, String>>().await },
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    assert_eq!(app.async_actions.pending_count(), 1);
+    assert!(app.history.is_empty());
 }
 
 #[tokio::test]

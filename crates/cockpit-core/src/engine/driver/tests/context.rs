@@ -850,6 +850,29 @@ async fn zero_window_compact_fails_explicitly_without_mutation() {
 }
 
 #[tokio::test]
+async fn compact_prune_stage_does_not_mutate_live_history() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    driver.stack[0].history = dup_read_history_big();
+    let before = serde_json::to_value(&driver.stack[0].history).unwrap();
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 0);
+
+    driver.do_compact(&tx).await;
+
+    assert_eq!(
+        serde_json::to_value(&driver.stack[0].history).unwrap(),
+        before,
+        "the private prune-first stage must not mutate the live frame before the final compact write"
+    );
+    drop(tx);
+    assert!(
+        matches!(rx.recv().await, Some(TurnEvent::Notice { text }) if text.contains("history was left unchanged"))
+    );
+}
+
+#[tokio::test]
 async fn compact_private_prune_preserves_shell_condensation() {
     use crate::config::providers::{CacheMode, ContextConfig};
     use crate::engine::message::{AssistantContent, OneOrMany};

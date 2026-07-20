@@ -704,32 +704,29 @@ impl Driver {
         // 0. Prune-first (lossless; denser transcript → tighter brief). This
         // intermediate form is deliberately private to compaction: publishing
         // a normal prune event/ledger here would leave a false durable trail if
-        // the assembled handoff later proves too large and we roll back.
+        // the assembled handoff later proves too large. Keep it as a derived
+        // history until the normal compaction reset commits the final plan.
         let compact_prune =
             prune::dedup_plan(&self.stack.last().expect("stack never empty").history);
-        prune::apply_plan(
-            &mut self.stack.last_mut().expect("stack never empty").history,
+        let mut pruned_history = prune::apply_plan_to(
+            &self.stack.last().expect("stack never empty").history,
             &compact_prune,
         );
-        let compact_condensations =
-            prune::condense_candidates(&self.stack.last().expect("stack never empty").history)
+        let compact_condense_plan = prune::CondensePlan {
+            targets: prune::condense_candidates(&pruned_history)
                 .into_iter()
                 .map(|candidate| {
                     let hash = crate::db::compressed_results::compressed_result_hash(
                         &candidate.original_body,
                     );
-                    prune::apply_condensed_tool_result(
-                        &mut self.stack.last_mut().expect("stack never empty").history,
-                        &candidate,
-                        &hash,
-                    );
-                    (candidate, hash)
+                    prune::CondenseTarget { candidate, hash }
                 })
-                .collect::<Vec<_>>();
+                .collect(),
+        };
+        pruned_history = prune::apply_condense_plan_to(&pruned_history, &compact_condense_plan);
 
         // 1. Model brief from the foreground agent's current history.
-        let filtered_history =
-            self.compact_brief_history(&self.stack.last().expect("stack never empty").history);
+        let filtered_history = self.compact_brief_history(&pruned_history);
         let candidate_tail = match compact::plan_compacted_history(
             &filtered_history,
             "",
@@ -803,7 +800,8 @@ impl Driver {
                 self.draft_brief_delta(tx, &tail_message_seqs, &ready.brief, revision_history)
                     .await
             } else {
-                self.draft_brief(tx, &tail_message_seqs).await
+                self.draft_brief(tx, &tail_message_seqs, filtered_history.clone())
+                    .await
             };
             let handoff = compact::assemble_handoff(&brief, &appendix);
             let plan = match compact::plan_compacted_history(
@@ -838,20 +836,21 @@ impl Driver {
         // Persist every recoverable original for the private prune transform
         // atomically, but only after the handoff is proven to fit. A storage
         // failure aborts before model history or timeline state changes.
-        let compressed_entries = compact_condensations
+        let compressed_entries = compact_condense_plan
+            .targets
             .into_iter()
             .map(
-                |(candidate, hash)| crate::db::compressed_results::CompressedToolResultEntry {
-                    hash,
+                |target| crate::db::compressed_results::CompressedToolResultEntry {
+                    hash: target.hash,
                     session_id: self.session.id,
                     agent_id: self.active_agent().to_string(),
-                    tool: candidate.tool,
-                    call_id: candidate.call_id,
-                    original_byte_len: candidate.original_body.len(),
-                    compressed_byte_len: Some(candidate.condensed_body.len()),
+                    tool: target.candidate.tool,
+                    call_id: target.candidate.call_id,
+                    original_byte_len: target.candidate.original_body.len(),
+                    compressed_byte_len: Some(target.candidate.condensed_body.len()),
                     created_at: chrono::Utc::now().timestamp(),
                     kind: "prune-boundary".to_string(),
-                    content: candidate.original_body,
+                    content: target.candidate.original_body,
                 },
             )
             .collect();
@@ -987,15 +986,12 @@ impl Driver {
         }
     }
 
-    /// Run one model round-trip asking the foreground agent to draft the
-    /// self-contained handoff brief (T6.e step 1).
-    pub(in crate::engine::driver) async fn draft_brief(
+    async fn draft_brief(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],
+        history: Vec<Message>,
     ) -> String {
-        let history =
-            self.compact_brief_history(&self.stack.last().expect("stack never empty").history);
         let draft = self.compact_brief_draft(tx, history).await;
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());

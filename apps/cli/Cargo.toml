@@ -123,6 +123,9 @@ toml = { workspace = true }
 # keeping the dependency surface (and the schemas we validate against,
 # all hand-authored object schemas) minimal.
 jsonschema = { workspace = true }
+jaq-core = { workspace = true }
+jaq-json = { workspace = true }
+jaq-std = { workspace = true }
 
 # Filesystem helpers
 dirs = { workspace = true }

@@ -348,11 +348,18 @@ async fn call_bash_inner(
         false
     };
 
-    let session_env = ctx
+    let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
+    let mut session_env = ctx
         .env_overlay
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let jq_shim_paths =
+        if should_prepare_jq_shim(options.force_unconfined, ctx.session.sandbox_mode()) {
+            crate::tools::jq_shim::prepare_host_jq_shim(&ctx.session, &mut session_env)
+        } else {
+            Vec::new()
+        };
     let tmp_dir = ctx.session.tmp_dir();
     let scrub = scrub_overrides(&session_env);
     let command_classification = crate::approval::classify::classify(command);
@@ -380,7 +387,7 @@ async fn call_bash_inner(
         queue_timeout_ms,
     );
 
-    if !options.force_unconfined && ctx.session.sandbox_mode().is_container() {
+    if is_container_run {
         return run_container_bash(
             command,
             &prefixed,
@@ -497,6 +504,8 @@ async fn call_bash_inner(
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
+    let extra_sandbox_paths =
+        merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
@@ -506,7 +515,7 @@ async fn call_bash_inner(
         tmp_dir.as_deref(),
         &scrub,
         &session_env,
-        &command_resource_plan.allow_paths,
+        &extra_sandbox_paths,
         ctx,
         timeout_ms,
     )
@@ -572,7 +581,7 @@ async fn call_bash_inner(
                 tmp_dir.as_deref(),
                 &scrub,
                 &session_env,
-                &command_resource_plan.allow_paths,
+                &extra_sandbox_paths,
                 ctx,
                 timeout_ms,
             )
@@ -1989,6 +1998,22 @@ fn render_bash_outcome(
         Some(code) => out.with_exit_code(code),
         None => out,
     }
+}
+
+fn merged_extra_sandbox_paths(
+    resource_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
+    jq_shim_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
+) -> Vec<crate::tools::shell_sandbox::ExtraSandboxPath> {
+    let mut paths = resource_paths.to_vec();
+    paths.extend_from_slice(jq_shim_paths);
+    paths
+}
+
+fn should_prepare_jq_shim(
+    force_unconfined: bool,
+    sandbox_mode: crate::tools::sandbox_mode::SandboxMode,
+) -> bool {
+    force_unconfined || !sandbox_mode.is_container()
 }
 
 /// Spawn `sh -c <command>` — confined via zerobox when `confine`, else

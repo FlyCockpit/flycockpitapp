@@ -46,6 +46,25 @@ fn bash_description_mentions_cap_and_tmpdir_redirection() {
     assert!(defensive.contains("Display output caps at 8 KB"));
     assert!(defensive.contains("$TMPDIR"));
     assert!(defensive.contains("persistent workspace artifact"));
+    assert!(!tool.description().contains("jaq"));
+    assert!(!tool.description().contains("diverg"));
+    assert!(!defensive.contains("jaq"));
+    assert!(!defensive.contains("diverg"));
+}
+
+#[test]
+fn jq_shim_is_skipped_only_for_actual_container_runs() {
+    use crate::tools::sandbox_mode::SandboxMode;
+
+    assert!(!should_prepare_jq_shim(false, SandboxMode::Container));
+    assert!(!should_prepare_jq_shim(
+        false,
+        SandboxMode::ContainerReadonly
+    ));
+    assert!(should_prepare_jq_shim(true, SandboxMode::Container));
+    assert!(should_prepare_jq_shim(true, SandboxMode::ContainerReadonly));
+    assert!(should_prepare_jq_shim(false, SandboxMode::Sandbox));
+    assert!(should_prepare_jq_shim(false, SandboxMode::Off));
 }
 
 #[test]

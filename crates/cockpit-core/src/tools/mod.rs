@@ -32,6 +32,7 @@ pub mod grep;
 pub mod handoff;
 pub mod harness;
 pub mod intel;
+pub mod jq_shim;
 pub mod lsp;
 pub mod mcp_tool;
 pub mod plan_doc;

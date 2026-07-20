@@ -98,6 +98,15 @@ pub enum Command {
     /// Refresh model lists from every configured provider's /models endpoint.
     FetchModels(FetchModelsArgs),
 
+    /// Run the bundled jq-compatible JSON query applet.
+    #[command(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Jq(JqArgs),
+
     /// Manage the background daemon (`start`, `stop`, `status`).
     #[command(subcommand)]
     Daemon(DaemonCommand),
@@ -190,6 +199,16 @@ pub enum Command {
 
     /// Generate shell completion script.
     Completion { shell: Shell },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct JqArgs {
+    #[arg(
+        value_name = "JQ_ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub args: Vec<std::ffi::OsString>,
 }
 
 /// `cockpit bash-hints` subcommands.

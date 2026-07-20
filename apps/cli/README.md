@@ -179,6 +179,7 @@ cockpit packages prune --dry-run
 | `cockpit models [provider]` | List locally configured models. |
 | `cockpit provider-catalog-status [provider]` | Show the last local provider catalog refresh status. |
 | `cockpit fetch-models [provider]` | Refresh model catalogs from configured providers. |
+| `cockpit jq [args...]` | Run Cockpit's bundled jq-compatible JSON query applet. |
 | `cockpit daemon start --detach` | Start the persistent background daemon. |
 | `cockpit daemon status` | Show daemon status. |
 | `cockpit daemon stop` | Stop the daemon. |
@@ -237,6 +238,7 @@ Runtime data:
 - SQLite database: `~/.local/share/cockpit/cockpit.db` or `$XDG_DATA_HOME/cockpit/cockpit.db`
 - Credentials: `~/.local/state/cockpit/credentials.json` or `$XDG_STATE_HOME/cockpit/credentials.json`
 - Logs: under the user cache directory, typically `~/.cache/cockpit/cockpit.log`
+- Host shell sessions create a per-session `jq` shim under the Cockpit data dir when no `jq` is already on `PATH`; container sandboxes keep using the `jq` installed in the container image, so custom container images should include `jq`.
 
 `cockpit daemon status --json` reports the daemon's resolved SQLite path and
 exact schema version. This is useful when two shells appear to see different

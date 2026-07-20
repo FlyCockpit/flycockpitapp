@@ -78,6 +78,7 @@ pub mod fetch_models;
 pub mod flycockpit;
 pub mod import;
 pub mod init;
+pub mod jq;
 pub mod kcl;
 pub mod learn;
 pub mod mcp;

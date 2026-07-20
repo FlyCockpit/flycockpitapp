@@ -3444,9 +3444,14 @@ mod tests {
         let mut args = test_spawn_args(tmp.path());
         args.llm_mode = crate::config::extended::LlmMode::Normal;
 
-        let build_task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
-        let builder_task =
-            task_definition(&builder(&args), crate::config::extended::LlmMode::Normal);
+        let build_task = task_definition(
+            &load("Build", &args).unwrap(),
+            crate::config::extended::LlmMode::Normal,
+        );
+        let builder_task = task_definition(
+            &load("builder", &args).unwrap(),
+            crate::config::extended::LlmMode::Normal,
+        );
 
         assert!(build_task.description.contains("substantive feature work"));
         assert!(build_task.description.contains("backgrounded JSON"));

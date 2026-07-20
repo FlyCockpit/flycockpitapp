@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use super::{AgentDef, AgentMode};
+use super::{AgentDef, AgentMode, ToolDescriptionSpec};
 
 /// Names of the built-in agents in scope for user editing, in canonical
 /// listing order. Drives the override-resolution, listing, and reset
@@ -150,9 +150,6 @@ fn def_with_normal(
         model: None,
         temperature: None,
         tools: Some(tools.iter().map(|t| t.to_string()).collect()),
-        // Embedded defaults carry their per-agent tool wording in the
-        // hardcoded factories ([`crate::engine::builtin`]), not here — the
-        // generic markdown path uses this field only for user-authored agents.
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: Some(super::default_scan_tool_results(name, mode)),
         permission: None,
@@ -184,7 +181,7 @@ fn auto_def() -> AgentDef {
 /// inline only for small single-scope edits. Tool surface mirrors
 /// [`crate::engine::builtin::build`].
 fn build_def() -> AgentDef {
-    def_with_normal(
+    let mut def = def_with_normal(
         "Build",
         "Primary coding agent; write-capable but delegate-eager, hands feature work to `builder`.",
         AgentMode::Primary,
@@ -219,7 +216,41 @@ fn build_def() -> AgentDef {
         ],
         crate::engine::builtin::BUILD_PROMPT,
         Some(crate::engine::builtin::BUILD_PROMPT_NORMAL),
-    )
+    );
+    def.tool_descriptions.insert(
+        "task".to_string(),
+        ToolDescriptionSpec::PerMode {
+            normal: Some(
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
+                    .to_string(),
+            ),
+            frontier: Some(
+                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
+                    .to_string(),
+            ),
+            defensive: Some(
+                "Delegate substantive implementation instead of doing it inline: hand each \
+                 well-scoped piece to `builder` to write/edit files, or to `explore` for \
+                 read-only investigation, with a complete standalone brief (goal, constraints, \
+                 exact files, what \"done\" looks like). Each `builder` task is one \
+                 implementation slice, not a bundle of unrelated asks. If the user asks for a \
+                 follow-up implementation iteration after `builder` returns, start a fresh \
+                 `builder` brief seeded with the prior result summary, relevant changed files, \
+                 and the new request. For how to USE a third-party dependency's API, your first \
+                 move is `docs` (JSON `{package, question}`), including dependency questions \
+                 found while preparing a `builder` brief; skip it only when exact usage is \
+                 clearly established in already-read local code. If a task returns a backgrounded \
+                 task_delegation JSON envelope, the tool call is closed but the child is detached \
+                 with result_pending=true; do not treat it as the report or redelegate solely \
+                 because it backgrounded. Continue the conversation and act on the async result, \
+                 or poll status/query/list by task_call_id. Read each child status/error; steer \
+                 only applies at the next child turn boundary if still running/actionable. Your \
+                 own inline work is limited to orchestration and short read-only lookups."
+                    .to_string(),
+            ),
+        },
+    );
+    def
 }
 
 /// `builder` — a write-capable worker subagent (holds file locks). Mirrors
@@ -227,7 +258,7 @@ fn build_def() -> AgentDef {
 /// `task→docs`, no `schedule`); do-it-yourself within scope. Tool surface mirrors
 /// [`crate::engine::builtin::builder`].
 fn builder_def() -> AgentDef {
-    def_with_normal(
+    let mut def = def_with_normal(
         "builder",
         "Write-capable worker; holds locks and applies edits, does its scope itself.",
         AgentMode::Subagent,
@@ -257,7 +288,36 @@ fn builder_def() -> AgentDef {
         ],
         crate::engine::builtin::BUILDER_PROMPT,
         Some(crate::engine::builtin::BUILDER_PROMPT_NORMAL),
-    )
+    );
+    def.tool_descriptions.insert(
+        "task".to_string(),
+        ToolDescriptionSpec::PerMode {
+            normal: Some(
+                "Use `task` only for docs by default for unfamiliar APIs; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
+                    .to_string(),
+            ),
+            frontier: Some(
+                "Use `task` only for docs when APIs are unfamiliar; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
+                    .to_string(),
+            ),
+            defensive: Some(
+                "Do the assigned code work yourself — read, lock, edit, and verify in this context. \
+                 Use `task` only to ask the `docs` pipeline how a third-party dependency's API \
+                 works — and when you need that API, asking `docs` is your first move, not a guess \
+                 or a web search, unless the exact usage pattern is clearly established in \
+                 already-read local code: a source-cited answer is worth the tokens. Do exactly \
+                 one assigned implementation slice. Do not try to delegate the feature itself or \
+                 accept new feature work outside the brief. If the request turns out to be out of \
+                 your assigned scope, return the out-of-scope ask to your caller via the structured \
+                 `return` report rather than expanding it. If a docs task returns backgrounded \
+                 task_delegation JSON, the call is closed but detached/result-pending; wait for \
+                 the async result or query/list/status by task_call_id, and read child status/error \
+                 because docs can fail, be cancelled, or be lost."
+                    .to_string(),
+            ),
+        },
+    );
+    def
 }
 
 /// `explore` — read-only investigator, leaf in the invocation tree. Tool

@@ -3,6 +3,7 @@ use crate::tui::settings::Dialog;
 use cockpit_core::engine::TurnEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use std::fs;
+use std::path::Path;
 
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -14,13 +15,32 @@ fn press(code: KeyCode) -> KeyEvent {
 }
 
 fn at_popup_app(tmp: &tempfile::TempDir) -> App {
+    write_ready_model_config(tmp.path());
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    fs::write(tmp.path().join("kept.rs"), "").unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = Dialog::None;
-    let cwd = app.launch.cwd.clone();
-    fs::create_dir(cwd.join(".git")).unwrap();
-    fs::write(cwd.join("kept.rs"), "").unwrap();
     app
+}
+
+fn write_ready_model_config(root: &Path) {
+    let cockpit = root.join(".cockpit");
+    fs::create_dir_all(&cockpit).unwrap();
+    fs::write(
+        cockpit.join("config.json"),
+        r#"{"active_model":{"provider":"p","model":"a"}}"#,
+    )
+    .unwrap();
+    let provider_path =
+        cockpit_config::providers::provider_file_path_for_config(&cockpit.join("config.json"), "p")
+            .unwrap();
+    fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+    fs::write(
+        provider_path,
+        r#"{"url":"https://example.test","models":[{"id":"a"}]}"#,
+    )
+    .unwrap();
 }
 
 /// The daemon's `GitignoreAllow` push overwrites the tracked session set

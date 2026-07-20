@@ -991,6 +991,26 @@ async fn handle_request(
             })
         }
 
+        Request::StatsRollup {
+            project_id,
+            range,
+            by_role,
+        } => {
+            let scope = project_id
+                .map(crate::db::stats::StatsScope::Project)
+                .unwrap_or(crate::db::stats::StatsScope::All);
+            let range = stats_range_from_proto(range);
+            let prices = crate::db::stats::PriceTable::load_default();
+            let now = chrono::Utc::now().timestamp();
+            let rollup = ctx
+                .db
+                .read_blocking(move |conn| {
+                    crate::db::stats::rollup(conn, &scope, range, &prices, by_role, now)
+                })
+                .map_err(internal)?;
+            Ok(Response::StatsRollup { rollup })
+        }
+
         Request::GuidanceEstimate {
             project_root,
             provider,
@@ -1699,6 +1719,13 @@ fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSumm
         last_read_at: goal.last_read_at,
         created_at: goal.created_at,
         updated_at: goal.updated_at,
+    }
+}
+
+fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRange {
+    match range {
+        proto::StatsRange::Last7Days => crate::db::stats::StatsRange::Last7Days,
+        proto::StatsRange::AllTime => crate::db::stats::StatsRange::AllTime,
     }
 }
 

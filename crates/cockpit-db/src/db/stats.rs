@@ -20,7 +20,7 @@
 //! explicit future follow-up, out of scope here.)
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::sql::SqlColumn;
 
@@ -89,7 +89,7 @@ fn scope_range_predicate(
 
 /// Full roll-up: the three §15a sections plus the resolved scope/range
 /// echoed back so a renderer can label the output.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsRollup {
     /// `project_id` the roll-up was scoped to, or `None` for all-projects.
     pub project_id: Option<String>,
@@ -106,7 +106,7 @@ pub struct StatsRollup {
 
 /// Section 1: token spend, one row per model, plus the per-role
 /// breakdown when `--by-role` was requested.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenSpend {
     /// One row per model, descending by total tokens.
     pub by_model: Vec<TokenRow>,
@@ -117,7 +117,7 @@ pub struct TokenSpend {
 }
 
 /// One token-spend row (GOALS §15a.1 columns).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenRow {
     pub model: String,
     pub provider: String,
@@ -134,7 +134,7 @@ pub struct TokenRow {
 }
 
 /// One `--by-role` token-spend row, keyed by `(model, provider, agent)`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenRoleRow {
     pub model: String,
     pub provider: String,
@@ -150,7 +150,7 @@ pub struct TokenRoleRow {
 
 /// Section 2: tool-call recovery per model, with the expandable
 /// breakdowns the TUI needs (GOALS §15a.2).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoverySection {
     /// One row per model, descending by total calls.
     pub by_model: Vec<RecoveryRow>,
@@ -166,7 +166,7 @@ pub struct RecoverySection {
 /// `recovered` = a non-`relational_default` recovery with `hard_fail =
 /// 0` (the view's `recoverable = 1`); `hard_fail` = validation failed
 /// and no stage matched. Relational defaults are *not* malformed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryRow {
     pub model: String,
     pub calls: i64,
@@ -178,7 +178,7 @@ pub struct RecoveryRow {
 }
 
 /// Per-(model, tool) recovery counts.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryToolRow {
     pub model: String,
     pub tool: String,
@@ -190,7 +190,7 @@ pub struct RecoveryToolRow {
 /// Per-(model, recovery_kind, recovery_stage) counts, e.g.
 /// `edit_cascade / whitespace_normalized`. `hard_fail` rows surface as
 /// `kind = "hard_fail"`, `stage = ""`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryStageRow {
     pub model: String,
     pub recovery_kind: String,
@@ -200,7 +200,7 @@ pub struct RecoveryStageRow {
 
 /// Section 3: language breakdown of file-touching tool calls, with
 /// non-file activity reported separately (GOALS §15c / §15e).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageSection {
     /// Top 8 languages + a folded `Other` row, descending by count.
     /// Percentages are over `total_file_calls`.
@@ -214,7 +214,7 @@ pub struct LanguageSection {
 }
 
 /// One language bar (GOALS §15a.3).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageRow {
     pub language: String,
     pub calls: i64,
@@ -223,7 +223,7 @@ pub struct LanguageRow {
 }
 
 /// One non-file-tool count (`bash`, `search`, `task`, ...).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NonFileRow {
     pub tool: String,
     pub calls: i64,

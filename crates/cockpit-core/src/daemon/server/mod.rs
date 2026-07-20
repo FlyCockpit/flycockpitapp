@@ -372,6 +372,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             system_tokens: _,
             model_instruction_tokens: _,
         } => scrub_option_string(file, redact),
+        proto::Response::StatsRollup { rollup } => scrub_stats_rollup(rollup, redact),
         proto::Response::CaffeinateState {
             active: _,
             lid_close_guaranteed: _,
@@ -1067,6 +1068,39 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
     scrub_string(project_id, redact);
     scrub_string(objective, redact);
     scrub_option_string(context, redact);
+}
+
+fn scrub_stats_rollup(rollup: &mut proto::StatsRollup, redact: &RedactionTable) {
+    scrub_option_string(&mut rollup.project_id, redact);
+    for row in &mut rollup.tokens.by_model {
+        scrub_string(&mut row.model, redact);
+        scrub_string(&mut row.provider, redact);
+    }
+    if let Some(rows) = &mut rollup.tokens.by_role {
+        for row in rows {
+            scrub_string(&mut row.model, redact);
+            scrub_string(&mut row.provider, redact);
+            scrub_string(&mut row.agent, redact);
+        }
+    }
+    for row in &mut rollup.recovery.by_model {
+        scrub_string(&mut row.model, redact);
+    }
+    for row in &mut rollup.recovery.by_tool {
+        scrub_string(&mut row.model, redact);
+        scrub_string(&mut row.tool, redact);
+    }
+    for row in &mut rollup.recovery.by_stage {
+        scrub_string(&mut row.model, redact);
+        scrub_string(&mut row.recovery_kind, redact);
+        scrub_string(&mut row.recovery_stage, redact);
+    }
+    for row in &mut rollup.language.languages {
+        scrub_string(&mut row.language, redact);
+    }
+    for row in &mut rollup.language.non_file {
+        scrub_string(&mut row.tool, redact);
+    }
 }
 
 fn scrub_session_message(message: &mut proto::SessionMessage, redact: &RedactionTable) {

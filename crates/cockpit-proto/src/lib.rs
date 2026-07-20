@@ -1016,6 +1016,7 @@ pub use cockpit_db::wire::{
 };
 
 pub use cockpit_db::db::session_goals::GoalStatus;
+pub use cockpit_db::stats::StatsRollup;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoalSummary {
@@ -1034,6 +1035,13 @@ pub struct GoalSummary {
     pub last_read_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsRange {
+    Last7Days,
+    AllTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

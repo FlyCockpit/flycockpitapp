@@ -671,6 +671,15 @@ pub enum Request {
         project_id: Option<String>,
     },
 
+    /// Return the `/stats` rollup from the daemon-owned database handle.
+    StatsRollup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        range: StatsRange,
+        #[serde(default)]
+        by_role: bool,
+    },
+
     /// Pre-flight sizing of the project's instruction/guidance file and
     /// full system prompt, for the fresh-chat context indicator. The
     /// daemon resolves the guidance file for `project_root` and estimates
@@ -782,6 +791,7 @@ macro_rules! command {
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, none);
             (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, none);
             (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, false, none);
+            (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, none);
         ] }

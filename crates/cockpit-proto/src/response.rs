@@ -269,6 +269,10 @@ pub enum Response {
         tags: HashMap<String, u64>,
     },
 
+    StatsRollup {
+        rollup: StatsRollup,
+    },
+
     /// Pre-flight sizing for the fresh-chat context indicator. `file` is
     /// the basename of the matched guidance file, or `None` when none was
     /// found. `tokens` is the guidance-file **body** size (the `… in

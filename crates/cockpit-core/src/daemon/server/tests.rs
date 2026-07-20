@@ -224,6 +224,32 @@ mod tests {
         assert!(matches!(response, Response::GoalStatus { goal: None }));
     }
 
+    #[tokio::test]
+    async fn stats_rpc_returns_rollup() {
+        let ctx = test_ctx();
+        let mut state = owner_state();
+        let response = handle_request(
+            Request::StatsRollup {
+                project_id: Some("project-1".to_string()),
+                range: proto::StatsRange::Last7Days,
+                by_role: true,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("stats rollup");
+        let Response::StatsRollup { rollup } = response else {
+            panic!("expected StatsRollup response");
+        };
+        assert_eq!(rollup.project_id.as_deref(), Some("project-1"));
+        assert_eq!(rollup.range, "7d");
+        assert!(rollup.tokens.by_model.is_empty());
+        assert!(matches!(rollup.tokens.by_role, Some(rows) if rows.is_empty()));
+        assert!(rollup.recovery.by_model.is_empty());
+        assert!(rollup.language.languages.is_empty());
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -1145,7 +1171,8 @@ mod tests {
             | ("list_scheduled_jobs", "owner_only", false)
             | ("list_agents", "owner_only", false)
             | ("list_models", "owner_only", false)
-            | ("get_usage_counts", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+            | ("get_usage_counts", "owner_only", false)
+            | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
             (_, _, true) => DispatchMatrixClass::Mutating,
             other => panic!("dispatch matrix request kind is unclassified: {other:?}"),
         }
@@ -1494,6 +1521,7 @@ mod tests {
             | "refresh_env"
             | "record_usage"
             | "get_usage_counts"
+            | "stats_rollup"
             | "guidance_estimate"
             | "stop_daemon" => AuthzAllowedOutcome::Response,
             "begin_attachment_upload"
@@ -1628,6 +1656,7 @@ mod tests {
             authz_session_writer("refresh_config"),
             authz_owner_only("record_usage"),
             authz_owner_only("get_usage_counts"),
+            authz_owner_only("stats_rollup"),
             authz_project_read("guidance_estimate"),
             authz_owner_only("stop_daemon"),
         ]
@@ -2518,6 +2547,11 @@ mod tests {
                 project_id: None,
             },
             "get_usage_counts" => Request::GetUsageCounts { project_id: None },
+            "stats_rollup" => Request::StatsRollup {
+                project_id: None,
+                range: proto::StatsRange::Last7Days,
+                by_role: false,
+            },
             "guidance_estimate" => Request::GuidanceEstimate {
                 project_root: root,
                 provider: None,
@@ -5595,6 +5629,17 @@ mod tests {
                 mutating: false,
             },
             CommandMetadataCase {
+                request: Request::StatsRollup {
+                    project_id: Some("proj".into()),
+                    range: proto::StatsRange::Last7Days,
+                    by_role: true,
+                },
+                kind: "stats_rollup",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
                 request: Request::GuidanceEstimate {
                     project_root: project_root.clone(),
                     provider: Some("openai".into()),
@@ -5712,6 +5757,7 @@ mod tests {
             RefreshConfig,
             RecordUsage,
             GetUsageCounts,
+            StatsRollup,
             GuidanceEstimate,
             StopDaemon,
         );

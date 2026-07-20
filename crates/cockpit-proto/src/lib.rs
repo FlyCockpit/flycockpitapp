@@ -1077,6 +1077,98 @@ pub struct ExportSessionData {
     pub redacted: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum CuratorAction {
+    Status,
+    Run {
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        consolidate: bool,
+    },
+    Pin {
+        name: String,
+    },
+    Unpin {
+        name: String,
+    },
+    Restore {
+        name: String,
+    },
+    Rollback {
+        #[serde(default)]
+        list: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CuratorResult {
+    Status {
+        status: CuratorStatus,
+    },
+    Run {
+        report: CuratorRunReport,
+    },
+    Pinned {
+        name: String,
+        pinned: bool,
+    },
+    Restored {
+        name: String,
+    },
+    Snapshots {
+        snapshots: Vec<CuratorSnapshotStatus>,
+    },
+    RolledBack {
+        snapshot: CuratorSnapshotStatus,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorRunReport {
+    pub dry_run: bool,
+    pub scanned: usize,
+    pub stale: Vec<String>,
+    pub archived: Vec<String>,
+    pub reactivated: Vec<String>,
+    pub skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorStatus {
+    pub skills: Vec<CuratorSkillStatus>,
+    pub snapshots: Vec<CuratorSnapshotStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorSkillStatus {
+    pub name: String,
+    pub state: String,
+    pub created_by: String,
+    pub use_count: u64,
+    pub view_count: u64,
+    pub pinned: bool,
+    pub source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorSnapshotStatus {
+    pub id: String,
+    pub path: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsRange {

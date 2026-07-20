@@ -470,6 +470,126 @@ mod tests {
         assert!(data.redacted);
     }
 
+    #[tokio::test]
+    async fn curator_rpc_performs_curation() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_root = project.path().join(".agents").join("skills");
+        write_curator_skill(&skill_root, "curated");
+        let ctx = test_ctx_with_config_source(curator_config_source(&skill_root));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Status,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("curator status");
+        let Response::Curator {
+            result: proto::CuratorResult::Status { status },
+        } = response
+        else {
+            panic!("expected curator status");
+        };
+        assert_eq!(status.skills.len(), 1);
+        assert_eq!(status.skills[0].name, "curated");
+
+        let response = handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Run {
+                    dry_run: true,
+                    consolidate: false,
+                },
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("curator dry run");
+        let Response::Curator {
+            result: proto::CuratorResult::Run { report },
+        } = response
+        else {
+            panic!("expected curator run");
+        };
+        assert!(report.dry_run);
+        assert_eq!(report.scanned, 1);
+
+        handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Pin {
+                    name: "curated".to_string(),
+                },
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("curator pin");
+        assert!(
+            ctx.db
+                .get_skill_usage("curated")
+                .unwrap()
+                .expect("skill usage row")
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn curator_rpc_failure_leaves_skills_unchanged() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_root = project.path().join(".agents").join("skills");
+        write_curator_skill(&skill_root, "curated");
+        let ctx = test_ctx_with_config_source(curator_config_source(&skill_root));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Status,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("seed curator status");
+        let before = ctx.db.list_skill_usage().unwrap();
+
+        let err = handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Pin {
+                    name: "missing".to_string(),
+                },
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("unknown skill rejects");
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(ctx.db.list_skill_usage().unwrap(), before);
+        assert!(skill_root.join("curated").join("SKILL.md").is_file());
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -702,6 +822,39 @@ mod tests {
             crate::daemon::terminal::test_host_factory(),
             config_source,
         ))
+    }
+
+    fn curator_config_source(skill_root: &Path) -> crate::daemon::config_source::ConfigSource {
+        let extended = crate::config::extended::ExtendedConfig {
+            skills: crate::config::extended::SkillsConfig {
+                scan_dirs: vec![skill_root.to_string_lossy().into_owned()],
+                ..crate::config::extended::SkillsConfig::default()
+            },
+            ..crate::config::extended::ExtendedConfig::default()
+        };
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        )
+    }
+
+    fn write_curator_skill(skill_root: &Path, name: &str) {
+        let dir = skill_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n\nUse it.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".cockpit-provenance.json"),
+            r#"{
+  "created_origin": "background_review",
+  "writes": [{"action":"create","origin":"background_review","unix_seconds":1}],
+  "pinned": false
+}"#,
+        )
+        .unwrap();
     }
 
     fn persistent_test_ctx() -> Arc<DaemonContext> {
@@ -1524,6 +1677,7 @@ mod tests {
             MutatingDispatchCase { kind: "set_goal_status", effect_class: Durable, observation: "session goal status changes" },
             MutatingDispatchCase { kind: "clear_goal", effect_class: Durable, observation: "session goal is closed" },
             MutatingDispatchCase { kind: "create_assistant_session", effect_class: Durable, observation: "deferred assistant session worker is registered" },
+            MutatingDispatchCase { kind: "curator", effect_class: Durable, observation: "skill curator state changes through daemon-owned DB/filesystem path" },
             MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
             MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
             MutatingDispatchCase { kind: "fs_create_dir", effect_class: Durable, observation: "directory created under project root" },
@@ -1722,6 +1876,7 @@ mod tests {
             | "clear_goal"
             | "list_assistants"
             | "export_session_data"
+            | "curator"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "fs_list"
@@ -1824,6 +1979,7 @@ mod tests {
             authz_owner_only("list_assistants"),
             authz_owner_only("create_assistant_session"),
             authz_owner_only("export_session_data"),
+            authz_owner_only("curator"),
             authz_session_writer("cancel_turn"),
             authz_project_files("fs_list"),
             authz_project_files("fs_stat"),
@@ -2589,6 +2745,10 @@ mod tests {
                 kind: proto::ExportSessionKind::TranscriptJson,
                 include_generated_artifacts: false,
                 include_sensitive: false,
+            },
+            "curator" => Request::Curator {
+                project_root: root,
+                action: proto::CuratorAction::Status,
             },
             "cancel_turn" => Request::CancelTurn,
             "fs_list" => Request::FsList {
@@ -3382,6 +3542,7 @@ mod tests {
             }
             "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
             "create_assistant_session" => assert_create_assistant_session_happy().await,
+            "curator" => assert_curator_mutating_happy().await,
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -3504,6 +3665,20 @@ mod tests {
                 .expect_err("missing assistant rejects session creation");
                 assert_eq!(err.code, ErrorCode::BadRequest);
                 assert!(ctx.registry.active_session_ids().is_empty());
+            }
+            "curator" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::Curator {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        action: proto::CuratorAction::Status,
+                    },
+                )
+                .await
+                .expect_err("curator rejects untrusted project");
+                assert_eq!(err.code, ErrorCode::WorkspaceTrust);
             }
             "archive_session"
             | "unarchive_session"
@@ -4599,6 +4774,44 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_curator_mutating_happy() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_root = project.path().join(".agents").join("skills");
+        write_curator_skill(&skill_root, "matrix-skill");
+        let ctx = test_ctx_with_config_source(curator_config_source(&skill_root));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Pin {
+                    name: "matrix-skill".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("curator happy");
+        assert!(matches!(
+            response,
+            Response::Curator {
+                result: proto::CuratorResult::Pinned { pinned: true, .. }
+            }
+        ));
+        assert!(
+            ctx.db
+                .get_skill_usage("matrix-skill")
+                .unwrap()
+                .expect("skill usage row")
+                .pinned
+        );
+    }
+
+    #[cfg(unix)]
     async fn assert_session_db_mutating_happy(kind: &str) {
         let ctx = test_ctx();
         let tmp = tempfile::tempdir().unwrap();
@@ -5391,6 +5604,16 @@ mod tests {
                 mutating: false,
             },
             CommandMetadataCase {
+                request: Request::Curator {
+                    project_root: project_root.clone(),
+                    action: proto::CuratorAction::Status,
+                },
+                kind: "curator",
+                session_id: None,
+                audit_path: Some("/repo"),
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::CancelTurn,
                 kind: "cancel_turn",
                 session_id: Some(attached_session_id),
@@ -6046,6 +6269,7 @@ mod tests {
             ListAssistants,
             CreateAssistantSession,
             ExportSessionData,
+            Curator,
             CancelTurn,
             FsList,
             FsStat,

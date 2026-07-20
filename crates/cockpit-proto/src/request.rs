@@ -215,6 +215,12 @@ pub enum Request {
         include_sensitive: bool,
     },
 
+    /// Execute a daemon-owned skill curator operation for a trusted project.
+    Curator {
+        project_root: String,
+        action: CuratorAction,
+    },
+
     /// Cancel the in-flight model call for the attached session. The
     /// daemon aborts the streaming completion and returns control to
     /// the agent stack so the user can redirect.
@@ -755,6 +761,7 @@ macro_rules! command {
             (Request::ListAssistants, "list_assistants", owner_only, none, false, none);
             (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, none);
             (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, none);
+            (Request::Curator { project_root, .. }, "curator", owner_only, none, true, path(project_root));
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, none);
             (Request::FsStat { project_root, .. }, "fs_stat", project_files(project_root), none, false, none);

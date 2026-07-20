@@ -293,6 +293,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_assistant_session_created(session, redact);
         }
         proto::Response::ExportSessionData { data } => scrub_export_session_data(data, redact),
+        proto::Response::Curator { result } => scrub_curator_result(result, redact),
         proto::Response::Forked {
             session_id: _,
             short_id: _,
@@ -1114,6 +1115,49 @@ fn scrub_assistant_session_created(
 fn scrub_export_session_data(data: &mut proto::ExportSessionData, redact: &RedactionTable) {
     scrub_string(&mut data.filename_extension, redact);
     scrub_string(&mut data.mime, redact);
+}
+
+fn scrub_curator_result(result: &mut proto::CuratorResult, redact: &RedactionTable) {
+    match result {
+        proto::CuratorResult::Status { status } => scrub_curator_status(status, redact),
+        proto::CuratorResult::Run { report } => scrub_curator_run_report(report, redact),
+        proto::CuratorResult::Pinned { name, pinned: _ }
+        | proto::CuratorResult::Restored { name } => scrub_string(name, redact),
+        proto::CuratorResult::Snapshots { snapshots } => {
+            for snapshot in snapshots {
+                scrub_curator_snapshot(snapshot, redact);
+            }
+        }
+        proto::CuratorResult::RolledBack { snapshot } => scrub_curator_snapshot(snapshot, redact),
+    }
+}
+
+fn scrub_curator_status(status: &mut proto::CuratorStatus, redact: &RedactionTable) {
+    for skill in &mut status.skills {
+        scrub_string(&mut skill.name, redact);
+        scrub_string(&mut skill.state, redact);
+        scrub_string(&mut skill.created_by, redact);
+        scrub_string(&mut skill.source_path, redact);
+        scrub_option_string(&mut skill.archive_path, redact);
+    }
+    for snapshot in &mut status.snapshots {
+        scrub_curator_snapshot(snapshot, redact);
+    }
+}
+
+fn scrub_curator_snapshot(snapshot: &mut proto::CuratorSnapshotStatus, redact: &RedactionTable) {
+    scrub_string(&mut snapshot.id, redact);
+    scrub_string(&mut snapshot.path, redact);
+    scrub_string(&mut snapshot.reason, redact);
+}
+
+fn scrub_curator_run_report(report: &mut proto::CuratorRunReport, redact: &RedactionTable) {
+    scrub_strings(&mut report.stale, redact);
+    scrub_strings(&mut report.archived, redact);
+    scrub_strings(&mut report.reactivated, redact);
+    scrub_strings(&mut report.skipped, redact);
+    scrub_option_string(&mut report.snapshot_id, redact);
+    scrub_option_string(&mut report.consolidation, redact);
 }
 
 fn scrub_stats_rollup(rollup: &mut proto::StatsRollup, redact: &RedactionTable) {

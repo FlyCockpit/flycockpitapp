@@ -415,6 +415,11 @@ async fn handle_request(
         )
         .await,
 
+        Request::Curator {
+            project_root,
+            action,
+        } => curator_request(ctx, PathBuf::from(project_root), action).await,
+
         Request::CancelTurn => {
             let att = require_attached(state)?;
             att.handle
@@ -1883,6 +1888,139 @@ async fn export_session_data(
         }
     })?;
     Ok(Response::ExportSessionData { data })
+}
+
+async fn curator_request(
+    ctx: &Arc<DaemonContext>,
+    project_root: PathBuf,
+    action: proto::CuratorAction,
+) -> std::result::Result<Response, ErrorPayload> {
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &project_root)
+            .map_err(workspace_trust_error)?;
+    let (_, extended) = ctx
+        .config_source()
+        .load_with_trust(&project_root, &trust_policy)
+        .map_err(workspace_trust_error)?;
+    let db = ctx.db.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<proto::CuratorResult> {
+        crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+            let curator = crate::skills::curator::SkillCurator::new(
+                db,
+                project_root,
+                extended.skills,
+            );
+            match action {
+                proto::CuratorAction::Status => Ok(proto::CuratorResult::Status {
+                    status: curator_status_to_proto(curator.status()?),
+                }),
+                proto::CuratorAction::Run {
+                    dry_run,
+                    consolidate,
+                } => Ok(proto::CuratorResult::Run {
+                    report: curator_run_report_to_proto(curator.run(
+                        crate::skills::curator::CuratorRunOptions {
+                            dry_run,
+                            consolidate,
+                        },
+                    )?),
+                }),
+                proto::CuratorAction::Pin { name } => {
+                    curator.pin(&name, true)?;
+                    Ok(proto::CuratorResult::Pinned { name, pinned: true })
+                }
+                proto::CuratorAction::Unpin { name } => {
+                    curator.pin(&name, false)?;
+                    Ok(proto::CuratorResult::Pinned {
+                        name,
+                        pinned: false,
+                    })
+                }
+                proto::CuratorAction::Restore { name } => {
+                    curator.restore(&name)?;
+                    Ok(proto::CuratorResult::Restored { name })
+                }
+                proto::CuratorAction::Rollback { list, id } => {
+                    if list {
+                        Ok(proto::CuratorResult::Snapshots {
+                            snapshots: curator
+                                .snapshots()?
+                                .into_iter()
+                                .map(curator_snapshot_to_proto)
+                                .collect(),
+                        })
+                    } else {
+                        Ok(proto::CuratorResult::RolledBack {
+                            snapshot: curator_snapshot_to_proto(curator.rollback(id.as_deref())?),
+                        })
+                    }
+                }
+            }
+        })
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: error.to_string(),
+    })?;
+    Ok(Response::Curator { result })
+}
+
+fn curator_status_to_proto(status: crate::skills::curator::CuratorStatus) -> proto::CuratorStatus {
+    proto::CuratorStatus {
+        skills: status
+            .skills
+            .into_iter()
+            .map(curator_skill_to_proto)
+            .collect(),
+        snapshots: status
+            .snapshots
+            .into_iter()
+            .map(curator_snapshot_to_proto)
+            .collect(),
+    }
+}
+
+fn curator_skill_to_proto(
+    skill: crate::skills::curator::CuratorSkillStatus,
+) -> proto::CuratorSkillStatus {
+    proto::CuratorSkillStatus {
+        name: skill.name,
+        state: skill.state,
+        created_by: skill.created_by,
+        use_count: skill.use_count,
+        view_count: skill.view_count,
+        pinned: skill.pinned,
+        source_path: skill.source_path,
+        archive_path: skill.archive_path,
+    }
+}
+
+fn curator_snapshot_to_proto(
+    snapshot: crate::skills::curator::CuratorSnapshotStatus,
+) -> proto::CuratorSnapshotStatus {
+    proto::CuratorSnapshotStatus {
+        id: snapshot.id,
+        path: snapshot.path,
+        reason: snapshot.reason,
+        created_at: snapshot.created_at,
+    }
+}
+
+fn curator_run_report_to_proto(
+    report: crate::skills::curator::CuratorRunReport,
+) -> proto::CuratorRunReport {
+    proto::CuratorRunReport {
+        dry_run: report.dry_run,
+        scanned: report.scanned,
+        stale: report.stale,
+        archived: report.archived,
+        reactivated: report.reactivated,
+        skipped: report.skipped,
+        snapshot_id: report.snapshot_id,
+        consolidation: report.consolidation,
+    }
 }
 
 fn paused_work_to_proto(row: crate::db::paused_work::PausedWorkRow) -> proto::PausedWorkSummary {

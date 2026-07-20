@@ -303,6 +303,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assistant_session_creation_is_atomic() {
+        let ctx = test_ctx();
+        let assistant_home = tempfile::tempdir().unwrap();
+        let untrusted_project = tempfile::tempdir().unwrap();
+        create_test_assistant(&ctx, &assistant_home, "helper-bot");
+        let mut state = owner_state();
+
+        let err = handle_request(
+            Request::CreateAssistantSession {
+                name: "helper-bot".into(),
+                project_root: untrusted_project.path().to_string_lossy().into_owned(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("untrusted workspace rejects assistant session creation");
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            ctx.registry.active_session_ids().is_empty(),
+            "failed assistant session creation must not register a live worker"
+        );
+        assert!(
+            ctx.db.list_sessions(false, 100).unwrap().is_empty(),
+            "failed assistant session creation must not persist a session row"
+        );
+    }
+
+    #[tokio::test]
     async fn export_rpc_returns_redacted_data() {
         let ctx = test_ctx();
         let session = ctx.db.create_session("p", "/repo", "Build").unwrap();

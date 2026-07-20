@@ -3095,11 +3095,14 @@ impl App {
     }
 
     fn async_action_animation_active(&self, now: Instant) -> bool {
-        let session_switch = AsyncActionKind::Internal("session.switch");
-        self.async_actions.has_pending_other_than(&session_switch)
+        let session_switches = [
+            AsyncActionKind::Internal("session.switch"),
+            AsyncActionKind::Internal("session.resume"),
+        ];
+        self.async_actions.has_pending_not_in(&session_switches)
             || self
                 .async_actions
-                .pending_kind_elapsed(&session_switch, now)
+                .pending_any_kind_elapsed(&session_switches, now)
                 .is_some_and(|elapsed| elapsed >= SESSION_SWITCH_SPINNER_THRESHOLD)
     }
 }

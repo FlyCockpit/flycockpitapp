@@ -215,10 +215,28 @@ impl AsyncActionRunner {
         self.pending.values().any(|pending| &pending.kind != kind)
     }
 
+    pub fn has_pending_not_in(&self, kinds: &[AsyncActionKind]) -> bool {
+        self.pending
+            .values()
+            .any(|pending| !kinds.iter().any(|kind| kind == &pending.kind))
+    }
+
     pub fn pending_kind_elapsed(&self, kind: &AsyncActionKind, now: Instant) -> Option<Duration> {
         self.pending
             .values()
             .filter(|pending| &pending.kind == kind)
+            .map(|pending| now.saturating_duration_since(pending.started_at))
+            .max()
+    }
+
+    pub fn pending_any_kind_elapsed(
+        &self,
+        kinds: &[AsyncActionKind],
+        now: Instant,
+    ) -> Option<Duration> {
+        self.pending
+            .values()
+            .filter(|pending| kinds.iter().any(|kind| kind == &pending.kind))
             .map(|pending| now.saturating_duration_since(pending.started_at))
             .max()
     }

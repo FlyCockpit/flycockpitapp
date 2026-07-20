@@ -5,7 +5,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 ## Machine-checked inventory
 
 <!-- scrub-inventory:start -->
-- Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`
+- Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`
 - Client boundary: `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/reports.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`
@@ -20,6 +20,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - `crates/cockpit-core/src/embeddings.rs`: embedding input text is scrubbed with `OutboundGuard::scrub_many` before the OpenAI-compatible embedding request leaves Cockpit.
 - `crates/cockpit-core/src/harness/run.rs`: harness prompts leave Cockpit for an external harness process, so this is a dispatch boundary for that provider-style execution path.
 - `crates/cockpit-core/src/knowledge.rs`: cited memory injected into model context and memory-search tool output are scrubbed before crossing dispatch/client-display boundaries.
+- `crates/cockpit-core/src/mcp/builtin.rs`: adapted native tool output is scrubbed before it crosses into the Monty builtin MCP result path.
 
 ## Client Boundary
 

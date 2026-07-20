@@ -10,7 +10,7 @@ pub(crate) struct ResultRecheckCtx {
 }
 
 impl ResultRecheckCtx {
-    pub(super) fn from_tool_ctx(ctx: &ToolCtx) -> Self {
+    pub(crate) fn from_tool_ctx(ctx: &ToolCtx) -> Self {
         Self {
             agent_id: ctx.agent_id.clone(),
             session: ctx.session.clone(),

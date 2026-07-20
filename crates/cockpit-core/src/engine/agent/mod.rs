@@ -363,7 +363,7 @@ fn store_truncated_tool_result(
     Ok(hash)
 }
 
-fn maybe_store_retrievable_truncated_tool_result(
+pub(crate) fn maybe_store_retrievable_truncated_tool_result(
     session: &Session,
     agent_id: &str,
     tool: &str,

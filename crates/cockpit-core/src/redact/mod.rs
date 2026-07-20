@@ -819,6 +819,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/engine/model/redact.rs",
         "crates/cockpit-core/src/harness/run.rs",
         "crates/cockpit-core/src/knowledge.rs",
+        "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
     ];

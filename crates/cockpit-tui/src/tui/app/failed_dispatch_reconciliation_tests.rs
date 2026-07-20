@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ratatui::layout::Rect;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{App, DispatchOutcome, SideConversation};
-use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
+use crate::tui::agent_runner::{
+    AgentRunner, ClientTasks, ControlRequest, SessionSwitchOutcome, SessionTarget, UsageCounts,
+};
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
@@ -63,9 +65,41 @@ fn runner_with_all_channels(
         daemon_compatible: true,
         current_client: None,
         attach_context: None,
-        last_applied_seq: None,
+        last_applied_seq: Some(Arc::new(Mutex::new(Some(0)))),
         client_tasks: ClientTasks::default(),
     }
+}
+
+fn switch_outcome(session_id: uuid::Uuid) -> AsyncActionPayload {
+    AsyncActionPayload::SessionSwitched(Box::new(SessionSwitchOutcome {
+        target: SessionTarget::New,
+        session_id,
+        short_id: "fresh1".to_string(),
+        active_agent: "Build".to_string(),
+        active_agent_path: vec!["Build".to_string()],
+        last_applied_seq: None,
+        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        active_model_state: None,
+        project_id: "project".to_string(),
+        history: Vec::new(),
+        paused_work: Vec::new(),
+        repair_required: None,
+        btw_fork: None,
+        daemon_version: "test".to_string(),
+        daemon_compatible: true,
+    }))
+}
+
+async fn drain_async_actions_until_idle(app: &mut App) {
+    for _ in 0..20 {
+        app.drain_async_actions();
+        if app.async_actions.pending_count() == 0 {
+            app.drain_async_actions();
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("async action did not complete");
 }
 
 fn seed_session_live_state(app: &mut App) {
@@ -724,10 +758,11 @@ async fn submission_during_swap_is_not_sent_to_previous_session() {
         control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
+    let (switch_tx, switch_rx) = oneshot::channel();
     app.async_actions.start(
         AsyncActionKind::Internal("session.switch"),
         AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
-        async move { std::future::pending::<Result<AsyncActionPayload, String>>().await },
+        async move { switch_rx.await.expect("switch result sent") },
     );
 
     let outcome = app.dispatch_optimistic_user_submission(
@@ -738,13 +773,67 @@ async fn submission_during_swap_is_not_sent_to_previous_session() {
         &[],
     );
 
-    assert_eq!(outcome, DispatchOutcome::SessionSwitching);
+    assert_eq!(outcome, DispatchOutcome::Sent);
+    assert!(input_rx.try_recv().is_err());
+    assert!(!newest_user_failed(&app));
+    assert!(error_lines(&app).is_empty());
+
+    switch_tx
+        .send(Ok(switch_outcome(uuid::Uuid::new_v4())))
+        .expect("switch receiver alive");
+    drain_async_actions_until_idle(&mut app).await;
+
+    let submission = input_rx
+        .try_recv()
+        .expect("queued input flushed after swap");
+    assert_eq!(submission.text, "hello");
+    assert!(!newest_user_failed(&app));
+}
+
+#[tokio::test]
+async fn connection_loss_during_swap_keeps_runner_for_reconnect_and_fails_buffered_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let (input_tx, mut input_rx) = mpsc::channel(1);
+    let (record_tx, _record_rx) = mpsc::channel(4);
+    let (control_tx, _control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(runner_with_all_channels(
+        input_tx,
+        record_tx,
+        control_tx,
+        Arc::new(Mutex::new(Vec::new())),
+    )));
+    let (switch_tx, switch_rx) = oneshot::channel();
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { switch_rx.await.expect("switch result sent") },
+    );
+
+    let outcome = app.dispatch_optimistic_user_submission(
+        "hello".to_string(),
+        UserSubmission::text("hello".to_string()),
+        "engine",
+        true,
+        &[],
+    );
+    assert_eq!(outcome, DispatchOutcome::Sent);
+    assert!(input_rx.try_recv().is_err());
+
+    switch_tx
+        .send(Err("attach: daemon connection closed".to_string()))
+        .expect("switch receiver alive");
+    drain_async_actions_until_idle(&mut app).await;
+
+    assert!(
+        matches!(app.agent_runner, Some(Ok(_))),
+        "connection loss during switch must leave the live runner for reconnect"
+    );
     assert!(input_rx.try_recv().is_err());
     assert!(newest_user_failed(&app));
     assert!(
-        error_lines(&app).iter().any(|line| {
-            line.starts_with("engine") && line.contains("session switch in progress")
-        })
+        error_lines(&app)
+            .iter()
+            .any(|line| *line == "/new: daemon connection lost; reconnecting")
     );
-    assert!(!app.busy);
 }

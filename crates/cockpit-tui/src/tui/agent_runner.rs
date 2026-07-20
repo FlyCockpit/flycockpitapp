@@ -172,13 +172,6 @@ impl AgentRunner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(crate) fn set_session_id(&self, session_id: uuid::Uuid) {
-        *self
-            .session_id_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session_id;
-    }
-
     pub fn can_switch_session(&self) -> bool {
         self.current_client.is_some()
             && self.attach_context.is_some()
@@ -193,9 +186,6 @@ impl AgentRunner {
         let current_client = self.current_client.clone();
         let attach_context = self.attach_context.clone();
         let last_applied_seq = self.last_applied_seq.clone();
-        let session_id_state = Arc::clone(&self.session_id_state);
-        let active_agent = Arc::clone(&self.active_agent);
-        let active_agent_path = Arc::clone(&self.active_agent_path);
         async move {
             let Some(current_client) = current_client else {
                 return Err("runner has no attached daemon client".to_string());
@@ -203,20 +193,31 @@ impl AgentRunner {
             let Some(attach_context) = attach_context else {
                 return Err("runner has no attach context".to_string());
             };
-            let Some(last_applied_seq) = last_applied_seq else {
+            let Some(_last_applied_seq) = last_applied_seq else {
                 return Err("runner has no session sequence state".to_string());
             };
-            switch_session_inner(
-                current_client,
-                attach_context,
-                last_applied_seq,
-                session_id_state,
-                active_agent,
-                active_agent_path,
-                target,
-            )
-            .await
+            switch_session_inner(current_client, attach_context, target).await
         }
+    }
+
+    pub(crate) fn apply_session_switch_outcome(&mut self, outcome: &SessionSwitchOutcome) {
+        apply_session_switch_state(
+            outcome,
+            &self.session_id_state,
+            self.last_applied_seq
+                .as_ref()
+                .expect("swappable runner has sequence state"),
+            &self.active_agent,
+            &self.active_agent_path,
+        );
+        self.short_id = outcome.short_id.clone();
+        self.project_id = outcome.project_id.clone();
+        self.foreground_target = outcome.foreground_target.clone();
+        self.active_model_state = outcome.active_model_state.clone();
+        self.history = outcome.history.clone();
+        self.paused_work = outcome.paused_work.clone();
+        self.repair_required = outcome.repair_required.clone();
+        self.btw_fork = outcome.btw_fork.clone();
     }
 }
 
@@ -256,6 +257,9 @@ pub struct SessionSwitchOutcome {
     pub target: SessionTarget,
     pub session_id: Uuid,
     pub short_id: String,
+    pub active_agent: String,
+    pub active_agent_path: Vec<String>,
+    pub last_applied_seq: Option<i64>,
     pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
     pub active_model_state: Option<proto::ActiveModelState>,
     pub project_id: String,
@@ -388,34 +392,18 @@ fn current_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>) -> Optio
 async fn switch_session_inner(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
-    last_applied_seq: Arc<Mutex<Option<i64>>>,
-    session_id_state: Arc<Mutex<Uuid>>,
-    active_agent: Arc<Mutex<String>>,
-    active_agent_path: Arc<Mutex<Vec<String>>>,
     target: SessionTarget,
 ) -> Result<SessionSwitchOutcome, String> {
     let current_client = current_client.read().await.clone();
-    switch_session_with_attach_request(
-        attach_context,
-        last_applied_seq,
-        session_id_state,
-        active_agent,
-        active_agent_path,
-        target,
-        move |request| {
-            let current_client = current_client.clone();
-            async move { current_client.request(request).await }
-        },
-    )
+    switch_session_with_attach_request(attach_context, target, move |request| {
+        let current_client = current_client.clone();
+        async move { current_client.request(request).await }
+    })
     .await
 }
 
 async fn switch_session_with_attach_request<F, Fut>(
     attach_context: Arc<RwLock<AttachRequestContext>>,
-    last_applied_seq: Arc<Mutex<Option<i64>>>,
-    session_id_state: Arc<Mutex<Uuid>>,
-    active_agent: Arc<Mutex<String>>,
-    active_agent_path: Arc<Mutex<Vec<String>>>,
     target: SessionTarget,
     send_request: F,
 ) -> Result<SessionSwitchOutcome, String>
@@ -461,7 +449,7 @@ where
             daemon_version,
             compatible,
             ..
-        }) => Ok(apply_session_switch_attached(
+        }) => Ok(session_switch_outcome_from_attached(
             SessionSwitchAttached {
                 session_id,
                 short_id,
@@ -478,10 +466,6 @@ where
                 daemon_compatible: compatible,
             },
             requested_target,
-            &session_id_state,
-            &last_applied_seq,
-            &active_agent,
-            &active_agent_path,
         )),
         Ok(other) => Err(format!("unexpected attach response: {other:?}")),
         Err(error) if error.code == ErrorCode::ProtocolVersion => {
@@ -507,36 +491,23 @@ struct SessionSwitchAttached {
     daemon_compatible: bool,
 }
 
-fn apply_session_switch_attached(
+fn session_switch_outcome_from_attached(
     attached: SessionSwitchAttached,
     target: SessionTarget,
-    session_id_state: &Arc<Mutex<Uuid>>,
-    last_applied_seq: &Arc<Mutex<Option<i64>>>,
-    active_agent: &Arc<Mutex<String>>,
-    active_agent_path: &Arc<Mutex<Vec<String>>>,
 ) -> SessionSwitchOutcome {
-    *active_agent
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = attached.active_agent.clone();
-    *active_agent_path
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = if attached.active_agent_path.is_empty()
-    {
-        vec![attached.active_agent]
+    let active_agent_path = if attached.active_agent_path.is_empty() {
+        vec![attached.active_agent.clone()]
     } else {
         attached.active_agent_path
     };
-    *last_applied_seq
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        attached.history.iter().filter_map(history_entry_seq).max();
-    *session_id_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = attached.session_id;
+    let last_applied_seq = attached.history.iter().filter_map(history_entry_seq).max();
     SessionSwitchOutcome {
         target,
         session_id: attached.session_id,
         short_id: attached.short_id,
+        active_agent: attached.active_agent,
+        active_agent_path,
+        last_applied_seq,
         foreground_target: attached.foreground_target.map(queue_target_from_proto),
         active_model_state: attached.active_model_state,
         project_id: attached.project_id,
@@ -547,6 +518,27 @@ fn apply_session_switch_attached(
         daemon_version: attached.daemon_version,
         daemon_compatible: attached.daemon_compatible,
     }
+}
+
+fn apply_session_switch_state(
+    outcome: &SessionSwitchOutcome,
+    session_id_state: &Arc<Mutex<Uuid>>,
+    last_applied_seq: &Arc<Mutex<Option<i64>>>,
+    active_agent: &Arc<Mutex<String>>,
+    active_agent_path: &Arc<Mutex<Vec<String>>>,
+) {
+    *active_agent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.active_agent.clone();
+    *active_agent_path
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.active_agent_path.clone();
+    *last_applied_seq
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.last_applied_seq;
+    *session_id_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.session_id;
 }
 
 fn is_global_event(event: &proto::Event) -> bool {
@@ -2525,7 +2517,7 @@ mod tests {
             seq: 7,
         }];
 
-        let outcome = apply_session_switch_attached(
+        let outcome = session_switch_outcome_from_attached(
             SessionSwitchAttached {
                 session_id: new_session_id,
                 short_id: "def456".to_string(),
@@ -2545,6 +2537,9 @@ mod tests {
                 session_id: new_session_id,
                 since_seq: Some(2),
             },
+        );
+        apply_session_switch_state(
+            &outcome,
             &session_id_state,
             &last_applied_seq,
             &active_agent,
@@ -2589,10 +2584,6 @@ mod tests {
 
         let outcome = switch_session_with_attach_request(
             attach_context,
-            last_applied_seq,
-            session_id_state.clone(),
-            active_agent,
-            active_agent_path,
             SessionTarget::New,
             move |request| {
                 captured.lock().unwrap().push(request);
@@ -2625,6 +2616,18 @@ mod tests {
         .expect("switch should attach");
 
         assert_eq!(outcome.session_id, new_session_id);
+        assert_eq!(
+            *session_id_state.lock().unwrap(),
+            initial_session_id,
+            "switch future must not mutate runner state before the app accepts its result"
+        );
+        apply_session_switch_state(
+            &outcome,
+            &session_id_state,
+            &last_applied_seq,
+            &active_agent,
+            &active_agent_path,
+        );
         assert_eq!(*session_id_state.lock().unwrap(), new_session_id);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);

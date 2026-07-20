@@ -1,5 +1,11 @@
 use super::*;
 
+fn reconnectable_session_switch_error(error: &str) -> bool {
+    error.contains("connection closed")
+        || error.contains("broken pipe")
+        || error.contains("connection reset")
+}
+
 impl App {
     pub(super) fn drain_async_actions(&mut self) -> bool {
         let results = self.async_actions.drain_completed();
@@ -102,10 +108,12 @@ impl App {
                 match result.payload {
                     Ok(AsyncActionPayload::SessionSwitched(outcome)) => {
                         self.apply_session_switch_outcome(*outcome);
+                        self.flush_pending_session_switch_submissions();
                     }
                     Ok(_) => {
                         self.agent_runner =
                             Some(Err("session switch returned unexpected payload".into()));
+                        self.fail_pending_session_switch_submissions();
                     }
                     Err(error) => {
                         let command = if label == "session.resume" {
@@ -113,10 +121,19 @@ impl App {
                         } else {
                             "/new"
                         };
-                        self.agent_runner = Some(Err(error.clone()));
-                        self.history.push(HistoryEntry::CommandError {
-                            line: format!("{command}: {error}"),
-                        });
+                        if reconnectable_session_switch_error(&error)
+                            && matches!(self.agent_runner, Some(Ok(_)))
+                        {
+                            self.history.push(HistoryEntry::CommandError {
+                                line: format!("{command}: daemon connection lost; reconnecting"),
+                            });
+                        } else {
+                            self.agent_runner = Some(Err(error.clone()));
+                            self.history.push(HistoryEntry::CommandError {
+                                line: format!("{command}: {error}"),
+                            });
+                        }
+                        self.fail_pending_session_switch_submissions();
                     }
                 }
             }
@@ -127,6 +144,7 @@ impl App {
                     seed_composer,
                 }) => {
                     self.apply_session_switch_outcome_without_resume_chrome(*outcome);
+                    self.flush_pending_session_switch_submissions();
                     self.push_plain(format!("/fork: switched to fork {fork_short_id}."));
                     if let Some(seed) = seed_composer {
                         self.composer.set(seed);
@@ -135,12 +153,22 @@ impl App {
                 }
                 Ok(_) => {
                     self.agent_runner = Some(Err("fork switch returned unexpected payload".into()));
+                    self.fail_pending_session_switch_submissions();
                 }
                 Err(error) => {
-                    self.agent_runner = Some(Err(error.clone()));
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/fork: could not attach to fork: {error}"),
-                    });
+                    if reconnectable_session_switch_error(&error)
+                        && matches!(self.agent_runner, Some(Ok(_)))
+                    {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: "/fork: daemon connection lost; reconnecting".to_string(),
+                        });
+                    } else {
+                        self.agent_runner = Some(Err(error.clone()));
+                        self.history.push(HistoryEntry::CommandError {
+                            line: format!("/fork: could not attach to fork: {error}"),
+                        });
+                    }
+                    self.fail_pending_session_switch_submissions();
                 }
             },
             AsyncActionKind::Internal("session.side") => match result.payload {
@@ -149,10 +177,12 @@ impl App {
                     side_short_id,
                 }) => {
                     self.apply_session_switch_outcome_preserving_history(*outcome, false);
+                    self.flush_pending_session_switch_submissions();
                     self.push_plain(Self::side_entry_banner(&side_short_id));
                 }
                 Ok(_) => {
                     self.agent_runner = Some(Err("side switch returned unexpected payload".into()));
+                    self.fail_pending_session_switch_submissions();
                 }
                 Err(error) => {
                     if let Some(side) = self.side_conversation.take() {
@@ -171,9 +201,18 @@ impl App {
                             },
                         );
                     }
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/side: could not enter side conversation: {error}"),
-                    });
+                    if reconnectable_session_switch_error(&error)
+                        && matches!(self.agent_runner, Some(Ok(_)))
+                    {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: "/side: daemon connection lost; reconnecting".to_string(),
+                        });
+                    } else {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: format!("/side: could not enter side conversation: {error}"),
+                        });
+                    }
+                    self.fail_pending_session_switch_submissions();
                 }
             },
             AsyncActionKind::Internal("session.side.return") => match result.payload {
@@ -182,16 +221,27 @@ impl App {
                         *outcome,
                         self.current_session_persisted,
                     );
+                    self.flush_pending_session_switch_submissions();
                 }
                 Ok(_) => {
                     self.agent_runner =
                         Some(Err("side return switch returned unexpected payload".into()));
+                    self.fail_pending_session_switch_submissions();
                 }
                 Err(error) => {
-                    self.agent_runner = Some(Err(error.clone()));
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/side: could not return to main session: {error}"),
-                    });
+                    if reconnectable_session_switch_error(&error)
+                        && matches!(self.agent_runner, Some(Ok(_)))
+                    {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: "/side: daemon connection lost; reconnecting".to_string(),
+                        });
+                    } else {
+                        self.agent_runner = Some(Err(error.clone()));
+                        self.history.push(HistoryEntry::CommandError {
+                            line: format!("/side: could not return to main session: {error}"),
+                        });
+                    }
+                    self.fail_pending_session_switch_submissions();
                 }
             },
             AsyncActionKind::Refresh("container.availability") => {

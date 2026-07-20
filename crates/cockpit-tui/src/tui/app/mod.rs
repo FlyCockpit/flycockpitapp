@@ -1068,6 +1068,14 @@ pub(super) enum DispatchOutcome {
     NoRunner,
 }
 
+pub(super) struct PendingSessionSwitchSubmission {
+    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub error_prefix: String,
+    pub optimistic_tag_entries: usize,
+    pub owns_working_span: bool,
+    pub queued_text: Option<String>,
+}
+
 impl DispatchOutcome {
     /// True when the turn never reached a worker, so a working span
     /// opened for this submit would otherwise hang forever.
@@ -1315,6 +1323,10 @@ pub struct App {
     /// truth; local code only adds optimistic placeholders while awaiting
     /// the daemon ack.
     pub(super) queue: Vec<QueuedUserMessage>,
+    /// User submissions accepted by the TUI while a session switch is in
+    /// flight. They are held locally until the new daemon attachment is
+    /// accepted, so they cannot be sent to the outgoing session.
+    pub(super) pending_session_switch_submissions: Vec<PendingSessionSwitchSubmission>,
     /// Current queue-edit foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
     /// means the client lacks enough information to mark any queue item as
@@ -2589,6 +2601,7 @@ impl App {
             use_emojis,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
+            pending_session_switch_submissions: Vec::new(),
             foreground_input_target: None,
             fresh_queue_ack: FreshQueueAck::None,
             prompt_history: Vec::new(),

@@ -57,6 +57,109 @@ impl App {
             .is_some_and(LocalChoice::is_multi)
     }
 
+    pub(super) fn has_pending_session_switch_action(&self) -> bool {
+        self.async_actions
+            .has_pending_kind(&AsyncActionKind::Internal("session.switch"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.resume"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.fork"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.side"))
+            || self
+                .async_actions
+                .has_pending_kind(&AsyncActionKind::Internal("session.side.return"))
+    }
+
+    pub(super) fn queue_pending_session_switch_submission(
+        &mut self,
+        submission: cockpit_core::engine::message::UserSubmission,
+        error_prefix: &str,
+        optimistic_tag_entries: usize,
+        owns_working_span: bool,
+        queued_text: Option<String>,
+    ) {
+        self.pending_session_switch_submissions
+            .push(PendingSessionSwitchSubmission {
+                submission,
+                error_prefix: error_prefix.to_string(),
+                optimistic_tag_entries,
+                owns_working_span,
+                queued_text,
+            });
+    }
+
+    pub(super) fn flush_pending_session_switch_submissions(&mut self) {
+        let pending = std::mem::take(&mut self.pending_session_switch_submissions);
+        for pending in pending {
+            let outcome = match self.agent_runner.as_ref() {
+                Some(Ok(runner)) => match runner.input_tx.try_send(pending.submission.clone()) {
+                    Ok(_) => {
+                        self.current_session_persisted = true;
+                        if pending.owns_working_span {
+                            self.fresh_queue_ack = FreshQueueAck::AwaitingAck;
+                        }
+                        DispatchOutcome::Sent
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        DispatchOutcome::QueueFull
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        DispatchOutcome::DriverClosed
+                    }
+                },
+                Some(Err(_)) => DispatchOutcome::RunnerFailed,
+                None => DispatchOutcome::NoRunner,
+            };
+            if outcome != DispatchOutcome::Sent {
+                self.reconcile_pending_session_switch_submission(pending, outcome);
+            }
+        }
+    }
+
+    pub(super) fn fail_pending_session_switch_submissions(&mut self) {
+        let pending = std::mem::take(&mut self.pending_session_switch_submissions);
+        for pending in pending {
+            self.reconcile_pending_session_switch_submission(
+                pending,
+                DispatchOutcome::SessionSwitching,
+            );
+        }
+    }
+
+    fn reconcile_pending_session_switch_submission(
+        &mut self,
+        pending: PendingSessionSwitchSubmission,
+        outcome: DispatchOutcome,
+    ) {
+        if let Some(queued_text) = pending.queued_text
+            && let Some(pos) = self.queue.iter().position(|item| item.text == queued_text)
+        {
+            self.queue.remove(pos);
+        }
+        if pending.owns_working_span {
+            self.fresh_queue_ack = FreshQueueAck::None;
+            self.reconcile_failed_dispatch(
+                outcome,
+                &pending.error_prefix,
+                pending.optimistic_tag_entries,
+            );
+            if outcome.span_orphaned() {
+                self.end_working_span();
+            }
+        } else {
+            let summary = format!("{}: queued message could not be sent", pending.error_prefix);
+            self.history.push(HistoryEntry::InferenceError {
+                detail: summary.clone(),
+                summary,
+                expanded: false,
+            });
+        }
+    }
+
     pub(super) fn resolve_local_choice(&mut self, selection: LocalChoiceSelection) {
         match self.pending_local_choice.take() {
             Some(LocalChoice::Init(pending)) => {
@@ -137,31 +240,15 @@ impl App {
             persist_failed: false,
         });
         self.push_tag_call_entries(tag_expansions);
-        if self
-            .async_actions
-            .has_pending_kind(&AsyncActionKind::Internal("session.switch"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.resume"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.fork"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.side"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.side.return"))
-        {
-            let outcome = DispatchOutcome::SessionSwitching;
-            if owns_working_span {
-                self.fresh_queue_ack = FreshQueueAck::None;
-            }
-            self.reconcile_failed_dispatch(outcome, error_prefix, tag_expansions.len());
-            if owns_working_span && outcome.span_orphaned() {
-                self.end_working_span();
-            }
-            return outcome;
+        if self.has_pending_session_switch_action() {
+            self.queue_pending_session_switch_submission(
+                submission,
+                error_prefix,
+                tag_expansions.len(),
+                owns_working_span,
+                None,
+            );
+            return DispatchOutcome::Sent;
         }
         self.ensure_agent_runner();
         let outcome = match self.agent_runner.as_ref() {

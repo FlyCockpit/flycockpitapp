@@ -154,15 +154,7 @@ impl App {
         current_session_persisted: bool,
     ) {
         if let Some(Ok(runner)) = &mut self.agent_runner {
-            runner.set_session_id(outcome.session_id);
-            runner.short_id = outcome.short_id.clone();
-            runner.project_id = outcome.project_id.clone();
-            runner.foreground_target = outcome.foreground_target.clone();
-            runner.active_model_state = outcome.active_model_state.clone();
-            runner.history = outcome.history;
-            runner.paused_work = outcome.paused_work;
-            runner.repair_required = outcome.repair_required;
-            runner.btw_fork = outcome.btw_fork;
+            runner.apply_session_switch_outcome(&outcome);
         }
         self.launch.session_id = Some(outcome.session_id);
         self.launch.session_short_id = Some(outcome.short_id);
@@ -193,15 +185,7 @@ impl App {
         let daemon_version = outcome.daemon_version.clone();
         let daemon_compatible = outcome.daemon_compatible;
         if let Some(Ok(runner)) = &mut self.agent_runner {
-            runner.set_session_id(outcome.session_id);
-            runner.short_id = outcome.short_id.clone();
-            runner.project_id = outcome.project_id.clone();
-            runner.foreground_target = outcome.foreground_target.clone();
-            runner.active_model_state = outcome.active_model_state.clone();
-            runner.history = outcome.history;
-            runner.paused_work = outcome.paused_work;
-            runner.repair_required = outcome.repair_required;
-            runner.btw_fork = outcome.btw_fork;
+            runner.apply_session_switch_outcome(&outcome);
         }
         if let Some(restored) = resume_history {
             self.history.clear();

@@ -2108,7 +2108,7 @@ impl App {
         // leaving `paste_images` empty).
         let submission = cockpit_core::engine::message::UserSubmission {
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            text: wire,
+            text: wire.clone(),
             display_text: Some(submitted.clone()),
             tag_expansions: tag_expansions.clone(),
             images: paste_images,
@@ -2129,10 +2129,28 @@ impl App {
                 &fresh_tag_expansions,
             );
         } else {
-            self.ensure_agent_runner();
-            match self.agent_runner.as_ref() {
-                Some(Ok(runner)) => {
-                    if runner.input_tx.try_send(submission).is_err() {
+            if self.has_pending_session_switch_action() {
+                self.queue_pending_session_switch_submission(
+                    submission,
+                    "engine",
+                    0,
+                    false,
+                    Some(wire.clone()),
+                );
+            } else {
+                self.ensure_agent_runner();
+                match self.agent_runner.as_ref() {
+                    Some(Ok(runner)) => {
+                        if runner.input_tx.try_send(submission).is_err() {
+                            let summary = "engine: queued message could not be sent".to_string();
+                            self.history.push(HistoryEntry::InferenceError {
+                                detail: summary.clone(),
+                                summary,
+                                expanded: false,
+                            });
+                        }
+                    }
+                    Some(Err(_)) | None => {
                         let summary = "engine: queued message could not be sent".to_string();
                         self.history.push(HistoryEntry::InferenceError {
                             detail: summary.clone(),
@@ -2140,14 +2158,6 @@ impl App {
                             expanded: false,
                         });
                     }
-                }
-                Some(Err(_)) | None => {
-                    let summary = "engine: queued message could not be sent".to_string();
-                    self.history.push(HistoryEntry::InferenceError {
-                        detail: summary.clone(),
-                        summary,
-                        expanded: false,
-                    });
                 }
             }
         }

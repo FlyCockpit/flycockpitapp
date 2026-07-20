@@ -179,61 +179,9 @@ impl App {
             return;
         }
 
-        match agent_runner::attach_to_session(
-            &self.launch.cwd,
-            session_id,
-            self.no_sandbox,
-            self.lifecycle_mode(),
-        ) {
-            Ok(mut runner) => {
-                // Daemonless: keep the ownership guard armed across resume.
-                self.arm_daemon_guard(&runner);
-                let short_id = runner.short_id.clone();
-                self.project_id = Some(runner.project_id.clone());
-                self.launch.session_id = Some(runner.session_id());
-                self.launch.session_short_id = Some(runner.short_id.clone());
-                // A resumed session already has a DB row
-                // (session-id-display-and-lazy-persist).
-                self.current_session_persisted = true;
-                // Switch the runner: fresh transcript view bound to the
-                // resumed session.
-                self.history.clear();
-                self.reset_session_live_state();
-                // Repopulate the full prior transcript from the daemon's
-                // chronological history snapshot
-                // (implementation note): user bubbles,
-                // agent messages, and tool boxes render exactly as a live
-                // session would, in order — no "resumed" divider. The status
-                // line below comes AFTER so it sits at the bottom.
-                let restored = wire_history_to_entries(std::mem::take(&mut runner.history));
-                self.history.extend(restored);
-                let paused_work = std::mem::take(&mut runner.paused_work);
-                let repair_required = runner.repair_required.clone();
-                let daemon_version = runner.daemon_version.clone();
-                let daemon_compatible = runner.daemon_compatible;
-                let live_btw_fork = runner.btw_fork.clone();
-                self.agent_runner = Some(Ok(runner));
-                if let Some(info) = live_btw_fork {
-                    self.open_btw_pane_from_info(info, true);
-                }
-                let label = if short_id.is_empty() {
-                    session_id.to_string()
-                } else {
-                    short_id
-                };
-                self.push_plain(format!("/resume: switched to session {label}."));
-                if let Some(repair) = repair_required {
-                    self.maybe_prompt_resume_repair(repair);
-                }
-                self.maybe_prompt_paused_work(session_id, paused_work);
-                self.maybe_show_daemon_version_chip(&daemon_version, daemon_compatible);
-            }
-            Err(e) => {
-                self.history.push(HistoryEntry::CommandError {
-                    line: format!("/resume: could not attach to session: {e}"),
-                });
-            }
-        }
+        self.history.push(HistoryEntry::CommandError {
+            line: "/resume: active runner cannot switch sessions".to_string(),
+        });
     }
 
     pub(super) fn maybe_prompt_paused_work(

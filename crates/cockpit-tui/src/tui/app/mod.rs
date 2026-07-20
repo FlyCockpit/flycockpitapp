@@ -480,8 +480,7 @@ impl App {
             return false;
         }
         if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Trust {
-            self.reload_launch_info();
-            self.reload_tui_config();
+            self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
         if self.daemon_prompt.is_none() {
@@ -1306,9 +1305,73 @@ struct StartupBackground {
     started: bool,
 }
 
+/// Daemon-resolved config the TUI renders from (`tui-config-single-source`).
+///
+/// The daemon is the sole trust-aware config resolver. This is seeded once at
+/// launch from the bootstrap `ExtendedConfig` read (with an *empty* provider
+/// view — provider/credential resolution is daemon-only, so the TUI never
+/// resolves providers itself), then replaced by each daemon-pushed
+/// `ConfigSnapshot`. A push whose generation is lower than a previously
+/// daemon-sourced snapshot is dropped as stale.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldConfig {
+    pub(crate) generation: u64,
+    /// `false` for the bootstrap seed; flips `true` on the first daemon push.
+    /// Generation comparison only guards daemon-sourced snapshots, so the
+    /// bootstrap seed is always superseded by the first real push.
+    pub(crate) from_daemon: bool,
+    pub(crate) extended: cockpit_config::extended::ExtendedConfig,
+    /// The daemon's redacted provider projection: header *values* stripped,
+    /// header *names* + `credential_configured` retained. Read by consumers
+    /// that need provider identity/auth state without secret material.
+    pub(crate) provider_view: cockpit_core::daemon::proto::ProviderConfigView,
+    /// Reconstructed from [`Self::provider_view`] for the `resolve_*` /
+    /// model-listing consumers. Header values are absent (never needed for
+    /// resolution); the TUI never renders credential material from it.
+    pub(crate) providers: cockpit_config::providers::ProvidersConfig,
+}
+
+impl HeldConfig {
+    fn from_view(
+        generation: u64,
+        from_daemon: bool,
+        extended: cockpit_config::extended::ExtendedConfig,
+        provider_view: cockpit_core::daemon::proto::ProviderConfigView,
+    ) -> Self {
+        let providers = providers_from_view(&provider_view);
+        Self {
+            generation,
+            from_daemon,
+            extended,
+            provider_view,
+            providers,
+        }
+    }
+}
+
+/// Rebuild a `ProvidersConfig` from the daemon's redacted provider view. The
+/// view carries no secrets (credential refs and header values are stripped
+/// daemon-side); the TUI only ever renders this projection.
+fn providers_from_view(
+    view: &cockpit_core::daemon::proto::ProviderConfigView,
+) -> cockpit_config::providers::ProvidersConfig {
+    cockpit_config::providers::ProvidersConfig {
+        providers: view
+            .providers
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.entry.clone()))
+            .collect(),
+        category_defaults: view.category_defaults.clone(),
+        on_unlisted_models_fetch: view.on_unlisted_models_fetch,
+        active_model: view.active_model.clone(),
+    }
+}
+
 #[allow(private_interfaces)]
 pub struct App {
     pub(super) launch: LaunchInfo,
+    /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
+    pub(super) config_snapshot: HeldConfig,
     pub(super) active_model_state_generation: u64,
     pub(super) composer: Composer,
     /// User's vim_mode setting (hint/enabled/disabled). Drives whether
@@ -2542,11 +2605,22 @@ impl App {
         // giant repo and would block the first frame. `spawn_git_refresh`
         // does an immediate background refresh and the branch pill pops in
         // a tick later (chrome guards on `repo_status.is_some()`).
+        // Bootstrap resolution (`tui-config-single-source`): resolve only the
+        // `ExtendedConfig` from disk; provider config is projected without
+        // resolving credentials. Provider/credential resolution is daemon-side
+        // — the daemon pushes the resolved snapshot on attach and the held
+        // `config_snapshot` replaces this seed.
         let LaunchBundle {
             launch,
             providers,
             extended,
-        } = welcome::load_bundle(project, false);
+        } = welcome::load_bundle_bootstrap(project, false);
+        let config_snapshot = HeldConfig::from_view(
+            0,
+            false,
+            extended.clone(),
+            cockpit_core::secret_ref::redact_provider_view(&providers),
+        );
         timer.phase("welcome_load");
         let tui_cfg = extended.tui.clone();
         timer.phase("config_load");
@@ -2611,6 +2685,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let mut app = Self {
             launch,
+            config_snapshot,
             active_model_state_generation: 0,
             composer,
             vim_setting,
@@ -3150,12 +3225,6 @@ fn editor_argv_for_target(editor: &std::ffi::OsStr, target: &str) -> Vec<String>
         argv.push(target.to_string());
     }
     argv
-}
-
-/// Resolve the answering-dialog config (GOALS §3b) from the effective layered
-/// `config.json`. Used to read the anti-misfire lockout delay.
-fn load_dialog_config(cwd: &Path) -> cockpit_config::extended::DialogConfig {
-    cockpit_config::extended::load_for_cwd(cwd).dialog
 }
 
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`

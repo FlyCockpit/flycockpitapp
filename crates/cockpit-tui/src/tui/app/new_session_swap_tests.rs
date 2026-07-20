@@ -9,7 +9,10 @@ use ratatui::backend::TestBackend;
 use std::time::{Duration, Instant};
 
 #[test]
-fn new_session_swap_loads_extended_config_once() {
+fn new_session_swap_reads_no_config_from_disk() {
+    // A `/new` swap performs no client-side config resolution
+    // (`tui-config-single-source`): the swapped-in session's attach delivers a
+    // fresh `ConfigSnapshot`, so the swap itself never touches disk.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new_with_db(
         Some(tmp.path()),
@@ -17,6 +20,7 @@ fn new_session_swap_loads_extended_config_once() {
         cockpit_db::Db::open_in_memory().unwrap(),
     );
     cockpit_config::extended::reset_load_for_cwd_call_count();
+    cockpit_config::providers::reset_load_effective_call_count();
 
     app.pending_new_session = true;
     let serviced = app
@@ -24,7 +28,8 @@ fn new_session_swap_loads_extended_config_once() {
         .expect("/new should be serviced");
 
     assert!(serviced);
-    assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 1);
+    assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 0);
+    assert_eq!(cockpit_config::providers::load_effective_call_count(), 0);
 }
 
 #[test]

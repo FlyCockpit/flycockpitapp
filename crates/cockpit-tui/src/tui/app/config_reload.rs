@@ -18,36 +18,52 @@ impl App {
         self.launch = fresh;
     }
 
-    /// Re-read launch info (provider/model/favorite) from disk and
-    /// keep the cwd + repo_status we already have.
-    pub(super) fn reload_launch_info(&mut self) {
-        // Skip the synchronous git fetch: the freshly-loaded `repo_status`
-        // is discarded below in favor of the live polled one, so re-running
-        // `git status` here is pure waste.
-        let LaunchBundle {
-            launch: fresh,
-            providers,
-            extended,
-        } = welcome::load_bundle(Some(&self.launch.cwd), false);
-        self.apply_launch_bundle(fresh, providers, &extended);
+    /// Re-sync config after a local write (`/settings` close, `/favorite`,
+    /// workspace-trust grant, a config-touching terminal command, a session
+    /// swap). The daemon is the sole resolver: when attached, ask it to
+    /// re-resolve and let the resulting pushed [`ConfigSnapshot`] update the
+    /// UI — the value we just wrote is **not** optimistically rendered
+    /// (`tui-config-single-source`, matching `active-model-switch-transaction`).
+    /// When detached the write still happened, so refresh the bootstrap
+    /// snapshot once from disk (the single documented detached exception).
+    pub(super) fn resync_config_after_local_write(&mut self) {
+        if matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
+            self.send_daemon_request(
+                "/settings",
+                cockpit_core::daemon::proto::Request::RefreshConfig,
+                ControlApplied::None,
+            );
+        } else {
+            self.refresh_bootstrap_config_snapshot();
+        }
     }
 
-    /// Re-read launch and TUI config from a single extended-config load.
-    pub(super) fn reload_launch_and_tui_config(&mut self) {
+    /// Re-run the pre-attach bootstrap projection (extended read + redacted,
+    /// credential-free provider view) and re-derive launch + TUI chrome from
+    /// it. This is the one sanctioned client-side resolution, reused for the
+    /// detached case (pre-attach first-run, daemonless `/settings` save).
+    pub(super) fn refresh_bootstrap_config_snapshot(&mut self) {
         let LaunchBundle {
             launch: fresh,
             providers,
             extended,
-        } = welcome::load_bundle(Some(&self.launch.cwd), false);
+        } = welcome::load_bundle_bootstrap(Some(&self.launch.cwd), false);
+        self.config_snapshot = HeldConfig::from_view(
+            self.config_snapshot.generation,
+            false,
+            extended.clone(),
+            cockpit_core::secret_ref::redact_provider_view(&providers),
+        );
+        self.has_no_providers_at_startup = self.config_snapshot.providers.providers.is_empty();
         self.apply_launch_bundle(fresh, providers, &extended);
         self.apply_tui_config_from_extended(&extended);
     }
 
-    /// Re-read the TUI-side config (vim mode, thinking display,
-    /// markdown rendering) so changes made via `/settings` take effect
-    /// immediately on dialog close.
-    pub(super) fn reload_tui_config(&mut self) {
-        let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
+    /// Apply TUI-side settings (vim mode, thinking display, markdown
+    /// rendering, …) from the held config snapshot so a `/settings` change
+    /// takes effect without a restart. Reads the held snapshot — never disk.
+    pub(super) fn apply_tui_config_from_snapshot(&mut self) {
+        let extended = self.config_snapshot.extended.clone();
         self.apply_tui_config_from_extended(&extended);
     }
 

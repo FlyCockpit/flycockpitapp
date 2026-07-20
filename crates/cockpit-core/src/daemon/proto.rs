@@ -33,6 +33,9 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             pending_count,
         }],
         TurnEvent::ControlRequestFinished { .. } => vec![],
+        // TUI-inbound only: the daemon originates `Event::ConfigSnapshot`
+        // directly, never by round-tripping a `TurnEvent`.
+        TurnEvent::ConfigSnapshot { .. } => vec![],
         TurnEvent::ThinkingStarted { agent, turn_id } => {
             vec![Event::ThinkingStarted {
                 session_id,

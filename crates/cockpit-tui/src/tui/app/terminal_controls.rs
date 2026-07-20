@@ -159,7 +159,7 @@ impl App {
             self.push_plain(line);
         }
         if touches_config {
-            self.reload_launch_info();
+            self.resync_config_after_local_write();
         }
         true
     }

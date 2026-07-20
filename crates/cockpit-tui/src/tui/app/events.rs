@@ -224,6 +224,9 @@ impl App {
             } => {
                 self.apply_active_model_state(provider, model, diverged, generation);
             }
+            TurnEvent::ConfigSnapshot { snapshot } => {
+                self.apply_config_snapshot(*snapshot);
+            }
             TurnEvent::ThinkingStarted { agent, turn_id } => {
                 // Note: a `ThinkingStarted` does NOT clear the reconnect
                 // status. It fires once at turn start, before the retry loop
@@ -1456,27 +1459,70 @@ impl App {
             return;
         }
         self.active_model_state_generation = generation;
-        let providers = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
-        let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
         self.launch.provider_line = format!("{provider} / {model}");
-        self.launch.active_model = Some((provider.clone(), model.clone()));
+        self.launch.active_model = Some((provider, model));
         self.launch.active_model_diverged = diverged;
-        self.launch.active_model_is_favorite = providers
-            .providers
-            .get(&provider)
-            .and_then(|entry| entry.models.iter().find(|entry| entry.id == model))
-            .map(|entry| entry.favorite)
-            .unwrap_or(false);
-        self.launch.active_model_is_trusted =
-            providers.resolve_trust(&provider, &model).is_trusted();
-        let capabilities = providers.resolve_capabilities(&provider, &model);
-        self.launch.active_model_max_context = capabilities.context_tokens;
-        self.launch.active_model_supports_images = capabilities.images == Some(true);
-        self.llm_mode = resolve_tui_llm_mode(
-            self.launch.active_model.as_ref(),
-            extended.llm_mode,
-            &providers,
-        );
+        // Favorite/trust/capabilities/llm-mode are projected off the held
+        // daemon snapshot (`tui-config-single-source`) — no disk read.
+        self.refresh_active_model_projection();
+    }
+
+    /// Recompute the active-model chrome (favorite, trust, max context, image
+    /// support, resolved LLM mode) from the held config snapshot and the
+    /// current `launch.active_model`. Pure field-swap; no disk read.
+    pub(super) fn refresh_active_model_projection(&mut self) {
+        let active = self.launch.active_model.clone();
+        let global = self.config_snapshot.extended.llm_mode;
+        let providers = &self.config_snapshot.providers;
+        let (favorite, trusted, max_context, supports_images) =
+            if let Some((provider, model)) = active.as_ref() {
+                let favorite = providers
+                    .providers
+                    .get(provider)
+                    .and_then(|entry| entry.models.iter().find(|entry| entry.id == *model))
+                    .map(|entry| entry.favorite)
+                    .unwrap_or(false);
+                let trusted = providers.resolve_trust(provider, model).is_trusted();
+                let capabilities = providers.resolve_capabilities(provider, model);
+                (
+                    favorite,
+                    trusted,
+                    capabilities.context_tokens,
+                    capabilities.images == Some(true),
+                )
+            } else {
+                (false, false, None, false)
+            };
+        let llm_mode = resolve_tui_llm_mode(active.as_ref(), global, providers);
+        self.launch.active_model_is_favorite = favorite;
+        self.launch.active_model_is_trusted = trusted;
+        self.launch.active_model_max_context = max_context;
+        self.launch.active_model_supports_images = supports_images;
+        self.llm_mode = llm_mode;
+    }
+
+    /// Apply a daemon-pushed config snapshot (`tui-config-single-source`).
+    /// Stale pushes — a lower generation than a previously daemon-sourced
+    /// snapshot — are dropped. Applying is a cheap field swap plus a projection
+    /// refresh; it performs no disk read or config resolution.
+    pub(super) fn apply_config_snapshot(
+        &mut self,
+        snapshot: cockpit_core::daemon::proto::ConfigSnapshot,
+    ) {
+        if self.config_snapshot.from_daemon && snapshot.generation < self.config_snapshot.generation
+        {
+            return;
+        }
+        let cockpit_core::daemon::proto::ConfigSnapshot {
+            generation,
+            extended,
+            providers,
+            ..
+        } = snapshot;
+        self.config_snapshot = super::HeldConfig::from_view(generation, true, extended, providers);
+        self.has_no_providers_at_startup = self.config_snapshot.providers.providers.is_empty();
+        self.apply_tui_config_from_snapshot();
+        self.refresh_active_model_projection();
     }
 
     /// Find the most-recent tool call with `call_id` — in a `ToolBox` or

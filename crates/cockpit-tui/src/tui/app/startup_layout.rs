@@ -24,8 +24,9 @@ impl App {
                 let Some(provider_id) = self.dialog.take_completed_provider_id() else {
                     return false;
                 };
-                self.reload_launch_info();
-                let model_id = first_provider_model_id(&self.launch.cwd, &provider_id);
+                self.refresh_bootstrap_config_snapshot();
+                let model_id =
+                    first_provider_model_id(&self.config_snapshot.providers, &provider_id);
                 let dialog = match model_id.as_deref() {
                     Some(model_id) => crate::tui::settings::Dialog::open_model_setup_preselected(
                         &self.launch.cwd,
@@ -57,7 +58,7 @@ impl App {
                 {
                     return false;
                 }
-                self.reload_launch_info();
+                self.refresh_bootstrap_config_snapshot();
                 self.dialog = crate::tui::settings::Dialog::open_first_run_complete();
                 self.first_run_flow = FirstRunFlow::None;
                 true
@@ -87,6 +88,7 @@ impl App {
         let cwd = self.launch.cwd.clone();
         let active_model = self.launch.active_model.clone();
         let socket = self.startup_background.daemon_socket.clone();
+        let providers = self.config_snapshot.providers.clone();
         self.async_actions.start(
             AsyncActionKind::Internal("startup.guidance.estimate"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.guidance.estimate")),
@@ -96,7 +98,7 @@ impl App {
                     None => (None, None),
                 };
                 let estimate = agent_runner::fetch_guidance_estimate_with_socket(
-                    &cwd, provider, model, socket,
+                    &cwd, providers, provider, model, socket,
                 )
                 .await;
                 Ok(AsyncActionPayload::StartupGuidanceEstimate {
@@ -245,8 +247,11 @@ impl App {
     }
 }
 
-fn first_provider_model_id(cwd: &Path, provider_id: &str) -> Option<String> {
-    cockpit_core::secret_ref::load_effective(cwd)
+fn first_provider_model_id(
+    providers: &cockpit_config::providers::ProvidersConfig,
+    provider_id: &str,
+) -> Option<String> {
+    providers
         .providers
         .get(provider_id)?
         .models

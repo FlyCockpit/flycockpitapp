@@ -1156,6 +1156,7 @@ pub struct GuidanceEstimate {
 /// for its mode. Best-effort and non-blocking for launch.
 pub async fn fetch_guidance_estimate_with_socket(
     cwd: &Path,
+    providers: cockpit_config::providers::ProvidersConfig,
     provider: Option<String>,
     model: Option<String>,
     socket: Option<std::path::PathBuf>,
@@ -1166,7 +1167,7 @@ pub async fn fetch_guidance_estimate_with_socket(
     {
         return est;
     }
-    local_guidance_estimate(cwd, provider.as_deref(), model.as_deref())
+    local_guidance_estimate(cwd, &providers, provider.as_deref(), model.as_deref())
 }
 
 /// Ask an already-running daemon for the calibrated estimate. Returns
@@ -1211,6 +1212,7 @@ async fn daemon_guidance_estimate_at_socket(
 /// small file along the cwd→git-root walk — so it never blocks launch.
 fn local_guidance_estimate(
     cwd: &Path,
+    providers: &cockpit_config::providers::ProvidersConfig,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> GuidanceEstimate {
@@ -1228,8 +1230,8 @@ fn local_guidance_estimate(
     let model_instruction_tokens = provider
         .zip(model)
         .and_then(|(provider, model)| {
-            let cfg = cockpit_core::secret_ref::load_effective(cwd);
-            cfg.resolve_model_system_prompt(provider, model)
+            providers
+                .resolve_model_system_prompt(provider, model)
                 .map(|prompt| cockpit_core::tokens::count(prompt) as u64)
         })
         .unwrap_or(0);
@@ -2293,8 +2295,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             session_id,
             interrupt_id,
         },
+        ConfigSnapshot { snapshot } => TurnEvent::ConfigSnapshot { snapshot },
         InterruptRaised { .. }
-        | ConfigSnapshot { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
@@ -2368,7 +2370,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "PROJECT RULES\nmore lines\n").unwrap();
 
-        let est = local_guidance_estimate(tmp.path(), None, None);
+        let est = local_guidance_estimate(tmp.path(), &Default::default(), None, None);
         assert_eq!(
             est.file.as_deref(),
             Some("AGENTS.md"),
@@ -2397,7 +2399,7 @@ mod tests {
         let sub = tmp.path().join("empty-project");
         std::fs::create_dir(&sub).unwrap();
 
-        let est = local_guidance_estimate(&sub, None, None);
+        let est = local_guidance_estimate(&sub, &Default::default(), None, None);
         assert!(
             est.file.is_none(),
             "no guidance file should resolve to None"

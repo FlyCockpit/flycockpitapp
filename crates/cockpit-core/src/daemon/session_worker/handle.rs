@@ -323,39 +323,7 @@ fn redacted_extended_config(
 fn redacted_provider_view(
     providers: &crate::config::providers::ProvidersConfig,
 ) -> proto::ProviderConfigView {
-    proto::ProviderConfigView {
-        providers: providers
-            .providers
-            .iter()
-            .map(|(id, entry)| {
-                let credential_configured =
-                    entry.credential_ref.is_some() || !entry.headers.is_empty();
-                let headers = entry
-                    .headers
-                    .iter()
-                    .map(|header| proto::ProviderHeaderView {
-                        name: header.name.clone(),
-                        value: "[redacted]".to_string(),
-                        redacted: true,
-                    })
-                    .collect();
-                let mut entry = entry.clone();
-                entry.credential_ref = None;
-                entry.headers.clear();
-                (
-                    id.clone(),
-                    proto::ProviderEntryView {
-                        entry,
-                        headers,
-                        credential_configured,
-                    },
-                )
-            })
-            .collect(),
-        category_defaults: providers.category_defaults.clone(),
-        on_unlisted_models_fetch: providers.on_unlisted_models_fetch,
-        active_model: providers.active_model.clone(),
-    }
+    crate::secret_ref::redact_provider_view(providers)
 }
 
 fn replace_config_snapshot(

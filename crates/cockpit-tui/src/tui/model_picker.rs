@@ -131,9 +131,13 @@ pub struct ModelChoice {
 
 pub fn ordered_model_choices(
     cwd: &Path,
+    global_mode: cockpit_config::extended::LlmMode,
     counts: &HashMap<String, u64>,
 ) -> Result<Vec<ModelChoice>, String> {
     ensure_config_reachable(cwd)?;
+    // NOTE: this provider read is owned by `tui-inventory-from-daemon`; the
+    // global LLM mode is now threaded in from the held daemon snapshot
+    // (`tui-config-single-source`) instead of a disk read.
     let cfg = cockpit_core::secret_ref::load_effective(cwd);
     let mut entries: Vec<Entry> = Vec::new();
     for (pid, entry) in &cfg.providers {
@@ -142,7 +146,6 @@ pub fn ordered_model_choices(
         }
     }
     sort_entries(&mut entries, counts);
-    let global_mode = cockpit_config::extended::load_for_cwd(cwd).llm_mode;
     Ok(entries
         .into_iter()
         .map(|e| {
@@ -205,18 +208,25 @@ impl ModelPickerDialog {
     /// config is reachable; callers should show the message inline.
     #[cfg(test)]
     pub fn open(cwd: &Path, counts: &HashMap<String, u64>) -> Result<Self, String> {
-        Self::open_with_failures(cwd, counts, &HashMap::new(), chrono::Utc::now().timestamp())
+        ensure_config_reachable(cwd)?;
+        let providers = cockpit_core::secret_ref::load_effective(cwd);
+        Self::open_with_failures(
+            providers,
+            counts,
+            &HashMap::new(),
+            chrono::Utc::now().timestamp(),
+        )
     }
 
+    /// Build the model picker from the held daemon provider snapshot
+    /// (`tui-config-single-source`). The redacted projection carries all model
+    /// metadata (ids, favorites, trust, capabilities) the picker renders.
     pub fn open_with_failures(
-        cwd: &Path,
+        cfg: cockpit_config::providers::ProvidersConfig,
         counts: &HashMap<String, u64>,
         failures: &crate::tui::auth_failure::AuthFailureAnnotations,
         now_epoch_secs: i64,
     ) -> Result<Self, String> {
-        ensure_config_reachable(cwd)?;
-        let cfg = cockpit_core::secret_ref::load_effective(cwd);
-
         let mut entries: Vec<Entry> = Vec::new();
         for (pid, entry) in &cfg.providers {
             for model in &entry.models {
@@ -858,20 +868,22 @@ fn reasoning_summary(capability: &ReasoningEffortCapability) -> String {
 /// Toggle the favorite flag on the currently-active model, persisting
 /// the change to `config.json`. Returns the new favorite state, or
 /// `Err` if there's no active model or no config to write to.
-pub fn toggle_active_favorite(cwd: &Path) -> Result<(bool, String, String), String> {
+pub fn toggle_active_favorite(
+    cwd: &Path,
+    providers: &cockpit_config::providers::ProvidersConfig,
+) -> Result<(bool, String, String), String> {
     ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let mut cfg = cockpit_core::secret_ref::load_effective(cwd);
-    let active = cfg
+    let active = providers
         .active_model
         .clone()
         .ok_or_else(|| "no active model — run `/model` first".to_string())?;
-    let entry = cfg
+    let entry = providers
         .providers
-        .get_mut(&active.provider)
+        .get(&active.provider)
         .ok_or_else(|| format!("provider `{}` not in config", active.provider))?;
     let model = entry
         .models
-        .iter_mut()
+        .iter()
         .find(|m| m.id == active.model)
         .ok_or_else(|| {
             format!(
@@ -879,8 +891,7 @@ pub fn toggle_active_favorite(cwd: &Path) -> Result<(bool, String, String), Stri
                 active.model, active.provider
             )
         })?;
-    model.favorite = !model.favorite;
-    let new = model.favorite;
+    let new = !model.favorite;
     let p = active.provider.clone();
     let m = active.model.clone();
     let path = config_write_target_for_provider(cwd, &p)
@@ -892,12 +903,10 @@ pub fn toggle_active_favorite(cwd: &Path) -> Result<(bool, String, String), Stri
 }
 
 pub fn cycle_active_favorite(
-    cwd: &Path,
+    cfg: &cockpit_config::providers::ProvidersConfig,
     counts: &HashMap<String, u64>,
     forward: bool,
 ) -> Result<Option<ActiveModelRef>, String> {
-    ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let cfg = cockpit_core::secret_ref::load_effective(cwd);
     let active = cfg
         .active_model
         .as_ref()
@@ -965,6 +974,14 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
+
+    /// Load the layered provider config for a test tree the same way the held
+    /// daemon snapshot's projection is derived (uncounted, no credential
+    /// resolution) — stands in for the pushed snapshot in unit tests.
+    fn providers_at(cwd: &std::path::Path) -> cockpit_config::providers::ProvidersConfig {
+        let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+        cockpit_config::providers::ConfigDoc::providers_from_paths(&paths)
+    }
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -1168,9 +1185,13 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let mut dialog =
-            ModelPickerDialog::open_with_failures(tmp.path(), &HashMap::new(), &failures, 17_200)
-                .unwrap();
+        let mut dialog = ModelPickerDialog::open_with_failures(
+            providers_at(tmp.path()),
+            &HashMap::new(),
+            &failures,
+            17_200,
+        )
+        .unwrap();
 
         let rendered = rendered_text(&mut dialog, 80, 12);
 
@@ -1332,7 +1353,7 @@ mod tests {
             }))
             .unwrap();
 
-        let next = cycle_active_favorite(tmp.path(), &HashMap::new(), true)
+        let next = cycle_active_favorite(&providers_at(tmp.path()), &HashMap::new(), true)
             .unwrap()
             .expect("next favorite");
         assert_eq!(next.provider, "p");
@@ -1342,7 +1363,7 @@ mod tests {
             .write_active_model(Some(&next))
             .unwrap();
 
-        let prev = cycle_active_favorite(tmp.path(), &HashMap::new(), false)
+        let prev = cycle_active_favorite(&providers_at(tmp.path()), &HashMap::new(), false)
             .unwrap()
             .expect("previous favorite");
         assert_eq!(prev.provider, "p");

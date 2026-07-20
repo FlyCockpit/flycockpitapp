@@ -24,7 +24,15 @@ impl App {
                 }
             };
 
-            let mut cfg = cockpit_core::secret_ref::load_effective(&cwd);
+            // A `/fetch-models` refresh makes authenticated network requests
+            // per provider, so it needs the full (unredacted) provider entries
+            // — the daemon's redacted snapshot cannot serve it, and there is no
+            // wire request for a daemon-side fetch. Load the layered provider
+            // config directly (credentials are resolved at request-construction
+            // time in core, not here); this is NOT `load_effective`, so no
+            // credential resolution or `$secret:` migration happens in the TUI.
+            let paths = cockpit_config::dirs::config_file_paths_for_load(&cwd);
+            let mut cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
             let policy = cfg
                 .on_unlisted_models_fetch
                 .unwrap_or(OnUnlistedModelsFetch::Keep);

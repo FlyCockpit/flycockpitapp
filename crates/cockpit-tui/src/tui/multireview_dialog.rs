@@ -211,12 +211,19 @@ struct SourceRow {
 impl MultireviewDialog {
     pub fn open(
         cwd: &Path,
+        extended: &cockpit_config::extended::ExtendedConfig,
         counts: &std::collections::HashMap<String, u64>,
     ) -> Result<Self, String> {
-        let cfg = cockpit_config::extended::load_for_cwd(cwd);
-        let defaults: BTreeSet<String> = cfg.review.default_participants.iter().cloned().collect();
+        let defaults: BTreeSet<String> = extended
+            .review
+            .default_participants
+            .iter()
+            .cloned()
+            .collect();
         let mut participants = Vec::new();
-        for model in crate::tui::model_picker::ordered_model_choices(cwd, counts)? {
+        for model in
+            crate::tui::model_picker::ordered_model_choices(cwd, extended.llm_mode, counts)?
+        {
             let label = model.label;
             let sticky = defaults.contains(&label);
             participants.push(Participant {

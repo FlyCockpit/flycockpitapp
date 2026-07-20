@@ -630,7 +630,7 @@ impl App {
         let Some((provider, model)) = self.launch.active_model.as_ref() else {
             return true;
         };
-        let providers = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
+        let providers = &self.config_snapshot.providers;
         let cache = providers.resolve_cache(provider, model);
         cache_config_caches(&cache)
     }

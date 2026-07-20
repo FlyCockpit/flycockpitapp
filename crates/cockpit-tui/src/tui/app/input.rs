@@ -423,8 +423,10 @@ impl App {
                 // so they apply without a restart.
                 self.dialog = Dialog::None;
                 self.sync_mouse_capture_from_dialog();
-                self.reload_launch_info();
-                self.reload_tui_config();
+                // The daemon re-resolves and pushes a fresh snapshot; the UI
+                // updates when it arrives (no optimistic render of the written
+                // value). Detached, this refreshes the bootstrap snapshot once.
+                self.resync_config_after_local_write();
             } else if let Some(req) = self.dialog.take_daemon_request() {
                 self.send_daemon_request("/settings", req, ControlApplied::None);
             }
@@ -2177,7 +2179,7 @@ impl App {
     }
 
     fn check_send_model_ready(&self) -> Result<(), MissingModelReason> {
-        let cfg = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
+        let cfg = &self.config_snapshot.providers;
         if cfg.providers.is_empty() {
             return Err(MissingModelReason::NoProviders);
         }
@@ -2192,7 +2194,7 @@ impl App {
 
     fn open_missing_model_setup(&mut self, reason: MissingModelReason) {
         let status = reason.status();
-        let cfg = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
+        let cfg = self.config_snapshot.providers.clone();
         if cfg.providers.is_empty() {
             self.first_run_flow = FirstRunFlow::AwaitProvider;
             self.dialog = Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));

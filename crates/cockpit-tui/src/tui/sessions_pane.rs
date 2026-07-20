@@ -449,6 +449,7 @@ impl SessionsPane {
         cwd: &std::path::Path,
         daemon_connected: bool,
         daemon_socket: Option<std::path::PathBuf>,
+        use_emojis: bool,
     ) -> Self {
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
@@ -465,7 +466,6 @@ impl SessionsPane {
         } else {
             Db::open_default().ok()
         };
-        let use_emojis = cockpit_config::extended::load_for_cwd(cwd).tui.use_emojis;
         let mut pane = Self {
             project_id,
             scope,
@@ -3211,6 +3211,7 @@ mod tests {
             tmp.path(),
             true,
             Some(tmp.path().join("missing-daemon.sock")),
+            false,
         );
 
         assert_eq!(pane.loading, Some("Loading sessions..."));

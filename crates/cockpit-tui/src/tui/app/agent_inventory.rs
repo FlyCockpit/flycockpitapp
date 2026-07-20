@@ -29,7 +29,7 @@ impl App {
     /// before that point discovery uses the agent definition as a best-effort
     /// startup approximation.
     pub(super) fn visible_skills(&self) -> Vec<cockpit_core::skills::Skill> {
-        let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
+        let extended = &self.config_snapshot.extended;
         let exact_names = self
             .agent_runner
             .as_ref()

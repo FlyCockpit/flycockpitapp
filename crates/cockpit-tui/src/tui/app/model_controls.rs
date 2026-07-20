@@ -18,7 +18,7 @@ impl App {
         // passes through; the gated names are already hidden from the cycle /
         // `/agent` list, so this guards a direct `/plan`-style invocation.
         if cockpit_core::agents::is_experimental_primary(name)
-            && !cockpit_config::extended::load_for_cwd(&self.launch.cwd).experimental_mode
+            && !self.config_snapshot.extended.experimental_mode
         {
             self.push_plain(format!(
                 "`{name}` requires experimental mode — enable it in `/settings`."
@@ -127,7 +127,7 @@ impl App {
         self.footer_agent_picker = None;
         self.footer_mode_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
-            &self.launch.cwd,
+            self.config_snapshot.providers.clone(),
             &self.usage_models,
             &self.auth_failure_annotations,
             chrono::Utc::now().timestamp(),
@@ -157,7 +157,10 @@ impl App {
         );
         self.auth_failure_fingerprints.insert(
             provider.clone(),
-            crate::tui::auth_failure::provider_auth_fingerprint(&self.launch.cwd, &provider),
+            crate::tui::auth_failure::provider_auth_fingerprint(
+                &self.config_snapshot.provider_view,
+                &provider,
+            ),
         );
         self.auth_failure_notice = Some(crate::tui::auth_failure::AuthFailureNotice {
             provider,
@@ -205,7 +208,7 @@ impl App {
             .filter_map(|(provider, fingerprint)| {
                 (*fingerprint
                     != crate::tui::auth_failure::provider_auth_fingerprint(
-                        &self.launch.cwd,
+                        &self.config_snapshot.provider_view,
                         provider,
                     ))
                 .then_some(provider.clone())
@@ -271,7 +274,7 @@ impl App {
 
     pub(super) fn cycle_footer_model(&mut self, forward: bool) {
         match crate::tui::model_picker::cycle_active_favorite(
-            &self.launch.cwd,
+            &self.config_snapshot.providers,
             &self.usage_models,
             forward,
         ) {
@@ -299,6 +302,7 @@ impl App {
     pub(super) fn open_quick_dialog(&mut self) {
         let models = match crate::tui::model_picker::ordered_model_choices(
             &self.launch.cwd,
+            self.config_snapshot.extended.llm_mode,
             &self.usage_models,
         ) {
             Ok(choices) => choices
@@ -550,7 +554,7 @@ impl App {
     /// pass with no dialog re-arms it.
     pub(super) fn dialog_lockout(&mut self) -> Duration {
         let lockout = if self.composer_active_since_dialog {
-            Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms)
+            Duration::from_millis(self.config_snapshot.extended.dialog.lockout_ms)
         } else {
             crate::tui::dialog::DialogState::NO_LOCKOUT
         };
@@ -565,7 +569,7 @@ impl App {
     /// be immediately answerable.
     pub(super) fn fresh_dialog_lockout(&mut self) -> Duration {
         self.composer_active_since_dialog = false;
-        Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms)
+        Duration::from_millis(self.config_snapshot.extended.dialog.lockout_ms)
     }
 }
 

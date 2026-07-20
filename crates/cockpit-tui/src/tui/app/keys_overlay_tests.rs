@@ -132,8 +132,12 @@ fn app_with_sessions_preview_pane(tmp: &tempfile::TempDir) -> App {
     app.daemon_connected = true;
     app.startup_background.daemon_socket = Some(dead_socket.clone());
     let session_id = Uuid::new_v4();
-    let mut pane =
-        crate::tui::sessions_pane::SessionsPane::open(&app.launch.cwd, true, Some(dead_socket));
+    let mut pane = crate::tui::sessions_pane::SessionsPane::open(
+        &app.launch.cwd,
+        true,
+        Some(dead_socket),
+        false,
+    );
     pane.apply_sessions_result(Ok(vec![session_summary(
         session_id,
         app.launch.cwd.display().to_string(),
@@ -162,6 +166,7 @@ fn question_dialog_shadows_and_resumes_an_open_overlay() {
         &app.launch.cwd,
         false,
         None,
+        false,
     ));
 
     assert_eq!(app.key_context(), KeyContext::Sessions);
@@ -260,6 +265,7 @@ fn leader_with_sessions_pane_open_shows_sessions_context() {
         &app.launch.cwd,
         false,
         None,
+        false,
     ));
     app.handle_key(ctrl('k'));
     let overlay = app.keys_overlay.as_ref().expect("leader opens over a pane");

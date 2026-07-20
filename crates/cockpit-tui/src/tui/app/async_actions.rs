@@ -684,7 +684,14 @@ impl App {
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                let cfg = cockpit_core::secret_ref::load_effective(&cwd);
+                // Provider usage probes make authenticated network requests,
+                // so they need full (unredacted) provider entries the daemon's
+                // redacted snapshot cannot supply, and there is no wire request
+                // for daemon-side usage. Load the layered provider config
+                // directly (NOT `load_effective`); credentials resolve at
+                // request-construction time in core, never in TUI state.
+                let paths = cockpit_config::dirs::config_file_paths_for_load(&cwd);
+                let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
                 cockpit_core::providers::usage::probes::fetch_all_provider_usage(
                     &cfg,
                     filter.as_deref(),

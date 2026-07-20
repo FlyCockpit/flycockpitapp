@@ -109,6 +109,28 @@ pub fn load_bundle(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
     }
 }
 
+/// The TUI's pre-attach bootstrap bundle (`tui-config-single-source`).
+///
+/// Identical to [`load_bundle`] except provider config is loaded WITHOUT
+/// resolving credentials (no credential-store access, no `$secret:` migration),
+/// so it performs exactly one config resolution — the `ExtendedConfig` read —
+/// and never counts as a credential resolution. Provider/credential resolution
+/// is the daemon's job; the daemon pushes the resolved snapshot on attach. The
+/// returned `providers` carry config values (models, trust, favorites) for the
+/// launch header but no resolved credential material.
+pub fn load_bundle_bootstrap(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
+    let cwd = resolve_launch_dir(project);
+    let paths = crate::config::dirs::config_file_paths_for_load(&cwd);
+    let providers = crate::config::providers::ConfigDoc::providers_from_paths(&paths);
+    let extended = crate::config::extended::load_for_cwd(&cwd);
+    let launch = build_launch_info(cwd, fetch_git, &providers, &extended);
+    LaunchBundle {
+        launch,
+        providers,
+        extended,
+    }
+}
+
 fn build_launch_info(
     cwd: PathBuf,
     fetch_git: bool,

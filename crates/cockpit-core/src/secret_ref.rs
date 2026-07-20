@@ -43,6 +43,51 @@ pub fn load_effective(cwd: &Path) -> ProvidersConfig {
     ConfigDoc::load_effective(cwd)
 }
 
+/// Project a resolved [`ProvidersConfig`] to the redacted view the daemon
+/// pushes to clients (`tui-config-single-source`). Credential refs and header
+/// *values* are stripped; header *names* and a `credential_configured` flag are
+/// retained so the client can render provider state without ever seeing secret
+/// material. The daemon and the TUI's pre-attach bootstrap share this one
+/// projection so their views are byte-identical for the same config tree.
+pub fn redact_provider_view(
+    providers: &ProvidersConfig,
+) -> crate::daemon::proto::ProviderConfigView {
+    use crate::daemon::proto;
+    proto::ProviderConfigView {
+        providers: providers
+            .providers
+            .iter()
+            .map(|(id, entry)| {
+                let credential_configured =
+                    entry.credential_ref.is_some() || !entry.headers.is_empty();
+                let headers = entry
+                    .headers
+                    .iter()
+                    .map(|header| proto::ProviderHeaderView {
+                        name: header.name.clone(),
+                        value: "[redacted]".to_string(),
+                        redacted: true,
+                    })
+                    .collect();
+                let mut entry = entry.clone();
+                entry.credential_ref = None;
+                entry.headers.clear();
+                (
+                    id.clone(),
+                    proto::ProviderEntryView {
+                        entry,
+                        headers,
+                        credential_configured,
+                    },
+                )
+            })
+            .collect(),
+        category_defaults: providers.category_defaults.clone(),
+        on_unlisted_models_fetch: providers.on_unlisted_models_fetch,
+        active_model: providers.active_model.clone(),
+    }
+}
+
 fn migrate_effective_layers_once(cwd: &Path) -> Result<()> {
     let paths = crate::config::dirs::config_file_paths_for_load(cwd);
     let seen = MIGRATED_LAYERS.get_or_init(|| Mutex::new(HashSet::new()));

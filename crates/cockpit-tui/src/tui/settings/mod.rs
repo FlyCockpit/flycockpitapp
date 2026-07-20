@@ -806,7 +806,15 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let cfg = cockpit_core::secret_ref::load_effective(cwd);
+        // The provider settings editor mutates and persists config to a
+        // specific write-target file; it needs the full (unredacted) entry to
+        // seed the edit form, which the daemon's redacted snapshot cannot
+        // supply. Load the layered provider config directly (NOT
+        // `load_effective`): no credential resolution happens here, and the
+        // resulting write is signalled to the daemon on dialog close
+        // (`resync_config_after_local_write`).
+        let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+        let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
         let Some(entry) = cfg.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };

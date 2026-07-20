@@ -843,6 +843,7 @@ fn run_model(app: &mut App, _: &str) -> bool {
 fn run_multireview(app: &mut App, _: &str) -> bool {
     match crate::tui::multireview_dialog::MultireviewDialog::open(
         &app.launch.cwd,
+        &app.config_snapshot.extended,
         &app.usage_models,
     ) {
         Ok(dialog) => app.overlay = Overlay::Multireview(dialog),
@@ -859,13 +860,16 @@ fn run_model_comparison(app: &mut App, _: &str) -> bool {
 }
 
 fn run_favorite(app: &mut App, _: &str) -> bool {
-    match crate::tui::model_picker::toggle_active_favorite(&app.launch.cwd) {
+    match crate::tui::model_picker::toggle_active_favorite(
+        &app.launch.cwd,
+        &app.config_snapshot.providers,
+    ) {
         Ok((new, p, m)) => {
             let verb = if new { "marked" } else { "unmarked" };
             app.history.push(HistoryEntry::Plain {
                 line: format!("/favorite: {verb} {p}/{m} as favorite"),
             });
-            app.reload_launch_info();
+            app.resync_config_after_local_write();
         }
         Err(e) => app.history.push(HistoryEntry::Plain {
             line: format!("/favorite: {e}"),
@@ -1040,6 +1044,7 @@ fn run_sessions(app: &mut App, _: &str) -> bool {
         &app.launch.cwd,
         app.daemon_connected,
         daemon_socket,
+        app.config_snapshot.extended.tui.use_emojis,
     ));
     if app.daemon_connected {
         app.start_sessions_list_action();
@@ -1285,7 +1290,7 @@ impl App {
     pub(super) fn handle_curator_command(&mut self, args: &str) {
         let result = (|| -> anyhow::Result<String> {
             let db = cockpit_db::Db::open_default()?;
-            let cfg = cockpit_config::extended::load_for_cwd(&self.launch.cwd).skills;
+            let cfg = self.config_snapshot.extended.skills.clone();
             let curator =
                 cockpit_core::skills::curator::SkillCurator::new(db, self.launch.cwd.clone(), cfg);
             let mut parts = args.split_whitespace();

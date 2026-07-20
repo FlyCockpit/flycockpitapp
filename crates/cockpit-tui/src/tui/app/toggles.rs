@@ -109,9 +109,10 @@ impl App {
             InterruptOption, InterruptQuestion, InterruptQuestionSet,
         };
 
-        // Load configured `(provider, model)` pairs from the effective
-        // `config.json` layers; tandem models must have working url/credentials.
-        let cfg = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
+        // Configured `(provider, model)` pairs come from the held daemon
+        // snapshot (`tui-config-single-source`); tandem models must have
+        // working url/credentials, which the daemon resolves.
+        let cfg = self.config_snapshot.providers.clone();
         if cfg.providers.is_empty() {
             self.push_plain(
                 "/model-comparison: no cockpit config found — run `/settings` to add a provider"

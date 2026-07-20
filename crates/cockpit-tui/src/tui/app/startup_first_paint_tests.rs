@@ -19,7 +19,10 @@ fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
     let app = App::new_with_db(Some(tmp.path()), false, db);
 
     assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 1);
-    assert_eq!(cockpit_config::providers::load_effective_call_count(), 1);
+    // Provider/credential resolution moved daemon-side (`tui-config-single-source`):
+    // the bootstrap projects the redacted provider view without resolving
+    // credentials, so it never calls the credential-aware `load_effective`.
+    assert_eq!(cockpit_config::providers::load_effective_call_count(), 0);
     assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 1);
     assert_eq!(cockpit_db::open_default_call_count(), 0);
     assert_eq!(cockpit_core::container::detect_runtime_call_count(), 0);

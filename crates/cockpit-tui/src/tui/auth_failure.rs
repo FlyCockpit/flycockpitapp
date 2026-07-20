@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 
 use cockpit_core::daemon::proto::AuthFailureKind;
 
@@ -60,25 +59,32 @@ pub fn notice_text(notice: &AuthFailureNotice, mouse: bool) -> String {
     }
 }
 
-/// Secret-safe, process-local fingerprint of the auth inputs for one provider.
-/// Only the hash is retained; credential contents never enter TUI state.
-pub fn provider_auth_fingerprint(cwd: &Path, provider_id: &str) -> u64 {
-    let config = cockpit_core::secret_ref::load_effective(cwd);
-    let entry = config.providers.get(provider_id);
-    let credential_ref = entry
-        .and_then(|entry| entry.credential_ref.as_deref())
-        .unwrap_or(provider_id);
-    let credential = cockpit_core::credentials::default_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value.get(credential_ref).cloned());
+/// Secret-safe, process-local fingerprint of one provider's auth *shape*,
+/// computed from the daemon's redacted provider view (`tui-config-single-source`).
+///
+/// Credential material never reaches the TUI, so this hashes only the
+/// non-secret projection the daemon resolves: url, header names, the
+/// `credential_configured` flag, and the declared auth scheme. It shifts when
+/// the provider's auth *structure* changes (url/header set/scheme/whether a
+/// credential is configured); it deliberately cannot observe a pure
+/// secret-value edit, since the daemon redacts values before they cross the
+/// wire.
+pub fn provider_auth_fingerprint(
+    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    provider_id: &str,
+) -> u64 {
+    let entry = view.providers.get(provider_id);
     let auth_inputs = entry.map(|entry| {
+        let header_names: Vec<&str> = entry
+            .headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect();
         serde_json::json!({
-            "url": entry.url,
-            "headers": entry.headers,
-            "credential_ref": entry.credential_ref,
-            "auth": entry.auth,
-            "credential": credential,
+            "url": entry.entry.url,
+            "header_names": header_names,
+            "credential_configured": entry.credential_configured,
+            "auth": entry.entry.auth,
         })
     });
     let encoded = serde_json::to_vec(&auth_inputs).unwrap_or_default();

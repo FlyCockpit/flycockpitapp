@@ -120,8 +120,14 @@ fn nested_subagent_auth_recovery_updates_when_pane_is_not_active() {
     assert!(app.auth_failure_notice.is_none());
 }
 
+/// Auth-failure clearing keys off the daemon's *redacted* provider view
+/// (`tui-config-single-source`): the TUI never sees credential values, so the
+/// fingerprint tracks provider auth *structure* (url, header names, whether a
+/// credential is configured). A structural change, once the refreshed snapshot
+/// lands, clears the stale annotation. (A pure secret-value edit is no longer
+/// client-observable — the daemon owns credential resolution.)
 #[test]
-fn annotation_cleared_on_credential_change() {
+fn annotation_cleared_on_provider_auth_structure_change() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
@@ -130,8 +136,24 @@ fn annotation_cleared_on_credential_change() {
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
         status: 401,
     }));
+    assert_eq!(app.auth_failure_annotations.len(), 1);
 
-    write_auth_header(tmp.path(), "Bearer new-secret");
+    // Structural change: a new provider URL. Visible in the redacted view.
+    let config_path = tmp.path().join(".cockpit/config.json");
+    let provider_path =
+        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+    fs::write(
+        provider_path,
+        serde_json::to_vec(&serde_json::json!({
+            "url": "https://example.test/v2",
+            "headers": [{"name": "Authorization", "value": "Bearer old-secret"}],
+            "models": [{"id": "m"}],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Detached: the bootstrap snapshot refresh stands in for the daemon push.
+    app.refresh_bootstrap_config_snapshot();
     app.clear_changed_provider_auth_failures();
 
     assert!(app.auth_failure_annotations.is_empty());

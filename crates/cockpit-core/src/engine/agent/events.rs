@@ -59,6 +59,14 @@ pub enum TurnEvent {
         diverged: bool,
         generation: u64,
     },
+    /// Authoritative daemon-resolved config snapshot for the attached
+    /// session (`tui-config-single-source`). Delivered on attach and on every
+    /// daemon re-resolution; the TUI renders from it instead of re-reading
+    /// config from disk. Carries the generation used to drop stale pushes.
+    /// TUI-inbound only — never emitted from a `TurnEvent` back onto the wire.
+    ConfigSnapshot {
+        snapshot: Box<crate::daemon::proto::ConfigSnapshot>,
+    },
     /// Model inference started; nothing has been emitted yet. The TUI
     /// shows a "Thinking…" placeholder until the first text delta
     /// arrives. Fires once per round-trip; also fires before reasoning-

@@ -319,7 +319,7 @@ async fn run_worker(
     };
     let root = Arc::new(
         builtin::load(&root_agent_name, &spawn_args)
-            .unwrap_or_else(|_| builtin::build(&spawn_args)),
+            .unwrap_or_else(|_| builtin::default_build(&spawn_args)),
     );
 
     // Snapshot the resolved agent-guidance file body that just went into

@@ -3852,7 +3852,7 @@ impl Driver {
         // to the same agent name's default build on a load failure so the swap
         // never strands the session without a primary.
         crate::engine::builtin::load(&name, &args)
-            .unwrap_or_else(|_| crate::engine::builtin::build(&args))
+            .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's

@@ -107,7 +107,7 @@ pub(crate) const MULTIREVIEW_PROMPT_NORMAL: &str = include_str!("multireview.nor
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
 pub(crate) const BEE_PROMPT_NORMAL: &str = include_str!("bee.normal.md");
 pub(crate) const BEE_PROMPT_FRONTIER: &str = include_str!("bee.frontier.md");
-const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
+pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
 /// Select a bundled agent's prompt body for the active `llm_mode`: defensive
 /// uses the flat body; normal uses the normal body when present; frontier uses
@@ -127,8 +127,8 @@ fn builtin_prompt_for(
     }
 }
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
-const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
-const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
+pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
+pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
 
 /// Per-spawn knobs threaded from the driver.
 #[derive(Clone)]
@@ -425,6 +425,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "hot",
         "circular",
         "search",
+        "impact",
         "change_impact",
         "task",
         "skill",
@@ -574,6 +575,7 @@ fn materialize_tool_by_name(
         "hot" => tb.with(Arc::new(tools::intel::HotTool)),
         "circular" => tb.with(Arc::new(tools::intel::CircularTool)),
         "search" => tb.with(Arc::new(tools::intel::SearchTool)),
+        "impact" => tb.with(Arc::new(tools::intel::ImpactTool)),
         "change_impact" => tb.with(Arc::new(tools::intel::ChangeImpactTool)),
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
         "skill_manage" => tb.with(Arc::new(tools::skill_manage::SkillManageTool)),
@@ -611,6 +613,12 @@ fn materialize_tool_by_name(
             let subs = reachable_subagents(def, &args.cwd);
             let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
             with_task_for_targets(tb, args, &sub_refs)
+        }
+        "grep" if def.is_some_and(|def| def.name == "docs-answerer") => {
+            tb.with(Arc::new(tools::grep::GrepTool))
+        }
+        "glob" if def.is_some_and(|def| def.name == "docs-answerer") => {
+            tb.with(Arc::new(tools::glob::GlobTool))
         }
         "grep" | "glob" => {
             bail!("tool `{name}` is docs-answerer-only and cannot be materialized for user agents")
@@ -926,32 +934,7 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     // fails loudly here (naming its source) rather than silently falling
     // back to the embedded default.
     let mut agent = match crate::agents::resolve(&args.cwd, name)? {
-        // A genuine on-disk file (override of a built-in, or a custom
-        // agent): build generically from the resolved definition so the
-        // user's edited tools/model/prompt take effect.
-        Some(def) if !def.source.as_os_str().is_empty() => agent_from_def(&def, args)?,
-        // An embedded default came back (no override): use the hardcoded
-        // factory, which is byte-identical and cache-stable.
-        Some(_) => {
-            let mut agent = match name {
-                "Auto" => auto(args),
-                "Build" => build(args),
-                "builder" => builder(args),
-                "explore" => explore(args),
-                "deepthink" => deepthink(args),
-                "scout" => scout(args),
-                "Plan" => plan(args),
-                "Swarm" => swarm(args),
-                "bee" => bee(args),
-                "Multireview" => multireview(args),
-                other => bail!("unknown built-in agent `{other}`"),
-            };
-            let def = crate::agents::embedded_default(name)
-                .expect("resolved embedded built-in must have embedded default");
-            agent.model = resolve_agent_model(&def, args)?;
-            agent.system = compose_system_prompt_for_model(&agent.role_prompt, &agent.model, args);
-            agent
-        }
+        Some(def) => agent_from_def(&def, args)?,
         // Not a built-in and no file on disk: unknown agent.
         None => bail!("unknown agent `{name}`"),
     };
@@ -968,6 +951,11 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     }
     agent.params = params_with_direct_computer(args, &agent.model);
     Ok(agent)
+}
+
+pub fn default_build(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Build").expect("Build has an embedded default");
+    agent_from_def(&def, args).expect("Build embedded default constructs")
 }
 
 /// Append the parent-granted tools onto a built agent's base toolbox (prompt
@@ -1009,6 +997,14 @@ pub fn is_noninteractive(name: &str) -> bool {
 /// feature (GOALS §3c): their transcript is never persisted as a handle.
 pub(crate) fn is_docs_pipeline(name: &str) -> bool {
     matches!(name, "docs" | "docs-resolver" | "docs-answerer")
+}
+
+fn is_internal_agent_def_name(name: &str) -> bool {
+    matches!(name, "computer" | "docs-resolver" | "docs-answerer")
+}
+
+fn internal_agent_def_uses_custom_tools(name: &str) -> bool {
+    name == "docs-resolver"
 }
 
 /// True when a delegated subagent named `name` is **follow-up eligible** — its
@@ -1094,7 +1090,7 @@ fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
 /// to exclude primaries from the delegated-subagent `return` tool: a primary is
 /// never delegated to and finishes via `Done`/`handoff`.
 fn is_primary(name: &str) -> bool {
-    matches!(name, "Auto" | "Build" | "Plan" | "Swarm")
+    matches!(name, "Auto" | "Build" | "Plan" | "Swarm" | "Multireview")
 }
 
 /// Register the `seed` tool (GOALS §3c) on `tb` when this is a read-only
@@ -1178,24 +1174,28 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     for name in &grant {
         tb = add_tool_by_name(tb, name, def, args)?;
     }
-    // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
-    // of the named grant — attach them like the built-in factories do.
-    tb = with_custom_tools(tb, &args.cwd);
-    // Cross-session recall tools, gated on interactive spawn.
-    tb = with_recall_tools(tb, args);
-    // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
-    // normal mode may emit seeds to its caller. The helper re-checks the
-    // (now-built) tool surface for write/lock tools, so only a genuinely
-    // read-only custom subagent gets it.
-    tb = maybe_with_seed_tool(tb, &def.name, args.llm_mode);
-    // `return` (structured-summary envelope, `structured-subagent
-    // -return-summary.md`): a delegated subagent finishes by returning a
-    // structured summary. An on-disk override of a bundled agent keeps its name,
-    // so `with_return_tool`'s name guards exclude a bundled primary/docs
-    // override; a custom agent is gated on its `mode` here (a `Primary`-only
-    // custom agent is chat-owning, never delegated to, so it gets no `return`).
-    if crate::agents::embedded_default(&def.name).is_some() || def.mode.is_subagent() {
-        tb = with_return_tool(tb, &def.name);
+    if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
+        // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
+        // of the named grant — attach them like the built-in factories do.
+        tb = with_custom_tools(tb, &args.cwd);
+    }
+    if !is_internal_agent_def_name(&def.name) {
+        // Cross-session recall tools, gated on interactive spawn.
+        tb = with_recall_tools(tb, args);
+        // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
+        // normal mode may emit seeds to its caller. The helper re-checks the
+        // (now-built) tool surface for write/lock tools, so only a genuinely
+        // read-only custom subagent gets it.
+        tb = maybe_with_seed_tool(tb, &def.name, args.llm_mode);
+        // `return` (structured-summary envelope, `structured-subagent
+        // -return-summary.md`): a delegated subagent finishes by returning a
+        // structured summary. An on-disk override of a bundled agent keeps its name,
+        // so `with_return_tool`'s name guards exclude a bundled primary/docs
+        // override; a custom agent is gated on its `mode` here (a `Primary`-only
+        // custom agent is chat-owning, never delegated to, so it gets no `return`).
+        if crate::agents::embedded_default(&def.name).is_some() || def.mode.is_subagent() {
+            tb = with_return_tool(tb, &def.name);
+        }
     }
     // Per-agent tool-description overrides (prompt
     // `per-agent-tool-definitions.md`): re-word a granted tool's description
@@ -1718,26 +1718,19 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
             model.model_id_ref()
         );
     }
-    let mut params = args.params.clone();
-    params.native_computer = Some(native_computer);
-    Ok(Agent {
-        name: "computer".to_string(),
-        system: compose_system_prompt_for_model(COMPUTER_PROMPT, &model, args),
-        role_prompt: COMPUTER_PROMPT.to_string(),
-        tools: with_return_tool(ToolBox::new(), "computer"),
-        model,
-        params,
-        scan_tool_results: false,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: DelegationRecursionContext {
-            enabled: args.delegation_recursion.enabled,
-            remaining_depth: 0,
-            allowed_targets: Vec::new(),
-            same_model_only: false,
-        },
-        env_overlay: args.env_overlay.clone(),
-    })
+    let mut child_args = args.clone();
+    child_args.model = model;
+    child_args.params.native_computer = Some(native_computer);
+    let def = crate::agents::embedded_internal_default("computer")
+        .expect("computer has an internal agent definition");
+    let mut agent = agent_from_def(&def, &child_args)?;
+    agent.delegation_recursion = DelegationRecursionContext {
+        enabled: args.delegation_recursion.enabled,
+        remaining_depth: 0,
+        allowed_targets: Vec::new(),
+        same_model_only: false,
+    };
+    Ok(agent)
 }
 
 /// `scout` — read-only recursive review worker. Its base surface mirrors
@@ -2012,37 +2005,24 @@ pub fn docs_resolver(
     approver: Option<Arc<crate::approval::Approver>>,
     interrupts: Option<Arc<crate::engine::interrupt::InterruptHub>>,
 ) -> Agent {
-    let tools = with_custom_tools(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::docs::ListPackagesTool::new(
-                resolution.clone(),
-                target,
-            )))
-            // The package-add gate's approver + interrupt hub are threaded
-            // straight into the tool — independent of the noninteractive
-            // `ToolCtx::approver` the pipeline leaves `None` (so the
-            // filesystem-confine path raises no escalation), per
-            // implementation note.
-            .with(Arc::new(crate::tools::docs::AddPackageTool::new(
-                resolution, approver, interrupts,
-            )))
-            .with(Arc::new(crate::tools::bash::BashTool::new())),
-        &args.cwd,
-    );
-
-    Agent {
-        name: "docs-resolver".to_string(),
-        system: compose_system_prompt_for_effective_model(DOCS_RESOLVER_PROMPT, args),
-        role_prompt: DOCS_RESOLVER_PROMPT.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: true,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
+    let def = crate::agents::embedded_internal_default("docs-resolver")
+        .expect("docs-resolver has an internal agent definition");
+    let mut agent = agent_from_def(&def, args).expect("docs-resolver internal def is valid");
+    agent.tools = agent
+        .tools
+        .with(Arc::new(crate::tools::docs::ListPackagesTool::new(
+            resolution.clone(),
+            target,
+        )))
+        // The package-add gate's approver + interrupt hub are threaded
+        // straight into the tool — independent of the noninteractive
+        // `ToolCtx::approver` the pipeline leaves `None` (so the
+        // filesystem-confine path raises no escalation), per
+        // implementation note.
+        .with(Arc::new(crate::tools::docs::AddPackageTool::new(
+            resolution, approver, interrupts,
+        )));
+    agent
 }
 
 /// Docs.2 — the answerer stage of the `docs` pipeline. Runs in the
@@ -2052,24 +2032,9 @@ pub fn docs_resolver(
 /// every path to `args.cwd`, which is why bash can be denied: Docs.2 runs
 /// inside untrusted third-party source.
 pub fn docs_answerer(args: &SpawnArgs) -> Agent {
-    let tools = ToolBox::new()
-        .with(Arc::new(crate::tools::read::ReadTool))
-        .with(Arc::new(crate::tools::grep::GrepTool))
-        .with(Arc::new(crate::tools::glob::GlobTool));
-
-    Agent {
-        name: "docs-answerer".to_string(),
-        system: compose_system_prompt_for_effective_model(DOCS_ANSWERER_PROMPT, args),
-        role_prompt: DOCS_ANSWERER_PROMPT.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: false,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
+    let def = crate::agents::embedded_internal_default("docs-answerer")
+        .expect("docs-answerer has an internal agent definition");
+    agent_from_def(&def, args).expect("docs-answerer internal def is valid")
 }
 
 #[cfg(test)]
@@ -2135,6 +2100,152 @@ mod tests {
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
             granted_tools: Vec::new(),
+        }
+    }
+
+    fn sorted_tool_names(agent: &Agent) -> Vec<String> {
+        let mut names: Vec<String> = agent
+            .tools
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn builtin_agent_grant_equivalence_to_legacy_factories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let cases: &[(&str, fn(&SpawnArgs) -> Agent)] = &[
+            ("Auto", auto),
+            ("Build", build),
+            ("builder", builder),
+            ("explore", explore),
+            ("deepthink", deepthink),
+            ("scout", scout),
+            ("Plan", plan),
+            ("Swarm", swarm),
+            ("bee", bee),
+            ("Multireview", multireview),
+        ];
+
+        for (name, legacy) in cases {
+            let loaded = load(name, &args).unwrap();
+            let expected = sorted_tool_names(&legacy(&args));
+            assert_eq!(
+                sorted_tool_names(&loaded),
+                expected,
+                "{name} loaded from AgentDef must keep the legacy factory grant"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_agent_grant_internal_defs_exist_and_construct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for name in ["computer", "docs-resolver", "docs-answerer"] {
+            assert!(
+                crate::agents::embedded_internal_default(name).is_some(),
+                "{name} must have an internal AgentDef"
+            );
+        }
+
+        let resolution = crate::tools::docs::DocsResolution::new();
+        let resolver = docs_resolver(&args, resolution, "pkg".to_string(), None, None);
+        assert_eq!(
+            sorted_tool_names(&resolver),
+            vec![
+                "add-package",
+                "bash",
+                "list-packages",
+                "webfetch",
+                "websearch"
+            ]
+        );
+
+        let answerer = docs_answerer(&args);
+        assert_eq!(sorted_tool_names(&answerer), vec!["glob", "grep", "read"]);
+    }
+
+    #[test]
+    fn builtin_agent_grant_impact_is_grantable_and_on_explore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let def = crate::agents::AgentDef {
+            name: "impact-user".to_string(),
+            description: "custom".to_string(),
+            mode: crate::agents::AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["impact".to_string()]),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("impact-user.md"),
+        };
+
+        crate::agents::validate_invariants(&def).expect("impact is a known grantable tool");
+        let agent = agent_from_def(&def, &args).expect("impact materializes");
+
+        assert!(agent.tools.names().contains(&"impact"));
+        assert!(
+            load("explore", &args)
+                .unwrap()
+                .tools
+                .names()
+                .contains(&"impact")
+        );
+    }
+
+    #[test]
+    fn builtin_agent_grant_embedded_defs_validate_invariants() {
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let def = crate::agents::embedded_default(name).expect("embedded builtin");
+            crate::agents::validate_invariants(&def)
+                .unwrap_or_else(|err| panic!("{name} embedded def violates invariants: {err}"));
+        }
+    }
+
+    #[test]
+    fn builtin_agent_grant_parent_grants_still_compose() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.interactive = false;
+        args.granted_tools = vec!["harness_list".to_string()];
+
+        let agent = load("explore", &args).unwrap();
+
+        assert!(agent.tools.names().contains(&"harness_list"));
+    }
+
+    #[test]
+    fn builtin_agent_grant_docs_answerer_only_tools_stay_ungrantable() {
+        let tmp = tempfile::tempdir().unwrap();
+        for tool in ["grep", "glob"] {
+            let def = crate::agents::AgentDef {
+                name: format!("user-{tool}"),
+                description: "custom".to_string(),
+                mode: crate::agents::AgentMode::Subagent,
+                model: None,
+                temperature: None,
+                tools: Some(vec![tool.to_string()]),
+                tool_descriptions: std::collections::BTreeMap::new(),
+                scan_tool_results: None,
+                permission: None,
+                prompt: "body".to_string(),
+                prompt_variants: std::collections::HashMap::new(),
+                source: tmp.path().join(format!("user-{tool}.md")),
+            };
+            let err = crate::agents::validate_invariants(&def)
+                .expect_err("sandbox-only docs tools must be rejected for user defs");
+            assert!(err.to_string().contains("docs-answerer-only"), "{err}");
+            assert!(err.to_string().contains("sandboxed tool"), "{err}");
         }
     }
 

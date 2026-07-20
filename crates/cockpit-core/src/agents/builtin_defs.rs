@@ -103,6 +103,15 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
     }
 }
 
+pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
+    match name {
+        "computer" => Some(computer_def()),
+        "docs-resolver" => Some(docs_resolver_def()),
+        "docs-answerer" => Some(docs_answerer_def()),
+        _ => None,
+    }
+}
+
 fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &str) -> AgentDef {
     def_with_normal(name, description, mode, tools, prompt, None)
 }
@@ -192,6 +201,8 @@ fn build_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
             // write/lock set (arbitrated by the lock authority)
             "readlock",
             "writeunlock",
@@ -201,6 +212,8 @@ fn build_def() -> AgentDef {
             "question",
             "skill",
             "skill_manage",
+            "harness_list",
+            "harness_invoke",
             "task",
             "mcp",
         ],
@@ -235,6 +248,8 @@ fn builder_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
             "question",
             "skill",
             "task",
@@ -264,6 +279,9 @@ fn explore_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
+            "lsp",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
         Some(crate::engine::builtin::EXPLORE_PROMPT_NORMAL),
@@ -302,6 +320,8 @@ fn scout_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
             "spawn",
             "return",
         ],
@@ -331,12 +351,17 @@ fn plan_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
+            "lsp",
             "plan_read",
             "plan_write",
             "plan_edit",
             "start_build",
             "question",
             "skill",
+            "harness_list",
+            "harness_invoke",
             "task",
             "mcp",
         ],
@@ -367,6 +392,8 @@ fn swarm_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
             // write/lock set (arbitrated by the lock authority)
             "readlock",
             "writeunlock",
@@ -376,6 +403,8 @@ fn swarm_def() -> AgentDef {
             "question",
             "skill",
             "skill_manage",
+            "harness_list",
+            "harness_invoke",
             "task",
             "spawn",
             "mcp",
@@ -411,6 +440,8 @@ fn bee_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
             "skill",
             "task",
             "spawn",
@@ -438,6 +469,8 @@ fn multireview_def() -> AgentDef {
             "hot",
             "circular",
             "search",
+            "impact",
+            "change_impact",
             "spawn",
             "harness_list",
             "harness_invoke",
@@ -446,5 +479,35 @@ fn multireview_def() -> AgentDef {
         ],
         crate::engine::builtin::MULTIREVIEW_PROMPT,
         Some(crate::engine::builtin::MULTIREVIEW_PROMPT_NORMAL),
+    )
+}
+
+fn computer_def() -> AgentDef {
+    def(
+        "computer",
+        "Internal provider-native computer-use worker.",
+        AgentMode::Subagent,
+        &["return"],
+        crate::engine::builtin::COMPUTER_PROMPT,
+    )
+}
+
+fn docs_resolver_def() -> AgentDef {
+    def(
+        "docs-resolver",
+        "Internal docs pipeline resolver stage.",
+        AgentMode::Subagent,
+        &["bash"],
+        crate::engine::builtin::DOCS_RESOLVER_PROMPT,
+    )
+}
+
+fn docs_answerer_def() -> AgentDef {
+    def(
+        "docs-answerer",
+        "Internal docs pipeline answerer stage.",
+        AgentMode::Subagent,
+        &["read", "grep", "glob"],
+        crate::engine::builtin::DOCS_ANSWERER_PROMPT,
     )
 }

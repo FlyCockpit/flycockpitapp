@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 mod builtin_defs;
 pub(crate) mod invariants;
 
+pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
     BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent,
     is_experimental_primary, is_hidden_primary, resolve_primary_for_flag,

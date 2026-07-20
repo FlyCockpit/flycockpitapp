@@ -120,6 +120,29 @@ impl App {
                     }
                 }
             }
+            AsyncActionKind::Internal("session.fork") => match result.payload {
+                Ok(AsyncActionPayload::ForkSessionSwitched {
+                    outcome,
+                    fork_short_id,
+                    seed_composer,
+                }) => {
+                    self.apply_session_switch_outcome_without_resume_chrome(*outcome);
+                    self.push_plain(format!("/fork: switched to fork {fork_short_id}."));
+                    if let Some(seed) = seed_composer {
+                        self.composer.set(seed);
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                }
+                Ok(_) => {
+                    self.agent_runner = Some(Err("fork switch returned unexpected payload".into()));
+                }
+                Err(error) => {
+                    self.agent_runner = Some(Err(error.clone()));
+                    self.history.push(HistoryEntry::CommandError {
+                        line: format!("/fork: could not attach to fork: {error}"),
+                    });
+                }
+            },
             AsyncActionKind::Refresh("container.availability") => {
                 if let Ok(AsyncActionPayload::ContainerAvailability(availability)) = result.payload
                 {

@@ -138,6 +138,21 @@ impl App {
         &mut self,
         outcome: agent_runner::SessionSwitchOutcome,
     ) {
+        self.apply_session_switch_outcome_inner(outcome, true);
+    }
+
+    pub(super) fn apply_session_switch_outcome_without_resume_chrome(
+        &mut self,
+        outcome: agent_runner::SessionSwitchOutcome,
+    ) {
+        self.apply_session_switch_outcome_inner(outcome, false);
+    }
+
+    fn apply_session_switch_outcome_inner(
+        &mut self,
+        outcome: agent_runner::SessionSwitchOutcome,
+        resume_chrome: bool,
+    ) {
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })
             .then(|| wire_history_to_entries(outcome.history.clone()));
         let short_id = outcome.short_id.clone();
@@ -180,20 +195,22 @@ impl App {
                 self.current_session_persisted = false;
             }
             agent_runner::SessionTarget::Resume { session_id, .. } => {
-                if let Some(info) = btw_fork {
-                    self.open_btw_pane_from_info(info, true);
+                if resume_chrome {
+                    if let Some(info) = btw_fork {
+                        self.open_btw_pane_from_info(info, true);
+                    }
+                    let label = if short_id.is_empty() {
+                        session_id.to_string()
+                    } else {
+                        short_id
+                    };
+                    self.push_plain(format!("/resume: switched to session {label}."));
+                    if let Some(repair) = repair_required {
+                        self.maybe_prompt_resume_repair(repair);
+                    }
+                    self.maybe_prompt_paused_work(session_id, paused_work);
+                    self.maybe_show_daemon_version_chip(&daemon_version, daemon_compatible);
                 }
-                let label = if short_id.is_empty() {
-                    session_id.to_string()
-                } else {
-                    short_id
-                };
-                self.push_plain(format!("/resume: switched to session {label}."));
-                if let Some(repair) = repair_required {
-                    self.maybe_prompt_resume_repair(repair);
-                }
-                self.maybe_prompt_paused_work(session_id, paused_work);
-                self.maybe_show_daemon_version_chip(&daemon_version, daemon_compatible);
             }
         }
     }

@@ -3098,6 +3098,7 @@ impl App {
         let session_switches = [
             AsyncActionKind::Internal("session.switch"),
             AsyncActionKind::Internal("session.resume"),
+            AsyncActionKind::Internal("session.fork"),
         ];
         self.async_actions.has_pending_not_in(&session_switches)
             || self

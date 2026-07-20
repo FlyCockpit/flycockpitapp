@@ -61,6 +61,11 @@ pub enum AsyncActionPayload {
         estimate: crate::tui::agent_runner::GuidanceEstimate,
     },
     SessionSwitched(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
+    ForkSessionSwitched {
+        outcome: Box<crate::tui::agent_runner::SessionSwitchOutcome>,
+        fork_short_id: String,
+        seed_composer: Option<String>,
+    },
     ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
         org: Option<cockpit_db::org_sync::OrgSyncDisclosure>,

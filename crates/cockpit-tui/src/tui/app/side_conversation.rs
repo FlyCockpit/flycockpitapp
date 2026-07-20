@@ -23,6 +23,31 @@ impl App {
         {
             return;
         }
+        let switch_task = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) if runner.can_switch_session() => Some(runner.switch_session_task(
+                agent_runner::SessionTarget::Resume {
+                    session_id: fork_session_id,
+                    since_seq: None,
+                },
+            )),
+            _ => None,
+        };
+        if let Some(switch_task) = switch_task {
+            self.async_actions.start(
+                AsyncActionKind::Internal("session.fork"),
+                AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+                async move {
+                    switch_task
+                        .await
+                        .map(|outcome| AsyncActionPayload::ForkSessionSwitched {
+                            outcome: Box::new(outcome),
+                            fork_short_id,
+                            seed_composer,
+                        })
+                },
+            );
+            return;
+        }
         match attach_to_session_retry_once(|| {
             agent_runner::attach_to_session(
                 &self.launch.cwd,

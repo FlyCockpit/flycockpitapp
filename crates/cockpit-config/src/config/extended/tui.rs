@@ -199,16 +199,116 @@ pub enum WebProvider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WebCustomConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_command: Option<String>,
+}
+
+impl WebCustomConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct WebConfig {
     #[serde(default)]
     pub provider: WebProvider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firecrawl_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "WebCustomConfig::is_default")]
+    pub custom: WebCustomConfig,
 }
 
 impl WebConfig {
     pub fn is_default(&self) -> bool {
         self == &Self::default()
+    }
+}
+
+pub fn validate_web_custom_placeholders(web: &WebConfig) -> anyhow::Result<()> {
+    validate_web_custom_command(
+        "web.custom.fetch_command",
+        web.custom.fetch_command.as_deref(),
+        "{url}",
+    )?;
+    validate_web_custom_command(
+        "web.custom.search_command",
+        web.custom.search_command.as_deref(),
+        "{query}",
+    )?;
+    Ok(())
+}
+
+fn validate_web_custom_command(
+    field: &str,
+    command: Option<&str>,
+    placeholder: &str,
+) -> anyhow::Result<()> {
+    let Some(command) = command.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if !command.contains(placeholder) {
+        anyhow::bail!("{field} is missing required placeholder {placeholder}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod web_custom_tests {
+    use super::*;
+
+    #[test]
+    fn web_custom_defaults_absent_and_skips_empty_on_roundtrip() {
+        let cfg: WebConfig = serde_json::from_str(r#"{"provider":"custom"}"#).unwrap();
+        assert_eq!(cfg.custom.fetch_command, None);
+        assert_eq!(cfg.custom.search_command, None);
+
+        let serialized = serde_json::to_value(WebConfig::default()).unwrap();
+        assert_eq!(serialized, serde_json::json!({"provider":"firecrawl"}));
+    }
+
+    #[test]
+    fn web_custom_placeholder_validation_rejects_nonblank_missing_required_placeholder() {
+        let blank = WebConfig {
+            provider: WebProvider::Custom,
+            firecrawl_base_url: None,
+            custom: WebCustomConfig {
+                fetch_command: Some("   ".to_string()),
+                search_command: None,
+            },
+        };
+        validate_web_custom_placeholders(&blank).unwrap();
+
+        let fetch = WebConfig {
+            provider: WebProvider::Custom,
+            firecrawl_base_url: None,
+            custom: WebCustomConfig {
+                fetch_command: Some("curl https://example.com".to_string()),
+                search_command: None,
+            },
+        };
+        let err = validate_web_custom_placeholders(&fetch)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("web.custom.fetch_command"), "{err}");
+        assert!(err.contains("{url}"), "{err}");
+
+        let search = WebConfig {
+            provider: WebProvider::Custom,
+            firecrawl_base_url: None,
+            custom: WebCustomConfig {
+                fetch_command: None,
+                search_command: Some("search-cli".to_string()),
+            },
+        };
+        let err = validate_web_custom_placeholders(&search)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("web.custom.search_command"), "{err}");
+        assert!(err.contains("{query}"), "{err}");
     }
 }
 

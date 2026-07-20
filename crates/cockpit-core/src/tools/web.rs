@@ -392,9 +392,30 @@ pub(crate) fn materialize_web_tool(
 ) -> Result<std::sync::Arc<dyn Tool>> {
     let cfg = crate::config::extended::load_for_cwd(cwd);
     if cfg.web.provider == WebProvider::Custom {
-        let (tpl, provenance) = custom_template_for(name, cwd, &cfg)?;
+        let command = match name {
+            WEBFETCH => cfg.web.custom.fetch_command.as_deref(),
+            WEBSEARCH => cfg.web.custom.search_command.as_deref(),
+            other => return Err(anyhow::anyhow!("unknown web tool `{other}`")),
+        }
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("custom web tool `{name}` has no configured command"))?;
+        let tpl = crate::config::extended::ToolCommandTemplate {
+            enabled: true,
+            command: command.to_string(),
+            description: None,
+        };
         return Ok(std::sync::Arc::new(
-            CustomBashTool::from_template_with_provenance(name, &tpl, provenance),
+            CustomBashTool::from_template_with_provenance(
+                name,
+                &tpl,
+                ToolTemplateProvenance::Configured {
+                    source: format!(
+                        "web.custom command in effective config for {}",
+                        cwd.display()
+                    ),
+                },
+            ),
         ));
     }
     match name {
@@ -414,31 +435,6 @@ pub(crate) fn web_tool_requires_gate(name: &str, cwd: &std::path::Path) -> bool 
         WEBSEARCH => is_custom_web_provider(cwd),
         _ => false,
     }
-}
-
-fn custom_template_for(
-    name: &str,
-    cwd: &std::path::Path,
-    cfg: &crate::config::extended::ExtendedConfig,
-) -> Result<(
-    crate::config::extended::ToolCommandTemplate,
-    ToolTemplateProvenance,
-)> {
-    if let Some(tpl) = cfg.tools.get(name) {
-        return Ok((
-            tpl.clone(),
-            ToolTemplateProvenance::Configured {
-                source: format!("effective config for {}", cwd.display()),
-            },
-        ));
-    }
-    if crate::tools::custom::is_builtin_web_tool(name) {
-        return Ok((
-            crate::tools::custom_templates::default_template_for(name),
-            ToolTemplateProvenance::ShippedDefault,
-        ));
-    }
-    Err(anyhow::anyhow!("unknown web tool `{name}`"))
 }
 
 fn required_non_empty_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -1263,6 +1259,7 @@ mod tests {
         let tiny = WebConfig {
             provider: WebProvider::Tinyfish,
             firecrawl_base_url: None,
+            custom: Default::default(),
         };
         let selected = select_backend_with(
             &tiny,
@@ -1275,6 +1272,7 @@ mod tests {
         let custom = WebConfig {
             provider: WebProvider::Custom,
             firecrawl_base_url: None,
+            custom: Default::default(),
         };
         assert_eq!(
             select_backend_with(&custom, |_| None, |_| None).kind(),
@@ -1349,6 +1347,7 @@ mod tests {
         let cfg = WebConfig {
             provider: WebProvider::Firecrawl,
             firecrawl_base_url: Some("https://config.example".to_string()),
+            custom: Default::default(),
         };
         assert_eq!(
             resolve_firecrawl_base_url_with(&cfg, &|name| {
@@ -1479,6 +1478,7 @@ mod tests {
         let cfg = WebConfig {
             provider: WebProvider::Tinyfish,
             firecrawl_base_url: None,
+            custom: Default::default(),
         };
         let selected = select_backend_with(&cfg, |_| None, |_| None);
         assert_eq!(selected.kind(), SelectedBackendKind::Firecrawl);

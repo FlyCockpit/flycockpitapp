@@ -62,7 +62,7 @@ pub use resource_scheduler::{
 #[allow(unused_imports)]
 pub use tui::{
     BannerConfig, DiffStyle, SleepScope, ThinkingDisplay, ToolCommandTemplate, TuiConfig,
-    VimModeSetting, WebConfig, WebProvider,
+    VimModeSetting, WebConfig, WebCustomConfig, WebProvider, validate_web_custom_placeholders,
 };
 
 #[cfg(test)]
@@ -120,13 +120,12 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packages_directory: Option<PathBuf>,
 
-    /// User-defined bash-command templates surfaced as built-in tools
-    /// (webfetch, websearch, …). Keyed by tool name.
+    /// User-defined bash-command templates. The webfetch/websearch tool
+    /// implementations live under [`WebConfig::custom`], not this map.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolCommandTemplate>,
 
-    /// Provider used by the built-in web tools. The shell-template entries in
-    /// `tools.webfetch` / `tools.websearch` are consulted only for `custom`.
+    /// Provider and optional custom commands used by the built-in web tools.
     #[serde(default, skip_serializing_if = "WebConfig::is_default")]
     pub web: WebConfig,
 
@@ -1723,6 +1722,8 @@ impl ExtendedConfigDoc {
         parse_field!("intelCentralityRanking", intel_centrality_ranking);
         parse_field!("experimentalMode", experimental_mode);
 
+        migrate_legacy_web_tool_templates(&mut cfg);
+
         (cfg, warnings)
     }
 
@@ -1851,6 +1852,32 @@ impl ExtendedConfigDoc {
         }
         self.save_raw()
     }
+}
+
+fn migrate_legacy_web_tool_templates(cfg: &mut ExtendedConfig) {
+    migrate_legacy_web_tool_template(cfg, "webfetch", |web| &mut web.custom.fetch_command);
+    migrate_legacy_web_tool_template(cfg, "websearch", |web| &mut web.custom.search_command);
+}
+
+fn migrate_legacy_web_tool_template(
+    cfg: &mut ExtendedConfig,
+    legacy_name: &str,
+    target: impl FnOnce(&mut WebConfig) -> &mut Option<String>,
+) {
+    let Some(template) = cfg.tools.remove(legacy_name) else {
+        return;
+    };
+    let destination = target(&mut cfg.web);
+    if destination
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+
+    // Legacy web tool descriptions are intentionally not migrated. WebCustomConfig
+    // fixes the tool contract by name; only the user-supplied command varies.
+    *destination = Some(template.command);
 }
 
 fn raw_get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {

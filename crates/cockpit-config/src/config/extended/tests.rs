@@ -75,6 +75,10 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.web = WebConfig {
         provider: WebProvider::Tinyfish,
         firecrawl_base_url: Some("https://firecrawl.test".into()),
+        custom: WebCustomConfig {
+            fetch_command: Some("custom-fetch {url}".into()),
+            search_command: Some("custom-search {query}".into()),
+        },
     };
     cfg.trusted_only = true;
     cfg.allow_remote_config = true;
@@ -1647,6 +1651,95 @@ fn config_resolution_result_unchanged_after_single_pass_rewrite() {
         vec!["home.log".to_string(), "project.log".to_string()]
     );
     assert_eq!(cfg.llm_mode, LlmMode::Normal);
+}
+
+#[test]
+fn web_custom_migrates_legacy_webfetch_tool_command() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "tools": {
+                "webfetch": {
+                    "enabled": false,
+                    "command": "curl {url}",
+                    "description": "Legacy fetch description"
+                },
+                "my_tool": {
+                    "enabled": true,
+                    "command": "echo {value}"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+
+    assert_eq!(cfg.web.custom.fetch_command.as_deref(), Some("curl {url}"));
+    assert!(!cfg.tools.contains_key("webfetch"));
+    assert!(cfg.tools.contains_key("my_tool"));
+}
+
+#[test]
+fn web_custom_migration_preserves_existing_typed_value() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "web": {
+                "provider": "custom",
+                "custom": {
+                    "fetch_command": "existing {url}"
+                }
+            },
+            "tools": {
+                "webfetch": {
+                    "enabled": true,
+                    "command": "legacy {url}"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+
+    assert_eq!(
+        cfg.web.custom.fetch_command.as_deref(),
+        Some("existing {url}")
+    );
+    assert!(!cfg.tools.contains_key("webfetch"));
+}
+
+#[test]
+fn web_custom_migration_drops_legacy_descriptions() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "tools": {
+                "webfetch": {
+                    "enabled": true,
+                    "command": "curl {url}",
+                    "description": "do not preserve this"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+
+    assert_eq!(cfg.web.custom.fetch_command.as_deref(), Some("curl {url}"));
+    assert!(cfg.tools.values().all(|tool| {
+        tool.description
+            .as_deref()
+            .is_none_or(|description| !description.contains("do not preserve this"))
+    }));
 }
 
 mod guards_and_resolvers;

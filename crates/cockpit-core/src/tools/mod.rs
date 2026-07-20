@@ -20,7 +20,6 @@
 pub mod bash;
 pub mod command_resource_profiles;
 pub mod custom;
-pub mod custom_templates;
 pub mod data_syntax;
 pub mod defer;
 pub mod delegation_payload_retrieve;

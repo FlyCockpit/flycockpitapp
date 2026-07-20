@@ -1,6 +1,5 @@
 use super::*;
 use cockpit_config::providers::{ModelEntry, ProviderEntry};
-use cockpit_core::tools::custom_templates::{builtin_tool_names, default_template_for};
 use providers::{FetchAllState, valid_url};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, TestBackend};
@@ -3700,7 +3699,7 @@ fn cursor_down(d: &mut SettingsDialog, n: usize) {
 }
 
 fn tools_setup_row() -> usize {
-    builtin_tool_names().len() * 3
+    2
 }
 
 fn tools_reset_row() -> usize {
@@ -3708,21 +3707,14 @@ fn tools_reset_row() -> usize {
 }
 
 #[test]
-fn tools_reset_arms_then_restores_builtins_and_drops_custom() {
+fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
     use cockpit_config::extended::ToolCommandTemplate;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
 
-    // Diverge a built-in and add a custom user tool.
-    d.extended.tools.insert(
-        "webfetch".into(),
-        ToolCommandTemplate {
-            enabled: false,
-            command: "mangled".into(),
-            description: Some("mangled".into()),
-        },
-    );
+    d.extended.web.custom.fetch_command = Some("fetch {url}".into());
+    d.extended.web.custom.search_command = Some("search {query}".into());
     d.extended.tools.insert(
         "my_custom".into(),
         ToolCommandTemplate {
@@ -3741,8 +3733,8 @@ fn tools_reset_arms_then_restores_builtins_and_drops_custom() {
         other => panic!("expected Tools, got {other:?}"),
     }
     assert_eq!(
-        d.extended.tools.get("webfetch").map(|e| e.command.as_str()),
-        Some("mangled"),
+        d.extended.web.custom.fetch_command.as_deref(),
+        Some("fetch {url}"),
         "arming must not mutate config"
     );
     assert!(d.extended.tools.contains_key("my_custom"));
@@ -3757,21 +3749,13 @@ fn tools_reset_arms_then_restores_builtins_and_drops_custom() {
         !d.extended.tools.contains_key("my_custom"),
         "custom tool removed"
     );
-    for name in builtin_tool_names() {
-        let got = d.extended.tools.get(*name).expect("built-in present");
-        let want = default_template_for(name);
-        assert_eq!(got.enabled, want.enabled, "{name} enabled restored");
-        assert_eq!(got.command, want.command, "{name} command restored");
-        assert_eq!(
-            got.description, want.description,
-            "{name} description restored"
-        );
-    }
+    assert_eq!(d.extended.web.custom.fetch_command, None);
+    assert_eq!(d.extended.web.custom.search_command, None);
     // Persisted to disk.
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
     assert!(!reloaded.tools.contains_key("my_custom"));
-    let wf = reloaded.tools.get("webfetch").expect("webfetch persisted");
-    assert_eq!(wf.command, default_template_for("webfetch").command);
+    assert_eq!(reloaded.web.custom.fetch_command, None);
+    assert_eq!(reloaded.web.custom.search_command, None);
 }
 
 #[test]
@@ -3794,7 +3778,7 @@ fn tools_reset_pending_cancelled_by_navigation() {
 }
 
 #[test]
-fn tools_page_documents_cleared_builtin_description_inherits_default() {
+fn tools_page_documents_custom_web_placeholders() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
@@ -3808,27 +3792,17 @@ fn tools_page_documents_cleared_builtin_description_inherits_default() {
         .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Clearing a built-in tool description inherits the default."));
+    assert!(rendered.contains("Custom web commands must include {url}"));
+    assert!(rendered.contains("{query}"));
 }
 
 #[test]
 fn tools_page_wraps_long_values_under_value_column() {
-    use cockpit_config::extended::ToolCommandTemplate;
-
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
-    d.extended.tools.insert(
-        "webfetch".into(),
-        ToolCommandTemplate {
-            enabled: true,
-            command: "curl --header very-long-header --max-time 20 --retry 4 -- {url}".into(),
-            description: Some(
-                "Fetch a URL with a deliberately long description that must wrap under value."
-                    .into(),
-            ),
-        },
-    );
+    d.extended.web.custom.fetch_command =
+        Some("curl --header very-long-header --max-time 20 --retry 4 -- {url}".into());
 
     let p = match d.test_page() {
         TestPageRef::Tools(p) => p,
@@ -3847,7 +3821,7 @@ fn tools_page_wraps_long_values_under_value_column() {
 
     let command_row = rendered
         .iter()
-        .position(|line| line.contains("  command"))
+        .position(|line| line.contains("webfetch"))
         .expect("command row rendered");
     assert!(
         rendered[command_row + 1].starts_with("                  "),
@@ -3857,20 +3831,6 @@ fn tools_page_wraps_long_values_under_value_column() {
     assert!(
         !rendered[command_row + 1].starts_with("curl"),
         "command continuation must not restart at column 0"
-    );
-
-    let description_row = rendered
-        .iter()
-        .position(|line| line.contains("  description"))
-        .expect("description row rendered");
-    assert!(
-        rendered[description_row + 1].starts_with("                  "),
-        "description continuation should align under value column: {:?}",
-        rendered[description_row + 1]
-    );
-    assert!(
-        !rendered[description_row + 1].starts_with("Fetch"),
-        "description continuation must not restart at column 0"
     );
 }
 
@@ -4009,7 +3969,7 @@ fn tools_web_firecrawl_base_url_validates_and_round_trips() {
 }
 
 #[test]
-fn tools_web_setup_custom_presets_fill_templates() {
+fn tools_web_setup_custom_commands_edit_typed_fields() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
@@ -4017,25 +3977,27 @@ fn tools_web_setup_custom_presets_fill_templates() {
     cursor_down(&mut d, tools_setup_row());
     d.handle_key(press(KeyCode::Enter));
     cursor_down(&mut d, 2);
-    d.handle_key(press(KeyCode::Enter)); // custom details
-    d.handle_key(press(KeyCode::Down));
-    d.handle_key(press(KeyCode::Enter)); // curl + ddgr
+    d.handle_key(press(KeyCode::Enter)); // custom commands
     assert_eq!(
         d.extended.web.provider,
         cockpit_config::extended::WebProvider::Custom
     );
+
+    d.handle_key(press(KeyCode::Enter)); // fetch command
+    d.paste("fetch-cli {url}");
+    d.handle_key(press(KeyCode::Enter));
     assert_eq!(
-        d.extended.tools.get("websearch").unwrap().command,
-        "ddgr --json --num 8 -- {query}"
+        d.extended.web.custom.fetch_command.as_deref(),
+        Some("fetch-cli {url}")
     );
 
     d.handle_key(press(KeyCode::Down));
-    d.handle_key(press(KeyCode::Enter)); // agent-browser preset
-    d.handle_key(press(KeyCode::Down));
-    d.handle_key(press(KeyCode::Enter)); // Bing engine
+    d.handle_key(press(KeyCode::Enter)); // search command
+    d.paste("search-cli {query}");
+    d.handle_key(press(KeyCode::Enter));
     assert_eq!(
-        d.extended.tools.get("websearch").unwrap().command,
-        "agent-browser --session cockpit-websearch open \"https://www.bing.com/search?q={query}\" && agent-browser --session cockpit-websearch get text body"
+        d.extended.web.custom.search_command.as_deref(),
+        Some("search-cli {query}")
     );
 }
 

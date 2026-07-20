@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use crate::config::extended::ToolCommandTemplate;
 use crate::engine::agent::Agent;
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::tool::ToolBox;
@@ -464,6 +463,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
 
 fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
     &[
+        "webfetch",
+        "websearch",
         "seed",
         "list-packages",
         "add-package",
@@ -478,10 +479,8 @@ fn is_reserved_custom_tool_name(name: &str) -> bool {
 
 fn validate_configured_custom_tools(cwd: &Path) -> Result<()> {
     let cfg = crate::config::extended::load_for_cwd(cwd);
+    crate::config::extended::validate_web_custom_placeholders(&cfg.web)?;
     for name in cfg.tools.keys() {
-        if crate::tools::custom::is_builtin_web_tool(name) {
-            continue;
-        }
         if is_reserved_custom_tool_name(name) {
             bail!(
                 "custom tool `{name}` collides with a reserved cockpit tool name; choose a different custom tool name"
@@ -857,23 +856,49 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
 }
 
 /// Load user-defined custom-bash tools from the effective layered config and
-/// append them to `tb`. Falls back to the shipped defaults for any built-in
-/// tool name the user hasn't configured.
+/// append them to `tb`. Web provider config is the only source for the
+/// built-in web tools; the `tools` map is only user-defined tools.
 /// Disabled rows and empty commands are skipped.
 fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
     let cfg = crate::config::extended::load_for_cwd(cwd);
-    let custom_web = cfg.web.provider == crate::config::extended::WebProvider::Custom;
 
-    if !custom_web {
+    if cfg.web.provider != crate::config::extended::WebProvider::Custom {
         tb = tb.with(Arc::new(crate::tools::web::WebFetchTool));
         tb = tb.with(Arc::new(crate::tools::web::WebSearchTool));
+    } else {
+        for (name, command) in [
+            (
+                crate::tools::custom::WEBFETCH,
+                cfg.web.custom.fetch_command.as_deref(),
+            ),
+            (
+                crate::tools::custom::WEBSEARCH,
+                cfg.web.custom.search_command.as_deref(),
+            ),
+        ] {
+            let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) else {
+                continue;
+            };
+            let tpl = crate::config::extended::ToolCommandTemplate {
+                enabled: true,
+                command: command.to_string(),
+                description: None,
+            };
+            tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
+                name,
+                &tpl,
+                ToolTemplateProvenance::Configured {
+                    source: format!(
+                        "web.custom command in effective config for {}",
+                        cwd.display()
+                    ),
+                },
+            )));
+        }
     }
 
     for (name, tpl) in cfg.tools.iter() {
         if !tpl.enabled || tpl.command.trim().is_empty() {
-            continue;
-        }
-        if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
             continue;
         }
         tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
@@ -883,22 +908,6 @@ fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
                 source: format!("effective config for {}", cwd.display()),
             },
         )));
-    }
-    for name in crate::tools::custom_templates::builtin_tool_names() {
-        if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
-            continue;
-        }
-        if cfg.tools.contains_key(*name) {
-            continue;
-        }
-        let tpl: ToolCommandTemplate = crate::tools::custom_templates::default_template_for(name);
-        if tpl.enabled && !tpl.command.trim().is_empty() {
-            tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
-                name,
-                &tpl,
-                ToolTemplateProvenance::ShippedDefault,
-            )));
-        }
     }
     tb
 }
@@ -2908,23 +2917,97 @@ mod tests {
         }
     }
 
-    /// Web tools (`webfetch`/`websearch`) note the prefer-`docs`-for-dependency-
-    /// API guidance (implementation note): web stays
-    /// available for what `docs` can't answer (news, non-package info).
     #[test]
-    fn web_tool_defaults_note_prefer_docs_for_dependency_api() {
-        for name in ["webfetch", "websearch"] {
-            let tpl = crate::tools::custom_templates::default_template_for(name);
-            let desc = tpl.description.unwrap_or_default().to_lowercase();
-            assert!(
-                desc.contains("docs"),
-                "`{name}` default description must mention preferring `docs`"
-            );
-            assert!(
-                desc.contains("can't answer") || desc.contains("cannot answer"),
-                "`{name}` default description must note web is for what `docs` can't answer"
-            );
-        }
+    fn with_custom_tools_keeps_native_web_tools_and_user_tool_for_firecrawl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "web": { "provider": "firecrawl" },
+                "tools": {
+                    "my_tool": {
+                        "enabled": true,
+                        "command": "echo {value}"
+                    }
+                }
+            }"#,
+        );
+
+        let tb = with_custom_tools(ToolBox::new(), tmp.path());
+        let names = tb.names();
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        assert!(names.contains(&"websearch"), "{names:?}");
+        assert!(names.contains(&"my_tool"), "{names:?}");
+    }
+
+    #[test]
+    fn with_custom_tools_registers_typed_custom_web_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "web": {
+                    "provider": "custom",
+                    "custom": {
+                        "fetch_command": "fetch-cli {url}",
+                        "search_command": "search-cli {query}"
+                    }
+                }
+            }"#,
+        );
+
+        let tb = with_custom_tools(ToolBox::new(), tmp.path());
+        let names = tb.names();
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        assert!(names.contains(&"websearch"), "{names:?}");
+        let webfetch = tb.get("webfetch").unwrap();
+        assert_eq!(
+            webfetch.description(),
+            crate::tools::custom::neutral_web_description("webfetch").unwrap()
+        );
+    }
+
+    #[test]
+    fn with_custom_tools_registers_only_nonblank_custom_web_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "web": {
+                    "provider": "custom",
+                    "custom": {
+                        "fetch_command": "fetch-cli {url}",
+                        "search_command": "   "
+                    }
+                }
+            }"#,
+        );
+
+        let tb = with_custom_tools(ToolBox::new(), tmp.path());
+        let names = tb.names();
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        assert!(!names.contains(&"websearch"), "{names:?}");
+    }
+
+    #[test]
+    fn with_custom_tools_allows_blank_custom_web_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(tmp.path(), r#"{"web":{"provider":"custom"}}"#);
+
+        let tb = with_custom_tools(ToolBox::new(), tmp.path());
+        let names = tb.names();
+        assert!(!names.contains(&"webfetch"), "{names:?}");
+        assert!(!names.contains(&"websearch"), "{names:?}");
+    }
+
+    #[test]
+    fn reserved_custom_tool_name_includes_typed_web_tools() {
+        assert!(is_reserved_custom_tool_name("webfetch"));
+        assert!(is_reserved_custom_tool_name("websearch"));
     }
 
     /// The per-agent `task` description override (`Build`/`builder`) follows

@@ -934,6 +934,16 @@ mod tests {
     }
 
     #[test]
+    fn default_container_image_keeps_jq_installed() {
+        assert!(
+            DEFAULT_DOCKERFILE
+                .split_whitespace()
+                .any(|token| token == "jq"),
+            "jq is required in the default sandbox image"
+        );
+    }
+
+    #[test]
     fn create_and_exec_args_encode_network_mount_uid_and_env() {
         let id = Uuid::nil();
         let tmp = tempfile::tempdir().unwrap();

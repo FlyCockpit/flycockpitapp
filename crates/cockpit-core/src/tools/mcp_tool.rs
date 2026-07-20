@@ -54,10 +54,17 @@ pub(crate) fn current_mcp_description_adverts(
     session: &crate::session::Session,
     cwd: &std::path::Path,
 ) -> Vec<String> {
-    let mut adverts = Vec::new();
     let auto_title_configured = crate::config::extended::load_for_cwd(cwd)
         .auto_title_model_ref()
         .is_some();
+    mcp_description_adverts_for_session(session, auto_title_configured)
+}
+
+fn mcp_description_adverts_for_session(
+    session: &crate::session::Session,
+    auto_title_configured: bool,
+) -> Vec<String> {
+    let mut adverts = Vec::new();
     if session.agent_rename_session_available(auto_title_configured) {
         adverts.push(
             "This session may be named via mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": ...})."
@@ -345,7 +352,10 @@ mod tests {
                                     .unwrap();
                             }
 
-                            let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+                            let adverts = mcp_description_adverts_for_session(
+                                &ctx.session,
+                                auto_title_configured,
+                            );
                             let has_rename_advert = adverts
                                 .iter()
                                 .any(|advert| advert.contains("rename_session"));

@@ -3178,6 +3178,8 @@ mod local_cmd_tests;
 #[cfg(test)]
 mod model_picker_input_tests;
 #[cfg(test)]
+mod new_session_swap_tests;
+#[cfg(test)]
 mod prediction_lifecycle_tests;
 #[cfg(test)]
 mod prediction_turn_assembly_tests;

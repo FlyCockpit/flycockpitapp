@@ -82,8 +82,7 @@ impl App {
         self.chat_cont_rows.clear();
         self.selection = None;
         // Reload from disk in case settings changed.
-        self.reload_launch_info();
-        self.reload_tui_config();
+        self.reload_launch_and_tui_config();
 
         let switch_task = match self.agent_runner.as_ref() {
             Some(Ok(runner)) if runner.can_switch_session() => {

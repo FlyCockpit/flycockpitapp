@@ -1,17 +1,12 @@
 use super::*;
 
 impl App {
-    /// Re-read launch info (provider/model/favorite) from disk and
-    /// keep the cwd + repo_status we already have.
-    pub(super) fn reload_launch_info(&mut self) {
-        // Skip the synchronous git fetch: the freshly-loaded `repo_status`
-        // is discarded below in favor of the live polled one, so re-running
-        // `git status` here is pure waste.
-        let LaunchBundle {
-            launch: mut fresh,
-            providers,
-            extended,
-        } = welcome::load_bundle(Some(&self.launch.cwd), false);
+    fn apply_launch_bundle(
+        &mut self,
+        mut fresh: LaunchInfo,
+        providers: cockpit_config::providers::ProvidersConfig,
+        extended: &cockpit_config::extended::ExtendedConfig,
+    ) {
         // Don't clobber the live repo status — it's maintained by the
         // background poller and is fresher than a re-read here.
         fresh.repo_status = self.launch.repo_status.clone();
@@ -23,11 +18,43 @@ impl App {
         self.launch = fresh;
     }
 
+    /// Re-read launch info (provider/model/favorite) from disk and
+    /// keep the cwd + repo_status we already have.
+    pub(super) fn reload_launch_info(&mut self) {
+        // Skip the synchronous git fetch: the freshly-loaded `repo_status`
+        // is discarded below in favor of the live polled one, so re-running
+        // `git status` here is pure waste.
+        let LaunchBundle {
+            launch: fresh,
+            providers,
+            extended,
+        } = welcome::load_bundle(Some(&self.launch.cwd), false);
+        self.apply_launch_bundle(fresh, providers, &extended);
+    }
+
+    /// Re-read launch and TUI config from a single extended-config load.
+    pub(super) fn reload_launch_and_tui_config(&mut self) {
+        let LaunchBundle {
+            launch: fresh,
+            providers,
+            extended,
+        } = welcome::load_bundle(Some(&self.launch.cwd), false);
+        self.apply_launch_bundle(fresh, providers, &extended);
+        self.apply_tui_config_from_extended(&extended);
+    }
+
     /// Re-read the TUI-side config (vim mode, thinking display,
     /// markdown rendering) so changes made via `/settings` take effect
     /// immediately on dialog close.
     pub(super) fn reload_tui_config(&mut self) {
         let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
+        self.apply_tui_config_from_extended(&extended);
+    }
+
+    fn apply_tui_config_from_extended(
+        &mut self,
+        extended: &cockpit_config::extended::ExtendedConfig,
+    ) {
         let tui_cfg = extended.tui.clone();
         self.vim_setting = tui_cfg.vim_mode;
         self.thinking_setting = tui_cfg.thinking;

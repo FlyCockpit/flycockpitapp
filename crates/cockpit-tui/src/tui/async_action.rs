@@ -5,6 +5,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -138,6 +139,7 @@ impl AsyncActionStart {
 #[derive(Debug)]
 struct PendingAction {
     kind: AsyncActionKind,
+    started_at: Instant,
     generation: u64,
     key: Option<AsyncActionKey>,
     handle: JoinHandle<()>,
@@ -207,6 +209,27 @@ impl AsyncActionRunner {
 
     pub fn has_pending_kind(&self, kind: &AsyncActionKind) -> bool {
         self.pending.values().any(|pending| &pending.kind == kind)
+    }
+
+    pub fn has_pending_other_than(&self, kind: &AsyncActionKind) -> bool {
+        self.pending.values().any(|pending| &pending.kind != kind)
+    }
+
+    pub fn pending_kind_elapsed(&self, kind: &AsyncActionKind, now: Instant) -> Option<Duration> {
+        self.pending
+            .values()
+            .filter(|pending| &pending.kind == kind)
+            .map(|pending| now.saturating_duration_since(pending.started_at))
+            .max()
+    }
+
+    #[cfg(test)]
+    pub fn set_pending_kind_started_at(&mut self, kind: &AsyncActionKind, started_at: Instant) {
+        for pending in self.pending.values_mut() {
+            if &pending.kind == kind {
+                pending.started_at = started_at;
+            }
+        }
     }
 
     pub fn start<F>(
@@ -306,6 +329,7 @@ impl AsyncActionRunner {
             id,
             PendingAction {
                 kind,
+                started_at: Instant::now(),
                 generation,
                 key,
                 handle,

@@ -115,6 +115,7 @@ use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ANIMATION_TICK: Duration = Duration::from_millis(100);
+const SESSION_SWITCH_SPINNER_THRESHOLD: Duration = Duration::from_millis(150);
 const RUN_CAPTURE_MAX_BYTES: usize = 256 * 1024;
 const RUN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUN_CAPTURE_POLL: Duration = Duration::from_millis(10);
@@ -3080,16 +3081,26 @@ impl App {
     }
 
     fn animation_tick_active(&self) -> bool {
+        let now = Instant::now();
         self.busy
             || self.pending.is_some()
             || self.toast.is_some()
             || self.ctrl_c_armed_at.is_some()
             || self.reconnect.is_some()
             || self.pane.is_some()
-            || self.async_actions.pending_count() > 0
+            || self.async_action_animation_active(now)
             || self.dialog.is_active()
             || self.question_dialog.is_some()
             || self.daemon_prompt.is_some()
+    }
+
+    fn async_action_animation_active(&self, now: Instant) -> bool {
+        let session_switch = AsyncActionKind::Internal("session.switch");
+        self.async_actions.has_pending_other_than(&session_switch)
+            || self
+                .async_actions
+                .pending_kind_elapsed(&session_switch, now)
+                .is_some_and(|elapsed| elapsed >= SESSION_SWITCH_SPINNER_THRESHOLD)
     }
 }
 

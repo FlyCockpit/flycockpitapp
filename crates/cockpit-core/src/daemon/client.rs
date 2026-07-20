@@ -46,6 +46,18 @@ const EVENT_QUEUE: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
+thread_local! {
+    static CONNECT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn reset_connect_call_count() {
+    CONNECT_CALLS.with(|calls| calls.set(0));
+}
+
+pub fn connect_call_count() -> usize {
+    CONNECT_CALLS.with(std::cell::Cell::get)
+}
+
 /// Public handle. Cheap to clone: every clone shares the same
 /// background reader/writer task; only the event-stream subscription
 /// differs.
@@ -83,6 +95,7 @@ impl DaemonClient {
     /// Connect to the daemon at `socket`. Spawns the background task
     /// before returning.
     pub async fn connect(socket: &Path) -> Result<Self> {
+        CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
         if let Some(ctx) = crate::daemon::server::in_process_context(socket) {
             return Ok(Self::from_in_process(ctx));
         }

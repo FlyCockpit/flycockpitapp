@@ -25,6 +25,46 @@ fn new_session_swap_loads_extended_config_once() {
     assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 1);
 }
 
+#[test]
+fn new_session_swap_makes_no_daemon_probe_or_connect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    cockpit_core::daemon::reset_blocking_probe_call_count();
+    cockpit_core::daemon::client::reset_connect_call_count();
+
+    app.pending_new_session = true;
+    let serviced = app
+        .maybe_service_new_session_with_clear(|| Ok(()))
+        .expect("/new should be serviced");
+
+    assert!(serviced);
+    assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 0);
+    assert_eq!(cockpit_core::daemon::client::connect_call_count(), 0);
+}
+
+#[test]
+fn new_session_swap_opens_no_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    cockpit_db::reset_open_default_call_count();
+
+    app.pending_new_session = true;
+    let serviced = app
+        .maybe_service_new_session_with_clear(|| Ok(()))
+        .expect("/new should be serviced");
+
+    assert!(serviced);
+    assert_eq!(cockpit_db::open_default_call_count(), 0);
+}
+
 fn app_with_only_session_switch_pending(started_at: Instant) -> App {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new_with_db(

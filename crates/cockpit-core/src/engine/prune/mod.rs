@@ -905,6 +905,123 @@ mod tests {
         }
     }
 
+    fn tool_result_id_at(history: &[Message], idx: usize) -> String {
+        match &history[idx] {
+            Message::User { content } => match content.first_ref() {
+                UserContent::ToolResult(tr) => tr.id.clone(),
+                _ => panic!("not a tool result"),
+            },
+            _ => panic!("not a user message"),
+        }
+    }
+
+    fn assert_message_kinds(history: &[Message], expected: &[&str]) {
+        let actual = history
+            .iter()
+            .map(|msg| match msg {
+                Message::System { .. } => "system",
+                Message::Assistant { .. } => "assistant",
+                Message::User { .. } => "user",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn characterize_dedup_apply_wire_shape() {
+        let exact_args = json!({ "path": "/abs/exact.rs" });
+        let overlap_older = json!({ "path": "/abs/overlap.rs", "offset": 1, "limit": 3 });
+        let overlap_newer = json!({ "path": "/abs/overlap.rs", "offset": 2, "limit": 3 });
+        let mut history = vec![
+            assistant_call("exact-old", "read", exact_args.clone()),
+            tool_result("exact-old", "exact old body with enough padding"),
+            assistant_call("exact-new", "read", exact_args),
+            tool_result("exact-new", "exact new body with enough padding"),
+            assistant_call("overlap-old", "read", overlap_older),
+            tool_result(
+                "overlap-old",
+                "1|line 1 content\n2|line 2 content\n3|line 3 content\n",
+            ),
+            assistant_call("overlap-new", "read", overlap_newer),
+            tool_result(
+                "overlap-new",
+                "2|line 2 content\n3|line 3 content\n4|line 4 content\n",
+            ),
+        ];
+
+        let plan = dedup_plan(&history);
+        assert_eq!(plan.targets.len(), 2);
+        assert_eq!(apply_plan(&mut history, &plan), 2);
+
+        assert_eq!(history.len(), 8);
+        assert_message_kinds(
+            &history,
+            &[
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+            ],
+        );
+        assert_eq!(tool_result_id_at(&history, 1), "exact-old");
+        assert_eq!(tool_result_id_at(&history, 3), "exact-new");
+        assert_eq!(tool_result_id_at(&history, 5), "overlap-old");
+        assert_eq!(tool_result_id_at(&history, 7), "overlap-new");
+        assert_eq!(
+            body_at(&history, 1),
+            "[elided: snapshot superseded — superseded by a later identical call; full body in transcript event exact-old]"
+        );
+        assert_eq!(body_at(&history, 3), "exact new body with enough padding");
+        assert_eq!(
+            body_at(&history, 5),
+            "1|line 1 content\n[elided: overlapping read superseded — these lines are in a later read; full body in transcript event overlap-new]\n"
+        );
+        assert_eq!(
+            body_at(&history, 7),
+            "2|line 2 content\n3|line 3 content\n4|line 4 content\n"
+        );
+    }
+
+    #[test]
+    fn characterize_condense_apply_wire_shape() {
+        let original = long_shell_body();
+        let mut history = vec![
+            assistant_call("bash-one", "bash", json!({ "command": "cargo test" })),
+            tool_result("bash-one", &original),
+        ];
+
+        let candidates = condense_candidates(&history);
+        assert_eq!(candidates.len(), 1);
+        let expected_condensed =
+            crate::tools::shell_compress::prune_boundary_condense("cargo test", &original)
+                .expect("fixture should condense");
+        let expected = format!(
+            "{}\n{}",
+            compressed_tool_result_marker(
+                "bash",
+                original.len(),
+                expected_condensed.len(),
+                "0123456789abcdefabcdef12",
+            ),
+            expected_condensed
+        );
+
+        assert!(apply_condensed_tool_result(
+            &mut history,
+            &candidates[0],
+            "0123456789abcdefabcdef12",
+        ));
+
+        assert_eq!(history.len(), 2);
+        assert_message_kinds(&history, &["assistant", "user"]);
+        assert_eq!(tool_result_id_at(&history, 1), "bash-one");
+        assert_eq!(body_at(&history, 1), expected);
+    }
+
     /// Two identical reads of the same file: the older body is elided,
     /// the newest survives, call shapes (the assistant turns) untouched.
     #[test]

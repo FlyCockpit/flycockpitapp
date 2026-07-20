@@ -59,7 +59,7 @@ fn runner_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> AgentRunn
         skill_inventory_names: Arc::new(Mutex::new(None)),
         foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
-        session_id: uuid::Uuid::new_v4(),
+        session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
         usage: UsageCounts::default(),

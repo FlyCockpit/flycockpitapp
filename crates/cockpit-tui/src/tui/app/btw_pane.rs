@@ -589,11 +589,11 @@ impl App {
 
         let existing_mode = self.btw_pane.as_ref().map(BtwPane::mode);
         let parent_session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.session_id,
+            Some(Ok(runner)) => runner.session_id(),
             _ => {
                 self.ensure_agent_runner();
                 match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => runner.session_id,
+                    Some(Ok(runner)) => runner.session_id(),
                     _ => {
                         self.history.push(HistoryEntry::CommandError {
                             line: "/btw: no daemon connection".to_string(),

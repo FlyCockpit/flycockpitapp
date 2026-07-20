@@ -167,7 +167,7 @@ impl App {
                 self.arm_daemon_guard(&runner);
                 let short_id = runner.short_id.clone();
                 self.project_id = Some(runner.project_id.clone());
-                self.launch.session_id = Some(runner.session_id);
+                self.launch.session_id = Some(runner.session_id());
                 self.launch.session_short_id = Some(runner.short_id.clone());
                 // A resumed session already has a DB row
                 // (session-id-display-and-lazy-persist).
@@ -376,7 +376,7 @@ impl App {
                     return;
                 };
                 let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => (runner.session_id, runner.socket.clone()),
+                    Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
                     _ => {
                         self.history.push(HistoryEntry::CommandError {
                             line: "/resume: no active session to fork from".to_string(),

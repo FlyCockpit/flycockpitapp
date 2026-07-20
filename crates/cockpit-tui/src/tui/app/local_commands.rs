@@ -340,7 +340,7 @@ impl App {
     /// before the first session exists. Same resolution `/rename` uses.
     pub(super) fn current_session_id(&self) -> Option<uuid::Uuid> {
         match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id),
+            Some(Ok(runner)) => Some(runner.session_id()),
             _ => self.launch.session_id,
         }
     }

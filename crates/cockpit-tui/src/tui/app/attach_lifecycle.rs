@@ -145,7 +145,7 @@ impl App {
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
             // (session-id-display-and-lazy-persist).
-            self.launch.session_id = Some(r.session_id);
+            self.launch.session_id = Some(r.session_id());
             self.launch.session_short_id = Some(r.short_id.clone());
             // Seed the in-memory tally from the daemon's authoritative
             // counts. Additive: any optimistic increments made before

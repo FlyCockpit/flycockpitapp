@@ -2002,7 +2002,7 @@ impl App {
         // Authoritative current session: the live runner if attached,
         // else the last-attached id tracked on launch info.
         let session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id),
+            Some(Ok(runner)) => Some(runner.session_id()),
             _ => self.launch.session_id,
         };
         let Some(session_id) = session_id else {
@@ -2067,7 +2067,7 @@ impl App {
         // Authoritative current session: the live runner if attached,
         // else the last-attached ids tracked on launch info.
         let (session_id, short_id) = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => (Some(runner.session_id), Some(runner.short_id.clone())),
+            Some(Ok(runner)) => (Some(runner.session_id()), Some(runner.short_id.clone())),
             _ => (self.launch.session_id, self.launch.session_short_id.clone()),
         };
         let Some(session_id) = session_id else {
@@ -2115,7 +2115,7 @@ impl App {
         // last-attached id tracked on launch info (same resolution as
         // `/rename`/`/export`).
         let session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id),
+            Some(Ok(runner)) => Some(runner.session_id()),
             _ => self.launch.session_id,
         };
         let Some(session_id) = session_id else {

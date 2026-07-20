@@ -81,7 +81,7 @@ pub struct AgentRunner {
     /// This session's full id. Shown in the startup graphic and printed on
     /// exit (session-id-display-and-lazy-persist). Assigned by the daemon at
     /// attach, before the `sessions` row is persisted.
-    pub session_id: uuid::Uuid,
+    pub(crate) session_id_state: Arc<Mutex<uuid::Uuid>>,
     /// This session's 6-char display id (GOALS §17b). The TUI captures
     /// it as the predecessor short-id when this session spawns a
     /// `/compact` handoff, so the fresh session can draw a "compacted
@@ -165,6 +165,20 @@ impl AgentRunner {
         Arc::clone(&self.event_notify)
     }
 
+    pub fn session_id(&self) -> uuid::Uuid {
+        *self
+            .session_id_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn set_session_id(&self, session_id: uuid::Uuid) {
+        *self
+            .session_id_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session_id;
+    }
+
     pub fn can_switch_session(&self) -> bool {
         self.current_client.is_some()
             && self.attach_context.is_some()
@@ -179,6 +193,7 @@ impl AgentRunner {
         let current_client = self.current_client.clone();
         let attach_context = self.attach_context.clone();
         let last_applied_seq = self.last_applied_seq.clone();
+        let session_id_state = Arc::clone(&self.session_id_state);
         let active_agent = Arc::clone(&self.active_agent);
         let active_agent_path = Arc::clone(&self.active_agent_path);
         async move {
@@ -195,6 +210,7 @@ impl AgentRunner {
                 current_client,
                 attach_context,
                 last_applied_seq,
+                session_id_state,
                 active_agent,
                 active_agent_path,
                 target,
@@ -221,7 +237,6 @@ pub(crate) fn drain_turn_events(events: &Arc<Mutex<Vec<TurnEvent>>>) -> Vec<Turn
 
 #[derive(Clone)]
 pub(crate) struct AttachRequestContext {
-    session_id: Uuid,
     project_root: String,
     no_sandbox: bool,
     env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire,
@@ -371,6 +386,7 @@ async fn switch_session_inner(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
     last_applied_seq: Arc<Mutex<Option<i64>>>,
+    session_id_state: Arc<Mutex<Uuid>>,
     active_agent: Arc<Mutex<String>>,
     active_agent_path: Arc<Mutex<Vec<String>>>,
     target: SessionTarget,
@@ -414,40 +430,82 @@ async fn switch_session_inner(
             repair_required,
             btw_fork,
             ..
-        }) => {
-            *active_agent
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_active_agent.clone();
-            *active_agent_path
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                if new_active_agent_path.is_empty() {
-                    vec![new_active_agent]
-                } else {
-                    new_active_agent_path
-                };
-            *last_applied_seq
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                history.iter().filter_map(history_entry_seq).max();
-            attach_context.write().await.session_id = session_id;
-            Ok(SessionSwitchOutcome {
+        }) => Ok(apply_session_switch_attached(
+            SessionSwitchAttached {
                 session_id,
                 short_id,
-                foreground_target: foreground_target.map(queue_target_from_proto),
+                active_agent: new_active_agent,
+                active_agent_path: new_active_agent_path,
+                foreground_target,
                 active_model_state,
                 project_id,
                 history,
                 paused_work,
                 repair_required: repair_required.map(|repair| *repair),
                 btw_fork,
-            })
-        }
+            },
+            &session_id_state,
+            &last_applied_seq,
+            &active_agent,
+            &active_agent_path,
+        )),
         Ok(other) => Err(format!("unexpected attach response: {other:?}")),
         Err(error) if error.code == ErrorCode::ProtocolVersion => {
             Err(incompatible_protocol_chip().to_string())
         }
         Err(error) => Err(format!("attach: daemon error: {error}")),
+    }
+}
+
+struct SessionSwitchAttached {
+    session_id: Uuid,
+    short_id: String,
+    active_agent: String,
+    active_agent_path: Vec<String>,
+    foreground_target: Option<proto::QueueTarget>,
+    active_model_state: Option<proto::ActiveModelState>,
+    project_id: String,
+    history: Vec<proto::HistoryEntry>,
+    paused_work: Vec<proto::PausedWorkSummary>,
+    repair_required: Option<proto::ResumeRepairState>,
+    btw_fork: Option<proto::BtwForkInfo>,
+}
+
+fn apply_session_switch_attached(
+    attached: SessionSwitchAttached,
+    session_id_state: &Arc<Mutex<Uuid>>,
+    last_applied_seq: &Arc<Mutex<Option<i64>>>,
+    active_agent: &Arc<Mutex<String>>,
+    active_agent_path: &Arc<Mutex<Vec<String>>>,
+) -> SessionSwitchOutcome {
+    *active_agent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = attached.active_agent.clone();
+    *active_agent_path
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = if attached.active_agent_path.is_empty()
+    {
+        vec![attached.active_agent]
+    } else {
+        attached.active_agent_path
+    };
+    *last_applied_seq
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        attached.history.iter().filter_map(history_entry_seq).max();
+    *session_id_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = attached.session_id;
+    SessionSwitchOutcome {
+        session_id: attached.session_id,
+        short_id: attached.short_id,
+        foreground_target: attached.foreground_target.map(queue_target_from_proto),
+        active_model_state: attached.active_model_state,
+        project_id: attached.project_id,
+        history: attached.history,
+        paused_work: attached.paused_work,
+        repair_required: attached.repair_required,
+        btw_fork: attached.btw_fork,
     }
 }
 
@@ -695,9 +753,9 @@ fn try_spawn_inner(
     let last_applied_seq = Arc::new(Mutex::new(
         history.iter().filter_map(history_entry_seq).max(),
     ));
+    let session_id_state = Arc::new(Mutex::new(session_id));
     let current_client = Arc::new(RwLock::new(client));
     let attach_context = Arc::new(RwLock::new(AttachRequestContext {
-        session_id,
         project_root: cwd.to_string_lossy().into_owned(),
         no_sandbox,
         env_snapshot: cockpit_core::env_snapshot::capture_tui_shell_env()
@@ -827,6 +885,7 @@ fn try_spawn_inner(
         let current_client = current_client.clone();
         let last_applied_seq = last_applied_seq.clone();
         let attach_context = attach_context.clone();
+        let session_id_state = session_id_state.clone();
         let driver = LocalReconnectDriver {
             socket: socket.clone(),
         };
@@ -858,7 +917,9 @@ fn try_spawn_inner(
                     } else if saw_draining {
                         saw_draining = false;
                     }
-                    let session_id = attach_context.read().await.session_id;
+                    let session_id = *session_id_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let incoming = IncomingEventContext {
                         session_id,
                         events: &events,
@@ -900,9 +961,18 @@ fn try_spawn_inner(
                 loop {
                     tokio::time::sleep(backoff.next_delay()).await;
                     let attach_snapshot = attach_context.read().await.clone();
-                    match reconnect_and_attach(&driver, &attach_snapshot, &last_applied_seq).await {
+                    let session_id = *session_id_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match reconnect_and_attach(
+                        &driver,
+                        session_id,
+                        &attach_snapshot,
+                        &last_applied_seq,
+                    )
+                    .await
+                    {
                         Ok(attached) => {
-                            let session_id = attach_context.read().await.session_id;
                             let incoming = IncomingEventContext {
                                 session_id,
                                 events: &events,
@@ -961,7 +1031,7 @@ fn try_spawn_inner(
         skill_inventory_names,
         foreground_target: foreground_target.map(queue_target_from_proto),
         active_model_state,
-        session_id,
+        session_id_state,
         short_id,
         project_id,
         usage,
@@ -1492,6 +1562,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
 
 async fn reconnect_and_attach(
     driver: &LocalReconnectDriver,
+    session_id: uuid::Uuid,
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
 ) -> Result<ReconnectAttach, ReconnectAttachError> {
@@ -1501,7 +1572,7 @@ async fn reconnect_and_attach(
         .map_err(ReconnectAttachError::Retriable)?;
     let response = client
         .request(Request::Attach {
-            session_id: Some(attach_context.session_id),
+            session_id: Some(session_id),
             since_seq: current_last_applied_seq(last_applied_seq),
             project_root: Some(attach_context.project_root.clone()),
             no_sandbox: attach_context.no_sandbox,
@@ -2325,7 +2396,7 @@ mod tests {
             skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
-            session_id: uuid::Uuid::new_v4(),
+            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -2396,6 +2467,58 @@ mod tests {
             events.lock().unwrap().is_empty(),
             "aborted client task must not append late events after runner drop"
         );
+    }
+
+    #[test]
+    fn agent_runner_switch_session_replaces_session_id_in_place() {
+        let old_session_id = uuid::Uuid::new_v4();
+        let new_session_id = uuid::Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(old_session_id));
+        let last_applied_seq = Arc::new(Mutex::new(Some(2)));
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let history = vec![proto::HistoryEntry::Assistant {
+            agent: "Plan".to_string(),
+            text: "restored".to_string(),
+            reasoning: String::new(),
+            ts_ms: 0,
+            seq: 7,
+        }];
+
+        let outcome = apply_session_switch_attached(
+            SessionSwitchAttached {
+                session_id: new_session_id,
+                short_id: "def456".to_string(),
+                active_agent: "Plan".to_string(),
+                active_agent_path: Vec::new(),
+                foreground_target: None,
+                active_model_state: None,
+                project_id: "new-project".to_string(),
+                history,
+                paused_work: Vec::new(),
+                repair_required: None,
+                btw_fork: None,
+            },
+            &session_id_state,
+            &last_applied_seq,
+            &active_agent,
+            &active_agent_path,
+        );
+
+        assert_eq!(
+            *session_id_state.lock().unwrap(),
+            new_session_id,
+            "switch must replace the live session id in place"
+        );
+        assert_eq!(outcome.session_id, new_session_id);
+        assert_eq!(outcome.short_id, "def456");
+        assert_eq!(outcome.project_id, "new-project");
+        assert_eq!(&*active_agent.lock().unwrap(), "Plan");
+        assert_eq!(
+            &*active_agent_path.lock().unwrap(),
+            &vec!["Plan".to_string()]
+        );
+        assert_eq!(*last_applied_seq.lock().unwrap(), Some(7));
     }
 
     #[test]

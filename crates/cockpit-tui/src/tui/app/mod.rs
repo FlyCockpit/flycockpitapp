@@ -2868,7 +2868,7 @@ impl App {
                 let _ = agent_runner::attached_request_tx_blocking(
                     runner.attached_request_tx.clone(),
                     cockpit_core::daemon::proto::Request::EndBtwFork {
-                        parent_session_id: runner.session_id,
+                        parent_session_id: runner.session_id(),
                     },
                 );
             }

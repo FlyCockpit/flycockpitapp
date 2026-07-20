@@ -359,7 +359,7 @@ impl App {
             _ => None,
         };
         let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => (runner.session_id, runner.socket.clone()),
+            Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
             _ => {
                 self.history.push(HistoryEntry::CommandError {
                     line: "/fork: no active session to fork from".to_string(),
@@ -745,7 +745,7 @@ mod tests {
             skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
-            session_id: uuid::Uuid::new_v4(),
+            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -959,7 +959,7 @@ mod tests {
         let mut app = test_app(tmp.path());
         let mut runner = runner();
         runner.socket = socket;
-        let parent_session_id = runner.session_id;
+        let parent_session_id = runner.session_id();
         app.agent_runner = Some(Ok(runner));
         app.current_session_persisted = true;
         app.history.push(HistoryEntry::User {

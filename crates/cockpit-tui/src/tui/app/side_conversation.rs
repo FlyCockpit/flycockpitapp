@@ -18,7 +18,7 @@ impl App {
             || !self.current_session_persisted
             || !matches!(
                 self.agent_runner.as_ref(),
-                Some(Ok(runner)) if runner.session_id == parent_session_id
+                Some(Ok(runner)) if runner.session_id() == parent_session_id
             )
         {
             return;
@@ -34,7 +34,7 @@ impl App {
             Ok(mut runner) => {
                 self.arm_daemon_guard(&runner);
                 self.project_id = Some(runner.project_id.clone());
-                self.launch.session_id = Some(runner.session_id);
+                self.launch.session_id = Some(runner.session_id());
                 self.launch.session_short_id = Some(runner.short_id.clone());
                 self.current_session_persisted = true;
                 self.history.clear();
@@ -65,7 +65,7 @@ impl App {
         // Need a live runner: the side fork goes onto the same daemon, and
         // forking off an un-persisted session has nothing to branch from.
         let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => (runner.session_id, runner.socket.clone()),
+            Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
             _ => {
                 self.history.push(HistoryEntry::CommandError {
                     line: "/side: no active session to fork from".to_string(),
@@ -110,7 +110,7 @@ impl App {
             || !self.current_session_persisted
             || !matches!(
                 self.agent_runner.as_ref(),
-                Some(Ok(runner)) if runner.session_id == parent_session_id
+                Some(Ok(runner)) if runner.session_id() == parent_session_id
             )
         {
             let socket = socket.clone();
@@ -174,7 +174,7 @@ impl App {
         };
 
         self.project_id = Some(runner.project_id.clone());
-        self.launch.session_id = Some(runner.session_id);
+        self.launch.session_id = Some(runner.session_id());
         self.launch.session_short_id = Some(runner.short_id.clone());
         // The ephemeral fork is never surfaced as resumable — keep
         // `current_session_persisted = false` so the exit-tail never prints

@@ -140,7 +140,7 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
     ) {
         if let Some(Ok(runner)) = &mut self.agent_runner {
-            runner.session_id = outcome.session_id;
+            runner.set_session_id(outcome.session_id);
             runner.short_id = outcome.short_id.clone();
             runner.project_id = outcome.project_id.clone();
             runner.foreground_target = outcome.foreground_target.clone();

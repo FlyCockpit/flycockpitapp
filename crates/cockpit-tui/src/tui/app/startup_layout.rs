@@ -199,15 +199,38 @@ impl App {
         })
     }
 
+    pub(super) fn command_capability_notice_text(&self) -> Option<String> {
+        self.command_capability_notice.as_ref().map(|notice| {
+            command_capability_notice_text(
+                &notice.text,
+                notice.fix_command.as_deref(),
+                self.mouse_capture && notice.fix_command.is_some(),
+            )
+        })
+    }
+
+    pub(super) fn persistent_notice_fix_command(&self) -> Option<&str> {
+        self.sandbox_down_notice
+            .as_ref()
+            .and_then(|notice| notice.fix_command.as_deref())
+            .or_else(|| {
+                self.command_capability_notice
+                    .as_ref()
+                    .and_then(|notice| notice.fix_command.as_deref())
+            })
+    }
+
     pub(super) fn persistent_notice_text(&self) -> Option<String> {
         // Sandbox recovery is safety-critical, so it keeps the shared notice
-        // row while active. The auth notice remains queued and appears as soon
-        // as the sandbox remedy clears.
-        self.sandbox_down_notice_text().or_else(|| {
-            self.auth_failure_notice
-                .as_ref()
-                .map(|notice| crate::tui::auth_failure::notice_text(notice, self.mouse_capture))
-        })
+        // row while active. Command-capability startup notices are next; the
+        // auth notice remains queued until higher-priority remedies clear.
+        self.sandbox_down_notice_text()
+            .or_else(|| self.command_capability_notice_text())
+            .or_else(|| {
+                self.auth_failure_notice
+                    .as_ref()
+                    .map(|notice| crate::tui::auth_failure::notice_text(notice, self.mouse_capture))
+            })
     }
 
     /// Height of the persistent below-input sandbox-down notice (§6.5): its

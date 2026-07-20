@@ -170,15 +170,15 @@ impl ProfileIntrospector for ProductionProfileIntrospector {
                 ),
             };
         }
-        let resolved = match which::which(tool) {
-            Ok(path) => path,
-            Err(error) => {
+        let resolved = match crate::capabilities::resolve_binary_with_env(tool, env, cwd) {
+            Some(path) => path,
+            None => {
                 return IntrospectionResult {
                     tool: tool.to_string(),
                     command,
                     status: IntrospectionStatus::Failed,
                     stdout: String::new(),
-                    detail: Some(format!("resolve failed: {error}")),
+                    detail: Some(format!("resolve failed: `{tool}` not found on PATH")),
                 };
             }
         };
@@ -576,7 +576,7 @@ fn add_rust_roots(
         needs,
     );
     for program in &m.builtin_programs {
-        if let Some(parent) = resolve_program_parent(program, cwd) {
+        if let Some(parent) = resolve_program_parent(program, cwd, session_env) {
             builder.add_root(
                 id,
                 "binary_dir",
@@ -1085,7 +1085,11 @@ fn expand_path(raw: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn resolve_program_parent(program: &str, cwd: &Path) -> Option<PathBuf> {
+fn resolve_program_parent(
+    program: &str,
+    cwd: &Path,
+    session_env: &HashMap<String, String>,
+) -> Option<PathBuf> {
     let candidate = if program.contains('/') || program.contains('\\') {
         let path = PathBuf::from(program);
         Some(if path.is_absolute() {
@@ -1094,7 +1098,7 @@ fn resolve_program_parent(program: &str, cwd: &Path) -> Option<PathBuf> {
             cwd.join(path)
         })
     } else {
-        which::which(program).ok()
+        crate::capabilities::resolve_binary_with_env(program, session_env, cwd)
     }?;
     candidate.parent().map(Path::to_path_buf)
 }

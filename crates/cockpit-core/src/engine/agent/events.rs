@@ -344,6 +344,15 @@ pub enum TurnEvent {
     /// unchanged).
     Notice { text: String },
 
+    /// Required external binary capabilities are missing for one or more
+    /// granted tools. UI-only: the TUI renders this as persistent startup
+    /// chrome with a copyable install command when the remedy has one. Never
+    /// enters the model context.
+    CommandCapabilityUnavailable {
+        text: String,
+        fix_command: Option<String>,
+    },
+
     /// The utility-model skill auto-selector injected a skill's body onto
     /// this turn's wire message (`auto-injected-skill-transcript-
     /// visibility.md`). UI-only: the TUI renders a distinct

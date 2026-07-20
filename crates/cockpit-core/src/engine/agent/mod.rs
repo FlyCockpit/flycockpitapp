@@ -102,7 +102,13 @@ pub(crate) fn turn_toolbox(agent: &Agent, session: &Session, cwd: &std::path::Pa
     toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd);
     let adverts = crate::tools::mcp_tool::current_mcp_description_adverts(session, cwd);
     crate::tools::mcp_tool::apply_mcp_description_adverts(&mut toolbox, &adverts);
-    toolbox
+    let env = agent
+        .env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
+    toolbox.apply_capabilities(&env, cwd, target)
 }
 
 fn guidance_user_message(body: &str, label: Option<&str>) -> Message {

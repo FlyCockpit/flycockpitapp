@@ -18,6 +18,7 @@ pub mod auth;
 pub mod auto_title;
 pub mod banner;
 pub mod browser;
+pub mod capabilities;
 pub use cockpit_config as config;
 pub mod computer;
 pub mod container;

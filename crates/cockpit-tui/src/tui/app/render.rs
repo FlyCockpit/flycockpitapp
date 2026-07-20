@@ -1311,11 +1311,7 @@ impl App {
             );
             return;
         }
-        let has_copy_chip = self
-            .sandbox_down_notice
-            .as_ref()
-            .and_then(|notice| notice.fix_command.as_ref())
-            .is_some()
+        let has_copy_chip = self.persistent_notice_fix_command().is_some()
             && self.mouse_capture
             && text.starts_with("[copy] ")
             && area.width >= 7;

@@ -643,6 +643,16 @@ pub enum Event {
         fix_command: Option<String>,
     },
 
+    /// Required command-line capabilities are unavailable for one or more
+    /// tools granted to this session. Rendered as persistent startup chrome
+    /// with a copyable install command when the remedy supplies one.
+    CommandCapabilityUnavailable {
+        session_id: Uuid,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fix_command: Option<String>,
+    },
+
     /// Redaction sources were toggled for the session
     /// (`/toggle-redaction`). Broadcast to every attached client so they
     /// surface the resulting state (TUI: a toast). Session-only.

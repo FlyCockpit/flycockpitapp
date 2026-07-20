@@ -336,6 +336,10 @@ pub trait Tool: Send + Sync {
         ToolEffect::Dynamic
     }
 
+    fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+        Vec::new()
+    }
+
     fn presentation(&self, args: &Value) -> ToolPresentation {
         ToolPresentation::default_for(self.name(), args)
     }
@@ -936,6 +940,8 @@ pub struct ToolBox {
     /// Rendered tool schemas for this finalized toolbox, keyed by LLM mode.
     /// Builder-style mutations clear it so per-agent overrides stay exact.
     definition_cache: Arc<Mutex<HashMap<crate::config::extended::LlmMode, Vec<ToolDefinition>>>>,
+    capability_unavailable: BTreeMap<String, Vec<crate::capabilities::ToolCapabilityIssue>>,
+    capability_description_suffixes: BTreeMap<String, Vec<String>>,
 }
 
 impl ToolBox {
@@ -944,7 +950,10 @@ impl ToolBox {
     }
 
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        self.tools.insert(name.clone(), tool);
+        self.capability_unavailable.remove(&name);
+        self.capability_description_suffixes.remove(&name);
         self.definition_cache.lock().unwrap().clear();
         self
     }
@@ -952,6 +961,8 @@ impl ToolBox {
     pub fn without(mut self, name: &str) -> Self {
         self.tools.remove(name);
         self.overrides.remove(name);
+        self.capability_unavailable.remove(name);
+        self.capability_description_suffixes.remove(name);
         self.definition_cache.lock().unwrap().clear();
         self
     }
@@ -983,7 +994,86 @@ impl ToolBox {
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        if self.capability_unavailable.contains_key(name) {
+            return None;
+        }
         self.tools.get(name)
+    }
+
+    pub fn apply_capabilities(
+        mut self,
+        env: &std::collections::HashMap<String, String>,
+        cwd: &std::path::Path,
+        target: crate::capabilities::ExecutionTarget,
+    ) -> Self {
+        let cache = crate::capabilities::default_probe_cache();
+        self.apply_capabilities_with_cache(env, cwd, target, &cache);
+        self
+    }
+
+    pub fn apply_capabilities_with_cache(
+        &mut self,
+        env: &std::collections::HashMap<String, String>,
+        cwd: &std::path::Path,
+        target: crate::capabilities::ExecutionTarget,
+        cache: &crate::capabilities::CapabilityProbeCache,
+    ) {
+        self.capability_unavailable.clear();
+        self.capability_description_suffixes.clear();
+        for (name, tool) in &self.tools {
+            let requirements = tool.binary_requirements();
+            let evaluation = crate::capabilities::evaluate_tool_requirements(
+                name,
+                &requirements,
+                env,
+                cwd,
+                target,
+                cache,
+            );
+            if !evaluation.unavailable.is_empty() {
+                self.capability_unavailable
+                    .insert(name.clone(), evaluation.unavailable);
+            }
+            if !evaluation.optional_missing.is_empty() {
+                self.capability_description_suffixes.insert(
+                    name.clone(),
+                    evaluation
+                        .optional_missing
+                        .into_iter()
+                        .map(|issue| {
+                            format!(
+                                " Optional `{}` missing: {}",
+                                issue.requirement.name,
+                                issue.render_remedy(crate::capabilities::RemedyPlatform::current())
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        self.definition_cache.lock().unwrap().clear();
+    }
+
+    pub fn capability_unavailable(
+        &self,
+    ) -> impl Iterator<Item = &crate::capabilities::ToolCapabilityIssue> {
+        self.capability_unavailable
+            .values()
+            .flat_map(|issues| issues.iter())
+    }
+
+    pub fn capability_notice_text(&self) -> Option<String> {
+        crate::capabilities::missing_required_notice(
+            self.capability_unavailable().cloned(),
+            crate::capabilities::RemedyPlatform::current(),
+        )
+    }
+
+    pub fn capability_notice_fix_command(&self) -> Option<String> {
+        crate::capabilities::first_copyable_install_command(
+            self.capability_unavailable().cloned(),
+            crate::capabilities::RemedyPlatform::current(),
+        )
     }
 
     /// Project every tool to a `ToolDefinition`, rendering descriptions in
@@ -998,7 +1088,14 @@ impl ToolBox {
         let definitions: Vec<ToolDefinition> = self
             .tools
             .values()
-            .map(|t| definition_of(&**t, mode, self.overrides.get(t.name())))
+            .filter(|t| !self.capability_unavailable.contains_key(t.name()))
+            .map(|t| {
+                let mut definition = definition_of(&**t, mode, self.overrides.get(t.name()));
+                if let Some(suffixes) = self.capability_description_suffixes.get(t.name()) {
+                    definition.description.push_str(&suffixes.join(""));
+                }
+                definition
+            })
             .collect();
         self.definition_cache
             .lock()
@@ -1008,7 +1105,11 @@ impl ToolBox {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.tools.keys().map(String::as_str).collect()
+        self.tools
+            .keys()
+            .filter(|name| !self.capability_unavailable.contains_key(*name))
+            .map(String::as_str)
+            .collect()
     }
 
     // Registry-emptiness query; retained for the tool-registry API surface.
@@ -1022,6 +1123,10 @@ impl ToolBox {
 mod capability_tests {
     use super::*;
     use crate::config::extended::LlmMode;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// The follow-up/seed capability is disabled only for defensive mode.
     #[test]
@@ -1029,6 +1134,241 @@ mod capability_tests {
         assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
         assert!(Capability::FollowupSeed.enabled(LlmMode::Frontier));
         assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
+    }
+
+    struct RequirementTool {
+        name: &'static str,
+        requirements: Vec<crate::capabilities::BinaryRequirement>,
+    }
+
+    #[async_trait]
+    impl Tool for RequirementTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "require external binary"
+        }
+
+        fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+            self.requirements.clone()
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    struct ToolTestProbe {
+        present: BTreeSet<String>,
+        calls: AtomicUsize,
+    }
+
+    impl ToolTestProbe {
+        fn new(present: &[&str]) -> Self {
+            Self {
+                present: present.iter().map(|name| (*name).to_string()).collect(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::capabilities::BinaryProbe for ToolTestProbe {
+        fn resolve(
+            &self,
+            name: &str,
+            _path: Option<&str>,
+            _cwd: &Path,
+            _budget: Duration,
+        ) -> crate::capabilities::BinaryProbeStatus {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.present.contains(name) {
+                crate::capabilities::BinaryProbeStatus::Present(PathBuf::from(format!(
+                    "/bin/{name}"
+                )))
+            } else {
+                crate::capabilities::BinaryProbeStatus::Missing
+            }
+        }
+    }
+
+    #[test]
+    fn capability_tool_trait_defaults_empty_and_declared_requirement_round_trips() {
+        struct NoRequirementTool;
+        #[async_trait]
+        impl Tool for NoRequirementTool {
+            fn name(&self) -> &str {
+                "none"
+            }
+            fn description(&self) -> &str {
+                "none"
+            }
+            fn parameters(&self) -> Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        assert!(NoRequirementTool.binary_requirements().is_empty());
+
+        let tool = RequirementTool {
+            name: "declared",
+            requirements: vec![crate::capabilities::BinaryRequirement::required(
+                "demo-bin",
+                crate::capabilities::CapabilityRemedy::prose("Install demo-bin."),
+            )],
+        };
+        let requirements = tool.binary_requirements();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].name, "demo-bin");
+        assert_eq!(
+            requirements[0].kind,
+            crate::capabilities::BinaryRequirementKind::Required
+        );
+    }
+
+    #[test]
+    fn capability_required_binary_controls_callable_set_and_notice_dedupes() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&["present-bin"]));
+        let cache = crate::capabilities::CapabilityProbeCache::new(probe, Duration::from_millis(1));
+        let mut toolbox = ToolBox::new()
+            .with(std::sync::Arc::new(RequirementTool {
+                name: "present_tool",
+                requirements: vec![crate::capabilities::BinaryRequirement::required(
+                    "present-bin",
+                    crate::capabilities::common_remedy("present-bin"),
+                )],
+            }))
+            .with(std::sync::Arc::new(RequirementTool {
+                name: "missing_a",
+                requirements: vec![crate::capabilities::BinaryRequirement::required(
+                    "missing-bin",
+                    crate::capabilities::common_remedy("missing-bin"),
+                )],
+            }))
+            .with(std::sync::Arc::new(RequirementTool {
+                name: "missing_b",
+                requirements: vec![crate::capabilities::BinaryRequirement::required(
+                    "missing-bin",
+                    crate::capabilities::common_remedy("missing-bin"),
+                )],
+            }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::from([("PATH".to_string(), "/bin".to_string())]),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.get("present_tool").is_some());
+        assert!(toolbox.get("missing_a").is_none());
+        assert!(toolbox.get("missing_b").is_none());
+        let definitions = toolbox.definitions(LlmMode::Normal);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "present_tool");
+        let notice = toolbox.capability_notice_text().unwrap();
+        assert_eq!(notice.matches("`missing-bin` missing").count(), 1);
+    }
+
+    #[test]
+    fn capability_notice_ignores_missing_binary_for_ungranted_tool() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&[]));
+        let cache =
+            crate::capabilities::CapabilityProbeCache::new(probe.clone(), Duration::from_millis(1));
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "granted_tool",
+            requirements: Vec::new(),
+        }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::new(),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.capability_notice_text().is_none());
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "only granted toolbox tools are probed"
+        );
+    }
+
+    #[test]
+    fn capability_optional_binary_keeps_tool_callable_and_updates_description() {
+        let cache = crate::capabilities::CapabilityProbeCache::new(
+            std::sync::Arc::new(ToolTestProbe::new(&[])),
+            Duration::from_millis(1),
+        );
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "optional_tool",
+            requirements: vec![crate::capabilities::BinaryRequirement::optional(
+                "optional-bin",
+                crate::capabilities::CapabilityRemedy::prose("Install optional-bin."),
+            )],
+        }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::new(),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.get("optional_tool").is_some());
+        let definitions = toolbox.definitions(LlmMode::Normal);
+        assert_eq!(definitions.len(), 1);
+        assert!(
+            definitions[0]
+                .description
+                .contains("Optional `optional-bin` missing")
+        );
+    }
+
+    #[test]
+    fn capability_toolbox_rebuild_cache_is_keyed_by_path() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&[]));
+        let cache =
+            crate::capabilities::CapabilityProbeCache::new(probe.clone(), Duration::from_millis(1));
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "missing_tool",
+            requirements: vec![crate::capabilities::BinaryRequirement::required(
+                "missing-bin",
+                crate::capabilities::common_remedy("missing-bin"),
+            )],
+        }));
+        let env_a = std::collections::HashMap::from([("PATH".to_string(), "/a".to_string())]);
+        let env_b = std::collections::HashMap::from([("PATH".to_string(), "/b".to_string())]);
+
+        toolbox.apply_capabilities_with_cache(
+            &env_a,
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+        toolbox.apply_capabilities_with_cache(
+            &env_a,
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        toolbox.apply_capabilities_with_cache(
+            &env_b,
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
     }
 }
 

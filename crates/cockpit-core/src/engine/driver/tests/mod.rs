@@ -148,6 +148,45 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
     (driver, tmp)
 }
 
+#[tokio::test]
+async fn command_capability_notice_emits_at_driver_startup_once() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    let template = crate::config::extended::ToolCommandTemplate {
+        enabled: true,
+        command: "cockpit-definitely-missing-startup-tool {query}".to_string(),
+        description: None,
+    };
+    let custom_tool = crate::tools::custom::CustomBashTool::from_template_with_provenance(
+        "startup_search",
+        &template,
+        crate::tools::custom::ToolTemplateProvenance::Configured {
+            source: "test".to_string(),
+        },
+    );
+    let empty_path = _tmp.path().join("empty-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let frame = driver.stack.last_mut().expect("test driver has root frame");
+    let agent = Arc::make_mut(&mut frame.agent);
+    *agent.env_overlay.write().unwrap() =
+        std::collections::HashMap::from([("PATH".to_string(), empty_path.display().to_string())]);
+    agent.tools = crate::engine::tool::ToolBox::new().with(Arc::new(custom_tool));
+    let (tx, mut rx) = mpsc::channel(4);
+
+    driver.emit_command_capability_notice_if_new(&tx).await;
+    driver.emit_command_capability_notice_if_new(&tx).await;
+
+    let first = rx.recv().await.expect("startup capability notice");
+    match first {
+        TurnEvent::CommandCapabilityUnavailable { text, fix_command } => {
+            assert!(text.contains("cockpit-definitely-missing-startup-tool"));
+            assert!(text.contains("startup_search"));
+            assert!(fix_command.is_none());
+        }
+        other => panic!("expected CommandCapabilityUnavailable, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "same startup notice is deduped");
+}
+
 fn learn_tool_args(name: &str) -> serde_json::Value {
     serde_json::json!({
         "action": "create",

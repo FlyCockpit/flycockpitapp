@@ -1839,6 +1839,34 @@ mod tests {
     }
 
     #[test]
+    fn command_capability_unavailable_event_round_trips_with_fix_command() {
+        let sid = Uuid::new_v4();
+        let text = "Required command capability unavailable: `demo` missing for `tool`.";
+        let fix_command = "sudo apt-get install demo";
+        let evt = Envelope::event(Event::CommandCapabilityUnavailable {
+            session_id: sid,
+            text: text.to_string(),
+            fix_command: Some(fix_command.to_string()),
+        });
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
+        match back.body {
+            Body::Event {
+                event:
+                    Event::CommandCapabilityUnavailable {
+                        session_id,
+                        text: got_text,
+                        fix_command: got_fix_command,
+                    },
+            } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(got_text, text);
+                assert_eq!(got_fix_command.as_deref(), Some(fix_command));
+            }
+            other => panic!("expected CommandCapabilityUnavailable event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn interrupt_question_serializes_as_tagged() {
         let q = InterruptQuestion::Single {
             prompt: "Backfill strategy?".into(),

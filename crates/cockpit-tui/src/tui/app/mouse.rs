@@ -83,7 +83,7 @@ impl App {
                 .sandbox_notice_copy_rect
                 .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
         {
-            self.copy_sandbox_fix_command();
+            self.copy_persistent_notice_fix_command();
             return;
         }
         if self.mouse_capture

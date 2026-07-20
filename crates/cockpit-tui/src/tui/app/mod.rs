@@ -1129,6 +1129,12 @@ pub(super) struct SandboxDownNotice {
     pub fix_command: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CommandCapabilityNotice {
+    pub text: String,
+    pub fix_command: Option<String>,
+}
+
 fn sandbox_down_notice_text(remedy: &str, fix_command: Option<&str>, copy_chip: bool) -> String {
     let mut text = if copy_chip && fix_command.is_some() {
         format!("[copy] ⚠ shell sandbox can't start: {remedy}.")
@@ -1145,6 +1151,18 @@ fn sandbox_down_notice_text(remedy: &str, fix_command: Option<&str>, copy_chip: 
     }
     text.push_str(" Run /sandbox off in the composer to continue.");
     text
+}
+
+fn command_capability_notice_text(
+    text: &str,
+    fix_command: Option<&str>,
+    copy_chip: bool,
+) -> String {
+    if copy_chip && fix_command.is_some() {
+        format!("[copy] ⚠ {text}")
+    } else {
+        format!("⚠ {text}")
+    }
 }
 
 pub(super) fn sandbox_notice_render_text(text: &str) -> String {
@@ -1875,6 +1893,7 @@ pub struct App {
     /// `SandboxState { enabled: false }` a `/sandbox off` triggers. Never
     /// enters history or any inference request — purely client-side chrome.
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
+    pub(super) command_capability_notice: Option<CommandCapabilityNotice>,
     pub(super) sandbox_notice_copy_rect: Option<Rect>,
     /// Process-local, event-earned per-model auth failures. These deliberately
     /// have no persistence path and start empty for every TUI process.
@@ -2746,6 +2765,7 @@ impl App {
             last_user_interaction: Instant::now(),
             waiting_for_lock: None,
             sandbox_down_notice: None,
+            command_capability_notice: None,
             sandbox_notice_copy_rect: None,
             auth_failure_annotations: Default::default(),
             auth_failure_notice: None,

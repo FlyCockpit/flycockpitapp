@@ -1755,6 +1755,35 @@ fn missing_binary_diagnostic_names_cockpit_environment() {
 }
 
 #[test]
+fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
+    let declared = cockpit_command_environment_block_with_requirements(
+        "jq . package.json",
+        Path::new("/repo"),
+        Some("127"),
+        None,
+        Some("jq"),
+        vec![crate::capabilities::BinaryRequirement::required(
+            "jq",
+            crate::capabilities::common_remedy("jq"),
+        )],
+    );
+    assert!(declared.contains("missing_binary: jq"));
+    assert!(declared.contains("remedy:"));
+    assert!(declared.contains("cockpit jq"));
+
+    let undeclared = cockpit_command_environment_block_with_requirements(
+        "mystery",
+        Path::new("/repo"),
+        Some("127"),
+        None,
+        Some("mystery"),
+        Vec::new(),
+    );
+    assert!(undeclared.contains("missing_binary: mystery"));
+    assert!(!undeclared.contains("remedy:"));
+}
+
+#[test]
 fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
     let outcome = ShellOutcome {
         stdout: Vec::new(),

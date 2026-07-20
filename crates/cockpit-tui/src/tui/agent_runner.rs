@@ -1569,6 +1569,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SandboxState { session_id, .. }
         | SandboxEscalationState { session_id, .. }
         | SandboxUnavailable { session_id, .. }
+        | CommandCapabilityUnavailable { session_id, .. }
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
         | TrustedOnlyState { session_id, .. }
@@ -2202,6 +2203,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             remedy,
             fix_command,
         },
+        CommandCapabilityUnavailable {
+            text, fix_command, ..
+        } => TurnEvent::CommandCapabilityUnavailable { text, fix_command },
         RedactionState {
             scan_environment,
             scan_dotenv,

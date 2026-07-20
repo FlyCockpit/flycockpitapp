@@ -136,6 +136,13 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         TurnEvent::Notice { text } => {
             vec![Event::Notice { session_id, text }]
         }
+        TurnEvent::CommandCapabilityUnavailable { text, fix_command } => {
+            vec![Event::CommandCapabilityUnavailable {
+                session_id,
+                text,
+                fix_command,
+            }]
+        }
         TurnEvent::SkillAutoInjected { name, reason } => {
             vec![Event::SkillAutoInjected {
                 session_id,

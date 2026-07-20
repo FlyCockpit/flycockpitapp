@@ -488,6 +488,9 @@ pub mod integration {
             crate::daemon::proto::Event::Notice { session_id, text } => {
                 DaemonEvent::Notice { session_id, text }
             }
+            crate::daemon::proto::Event::CommandCapabilityUnavailable {
+                session_id, text, ..
+            } => DaemonEvent::Notice { session_id, text },
             crate::daemon::proto::Event::PausedWorkAvailable { session_id, items } => {
                 DaemonEvent::PausedWorkAvailable {
                     session_id,

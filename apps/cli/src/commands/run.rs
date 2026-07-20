@@ -999,6 +999,9 @@ fn handle_run_event(
                     "[reconnecting: {provider}/{model} unreachable at {url} (attempt {attempt})]"
                 );
             }
+            proto::Event::CommandCapabilityUnavailable { text, .. } => {
+                let _ = writeln!(stderr, "[notice: {text}]");
+            }
             proto::Event::SessionEnded { reason, .. } => {
                 let _ = writeln!(stderr, "[session ended: {reason}]");
                 return RunEventAction::Break;
@@ -1275,6 +1278,14 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
         proto::Event::SessionPersistFailed { error, .. } => {
             json!({ "event": "error", "session_id": session_id, "code": "session_persist_failed", "message": error })
         }
+        proto::Event::CommandCapabilityUnavailable {
+            text, fix_command, ..
+        } => json!({
+            "event": "command_capability_unavailable",
+            "session_id": session_id,
+            "text": text,
+            "fix_command": fix_command,
+        }),
         other if verbose => {
             json!({ "event": "raw_event", "session_id": session_id, "raw": proto::Envelope::event(other.clone()) })
         }
@@ -1345,6 +1356,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SandboxState { session_id, .. }
         | SandboxEscalationState { session_id, .. }
         | SandboxUnavailable { session_id, .. }
+        | CommandCapabilityUnavailable { session_id, .. }
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
         | TrustedOnlyState { session_id, .. }

@@ -133,6 +133,19 @@ impl Tool for CustomBashTool {
         self.build_schema()
     }
 
+    fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+        first_template_program(&self.template)
+            .filter(|program| !program.contains('/') && !program.contains('\\'))
+            .filter(|program| !program.contains('{') && !program.contains('}'))
+            .map(|program| {
+                vec![crate::capabilities::BinaryRequirement::required(
+                    program,
+                    crate::capabilities::common_remedy(program),
+                )]
+            })
+            .unwrap_or_default()
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let selected = self.selected_template();
         if !selected.tpl.enabled || selected.tpl.command.trim().is_empty() {
@@ -168,14 +181,33 @@ impl Tool for CustomBashTool {
         let mut combined = String::new();
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let missing_binary = output.status.code().and_then(|code| {
+                crate::tools::bash::missing_binary_from_shell_failure(code, &stderr)
+            });
             combined.push_str(&render_failure_diagnostic(
                 &self.name,
                 &selected,
                 output.status.code(),
                 ctx,
             ));
+            combined.push_str(
+                &crate::tools::bash::cockpit_command_environment_block_with_requirements(
+                    &cmd,
+                    &ctx.cwd,
+                    output
+                        .status
+                        .code()
+                        .as_ref()
+                        .map(|code| code.to_string())
+                        .as_deref(),
+                    None,
+                    missing_binary.as_deref(),
+                    self.binary_requirements(),
+                ),
+            );
             combined.push_str("\n[stderr]\n");
-            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            combined.push_str(&stderr);
         }
 
         let changed_after_build = false;
@@ -241,6 +273,10 @@ fn render_failure_diagnostic(
             .map(|code| code.to_string())
             .unwrap_or_else(|| "signal".to_string()),
     )
+}
+
+fn first_template_program(template: &str) -> Option<&str> {
+    template.split_whitespace().next().filter(|s| !s.is_empty())
 }
 
 pub(crate) fn neutral_web_description(name: &str) -> Option<&'static str> {
@@ -349,6 +385,31 @@ mod tests {
         let tpl = "echo {a b} {valid} {}";
         let p = extract_placeholders(tpl);
         assert_eq!(p, vec!["valid".to_string()]);
+    }
+
+    #[test]
+    fn custom_bash_declares_first_template_program_as_required_binary() {
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "firecrawl search {query}".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "websearch",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".to_string(),
+            },
+        );
+
+        let requirements = tool.binary_requirements();
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].name, "firecrawl");
+        assert_eq!(
+            requirements[0].kind,
+            crate::capabilities::BinaryRequirementKind::Required
+        );
     }
 
     #[test]
@@ -525,6 +586,13 @@ mod tests {
             )
         );
         assert!(out.content.contains("provenance: configured"));
+        assert!(
+            out.content
+                .contains("missing_binary: cockpit-definitely-missing-websearch")
+        );
+        assert!(out.content.contains(
+            "remedy: Install `cockpit-definitely-missing-websearch` and ensure it is on PATH."
+        ));
         assert!(out.content.contains("[stderr]"));
         assert!(out.content.contains("cockpit-definitely-missing-websearch"));
     }

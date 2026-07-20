@@ -1,17 +1,12 @@
 use super::*;
 
 impl App {
-    pub(super) fn copy_sandbox_fix_command(&mut self) {
-        let Some(command) = self
-            .sandbox_down_notice
-            .as_ref()
-            .and_then(|notice| notice.fix_command.as_deref())
-            .map(str::to_string)
-        else {
+    pub(super) fn copy_persistent_notice_fix_command(&mut self) {
+        let Some(command) = self.persistent_notice_fix_command().map(str::to_string) else {
             return;
         };
         match crate::clipboard::copy_plain(&command) {
-            Ok(_) => self.show_copy_ok_or_tmux_hint("Copied sandbox fix command.".to_string()),
+            Ok(_) => self.show_copy_ok_or_tmux_hint("Copied fix command.".to_string()),
             Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
         }
     }

@@ -473,27 +473,33 @@ impl McpChildEventRecorder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Availability {
     available: bool,
     reason: Option<String>,
 }
 
 impl Availability {
-    #[allow(dead_code)]
-    fn available() -> Self {
+    pub fn available() -> Self {
         Self {
             available: true,
             reason: None,
         }
     }
 
-    #[allow(dead_code)]
-    fn unavailable(reason: impl Into<String>) -> Self {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             available: false,
             reason: Some(reason.into()),
         }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }
 

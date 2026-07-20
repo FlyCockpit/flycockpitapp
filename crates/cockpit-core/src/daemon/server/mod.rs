@@ -812,6 +812,14 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scrub_string(remedy, redact);
             scrub_option_string(fix_command, redact);
         }
+        proto::Event::CommandCapabilityUnavailable {
+            session_id: _,
+            text,
+            fix_command,
+        } => {
+            scrub_string(text, redact);
+            scrub_option_string(fix_command, redact);
+        }
         proto::Event::PreflightState {
             session_id: _,
             enabled: _,

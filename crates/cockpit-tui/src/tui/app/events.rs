@@ -1270,6 +1270,10 @@ impl App {
                     fix_command,
                 });
             }
+            TurnEvent::CommandCapabilityUnavailable { text, fix_command } => {
+                self.command_capability_notice =
+                    Some(CommandCapabilityNotice { text, fix_command });
+            }
             TurnEvent::RedactionState {
                 scan_environment,
                 scan_dotenv,

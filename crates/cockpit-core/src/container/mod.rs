@@ -96,8 +96,8 @@ pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
     #[cfg(any(test, feature = "test-support"))]
     DETECT_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
     let harness = harness_in_container();
-    let docker = which::which("docker").ok();
-    let podman = which::which("podman").ok();
+    let docker = crate::capabilities::resolve_binary("docker");
+    let podman = crate::capabilities::resolve_binary("podman");
     let runtime = docker
         .map(|binary| ContainerRuntime {
             kind: ContainerRuntimeKind::Docker,

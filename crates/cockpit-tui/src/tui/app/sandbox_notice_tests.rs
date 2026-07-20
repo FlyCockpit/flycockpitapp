@@ -92,6 +92,33 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
     assert!(app.sandbox_down_notice.is_none());
 }
 
+#[test]
+fn command_capability_unavailable_raises_persistent_copyable_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let history_len_before = app.history.len();
+    let text = "Required command capability unavailable: `demo` missing for `custom_tool`. Install demo. Fix: sudo apt-get install demo";
+    let fix_command = "sudo apt-get install demo";
+
+    app.apply_event(TurnEvent::CommandCapabilityUnavailable {
+        text: text.to_string(),
+        fix_command: Some(fix_command.to_string()),
+    });
+
+    assert_eq!(
+        app.command_capability_notice
+            .as_ref()
+            .map(|notice| notice.text.as_str()),
+        Some(text)
+    );
+    assert_eq!(app.persistent_notice_fix_command(), Some(fix_command));
+    let notice = app.persistent_notice_text().unwrap();
+    assert!(notice.contains("Required command capability unavailable"));
+    assert!(notice.contains("sudo apt-get install demo"));
+    assert!(app.sandbox_notice_lines() > 0, "persistent row reserved");
+    assert_eq!(app.history.len(), history_len_before);
+}
+
 /// The waiting-for-lock chrome state (`readlock-wait-and-lock-expiry.md`):
 /// a `WaitingForLock { waiting: true }` event sets the transient state with
 /// the path + holder, the `waiting: false` clear removes it, and neither

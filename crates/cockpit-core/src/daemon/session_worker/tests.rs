@@ -1085,6 +1085,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn command_capability_unavailable_maps_to_broadcast_with_fix_command() {
+        let sid = Uuid::new_v4();
+        let text = "Required command capability unavailable: `demo` missing for `tool`.";
+        let fix_command = "sudo apt-get install demo";
+        let out = proto::turn_event_to_proto(
+            TurnEvent::CommandCapabilityUnavailable {
+                text: text.to_string(),
+                fix_command: Some(fix_command.to_string()),
+            },
+            sid,
+        );
+        match out.as_slice() {
+            [
+                proto::Event::CommandCapabilityUnavailable {
+                    session_id,
+                    text: got_text,
+                    fix_command: got_fix_command,
+                },
+            ] => {
+                assert_eq!(*session_id, sid);
+                assert_eq!(got_text, text);
+                assert_eq!(got_fix_command.as_deref(), Some(fix_command));
+            }
+            other => panic!("expected one CommandCapabilityUnavailable, got {other:?}"),
+        }
+    }
+
     /// Reattach hydration: once the daemon has diagnosed sandbox startup as
     /// unavailable, a later client attach re-broadcasts the remembered notice
     /// with the structured fix command without waiting for another `bash` call.

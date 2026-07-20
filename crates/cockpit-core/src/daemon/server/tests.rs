@@ -251,6 +251,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_rollup_runs_off_request_loop() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("project-1", "/repo", "Build").unwrap();
+        ctx.db
+            .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
+                call_id: Uuid::new_v4(),
+                session_id: session.session_id,
+                project_id: "project-1".to_string(),
+                project_root: "/repo".to_string(),
+                model: "gpt-5".to_string(),
+                provider: "openai".to_string(),
+                timestamp: chrono::Utc::now().timestamp(),
+                input_tokens: 10,
+                output_tokens: 20,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd_micros: None,
+                is_utility: false,
+            })
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::StatsRollup {
+                project_id: Some("project-1".to_string()),
+                range: proto::StatsRange::AllTime,
+                by_role: true,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("stats rollup");
+
+        let Response::StatsRollup { rollup } = response else {
+            panic!("expected StatsRollup response");
+        };
+        assert_eq!(rollup.project_id.as_deref(), Some("project-1"));
+        assert_eq!(rollup.range, "all");
+        assert_eq!(rollup.tokens.by_model.len(), 1);
+        assert_eq!(rollup.tokens.by_model[0].model, "gpt-5");
+        assert_eq!(rollup.tokens.by_model[0].provider, "openai");
+        assert_eq!(rollup.tokens.by_model[0].input_tokens, 10);
+        assert_eq!(rollup.tokens.by_model[0].output_tokens, 20);
+    }
+
+    #[tokio::test]
     async fn assistant_rpc_creates_session_via_registry() {
         let ctx = test_ctx();
         let assistant_home = tempfile::tempdir().unwrap();

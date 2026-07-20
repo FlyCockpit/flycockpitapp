@@ -1054,21 +1054,7 @@ async fn handle_request(
             project_id,
             range,
             by_role,
-        } => {
-            let scope = project_id
-                .map(crate::db::stats::StatsScope::Project)
-                .unwrap_or(crate::db::stats::StatsScope::All);
-            let range = stats_range_from_proto(range);
-            let prices = crate::db::stats::PriceTable::load_default();
-            let now = chrono::Utc::now().timestamp();
-            let rollup = ctx
-                .db
-                .read_blocking(move |conn| {
-                    crate::db::stats::rollup(conn, &scope, range, &prices, by_role, now)
-                })
-                .map_err(internal)?;
-            Ok(Response::StatsRollup { rollup })
-        }
+        } => stats_rollup(ctx, project_id, range, by_role).await,
 
         Request::GuidanceEstimate {
             project_root,
@@ -1796,6 +1782,30 @@ fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRa
         proto::StatsRange::Last7Days => crate::db::stats::StatsRange::Last7Days,
         proto::StatsRange::AllTime => crate::db::stats::StatsRange::AllTime,
     }
+}
+
+async fn stats_rollup(
+    ctx: &Arc<DaemonContext>,
+    project_id: Option<String>,
+    range: proto::StatsRange,
+    by_role: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let db = ctx.db.clone();
+    let rollup = tokio::task::spawn_blocking(move || {
+        let scope = project_id
+            .map(crate::db::stats::StatsScope::Project)
+            .unwrap_or(crate::db::stats::StatsScope::All);
+        let range = stats_range_from_proto(range);
+        let prices = crate::db::stats::PriceTable::load_default();
+        let now = chrono::Utc::now().timestamp();
+        db.read_blocking(move |conn| {
+            crate::db::stats::rollup(conn, &scope, range, &prices, by_role, now)
+        })
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    Ok(Response::StatsRollup { rollup })
 }
 
 async fn export_session_data(

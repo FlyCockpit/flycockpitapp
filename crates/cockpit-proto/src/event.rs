@@ -178,6 +178,8 @@ pub enum Event {
     /// and show the error because the worker will end this session.
     SessionDriverFailed {
         session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
         error: String,
     },
 

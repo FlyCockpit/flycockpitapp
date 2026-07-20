@@ -730,8 +730,8 @@ async fn handle_request(
         }
         Request::RunScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
-            let result = scheduler.run_now(&id).await.map_err(internal)?;
-            Ok(Response::ScheduledJobRun { id, result })
+            scheduler.run_now(&id).map_err(internal)?;
+            Ok(Response::ScheduledJobRunQueued { id })
         }
 
         Request::ListAgents => list_agents(ctx, state),

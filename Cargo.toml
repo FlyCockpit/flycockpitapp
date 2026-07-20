@@ -27,6 +27,10 @@ brush-parser = "0.4"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 csv = "1"
+# Scheduler cron parser evaluation (2026-07-20): croner 3.0.1 is MIT
+# licensed, edition 2021 with no rust-version pin, and uses chrono-only
+# calendar math with no platform-specific APIs, so it is compatible with the
+# workspace MSRV 1.95.0 and Windows CI targets.
 croner = "3.0.1"
 dirs = "6"
 dotenvy = "0.15"

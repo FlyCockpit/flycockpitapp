@@ -787,16 +787,11 @@
     },
     "response": "scheduled_job_deleted"
   },
-  "scheduled_job_run": {
+  "scheduled_job_run_queued": {
     "data": {
-      "id": "job-fixture",
-      "result": {
-        "finished_at": 1700000001,
-        "ok": true,
-        "summary": "completed"
-      }
+      "id": "job-fixture"
     },
-    "response": "scheduled_job_run"
+    "response": "scheduled_job_run_queued"
   },
   "scheduled_jobs": {
     "data": {

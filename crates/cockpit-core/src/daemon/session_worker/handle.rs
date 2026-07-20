@@ -261,7 +261,11 @@ fn emit_session_driver_failed_once(
     send_current_event(
         event_tx,
         redaction,
-        proto::Event::SessionDriverFailed { session_id, error },
+        proto::Event::SessionDriverFailed {
+            session_id,
+            turn_id: None,
+            error,
+        },
     );
 }
 

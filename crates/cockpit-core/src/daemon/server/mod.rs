@@ -331,9 +331,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
-        proto::Response::ScheduledJobRun { id: _, result } => {
-            scrub_scheduled_job_last_result(result, redact);
-        }
+        proto::Response::ScheduledJobRunQueued { id: _ } => {}
         proto::Response::Agents { agents } => {
             for agent in agents {
                 scrub_agent_summary(agent, redact);
@@ -567,6 +565,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         }
         | proto::Event::SessionDriverFailed {
             session_id: _,
+            turn_id: _,
             error,
         } => scrub_string(error, redact),
         proto::Event::Notice {

@@ -209,9 +209,8 @@ pub enum Response {
         deleted: bool,
     },
 
-    ScheduledJobRun {
+    ScheduledJobRunQueued {
         id: String,
-        result: ScheduledJobLastResult,
     },
 
     Agents {

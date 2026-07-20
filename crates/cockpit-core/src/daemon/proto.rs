@@ -124,7 +124,11 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             vec![Event::SessionPersistFailed { session_id, error }]
         }
         TurnEvent::SessionDriverFailed { error } => {
-            vec![Event::SessionDriverFailed { session_id, error }]
+            vec![Event::SessionDriverFailed {
+                session_id,
+                turn_id: None,
+                error,
+            }]
         }
         TurnEvent::UserMessageDispatchFailed { .. } => vec![],
         TurnEvent::PreflightStarted => {

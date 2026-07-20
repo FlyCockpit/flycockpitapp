@@ -477,7 +477,7 @@ mod tests {
         let event = event_rx.try_recv().unwrap();
         assert!(matches!(
             event.event,
-            proto::Event::SessionDriverFailed { session_id: id, error }
+            proto::Event::SessionDriverFailed { session_id: id, error, .. }
                 if id == session_id && error == "first failure"
         ));
         assert!(

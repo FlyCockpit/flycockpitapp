@@ -4130,7 +4130,7 @@ mod tests {
             "create_scheduled_job"
             | "delete_scheduled_job"
             | "set_scheduled_job_enabled"
-            | "run_scheduled_job" => assert_scheduler_shared_only_dispatch(case.kind).await,
+            | "run_scheduled_job" => assert_scheduler_dispatch_happy(case.kind).await,
             "set_approval_mode"
             | "set_sandbox"
             | "set_sandbox_escalation"
@@ -5764,6 +5764,63 @@ mod tests {
             "unexpected scheduler error: {}",
             err.message
         );
+    }
+
+    #[cfg(unix)]
+    async fn assert_scheduler_dispatch_happy(kind: &str) {
+        let ctx = persistent_test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let scheduler = ctx.scheduler.as_ref().expect("persistent scheduler");
+        if kind != "create_scheduled_job" {
+            dispatch_matrix_request(&ctx, authz_matrix_request(
+                "create_scheduled_job",
+                Uuid::new_v4(),
+                tmp.path(),
+            ))
+            .await
+            .expect("seed scheduled job");
+        }
+        let response = dispatch_matrix_request(
+            &ctx,
+            authz_matrix_request(kind, Uuid::new_v4(), tmp.path()),
+        )
+        .await
+        .expect("scheduler happy path");
+        match kind {
+            "create_scheduled_job" => {
+                assert!(matches!(response, Response::ScheduledJob { .. }));
+                assert!(
+                    scheduler
+                        .list_jobs(None)
+                        .unwrap()
+                        .iter()
+                        .any(|job| job.id == "job-authz")
+                );
+            }
+            "delete_scheduled_job" => {
+                assert!(matches!(
+                    response,
+                    Response::ScheduledJobDeleted { deleted: true, .. }
+                ));
+                assert!(
+                    scheduler
+                        .list_jobs(None)
+                        .unwrap()
+                        .iter()
+                        .all(|job| job.id != "job-authz")
+                );
+            }
+            "set_scheduled_job_enabled" => {
+                let Response::ScheduledJob { job } = response else {
+                    panic!("expected scheduled job response");
+                };
+                assert!(job.enabled);
+            }
+            "run_scheduled_job" => {
+                assert!(matches!(response, Response::ScheduledJobRunQueued { .. }));
+            }
+            other => panic!("unexpected scheduler dispatch kind {other}"),
+        }
     }
 
     #[cfg(unix)]

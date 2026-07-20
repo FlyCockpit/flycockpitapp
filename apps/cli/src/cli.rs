@@ -275,6 +275,8 @@ pub enum TrustCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ScheduleCommand {
+    /// Create or replace a durable scheduler job.
+    Create(ScheduleCreateArgs),
     /// List durable scheduler jobs.
     List(ScheduleListArgs),
     /// Enable a durable scheduler job.
@@ -292,6 +294,27 @@ pub enum ScheduleCommand {
         #[arg(value_name = "ID")]
         id: String,
     },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ScheduleCreateArgs {
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// Job owner, e.g. assistant:alice or system:dreamer.
+    #[arg(long, value_name = "OWNER")]
+    pub owner: String,
+    /// JSON ScheduledJobSchedule payload, e.g. {"type":"every","seconds":60}.
+    #[arg(long, value_name = "JSON")]
+    pub schedule_json: String,
+    /// JSON ScheduledJobPayload payload.
+    #[arg(long, value_name = "JSON")]
+    pub payload_json: String,
+    /// Create the job disabled.
+    #[arg(long)]
+    pub disabled: bool,
+    /// Missed-run policy.
+    #[arg(long, default_value = "skip", value_parser = ["skip", "run_once_on_start"])]
+    pub missed_run_policy: String,
 }
 
 #[derive(Debug, clap::Args)]

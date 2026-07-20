@@ -38,7 +38,7 @@ impl App {
         &mut self,
         text: String,
         display_text: Option<String>,
-        tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
+        tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
         queue_item_ids: Vec<uuid::Uuid>,
         seq: Option<i64>,
         preflight_cleaned: Option<String>,
@@ -547,7 +547,7 @@ impl App {
                     self.history.push(HistoryEntry::ToolLine {
                         call_id,
                         tool,
-                        summary: crate::text::first_line(&output, 200),
+                        summary: cockpit_core::text::first_line(&output, 200),
                         state: ToolCallState::Success,
                     });
                 }
@@ -610,8 +610,8 @@ impl App {
                 // Bold red when the model built the call badly; plain red
                 // when the tool failed for another reason.
                 let state = match kind {
-                    crate::engine::tool::ToolFailKind::Invocation => ToolCallState::BadCall,
-                    crate::engine::tool::ToolFailKind::Execution => ToolCallState::Failed,
+                    cockpit_core::engine::tool::ToolFailKind::Invocation => ToolCallState::BadCall,
+                    cockpit_core::engine::tool::ToolFailKind::Execution => ToolCallState::Failed,
                 };
                 if !self.update_tool_state(&call_id, state, Some((error.clone(), false)), None) {
                     // No pending call to update (e.g. an edit/write tool
@@ -620,7 +620,7 @@ impl App {
                     self.history.push(HistoryEntry::ToolLine {
                         call_id,
                         tool,
-                        summary: crate::text::first_line(&error, 200),
+                        summary: cockpit_core::text::first_line(&error, 200),
                         state,
                     });
                 }
@@ -654,7 +654,7 @@ impl App {
                     "timeout_ttft" => "no first token within the timeout".to_string(),
                     "timeout_idle" => "stream stalled past the idle timeout".to_string(),
                     other if detail.is_empty() => other.to_string(),
-                    other => format!("{other}: {}", crate::text::first_line(&detail, 200)),
+                    other => format!("{other}: {}", cockpit_core::text::first_line(&detail, 200)),
                 };
                 let summary = format!("Inference failed ({provider}/{model}): {reason}");
                 self.history.push(HistoryEntry::InferenceError {
@@ -966,9 +966,11 @@ impl App {
                 // rehydration. A same-id re-raise only updates queue metadata
                 // for the visible dialog.
                 let lockout = match reason {
-                    crate::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
-                    crate::daemon::proto::InterruptRaiseReason::Advance
-                    | crate::daemon::proto::InterruptRaiseReason::Rehydration => {
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Initial => {
+                        self.dialog_lockout()
+                    }
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Advance
+                    | cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
                         self.fresh_dialog_lockout()
                     }
                 };
@@ -979,7 +981,7 @@ impl App {
                 let is_approval = questions.questions.iter().any(|q| {
                     matches!(
                         q,
-                        crate::daemon::proto::InterruptQuestion::Single {
+                        cockpit_core::daemon::proto::InterruptQuestion::Single {
                             permission: true,
                             approval_class: None,
                             ..
@@ -1243,7 +1245,9 @@ impl App {
                 self.container_network_enabled = container_network_enabled;
                 self.container_availability = container_availability;
                 let toast = match mode {
-                    crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox on".to_string(),
+                    cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => {
+                        "sandbox on".to_string()
+                    }
                     other => format!("sandbox {}", sandbox_mode_label(other)),
                 };
                 self.show_toast(&toast, ToastKind::Info);
@@ -1394,7 +1398,7 @@ impl App {
                 relay_region,
                 last_error,
             } => {
-                self.connector_disclosure = Some(crate::db::connector::ConnectorDisclosure {
+                self.connector_disclosure = Some(cockpit_db::connector::ConnectorDisclosure {
                     enabled,
                     status,
                     relay_url,
@@ -1448,8 +1452,8 @@ impl App {
             return;
         }
         self.active_model_state_generation = generation;
-        let providers = crate::secret_ref::load_effective(&self.launch.cwd);
-        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
+        let providers = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
+        let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
         self.launch.provider_line = format!("{provider} / {model}");
         self.launch.active_model = Some((provider.clone(), model.clone()));
         self.launch.active_model_diverged = diverged;
@@ -1532,7 +1536,7 @@ impl App {
         // goes verbatim to the BODY, never reasoning — a missing close can't
         // swallow the model's answer (priority #1).
         if !p.tag_partial.is_empty() {
-            let mut splitter = crate::engine::think::ThinkSplitter::from_parts(
+            let mut splitter = cockpit_core::engine::think::ThinkSplitter::from_parts(
                 p.inside_think,
                 p.body_started,
                 std::mem::take(&mut p.tag_partial),
@@ -1644,7 +1648,7 @@ fn is_write_tool(tool: &str) -> bool {
 }
 
 #[cfg(test)]
-const TOOL_ARG_SUMMARY_CHARS: usize = crate::engine::tool::TOOL_PRESENTATION_SUMMARY_CHARS;
+const TOOL_ARG_SUMMARY_CHARS: usize = cockpit_core::engine::tool::TOOL_PRESENTATION_SUMMARY_CHARS;
 
 /// `(collapsed_summary, full_input)` for a tool call. The summary is a
 /// single line (path, first line of a command, URL); `full_input` is the
@@ -1703,9 +1707,9 @@ fn mcp_child_expanded_by_default(meta: Option<&crate::tui::history::McpChildMeta
 
 #[cfg(test)]
 fn readable_arg_value(value: &serde_json::Value, limit: usize, multiline: bool) -> String {
-    crate::text::format_arg_value(
+    cockpit_core::text::format_arg_value(
         value,
-        crate::text::ArgFormatOptions::history(limit, multiline),
+        cockpit_core::text::ArgFormatOptions::history(limit, multiline),
     )
 }
 
@@ -1745,9 +1749,9 @@ fn restored_tool_state(hard_fail: bool) -> ToolCallState {
 /// read-only rendering path. Tool-call rows honor the wire-vs-user split
 /// (GOALS §14): the user-facing summary is built from `original_input`.
 pub(super) fn wire_history_to_entries(
-    wire: Vec<crate::daemon::proto::HistoryEntry>,
+    wire: Vec<cockpit_core::daemon::proto::HistoryEntry>,
 ) -> Vec<HistoryEntry> {
-    use crate::daemon::proto::HistoryEntry as Wire;
+    use cockpit_core::daemon::proto::HistoryEntry as Wire;
     let mut out: Vec<HistoryEntry> = Vec::new();
     let mut pending_mcp_children: std::collections::BTreeMap<String, Vec<ToolCall>> =
         std::collections::BTreeMap::new();
@@ -2160,8 +2164,8 @@ pub(super) const GIT_AGENT_TOKEN_CAP: usize = 2000;
 /// deterministic so the assembly is unit-testable without an `App`.
 pub(super) fn turns_from_history(
     history: &[HistoryEntry],
-) -> Vec<crate::engine::predict::PredictionTurn> {
-    use crate::engine::predict::PredictionTurn;
+) -> Vec<cockpit_core::engine::predict::PredictionTurn> {
+    use cockpit_core::engine::predict::PredictionTurn;
     let mut turns: Vec<PredictionTurn> = Vec::new();
     // True when the last pushed turn is still awaiting its agent reply (so a
     // following user message folds rather than opening a new one).
@@ -2243,15 +2247,15 @@ fn resource_event_label(resources: &std::collections::HashMap<String, u32>) -> S
         .join(",")
 }
 
-/// Whether a resolved [`crate::config::providers::CacheConfig`] means the
+/// Whether a resolved [`cockpit_config::providers::CacheConfig`] means the
 /// provider/model actually caches. Reuses the pruning-policy no-cache
-/// predicate ([`crate::engine::prune::cache_state`]): the only way it
-/// reports [`crate::engine::prune::ColdReason::NoCacheProvider`] for a
+/// predicate ([`cockpit_core::engine::prune::cache_state`]): the only way it
+/// reports [`cockpit_core::engine::prune::ColdReason::NoCacheProvider`] for a
 /// freshly-sent, non-busting prefix is `cache.mode = none`. Pure over its
 /// input so the cache-break-warning suppression is unit-testable without
 /// constructing an `App`.
-pub(super) fn cache_config_caches(cache: &crate::config::providers::CacheConfig) -> bool {
-    use crate::engine::prune::{CacheState, ColdReason, cache_state};
+pub(super) fn cache_config_caches(cache: &cockpit_config::providers::CacheConfig) -> bool {
+    use cockpit_core::engine::prune::{CacheState, ColdReason, cache_state};
     !matches!(
         cache_state(cache, Some(0), false),
         CacheState::Cold(ColdReason::NoCacheProvider)
@@ -2276,8 +2280,8 @@ fn auto_prune_trigger_label(reason: &str) -> &'static str {
 /// has no short alias.
 pub(super) fn parse_llm_mode_arg(
     arg: &str,
-) -> Result<Option<crate::config::extended::LlmMode>, String> {
-    use crate::config::extended::LlmMode;
+) -> Result<Option<cockpit_config::extended::LlmMode>, String> {
+    use cockpit_config::extended::LlmMode;
     match arg.trim().to_ascii_lowercase().as_str() {
         "" | "toggle" => Ok(None),
         "defend" | "defensive" => Ok(Some(LlmMode::Defensive)),
@@ -2418,7 +2422,7 @@ fn run_capture(command: std::process::Command) -> (String, bool) {
 }
 
 fn kill_capture_child(child: &mut std::process::Child) {
-    crate::process::terminate_group_sync(child, std::time::Duration::from_millis(200));
+    cockpit_core::process::terminate_group_sync(child, std::time::Duration::from_millis(200));
 }
 
 pub(super) fn run_capture_with_options(
@@ -2604,13 +2608,13 @@ pub(super) fn cap_display_lines(s: &str) -> String {
 
 /// Cap text to roughly `max_tokens` (cl100k estimate) with a marker.
 pub(super) fn cap_tokens(s: &str, max_tokens: usize) -> String {
-    if crate::tokens::count(s) <= max_tokens {
+    if cockpit_core::tokens::count(s) <= max_tokens {
         return s.to_string();
     }
     let mut budget = max_tokens.saturating_mul(4).max(64);
     loop {
         let truncated: String = s.chars().take(budget).collect();
-        if budget < 64 || crate::tokens::count(&truncated) <= max_tokens {
+        if budget < 64 || cockpit_core::tokens::count(&truncated) <= max_tokens {
             return format!("{truncated}\n… [truncated to ~{max_tokens} tokens]");
         }
         budget = budget * 3 / 4;
@@ -2940,7 +2944,7 @@ mod tests {
 
     #[test]
     fn restored_session_reconstructs_children() {
-        let child = crate::daemon::proto::HistoryEntry::ToolCall {
+        let child = cockpit_core::daemon::proto::HistoryEntry::ToolCall {
             seq: 1,
             agent: "Build".into(),
             call_id: "outer:mcp:0".into(),
@@ -2967,7 +2971,7 @@ mod tests {
             truncated: false,
             hint: None,
         };
-        let parent = crate::daemon::proto::HistoryEntry::ToolCall {
+        let parent = cockpit_core::daemon::proto::HistoryEntry::ToolCall {
             seq: 2,
             agent: "Build".into(),
             call_id: "outer".into(),
@@ -3010,9 +3014,9 @@ mod tests {
         let restored_lines = crate::tui::history::render_entry(
             &restored[0],
             100,
-            crate::config::extended::ThinkingDisplay::Condensed,
+            cockpit_config::extended::ThinkingDisplay::Condensed,
             crate::tui::history::MarkdownOpts::default(),
-            crate::config::extended::DiffStyle::default(),
+            cockpit_config::extended::DiffStyle::default(),
             false,
             &std::collections::HashSet::new(),
             0,
@@ -3030,9 +3034,9 @@ mod tests {
         let live_lines = crate::tui::history::render_entry(
             &live,
             100,
-            crate::config::extended::ThinkingDisplay::Condensed,
+            cockpit_config::extended::ThinkingDisplay::Condensed,
             crate::tui::history::MarkdownOpts::default(),
-            crate::config::extended::DiffStyle::default(),
+            cockpit_config::extended::DiffStyle::default(),
             false,
             &std::collections::HashSet::new(),
             0,

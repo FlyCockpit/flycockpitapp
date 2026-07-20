@@ -4,7 +4,7 @@
 //! A floating dialog over the chat body: a sidebar lists the project's notes
 //! by name (plus a "+ new note" affordance); the main pane shows the selected
 //! note. Notes are scoped to the **project root** and persist in the global
-//! cockpit DB ([`crate::db::project_notes`]), so the same notes appear across
+//! cockpit DB ([`cockpit_db::project_notes`]), so the same notes appear across
 //! every session in that project. Notes are pure TUI/DB state — they never
 //! enter any outbound model prompt (token economy, GOALS §10).
 //!
@@ -28,12 +28,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use uuid::Uuid;
 
-use crate::db::Db;
-use crate::db::project_notes::ProjectNote;
 use crate::tui::composer::Composer;
 use crate::tui::markdown;
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_db::Db;
+use cockpit_db::project_notes::ProjectNote;
 
 /// Which part of the dialog has focus / what the user is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +144,7 @@ impl NotesPane {
     /// root, falling back to `cwd`) and loading that project's notes. A DB
     /// failure is surfaced inline rather than refusing to open.
     pub fn open(cwd: &std::path::Path, vim_enabled: bool) -> Self {
-        let project_root = crate::git::find_worktree_root(cwd)
+        let project_root = cockpit_core::git::find_worktree_root(cwd)
             .unwrap_or_else(|| cwd.to_path_buf())
             .to_string_lossy()
             .into_owned();

@@ -7,9 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::config::extended::{ApprovalMode, LlmMode};
-use crate::config::providers::ModelTrust;
-use crate::tools::sandbox_mode::SandboxMode;
+use cockpit_config::extended::{ApprovalMode, LlmMode};
+use cockpit_config::providers::ModelTrust;
+use cockpit_core::tools::sandbox_mode::SandboxMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickModelChoice {
@@ -40,7 +40,7 @@ pub struct QuickCurrent {
     pub trusted_only: bool,
     pub sandbox_mode: SandboxMode,
     pub container_network_enabled: bool,
-    pub container_availability: crate::container::ContainerAvailability,
+    pub container_availability: cockpit_core::container::ContainerAvailability,
     pub approval_mode: ApprovalMode,
     pub active_model: Option<(String, String)>,
 }
@@ -657,7 +657,7 @@ fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
 
 fn sandbox_mode_description(
     mode: SandboxMode,
-    availability: &crate::container::ContainerAvailability,
+    availability: &cockpit_core::container::ContainerAvailability,
 ) -> String {
     match mode {
         SandboxMode::Off => "shell sandboxing disabled for this session".to_string(),
@@ -671,10 +671,10 @@ fn sandbox_mode_description(
 }
 
 fn container_unavailable_label(
-    availability: &crate::container::ContainerAvailability,
+    availability: &cockpit_core::container::ContainerAvailability,
 ) -> &'static str {
     match availability.reason {
-        Some(crate::container::ContainerUnavailableReason::HarnessInContainer) => {
+        Some(cockpit_core::container::ContainerUnavailableReason::HarnessInContainer) => {
             "Cockpit is running inside a container"
         }
         _ => "No docker/podman runtime found",
@@ -741,8 +741,8 @@ mod tests {
             trusted_only: false,
             sandbox_mode: SandboxMode::Sandbox,
             container_network_enabled: false,
-            container_availability: crate::container::ContainerAvailability {
-                runtime: Some(crate::container::ContainerRuntimeKind::Docker),
+            container_availability: cockpit_core::container::ContainerAvailability {
+                runtime: Some(cockpit_core::container::ContainerRuntimeKind::Docker),
                 harness_in_container: false,
                 available: true,
                 reason: None,
@@ -938,11 +938,11 @@ mod tests {
     #[test]
     fn sandbox_tab_does_not_stage_unavailable_container_mode() {
         let mut current = current();
-        current.container_availability = crate::container::ContainerAvailability {
+        current.container_availability = cockpit_core::container::ContainerAvailability {
             runtime: None,
             harness_in_container: false,
             available: false,
-            reason: Some(crate::container::ContainerUnavailableReason::NoRuntime),
+            reason: Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime),
         };
         let mut dialog = QuickDialog::open(current, vec![model("p/a")]);
         for _ in 0..3 {

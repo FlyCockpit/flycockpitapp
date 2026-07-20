@@ -63,8 +63,8 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<S
 /// the CLI mirror do (GOALS §15b): prefer the git worktree root for
 /// stability, else the cwd. `None` when the cwd can't be read.
 pub(crate) fn resolve_project_id(cwd: &Path) -> Option<String> {
-    let root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    Some(crate::session::project_id_for(&root))
+    let root = cockpit_core::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    Some(cockpit_core::session::project_id_for(&root))
 }
 
 /// Short prefix of a `project_id` hash for the title chip — the full

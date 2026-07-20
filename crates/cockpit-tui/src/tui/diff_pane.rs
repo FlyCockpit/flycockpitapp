@@ -14,7 +14,7 @@
 //!
 //! The pane is **read-only**: it never stages, applies, reverts, or edits,
 //! and it never invokes a destructive git command — only `git diff`, through
-//! the existing [`crate::git`] helpers. Its state is user-facing TUI state
+//! the existing the `cockpit_core::git` helpers. Its state is user-facing TUI state
 //! only and never enters any outbound model prompt.
 //!
 //! Diff bodies are parsed **once** at load into per-file sections
@@ -41,11 +41,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::config::extended::DiffStyle;
 use crate::tui::diff::SIDE_BY_SIDE_MIN_WIDTH;
 use crate::tui::history::HistoryEntry;
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_config::extended::DiffStyle;
 
 /// Minimum total body width for the two-column (list + diff) layout. Below
 /// this the file list is hidden and only the selected diff renders, and
@@ -339,8 +339,10 @@ impl DiffPane {
         let source = self.sources[self.active];
         self.loaded = match source {
             DiffSource::Last => self.last.clone(),
-            DiffSource::Worktree => load_git(crate::git::diff_worktree(&self.cwd), &self.cwd),
-            DiffSource::Staged => load_git(crate::git::diff_staged(&self.cwd), &self.cwd),
+            DiffSource::Worktree => {
+                load_git(cockpit_core::git::diff_worktree(&self.cwd), &self.cwd)
+            }
+            DiffSource::Staged => load_git(cockpit_core::git::diff_staged(&self.cwd), &self.cwd),
         };
         self.file_list.reset();
         self.scroll = 0;
@@ -521,7 +523,7 @@ fn load_git(result: anyhow::Result<String>, cwd: &std::path::Path) -> Loaded {
         Err(_) => {
             // Distinguish "not a worktree" from a generic git error so the
             // message is actionable, without surfacing raw git stderr.
-            if crate::git::find_worktree_root(cwd).is_none() {
+            if cockpit_core::git::find_worktree_root(cwd).is_none() {
                 Loaded::State("not a git worktree".to_string())
             } else {
                 Loaded::State("could not read git diff".to_string())

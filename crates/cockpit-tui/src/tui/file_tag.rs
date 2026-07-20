@@ -11,8 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 use ignore::WalkBuilder;
 
-use crate::config::extended::LlmMode;
-use crate::tools::common::{
+use cockpit_config::extended::LlmMode;
+use cockpit_core::tools::common::{
     OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice_with_byte_cap, truncation_marker,
 };
 
@@ -107,7 +107,8 @@ pub fn suggestions(
 ) -> Vec<Suggestion> {
     // The allowlist anchors at the enclosing worktree root, identical to the
     // read gate's matching root.
-    let allow_root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let allow_root =
+        cockpit_core::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let query = query.trim_start_matches('@');
     let (dir_part, name_part) = split_query(query);
     let search_root = if dir_part.is_empty() {
@@ -235,7 +236,7 @@ fn level_entries(dir: &Path, allow_root: &Path, allow: &[String]) -> Vec<(PathBu
     // Re-include allowlisted-but-gitignored immediate children: a depth-1
     // gitignore-off walk, keeping only entries the allowlist re-permits.
     if !allow.is_empty() {
-        let matcher = crate::gitignore::build_allowlist_matcher(allow_root, allow);
+        let matcher = cockpit_core::gitignore::build_allowlist_matcher(allow_root, allow);
         if !matcher.is_empty() {
             let mut wide = WalkBuilder::new(dir);
             wide.hidden(false)
@@ -255,7 +256,7 @@ fn level_entries(dir: &Path, allow_root: &Path, allow: &[String]) -> Vec<(PathBu
                 if seen.contains(&path) {
                     continue;
                 }
-                if !crate::gitignore::allowlist_matches(&path, allow_root, allow) {
+                if !cockpit_core::gitignore::allowlist_matches(&path, allow_root, allow) {
                     continue;
                 }
                 let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
@@ -330,7 +331,7 @@ pub struct TagExpansion {
     pub ok: bool,
 }
 
-impl From<TagExpansion> for crate::daemon::proto::TagExpansionMeta {
+impl From<TagExpansion> for cockpit_core::daemon::proto::TagExpansionMeta {
     fn from(expansion: TagExpansion) -> Self {
         Self {
             tool: expansion.tool.to_string(),
@@ -370,7 +371,8 @@ impl TagPolicy {
 
     pub fn new_for_mode(cwd: &Path, allow: Vec<String>, mode: LlmMode) -> Self {
         let cwd_resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let allow_root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        let allow_root =
+            cockpit_core::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
         Self {
             cwd: cwd.to_path_buf(),
             cwd_resolved,
@@ -725,7 +727,7 @@ fn check_policy(
         ));
     }
 
-    if !crate::gitignore::is_permitted(&target, &policy.allow_root, policy.allow()) {
+    if !cockpit_core::gitignore::is_permitted(&target, &policy.allow_root, policy.allow()) {
         return Some(skip(
             policy_tool_for(resolved),
             path_part,

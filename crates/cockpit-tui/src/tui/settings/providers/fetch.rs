@@ -22,7 +22,7 @@ impl FetchAllState {
     /// bad provider never blocks the rest — `tick` drains the live
     /// handles as they complete.
     pub(in crate::tui::settings) fn spawn(
-        providers: &crate::config::providers::ProvidersConfig,
+        providers: &cockpit_config::providers::ProvidersConfig,
     ) -> Self {
         let mut ids: Vec<String> = providers.providers.keys().cloned().collect();
         ids.sort();

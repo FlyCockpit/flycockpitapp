@@ -11,9 +11,9 @@ use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
 use super::{App, ControlApplied, FirstRunFlow, LocalChoiceSelection, Overlay, TranscriptFind};
-use crate::daemon::proto::{self, Request, Response};
-use crate::engine::message::{QueueItemStatus, QueuedUserMessage};
 use crate::tui::settings::Dialog;
+use cockpit_core::daemon::proto::{self, Request, Response};
+use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -329,8 +329,8 @@ impl App {
                     // client's `--no-sandbox` is a per-session default
                     // applied at attach, not a daemon-level launch flag
                     // (sandboxing part 2 precedence).
-                    match crate::daemon::DaemonPaths::resolve()
-                        .and_then(|_| crate::daemon::spawn_detached(false))
+                    match cockpit_core::daemon::DaemonPaths::resolve()
+                        .and_then(|_| cockpit_core::daemon::spawn_detached(false))
                     {
                         Ok(pid) => {
                             self.push_plain(format!(
@@ -1422,7 +1422,7 @@ impl App {
             // commit, so it's deliberately not counted here.
             let project_id = self.project_id.clone();
             self.record_usage(
-                crate::daemon::proto::UsageKind::Tag,
+                cockpit_core::daemon::proto::UsageKind::Tag,
                 sug.replacement.clone(),
                 project_id,
             );
@@ -1442,7 +1442,7 @@ impl App {
     /// detail (lines read / entries listed / why it was skipped).
     pub(super) fn push_tag_call_entries(
         &mut self,
-        expansions: &[crate::daemon::proto::TagExpansionMeta],
+        expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
     ) {
         for e in expansions {
             let mark = if e.ok { '✓' } else { '✗' };
@@ -2040,7 +2040,7 @@ impl App {
         // Tag expansion runs over the paste-expanded wire so a tag and a
         // pasted block can coexist in one message.
         let quoted = crate::tui::file_tag::quote_tracked_tags(&paste_wire, &self.accepted_tags);
-        let mut allow = crate::config::extended::resolve_gitignore_allow(&self.launch.cwd);
+        let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
         let tag_policy =
             crate::tui::file_tag::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
@@ -2081,7 +2081,7 @@ impl App {
         let tag_expansions = expanded
             .expansions
             .into_iter()
-            .map(crate::daemon::proto::TagExpansionMeta::from)
+            .map(cockpit_core::daemon::proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
         let fresh_tag_expansions = if was_busy {
             self.queue.push(optimistic_queue_item_with_display(
@@ -2106,8 +2106,8 @@ impl App {
         // Carry the wire text together with any real image parts (vision
         // only — non-vision folded the images into `wire` as text notes,
         // leaving `paste_images` empty).
-        let submission = crate::engine::message::UserSubmission {
-            kind: crate::engine::message::UserSubmissionKind::User,
+        let submission = cockpit_core::engine::message::UserSubmission {
+            kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: wire,
             display_text: Some(submitted.clone()),
             tag_expansions: tag_expansions.clone(),
@@ -2167,7 +2167,7 @@ impl App {
     }
 
     fn check_send_model_ready(&self) -> Result<(), MissingModelReason> {
-        let cfg = crate::secret_ref::load_effective(&self.launch.cwd);
+        let cfg = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
         if cfg.providers.is_empty() {
             return Err(MissingModelReason::NoProviders);
         }
@@ -2182,7 +2182,7 @@ impl App {
 
     fn open_missing_model_setup(&mut self, reason: MissingModelReason) {
         let status = reason.status();
-        let cfg = crate::secret_ref::load_effective(&self.launch.cwd);
+        let cfg = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
         if cfg.providers.is_empty() {
             self.first_run_flow = FirstRunFlow::AwaitProvider;
             self.dialog = Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
@@ -2201,7 +2201,9 @@ impl App {
                 model_id,
                 Some(status),
             ),
-            None => Dialog::open_setup_wizard(&self.launch.cwd, crate::wizard::MODEL_WIZARD_ID),
+            None => {
+                Dialog::open_setup_wizard(&self.launch.cwd, cockpit_core::wizard::MODEL_WIZARD_ID)
+            }
         };
         match dialog {
             Ok(dialog) => {
@@ -2490,7 +2492,7 @@ pub(super) fn optimistic_queue_item_with_display(
         status: QueueItemStatus::Queued,
         text,
         display_text,
-        target: crate::engine::message::QueueTarget::root(""),
+        target: cockpit_core::engine::message::QueueTarget::root(""),
     }
 }
 
@@ -2503,7 +2505,7 @@ pub(super) fn queue_item_from_proto(item: proto::QueueItem) -> QueuedUserMessage
         },
         text: item.text,
         display_text: item.display_text,
-        target: crate::engine::message::QueueTarget {
+        target: cockpit_core::engine::message::QueueTarget {
             id: item.target.id,
             agent: item.target.agent,
             depth: item.target.depth,
@@ -2518,8 +2520,8 @@ pub(super) fn queue_item_from_proto(item: proto::QueueItem) -> QueuedUserMessage
 fn redaction_selected_ids(
     result: &crate::tui::dialog::question::QuestionResult,
 ) -> Option<Vec<String>> {
-    use crate::daemon::proto::ResolveResponse;
     use crate::tui::dialog::question::QuestionResult;
+    use cockpit_core::daemon::proto::ResolveResponse;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
             Some(ResolveResponse::Multi { selected_ids }) => Some(selected_ids.clone()),
@@ -2532,8 +2534,8 @@ fn redaction_selected_ids(
 /// The chosen single-select option id from a closed `/init` prompt, or
 /// `None` for cancel / a malformed response.
 fn init_selected_id(result: &crate::tui::dialog::question::QuestionResult) -> Option<String> {
-    use crate::daemon::proto::ResolveResponse;
     use crate::tui::dialog::question::QuestionResult;
+    use cockpit_core::daemon::proto::ResolveResponse;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
             Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
@@ -2699,7 +2701,7 @@ impl App {
             crate::tui::async_action::AsyncActionKind::Internal("paste.token_count"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
-                let tokens = std::panic::catch_unwind(|| crate::tokens::count(&full))
+                let tokens = std::panic::catch_unwind(|| cockpit_core::tokens::count(&full))
                     .map_err(|_| "paste token count panicked".to_string())?;
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::PasteTokenCount {
@@ -3531,11 +3533,11 @@ fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<(), String> {
     if images.is_empty() {
         return Ok(());
     }
-    if images.len() > crate::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE {
+    if images.len() > cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
             images.len(),
-            crate::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+            cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
         ));
     }
     let mut total = 0usize;
@@ -3544,31 +3546,31 @@ fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<(), String> {
         if png.is_empty() {
             return Err(format!("Pasted image #{display_idx} is empty."));
         }
-        if png.len() > crate::daemon::proto::MAX_SINGLE_IMAGE_BYTES {
+        if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES {
             return Err(format!(
                 "Pasted image #{display_idx} is too large: {} bytes exceeds the {} byte limit.",
                 png.len(),
-                crate::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+                cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
             ));
         }
         total = total.saturating_add(png.len());
-        if total > crate::daemon::proto::MAX_TOTAL_IMAGE_BYTES {
+        if total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES {
             return Err(format!(
                 "Pasted images are too large: {} total bytes exceeds the {} byte limit.",
                 total,
-                crate::daemon::proto::MAX_TOTAL_IMAGE_BYTES
+                cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES
             ));
         }
         let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
-        if image.width() > crate::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
-            || image.height() > crate::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+        if image.width() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+            || image.height() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
         {
             return Err(format!(
                 "Pasted image #{display_idx} is too large: {}x{} exceeds the {} pixel dimension limit.",
                 image.width(),
                 image.height(),
-                crate::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+                cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
             ));
         }
     }
@@ -3600,14 +3602,17 @@ mod image_submit_validation_tests {
     #[test]
     fn rejects_too_many_images_before_dispatch() {
         let png = sample_png();
-        let images = vec![png; crate::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE + 1];
+        let images = vec![png; cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE + 1];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
         assert!(err.contains("Too many pasted images"));
     }
 
     #[test]
     fn rejects_oversized_single_image_before_dispatch() {
-        let images = vec![vec![0u8; crate::daemon::proto::MAX_SINGLE_IMAGE_BYTES + 1]];
+        let images = vec![vec![
+            0u8;
+            cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES + 1
+        ]];
         let err = validate_pasted_images_for_submit(&images).expect_err("oversized");
         assert!(err.contains("too large"));
         assert!(err.contains("byte limit"));
@@ -3695,12 +3700,12 @@ mod tag_delete_tests {
 #[cfg(test)]
 mod queued_message_edit_tests {
     use super::{optimistic_queue_item, queue_item_from_proto};
-    use crate::daemon::proto::{
-        QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
-    };
-    use crate::engine::message::{QueueItemStatus as EngineQueueItemStatus, UserSubmission};
     use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
     use crate::tui::app::App;
+    use cockpit_core::daemon::proto::{
+        QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
+    };
+    use cockpit_core::engine::message::{QueueItemStatus as EngineQueueItemStatus, UserSubmission};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -3721,7 +3726,7 @@ mod queued_message_edit_tests {
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
@@ -3739,8 +3744,8 @@ mod queued_message_edit_tests {
         }
     }
 
-    fn proto_target(id: &str) -> crate::daemon::proto::QueueTarget {
-        crate::daemon::proto::QueueTarget {
+    fn proto_target(id: &str) -> cockpit_core::daemon::proto::QueueTarget {
+        cockpit_core::daemon::proto::QueueTarget {
             id: id.to_string(),
             agent: "Build".to_string(),
             depth: 0,
@@ -3751,7 +3756,7 @@ mod queued_message_edit_tests {
     fn proto_item_with_target(
         text: &str,
         status: QueueItemStatus,
-        target: crate::daemon::proto::QueueTarget,
+        target: cockpit_core::daemon::proto::QueueTarget,
     ) -> QueueItem {
         QueueItem {
             id: uuid::Uuid::new_v4(),
@@ -3763,7 +3768,11 @@ mod queued_message_edit_tests {
     }
 
     fn proto_item(text: &str, status: QueueItemStatus) -> QueueItem {
-        proto_item_with_target(text, status, crate::daemon::proto::QueueTarget::default())
+        proto_item_with_target(
+            text,
+            status,
+            cockpit_core::daemon::proto::QueueTarget::default(),
+        )
     }
 
     #[test]
@@ -3783,14 +3792,14 @@ mod queued_message_edit_tests {
                     status: QueueItemStatus::Queued,
                     text: older.text,
                     display_text: None,
-                    target: crate::daemon::proto::QueueTarget::default(),
+                    target: cockpit_core::daemon::proto::QueueTarget::default(),
                 },
                 QueueItem {
                     id: newer.id,
                     status: QueueItemStatus::Queued,
                     text: newer.text,
                     display_text: Some("edit @a.rs".to_string()),
-                    target: crate::daemon::proto::QueueTarget::default(),
+                    target: cockpit_core::daemon::proto::QueueTarget::default(),
                 },
             ],
             queue: Vec::new(),
@@ -3855,7 +3864,7 @@ mod queued_message_edit_tests {
                 status: QueueItemStatus::Queued,
                 text: editable.text,
                 display_text: Some("editable @compact".to_string()),
-                target: crate::daemon::proto::QueueTarget::default(),
+                target: cockpit_core::daemon::proto::QueueTarget::default(),
             }],
             queue: Vec::new(),
         });
@@ -4051,7 +4060,7 @@ mod queued_message_edit_tests {
             .push(optimistic_queue_item("local stale".to_string()));
         let daemon_item = proto_item("daemon item", QueueItemStatus::Queued);
 
-        app.apply_event(crate::engine::TurnEvent::QueueUpdated {
+        app.apply_event(cockpit_core::engine::TurnEvent::QueueUpdated {
             queue: vec![queue_item_from_proto(daemon_item)],
         });
 
@@ -4098,14 +4107,14 @@ mod queued_message_edit_tests {
 
 #[cfg(test)]
 mod paste_routing_tests {
-    use crate::db::pins::PinnedMessage;
-    use crate::engine::message::UserSubmission;
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
     use crate::tui::app::{App, Overlay};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
+    use cockpit_core::engine::message::UserSubmission;
+    use cockpit_db::pins::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -4132,7 +4141,7 @@ mod paste_routing_tests {
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
@@ -4209,7 +4218,7 @@ mod paste_routing_tests {
 
         drain_async_actions_until_idle(&mut app).await;
 
-        let expected = PasteRegistry::text_placeholder(1, crate::tokens::count(&pasted));
+        let expected = PasteRegistry::text_placeholder(1, cockpit_core::tokens::count(&pasted));
         assert_eq!(app.composer.text(), expected);
         let block = &app.paste_registry.blocks()[0];
         assert_eq!((block.start, block.end), (0, expected.len()));
@@ -4237,9 +4246,11 @@ mod paste_routing_tests {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         app.agent_runner = Some(Ok(runner_with_input_tx(input_tx)));
         let pasted = long_paste("wire display");
-        let placeholder =
-            app.paste_registry
-                .register_text(0, pasted.clone(), crate::tokens::count(&pasted));
+        let placeholder = app.paste_registry.register_text(
+            0,
+            pasted.clone(),
+            cockpit_core::tokens::count(&pasted),
+        );
         app.composer.insert_str(&placeholder);
 
         let keep_running = app.submit_input();
@@ -4729,8 +4740,8 @@ mod slash_cursor_tests {
 mod chat_scrollback_key_tests {
     use super::super::Selection;
     use super::*;
-    use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
+    use cockpit_core::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crossterm::event::{KeyEventState, KeyModifiers};
     use std::time::Duration;
     use uuid::Uuid;

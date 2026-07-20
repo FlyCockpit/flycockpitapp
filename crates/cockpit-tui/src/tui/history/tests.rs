@@ -132,10 +132,10 @@ fn export_transcript_includes_user_note_in_order() {
 #[test]
 fn export_transcript_includes_interrupt_decision_rows() {
     let history = vec![HistoryEntry::InterruptDecision {
-        decision: crate::daemon::proto::InterruptDecision {
+        decision: cockpit_core::daemon::proto::InterruptDecision {
             permission: false,
             cancelled: true,
-            lines: vec![crate::daemon::proto::InterruptDecisionLine {
+            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
                 prompt: "Proceed?".to_string(),
                 answer: "No".to_string(),
             }],
@@ -152,10 +152,10 @@ fn export_transcript_includes_interrupt_decision_rows() {
 #[test]
 fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
     let entry = HistoryEntry::InterruptDecision {
-        decision: crate::daemon::proto::InterruptDecision {
+        decision: cockpit_core::daemon::proto::InterruptDecision {
             permission: true,
             cancelled: true,
-            lines: vec![crate::daemon::proto::InterruptDecisionLine {
+            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
                 prompt: "Run command?".to_string(),
                 answer: "Allow".to_string(),
             }],
@@ -167,7 +167,7 @@ fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -236,7 +236,7 @@ fn inference_error_collapsed_and_expanded_render_clickable_rows() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -265,7 +265,7 @@ fn inference_error_collapsed_and_expanded_render_clickable_rows() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -289,7 +289,7 @@ fn inference_error_without_detail_expands_to_safe_placeholder() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -327,7 +327,7 @@ fn render_user_note_is_a_distinct_labeled_row() {
         40,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &HashSet::new(),
         0,
@@ -365,7 +365,7 @@ fn plain_and_maintenance_lines_are_indented_and_muted() {
             80,
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
-            crate::config::extended::DiffStyle::default(),
+            cockpit_config::extended::DiffStyle::default(),
             false,
             &HashSet::new(),
             0,
@@ -424,7 +424,7 @@ fn semantic_warning_and_error_colors_are_not_muted() {
             80,
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
-            crate::config::extended::DiffStyle::default(),
+            cockpit_config::extended::DiffStyle::default(),
             false,
             &HashSet::new(),
             0,
@@ -648,7 +648,7 @@ fn failed_user_entry_has_no_chip_target() {
         60,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &HashSet::new(),
         0,
@@ -1183,7 +1183,7 @@ fn external_child_renders_as_mcp_call() {
 
 #[test]
 fn builtin_functions_have_glyph_and_label_entries() {
-    let presentations = crate::mcp::builtin::builtin_presentations();
+    let presentations = cockpit_core::mcp::builtin::builtin_presentations();
     for name in ["rename_session", "request_compact", "context_usage"] {
         let Some((_name, presentation)) = presentations
             .iter()
@@ -1475,7 +1475,7 @@ fn builtin_and_tool_presentation_resolve_through_one_interface() {
         &serde_json::json!({ "command": "cargo test" }),
         None,
     );
-    let not_tool = crate::engine::tool::known_tool_presentation(
+    let not_tool = cockpit_core::engine::tool::known_tool_presentation(
         "rename_session",
         &serde_json::json!({ "name": "Test session" }),
     );
@@ -2110,7 +2110,7 @@ fn compaction_renders_as_tool_call() {
             80,
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
-            crate::config::extended::DiffStyle::default(),
+            cockpit_config::extended::DiffStyle::default(),
             false,
             &no_elided(),
             0,
@@ -2130,7 +2130,7 @@ fn compaction_expand_shows_handoff() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -2160,7 +2160,7 @@ fn backup_warning_renders_yellow() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -2185,7 +2185,7 @@ fn command_error_renders_red() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -2212,7 +2212,7 @@ fn inference_warning_renders_yellow() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -2272,7 +2272,7 @@ fn render_sub(
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -2529,7 +2529,7 @@ fn subagent_batch_label_shows_running_and_done_state() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,
@@ -2562,7 +2562,7 @@ fn subagent_batch_label_shows_running_and_done_state() {
         80,
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &no_elided(),
         0,

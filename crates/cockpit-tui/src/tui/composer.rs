@@ -23,7 +23,7 @@
 //!
 //! Reference implementation: codex's `bottom_pane/textarea.rs`.
 
-pub use crate::welcome::INPUT_PREFIX;
+pub use cockpit_core::welcome::INPUT_PREFIX;
 
 /// Display width of [`INPUT_PREFIX`] in terminal columns. Computed via
 /// `unicode-width` so wider glyphs (CJK, emoji) would size correctly if

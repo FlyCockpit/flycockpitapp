@@ -19,9 +19,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
 use super::shell::{SettingsScrollStates, push_wrapped_text, selected_line_from_marker};
@@ -773,7 +773,7 @@ impl SettingsPage for InstructionsPage {
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › Behavior › Instructions Files",
-            crate::welcome::display_path(&cx.config_path)
+            cockpit_core::welcome::display_path(&cx.config_path)
         )
     }
 
@@ -809,7 +809,7 @@ impl SettingsPage for RedactPatternsPage {
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › Privacy & Safety › Environment File Patterns",
-            crate::welcome::display_path(&cx.config_path)
+            cockpit_core::welcome::display_path(&cx.config_path)
         )
     }
 

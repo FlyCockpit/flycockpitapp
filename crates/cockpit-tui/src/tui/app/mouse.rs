@@ -60,7 +60,7 @@ impl App {
                 .at(mouse.column, mouse.row)
                 .map(|link| link.url.clone())
         {
-            if crate::clipboard::is_ssh() {
+            if cockpit_core::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url) {
                     Ok(_) => self.show_toast("Link copied (SSH session)", ToastKind::Success),
                     Err(error) => {
@@ -332,7 +332,7 @@ impl App {
                     .get(chat_row)
                     .is_some_and(|meta| meta.diff_path.is_some());
             let items = crate::tui::context_menu::ContextMenu::build_items(
-                crate::clipboard::is_ssh(),
+                cockpit_core::sysinfo::is_ssh(),
                 diff_editor,
             );
             self.context_menu = Some(crate::tui::context_menu::ContextMenu {

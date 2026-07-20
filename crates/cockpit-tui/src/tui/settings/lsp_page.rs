@@ -6,8 +6,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use crate::daemon::proto::{LspControlAction, Request};
 use crate::tui::textfield::TextField;
+use cockpit_core::daemon::proto::{LspControlAction, Request};
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{self, marker, muted_style, selected_or_field};
@@ -69,7 +69,7 @@ impl SettingsPage for LspPage {
         let row_count = LSP_SERVER_ROW_START
             + cx.project_context()
                 .project_root()
-                .map(|cwd| crate::daemon::lsp::builtin_server_views(cwd, &cx.extended).len())
+                .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &cx.extended).len())
                 .unwrap_or(1);
         if let Some(edit) = self.editing {
             match key.code {
@@ -234,7 +234,10 @@ impl SettingsPage for LspPage {
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
-        format!("{} › LSP", crate::welcome::display_path(&cx.config_path))
+        format!(
+            "{} › LSP",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
@@ -326,16 +329,16 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
             .render_line(p.cursor == row_index(LspRow::Reset), "restore LSP defaults"),
     ];
     if let Some(cwd) = project_context.project_root() {
-        for (idx, server) in crate::daemon::lsp::builtin_server_views(cwd, &dialog.extended)
+        for (idx, server) in cockpit_core::daemon::lsp::builtin_server_views(cwd, &dialog.extended)
             .into_iter()
             .enumerate()
         {
             let status = match server.status {
-                crate::daemon::lsp::LspServerStatus::Installed => "installed",
-                crate::daemon::lsp::LspServerStatus::Missing => "missing",
-                crate::daemon::lsp::LspServerStatus::Disabled => "disabled",
-                crate::daemon::lsp::LspServerStatus::Broken => "broken",
-                crate::daemon::lsp::LspServerStatus::Installing => "installing",
+                cockpit_core::daemon::lsp::LspServerStatus::Installed => "installed",
+                cockpit_core::daemon::lsp::LspServerStatus::Missing => "missing",
+                cockpit_core::daemon::lsp::LspServerStatus::Disabled => "disabled",
+                cockpit_core::daemon::lsp::LspServerStatus::Broken => "broken",
+                cockpit_core::daemon::lsp::LspServerStatus::Installing => "installing",
             };
             let command = server.command.join(" ");
             let install = server
@@ -416,7 +419,7 @@ fn lsp_edit_row<T: ToString>(
     if p.editing == Some(edit) {
         let selected = idx == p.cursor;
         let text = p.buf.text();
-        let cursor = crate::text::floor_char_boundary(text, p.buf.cursor());
+        let cursor = cockpit_core::text::floor_char_boundary(text, p.buf.cursor());
         let (before, after) = text.split_at(cursor);
         Line::from(vec![
             Span::raw(marker(selected)),
@@ -468,7 +471,7 @@ impl SettingsCx {
         match p.reset.activate() {
             ResetOutcome::Armed => p.status = None,
             ResetOutcome::Apply => {
-                self.extended.lsp = crate::config::extended::LspConfig::default();
+                self.extended.lsp = cockpit_config::extended::LspConfig::default();
                 p.status = save_status(self.save_extended());
             }
         }
@@ -479,7 +482,7 @@ impl SettingsCx {
             p.status = Some(PROJECT_CONTEXT_UNAVAILABLE.to_string());
             return;
         };
-        let Some(server) = crate::daemon::lsp::builtin_server_views(&cwd, &self.extended)
+        let Some(server) = cockpit_core::daemon::lsp::builtin_server_views(&cwd, &self.extended)
             .into_iter()
             .nth(server_idx)
         else {
@@ -516,7 +519,7 @@ pub(super) fn project_context_for_config(
 }
 
 fn project_root_for_project_config(config_path: &Path) -> Option<PathBuf> {
-    if config_path.file_name()? != crate::config::dirs::CONFIG_FILE {
+    if config_path.file_name()? != cockpit_config::dirs::CONFIG_FILE {
         return None;
     }
     let config_dir = config_path.parent()?;

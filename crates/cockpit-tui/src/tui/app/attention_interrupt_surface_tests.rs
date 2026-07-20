@@ -1,8 +1,8 @@
 use super::{App, ToastKind};
-use crate::daemon::proto::{
+use cockpit_core::daemon::proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
 };
-use crate::engine::TurnEvent;
+use cockpit_core::engine::TurnEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use uuid::Uuid;
 

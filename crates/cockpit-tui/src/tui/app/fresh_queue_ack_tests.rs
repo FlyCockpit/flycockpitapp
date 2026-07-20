@@ -1,7 +1,7 @@
 use super::{App, FreshQueueAck};
-use crate::engine::TurnEvent;
-use crate::engine::message::{QueueItemStatus, QueuedUserMessage};
 use crate::tui::history::HistoryEntry;
+use cockpit_core::engine::TurnEvent;
+use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
 fn item(id: u128, text: &str) -> QueuedUserMessage {
     QueuedUserMessage {
@@ -9,7 +9,7 @@ fn item(id: u128, text: &str) -> QueuedUserMessage {
         status: QueueItemStatus::Queued,
         text: text.to_string(),
         display_text: None,
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
     }
 }
 
@@ -17,10 +17,12 @@ fn item(id: u128, text: &str) -> QueuedUserMessage {
 fn foreground_input_target_event_updates_tracked_target() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.foreground_input_target = Some(crate::engine::message::QueueTarget::root("Build"));
+    app.foreground_input_target = Some(cockpit_core::engine::message::QueueTarget::root("Build"));
 
     app.apply_event(TurnEvent::ForegroundInputTarget {
-        target: crate::engine::message::QueueTarget::child("explore", 1, "call-1", "default"),
+        target: cockpit_core::engine::message::QueueTarget::child(
+            "explore", 1, "call-1", "default",
+        ),
     });
     assert_eq!(
         app.foreground_input_target
@@ -36,7 +38,7 @@ fn foreground_input_target_event_updates_tracked_target() {
     );
 
     app.apply_event(TurnEvent::ForegroundInputTarget {
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
     });
     assert_eq!(
         app.foreground_input_target
@@ -89,14 +91,14 @@ fn fresh_queue_ack_does_not_duplicate_optimistic_user_row() {
     app.apply_event(TurnEvent::QueuedUserMessagesFolded {
         text: "fresh hello".to_string(),
         display_text: None,
-        tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "1 line".to_string(),
             ok: true,
         }],
         queue_item_ids: vec![uuid::Uuid::from_u128(1)],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(42),
         preflight_cleaned: None,
     });
@@ -138,7 +140,7 @@ fn fresh_fold_before_queue_ack_still_suppresses_optimistic_row() {
         display_text: Some("fresh race".to_string()),
         tag_expansions: Vec::new(),
         queue_item_ids: vec![id],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(49),
         preflight_cleaned: None,
     });
@@ -167,7 +169,7 @@ fn queued_fold_off_tail_preserves_scroll_position() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(10)],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(70),
         preflight_cleaned: None,
     });
@@ -187,7 +189,7 @@ fn queued_fold_at_tail_stays_live_tail() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(12)],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(72),
         preflight_cleaned: None,
     });
@@ -218,7 +220,7 @@ fn busy_queue_update_still_renders_and_folds_once() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(11)],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(77),
         preflight_cleaned: None,
     });
@@ -239,7 +241,7 @@ fn two_busy_queue_items_fold_once_in_order() {
         display_text: None,
         tag_expansions: Vec::new(),
         queue_item_ids: vec![uuid::Uuid::from_u128(21), uuid::Uuid::from_u128(22)],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(81),
         preflight_cleaned: None,
     });
@@ -269,14 +271,14 @@ fn queued_fold_event_renders_daemon_display_and_tag_metadata() {
     app.apply_event(TurnEvent::QueuedUserMessagesFolded {
         text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
         display_text: Some("queued @src/lib.rs".to_string()),
-        tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             ok: true,
             detail: "1 line".to_string(),
         }],
         queue_item_ids: vec![uuid::Uuid::from_u128(31)],
-        target: crate::engine::message::QueueTarget::root("Build"),
+        target: cockpit_core::engine::message::QueueTarget::root("Build"),
         seq: Some(91),
         preflight_cleaned: None,
     });

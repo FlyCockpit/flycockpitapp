@@ -8,9 +8,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::config::extended::persist_review_default_participants;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_config::extended::persist_review_default_participants;
 use unicode_width::UnicodeWidthStr;
 
 pub const DIALOG_HEIGHT: u16 = 20;
@@ -213,7 +213,7 @@ impl MultireviewDialog {
         cwd: &Path,
         counts: &std::collections::HashMap<String, u64>,
     ) -> Result<Self, String> {
-        let cfg = crate::config::extended::load_for_cwd(cwd);
+        let cfg = cockpit_config::extended::load_for_cwd(cwd);
         let defaults: BTreeSet<String> = cfg.review.default_participants.iter().cloned().collect();
         let mut participants = Vec::new();
         for model in crate::tui::model_picker::ordered_model_choices(cwd, counts)? {
@@ -226,7 +226,7 @@ impl MultireviewDialog {
                 sticky,
             });
         }
-        let harnesses = crate::config::extended::resolve_harnesses(cwd);
+        let harnesses = cockpit_config::extended::resolve_harnesses(cwd);
         let mut names: Vec<String> = harnesses.keys().cloned().collect();
         names.sort();
         for name in names {
@@ -405,9 +405,9 @@ impl MultireviewDialog {
         let mut skipped = Vec::new();
         for row in self.sources.iter().filter(|s| s.selected) {
             let result = match row.label {
-                "Uncommitted changes" => crate::git::review_source_uncommitted(&self.cwd),
-                "Unstaged changes" => crate::git::review_source_unstaged(&self.cwd),
-                "Unpushed changes" => crate::git::review_source_unpushed(&self.cwd),
+                "Uncommitted changes" => cockpit_core::git::review_source_uncommitted(&self.cwd),
+                "Unstaged changes" => cockpit_core::git::review_source_unstaged(&self.cwd),
+                "Unpushed changes" => cockpit_core::git::review_source_unpushed(&self.cwd),
                 "PR" => {
                     let pr = row.pr.as_deref().unwrap_or("").trim();
                     if pr.is_empty() {
@@ -415,7 +415,7 @@ impl MultireviewDialog {
                             "PR source selected but no PR number or URL was entered"
                         ))
                     } else {
-                        crate::git::review_source_pr(&self.cwd, pr)
+                        cockpit_core::git::review_source_pr(&self.cwd, pr)
                     }
                 }
                 _ => continue,

@@ -24,16 +24,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::config::dirs::{
-    COCKPIT_CONFIG_ENV, config_file_paths_for_load, config_write_target_for_provider,
-};
-use crate::config::providers::{
-    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry, ProviderEntry,
-    ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
-};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_config::dirs::{
+    COCKPIT_CONFIG_ENV, config_file_paths_for_load, config_write_target_for_provider,
+};
+use cockpit_config::providers::{
+    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry, ProviderEntry,
+    ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
+};
 use unicode_width::UnicodeWidthStr;
 
 pub const DIALOG_HEIGHT: u16 = 18;
@@ -92,9 +92,9 @@ impl Entry {
 }
 
 fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry) -> Entry {
-    let native_anthropic = crate::config::providers::is_anthropic_native_base_url(&provider.url);
+    let native_anthropic = cockpit_config::providers::is_anthropic_native_base_url(&provider.url);
     let reasoning_effort = if native_anthropic
-        && crate::config::providers::validate_anthropic_model_configuration(provider, &model.id)
+        && cockpit_config::providers::validate_anthropic_model_configuration(provider, &model.id)
             .is_err()
     {
         None
@@ -125,8 +125,8 @@ pub struct ModelChoice {
     pub model_id: String,
     pub label: String,
     pub is_favorite: bool,
-    pub trust: crate::config::providers::ModelTrust,
-    pub mode: crate::config::extended::LlmMode,
+    pub trust: cockpit_config::providers::ModelTrust,
+    pub mode: cockpit_config::extended::LlmMode,
 }
 
 pub fn ordered_model_choices(
@@ -134,7 +134,7 @@ pub fn ordered_model_choices(
     counts: &HashMap<String, u64>,
 ) -> Result<Vec<ModelChoice>, String> {
     ensure_config_reachable(cwd)?;
-    let cfg = crate::secret_ref::load_effective(cwd);
+    let cfg = cockpit_core::secret_ref::load_effective(cwd);
     let mut entries: Vec<Entry> = Vec::new();
     for (pid, entry) in &cfg.providers {
         for model in &entry.models {
@@ -142,7 +142,7 @@ pub fn ordered_model_choices(
         }
     }
     sort_entries(&mut entries, counts);
-    let global_mode = crate::config::extended::load_for_cwd(cwd).llm_mode;
+    let global_mode = cockpit_config::extended::load_for_cwd(cwd).llm_mode;
     Ok(entries
         .into_iter()
         .map(|e| {
@@ -215,7 +215,7 @@ impl ModelPickerDialog {
         now_epoch_secs: i64,
     ) -> Result<Self, String> {
         ensure_config_reachable(cwd)?;
-        let cfg = crate::secret_ref::load_effective(cwd);
+        let cfg = cockpit_core::secret_ref::load_effective(cwd);
 
         let mut entries: Vec<Entry> = Vec::new();
         for (pid, entry) in &cfg.providers {
@@ -860,7 +860,7 @@ fn reasoning_summary(capability: &ReasoningEffortCapability) -> String {
 /// `Err` if there's no active model or no config to write to.
 pub fn toggle_active_favorite(cwd: &Path) -> Result<(bool, String, String), String> {
     ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let mut cfg = crate::secret_ref::load_effective(cwd);
+    let mut cfg = cockpit_core::secret_ref::load_effective(cwd);
     let active = cfg
         .active_model
         .clone()
@@ -897,7 +897,7 @@ pub fn cycle_active_favorite(
     forward: bool,
 ) -> Result<Option<ActiveModelRef>, String> {
     ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let cfg = crate::secret_ref::load_effective(cwd);
+    let cfg = cockpit_core::secret_ref::load_effective(cwd);
     let active = cfg
         .active_model
         .as_ref()
@@ -1045,7 +1045,7 @@ mod tests {
             ],
             default: Some("xhigh".into()),
             request_mapping: Some(
-                crate::config::providers::ReasoningEffortRequestMapping::JsonField {
+                cockpit_config::providers::ReasoningEffortRequestMapping::JsonField {
                     field: "reasoning_effort".into(),
                     values: BTreeMap::from([
                         ("minimal".into(), serde_json::json!("minimal")),
@@ -1053,7 +1053,7 @@ mod tests {
                     ]),
                 },
             ),
-            source: Some(crate::config::providers::CapabilitySource::Live),
+            source: Some(cockpit_config::providers::CapabilitySource::Live),
         }
     }
 
@@ -1062,10 +1062,10 @@ mod tests {
         let model = ModelEntry {
             id: "claude-test".into(),
             thinking_modes: vec![ThinkingMode::High],
-            capabilities: crate::config::providers::ModelCapabilities {
+            capabilities: cockpit_config::providers::ModelCapabilities {
                 max_output_tokens: Some(8_192),
                 reasoning_effort: Some(reasoning_capability()),
-                ..crate::config::providers::ModelCapabilities::default()
+                ..cockpit_config::providers::ModelCapabilities::default()
             },
             ..ModelEntry::default()
         };
@@ -1144,13 +1144,13 @@ mod tests {
     #[test]
     fn picker_annotates_last_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         fs::write(
             provider_path,
@@ -1160,7 +1160,9 @@ mod tests {
         let failures = [(
             ("p".to_string(), "claude".to_string()),
             crate::tui::auth_failure::AuthFailureRecord {
-                kind: crate::daemon::proto::AuthFailureKind::CredentialsRejected { status: 403 },
+                kind: cockpit_core::daemon::proto::AuthFailureKind::CredentialsRejected {
+                    status: 403,
+                },
                 failed_at_epoch_secs: 10_000,
             },
         )]
@@ -1285,7 +1287,7 @@ mod tests {
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         fs::write(
             provider_path,
@@ -1313,7 +1315,7 @@ mod tests {
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         fs::write(
             &provider_path,
@@ -1418,7 +1420,7 @@ mod tests {
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         fs::write(
             provider_path,
@@ -1463,7 +1465,7 @@ mod tests {
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         fs::write(
             provider_path,
@@ -1472,7 +1474,7 @@ mod tests {
         .unwrap();
         let mut fallback = entry("fallback");
         fallback.reasoning_effort = Some(ReasoningEffortCapability {
-            source: Some(crate::config::providers::CapabilitySource::Fallback),
+            source: Some(cockpit_config::providers::CapabilitySource::Fallback),
             ..ReasoningEffortCapability::default()
         });
         let mut d = dialog_with_cwd(tmp.path().to_path_buf(), vec![fallback]);

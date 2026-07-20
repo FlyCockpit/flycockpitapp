@@ -86,7 +86,7 @@ impl App {
                     let rebuilt = crate::tui::paste::PasteRegistry::rebuild_from_editor(
                         &text,
                         &retained_images,
-                        crate::tokens::count,
+                        cockpit_core::tokens::count,
                     );
                     self.composer.set(rebuilt.buffer);
                     self.paste_registry = rebuilt.registry;

@@ -28,7 +28,7 @@ Data flow: web/native → oRPC client (React Query options) → routers in `pack
 
 ### Rust (`apps/cli`, `crates/*`)
 
-`apps/cli` is the Rust `cockpit` AI coding harness binary. It owns CLI argument parsing, subcommand wiring, and terminal host integration; `commands/tui.rs` launches `cockpit_tui::app::App`, the one sanctioned binary-to-UI edge. The ratatui terminal interface, panes, overlays, and clipboard helpers live in `crates/cockpit-tui`. Reusable application logic lives in `crates/cockpit-core`, including daemon, engine, providers, auth, tools, agents, skills, session, redaction, packages, and wizard modules. SQLite storage and migrations live in `crates/cockpit-db`; config types/loading live in `crates/cockpit-config`; daemon protocol types live in `crates/cockpit-proto`.
+`apps/cli` is the Rust `cockpit` AI coding harness binary. It owns CLI argument parsing, subcommand wiring, and terminal host integration; `commands/tui.rs` launches `cockpit_tui::tui::app::App`, the one sanctioned binary-to-UI edge. The ratatui terminal interface, panes, overlays, and clipboard helpers live in `crates/cockpit-tui`. Reusable application logic lives in `crates/cockpit-core`, including daemon, engine, providers, auth, tools, agents, skills, session, redaction, packages, and wizard modules. SQLite storage and migrations live in `crates/cockpit-db`; config types/loading live in `crates/cockpit-config`; daemon protocol types live in `crates/cockpit-proto`.
 
 `apps/relay-rs` is the Rust relay that is replacing `apps/relay`; both relay implementations exist during the transition tracked by the `retire-typescript-relay` prompt. Relay wire types live in `crates/relay-protocol`.
 

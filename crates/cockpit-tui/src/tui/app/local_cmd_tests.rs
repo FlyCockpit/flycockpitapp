@@ -192,7 +192,7 @@ fn external_editor_tempfile_is_owner_only() {
 
 #[test]
 fn parse_sandbox_arg_maps_to_modes_and_network() {
-    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
 
     assert_eq!(parse_sandbox_arg(""), Ok(SandboxCommand::Cycle));
     assert_eq!(parse_sandbox_arg("  "), Ok(SandboxCommand::Cycle));
@@ -250,8 +250,8 @@ fn parse_sandbox_escalation_arg_maps_to_actions() {
 #[test]
 fn next_sandbox_mode_skips_unavailable_container_modes() {
     use super::next_sandbox_mode;
-    use crate::container::{ContainerAvailability, ContainerUnavailableReason};
-    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_core::container::{ContainerAvailability, ContainerUnavailableReason};
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
 
     let unavailable = ContainerAvailability {
         runtime: None,
@@ -269,7 +269,7 @@ fn next_sandbox_mode_skips_unavailable_container_modes() {
     );
 
     let available = ContainerAvailability {
-        runtime: Some(crate::container::ContainerRuntimeKind::Docker),
+        runtime: Some(cockpit_core::container::ContainerRuntimeKind::Docker),
         harness_in_container: false,
         available: true,
         reason: None,
@@ -286,7 +286,7 @@ fn next_sandbox_mode_skips_unavailable_container_modes() {
 
 #[test]
 fn parse_llm_mode_arg_toggle_default_and_aliases() {
-    use crate::config::extended::LlmMode;
+    use cockpit_config::extended::LlmMode;
     // No arg or `toggle` → toggle (None).
     assert_eq!(parse_llm_mode_arg(""), Ok(None));
     assert_eq!(parse_llm_mode_arg("  "), Ok(None));
@@ -310,7 +310,7 @@ fn parse_llm_mode_arg_toggle_default_and_aliases() {
 
 #[test]
 fn cache_break_warning_suppressed_on_no_cache_provider() {
-    use crate::config::providers::{CacheConfig, CacheMode};
+    use cockpit_config::providers::{CacheConfig, CacheMode};
     // No-cache provider → the predicate says it doesn't cache, so the
     // warning is suppressed.
     let none = CacheConfig {
@@ -348,7 +348,7 @@ fn cap_tokens_truncates_large_input() {
     let big = "word ".repeat(5000);
     let capped = cap_tokens(&big, 100);
     assert!(capped.contains("truncated"));
-    assert!(crate::tokens::count(&capped) <= 200);
+    assert!(cockpit_core::tokens::count(&capped) <= 200);
 }
 
 #[test]

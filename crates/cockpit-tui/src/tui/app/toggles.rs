@@ -12,7 +12,7 @@ impl App {
     ) {
         self.send_daemon_request(
             "/toggle-redaction",
-            crate::daemon::proto::Request::SetRedaction {
+            cockpit_core::daemon::proto::Request::SetRedaction {
                 scan_environment,
                 scan_dotenv,
                 scan_ssh_keys,
@@ -26,7 +26,9 @@ impl App {
     /// interrupt) like the `/init` existing-file prompt; the close handler
     /// matches the synthetic interrupt id and applies the selection.
     pub(super) fn open_redaction_toggle_dialog(&mut self) {
-        use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+        use cockpit_core::daemon::proto::{
+            InterruptOption, InterruptQuestion, InterruptQuestionSet,
+        };
         let interrupt_id = uuid::Uuid::new_v4();
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Multi {
@@ -103,11 +105,13 @@ impl App {
     /// interrupt) like the bare `/toggle-redaction` picker; the close handler
     /// matches the synthetic id and routes the selection to the daemon.
     pub(super) fn open_model_comparison_dialog(&mut self) {
-        use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+        use cockpit_core::daemon::proto::{
+            InterruptOption, InterruptQuestion, InterruptQuestionSet,
+        };
 
         // Load configured `(provider, model)` pairs from the effective
         // `config.json` layers; tandem models must have working url/credentials.
-        let cfg = crate::secret_ref::load_effective(&self.launch.cwd);
+        let cfg = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
         if cfg.providers.is_empty() {
             self.push_plain(
                 "/model-comparison: no cockpit config found — run `/settings` to add a provider"
@@ -203,7 +207,7 @@ impl App {
             .collect();
         self.send_daemon_request(
             "/model-comparison",
-            crate::daemon::proto::Request::SetTandemModels { models },
+            cockpit_core::daemon::proto::Request::SetTandemModels { models },
             ControlApplied::None,
         );
     }

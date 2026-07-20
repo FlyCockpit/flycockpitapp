@@ -61,18 +61,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::config::dirs::{
+use crate::tui::textfield::TextField;
+use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
     cwd_scoped_creatable_dirs, discover_config_dirs, scaffold_config_dir,
 };
-use crate::config::extended::{ExtendedConfig, ExtendedConfigDoc};
-use crate::config::providers::{
+use cockpit_config::extended::{ExtendedConfig, ExtendedConfigDoc};
+use cockpit_config::providers::{
     AuthKind, ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig,
 };
-use crate::daemon::proto::Request;
-use crate::providers::models_fetch::FetchOutcome;
-use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_core::daemon::proto::Request;
+use cockpit_core::providers::models_fetch::FetchOutcome;
 use shell::{SettingsScrollStates, marker, muted_style, selected_or_field};
 
 /// Height (in rows) the dialog wants when active.
@@ -81,9 +81,9 @@ pub const DIALOG_HEIGHT: u16 = 20;
 pub enum Dialog {
     None,
     WorkspaceTrust {
-        root: crate::config::trust::TrustRoot,
+        root: cockpit_config::trust::TrustRoot,
         cursor: usize,
-        chosen: Option<crate::db::workspace_trust::WorkspaceTrustMode>,
+        chosen: Option<cockpit_db::workspace_trust::WorkspaceTrustMode>,
     },
     PickConfig {
         dirs: Vec<ConfigDir>,
@@ -114,7 +114,7 @@ pub enum Dialog {
         cwd: PathBuf,
     },
     WizardMenu {
-        wizards: Vec<crate::wizard::WizardDescriptor>,
+        wizards: Vec<cockpit_core::wizard::WizardDescriptor>,
         cursor: usize,
         cwd: PathBuf,
     },
@@ -127,7 +127,7 @@ pub enum Dialog {
 }
 
 pub struct SetupWizardDialog {
-    run: crate::wizard::WizardRun,
+    run: cockpit_core::wizard::WizardRun,
     cursor: usize,
     text: TextField,
     multi: std::collections::BTreeSet<String>,
@@ -146,10 +146,10 @@ pub struct SettingsDialog {
 
 fn setup_wizard_dialog(
     cwd: &std::path::Path,
-    descriptor: crate::wizard::WizardDescriptor,
+    descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
 ) -> Result<Dialog, String> {
-    let run = crate::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
+    let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
     let mut cursor = 0;
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
@@ -384,7 +384,7 @@ pub struct SettingsCx {
     pub(super) back_to_picker: bool,
     /// PATH-presence resolver for harness-preset seeding: returns whether a
     /// harness `command` is installed (found on `PATH`). Defaults to the
-    /// real [`crate::harness::preflight::which_on_path`]; tests inject a
+    /// real [`cockpit_core::harness::preflight::which_on_path`]; tests inject a
     /// stub so seeding doesn't depend on the CI machine's installed tools.
     pub(super) command_installed: fn(&str) -> bool,
     pub(super) env_lookup: fn(&str) -> Option<String>,
@@ -444,10 +444,10 @@ fn lsp_page(page: LspPage) -> PageBox {
     Box::new(page)
 }
 
-#[cfg(test)]
-use crate::daemon::proto::LspControlAction;
 use agents_page::AgentsPage;
 use category::{Category, CategoryPage};
+#[cfg(test)]
+use cockpit_core::daemon::proto::LspControlAction;
 use harnesses_page::HarnessesPage;
 use lsp_page::LspPage;
 #[cfg(test)]
@@ -576,7 +576,10 @@ impl Dialog {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_setup_answer(&self, step_id: &str) -> Option<crate::wizard::WizardAnswer> {
+    pub(crate) fn test_setup_answer(
+        &self,
+        step_id: &str,
+    ) -> Option<cockpit_core::wizard::WizardAnswer> {
         let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
@@ -584,7 +587,7 @@ impl Dialog {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_setup_prefill(&self) -> Option<crate::wizard::WizardAnswer> {
+    pub(crate) fn test_setup_prefill(&self) -> Option<cockpit_core::wizard::WizardAnswer> {
         let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
@@ -610,7 +613,7 @@ impl Dialog {
         }
     }
 
-    pub fn open_workspace_trust(root: crate::config::trust::TrustRoot) -> Self {
+    pub fn open_workspace_trust(root: cockpit_config::trust::TrustRoot) -> Self {
         Dialog::WorkspaceTrust {
             root,
             cursor: 0,
@@ -621,8 +624,8 @@ impl Dialog {
     pub fn take_workspace_trust_choice(
         &mut self,
     ) -> Option<(
-        crate::config::trust::TrustRoot,
-        crate::db::workspace_trust::WorkspaceTrustMode,
+        cockpit_config::trust::TrustRoot,
+        cockpit_db::workspace_trust::WorkspaceTrustMode,
     )> {
         let Dialog::WorkspaceTrust { root, chosen, .. } = self else {
             return None;
@@ -723,7 +726,7 @@ impl Dialog {
 
     pub fn open_setup(cwd: &std::path::Path) -> Self {
         Dialog::WizardMenu {
-            wizards: crate::wizard::registry(),
+            wizards: cockpit_core::wizard::registry(),
             cursor: 0,
             cwd: cwd.to_path_buf(),
         }
@@ -731,9 +734,9 @@ impl Dialog {
 
     pub fn open_setup_wizard(cwd: &std::path::Path, wizard_id: &str) -> Result<Self, String> {
         match wizard_id {
-            crate::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
-            crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID => {
-                let descriptor = crate::commands::setup::descriptor_for_cwd(wizard_id, cwd)
+            cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
+            cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
+                let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, cwd)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
                 setup_wizard_dialog(cwd, descriptor, None)
             }
@@ -748,7 +751,7 @@ impl Dialog {
         status: Option<String>,
     ) -> Result<Self, String> {
         let descriptor =
-            crate::commands::setup::model_descriptor_for_cwd(cwd, Some((provider_id, model_id)));
+            cockpit_core::wizard::model_descriptor_for_cwd(cwd, Some((provider_id, model_id)));
         setup_wizard_dialog(cwd, descriptor, status)
     }
 
@@ -786,7 +789,7 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let cfg = crate::secret_ref::load_effective(cwd);
+        let cfg = cockpit_core::secret_ref::load_effective(cwd);
         let Some(entry) = cfg.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };
@@ -797,10 +800,12 @@ impl Dialog {
         let parent = EditState::new(provider_id.to_string(), entry.clone());
         let oauth_provider = if oauth_expired {
             match entry.effective_template(provider_id) {
-                Some(crate::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
+                Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
                     Some(OAuthProvider::Codex)
                 }
-                Some(crate::auth::xai_oauth::CREDENTIAL_KEY | "grok") => Some(OAuthProvider::Grok),
+                Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok") => {
+                    Some(OAuthProvider::Grok)
+                }
                 _ => None,
             }
         } else {
@@ -1253,7 +1258,7 @@ impl SettingsDialog {
         // editable rows. Materialization-only — an existing config whose
         // `scan_dirs` is absent/empty stays empty (clean break).
         if !extended_path.exists() {
-            extended.skills.scan_dirs = crate::config::extended::SEEDED_SCAN_DIRS
+            extended.skills.scan_dirs = cockpit_config::extended::SEEDED_SCAN_DIRS
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -1272,7 +1277,9 @@ impl SettingsDialog {
                 picker_cwd: None,
                 active_project_root: None,
                 back_to_picker: false,
-                command_installed: |cmd| crate::harness::preflight::which_on_path(cmd).is_some(),
+                command_installed: |cmd| {
+                    cockpit_core::harness::preflight::which_on_path(cmd).is_some()
+                },
                 env_lookup: |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
                 credential_store_path: None,
                 last_secret_notice: None,
@@ -1335,7 +1342,7 @@ impl SettingsDialog {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
         let mut merged = doc.providers();
         merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
-        let notice = crate::secret_ref::protect_literal_headers(
+        let notice = cockpit_core::secret_ref::protect_literal_headers(
             &mut merged.providers,
             self.credential_store_path.as_deref(),
         )
@@ -1358,7 +1365,7 @@ impl SettingsDialog {
             .get(provider_id)
             .into_iter()
             .flat_map(|provider| &provider.headers)
-            .flat_map(|header| crate::envref::referenced_names(&header.value))
+            .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
             .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
             .collect::<std::collections::BTreeSet<_>>();
         let mut credential_refs = self
@@ -1376,7 +1383,7 @@ impl SettingsDialog {
             for name in provider
                 .headers
                 .iter()
-                .flat_map(|header| crate::envref::referenced_names(&header.value))
+                .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
                 .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
             {
                 names.remove(&name);
@@ -1397,8 +1404,8 @@ impl SettingsDialog {
         }
 
         let mut store = match &self.credential_store_path {
-            Some(path) => crate::credentials::CredentialStore::open(path.clone()),
-            None => crate::credentials::CredentialStore::open_default(),
+            Some(path) => cockpit_core::credentials::CredentialStore::open(path.clone()),
+            None => cockpit_core::credentials::CredentialStore::open_default(),
         }
         .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
@@ -1782,7 +1789,7 @@ impl SettingsPage for RootPage {
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
-        crate::welcome::display_path(&cx.config_path)
+        cockpit_core::welcome::display_path(&cx.config_path)
     }
 
     fn help_text(&self, cx: &SettingsCx) -> &'static str {
@@ -1942,7 +1949,7 @@ impl SettingsCx {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
         let mut merged = doc.providers();
         merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
-        let notice = crate::secret_ref::protect_literal_headers(
+        let notice = cockpit_core::secret_ref::protect_literal_headers(
             &mut merged.providers,
             self.credential_store_path.as_deref(),
         )
@@ -1965,7 +1972,7 @@ impl SettingsCx {
             .get(provider_id)
             .into_iter()
             .flat_map(|provider| &provider.headers)
-            .flat_map(|header| crate::envref::referenced_names(&header.value))
+            .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
             .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
             .collect::<std::collections::BTreeSet<_>>();
         let mut credential_refs = self
@@ -1983,7 +1990,7 @@ impl SettingsCx {
             for name in provider
                 .headers
                 .iter()
-                .flat_map(|header| crate::envref::referenced_names(&header.value))
+                .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
                 .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
             {
                 names.remove(&name);
@@ -2004,8 +2011,8 @@ impl SettingsCx {
         }
 
         let mut store = match &self.credential_store_path {
-            Some(path) => crate::credentials::CredentialStore::open(path.clone()),
-            None => crate::credentials::CredentialStore::open_default(),
+            Some(path) => cockpit_core::credentials::CredentialStore::open(path.clone()),
+            None => cockpit_core::credentials::CredentialStore::open_default(),
         }
         .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
@@ -2073,7 +2080,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         return false;
     };
     match step.kind {
-        crate::wizard::StepKind::Select { options } => {
+        cockpit_core::wizard::StepKind::Select { options } => {
             match list_key_action(key, cursor, options.len()) {
                 ListAction::Close => return true,
                 ListAction::Stay => {}
@@ -2085,17 +2092,17 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                         multi,
                         multi_touched,
                         status,
-                        crate::wizard::WizardAnswer::Select(options[index].id.to_string()),
+                        cockpit_core::wizard::WizardAnswer::Select(options[index].id.to_string()),
                     );
                 }
             }
         }
-        crate::wizard::StepKind::Confirm => match key.code {
+        cockpit_core::wizard::StepKind::Confirm => match key.code {
             KeyCode::Esc => return true,
             KeyCode::Enter => {
                 let answer = run
                     .prefill()
-                    .unwrap_or(crate::wizard::WizardAnswer::Confirm(false));
+                    .unwrap_or(cockpit_core::wizard::WizardAnswer::Confirm(false));
                 submit_setup_wizard_answer(run, cursor, text, multi, multi_touched, status, answer);
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => submit_setup_wizard_answer(
@@ -2105,7 +2112,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 multi,
                 multi_touched,
                 status,
-                crate::wizard::WizardAnswer::Confirm(true),
+                cockpit_core::wizard::WizardAnswer::Confirm(true),
             ),
             KeyCode::Char('n') | KeyCode::Char('N') => submit_setup_wizard_answer(
                 run,
@@ -2114,11 +2121,11 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 multi,
                 multi_touched,
                 status,
-                crate::wizard::WizardAnswer::Confirm(false),
+                cockpit_core::wizard::WizardAnswer::Confirm(false),
             ),
             _ => {}
         },
-        crate::wizard::StepKind::Text => match key.code {
+        cockpit_core::wizard::StepKind::Text => match key.code {
             KeyCode::Esc => return true,
             KeyCode::Enter => {
                 submit_setup_wizard_answer(
@@ -2128,14 +2135,14 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                     multi,
                     multi_touched,
                     status,
-                    crate::wizard::WizardAnswer::Text(text.text().to_string()),
+                    cockpit_core::wizard::WizardAnswer::Text(text.text().to_string()),
                 );
             }
             _ => {
                 text.handle_key(key);
             }
         },
-        crate::wizard::StepKind::Info => match key.code {
+        cockpit_core::wizard::StepKind::Info => match key.code {
             KeyCode::Esc => return true,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 submit_setup_wizard_answer(
@@ -2145,14 +2152,14 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                     multi,
                     multi_touched,
                     status,
-                    crate::wizard::WizardAnswer::Acknowledged,
+                    cockpit_core::wizard::WizardAnswer::Acknowledged,
                 );
             }
             _ => {}
         },
-        crate::wizard::StepKind::Action { .. } => {
+        cockpit_core::wizard::StepKind::Action { .. } => {
             if step.id == "security-save" {
-                match crate::commands::setup::apply_security_answers(cwd, run) {
+                match cockpit_core::wizard::apply_security_answers(cwd, run) {
                     Ok(Some(path)) => *status = Some(format!("Saved {}", path.display())),
                     Ok(None) => *status = Some("Security settings unchanged.".to_string()),
                     Err(error) => {
@@ -2161,7 +2168,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                     }
                 }
             } else if step.id == "model-save" {
-                match crate::commands::setup::apply_model_answers(cwd, run) {
+                match cockpit_core::wizard::apply_model_answers(cwd, run) {
                     Ok(Some(path)) => *status = Some(format!("Saved {}", path.display())),
                     Ok(None) => *status = Some("Model settings unchanged.".to_string()),
                     Err(error) => {
@@ -2177,10 +2184,10 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 multi,
                 multi_touched,
                 status,
-                crate::wizard::WizardAnswer::Acknowledged,
+                cockpit_core::wizard::WizardAnswer::Acknowledged,
             );
         }
-        crate::wizard::StepKind::MultiToggle { options } => match key.code {
+        cockpit_core::wizard::StepKind::MultiToggle { options } => match key.code {
             KeyCode::Esc => return true,
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                 *cursor = crate::tui::nav::wrap_prev(*cursor, options.len());
@@ -2191,7 +2198,9 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
             KeyCode::Char(' ') if *cursor < options.len() => {
                 if !*multi_touched {
                     multi.clear();
-                    if let Some(crate::wizard::WizardAnswer::MultiToggle(values)) = run.prefill() {
+                    if let Some(cockpit_core::wizard::WizardAnswer::MultiToggle(values)) =
+                        run.prefill()
+                    {
                         multi.extend(values);
                     }
                     *multi_touched = true;
@@ -2203,29 +2212,30 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let answer = if !*multi_touched
-                    && let Some(crate::wizard::WizardAnswer::MultiToggle(values)) = run.prefill()
+                    && let Some(cockpit_core::wizard::WizardAnswer::MultiToggle(values)) =
+                        run.prefill()
                 {
-                    crate::wizard::WizardAnswer::MultiToggle(values)
+                    cockpit_core::wizard::WizardAnswer::MultiToggle(values)
                 } else {
-                    crate::wizard::WizardAnswer::MultiToggle(multi.iter().cloned().collect())
+                    cockpit_core::wizard::WizardAnswer::MultiToggle(multi.iter().cloned().collect())
                 };
                 submit_setup_wizard_answer(run, cursor, text, multi, multi_touched, status, answer);
             }
             _ => {}
         },
-        crate::wizard::StepKind::Secret => {}
+        cockpit_core::wizard::StepKind::Secret => {}
     }
     false
 }
 
 fn submit_setup_wizard_answer(
-    run: &mut crate::wizard::WizardRun,
+    run: &mut cockpit_core::wizard::WizardRun,
     cursor: &mut usize,
     text: &mut TextField,
     multi: &mut std::collections::BTreeSet<String>,
     multi_touched: &mut bool,
     status: &mut Option<String>,
-    answer: crate::wizard::WizardAnswer,
+    answer: cockpit_core::wizard::WizardAnswer,
 ) {
     match run.submit(answer) {
         Ok(()) => sync_setup_wizard_inputs(run, cursor, text, multi, multi_touched),
@@ -2234,7 +2244,7 @@ fn submit_setup_wizard_answer(
 }
 
 fn sync_setup_wizard_inputs(
-    run: &crate::wizard::WizardRun,
+    run: &cockpit_core::wizard::WizardRun,
     cursor: &mut usize,
     text: &mut TextField,
     multi: &mut std::collections::BTreeSet<String>,
@@ -2247,15 +2257,15 @@ fn sync_setup_wizard_inputs(
         return;
     };
     match step.kind {
-        crate::wizard::StepKind::Text => {
+        cockpit_core::wizard::StepKind::Text => {
             let value = match run.prefill() {
-                Some(crate::wizard::WizardAnswer::Text(value)) => value,
+                Some(cockpit_core::wizard::WizardAnswer::Text(value)) => value,
                 _ => String::new(),
             };
             text.set(value);
         }
-        crate::wizard::StepKind::MultiToggle { .. } => {
-            if let Some(crate::wizard::WizardAnswer::MultiToggle(values)) = run.prefill() {
+        cockpit_core::wizard::StepKind::MultiToggle { .. } => {
+            if let Some(cockpit_core::wizard::WizardAnswer::MultiToggle(values)) = run.prefill() {
                 multi.extend(values);
             }
         }
@@ -2263,14 +2273,14 @@ fn sync_setup_wizard_inputs(
     }
 }
 
-fn setup_wizard_cursor_for_current_prefill(run: &crate::wizard::WizardRun) -> usize {
+fn setup_wizard_cursor_for_current_prefill(run: &cockpit_core::wizard::WizardRun) -> usize {
     let Some(step) = run.current_step() else {
         return 0;
     };
-    let crate::wizard::StepKind::Select { options } = &step.kind else {
+    let cockpit_core::wizard::StepKind::Select { options } = &step.kind else {
         return 0;
     };
-    let Some(crate::wizard::WizardAnswer::Select(value)) = run.prefill() else {
+    let Some(cockpit_core::wizard::WizardAnswer::Select(value)) = run.prefill() else {
         return 0;
     };
     options
@@ -2281,11 +2291,11 @@ fn setup_wizard_cursor_for_current_prefill(run: &crate::wizard::WizardRun) -> us
 
 enum WorkspaceTrustAction {
     Stay,
-    Choose(crate::db::workspace_trust::WorkspaceTrustMode),
+    Choose(cockpit_db::workspace_trust::WorkspaceTrustMode),
 }
 
 fn workspace_trust_key_action(key: KeyEvent, cursor: &mut usize) -> WorkspaceTrustAction {
-    use crate::db::workspace_trust::WorkspaceTrustMode;
+    use cockpit_db::workspace_trust::WorkspaceTrustMode;
     const LEN: usize = 3;
     match key.code {
         KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
@@ -2339,7 +2349,7 @@ fn list_key_action(key: KeyEvent, cursor: &mut usize, len: usize) -> ListAction 
 fn render_workspace_trust(
     frame: &mut Frame,
     area: Rect,
-    root: &crate::config::trust::TrustRoot,
+    root: &cockpit_config::trust::TrustRoot,
     cursor: usize,
 ) {
     let block = Block::default()
@@ -2356,17 +2366,17 @@ fn render_workspace_trust(
         (
             "trust",
             "open and honor project .cockpit config",
-            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
         ),
         (
             "ignore-config",
             "open but ignore project .cockpit config and approvals",
-            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            cockpit_db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         ),
         (
             "untrusted",
             "refuse to open",
-            crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+            cockpit_db::workspace_trust::WorkspaceTrustMode::Untrusted,
         ),
     ];
     let mut lines = vec![
@@ -2421,12 +2431,12 @@ fn render_picker(
     } else {
         let path_w = entries
             .iter()
-            .map(|e| crate::welcome::display_path(&e.path).chars().count())
+            .map(|e| cockpit_core::welcome::display_path(&e.path).chars().count())
             .max()
             .unwrap_or(0);
         for (i, entry) in entries.iter().enumerate() {
             let marker = if i == cursor { "▸ " } else { "  " };
-            let path_str = crate::welcome::display_path(&entry.path);
+            let path_str = cockpit_core::welcome::display_path(&entry.path);
             let kind_str = kind_label(&entry.kind);
             let mut spans: Vec<Span<'static>> = Vec::new();
             spans.push(Span::raw(marker));
@@ -2462,7 +2472,7 @@ fn render_picker(
 fn render_wizard_menu(
     frame: &mut Frame,
     area: Rect,
-    wizards: &[crate::wizard::WizardDescriptor],
+    wizards: &[cockpit_core::wizard::WizardDescriptor],
     cursor: usize,
 ) {
     let block = Block::default()
@@ -2538,7 +2548,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         }
         lines.push(Line::default());
         match &step.kind {
-            crate::wizard::StepKind::Select { options } => {
+            cockpit_core::wizard::StepKind::Select { options } => {
                 for (index, option) in options.iter().enumerate() {
                     let marker = if index == *cursor { "▸ " } else { "  " };
                     let style = if index == *cursor {
@@ -2554,28 +2564,30 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     ]));
                 }
             }
-            crate::wizard::StepKind::Confirm => {
+            cockpit_core::wizard::StepKind::Confirm => {
                 let current = match run.prefill() {
-                    Some(crate::wizard::WizardAnswer::Confirm(true)) => "yes",
+                    Some(cockpit_core::wizard::WizardAnswer::Confirm(true)) => "yes",
                     _ => "no",
                 };
                 lines.push(Line::from(format!("Current/default: {current}")));
             }
-            crate::wizard::StepKind::Text => {
+            cockpit_core::wizard::StepKind::Text => {
                 lines.push(Line::from(format!("Value: {}", text.text())));
             }
-            crate::wizard::StepKind::Info => {
+            cockpit_core::wizard::StepKind::Info => {
                 lines.push(Line::from("Press Enter to continue."));
             }
-            crate::wizard::StepKind::Action { progress } => {
+            cockpit_core::wizard::StepKind::Action { progress } => {
                 lines.push(Line::from(*progress));
             }
-            crate::wizard::StepKind::MultiToggle { options } => {
+            cockpit_core::wizard::StepKind::MultiToggle { options } => {
                 let prefill_values = if *multi_touched {
                     None
                 } else {
                     match run.prefill() {
-                        Some(crate::wizard::WizardAnswer::MultiToggle(values)) => Some(values),
+                        Some(cockpit_core::wizard::WizardAnswer::MultiToggle(values)) => {
+                            Some(values)
+                        }
                         _ => None,
                     }
                 };
@@ -2601,7 +2613,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     ]));
                 }
             }
-            crate::wizard::StepKind::Secret => {
+            cockpit_core::wizard::StepKind::Secret => {
                 lines.push(Line::from("Unsupported setup step."));
             }
         }
@@ -2652,12 +2664,12 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
         .into_iter()
         .rfind(|d| d.kind == ConfigDirKind::Project)
     {
-        return dir.path.join(crate::config::dirs::CONFIG_FILE);
+        return dir.path.join(cockpit_config::dirs::CONFIG_FILE);
     }
     let project = cwd.join(".cockpit");
     // Best-effort scaffold; if it fails the doc loader still writes on save.
     let _ = scaffold_config_dir(&project);
-    project.join(crate::config::dirs::CONFIG_FILE)
+    project.join(cockpit_config::dirs::CONFIG_FILE)
 }
 
 fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {

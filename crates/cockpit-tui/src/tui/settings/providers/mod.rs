@@ -46,23 +46,23 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::auth::{
-    codex_oauth,
-    copilot_setup::{self, Shell as CopilotShell},
-    xai_oauth,
-};
-use crate::config::providers::{
+use crate::tui::textfield::TextField;
+use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_config::providers::{
     HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy, OnUnlistedModelsFetch,
     ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
     merge_fetched_models_with_policy, provider_model_fetch_display_state,
     provider_model_fetch_reason_display, redact_model_fetch_reason,
 };
-use crate::envref;
-use crate::providers::models_fetch::FetchOutcome;
-use crate::providers::{self as templates, ProviderTemplate};
-use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
-use crate::wizard::{WizardAnswer, WizardRun};
+use cockpit_core::auth::{
+    codex_oauth,
+    copilot_setup::{self, Shell as CopilotShell},
+    xai_oauth,
+};
+use cockpit_core::envref;
+use cockpit_core::providers::models_fetch::FetchOutcome;
+use cockpit_core::providers::{self as templates, ProviderTemplate};
+use cockpit_core::wizard::{WizardAnswer, WizardRun};
 
 pub(super) use row_editor::{
     HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
@@ -107,10 +107,10 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
     let registry = templates::ProviderRegistry::standard();
     match registry.provider_id_for(provider_id, entry) {
         "copilot" => actions.push(EditAction::CopilotAuth),
-        crate::auth::xai_oauth::CREDENTIAL_KEY => {
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY => {
             actions.push(EditAction::OAuthAuth(OAuthProvider::Grok))
         }
-        crate::auth::codex_oauth::CREDENTIAL_KEY => {
+        cockpit_core::auth::codex_oauth::CREDENTIAL_KEY => {
             actions.push(EditAction::OAuthAuth(OAuthProvider::Codex))
         }
         _ => {}
@@ -131,9 +131,9 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
 fn provider_settings_summary(entry: &ProviderEntry) -> String {
     let ctx = &entry.context;
     let mode = match entry.mode {
-        Some(crate::config::extended::LlmMode::Defensive) => "defensive",
-        Some(crate::config::extended::LlmMode::Normal) => "normal",
-        Some(crate::config::extended::LlmMode::Frontier) => "frontier",
+        Some(cockpit_config::extended::LlmMode::Defensive) => "defensive",
+        Some(cockpit_config::extended::LlmMode::Normal) => "normal",
+        Some(cockpit_config::extended::LlmMode::Frontier) => "frontier",
         None => "inherit",
     };
     let prune = match entry.auto_prune {
@@ -158,8 +158,8 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
     summary.push_str(&format!(
         " · trust {} · quality {} · cost {} · subagents {}",
         match entry.trust {
-            Some(crate::config::providers::ModelTrust::Trusted) => "trusted",
-            Some(crate::config::providers::ModelTrust::Untrusted) | None => "untrusted",
+            Some(cockpit_config::providers::ModelTrust::Trusted) => "trusted",
+            Some(cockpit_config::providers::ModelTrust::Untrusted) | None => "untrusted",
         },
         entry
             .quality_rank
@@ -334,7 +334,7 @@ fn header_value_is_env_only(value: &str) -> bool {
 }
 
 fn looks_like_literal_secret(value: &str) -> bool {
-    crate::secret_ref::looks_like_literal_secret(value)
+    cockpit_core::secret_ref::looks_like_literal_secret(value)
 }
 
 fn mask_header_value(value: &str) -> String {
@@ -394,7 +394,7 @@ fn utf8_char_len(first: u8) -> usize {
     }
 }
 
-pub(super) fn initial_list_cursor(config: &crate::config::providers::ProvidersConfig) -> usize {
+pub(super) fn initial_list_cursor(config: &cockpit_config::providers::ProvidersConfig) -> usize {
     if config.providers.is_empty() { 0 } else { 1 }
 }
 
@@ -744,7 +744,7 @@ pub(super) enum EditField {
 impl AddState {
     pub(super) fn new() -> Self {
         Self {
-            run: WizardRun::new(crate::wizard::provider_descriptor())
+            run: WizardRun::new(cockpit_core::wizard::provider_descriptor())
                 .expect("built-in provider wizard descriptor is valid"),
             template_cursor: 0,
             template: None,
@@ -789,7 +789,7 @@ fn provider_entry_from_add(
     template: &'static ProviderTemplate,
     headers: Vec<HeaderSpec>,
 ) -> ProviderEntry {
-    crate::wizard::provider_entry_for_template(
+    cockpit_core::wizard::provider_entry_for_template(
         template,
         s.url_field.text().trim_end_matches('/').to_string(),
         headers,
@@ -3425,8 +3425,8 @@ fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
             .map(|name| format!("${name}"))
             .collect::<Vec<_>>();
         let message = if !secret_missing.is_empty() && env_missing.is_empty() {
-            let path = crate::credentials::default_path()
-                .map(|path| crate::welcome::display_path(&path))
+            let path = cockpit_core::credentials::default_path()
+                .map(|path| cockpit_core::welcome::display_path(&path))
                 .unwrap_or_else(|| "the credential store".to_string());
             format!(
                 "  Named secret not detected in {path}: {}",
@@ -3559,16 +3559,16 @@ fn render_model_fetch_status_block(
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let state = provider_model_fetch_display_state(entry);
     let state_style = match state {
-        crate::config::providers::ProviderModelFetchDisplayState::Live => {
+        cockpit_config::providers::ProviderModelFetchDisplayState::Live => {
             Style::default().fg(Color::Green)
         }
-        crate::config::providers::ProviderModelFetchDisplayState::Fallback
-        | crate::config::providers::ProviderModelFetchDisplayState::Preserved
-        | crate::config::providers::ProviderModelFetchDisplayState::Unsupported => {
+        cockpit_config::providers::ProviderModelFetchDisplayState::Fallback
+        | cockpit_config::providers::ProviderModelFetchDisplayState::Preserved
+        | cockpit_config::providers::ProviderModelFetchDisplayState::Unsupported => {
             Style::default().fg(Color::Yellow)
         }
-        crate::config::providers::ProviderModelFetchDisplayState::Failed
-        | crate::config::providers::ProviderModelFetchDisplayState::AuthFailed => {
+        cockpit_config::providers::ProviderModelFetchDisplayState::Failed
+        | cockpit_config::providers::ProviderModelFetchDisplayState::AuthFailed => {
             Style::default().fg(Color::Red)
         }
     };
@@ -3687,7 +3687,7 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
     ];
     if active {
         let text = field.text();
-        let cursor = crate::text::floor_char_boundary(text, field.cursor());
+        let cursor = cockpit_core::text::floor_char_boundary(text, field.cursor());
         let (before, after) = text.split_at(cursor);
         spans.push(Span::styled(before.to_string(), value_style));
         spans.push(super::shell::cursor_marker_span());
@@ -3703,7 +3703,7 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
 /// back to the providers list with an inline status when no model is active
 /// or the active (provider, model) can't be resolved in config.
 pub(super) fn active_model_settings_page(
-    config: &crate::config::providers::ProvidersConfig,
+    config: &cockpit_config::providers::ProvidersConfig,
 ) -> ProvidersPage {
     let no_model = |msg: &str| ProvidersPage::List {
         cursor: initial_list_cursor(config),
@@ -3860,7 +3860,7 @@ impl SettingsPage for ProvidersPage {
         };
         format!(
             "{}{}",
-            crate::welcome::display_path(&cx.config_path),
+            cockpit_core::welcome::display_path(&cx.config_path),
             crumbs
         )
     }

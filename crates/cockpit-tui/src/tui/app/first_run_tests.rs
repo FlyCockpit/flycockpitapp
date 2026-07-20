@@ -1,10 +1,10 @@
 use super::*;
-use crate::config::dirs::test_support::IsolatedCockpitHome;
-use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+use cockpit_config::dirs::test_support::IsolatedCockpitHome;
+use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-fn daemon_paths(tmp: &tempfile::TempDir) -> crate::daemon::DaemonPaths {
-    crate::daemon::DaemonPaths {
+fn daemon_paths(tmp: &tempfile::TempDir) -> cockpit_core::daemon::DaemonPaths {
+    cockpit_core::daemon::DaemonPaths {
         pid_file: tmp.path().join("daemon.pid"),
         socket: tmp.path().join("daemon.sock"),
         ephemeral: false,
@@ -42,9 +42,9 @@ fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
 fn daemon_autostart_ask_shows_modal() {
     let tmp = tempfile::tempdir().unwrap();
     let state = daemon_not_running_state_with_spawn(
-        crate::daemon::DaemonStatus::NotRunning,
+        cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
-        crate::config::extended::DaemonAutostart::Ask,
+        cockpit_config::extended::DaemonAutostart::Ask,
         None,
         false,
         || panic!("ask mode must not spawn"),
@@ -59,9 +59,9 @@ fn daemon_autostart_ask_shows_modal() {
 fn daemon_autostart_failure_falls_back_to_modal() {
     let tmp = tempfile::tempdir().unwrap();
     let state = daemon_not_running_state_with_spawn(
-        crate::daemon::DaemonStatus::NotRunning,
+        cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
-        crate::config::extended::DaemonAutostart::Shared,
+        cockpit_config::extended::DaemonAutostart::Shared,
         None,
         false,
         || anyhow::bail!("boom"),
@@ -75,19 +75,19 @@ fn daemon_autostart_failure_falls_back_to_modal() {
 #[test]
 fn daemon_autostart_notice_shows_once() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = crate::db::Db::open_in_memory().unwrap();
+    let db = cockpit_db::Db::open_in_memory().unwrap();
     let first = daemon_not_running_state_with_spawn(
-        crate::daemon::DaemonStatus::NotRunning,
+        cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
-        crate::config::extended::DaemonAutostart::Private,
+        cockpit_config::extended::DaemonAutostart::Private,
         Some(&db),
         db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).unwrap(),
         || panic!("private mode must not spawn"),
     );
     let second = daemon_not_running_state_with_spawn(
-        crate::daemon::DaemonStatus::NotRunning,
+        cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
-        crate::config::extended::DaemonAutostart::Private,
+        cockpit_config::extended::DaemonAutostart::Private,
         Some(&db),
         db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).unwrap(),
         || panic!("private mode must not spawn"),
@@ -105,7 +105,7 @@ fn first_run_chains_provider_then_model() {
     let mut app = App::new_with_db(
         Some(tmp.path()),
         false,
-        crate::db::Db::open_in_memory().unwrap(),
+        cockpit_db::Db::open_in_memory().unwrap(),
     );
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
@@ -116,21 +116,23 @@ fn first_run_chains_provider_then_model() {
 
     assert_eq!(
         app.dialog.test_page_name(),
-        Some(crate::wizard::MODEL_WIZARD_ID)
+        Some(cockpit_core::wizard::MODEL_WIZARD_ID)
     );
     assert_eq!(
         app.dialog.test_setup_prefill(),
-        Some(crate::wizard::WizardAnswer::Select("p".to_string()))
+        Some(cockpit_core::wizard::WizardAnswer::Select("p".to_string()))
     );
     app.dialog
         .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         app.dialog.test_setup_answer("provider"),
-        Some(crate::wizard::WizardAnswer::Select("p".to_string()))
+        Some(cockpit_core::wizard::WizardAnswer::Select("p".to_string()))
     );
     assert_eq!(
         app.dialog.test_setup_prefill(),
-        Some(crate::wizard::WizardAnswer::Select("p:m".to_string()))
+        Some(cockpit_core::wizard::WizardAnswer::Select(
+            "p:m".to_string()
+        ))
     );
 }
 
@@ -142,7 +144,7 @@ fn no_model_send_opens_wizard_preserves_input() {
     let mut app = App::new_with_db(
         Some(tmp.path()),
         false,
-        crate::db::Db::open_in_memory().unwrap(),
+        cockpit_db::Db::open_in_memory().unwrap(),
     );
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
@@ -161,8 +163,8 @@ fn trust_dialog_persists_decision() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = IsolatedCockpitHome::new(tmp.path());
     write_raw_config(tmp.path(), r#"{"daemon":{"autostart":"ask"}}"#);
-    let db = crate::db::Db::open_in_memory().unwrap();
-    let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();
+    let db = cockpit_db::Db::open_in_memory().unwrap();
+    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
     let mut app = App::new_with_db_and_workspace_trust(
         Some(tmp.path()),
         false,
@@ -173,7 +175,7 @@ fn trust_dialog_persists_decision() {
     assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
     assert!(!app.apply_workspace_trust_choice(
         root.clone(),
-        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        cockpit_db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
     ));
 
     let decision = db
@@ -182,7 +184,7 @@ fn trust_dialog_persists_decision() {
         .expect("trust decision persisted");
     assert_eq!(
         decision.mode,
-        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        cockpit_db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
     );
-    crate::config::trust::clear_runtime_policy_for_tests();
+    cockpit_config::trust::clear_runtime_policy_for_tests();
 }

@@ -1,6 +1,6 @@
 use super::App;
-use crate::engine::TurnEvent;
 use crate::tui::history::HistoryEntry;
+use cockpit_core::engine::TurnEvent;
 
 /// Push the optimistic user row exactly as `submit_input` does on a fresh
 /// send: original text, no cleaned form, no indicator, unstamped `seq`.
@@ -82,9 +82,9 @@ fn persist_failure_clears_busy_marks_user_row_and_shows_error_line() {
             .find(|entry| matches!(entry, HistoryEntry::User { .. }))
             .unwrap(),
         60,
-        crate::config::extended::ThinkingDisplay::Condensed,
+        cockpit_config::extended::ThinkingDisplay::Condensed,
         crate::tui::history::MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &std::collections::HashSet::new(),
         0,
@@ -152,9 +152,9 @@ fn rewritten_flow_shows_indicator_then_replaces_with_chip_and_reveals_original()
     let r = crate::tui::history::render_entry(
         app.history.last().unwrap(),
         60,
-        crate::config::extended::ThinkingDisplay::Condensed,
+        cockpit_config::extended::ThinkingDisplay::Condensed,
         crate::tui::history::MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &std::collections::HashSet::new(),
         // Past one cycle so a dot is present.
@@ -194,9 +194,9 @@ fn rewritten_flow_shows_indicator_then_replaces_with_chip_and_reveals_original()
     let r = crate::tui::history::render_entry(
         app.history.last().unwrap(),
         60,
-        crate::config::extended::ThinkingDisplay::Condensed,
+        cockpit_config::extended::ThinkingDisplay::Condensed,
         crate::tui::history::MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &std::collections::HashSet::new(),
         0,
@@ -218,9 +218,9 @@ fn rewritten_flow_shows_indicator_then_replaces_with_chip_and_reveals_original()
     let r = crate::tui::history::render_entry(
         app.history.last().unwrap(),
         60,
-        crate::config::extended::ThinkingDisplay::Condensed,
+        cockpit_config::extended::ThinkingDisplay::Condensed,
         crate::tui::history::MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &std::collections::HashSet::new(),
         0,
@@ -264,9 +264,9 @@ fn skipped_message_shows_instantly_with_no_indicator_and_is_never_rewritten() {
     let r = crate::tui::history::render_entry(
         app.history.last().unwrap(),
         60,
-        crate::config::extended::ThinkingDisplay::Condensed,
+        cockpit_config::extended::ThinkingDisplay::Condensed,
         crate::tui::history::MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &std::collections::HashSet::new(),
         400,

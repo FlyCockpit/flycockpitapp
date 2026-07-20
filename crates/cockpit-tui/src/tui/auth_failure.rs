@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
-use crate::daemon::proto::AuthFailureKind;
+use cockpit_core::daemon::proto::AuthFailureKind;
 
 pub type AuthFailureAnnotations = HashMap<(String, String), AuthFailureRecord>;
 
@@ -63,12 +63,12 @@ pub fn notice_text(notice: &AuthFailureNotice, mouse: bool) -> String {
 /// Secret-safe, process-local fingerprint of the auth inputs for one provider.
 /// Only the hash is retained; credential contents never enter TUI state.
 pub fn provider_auth_fingerprint(cwd: &Path, provider_id: &str) -> u64 {
-    let config = crate::secret_ref::load_effective(cwd);
+    let config = cockpit_core::secret_ref::load_effective(cwd);
     let entry = config.providers.get(provider_id);
     let credential_ref = entry
         .and_then(|entry| entry.credential_ref.as_deref())
         .unwrap_or(provider_id);
-    let credential = crate::credentials::default_path()
+    let credential = cockpit_core::credentials::default_path()
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| value.get(credential_ref).cloned());

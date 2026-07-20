@@ -8,11 +8,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::config::extended::{ToolCommandTemplate, WebProvider as ConfigWebProvider};
-use crate::credentials::CredentialStore;
-use crate::tools::custom_templates::{builtin_tool_names, default_template_for};
 use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
+use cockpit_config::extended::{ToolCommandTemplate, WebProvider as ConfigWebProvider};
+use cockpit_core::credentials::CredentialStore;
+use cockpit_core::tools::custom_templates::{builtin_tool_names, default_template_for};
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
@@ -947,7 +947,10 @@ impl SettingsPage for ToolsPage {
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
-        format!("{} › Tools", crate::welcome::display_path(&cx.config_path))
+        format!(
+            "{} › Tools",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {

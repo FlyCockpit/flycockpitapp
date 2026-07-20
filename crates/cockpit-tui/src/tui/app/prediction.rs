@@ -12,7 +12,7 @@ impl App {
     /// Consecutive user messages (e.g. queued + folded) flatten into the
     /// most recent open turn's user text so the turn count stays faithful.
     /// `engine::predict::last_turns` then keeps only the last 3.
-    pub(super) fn prediction_turns(&self) -> Vec<crate::engine::predict::PredictionTurn> {
+    pub(super) fn prediction_turns(&self) -> Vec<cockpit_core::engine::predict::PredictionTurn> {
         turns_from_history(&self.history)
     }
 
@@ -39,10 +39,11 @@ impl App {
         let cwd = self.launch.cwd.clone();
         let slot = Arc::clone(&self.prediction_result);
         tokio::spawn(async move {
-            let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
+            let (extended, providers) = cockpit_core::auto_title::load_configs_for(&cwd);
             // Build the same non-bypassable redaction table the driver uses
             // (GOALS §7) so the prediction prompt is scrubbed before send.
-            let redactor = match crate::redact::RedactionTable::build(&extended.redact, &cwd) {
+            let redactor = match cockpit_core::redact::RedactionTable::build(&extended.redact, &cwd)
+            {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
                     tracing::debug!(error = %e, "predict: redaction table build failed; no ghost");
@@ -50,7 +51,7 @@ impl App {
                 }
             };
             let trusted_only = Arc::new(std::sync::atomic::AtomicBool::new(extended.trusted_only));
-            let text = crate::engine::predict::predict(
+            let text = cockpit_core::engine::predict::predict(
                 &turns,
                 mode,
                 &extended,
@@ -80,7 +81,7 @@ impl App {
         };
         let long_mode = matches!(
             self.predict_setting,
-            crate::config::extended::PredictNextMessage::Long
+            cockpit_config::extended::PredictNextMessage::Long
         );
         self.prediction_state
             .on_result(turn_id, text, long_mode, self.composer.is_empty());

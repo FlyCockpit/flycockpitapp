@@ -2,12 +2,12 @@ use super::{
     App, FooterAgentPicker, FooterHitArea, FooterModePicker, FooterPickerKind, FooterPickerRowHit,
     HistoryEntry, Overlay,
 };
-use crate::config::extended::LlmMode;
-use crate::daemon::proto::Request;
-use crate::engine::message::UserSubmission;
-use crate::engine::{ControlRequestId, ControlRequestOutcome, TurnEvent};
 use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
 use crate::tui::settings::Dialog;
+use cockpit_config::extended::LlmMode;
+use cockpit_core::daemon::proto::Request;
+use cockpit_core::engine::message::UserSubmission;
+use cockpit_core::engine::{ControlRequestId, ControlRequestOutcome, TurnEvent};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -57,7 +57,7 @@ fn runner_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> AgentRunn
         active_agent: Arc::new(Mutex::new("Build".to_string())),
         active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
         skill_inventory_names: Arc::new(Mutex::new(None)),
-        foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id: uuid::Uuid::new_v4(),
         short_id: "abc123".to_string(),
@@ -88,7 +88,7 @@ fn write_model_config(root: &std::path::Path) {
     let config_path = cockpit.join("config.json");
     fs::write(&config_path, "{}").unwrap();
     let provider_path =
-        crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
     fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
     fs::write(
         provider_path,
@@ -107,7 +107,7 @@ fn write_favorite_model_config(root: &std::path::Path) {
     )
     .unwrap();
     let provider_path =
-        crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
     fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
     fs::write(
         provider_path,
@@ -129,7 +129,7 @@ fn plain_lines(app: &App) -> Vec<&str> {
 #[test]
 fn footer_enter_opens_selector_for_each_axis() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_model_config(tmp.path());
     let mut app = app(&tmp);
 
@@ -152,7 +152,7 @@ fn footer_enter_opens_selector_for_each_axis() {
 #[test]
 fn quick_dialog_space_stages_without_daemon_request_enter_commits() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_favorite_model_config(tmp.path());
     let (mut app, mut rx) = app_with_runner(&tmp);
     let config_path = tmp.path().join(".cockpit").join("config.json");
@@ -181,7 +181,7 @@ fn quick_dialog_space_stages_without_daemon_request_enter_commits() {
     );
     match rx.try_recv().expect("quick commit sends a request").request {
         Request::SetSessionLlmMode { mode } => {
-            assert_eq!(mode, crate::config::extended::LlmMode::Normal);
+            assert_eq!(mode, cockpit_config::extended::LlmMode::Normal);
         }
         other => panic!("expected session-only LLM mode request, got {other:?}"),
     }

@@ -6,12 +6,12 @@
 //! (+ overridden) status, and its **effective model** (the frontmatter
 //! `model:` in canonical `provider/model` slash form, or the session
 //! default). The docs pipeline is deliberately absent: it is a fixed
-//! two-stage internal pipeline, never a user-editable [`crate::agents::AgentDef`].
+//! two-stage internal pipeline, never a user-editable [`cockpit_core::agents::AgentDef`].
 //!
 //! Actions:
 //!   - `enter` / `e` — **edit** the highlighted agent's on-disk
 //!     `.cockpit/agents/<name>.md`. A non-overridden built-in is
-//!     auto-ejected first (existing [`crate::agents::eject_builtin`] path).
+//!     auto-ejected first (existing [`cockpit_core::agents::eject_builtin`] path).
 //!     The editor is chosen by precedence: `$EDITOR` (external, the event
 //!     loop suspends/restores the TUI) → in-TUI vim editor (when vim mode
 //!     is on) → in-TUI plain editor. On return the file is re-read from
@@ -35,8 +35,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::agents::{AgentKind, AgentListing, is_builtin_agent, list_all};
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_core::agents::{AgentKind, AgentListing, is_builtin_agent, list_all};
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
@@ -256,7 +256,7 @@ impl SettingsCx {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     p.confirm_reset = false;
                     let cwd = self.agents_cwd();
-                    match crate::agents::reset_all_builtins(&cwd) {
+                    match cockpit_core::agents::reset_all_builtins(&cwd) {
                         Ok(removed) => {
                             p.status = Some(format!(
                                 "reset {} built-in override(s) to default",
@@ -366,12 +366,12 @@ impl SettingsCx {
             // returning the existing path; otherwise it writes the embedded
             // default to this layer's `.cockpit/agents/<name>.md`.
             let config_dir = self.agents_config_dir();
-            let (path, _newly) = crate::agents::eject_builtin(cwd, &config_dir, name)?;
+            let (path, _newly) = cockpit_core::agents::eject_builtin(cwd, &config_dir, name)?;
             Ok(path)
         } else {
             // Custom agent — edit its existing file in whatever layer it
             // resolves from.
-            crate::agents::find_override(cwd, name)
+            cockpit_core::agents::find_override(cwd, name)
                 .ok_or_else(|| anyhow::anyhow!("custom agent `{name}` has no on-disk file"))
         }
     }
@@ -394,7 +394,7 @@ impl SettingsCx {
             return;
         }
         let cwd = self.agents_cwd();
-        match crate::agents::find_override(&cwd, &name) {
+        match cockpit_core::agents::find_override(&cwd, &name) {
             Some(path) => match std::fs::remove_file(&path) {
                 Ok(()) => p.status = Some(format!("deleted custom agent `{name}`")),
                 Err(e) => p.status = Some(format!("delete failed: {e}")),
@@ -425,7 +425,7 @@ impl SettingsCx {
             return;
         }
         let cwd = self.agents_cwd();
-        match crate::agents::find_override(&cwd, &name) {
+        match cockpit_core::agents::find_override(&cwd, &name) {
             Some(path) => match std::fs::remove_file(&path) {
                 Ok(()) => p.status = Some(format!("reset `{name}` to default")),
                 Err(e) => p.status = Some(format!("reset failed: {e}")),
@@ -706,7 +706,7 @@ mod tests {
         .unwrap();
         // Vim mode off → the in-TUI editor types chars directly.
         let mut d = agents_dialog(&tmp);
-        d.extended.tui.vim_mode = crate::config::extended::VimModeSetting::Disabled;
+        d.extended.tui.vim_mode = cockpit_config::extended::VimModeSetting::Disabled;
         focus(&mut d, "mine");
         d.handle_key(press(KeyCode::Enter));
         assert!(page(&d).editing.is_some());
@@ -744,7 +744,7 @@ mod tests {
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
-        d.extended.tui.vim_mode = crate::config::extended::VimModeSetting::Disabled;
+        d.extended.tui.vim_mode = cockpit_config::extended::VimModeSetting::Disabled;
         focus(&mut d, "mine");
         d.handle_key(press(KeyCode::Enter));
         // Type a body-only document (no frontmatter) so the saved file fails
@@ -950,7 +950,10 @@ impl SettingsPage for AgentsPage {
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
-        format!("{} › Agents", crate::welcome::display_path(&cx.config_path))
+        format!(
+            "{} › Agents",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {

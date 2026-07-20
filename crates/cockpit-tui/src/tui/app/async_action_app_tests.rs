@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 fn configured_app(tmp: &tempfile::TempDir) -> App {
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     fs::write(cockpit.join("config.json"), "{}").unwrap();
@@ -159,9 +159,9 @@ async fn display_daemon_probe_dedupes_and_does_not_block_input() {
 
     app.start_display_daemon_probe_action(move || {
         release_rx.recv().unwrap();
-        crate::daemon::DaemonStatus::Stale
+        cockpit_core::daemon::DaemonStatus::Stale
     });
-    app.start_display_daemon_probe_action(|| crate::daemon::DaemonStatus::Running);
+    app.start_display_daemon_probe_action(|| cockpit_core::daemon::DaemonStatus::Running);
 
     assert_eq!(app.async_actions.pending_count(), 1);
     app.composer.insert_char('p');
@@ -178,7 +178,7 @@ async fn stale_display_daemon_probe_result_is_ignored_after_context_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
 
-    app.start_display_daemon_probe_action(|| crate::daemon::DaemonStatus::Running);
+    app.start_display_daemon_probe_action(|| cockpit_core::daemon::DaemonStatus::Running);
     app.launch.cwd = tmp.path().join("different-root");
     drain_until_idle(&mut app).await;
 
@@ -190,7 +190,7 @@ async fn display_daemon_probe_non_running_status_degrades_quietly() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
 
-    app.start_display_daemon_probe_action(|| crate::daemon::DaemonStatus::Stale);
+    app.start_display_daemon_probe_action(|| cockpit_core::daemon::DaemonStatus::Stale);
     drain_until_idle(&mut app).await;
 
     assert!(app.agent_runner.is_none());

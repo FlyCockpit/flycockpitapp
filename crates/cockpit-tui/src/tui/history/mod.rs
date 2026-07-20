@@ -17,8 +17,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::extended::ThinkingDisplay;
-use crate::engine::tool::ToolPresentation;
 use crate::tui::markdown;
 #[cfg(test)]
 use crate::tui::message_block::wrap_lines_to_width_reserving_first;
@@ -30,6 +28,8 @@ use crate::tui::theme::{
     ERROR_TEXT, INFO_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE,
     SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
 };
+use cockpit_config::extended::ThinkingDisplay;
+use cockpit_core::engine::tool::ToolPresentation;
 
 mod pending;
 mod scroll;
@@ -112,7 +112,7 @@ pub enum HistoryEntry {
     /// maintenance so dismissed decisions can be styled from the wire
     /// `cancelled` flag instead of string-matching the answer.
     InterruptDecision {
-        decision: crate::daemon::proto::InterruptDecision,
+        decision: cockpit_core::daemon::proto::InterruptDecision,
     },
     /// A user-authored session-history note (`/note <text>`,
     /// implementation note). Rendered as a DISTINCT "note to
@@ -916,7 +916,7 @@ pub fn render_entry(
     width: u16,
     thinking: ThinkingDisplay,
     md: MarkdownOpts,
-    diff_style: crate::config::extended::DiffStyle,
+    diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
     elided: &HashSet<String>,
     preflight_dots_ms: u128,
@@ -1705,7 +1705,7 @@ fn render_user_markdown(
 }
 
 fn render_interrupt_decision(
-    decision: &crate::daemon::proto::InterruptDecision,
+    decision: &cockpit_core::daemon::proto::InterruptDecision,
 ) -> Vec<Line<'static>> {
     let prefix = if decision.permission {
         "approval"
@@ -2492,14 +2492,14 @@ pub fn resolve_tool_presentation(
 ) -> ToolPresentation {
     if let Some(meta) = mcp_child {
         if meta.builtin == Some(true)
-            && meta.server.as_deref() == Some(crate::mcp::builtin::BUILTIN_SERVER_ID)
-            && let Some(presentation) = crate::mcp::builtin::presentation(tool, args)
+            && meta.server.as_deref() == Some(cockpit_core::mcp::builtin::BUILTIN_SERVER_ID)
+            && let Some(presentation) = cockpit_core::mcp::builtin::presentation(tool, args)
         {
             return presentation;
         }
         return mcp_child_presentation(tool, args, meta);
     }
-    crate::engine::tool::known_tool_presentation(tool, args)
+    cockpit_core::engine::tool::known_tool_presentation(tool, args)
 }
 
 fn mcp_child_presentation(
@@ -2513,7 +2513,7 @@ fn mcp_child_presentation(
         .filter(|server| !server.is_empty())
         .map(|server| format!("{server}.{tool}"))
         .unwrap_or_else(|| tool.to_string());
-    let (args_summary, args_full) = crate::engine::tool::readable_args(
+    let (args_summary, args_full) = cockpit_core::engine::tool::readable_args(
         args.get("args")
             .filter(|_| meta.kind.as_deref() == Some("invoke"))
             .unwrap_or(args),
@@ -3344,10 +3344,10 @@ pub fn route_text_delta(
 ) -> bool {
     // Single source of truth: the streaming split and the engine's
     // finalization split drive the SAME state machine
-    // (`crate::engine::think`), so the displayed body, the stored text,
+    // (`cockpit_core::engine::think`), so the displayed body, the stored text,
     // and the rebuilt model history can never disagree. We adapt the
     // splitter's state to/from `PendingMsg`'s two flat fields here.
-    let mut splitter = crate::engine::think::ThinkSplitter::from_parts(
+    let mut splitter = cockpit_core::engine::think::ThinkSplitter::from_parts(
         *inside_think,
         *body_started,
         std::mem::take(tag_partial),

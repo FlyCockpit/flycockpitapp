@@ -23,15 +23,15 @@ use uuid::Uuid;
 
 use crate::tui::settings::secret_display::mask_value;
 
-use crate::daemon::proto::{
-    CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
-    SandboxEscalation,
-};
 use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page, PageKind};
 use crate::tui::geometry::{MIN_HISTORY_HEIGHT, STATUS_HEIGHT};
 use crate::tui::keys_overlay::{DialogBindingId, dialog_binding, dialog_footer_bindings};
 use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use cockpit_core::daemon::proto::{
+    CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
+    SandboxEscalation,
+};
 
 /// Codex-style cap on visible option rows. Longer lists scroll, keeping
 /// the focused row in view, instead of clipping.
@@ -2549,7 +2549,7 @@ mod tests {
 
     // ---- bash command-detail block --------------------------------------
 
-    use crate::daemon::proto::{CharSpan, CommandDetail};
+    use cockpit_core::daemon::proto::{CharSpan, CommandDetail};
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -2686,7 +2686,7 @@ mod tests {
         let mut detail = base_command_detail();
         detail.cwd = Some("/workspace/project".into());
         detail.remembered_key = Some("echo hi".into());
-        detail.write_content = Some(crate::daemon::proto::WriteContentPreview {
+        detail.write_content = Some(cockpit_core::daemon::proto::WriteContentPreview {
             content: "safe\x1b[2Jbell\x07del\x7f\nnext".into(),
             dynamic: false,
         });

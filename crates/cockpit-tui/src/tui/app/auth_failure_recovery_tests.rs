@@ -3,8 +3,8 @@ use std::fs;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Overlay};
-use crate::daemon::proto::AuthFailureKind;
-use crate::engine::TurnEvent;
+use cockpit_core::daemon::proto::AuthFailureKind;
+use cockpit_core::engine::TurnEvent;
 
 fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
     let cockpit = root.join(".cockpit");
@@ -12,7 +12,7 @@ fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
     let config_path = cockpit.join("config.json");
     fs::write(&config_path, "{}").unwrap();
     let provider_path =
-        crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
     fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
     let mut provider = serde_json::json!({
         "url": url,
@@ -38,7 +38,7 @@ fn auth_event(kind: AuthFailureKind) -> TurnEvent {
 fn write_auth_header(root: &std::path::Path, value: &str) {
     let config_path = root.join(".cockpit/config.json");
     let provider_path =
-        crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
     let provider = serde_json::json!({
         "url": "https://example.test/v1",
         "headers": [{"name": "Authorization", "value": value}],
@@ -50,7 +50,7 @@ fn write_auth_header(root: &std::path::Path, value: &str) {
 #[test]
 fn auth_failure_notice_actions() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
@@ -73,7 +73,7 @@ fn auth_failure_notice_actions() {
 #[test]
 fn annotation_cleared_on_success() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
     let mut app = App::new(Some(tmp.path()), false);
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
@@ -92,7 +92,7 @@ fn annotation_cleared_on_success() {
 #[test]
 fn nested_subagent_auth_recovery_updates_when_pane_is_not_active() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
     let mut app = App::new(Some(tmp.path()), false);
 
@@ -123,7 +123,7 @@ fn nested_subagent_auth_recovery_updates_when_pane_is_not_active() {
 #[test]
 fn annotation_cleared_on_credential_change() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
     write_auth_header(tmp.path(), "Bearer old-secret");
     let mut app = App::new(Some(tmp.path()), false);
@@ -140,7 +140,7 @@ fn annotation_cleared_on_credential_change() {
 #[test]
 fn oauth_expired_notice_deep_links() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     write_provider(
         tmp.path(),
         Some("codex"),
@@ -159,7 +159,7 @@ fn oauth_expired_notice_deep_links() {
 #[test]
 fn auth_failure_annotations_start_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let app = App::new(Some(tmp.path()), false);
     assert!(app.auth_failure_annotations.is_empty());
     assert!(app.auth_failure_notice.is_none());

@@ -1,6 +1,6 @@
 use super::App;
-use crate::engine::TurnEvent;
 use crate::tui::history::HistoryEntry;
+use cockpit_core::engine::TurnEvent;
 
 /// Push the optimistic user row exactly as a fresh send does: original
 /// text, no cleaned form, unstamped `seq` (the auto-inject events arrive
@@ -21,9 +21,9 @@ fn render(entry: &HistoryEntry) -> crate::tui::history::Rendered {
     crate::tui::history::render_entry(
         entry,
         80,
-        crate::config::extended::ThinkingDisplay::Condensed,
+        cockpit_config::extended::ThinkingDisplay::Condensed,
         crate::tui::history::MarkdownOpts::default(),
-        crate::config::extended::DiffStyle::default(),
+        cockpit_config::extended::DiffStyle::default(),
         false,
         &std::collections::HashSet::new(),
         0,

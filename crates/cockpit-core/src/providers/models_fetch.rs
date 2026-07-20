@@ -1352,6 +1352,29 @@ fn push_missing(dst: &mut Vec<String>, src: &[String]) {
     }
 }
 
+/// Write a fetched model list back to the most specific writable config
+/// layer for `provider_id`. The terminating step of every `/fetch-models`
+/// flow, shared by the `cockpit fetch-models` subcommand and the TUI's
+/// background model refresh.
+pub fn persist_provider(
+    cwd: &std::path::Path,
+    provider_id: &str,
+    entry: ProviderEntry,
+) -> Result<()> {
+    let path = crate::config::dirs::config_write_target_for_provider(cwd, provider_id).ok_or_else(
+        || anyhow!("no cockpit config found — run `/settings` inside the TUI to create one"),
+    )?;
+    let mut doc = crate::config::providers::ConfigDoc::load(&path)?;
+    doc.write_provider_models(
+        provider_id,
+        &entry.models,
+        entry.models_fetched_at,
+        entry.model_catalog,
+        entry.last_model_fetch,
+    )
+    .context("writing config.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

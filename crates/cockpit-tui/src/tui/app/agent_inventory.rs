@@ -7,8 +7,8 @@ impl App {
                 return;
             };
             (
-                crate::sync::lock_or_recover(&runner.active_agent).clone(),
-                crate::sync::lock_or_recover(&runner.active_agent_path).clone(),
+                cockpit_core::sync::lock_or_recover(&runner.active_agent).clone(),
+                cockpit_core::sync::lock_or_recover(&runner.active_agent_path).clone(),
             )
         };
         let mut changed = false;
@@ -28,21 +28,21 @@ impl App {
     /// the daemon publishes names filtered against the exact live toolbox;
     /// before that point discovery uses the agent definition as a best-effort
     /// startup approximation.
-    pub(super) fn visible_skills(&self) -> Vec<crate::skills::Skill> {
-        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
+    pub(super) fn visible_skills(&self) -> Vec<cockpit_core::skills::Skill> {
+        let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
         let exact_names = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
             .and_then(|runner| runner.skill_inventory_names.lock().unwrap().clone());
         if let Some(exact_names) = exact_names {
-            crate::skills::discover(&self.launch.cwd, &extended.skills)
+            cockpit_core::skills::discover(&self.launch.cwd, &extended.skills)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|skill| exact_names.contains(&skill.frontmatter.name))
                 .collect()
         } else {
-            crate::skills::discover_for_agent(
+            cockpit_core::skills::discover_for_agent(
                 &self.launch.cwd,
                 &extended.skills,
                 &self.launch.agent_name,

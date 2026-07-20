@@ -45,7 +45,7 @@ impl App {
     pub(super) fn interrupt_agent(&mut self) {
         self.send_daemon_request(
             "interrupt",
-            crate::daemon::proto::Request::CancelTurn,
+            cockpit_core::daemon::proto::Request::CancelTurn,
             ControlApplied::None,
         );
     }

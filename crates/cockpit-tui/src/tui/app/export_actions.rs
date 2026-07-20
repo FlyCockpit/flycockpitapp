@@ -25,7 +25,9 @@ impl App {
     /// `/export debug` (hidden) — write the full CLI bundle `.zip` for
     /// the current session, overwriting any prior file. Reads the DB
     /// directly (like the CLI) so it works regardless of daemon state,
-    /// reusing the single shared zip-assembly implementation.
+    /// reusing [`cockpit_core::session::export::write_bundle_zip`] —
+    /// the single shared zip-assembly implementation, called in-process
+    /// with this handle.
     pub(super) fn export_debug_bundle(
         &mut self,
         session_id: uuid::Uuid,
@@ -33,15 +35,17 @@ impl App {
         exports_dir: &Path,
     ) {
         let out_path = exports_dir.join(format!("{file_stem}.zip"));
-        let result = (|| -> anyhow::Result<crate::commands::export::BundleSummary> {
-            let db = crate::db::Db::open_default()?;
+        let result = (|| -> anyhow::Result<cockpit_core::session::export::BundleSummary> {
+            let db = cockpit_db::Db::open_default()?;
             let target = db
                 .get_session(session_id)?
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found in the DB"))?;
             // Unconditional overwrite (the TUI has no `--force`); this
             // does not weaken the CLI's no-clobber-without-`--force`
-            // guarantee, which lives in `commands::export::run`.
-            crate::commands::export::write_bundle_zip(&db, &target, &out_path, true, false, false)
+            // guarantee, which lives in the CLI's `export::run`.
+            cockpit_core::session::export::write_bundle_zip(
+                &db, &target, &out_path, true, false, false,
+            )
         })();
         let line = match result {
             Ok(summary) => format!(

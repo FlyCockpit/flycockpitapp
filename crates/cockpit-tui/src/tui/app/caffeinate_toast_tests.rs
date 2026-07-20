@@ -1,5 +1,5 @@
 use super::{App, ToastKind};
-use crate::engine::TurnEvent;
+use cockpit_core::engine::TurnEvent;
 
 fn apply_caffeinate(app: &mut App, active: bool, lid_close_guaranteed: bool, message: &str) {
     app.apply_event(TurnEvent::CaffeinateState {

@@ -1,7 +1,7 @@
 //! `/stats` pane (GOALS §15 / §15e).
 //!
 //! A full-body interactive view over the part-1 roll-up layer
-//! ([`crate::db::stats::rollup`]). It renders the three §15a sections —
+//! ([`cockpit_db::stats::rollup`]). It renders the three §15a sections —
 //! token spend per model, tool-call recovery per model, and the
 //! language breakdown — with interactive scope (current project / all)
 //! and range (7d / all) toggles plus an expandable recovery drilldown.
@@ -22,13 +22,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::db::Db;
-use crate::db::stats::{
-    LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
-};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_db::Db;
+use cockpit_db::stats::{
+    LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
+};
 
 /// Width (in cells) of the language bar gauge. Hand-rolled `█`/`░`
 /// matching the §15e UI sketch; degrades by shortening when the
@@ -388,7 +388,7 @@ fn run_rollup(
     };
     let now = chrono::Utc::now().timestamp();
     db.read_blocking(|conn| {
-        crate::db::stats::rollup(conn, &stats_scope, range.to_range(), prices, false, now)
+        cockpit_db::stats::rollup(conn, &stats_scope, range.to_range(), prices, false, now)
     })
     .map_err(|e| e.to_string())
 }
@@ -731,7 +731,7 @@ fn fmt_cost(c: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::stats::{
+    use cockpit_db::stats::{
         LanguageRow, NonFileRow, RecoveryRow, RecoveryStageRow, RecoveryToolRow,
     };
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn cursor_follow_accounts_for_expanded_variable_height_rows() {
         let mut rollup = empty_rollup();
-        rollup.tokens.by_model = vec![crate::db::stats::TokenRow {
+        rollup.tokens.by_model = vec![cockpit_db::stats::TokenRow {
             model: "tok".into(),
             provider: "p".into(),
             input_tokens: 1,

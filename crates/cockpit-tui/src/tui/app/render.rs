@@ -198,19 +198,19 @@ fn tool_call_state_id(state: ToolCallState) -> u8 {
     }
 }
 
-fn thinking_display_id(value: crate::config::extended::ThinkingDisplay) -> u8 {
+fn thinking_display_id(value: cockpit_config::extended::ThinkingDisplay) -> u8 {
     match value {
-        crate::config::extended::ThinkingDisplay::Condensed => 0,
-        crate::config::extended::ThinkingDisplay::Hidden => 1,
-        crate::config::extended::ThinkingDisplay::Verbose => 2,
+        cockpit_config::extended::ThinkingDisplay::Condensed => 0,
+        cockpit_config::extended::ThinkingDisplay::Hidden => 1,
+        cockpit_config::extended::ThinkingDisplay::Verbose => 2,
     }
 }
 
-fn diff_style_id(value: crate::config::extended::DiffStyle) -> u8 {
+fn diff_style_id(value: cockpit_config::extended::DiffStyle) -> u8 {
     match value {
-        crate::config::extended::DiffStyle::SideBySide => 0,
-        crate::config::extended::DiffStyle::Inline => 1,
-        crate::config::extended::DiffStyle::Hidden => 2,
+        cockpit_config::extended::DiffStyle::SideBySide => 0,
+        cockpit_config::extended::DiffStyle::Inline => 1,
+        cockpit_config::extended::DiffStyle::Hidden => 2,
     }
 }
 
@@ -422,9 +422,9 @@ fn history_render_signature(
     entry: &HistoryEntry,
     version: u64,
     width: u16,
-    thinking: crate::config::extended::ThinkingDisplay,
+    thinking: cockpit_config::extended::ThinkingDisplay,
     md: crate::tui::history::MarkdownOpts,
-    diff_style: crate::config::extended::DiffStyle,
+    diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
@@ -711,7 +711,7 @@ impl App {
         // ("Approve for this session" approvals,
         // implementation note) so session-only
         // entries render exactly like persisted ones (dimmed, `gitignored`).
-        let mut allow = crate::config::extended::resolve_gitignore_allow(&self.launch.cwd);
+        let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
         let walked =
             crate::tui::file_tag::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
@@ -2425,8 +2425,8 @@ impl App {
         {
             return tokens;
         }
-        let tokens = (crate::tokens::count(&pending.text)
-            + crate::tokens::count(&pending.reasoning))
+        let tokens = (cockpit_core::tokens::count(&pending.text)
+            + cockpit_core::tokens::count(&pending.reasoning))
         .min(u32::MAX as usize) as u32;
         self.pending_token_cache.set(Some((key, tokens)));
         tokens
@@ -2447,7 +2447,7 @@ impl App {
         // Buffered `<git>` blocks (GOALS §1l) ride the next user
         // message; surface their cost before the user commits to send.
         for block in &self.pending_git_blocks {
-            tokens += crate::tokens::count(block);
+            tokens += cockpit_core::tokens::count(block);
         }
         tokens.min(u32::MAX as usize) as u32
     }
@@ -2462,7 +2462,7 @@ impl App {
         let mut tokens = self.history_estimate_tokens() as u64;
         tokens += self.pending_tokens() as u64;
         for block in &self.pending_git_blocks {
-            tokens += crate::tokens::count(block) as u64;
+            tokens += cockpit_core::tokens::count(block) as u64;
         }
         tokens
     }
@@ -2482,8 +2482,11 @@ impl App {
             .as_ref()
             .map(|e| e.model_instruction_tokens)
             .unwrap_or(0);
-        let breakdown =
-            crate::engine::builtin::chat_system_prompt_breakdown(&self.launch.cwd, short_id, None);
+        let breakdown = cockpit_core::engine::builtin::chat_system_prompt_breakdown(
+            &self.launch.cwd,
+            short_id,
+            None,
+        );
         let snapshot = crate::tui::context_pane::ContextSnapshot::new(
             model_instructions.max(breakdown.model_instructions),
             breakdown.base_prompt,
@@ -2521,30 +2524,33 @@ impl App {
         let mut tokens: usize = 0;
         for entry in &self.history {
             tokens += match entry {
-                HistoryEntry::User { text, .. } => crate::tokens::count(text),
+                HistoryEntry::User { text, .. } => cockpit_core::tokens::count(text),
                 HistoryEntry::Plain { line }
                 | HistoryEntry::CommandError { line }
-                | HistoryEntry::Maintenance { line } => crate::tokens::count(line),
+                | HistoryEntry::Maintenance { line } => cockpit_core::tokens::count(line),
                 // UI/export-only acknowledgement of a settled interrupt; the
                 // model context receives the actual decision through the
                 // daemon event stream, not this rendered row.
                 HistoryEntry::InterruptDecision { .. } => 0,
-                HistoryEntry::ToolLine { summary, .. } => crate::tokens::count(summary),
+                HistoryEntry::ToolLine { summary, .. } => cockpit_core::tokens::count(summary),
                 HistoryEntry::ToolBox { calls, .. } => calls
                     .iter()
-                    .map(|c| crate::tokens::count(&c.summary) + crate::tokens::count(&c.output))
+                    .map(|c| {
+                        cockpit_core::tokens::count(&c.summary)
+                            + cockpit_core::tokens::count(&c.output)
+                    })
                     .sum(),
                 HistoryEntry::Diff { old, new, .. } => {
-                    crate::tokens::count(old) + crate::tokens::count(new)
+                    cockpit_core::tokens::count(old) + cockpit_core::tokens::count(new)
                 }
                 HistoryEntry::Agent {
                     text, reasoning, ..
-                } => crate::tokens::count(text) + crate::tokens::count(reasoning),
+                } => cockpit_core::tokens::count(text) + cockpit_core::tokens::count(reasoning),
                 // The child's report is delivered to the parent as its
                 // `task` tool result, so it enters the model's context.
                 HistoryEntry::Subagent { outcome, .. } => outcome
                     .as_ref()
-                    .map(|o| crate::tokens::count(&o.report))
+                    .map(|o| cockpit_core::tokens::count(&o.report))
                     .unwrap_or(0),
                 // Local-command output is never sent to the agent
                 // (GOALS §1k); `/git`'s agent-bound cost is accounted
@@ -4382,10 +4388,6 @@ mod render_history_spacing_tests {
         App, ChatCopyTarget, ChatRowKind, ControlChip, Selection, TranscriptFind,
         affordance_target_for_row, extract_selection_plaintext,
     };
-    use crate::config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-    use crate::db::{open_default_call_count, reset_open_default_call_count};
-    use crate::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
-    use crate::tokens::{count_call_count, reset_count_call_count};
     use crate::tui::app::{AffordanceTarget, SandboxDownNotice};
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
@@ -4399,6 +4401,10 @@ mod render_history_spacing_tests {
         reset_render_counters as reset_markdown_counters,
     };
     use crate::tui::theme::TRANSCRIPT_HOVER_BG;
+    use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
+    use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
+    use cockpit_core::tokens::{count_call_count, reset_count_call_count};
+    use cockpit_db::{open_default_call_count, reset_open_default_call_count};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -4612,7 +4618,7 @@ mod render_history_spacing_tests {
         app.history_render_fingerprints = vec![0; app.history.len()];
 
         assert!(app.open_subagent_view_for_history_index(0));
-        app.apply_event(crate::engine::agent::TurnEvent::SubagentReport {
+        app.apply_event(cockpit_core::engine::agent::TurnEvent::SubagentReport {
             agent: "explore".to_string(),
             task_call_id: "call-1".to_string(),
             label: "default".to_string(),
@@ -6062,9 +6068,9 @@ mod prediction_ghost_context_indicator_tests {
     use super::{
         App, COMPOSER_PLACEHOLDER, first_line_truncated, input_visual_rows, wrap_ghost_line_chunks,
     };
-    use crate::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
     use crate::tui::theme::MUTED_TEXT;
+    use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;

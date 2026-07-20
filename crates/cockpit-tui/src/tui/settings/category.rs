@@ -35,17 +35,17 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::config::extended::{
+use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode, suggest_paths};
+use crate::tui::textfield::TextField;
+use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
+use cockpit_config::extended::{
     ApprovalMode, Concurrency, DefaultPrimaryAgent, DiffStyle, InjectionResultAction,
     InjectionThreshold, LlmMode, PredictNextMessage, ShellCompression, TextEmbeddedRecovery,
     ThinkingDisplay, TuiConfig, VimModeSetting,
 };
-use crate::tools::command_resource_profiles::{
+use cockpit_core::tools::command_resource_profiles::{
     GO_TOOLCHAIN, JAVA_TOOLCHAIN, NODE_PACKAGE_MANAGER, PYTHON_TOOLCHAIN, RUST_TOOLCHAIN,
 };
-use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode, suggest_paths};
-use crate::tui::textfield::TextField;
-use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 
 use super::descriptor::{FieldKind, SettingDescriptor, SettingHeading, SettingStore};
 use super::reset::{ResetButton, ResetOutcome};
@@ -164,14 +164,16 @@ fn approval_mode_label(m: ApprovalMode) -> &'static str {
     }
 }
 
-fn sandbox_mode_setting_value(mode: crate::tools::sandbox_mode::SandboxMode) -> String {
+fn sandbox_mode_setting_value(mode: cockpit_core::tools::sandbox_mode::SandboxMode) -> String {
     let label = match mode {
-        crate::tools::sandbox_mode::SandboxMode::Off => "off",
-        crate::tools::sandbox_mode::SandboxMode::Sandbox => "on (default host filesystem sandbox)",
-        crate::tools::sandbox_mode::SandboxMode::Container => "container",
-        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+        cockpit_core::tools::sandbox_mode::SandboxMode::Off => "off",
+        cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => {
+            "on (default host filesystem sandbox)"
+        }
+        cockpit_core::tools::sandbox_mode::SandboxMode::Container => "container",
+        cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
     };
-    if mode.is_container() && !crate::container::availability_snapshot().available {
+    if mode.is_container() && !cockpit_core::container::availability_snapshot().available {
         format!("{label} (unavailable here)")
     } else {
         label.to_string()
@@ -179,10 +181,10 @@ fn sandbox_mode_setting_value(mode: crate::tools::sandbox_mode::SandboxMode) -> 
 }
 
 fn cycle_sandbox_mode(
-    mode: crate::tools::sandbox_mode::SandboxMode,
-) -> crate::tools::sandbox_mode::SandboxMode {
-    use crate::tools::sandbox_mode::SandboxMode;
-    let modes: &[SandboxMode] = if crate::container::availability_snapshot().available {
+    mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+) -> cockpit_core::tools::sandbox_mode::SandboxMode {
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    let modes: &[SandboxMode] = if cockpit_core::container::availability_snapshot().available {
         &[
             SandboxMode::Off,
             SandboxMode::Sandbox,
@@ -2024,7 +2026,7 @@ where
     serde_json::from_str(raw).map_err(|e| format!("invalid JSON for {label}: {e}"))
 }
 
-fn toggle_command_profile(e: &mut crate::config::extended::ExtendedConfig, id: &str) {
+fn toggle_command_profile(e: &mut cockpit_config::extended::ExtendedConfig, id: &str) {
     let next = !e.command_resource_profiles.profile_enabled(id);
     e.command_resource_profiles
         .enabled
@@ -2436,7 +2438,9 @@ impl SettingsCx {
                 // enabled value (`Build`) so the stored `defaultPrimaryAgent`
                 // never points at a now-hidden gated agent.
                 if !e.experimental_mode
-                    && crate::agents::is_experimental_primary(e.default_primary_agent.agent_name())
+                    && cockpit_core::agents::is_experimental_primary(
+                        e.default_primary_agent.agent_name(),
+                    )
                 {
                     e.default_primary_agent = DefaultPrimaryAgent::Build;
                 }
@@ -2450,7 +2454,7 @@ impl SettingsCx {
                 // are when on).
                 let mut next = e.default_primary_agent.cycled();
                 if !e.experimental_mode {
-                    while crate::agents::is_experimental_primary(next.agent_name()) {
+                    while cockpit_core::agents::is_experimental_primary(next.agent_name()) {
                         next = next.cycled();
                     }
                 }
@@ -2566,7 +2570,7 @@ impl SettingsCx {
                 self.extended.tui.exit_tail_lines = v;
             }
             S::LoopGuardThreshold => {
-                let v = parse_min_u32(trimmed, crate::config::extended::MIN_LOOP_GUARD_THRESHOLD)?;
+                let v = parse_min_u32(trimmed, cockpit_config::extended::MIN_LOOP_GUARD_THRESHOLD)?;
                 self.extended.loop_guard.repeat_threshold = v;
             }
             S::MaxPrimaryRounds => {
@@ -2708,7 +2712,7 @@ impl SettingsCx {
             Ok(()) => {
                 if id == SettingId::SandboxEscalationEnabled {
                     self.pending_daemon_request =
-                        Some(crate::daemon::proto::Request::SetSandboxEscalation {
+                        Some(cockpit_core::daemon::proto::Request::SetSandboxEscalation {
                             enabled: self.extended.sandbox_escalation_enabled,
                         });
                 }
@@ -2733,7 +2737,7 @@ impl SettingsCx {
         if self.config_path == project_config {
             return None;
         }
-        let doc = crate::config::extended::ExtendedConfigDoc::load(&project_config).ok()?;
+        let doc = cockpit_config::extended::ExtendedConfigDoc::load(&project_config).ok()?;
         if !doc.raw_has_path(path) {
             return None;
         }
@@ -2836,7 +2840,7 @@ impl SettingsCx {
                 p.pending_mouse_capture = Some(self.extended.tui.mouse_capture);
             }
             Category::Behavior => {
-                let d = crate::config::extended::ExtendedConfig::default();
+                let d = cockpit_config::extended::ExtendedConfig::default();
                 let e = &mut self.extended;
                 e.default_primary_agent = d.default_primary_agent;
                 e.llm_mode = d.llm_mode;
@@ -3000,7 +3004,7 @@ fn remove_project_shadow_path(
     project_config: &std::path::Path,
     path: &[&str],
 ) -> Result<bool, String> {
-    let mut doc = crate::config::extended::ExtendedConfigDoc::load(project_config)
+    let mut doc = cockpit_config::extended::ExtendedConfigDoc::load(project_config)
         .map_err(|e| e.to_string())?;
     let removed = doc.remove_raw_path(path);
     if removed {
@@ -3246,22 +3250,22 @@ impl SettingsCx {
         frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), help_area);
     }
 }
-fn reset_privacy_category(e: &mut crate::config::extended::ExtendedConfig) {
+fn reset_privacy_category(e: &mut cockpit_config::extended::ExtendedConfig) {
     let preserved_dotenv_patterns = e.redact.dotenv_patterns.clone();
     let preserved_extra_dotenv_paths = e.redact.extra_dotenv_paths.clone();
     let preserved_denylist = e.redact.denylist.clone();
     let preserved_allowlist = e.redact.allowlist.clone();
     let preserved_gitignore_allow = e.gitignore_allow.clone();
 
-    e.redact = crate::config::extended::RedactConfig {
+    e.redact = cockpit_config::extended::RedactConfig {
         dotenv_patterns: preserved_dotenv_patterns,
         extra_dotenv_paths: preserved_extra_dotenv_paths,
         denylist: preserved_denylist,
         allowlist: preserved_allowlist,
-        ..crate::config::extended::RedactConfig::default()
+        ..cockpit_config::extended::RedactConfig::default()
     };
     e.gitignore_allow = preserved_gitignore_allow;
-    e.prompt_injection_guard = crate::config::extended::PromptInjectionGuardConfig::default();
+    e.prompt_injection_guard = cockpit_config::extended::PromptInjectionGuardConfig::default();
     e.allow_remote_config = false;
 }
 
@@ -3317,7 +3321,7 @@ impl SettingsPage for CategoryPage {
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › {}",
-            crate::welcome::display_path(&cx.config_path),
+            cockpit_core::welcome::display_path(&cx.config_path),
             self.category.crumb()
         )
     }

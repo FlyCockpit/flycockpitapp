@@ -757,7 +757,7 @@ impl DialogState {
     /// advance (instant-accept). Multi-select: toggle it, no advance.
     fn number_select(&mut self, idx: usize) -> DialogOutcome {
         if self.pages[self.page].permission
-            && self.pages[self.page].options[idx].id == crate::approval::ID_MORE_OPTIONS
+            && self.pages[self.page].options[idx].id == cockpit_core::approval::ID_MORE_OPTIONS
         {
             return self.reveal_secondary_options();
         }
@@ -876,7 +876,7 @@ impl DialogState {
         };
         let id = option.id.clone();
         if page.is_select() {
-            if page.permission && id == crate::approval::ID_MORE_OPTIONS {
+            if page.permission && id == cockpit_core::approval::ID_MORE_OPTIONS {
                 return self.reveal_secondary_options();
             }
             if page.permission && self.page_states[self.page].selected.as_slice() != [id.as_str()] {
@@ -909,7 +909,7 @@ impl DialogState {
         let more_index = page
             .options
             .iter()
-            .position(|option| option.id == crate::approval::ID_MORE_OPTIONS);
+            .position(|option| option.id == cockpit_core::approval::ID_MORE_OPTIONS);
         if let Some(index) = more_index {
             page.options.remove(index);
             let first = page.options.len();
@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn permission_more_options_reveals_secondary_and_renumbers() {
-        let mut more = DialogOption::new(crate::approval::ID_MORE_OPTIONS, "More options…");
+        let mut more = DialogOption::new(cockpit_core::approval::ID_MORE_OPTIONS, "More options…");
         more.secondary = false;
         let mut secondary_b = opt("b");
         secondary_b.secondary = true;

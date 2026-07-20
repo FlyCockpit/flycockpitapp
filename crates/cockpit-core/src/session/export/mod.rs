@@ -1,5 +1,11 @@
-//! `cockpit export <session>` — session-log export (session-log-export
+//! Session debug-bundle assembly — session-log export (session-log-export
 //! Part D).
+//!
+//! The single zip-assembly implementation shared by the CLI
+//! `cockpit export <session>` command and the TUI `/export debug`
+//! command. The CLI command surface (arg parsing, stdout reporting)
+//! lives in `apps/cli/src/commands/export.rs`; everything that builds
+//! the archive lives here.
 //!
 //! Bundles a session — plus every descendant fork **and** every
 //! `/compact` successor session it links to — into a self-contained
@@ -42,8 +48,6 @@ use uuid::Uuid;
 use zip::write::{SimpleFileOptions, ZipWriter};
 
 use crate::approval::store::{ManagedGrants, global_approvals_dir, list_managed_grants};
-use crate::cli::ExportArgs;
-use crate::commands::CommandUsageError;
 use crate::config::dirs::{ConfigDir, ConfigDirKind, discover_config_dirs};
 use crate::db::Db;
 use crate::db::session_log::SessionEventRow;
@@ -83,66 +87,10 @@ fn fs_safe(s: &str) -> String {
         .collect()
 }
 
-pub async fn run(args: ExportArgs) -> Result<()> {
-    let db = Db::open_default()?;
-    let target = resolve_target_session(&db, &args)?;
-
-    // Collect the target plus all descendant forks and `/compact`
-    // successor sessions, then assemble the archive. The walk is cheap
-    // point-lookups per session; the read is bounded by the session's
-    // history, which is acceptable to do on the current task for a
-    // one-shot CLI export.
-    let out_path = args
-        .output
-        .clone()
-        .unwrap_or_else(|| default_output_path(&target));
-
-    if args.include_sensitive {
-        eprintln!(
-            "warning: --include-sensitive exports exact captured payloads and may include secrets sent to trusted models"
-        );
-    }
-
-    let summary = write_bundle_zip(
-        &db,
-        &target,
-        &out_path,
-        args.force,
-        args.include_generated,
-        args.include_sensitive,
-    )?;
-
-    println!(
-        "Exported session `{}` ({} session{}, {} bytes) → {}",
-        target.short_id.as_deref().unwrap_or("?"),
-        summary.session_count,
-        if summary.session_count == 1 { "" } else { "s" },
-        summary.byte_len,
-        out_path.display()
-    );
-    Ok(())
-}
-
-fn resolve_target_session(db: &Db, args: &ExportArgs) -> Result<SessionRow> {
-    let ident = args
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            CommandUsageError::new("a session identifier (`short_id` or UUID) is required")
-        })?;
-
-    match resolve_session(db, ident)? {
-        Ok(row) => Ok(row),
-        Err(message) => Err(CommandUsageError::new(message).into()),
-    }
-}
-
 /// What a completed bundle write produced — surfaced so callers (CLI
 /// and the TUI debug export) can report identical stats.
 #[derive(Debug)]
-pub(crate) struct BundleSummary {
+pub struct BundleSummary {
     pub session_count: usize,
     pub byte_len: usize,
 }
@@ -157,7 +105,7 @@ pub(crate) struct BundleSummary {
 /// `true` replaces it unconditionally (the TUI path, which has no force
 /// flag and is specified to overwrite its own prior export). The CLI
 /// passes `args.force` here, so its guarantee is preserved.
-pub(crate) fn write_bundle_zip(
+pub fn write_bundle_zip(
     db: &Db,
     target: &SessionRow,
     out_path: &std::path::Path,
@@ -204,7 +152,7 @@ pub(crate) fn write_bundle_zip(
 /// success; `Ok(Err(message))` for a usage error (not found / ambiguous)
 /// the caller surfaces with exit 64. A full UUID resolves directly; any
 /// other string is treated as a `short_id` and matched globally.
-fn resolve_session(db: &Db, ident: &str) -> Result<std::result::Result<SessionRow, String>> {
+pub fn resolve_session(db: &Db, ident: &str) -> Result<std::result::Result<SessionRow, String>> {
     if let Ok(uuid) = Uuid::parse_str(ident) {
         return Ok(match db.get_session(uuid)? {
             Some(row) => Ok(row),
@@ -1664,7 +1612,7 @@ fn is_generated_layer_artifact(rel: &Path, is_dir: bool) -> bool {
 
 /// `./cockpit-session-<short_id>.zip`, falling back to the UUID when no
 /// short id is set.
-fn default_output_path(target: &SessionRow) -> PathBuf {
+pub fn default_output_path(target: &SessionRow) -> PathBuf {
     let id = target
         .short_id
         .clone()

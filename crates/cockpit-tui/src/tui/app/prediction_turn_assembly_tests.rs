@@ -79,7 +79,7 @@ fn assembles_every_turn_faithfully() {
     ];
     let turns = turns_from_history(&history);
     assert_eq!(turns.len(), 4);
-    let last3 = crate::engine::predict::last_turns(&turns);
+    let last3 = cockpit_core::engine::predict::last_turns(&turns);
     assert_eq!(last3.len(), 3);
     assert_eq!(last3[0].user, "q2");
     assert_eq!(last3[2].user, "q4");
@@ -115,6 +115,6 @@ fn trailing_open_turn_has_empty_agent() {
 fn fresh_session_has_no_agent_response() {
     let history = vec![user("first message")];
     let turns = turns_from_history(&history);
-    let window = crate::engine::predict::last_turns(&turns);
+    let window = cockpit_core::engine::predict::last_turns(&turns);
     assert!(window.iter().all(|t| t.agent.trim().is_empty()));
 }

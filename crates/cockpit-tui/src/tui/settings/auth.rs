@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::config::providers::ProviderEntry;
-use crate::providers::models_fetch::{self, FetchOutcome};
+use cockpit_config::providers::ProviderEntry;
+use cockpit_core::providers::models_fetch::{self, FetchOutcome};
 
 /// Shared cell for an in-flight `/models` fetch. The background task
 /// writes the result; the event loop polls it on each tick.

@@ -18,10 +18,10 @@ use ratatui::text::{Line, Span};
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mcp::config::{
+use crate::tui::textfield::TextField;
+use cockpit_core::mcp::config::{
     Auth, EnvAuth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport,
 };
-use crate::tui::textfield::TextField;
 
 use super::secret_display;
 use super::shell::{
@@ -177,9 +177,9 @@ fn lifecycle(name: &str, s: &ServerConfig) -> ServerLifecycle {
         }
         Auth::Oauth(_) => {
             // OAuth is ready iff a token is stored for `mcp:<name>`.
-            let stored = crate::credentials::CredentialStore::open_default()
+            let stored = cockpit_core::credentials::CredentialStore::open_default()
                 .ok()
-                .and_then(|store| store.get(&crate::mcp::auth::cred_key(name)).cloned())
+                .and_then(|store| store.get(&cockpit_core::mcp::auth::cred_key(name)).cloned())
                 .is_some();
             if stored {
                 ServerLifecycle::Ready
@@ -280,7 +280,7 @@ impl SettingsCx {
                         let server = server.clone();
                         let res = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current()
-                                .block_on(crate::mcp::auth::run_oauth_flow(&name, &server))
+                                .block_on(cockpit_core::mcp::auth::run_oauth_flow(&name, &server))
                         });
                         s.status = Some(match res {
                             Ok(_) => format!("authenticated `{name}`"),
@@ -825,7 +825,7 @@ fn build_server_from_editor(
         name,
         s.base_env.text(),
         &s.stored_base_env_refs,
-        crate::mcp::auth::base_env_cred_key,
+        cockpit_core::mcp::auth::base_env_cred_key,
         &mut credential_refs,
     )?;
     let auth = match s.auth {
@@ -848,14 +848,14 @@ fn build_server_from_editor(
                         Some(key.clone())
                     }
                     None => {
-                        let key = crate::mcp::auth::header_cred_key(name);
+                        let key = cockpit_core::mcp::auth::header_cred_key(name);
                         store_secret(&key, value).map_err(|e| e.to_string())?;
                         credential_refs.insert(key.clone());
                         Some(key)
                     }
                 }
             } else {
-                let key = crate::mcp::auth::header_cred_key(name);
+                let key = cockpit_core::mcp::auth::header_cred_key(name);
                 store_secret(&key, value).map_err(|e| e.to_string())?;
                 credential_refs.insert(key.clone());
                 Some(key)
@@ -875,7 +875,7 @@ fn build_server_from_editor(
                 name,
                 s.auth_env.text(),
                 &s.stored_auth_env_refs,
-                crate::mcp::auth::auth_env_cred_key,
+                cockpit_core::mcp::auth::auth_env_cred_key,
                 &mut credential_refs,
             )?;
             if vars.is_empty() && credential_refs_map.is_empty() {
@@ -1010,12 +1010,12 @@ fn is_env_reference(value: &str) -> bool {
 }
 
 fn store_secret(key: &str, value: &str) -> anyhow::Result<()> {
-    let store = crate::credentials::CredentialStore::open_default()?;
+    let store = cockpit_core::credentials::CredentialStore::open_default()?;
     store.save_record_merged(key, serde_json::json!({ "secret": value }))
 }
 
 fn remove_credential_refs(refs: &BTreeSet<String>) -> anyhow::Result<()> {
-    let store = crate::credentials::CredentialStore::open_default()?;
+    let store = cockpit_core::credentials::CredentialStore::open_default()?;
     for key in refs {
         store.remove_record_merged(key)?;
     }
@@ -1042,14 +1042,14 @@ fn credential_refs(name: &str, server: &ServerConfig) -> BTreeSet<String> {
             if let Some(key) = &h.credential_ref {
                 refs.insert(key.clone());
             } else if !h.value.trim().is_empty() && !is_env_reference(&h.value) {
-                refs.insert(crate::mcp::auth::header_cred_key(name));
+                refs.insert(cockpit_core::mcp::auth::header_cred_key(name));
             }
         }
         Auth::Env(e) => {
             refs.extend(e.credential_refs.values().cloned());
             for (env_name, value) in &e.vars {
                 if !is_env_reference(value) {
-                    refs.insert(crate::mcp::auth::auth_env_cred_key(name, env_name));
+                    refs.insert(cockpit_core::mcp::auth::auth_env_cred_key(name, env_name));
                 }
             }
         }
@@ -1074,7 +1074,7 @@ mod tests {
     use super::*;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env::lock()
+        cockpit_core::test_env::lock()
     }
 
     fn server(auth: Auth, enabled: bool) -> ServerConfig {
@@ -1200,7 +1200,7 @@ mod tests {
         let _env = env_lock();
         let old_xdg = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
-        let store = crate::credentials::CredentialStore::open_default().unwrap();
+        let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         store
             .save_record_merged(
                 "mcp:typefully:header",
@@ -1232,7 +1232,7 @@ mod tests {
         }
         assert!(refs.contains("mcp:typefully:header"));
         let reloaded =
-            crate::credentials::CredentialStore::open(store.path().to_path_buf()).unwrap();
+            cockpit_core::credentials::CredentialStore::open(store.path().to_path_buf()).unwrap();
         assert_eq!(
             reloaded
                 .get("mcp:typefully:header")
@@ -1252,7 +1252,7 @@ mod tests {
         let _env = env_lock();
         let old_xdg = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
-        let store = crate::credentials::CredentialStore::open_default().unwrap();
+        let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         store
             .save_record_merged(
                 "mcp:typefully:header",
@@ -1282,7 +1282,7 @@ mod tests {
         }
         assert!(refs.contains("mcp:typefully:header"));
         let reloaded =
-            crate::credentials::CredentialStore::open(store.path().to_path_buf()).unwrap();
+            cockpit_core::credentials::CredentialStore::open(store.path().to_path_buf()).unwrap();
         assert_eq!(
             reloaded
                 .get("mcp:typefully:header")
@@ -1318,7 +1318,7 @@ mod tests {
             other => panic!("expected header auth, got {other:?}"),
         }
         assert!(refs.contains("mcp:typefully:header"));
-        let store = crate::credentials::CredentialStore::open_default().unwrap();
+        let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         assert_eq!(
             store
                 .get("mcp:typefully:header")
@@ -1352,7 +1352,7 @@ impl SettingsPage for McpPage {
         };
         format!(
             "{}{}",
-            crate::welcome::display_path(&cx.config_path),
+            cockpit_core::welcome::display_path(&cx.config_path),
             crumbs
         )
     }

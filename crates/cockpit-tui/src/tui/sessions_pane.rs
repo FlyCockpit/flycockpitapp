@@ -10,7 +10,7 @@
 //! ## Data sources
 //!
 //! - **Tiers 1-2** (active jobs / processing) come from the daemon's
-//!   in-memory per-session [`crate::daemon::session_worker::LiveState`]
+//!   in-memory per-session [`cockpit_core::daemon::session_worker::LiveState`]
 //!   via the `SessionLiveStatus` RPC. Daemon down → no live tiers, no
 //!   crash (sessions fall to the DB-derived tiers).
 //! - **Tiers 3-5** (unread / pending-question / read) come from the DB
@@ -24,8 +24,8 @@
 //!   delete are blocking daemon requests through
 //!   [`crate::tui::agent_runner`], and live status (tiers 1-2) is intact.
 //! - **Daemonless:** the list is read straight from the session DB
-//!   read-only ([`crate::db::Db::open_default`], same as `/stats`) via the
-//!   shared [`crate::db::Db::list_session_summaries`] the daemon also calls,
+//!   read-only ([`cockpit_db::Db::open_default`], same as `/stats`) via the
+//!   shared [`cockpit_db::Db::list_session_summaries`] the daemon also calls,
 //!   so ordering / scoping / fork-grouping match. Live status is absent
 //!   (every session falls to its DB-derived tier — never an error), and the
 //!   mutating actions (resume / archive / delete / unarchive) are disabled
@@ -43,13 +43,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use uuid::Uuid;
 
-use crate::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
-use crate::db::Db;
 use crate::tui::agent_runner;
 use crate::tui::message_block::{MessageBlock, MessageBlockRole, render_markdown_message_block};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use cockpit_core::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
+use cockpit_db::Db;
 
 /// Root-session row cap for the daemonless direct-DB list — matches the
 /// daemon `ListSessions` handler's `100` so both modes show the same set.
@@ -136,19 +136,19 @@ pub fn classify(summary: &SessionSummary, live: Option<(bool, bool)>) -> Tier {
         return Tier::ActiveSchedules;
     }
     match summary.activity_state {
-        Some(crate::daemon::proto::SessionActivityState::ToolRunning) => {
+        Some(cockpit_core::daemon::proto::SessionActivityState::ToolRunning) => {
             return Tier::ToolRunning;
         }
-        Some(crate::daemon::proto::SessionActivityState::InferenceInProgress) => {
+        Some(cockpit_core::daemon::proto::SessionActivityState::InferenceInProgress) => {
             return Tier::InferenceInProgress;
         }
-        Some(crate::daemon::proto::SessionActivityState::Interrupted) => {
+        Some(cockpit_core::daemon::proto::SessionActivityState::Interrupted) => {
             return Tier::Interrupted;
         }
-        Some(crate::daemon::proto::SessionActivityState::PendingQuestion) => {
+        Some(cockpit_core::daemon::proto::SessionActivityState::PendingQuestion) => {
             return Tier::PendingQuestion;
         }
-        Some(crate::daemon::proto::SessionActivityState::Parked) | None => {}
+        Some(cockpit_core::daemon::proto::SessionActivityState::Parked) | None => {}
     }
     if let Some((_has_schedules, processing)) = live
         && processing
@@ -465,7 +465,7 @@ impl SessionsPane {
         } else {
             Db::open_default().ok()
         };
-        let use_emojis = crate::config::extended::load_for_cwd(cwd).tui.use_emojis;
+        let use_emojis = cockpit_config::extended::load_for_cwd(cwd).tui.use_emojis;
         let mut pane = Self {
             project_id,
             scope,
@@ -1108,7 +1108,7 @@ impl SessionsPane {
         session_id: Uuid,
         choice: ConfirmChoice,
     ) -> Option<SessionsOutcome> {
-        use crate::daemon::proto::Request;
+        use cockpit_core::daemon::proto::Request;
         let req = match choice {
             ConfirmChoice::Cancel => {
                 self.step = Step::Browse;
@@ -1149,7 +1149,7 @@ impl SessionsPane {
         let s = self.selected().cloned()?;
         s.archived_at?;
         match agent_runner::daemon_request_blocking(
-            crate::daemon::proto::Request::UnarchiveSession {
+            cockpit_core::daemon::proto::Request::UnarchiveSession {
                 session_id: s.session_id,
             },
         ) {
@@ -2175,13 +2175,14 @@ mod tests {
     #[test]
     fn classify_distinguishes_activity_states() {
         let mut s = summary(Uuid::new_v4(), 100);
-        s.activity_state = Some(crate::daemon::proto::SessionActivityState::ToolRunning);
+        s.activity_state = Some(cockpit_core::daemon::proto::SessionActivityState::ToolRunning);
         assert_eq!(classify(&s, Some((false, true))), Tier::ToolRunning);
-        s.activity_state = Some(crate::daemon::proto::SessionActivityState::InferenceInProgress);
+        s.activity_state =
+            Some(cockpit_core::daemon::proto::SessionActivityState::InferenceInProgress);
         assert_eq!(classify(&s, None), Tier::InferenceInProgress);
-        s.activity_state = Some(crate::daemon::proto::SessionActivityState::Interrupted);
+        s.activity_state = Some(cockpit_core::daemon::proto::SessionActivityState::Interrupted);
         assert_eq!(classify(&s, None), Tier::Interrupted);
-        s.activity_state = Some(crate::daemon::proto::SessionActivityState::PendingQuestion);
+        s.activity_state = Some(cockpit_core::daemon::proto::SessionActivityState::PendingQuestion);
         s.open_interrupts = 2;
         assert_eq!(classify(&s, None), Tier::PendingQuestion);
         assert_eq!(classify(&s, Some((true, true))), Tier::ActiveSchedules);
@@ -2711,7 +2712,7 @@ mod tests {
         let root = db.create_session("pid", "/proj", "builder").unwrap();
         db.insert_session_event(
             root.session_id,
-            crate::db::session_log::SessionEventKind::UserMessage,
+            cockpit_db::session_log::SessionEventKind::UserMessage,
             Some("builder"),
             None,
             &serde_json::json!({"text": "preview on first render"}),

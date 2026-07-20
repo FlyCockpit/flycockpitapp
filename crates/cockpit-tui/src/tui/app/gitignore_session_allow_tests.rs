@@ -1,6 +1,6 @@
 use super::App;
-use crate::engine::TurnEvent;
 use crate::tui::settings::Dialog;
+use cockpit_core::engine::TurnEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use std::fs;
 

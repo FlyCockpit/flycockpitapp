@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use crate::banner;
 use crate::tui::chrome;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
-use crate::welcome::{APP_NAME, LaunchInfo};
+use cockpit_core::welcome::{APP_NAME, LaunchInfo};
 
 const ACCENT: Color = Color::Indexed(ACCENT_BLUE_INDEX);
 const GREY: Color = Color::Indexed(MUTED_COLOR_INDEX);

@@ -9,7 +9,7 @@
 //!
 //! The one mutating action is **delete**: the focused grant row, on the
 //! delete/remove key, is dropped from its scope's `approvals.json` via
-//! [`crate::approval::store::delete_managed_grant`], which reloads the file
+//! [`cockpit_core::approval::store::delete_managed_grant`], which reloads the file
 //! and rewrites it atomically (the same load→mutate→store path the store
 //! uses to *record* grants — so a concurrent edit to a different entry is
 //! preserved, never clobbered). Removal takes effect on the next approval
@@ -31,12 +31,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::approval::store::{
+use crate::tui::pane::{Pane, ScrollList};
+use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use cockpit_core::approval::store::{
     ManagedGrantKind, ManagedGrants, delete_managed_grant, global_approvals_dir,
     list_managed_grants, project_approvals_dir,
 };
-use crate::tui::pane::{Pane, ScrollList};
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
 /// The two persisted *file* scopes the pane manages. Session scope is
 /// deliberately excluded (it lives in SQLite and expires with the
@@ -97,8 +97,8 @@ impl PermissionsPane {
     /// sees an explicit state per scope. Pure file reads — no daemon
     /// round-trip.
     pub fn open(cwd: &Path) -> Self {
-        let project_dir = crate::git::find_worktree_root(cwd)
-            .filter(|root| crate::config::trust::project_config_allowed(&root.join(".cockpit")))
+        let project_dir = cockpit_core::git::find_worktree_root(cwd)
+            .filter(|root| cockpit_config::trust::project_config_allowed(&root.join(".cockpit")))
             .and_then(|root| project_approvals_dir(&root));
         let global_dir = global_approvals_dir();
         let scopes = vec![
@@ -504,7 +504,7 @@ fn grant_row(key: &str, selected: bool) -> Line<'static> {
 }
 
 fn path_grant_row(
-    grant: &crate::approval::store::ManagedPathGrant,
+    grant: &cockpit_core::approval::store::ManagedPathGrant,
     selected: bool,
 ) -> Line<'static> {
     grant_row_spans(&grant.key, Some(grant.access_label()), selected)
@@ -590,9 +590,9 @@ mod tests {
             commands: commands.iter().map(|s| s.to_string()).collect(),
             paths: paths
                 .iter()
-                .map(|s| crate::approval::store::ManagedPathGrant {
+                .map(|s| cockpit_core::approval::store::ManagedPathGrant {
                     key: s.to_string(),
-                    access: crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                    access: cockpit_core::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
                 })
                 .collect(),
             loop_accept: Vec::new(),

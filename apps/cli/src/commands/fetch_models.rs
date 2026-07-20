@@ -16,13 +16,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::cli::FetchModelsArgs;
-use crate::config::dirs::{config_write_target_for_provider, most_specific_config_write_target};
+use crate::config::dirs::most_specific_config_write_target;
 use crate::config::providers::{
     ConfigDoc, ModelMergePolicy, OnUnlistedModelsFetch, ProviderEntry, ProviderModelCatalog,
     ProviderModelFetchDisplayState, ProvidersConfig, merge_fetched_models_with_policy,
     provider_model_fetch_display_state, redact_model_fetch_reason,
 };
-use crate::providers::models_fetch::{self, FetchOutcome};
+use crate::providers::models_fetch::{self, FetchOutcome, persist_provider};
 
 pub async fn run(args: FetchModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
@@ -475,21 +475,6 @@ fn pick_fallback_decision_with_io(
         _ => FallbackDecision::Keep,
     };
     Ok(decision)
-}
-
-pub(crate) fn persist_provider(cwd: &Path, provider_id: &str, entry: ProviderEntry) -> Result<()> {
-    let path = config_write_target_for_provider(cwd, provider_id).ok_or_else(|| {
-        anyhow::anyhow!("no cockpit config found — run `/settings` inside the TUI to create one")
-    })?;
-    let mut doc = ConfigDoc::load(&path)?;
-    doc.write_provider_models(
-        provider_id,
-        &entry.models,
-        entry.models_fetched_at,
-        entry.model_catalog,
-        entry.last_model_fetch,
-    )
-    .context("writing config.json")
 }
 
 pub(crate) fn persist_unlisted_policy(

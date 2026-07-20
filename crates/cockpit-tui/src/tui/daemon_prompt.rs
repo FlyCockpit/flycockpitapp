@@ -1,5 +1,5 @@
 //! "Daemon isn't running — what now?" dialog shown at TUI launch when
-//! [`crate::daemon::probe`] returns anything other than `Running`.
+//! [`cockpit_core::daemon::probe`] returns anything other than `Running`.
 //!
 //! Choices:
 //!   - Start a shared daemon (spawns a detached persistent child at the
@@ -20,8 +20,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::daemon::{DaemonPaths, DaemonStatus};
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_core::daemon::{DaemonPaths, DaemonStatus};
 
 pub const DIALOG_HEIGHT: u16 = 14;
 

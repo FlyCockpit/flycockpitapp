@@ -19,7 +19,7 @@
 //! and are not part of the TUI's live context snapshot, so they are not
 //! invented here.
 //!
-//! Token counts are cl100k_base (`crate::tokens::count`) — the same
+//! Token counts are cl100k_base (`cockpit_core::tokens::count`) — the same
 //! fallback the live context indicator uses pre-flight — and the window
 //! size is the active model's `context_length` from provider config
 //! (`launch.active_model_max_context`), exactly as the chrome's percentage

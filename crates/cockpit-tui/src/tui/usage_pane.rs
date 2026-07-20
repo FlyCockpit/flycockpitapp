@@ -7,9 +7,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::providers::usage::{ProviderUsageSnapshot, render_usage_lines};
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_core::providers::usage::{ProviderUsageSnapshot, render_usage_lines};
 
 pub struct UsagePane {
     rows: Result<Vec<ProviderUsageSnapshot>, String>,

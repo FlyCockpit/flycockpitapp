@@ -178,9 +178,9 @@ impl OAuthEffects {
     pub(crate) fn production() -> Self {
         Self {
             copy: crate::clipboard::copy_plain,
-            is_ssh: crate::clipboard::is_ssh,
-            open: crate::browser::open,
-            bind: crate::auth::xai_oauth::bind_callback_listener,
+            is_ssh: cockpit_core::sysinfo::is_ssh,
+            open: cockpit_core::browser::open,
+            bind: cockpit_core::auth::xai_oauth::bind_callback_listener,
         }
     }
 }
@@ -492,7 +492,7 @@ impl OAuthFlowState {
             OAuthProvider::Codex => {
                 self.polling = false;
                 self.logged_in = result.as_ref().copied().unwrap_or(false)
-                    || crate::auth::codex_oauth::is_logged_in();
+                    || cockpit_core::auth::codex_oauth::is_logged_in();
                 self.status = Some(result.map(|_| "Codex OAuth login complete".to_string()));
                 if self.logged_in {
                     self.session = OAuthSession::None;
@@ -501,7 +501,7 @@ impl OAuthFlowState {
             OAuthProvider::Grok => {
                 self.pending = false;
                 self.logged_in = result.as_ref().copied().unwrap_or(false)
-                    || crate::auth::xai_oauth::is_logged_in();
+                    || cockpit_core::auth::xai_oauth::is_logged_in();
                 self.status = Some(result.map(|_| "xAI OAuth login complete".to_string()));
                 if self.logged_in {
                     self.paste_focused = false;

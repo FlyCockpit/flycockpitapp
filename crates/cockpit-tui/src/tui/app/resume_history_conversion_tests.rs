@@ -1,6 +1,6 @@
 use super::wire_history_to_entries;
-use crate::daemon::proto::HistoryEntry as Wire;
 use crate::tui::history::{HistoryEntry, ToolCallState};
+use cockpit_core::daemon::proto::HistoryEntry as Wire;
 use serde_json::json;
 
 #[test]
@@ -50,7 +50,7 @@ fn replayed_user_row_renders_tag_entries() {
     let entries = wire_history_to_entries(vec![Wire::User {
         text: "expanded wire".into(),
         display_text: Some("review @src/lib.rs".into()),
-        tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
             tool: "read".into(),
             path: "src/lib.rs".into(),
             detail: "142 lines".into(),
@@ -151,10 +151,10 @@ fn converts_user_assistant_tool_call_to_tui_entries() {
 #[test]
 fn converts_interrupt_decision_to_dedicated_tui_entry() {
     let entries = wire_history_to_entries(vec![Wire::InterruptDecision {
-        decision: crate::daemon::proto::InterruptDecision {
+        decision: cockpit_core::daemon::proto::InterruptDecision {
             permission: true,
             cancelled: false,
-            lines: vec![crate::daemon::proto::InterruptDecisionLine {
+            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
                 prompt: "Run command?".into(),
                 answer: "Allow".into(),
             }],

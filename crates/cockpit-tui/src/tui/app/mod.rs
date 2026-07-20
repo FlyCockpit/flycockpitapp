@@ -91,12 +91,6 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
-use crate::config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-use crate::engine::message::{QueueTarget, QueuedUserMessage};
-use crate::engine::{
-    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
-};
-use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
@@ -111,7 +105,13 @@ use crate::tui::history::{
 };
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput, with_input_suspended};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
-use crate::welcome::{self, LaunchBundle, LaunchInfo};
+use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
+use cockpit_core::engine::message::{QueueTarget, QueuedUserMessage};
+use cockpit_core::engine::{
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
+};
+use cockpit_core::git::{self, RepoStatus};
+use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ANIMATION_TICK: Duration = Duration::from_millis(100);
@@ -206,13 +206,13 @@ pub(super) struct FooterModePicker {
 }
 
 impl FooterModePicker {
-    fn new(current: crate::config::extended::LlmMode) -> Self {
+    fn new(current: cockpit_config::extended::LlmMode) -> Self {
         Self {
             cursor: footer_mode_index(current),
         }
     }
 
-    fn selected_mode(self) -> crate::config::extended::LlmMode {
+    fn selected_mode(self) -> cockpit_config::extended::LlmMode {
         FOOTER_MODE_ORDER[self.cursor]
     }
 
@@ -261,7 +261,7 @@ pub(crate) enum ControlApplied {
 #[derive(Debug, Clone)]
 pub enum StartupWorkspaceTrust {
     Decided,
-    Pending(crate::config::trust::TrustRoot),
+    Pending(cockpit_config::trust::TrustRoot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,13 +279,13 @@ struct StartupDaemonState {
     notice: Option<String>,
 }
 
-const FOOTER_MODE_ORDER: [crate::config::extended::LlmMode; 3] = [
-    crate::config::extended::LlmMode::Defensive,
-    crate::config::extended::LlmMode::Normal,
-    crate::config::extended::LlmMode::Frontier,
+const FOOTER_MODE_ORDER: [cockpit_config::extended::LlmMode; 3] = [
+    cockpit_config::extended::LlmMode::Defensive,
+    cockpit_config::extended::LlmMode::Normal,
+    cockpit_config::extended::LlmMode::Frontier,
 ];
 
-fn footer_mode_index(mode: crate::config::extended::LlmMode) -> usize {
+fn footer_mode_index(mode: cockpit_config::extended::LlmMode) -> usize {
     FOOTER_MODE_ORDER
         .iter()
         .position(|m| *m == mode)
@@ -299,9 +299,9 @@ fn footer_agent_picker_height(picker: Option<&FooterAgentPicker>) -> u16 {
 
 fn resolve_tui_llm_mode(
     active_model: Option<&(String, String)>,
-    global: crate::config::extended::LlmMode,
-    providers: &crate::config::providers::ProvidersConfig,
-) -> crate::config::extended::LlmMode {
+    global: cockpit_config::extended::LlmMode,
+    providers: &cockpit_config::providers::ProvidersConfig,
+) -> cockpit_config::extended::LlmMode {
     let Some((provider, model)) = active_model else {
         return global;
     };
@@ -309,8 +309,8 @@ fn resolve_tui_llm_mode(
 }
 
 fn persist_trusted_only_default(cwd: &Path, enabled: bool) -> anyhow::Result<()> {
-    use crate::config::dirs::{CONFIG_FILE, discover_config_dirs};
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::dirs::{CONFIG_FILE, discover_config_dirs};
+    use cockpit_config::extended::ExtendedConfigDoc;
 
     let target = discover_config_dirs(cwd)
         .into_iter()
@@ -327,15 +327,15 @@ fn persist_trusted_only_default(cwd: &Path, enabled: bool) -> anyhow::Result<()>
 const DAEMON_AUTOSTART_NOTICE_FLAG: &str = "daemon-autostart-notice-v1";
 
 fn startup_daemon_state(
-    autostart: crate::config::extended::DaemonAutostart,
-    db: Option<&crate::db::Db>,
+    autostart: cockpit_config::extended::DaemonAutostart,
+    db: Option<&cockpit_db::Db>,
 ) -> StartupDaemonState {
     let notice_seen = db
         .and_then(|db| db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).ok())
         .unwrap_or(false);
-    match crate::daemon::DaemonPaths::resolve() {
-        Ok(paths) if paths.ephemeral => match crate::daemon::probe_blocking(&paths) {
-            crate::daemon::DaemonStatus::Running => StartupDaemonState {
+    match cockpit_core::daemon::DaemonPaths::resolve() {
+        Ok(paths) if paths.ephemeral => match cockpit_core::daemon::probe_blocking(&paths) {
+            cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
                 prompt: None,
                 connected: true,
                 socket: Some(paths.socket.clone()),
@@ -345,9 +345,9 @@ fn startup_daemon_state(
             status => daemon_not_running_state(status, paths, autostart, db, notice_seen),
         },
         Ok(_) => {
-            let probe = crate::daemon::discover_blocking();
+            let probe = cockpit_core::daemon::discover_blocking();
             match probe.status {
-                crate::daemon::DaemonStatus::Running => StartupDaemonState {
+                cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
                     prompt: None,
                     connected: true,
                     socket: Some(probe.paths.socket.clone()),
@@ -368,27 +368,27 @@ fn startup_daemon_state(
 }
 
 fn daemon_not_running_state(
-    status: crate::daemon::DaemonStatus,
-    paths: crate::daemon::DaemonPaths,
-    autostart: crate::config::extended::DaemonAutostart,
-    db: Option<&crate::db::Db>,
+    status: cockpit_core::daemon::DaemonStatus,
+    paths: cockpit_core::daemon::DaemonPaths,
+    autostart: cockpit_config::extended::DaemonAutostart,
+    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
 ) -> StartupDaemonState {
     daemon_not_running_state_with_spawn(status, paths, autostart, db, notice_seen, || {
-        crate::daemon::spawn_detached(false)
+        cockpit_core::daemon::spawn_detached(false)
     })
 }
 
 fn daemon_not_running_state_with_spawn(
-    status: crate::daemon::DaemonStatus,
-    paths: crate::daemon::DaemonPaths,
-    autostart: crate::config::extended::DaemonAutostart,
-    db: Option<&crate::db::Db>,
+    status: cockpit_core::daemon::DaemonStatus,
+    paths: cockpit_core::daemon::DaemonPaths,
+    autostart: cockpit_config::extended::DaemonAutostart,
+    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
     spawn_shared: impl FnOnce() -> anyhow::Result<u32>,
 ) -> StartupDaemonState {
     match autostart {
-        crate::config::extended::DaemonAutostart::Ask => StartupDaemonState {
+        cockpit_config::extended::DaemonAutostart::Ask => StartupDaemonState {
             prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
                 status, paths,
             )),
@@ -397,7 +397,7 @@ fn daemon_not_running_state_with_spawn(
             daemonless: false,
             notice: None,
         },
-        crate::config::extended::DaemonAutostart::Private => StartupDaemonState {
+        cockpit_config::extended::DaemonAutostart::Private => StartupDaemonState {
             prompt: None,
             connected: true,
             socket: None,
@@ -408,7 +408,7 @@ fn daemon_not_running_state_with_spawn(
                 "started a private cockpit daemon for this window only",
             ),
         },
-        crate::config::extended::DaemonAutostart::Shared => match spawn_shared() {
+        cockpit_config::extended::DaemonAutostart::Shared => match spawn_shared() {
             Ok(pid) => StartupDaemonState {
                 prompt: None,
                 connected: true,
@@ -438,7 +438,7 @@ fn daemon_not_running_state_with_spawn(
 }
 
 fn daemon_autostart_notice(
-    db: Option<&crate::db::Db>,
+    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
     text: &str,
 ) -> Option<String> {
@@ -453,8 +453,8 @@ fn daemon_autostart_notice(
 impl App {
     pub(super) fn apply_workspace_trust_choice(
         &mut self,
-        root: crate::config::trust::TrustRoot,
-        mode: crate::db::workspace_trust::WorkspaceTrustMode,
+        root: cockpit_config::trust::TrustRoot,
+        mode: cockpit_db::workspace_trust::WorkspaceTrustMode,
     ) -> bool {
         let Some(db) = self.startup_background.db.clone() else {
             self.show_toast("workspace trust could not be saved", ToastKind::Error);
@@ -467,18 +467,18 @@ impl App {
             );
             return false;
         }
-        if mode == crate::db::workspace_trust::WorkspaceTrustMode::Untrusted {
+        if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Untrusted {
             self.push_plain(format!(
                 "workspace {} is untrusted and cannot be opened",
                 root.root.display()
             ));
             return true;
         }
-        if let Err(error) = crate::config::trust::apply_trusted_workspace(root, mode) {
+        if let Err(error) = cockpit_config::trust::apply_trusted_workspace(root, mode) {
             self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
             return false;
         }
-        if mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust {
+        if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Trust {
             self.reload_launch_info();
             self.reload_tui_config();
         }
@@ -918,7 +918,7 @@ pub(super) struct PendingPausedWork {
 /// history needs an explicit repair/fork/export decision.
 pub(super) struct PendingResumeRepair {
     pub(super) interrupt_id: uuid::Uuid,
-    pub(super) state: crate::daemon::proto::ResumeRepairState,
+    pub(super) state: cockpit_core::daemon::proto::ResumeRepairState,
 }
 
 #[derive(Default)]
@@ -1275,7 +1275,7 @@ pub(super) enum PaneSide {
 #[derive(Debug, Clone)]
 struct StartupBackground {
     daemon_socket: Option<PathBuf>,
-    db: Option<crate::db::Db>,
+    db: Option<cockpit_db::Db>,
     started: bool,
 }
 
@@ -1443,7 +1443,7 @@ pub struct App {
     /// ownership contract `cockpit run` uses. `Some` only in daemonless mode
     /// once the runner has spawned the owned daemon; `None` when attached to
     /// a daemon we don't own.
-    pub(super) daemon_guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    pub(super) daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
     /// Signal task that fires the guard's shutdown on SIGINT/SIGTERM. Held so
     /// it can be aborted once the happy-path teardown has run.
     pub(super) daemon_signal_task: Option<tokio::task::JoinHandle<()>>,
@@ -1612,7 +1612,7 @@ pub struct App {
     /// the live context counter (see `context_tokens`): the displayed
     /// value is this total plus a local estimate of everything streamed
     /// since it arrived. `None` until the first call returns.
-    pub(super) last_usage: Option<crate::tokens::TokenUsage>,
+    pub(super) last_usage: Option<cockpit_core::tokens::TokenUsage>,
     /// Local cl100k_base estimate captured the instant `last_usage` was
     /// set — the baseline the live counter measures streamed tokens
     /// against, so the number climbs per token and re-snaps to the
@@ -1691,7 +1691,7 @@ pub struct App {
     /// Resolved from the layered config at launch and tracked live off the
     /// daemon's `LlmModeChanged` event so the `/llm-mode` toggle + cache-break
     /// warning resolve against the authoritative current value.
-    pub(super) llm_mode: crate::config::extended::LlmMode,
+    pub(super) llm_mode: cockpit_config::extended::LlmMode,
     /// Root primary plus active interactive subagent path for footer chrome.
     pub(super) agent_path: Vec<String>,
     /// Footer control selected by mouse; arrow/enter keys operate on it until
@@ -1733,7 +1733,7 @@ pub struct App {
     pub(super) pending_stop_confirm: Option<Vec<String>>,
     /// `RecordUsage` requests made before the daemon runner exists.
     /// Flushed (with tag project ids backfilled) once it's created.
-    pub(super) pending_usage: Vec<crate::daemon::proto::Request>,
+    pub(super) pending_usage: Vec<cockpit_core::daemon::proto::Request>,
     /// Ctrl+G was pressed — the event loop suspends ratatui, runs
     /// `$EDITOR` against the composer text, then reloads the file back
     /// into the composer.
@@ -1816,9 +1816,9 @@ pub struct App {
     /// filesystem sandboxing OFF (unless the daemon itself was launched
     /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
     pub(super) no_sandbox: bool,
-    pub(super) sandbox_mode: crate::tools::sandbox_mode::SandboxMode,
+    pub(super) sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode,
     pub(super) container_network_enabled: bool,
-    pub(super) container_availability: crate::container::ContainerAvailability,
+    pub(super) container_availability: cockpit_core::container::ContainerAvailability,
     /// Daemon-broadcast caffeination state (`/caffeinate`). Drives the `☕`
     /// chrome glyph; set/cleared from the daemon-global `CaffeinateState`
     /// event so it stays in sync across all clients (incl. until-idle
@@ -1895,7 +1895,7 @@ pub struct App {
     pub(super) sandbox_escalation_enabled: bool,
     /// Live command-approval mode for this session (`/quick`). Seeded from the
     /// config default and kept in sync by daemon broadcasts.
-    pub(super) approval_mode: crate::config::extended::ApprovalMode,
+    pub(super) approval_mode: cockpit_config::extended::ApprovalMode,
     /// Live delegation recursion setting for this session (`/quick`). Seeded
     /// from config defaults and kept in sync by daemon broadcasts.
     pub(super) delegation_recursion_enabled: bool,
@@ -1922,10 +1922,10 @@ pub struct App {
     pub(super) pending_tandem_options: Vec<(String, String)>,
     /// Persistent enterprise org-policy session-log sync disclosure. Loaded
     /// from durable sync state at startup; absence means no active policy.
-    pub(super) org_sync_disclosure: Option<crate::db::org_sync::OrgSyncDisclosure>,
+    pub(super) org_sync_disclosure: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
-    pub(super) connector_disclosure: Option<crate::db::connector::ConnectorDisclosure>,
+    pub(super) connector_disclosure: Option<cockpit_db::connector::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     first_run_flow: FirstRunFlow,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -1942,7 +1942,7 @@ pub struct App {
     /// Composer next-message prediction setting
     /// (implementation note). `off` short-circuits before
     /// any utility call; `short`/`long` bound the prediction.
-    pub(super) predict_setting: crate::config::extended::PredictNextMessage,
+    pub(super) predict_setting: cockpit_config::extended::PredictNextMessage,
     /// The next-message prediction lifecycle state (turn counter, cache,
     /// live ghost). Pure + unit-testable; see [`PredictionState`].
     pub(super) prediction_state: PredictionState,
@@ -2171,31 +2171,31 @@ pub(super) struct IdleReasonStatus {
     kind: ToastKind,
 }
 
-fn idle_reason_status(reason: crate::engine::IdleReason) -> Option<IdleReasonStatus> {
+fn idle_reason_status(reason: cockpit_core::engine::IdleReason) -> Option<IdleReasonStatus> {
     match reason {
-        crate::engine::IdleReason::Completed => None,
-        crate::engine::IdleReason::GoalComplete => Some(IdleReasonStatus {
+        cockpit_core::engine::IdleReason::Completed => None,
+        cockpit_core::engine::IdleReason::GoalComplete => Some(IdleReasonStatus {
             text: "goal session completed".to_string(),
             kind: ToastKind::Success,
         }),
-        crate::engine::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
+        cockpit_core::engine::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
             text: format!("goal stalled ({code}) — run `/goal resume` or send guidance"),
             kind: ToastKind::Warning,
         }),
-        crate::engine::IdleReason::BudgetLimited => Some(IdleReasonStatus {
+        cockpit_core::engine::IdleReason::BudgetLimited => Some(IdleReasonStatus {
             text: "goal paused: token budget reached — run `/goal resume` or adjust budget"
                 .to_string(),
             kind: ToastKind::Warning,
         }),
-        crate::engine::IdleReason::UsageLimited => Some(IdleReasonStatus {
+        cockpit_core::engine::IdleReason::UsageLimited => Some(IdleReasonStatus {
             text: "usage limit — auto-resuming shortly".to_string(),
             kind: ToastKind::Warning,
         }),
-        crate::engine::IdleReason::Error { class } => Some(IdleReasonStatus {
+        cockpit_core::engine::IdleReason::Error { class } => Some(IdleReasonStatus {
             text: format!("turn stopped on {class} — inspect the error and retry"),
             kind: ToastKind::Error,
         }),
-        crate::engine::IdleReason::Interrupted => Some(IdleReasonStatus {
+        cockpit_core::engine::IdleReason::Interrupted => Some(IdleReasonStatus {
             text: "turn interrupted".to_string(),
             kind: ToastKind::Info,
         }),
@@ -2459,7 +2459,7 @@ impl App {
     }
 
     #[cfg(test)]
-    pub fn new_with_db(project: Option<&Path>, no_sandbox: bool, db: crate::db::Db) -> Self {
+    pub fn new_with_db(project: Option<&Path>, no_sandbox: bool, db: cockpit_db::Db) -> Self {
         Self::new_inner(
             project,
             no_sandbox,
@@ -2471,7 +2471,7 @@ impl App {
     pub fn new_with_db_and_workspace_trust(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: crate::db::Db,
+        db: cockpit_db::Db,
         trust: StartupWorkspaceTrust,
     ) -> Self {
         Self::new_inner(project, no_sandbox, Some(db), trust)
@@ -2480,7 +2480,7 @@ impl App {
     pub fn new_with_db_and_session(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: crate::db::Db,
+        db: cockpit_db::Db,
         session_id: uuid::Uuid,
     ) -> Self {
         let mut app = Self::new_inner(
@@ -2502,10 +2502,10 @@ impl App {
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
-        startup_db: Option<crate::db::Db>,
+        startup_db: Option<cockpit_db::Db>,
         startup_trust: StartupWorkspaceTrust,
     ) -> Self {
-        let mut timer = crate::startup::PhaseTimer::start("App::new");
+        let mut timer = cockpit_core::startup::PhaseTimer::start("App::new");
         // Skip the synchronous `git status` here — it can take seconds in a
         // giant repo and would block the first frame. `spawn_git_refresh`
         // does an immediate background refresh and the branch pill pops in
@@ -2716,9 +2716,9 @@ impl App {
             active_schedules: std::collections::BTreeMap::new(),
             ctrl_c_armed_at: None,
             no_sandbox,
-            sandbox_mode: crate::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
+            sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
             container_network_enabled: false,
-            container_availability: crate::container::initial_availability_unknown(),
+            container_availability: cockpit_core::container::initial_availability_unknown(),
             caffeinate_active: false,
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),
@@ -2860,7 +2860,7 @@ impl App {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let _ = agent_runner::attached_request_tx_blocking(
                     runner.attached_request_tx.clone(),
-                    crate::daemon::proto::Request::EndBtwFork {
+                    cockpit_core::daemon::proto::Request::EndBtwFork {
                         parent_session_id: runner.session_id,
                     },
                 );
@@ -3104,8 +3104,8 @@ fn editor_argv_for_target(editor: &std::ffi::OsStr, target: &str) -> Vec<String>
 
 /// Resolve the answering-dialog config (GOALS §3b) from the effective layered
 /// `config.json`. Used to read the anti-misfire lockout delay.
-fn load_dialog_config(cwd: &Path) -> crate::config::extended::DialogConfig {
-    crate::config::extended::load_for_cwd(cwd).dialog
+fn load_dialog_config(cwd: &Path) -> cockpit_config::extended::DialogConfig {
+    cockpit_config::extended::load_for_cwd(cwd).dialog
 }
 
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`

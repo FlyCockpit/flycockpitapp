@@ -2,7 +2,7 @@ use super::*;
 
 impl App {
     pub(super) fn swap_primary_agent(&mut self, name: &str) {
-        if crate::agents::is_hidden_primary(name) {
+        if cockpit_core::agents::is_hidden_primary(name) {
             self.push_plain(format!(
                 "`{name}` is hidden — start it with `/multireview`."
             ));
@@ -17,8 +17,8 @@ impl App {
         // (`/plan`/`/swarm`/`/build`, `/agent <gated>`, `Shift+Tab`)
         // passes through; the gated names are already hidden from the cycle /
         // `/agent` list, so this guards a direct `/plan`-style invocation.
-        if crate::agents::is_experimental_primary(name)
-            && !crate::config::extended::load_for_cwd(&self.launch.cwd).experimental_mode
+        if cockpit_core::agents::is_experimental_primary(name)
+            && !cockpit_config::extended::load_for_cwd(&self.launch.cwd).experimental_mode
         {
             self.push_plain(format!(
                 "`{name}` requires experimental mode — enable it in `/settings`."
@@ -27,7 +27,7 @@ impl App {
         }
         self.send_daemon_request(
             "/agent",
-            crate::daemon::proto::Request::SetAgent {
+            cockpit_core::daemon::proto::Request::SetAgent {
                 name: name.to_string(),
             },
             ControlApplied::PrimaryAgentSwitch {
@@ -71,7 +71,7 @@ impl App {
     pub(super) fn start_multireview(&mut self, kickoff: String) {
         self.send_daemon_request(
             "/multireview",
-            crate::daemon::proto::Request::SetAgent {
+            cockpit_core::daemon::proto::Request::SetAgent {
                 name: "Multireview".to_string(),
             },
             ControlApplied::Multireview { kickoff },
@@ -84,14 +84,14 @@ impl App {
     /// [`Self::swap_primary_agent`], so it carries the same confirmation
     /// line and start-a-session-first guard `/plan`/`/build` have.
     pub(super) fn cycle_primary_agent(&mut self) {
-        let order = crate::agents::chat_ownable_primaries(&self.launch.cwd);
-        let next = crate::agents::next_primary_in_cycle(&self.launch.agent_name, &order);
+        let order = cockpit_core::agents::chat_ownable_primaries(&self.launch.cwd);
+        let next = cockpit_core::agents::next_primary_in_cycle(&self.launch.agent_name, &order);
         self.swap_primary_agent(&next);
     }
 
     pub(super) fn open_footer_agent_picker(&mut self) {
         self.footer_mode_picker = None;
-        let order = crate::agents::chat_ownable_primaries(&self.launch.cwd);
+        let order = cockpit_core::agents::chat_ownable_primaries(&self.launch.cwd);
         let current = self
             .agent_path
             .first()
@@ -145,7 +145,7 @@ impl App {
         &mut self,
         provider: String,
         model: String,
-        kind: crate::daemon::proto::AuthFailureKind,
+        kind: cockpit_core::daemon::proto::AuthFailureKind,
         failed_at_epoch_secs: i64,
     ) {
         self.auth_failure_annotations.insert(
@@ -222,7 +222,7 @@ impl App {
         };
         let oauth_expired = matches!(
             notice.kind,
-            crate::daemon::proto::AuthFailureKind::OAuthExpired { .. }
+            cockpit_core::daemon::proto::AuthFailureKind::OAuthExpired { .. }
         );
         self.dialog = crate::tui::settings::Dialog::open_provider_settings(
             &self.launch.cwd,
@@ -243,7 +243,7 @@ impl App {
         if let Some(active) = selected {
             self.notify_active_model_selected(
                 active,
-                crate::daemon::proto::ActiveModelSwitchTrigger::Picker,
+                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             );
         }
         let line = self.model_summary_history_line();
@@ -252,13 +252,13 @@ impl App {
 
     pub(super) fn notify_active_model_selected(
         &mut self,
-        active: crate::config::providers::ActiveModelRef,
-        trigger: crate::daemon::proto::ActiveModelSwitchTrigger,
+        active: cockpit_config::providers::ActiveModelRef,
+        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
     ) {
         let provider = active.provider.clone();
         let model = active.model.clone();
         self.record_usage(
-            crate::daemon::proto::UsageKind::Model,
+            cockpit_core::daemon::proto::UsageKind::Model,
             format!("{provider}/{model}"),
             None,
         );
@@ -280,7 +280,7 @@ impl App {
                 let model = active.model.clone();
                 self.notify_active_model_selected(
                     active,
-                    crate::daemon::proto::ActiveModelSwitchTrigger::Cycle,
+                    cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
                 );
                 self.push_plain(format!("/model: active model is now {provider}/{model} ★"));
             }
@@ -329,14 +329,14 @@ impl App {
         if let Some(mode) = commit.llm_mode {
             self.send_daemon_request(
                 "/quick",
-                crate::daemon::proto::Request::SetSessionLlmMode { mode },
+                cockpit_core::daemon::proto::Request::SetSessionLlmMode { mode },
                 ControlApplied::CacheBreakWarning,
             );
         }
         if let Some((enabled, default_depth)) = commit.recursion {
             self.send_daemon_request(
                 "/quick",
-                crate::daemon::proto::Request::SetDelegationRecursion {
+                cockpit_core::daemon::proto::Request::SetDelegationRecursion {
                     enabled,
                     default_depth,
                 },
@@ -346,7 +346,7 @@ impl App {
         if let Some(enabled) = commit.trusted_only {
             self.send_daemon_request(
                 "/quick",
-                crate::daemon::proto::Request::SetTrustedOnly {
+                cockpit_core::daemon::proto::Request::SetTrustedOnly {
                     enabled: Some(enabled),
                 },
                 ControlApplied::None,
@@ -355,7 +355,7 @@ impl App {
         if commit.sandbox_mode.is_some() || commit.container_network_enabled.is_some() {
             self.send_daemon_request(
                 "/quick",
-                crate::daemon::proto::Request::SetSandbox {
+                cockpit_core::daemon::proto::Request::SetSandbox {
                     mode: commit.sandbox_mode,
                     container_network_enabled: commit.container_network_enabled,
                 },
@@ -365,26 +365,26 @@ impl App {
         if let Some(mode) = commit.approval_mode {
             self.send_daemon_request(
                 "/quick",
-                crate::daemon::proto::Request::SetApprovalMode { mode },
+                cockpit_core::daemon::proto::Request::SetApprovalMode { mode },
                 ControlApplied::None,
             );
         }
         if let Some((provider, model)) = commit.active_model {
             self.record_usage(
-                crate::daemon::proto::UsageKind::Model,
+                cockpit_core::daemon::proto::UsageKind::Model,
                 format!("{provider}/{model}"),
                 None,
             );
             self.send_daemon_request(
                 "/quick",
                 active_model_request(
-                    crate::config::providers::ActiveModelRef {
+                    cockpit_config::providers::ActiveModelRef {
                         provider: provider.clone(),
                         model: model.clone(),
                         reasoning_effort: None,
                         thinking_mode: None,
                     },
-                    crate::daemon::proto::ActiveModelSwitchTrigger::Quick,
+                    cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
                 ),
                 ControlApplied::QuickActiveModel { provider, model },
             );
@@ -401,26 +401,30 @@ impl App {
         self.cycle_primary_agent();
     }
 
-    pub(super) fn set_footer_llm_mode(&mut self, target: crate::config::extended::LlmMode) {
+    pub(super) fn set_footer_llm_mode(&mut self, target: cockpit_config::extended::LlmMode) {
         self.handle_llm_mode_command(target.as_str());
     }
 
     pub(super) fn previous_llm_mode(
-        mode: crate::config::extended::LlmMode,
-    ) -> crate::config::extended::LlmMode {
+        mode: cockpit_config::extended::LlmMode,
+    ) -> cockpit_config::extended::LlmMode {
         match mode {
-            crate::config::extended::LlmMode::Defensive => {
-                crate::config::extended::LlmMode::Frontier
+            cockpit_config::extended::LlmMode::Defensive => {
+                cockpit_config::extended::LlmMode::Frontier
             }
-            crate::config::extended::LlmMode::Normal => crate::config::extended::LlmMode::Defensive,
-            crate::config::extended::LlmMode::Frontier => crate::config::extended::LlmMode::Normal,
+            cockpit_config::extended::LlmMode::Normal => {
+                cockpit_config::extended::LlmMode::Defensive
+            }
+            cockpit_config::extended::LlmMode::Frontier => {
+                cockpit_config::extended::LlmMode::Normal
+            }
         }
     }
 
     pub(super) fn send_daemon_request(
         &mut self,
         label: &str,
-        req: crate::daemon::proto::Request,
+        req: cockpit_core::daemon::proto::Request,
         applied: ControlApplied,
     ) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
@@ -483,8 +487,8 @@ impl App {
             ControlApplied::Multireview { kickoff } => {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
                 self.begin_working_span();
-                let submission = crate::engine::message::UserSubmission {
-                    kind: crate::engine::message::UserSubmissionKind::User,
+                let submission = cockpit_core::engine::message::UserSubmission {
+                    kind: cockpit_core::engine::message::UserSubmissionKind::User,
                     text: kickoff.clone(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -566,10 +570,10 @@ impl App {
 }
 
 fn active_model_request(
-    active: crate::config::providers::ActiveModelRef,
-    trigger: crate::daemon::proto::ActiveModelSwitchTrigger,
-) -> crate::daemon::proto::Request {
-    crate::daemon::proto::Request::SetActiveModel {
+    active: cockpit_config::providers::ActiveModelRef,
+    trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+) -> cockpit_core::daemon::proto::Request {
+    cockpit_core::daemon::proto::Request::SetActiveModel {
         provider: active.provider,
         model: active.model,
         trigger,

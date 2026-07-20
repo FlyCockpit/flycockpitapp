@@ -7,11 +7,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::engine::resource_scheduler::{
-    ResourceQueuedSnapshot, ResourceQueuedState, ResourceRunningSnapshot, ResourceSchedulerSnapshot,
-};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use cockpit_core::engine::resource_scheduler::{
+    ResourceQueuedSnapshot, ResourceQueuedState, ResourceRunningSnapshot, ResourceSchedulerSnapshot,
+};
 
 #[derive(Debug)]
 pub enum ResourcesOutcome {
@@ -326,7 +326,7 @@ fn command_label(label: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::resource_scheduler::{
+    use cockpit_core::engine::resource_scheduler::{
         ResourcePoolSnapshot, ResourceRequestMetadata, ResourceRequirements,
     };
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};

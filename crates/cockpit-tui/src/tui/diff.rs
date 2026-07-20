@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::config::extended::DiffStyle;
+use cockpit_config::extended::DiffStyle;
 
 /// Minimum terminal width (in columns) for [`DiffStyle::SideBySide`].
 /// Below this, [`render_diff`] falls back to [`DiffStyle::Inline`].

@@ -96,10 +96,10 @@ impl App {
         let Some(session_id) = self.current_session_id() else {
             return Vec::new();
         };
-        let snapshot = crate::db::Db::open_default()
+        let snapshot = cockpit_db::Db::open_default()
             .and_then(|db| {
                 db.read_blocking(|conn| {
-                    crate::engine::rehydrate::subagent_history_snapshot_conn(
+                    cockpit_core::engine::rehydrate::subagent_history_snapshot_conn(
                         conn,
                         session_id,
                         task_call_id,
@@ -196,7 +196,7 @@ impl App {
         self.history_render_versions.resize(self.history.len(), 0);
         self.history_render_fingerprints
             .resize(self.history.len(), 0);
-        let req = crate::daemon::proto::Request::SteerDelegation {
+        let req = cockpit_core::daemon::proto::Request::SteerDelegation {
             session_id,
             task_call_id: view.task_call_id,
             label: view.label,
@@ -206,7 +206,7 @@ impl App {
             AsyncActionKind::DaemonRpc("subagent.steer"),
             AsyncActionPolicy::AllowConcurrent,
             move || match agent_runner::daemon_request_blocking(req)? {
-                crate::daemon::proto::Response::DelegationSteer { result } => {
+                cockpit_core::daemon::proto::Response::DelegationSteer { result } => {
                     Ok(AsyncActionPayload::DelegationSteer(result))
                 }
                 other => Err(format!("unexpected steer response: {other:?}")),
@@ -217,32 +217,32 @@ impl App {
 
     pub(super) fn apply_subagent_steer_result(
         &mut self,
-        result: crate::daemon::proto::DelegationSteerResult,
+        result: cockpit_core::daemon::proto::DelegationSteerResult,
     ) {
         let line = match result.status {
-            crate::daemon::proto::DelegationSteerStatus::Queued => {
+            cockpit_core::daemon::proto::DelegationSteerStatus::Queued => {
                 let label = result.label.clone().unwrap_or_default();
                 format!(
                     "steer queued for {}/{} at next turn boundary",
                     result.task_call_id, label
                 )
             }
-            crate::daemon::proto::DelegationSteerStatus::NotSteerable => {
+            cockpit_core::daemon::proto::DelegationSteerStatus::NotSteerable => {
                 format!("steer not queued: {}", result.message)
             }
-            crate::daemon::proto::DelegationSteerStatus::InternalError => {
+            cockpit_core::daemon::proto::DelegationSteerStatus::InternalError => {
                 format!("steer failed: {}", result.message)
             }
         };
         match result.status {
-            crate::daemon::proto::DelegationSteerStatus::Queued => {
+            cockpit_core::daemon::proto::DelegationSteerStatus::Queued => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.notice = Some(line);
                 } else {
                     self.show_toast(line, ToastKind::Success);
                 }
             }
-            crate::daemon::proto::DelegationSteerStatus::NotSteerable => {
+            cockpit_core::daemon::proto::DelegationSteerStatus::NotSteerable => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.read_only = true;
                     view.finished = true;
@@ -255,7 +255,7 @@ impl App {
                     self.show_toast(line, ToastKind::Warning);
                 }
             }
-            crate::daemon::proto::DelegationSteerStatus::InternalError => {
+            cockpit_core::daemon::proto::DelegationSteerStatus::InternalError => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.notice = Some(line);
                 } else {

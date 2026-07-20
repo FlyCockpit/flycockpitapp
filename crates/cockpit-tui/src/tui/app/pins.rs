@@ -2,12 +2,12 @@
 //! pick-a-message mode, the `/pins` review mode, the mouse `[fork]` and
 //! `[pin]`/`[unpin]` controls, and the below-input count indicator's data source.
 //!
-//! Pins are pure DB state the TUI owns directly via [`crate::db::Db`]
+//! Pins are pure DB state the TUI owns directly via [`cockpit_db::Db`]
 //! (`open_default`, same pattern as `/sessions` + `/export`). Nothing here
 //! ever enters the outbound model prompt (token economy, priority #2).
 
-use crate::db::Db;
 use crate::tui::history::HistoryEntry;
+use cockpit_db::Db;
 
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 use std::collections::HashSet;
@@ -546,7 +546,7 @@ impl App {
             clicked_chat_row: 0,
             cursor: 0,
             items: crate::tui::context_menu::ContextMenu::build_items(
-                crate::clipboard::is_ssh(),
+                cockpit_core::sysinfo::is_ssh(),
                 false,
             ),
         });
@@ -703,9 +703,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{App, CopyShape, pin_refresh_call_count, reset_pin_refresh_call_count};
-    use crate::db::Db;
-    use crate::db::session_log::SessionEventKind;
     use crate::tui::settings::Dialog;
+    use cockpit_db::Db;
+    use cockpit_db::session_log::SessionEventKind;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -743,7 +743,7 @@ mod tests {
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
@@ -912,7 +912,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fork_for_seq_sends_fork_session_request_with_message_seq() {
-        use crate::daemon::proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
+        use cockpit_core::daemon::proto::{
+            Body, Envelope, ProtoStream, RecvFrame, Request, Response,
+        };
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();

@@ -2,12 +2,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use uuid::Uuid;
 
-use crate::daemon::proto::{self, Request, Response};
-use crate::engine::TurnEvent;
-use crate::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage, UserSubmission};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg, route_text_delta};
+use cockpit_core::daemon::proto::{self, Request, Response};
+use cockpit_core::engine::TurnEvent;
+use cockpit_core::engine::message::{
+    QueueItemStatus, QueueTarget, QueuedUserMessage, UserSubmission,
+};
 
 use super::{App, new_pending, wire_history_to_entries};
 
@@ -115,7 +117,7 @@ impl BtwPane {
         &mut self,
         cwd: &std::path::Path,
         no_sandbox: bool,
-        mode: crate::daemon::client::LifecycleMode,
+        mode: cockpit_core::daemon::client::LifecycleMode,
     ) {
         if matches!(self.runner, Some(Ok(_))) {
             return;
@@ -281,7 +283,7 @@ impl BtwPane {
             return Err("btw pane is not attached".to_string());
         };
         let submission = UserSubmission {
-            kind: crate::engine::message::UserSubmissionKind::User,
+            kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: text.clone(),
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),
@@ -742,9 +744,9 @@ impl App {
             return;
         };
         let lockout = match reason {
-            crate::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
-            crate::daemon::proto::InterruptRaiseReason::Advance
-            | crate::daemon::proto::InterruptRaiseReason::Rehydration => {
+            cockpit_core::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
+            cockpit_core::daemon::proto::InterruptRaiseReason::Advance
+            | cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
                 self.fresh_dialog_lockout()
             }
         };
@@ -769,7 +771,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::proto::{
+    use cockpit_core::daemon::proto::{
         InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
     };
 
@@ -917,7 +919,7 @@ mod tests {
         pane.apply_event(
             TurnEvent::AgentIdle {
                 turn_id: Some("side".to_string()),
-                reason: crate::engine::IdleReason::Completed,
+                reason: cockpit_core::engine::IdleReason::Completed,
             },
             true,
         );

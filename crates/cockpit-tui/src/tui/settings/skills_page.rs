@@ -112,7 +112,7 @@ impl SettingsCx {
                     // the second.
                     if p.reset.activate() == ResetOutcome::Apply {
                         self.extended.skills =
-                            crate::config::extended::SkillsConfig::seeded_default();
+                            cockpit_config::extended::SkillsConfig::seeded_default();
                         p.cursor = p
                             .cursor
                             .min(TOGGLE_ROWS + self.extended.skills.scan_dirs.len());
@@ -348,7 +348,7 @@ fn dir_index(cursor: usize, dir_count: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use tempfile::TempDir;
 
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn skills_reset_arms_then_restores_seeded_default() {
-        use crate::config::extended::SkillsConfig;
+        use cockpit_config::extended::SkillsConfig;
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_skills_dialog(&tmp);
         // Diverge from the seeded default.
@@ -630,7 +630,10 @@ impl SettingsPage for SkillsPage {
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
-        format!("{} › Skills", crate::welcome::display_path(&cx.config_path))
+        format!(
+            "{} › Skills",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {

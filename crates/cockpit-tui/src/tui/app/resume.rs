@@ -10,8 +10,8 @@ impl App {
         &mut self,
         result: crate::tui::dialog::question::QuestionResult,
     ) {
-        use crate::daemon::proto::{Request, ResolveResponse};
         use crate::tui::dialog::question::QuestionResult;
+        use cockpit_core::daemon::proto::{Request, ResolveResponse};
         let (interrupt_id, response) = match result {
             QuestionResult::Submit {
                 interrupt_id,
@@ -78,7 +78,7 @@ impl App {
         self.pending_prune_confirm = false;
         self.send_daemon_request(
             "/prune",
-            crate::daemon::proto::Request::Prune,
+            cockpit_core::daemon::proto::Request::Prune,
             ControlApplied::None,
         );
     }
@@ -91,7 +91,7 @@ impl App {
 
     /// `/compact`: enqueue an in-place compaction turn on the active session.
     pub(super) fn start_compact(&mut self) {
-        let submission = crate::engine::message::UserSubmission::compact_notice();
+        let submission = cockpit_core::engine::message::UserSubmission::compact_notice();
         self.ensure_agent_runner();
         let span_orphaned = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.input_tx.try_send(submission) {
@@ -216,12 +216,14 @@ impl App {
     pub(super) fn maybe_prompt_paused_work(
         &mut self,
         session_id: uuid::Uuid,
-        paused_work: Vec<crate::daemon::proto::PausedWorkSummary>,
+        paused_work: Vec<cockpit_core::daemon::proto::PausedWorkSummary>,
     ) {
         if paused_work.is_empty() {
             return;
         }
-        use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+        use cockpit_core::daemon::proto::{
+            InterruptOption, InterruptQuestion, InterruptQuestionSet,
+        };
         let pending_tools: i64 = paused_work.iter().map(|item| item.pending_tool_count).sum();
         let agents = paused_work
             .iter()
@@ -279,9 +281,11 @@ impl App {
 
     pub(super) fn maybe_prompt_resume_repair(
         &mut self,
-        state: crate::daemon::proto::ResumeRepairState,
+        state: cockpit_core::daemon::proto::ResumeRepairState,
     ) {
-        use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+        use cockpit_core::daemon::proto::{
+            InterruptOption, InterruptQuestion, InterruptQuestionSet,
+        };
         let ids = if state.failing_tool_call_ids.is_empty() {
             "unknown tool id".to_string()
         } else {
@@ -406,7 +410,7 @@ impl App {
                 self.push_plain("/resume: applying explicit synthetic repair.".to_string());
                 self.send_daemon_request(
                     "/resume",
-                    crate::daemon::proto::Request::RepairResume {
+                    cockpit_core::daemon::proto::Request::RepairResume {
                         session_id: pending.state.session_id,
                     },
                     ControlApplied::None,
@@ -439,12 +443,12 @@ impl App {
         daemon_version: &str,
         compatible: bool,
     ) {
-        if compatible || daemon_version == crate::daemon::proto::DAEMON_VERSION {
+        if compatible || daemon_version == cockpit_core::daemon::proto::DAEMON_VERSION {
             return;
         }
         self.push_plain(format!(
             "daemon {daemon_version} is newer than this client {}; relaunch cockpit to refresh",
-            crate::daemon::proto::DAEMON_VERSION
+            cockpit_core::daemon::proto::DAEMON_VERSION
         ));
     }
 }

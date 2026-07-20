@@ -20,11 +20,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::config::extended::{
+use crate::tui::textfield::TextField;
+use cockpit_config::extended::{
     ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, PromptInputMode,
     builtin_harness_presets,
 };
-use crate::tui::textfield::TextField;
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
@@ -502,7 +502,7 @@ impl SettingsCx {
         lines.push(Line::from(vec![
             Span::styled("config: ".to_string(), muted),
             Span::styled(
-                crate::welcome::display_path(&self.extended_path),
+                cockpit_core::welcome::display_path(&self.extended_path),
                 focused_field_style(),
             ),
         ]));
@@ -757,7 +757,7 @@ impl SettingsPage for HarnessesPage {
         };
         format!(
             "{}{}",
-            crate::welcome::display_path(&cx.config_path),
+            cockpit_core::welcome::display_path(&cx.config_path),
             crumbs
         )
     }

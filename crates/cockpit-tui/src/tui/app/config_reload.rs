@@ -27,7 +27,7 @@ impl App {
     /// markdown rendering) so changes made via `/settings` take effect
     /// immediately on dialog close.
     pub(super) fn reload_tui_config(&mut self) {
-        let extended = crate::config::extended::load_for_cwd(&self.launch.cwd);
+        let extended = cockpit_config::extended::load_for_cwd(&self.launch.cwd);
         let tui_cfg = extended.tui.clone();
         self.vim_setting = tui_cfg.vim_mode;
         self.thinking_setting = tui_cfg.thinking;

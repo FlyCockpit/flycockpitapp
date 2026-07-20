@@ -27,20 +27,20 @@ pub enum AsyncActionPayload {
     Text(String),
     Bool(bool),
     #[allow(dead_code)]
-    DaemonResponse(Box<crate::daemon::proto::Response>),
-    Sessions(Vec<crate::daemon::proto::SessionSummary>),
+    DaemonResponse(Box<cockpit_core::daemon::proto::Response>),
+    Sessions(Vec<cockpit_core::daemon::proto::SessionSummary>),
     SessionMessages {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
-        messages: Vec<crate::daemon::proto::SessionMessage>,
+        messages: Vec<cockpit_core::daemon::proto::SessionMessage>,
         has_more: bool,
     },
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
-    ResourceSnapshot(crate::engine::resource_scheduler::ResourceSchedulerSnapshot),
+    ResourceSnapshot(cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot),
     PromoteResource {
-        status: crate::daemon::proto::ResourcePromoteStatus,
+        status: cockpit_core::daemon::proto::ResourcePromoteStatus,
         message: String,
-        snapshot: crate::engine::resource_scheduler::ResourceSchedulerSnapshot,
+        snapshot: cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot,
     },
     ForkCreated {
         parent_session_id: uuid::Uuid,
@@ -52,19 +52,19 @@ pub enum AsyncActionPayload {
     NoteRecorded {
         text: String,
     },
-    DelegationSteer(crate::daemon::proto::DelegationSteerResult),
+    DelegationSteer(cockpit_core::daemon::proto::DelegationSteerResult),
     GuidanceEstimate(crate::tui::agent_runner::GuidanceEstimate),
     StartupGuidanceEstimate {
         cwd: std::path::PathBuf,
         active_model: Option<(String, String)>,
         estimate: crate::tui::agent_runner::GuidanceEstimate,
     },
-    ContainerAvailability(crate::container::ContainerAvailability),
+    ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
-        org: Option<crate::db::org_sync::OrgSyncDisclosure>,
-        connector: Option<crate::db::connector::ConnectorDisclosure>,
+        org: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
+        connector: Option<cockpit_db::connector::ConnectorDisclosure>,
     },
-    ProviderUsage(Vec<crate::providers::usage::ProviderUsageSnapshot>),
+    ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
     PasteTokenCount {
         block_id: u64,
         tokens: usize,
@@ -77,14 +77,14 @@ pub enum AsyncActionPayload {
     },
     DaemonProbe {
         cwd: std::path::PathBuf,
-        status: crate::daemon::DaemonStatus,
+        status: cockpit_core::daemon::DaemonStatus,
     },
-    OAuthCodexBegin(crate::auth::codex_oauth::DeviceLogin),
+    OAuthCodexBegin(cockpit_core::auth::codex_oauth::DeviceLogin),
     OAuthCodexComplete {
         logged_in: bool,
     },
     OAuthGrokBegin {
-        login: crate::auth::xai_oauth::ManualLogin,
+        login: cockpit_core::auth::xai_oauth::ManualLogin,
     },
     OAuthGrokComplete {
         logged_in: bool,

@@ -166,7 +166,7 @@ pub fn emit_osc8(registry: &LinkRegistry, enabled: bool) -> io::Result<()> {
 }
 
 pub fn open_browser(url: &str) -> anyhow::Result<()> {
-    crate::browser::open(url)
+    cockpit_core::browser::open(url)
 }
 
 #[cfg(test)]

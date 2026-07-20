@@ -10,13 +10,16 @@
 //!   when the session is over SSH so the caller can show a toast and
 //!   fall back to `copy_plain`.
 //!
-//! SSH detection is `$SSH_CONNECTION` / `$SSH_TTY` — OpenSSH sets these
-//! on the remote side. Inside tmux on a local machine they're unset
-//! so we still pick the local-clipboard path.
+//! SSH detection lives in [`cockpit_core::sysinfo::is_ssh`] — it is an
+//! environment probe rather than terminal-UI logic, and non-TUI callers
+//! such as `cockpit setup` need it too. It reads `$SSH_CONNECTION` /
+//! `$SSH_TTY`, which OpenSSH sets on the remote side; inside tmux on a
+//! local machine they're unset so we still pick the local-clipboard path.
 
 use std::io::{Write, stdout};
 
 use base64::Engine;
+use cockpit_core::sysinfo::is_ssh;
 
 /// Why a copy attempt didn't reach the system clipboard.
 #[derive(Debug)]
@@ -118,15 +121,6 @@ pub fn copy_rich(plain: &str, html: &str) -> Result<(), CopyError> {
         return Err(CopyError::UnsupportedOverSsh);
     }
     arboard_set_html(html, plain)
-}
-
-/// True when the current process appears to be running over SSH —
-/// `$SSH_CONNECTION` or `$SSH_TTY` is set. Used by the rich-text
-/// copy path to fall back to OSC52 plain, and by the context-menu
-/// builder to drop "Copy as rich text" from the offered list (it
-/// can't reach the local clipboard over SSH anyway).
-pub fn is_ssh() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 
 /// xterm's documented OSC-string parse ceiling for the base64 payload;

@@ -47,6 +47,19 @@ pub fn os_string() -> String {
     }
 }
 
+/// True when the current process appears to be running over SSH —
+/// `$SSH_CONNECTION` or `$SSH_TTY` is set. OpenSSH sets these on the remote
+/// side; inside tmux on a local machine they are unset, so a local session
+/// still reads as local.
+///
+/// Environment detection, not terminal-UI logic: the TUI clipboard uses it
+/// to pick OSC52 over the local clipboard and to drop "Copy as rich text"
+/// from the context menu, and `cockpit setup` uses it to decide whether an
+/// OAuth URL can be opened locally.
+pub fn is_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

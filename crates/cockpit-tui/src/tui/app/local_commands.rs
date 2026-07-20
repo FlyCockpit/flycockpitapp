@@ -31,8 +31,8 @@ impl App {
     /// untouched.
     pub(super) fn resolve_init_choice(&mut self, pending: PendingInit, selected_id: Option<&str>) {
         let mode = match selected_id {
-            Some("update") => crate::commands::init::InitMode::Update,
-            Some("overwrite") => crate::commands::init::InitMode::Overwrite,
+            Some("update") => cockpit_core::init::InitMode::Update,
+            Some("overwrite") => cockpit_core::init::InitMode::Overwrite,
             _ => {
                 self.push_plain(format!(
                     "/init: cancelled — `{}` left untouched",
@@ -41,7 +41,7 @@ impl App {
                 return;
             }
         };
-        let prompt = crate::commands::init::build_init_prompt(&pending.display, mode);
+        let prompt = cockpit_core::init::build_init_prompt(&pending.display, mode);
         self.dispatch_init_turn(&pending.display, prompt);
     }
 
@@ -102,7 +102,7 @@ impl App {
     pub(super) fn dispatch_init_turn(&mut self, display: &str, wire: String) {
         self.chat_scroll_offset = 0;
         self.begin_working_span();
-        let submission = crate::engine::message::UserSubmission::text(wire);
+        let submission = cockpit_core::engine::message::UserSubmission::text(wire);
         self.dispatch_optimistic_user_submission(
             format!("/init {display}"),
             submission,
@@ -115,10 +115,10 @@ impl App {
     pub(super) fn dispatch_optimistic_user_submission(
         &mut self,
         display: String,
-        mut submission: crate::engine::message::UserSubmission,
+        mut submission: cockpit_core::engine::message::UserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
-        tag_expansions: &[crate::daemon::proto::TagExpansionMeta],
+        tag_expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
     ) -> DispatchOutcome {
         if submission.display_text.is_none() && submission.text != display {
             submission.display_text = Some(display.clone());
@@ -211,13 +211,13 @@ impl App {
         let request = match selected_id {
             Some("resume") => {
                 self.push_plain("/resume: resuming paused daemon work.".to_string());
-                crate::daemon::proto::Request::ResumePausedWork {
+                cockpit_core::daemon::proto::Request::ResumePausedWork {
                     session_id: pending.session_id,
                 }
             }
             Some("cancel") | None => {
                 self.push_plain("/resume: cancelled paused daemon work.".to_string());
-                crate::daemon::proto::Request::CancelPausedWork {
+                cockpit_core::daemon::proto::Request::CancelPausedWork {
                     session_id: pending.session_id,
                 }
             }
@@ -231,7 +231,7 @@ impl App {
             self.push_plain("/goal: no active session. Usage: /goal <objective> | status | pause | resume | clear | edit".to_string());
             return;
         };
-        match crate::db::Db::open_default().and_then(|db| {
+        match cockpit_db::Db::open_default().and_then(|db| {
             db.refresh_session_goal_usage(session_id)?;
             db.current_session_goal(session_id, false)
         }) {
@@ -260,7 +260,7 @@ impl App {
 
     pub(super) fn set_goal_status(
         &mut self,
-        status: crate::db::session_goals::GoalStatus,
+        status: cockpit_db::session_goals::GoalStatus,
         label: &str,
     ) {
         let Some(session_id) = self.launch.session_id else {
@@ -269,7 +269,7 @@ impl App {
             });
             return;
         };
-        match crate::db::Db::open_default()
+        match cockpit_db::Db::open_default()
             .and_then(|db| db.set_session_goal_status(session_id, status))
         {
             Ok(goal) => self.push_plain(format!("{label}: goal is now {}.", goal.status.as_str())),
@@ -282,7 +282,7 @@ impl App {
     pub(super) fn dispatch_goal_turn(&mut self, display: &str, wire: String) {
         self.chat_scroll_offset = 0;
         self.begin_working_span();
-        let submission = crate::engine::message::UserSubmission::text(wire);
+        let submission = cockpit_core::engine::message::UserSubmission::text(wire);
         self.dispatch_optimistic_user_submission(
             format!("/goal {display}"),
             submission,
@@ -305,8 +305,8 @@ impl App {
     pub(super) fn dispatch_skill_invocation(&mut self, display: String, name: &str, args: &str) {
         self.chat_scroll_offset = 0;
         self.begin_working_span();
-        let submission = crate::engine::message::UserSubmission {
-            kind: crate::engine::message::UserSubmissionKind::User,
+        let submission = cockpit_core::engine::message::UserSubmission {
+            kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: args.trim().to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -347,7 +347,7 @@ impl App {
     pub(super) fn cancel_schedule(&mut self, job_id: &str, cmd: &str) {
         self.send_daemon_request(
             cmd,
-            crate::daemon::proto::Request::CancelSchedule {
+            cockpit_core::daemon::proto::Request::CancelSchedule {
                 job_id: job_id.to_string(),
             },
             ControlApplied::ScheduleCancel {
@@ -401,26 +401,26 @@ impl App {
     /// `.cockpit/`), preferring an existing file, else the first creatable.
     pub(super) fn mcp_config_path(&self) -> Option<std::path::PathBuf> {
         let cwd = &self.launch.cwd;
-        for d in crate::config::dirs::discover_config_dirs(cwd) {
+        for d in cockpit_config::dirs::discover_config_dirs(cwd) {
             let p = d.path.join("mcp.json");
             if p.exists() {
                 return Some(p);
             }
         }
-        crate::config::dirs::cwd_scoped_creatable_dirs(cwd)
+        cockpit_config::dirs::cwd_scoped_creatable_dirs(cwd)
             .into_iter()
             .next()
             .map(|d| d.path.join("mcp.json"))
     }
 
-    pub(super) fn mcp_load(&self) -> crate::mcp::config::McpConfig {
+    pub(super) fn mcp_load(&self) -> cockpit_core::mcp::config::McpConfig {
         #[cfg(test)]
         MCP_LOAD_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        crate::mcp::config::McpConfig::discover(&self.launch.cwd)
+        cockpit_core::mcp::config::McpConfig::discover(&self.launch.cwd)
     }
 
-    pub(super) fn mcp_save(&mut self, cfg: &crate::mcp::config::McpConfig) -> bool {
+    pub(super) fn mcp_save(&mut self, cfg: &cockpit_core::mcp::config::McpConfig) -> bool {
         self.slash_menu_cache.borrow_mut().take();
         let Some(path) = self.mcp_config_path() else {
             self.push_plain("No writable .cockpit/ directory for MCP config".to_string());
@@ -491,8 +491,8 @@ impl App {
     /// elsewhere — reuse this verbatim). Returns `None` when the warning is
     /// meaningless because the active model/provider does not cache: reuses
     /// the pruning-policy no-cache predicate
-    /// ([`crate::engine::prune::cache_state`] →
-    /// [`crate::engine::prune::ColdReason::NoCacheProvider`]) rather than
+    /// ([`cockpit_core::engine::prune::cache_state`] →
+    /// [`cockpit_core::engine::prune::ColdReason::NoCacheProvider`]) rather than
     /// re-deriving "does this provider cache."
     pub(super) fn cache_break_warning(&self) -> Option<String> {
         if self.active_provider_caches() {
@@ -509,15 +509,15 @@ impl App {
 
     /// Whether the active model/provider has a prompt cache at all. Reuses
     /// the pruning-policy no-cache predicate: the resolved
-    /// [`crate::config::providers::CacheConfig`] is fed to
-    /// [`crate::engine::prune::cache_state`]; a `NoCacheProvider` cold reason
+    /// [`cockpit_config::providers::CacheConfig`] is fed to
+    /// [`cockpit_core::engine::prune::cache_state`]; a `NoCacheProvider` cold reason
     /// means it never caches. Best-effort — an unresolvable model is treated
     /// as caching so the warning errs on the side of showing.
     pub(super) fn active_provider_caches(&self) -> bool {
         let Some((provider, model)) = self.launch.active_model.as_ref() else {
             return true;
         };
-        let providers = crate::secret_ref::load_effective(&self.launch.cwd);
+        let providers = cockpit_core::secret_ref::load_effective(&self.launch.cwd);
         let cache = providers.resolve_cache(provider, model);
         cache_config_caches(&cache)
     }
@@ -530,7 +530,7 @@ impl App {
     /// edits take effect on the next turn without a restart. An unresolvable
     /// model falls through to the global default (on).
     pub(super) fn strip_inline_think(&self) -> bool {
-        let (extended, providers) = crate::auto_title::load_configs_for(&self.launch.cwd);
+        let (extended, providers) = cockpit_core::auto_title::load_configs_for(&self.launch.cwd);
         match self.launch.active_model.as_ref() {
             Some((provider, model)) => {
                 providers.resolve_inline_think(provider, model, extended.inline_think)
@@ -567,7 +567,7 @@ impl App {
         self.paste_registry.clear();
         self.reset_slash_window();
         self.record_usage(
-            crate::daemon::proto::UsageKind::Slash,
+            cockpit_core::daemon::proto::UsageKind::Slash,
             "skill".to_string(),
             None,
         );

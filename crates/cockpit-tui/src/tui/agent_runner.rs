@@ -2,11 +2,11 @@
 //!
 //! Phase 4 of the daemon migration: the TUI no longer owns the
 //! engine. Instead [`try_spawn`] probes (or auto-promotes) the daemon
-//! via [`crate::daemon::client`], attaches a session at the cwd, and
+//! via [`cockpit_core::daemon::client`], attaches a session at the cwd, and
 //! pipes the per-tick event stream from the daemon's broadcast back
 //! to the TUI in the same `Arc<Mutex<Vec<TurnEvent>>>` shape the rest
 //! of `app.rs` already consumes. The wire-shape of events is
-//! [`crate::daemon::proto::Event`]; we translate to [`TurnEvent`] at
+//! [`cockpit_core::daemon::proto::Event`]; we translate to [`TurnEvent`] at
 //! the boundary so the TUI rendering paths don't need to know they
 //! talk to a daemon.
 
@@ -19,10 +19,10 @@ use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
-use crate::daemon::image_upload::upload_submission_images;
-use crate::daemon::proto::{self, ErrorCode, Request, Response};
-use crate::engine::{
+use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
+use cockpit_core::daemon::image_upload::upload_submission_images;
+use cockpit_core::daemon::proto::{self, ErrorCode, Request, Response};
+use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
 
@@ -51,7 +51,7 @@ pub struct AgentRunner {
     /// Send user submissions here (text + any pasted image parts). Each
     /// becomes one `SendUserMessage` request; the daemon's queue-folding
     /// (GOALS §1c) is performed inside the worker, not here.
-    pub input_tx: mpsc::Sender<crate::engine::message::UserSubmission>,
+    pub input_tx: mpsc::Sender<cockpit_core::engine::message::UserSubmission>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
     pub record_tx: mpsc::Sender<Request>,
     /// Response-bearing control requests from TUI commands. Kept separate
@@ -74,7 +74,7 @@ pub struct AgentRunner {
     pub skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
     /// Queue-edit foreground target from the attach snapshot. Live updates
     /// arrive as `TurnEvent::ForegroundInputTarget`.
-    pub foreground_target: Option<crate::engine::message::QueueTarget>,
+    pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
     /// Authoritative active-model snapshot from `Attach`, used to seed chrome
     /// before any later live active-model event arrives.
     pub active_model_state: Option<proto::ActiveModelState>,
@@ -94,7 +94,7 @@ pub struct AgentRunner {
     pub usage: UsageCounts,
     /// `true` when this TUI *spawned* the daemon it's attached to (the
     /// daemonless `AlwaysEphemeral` path) and therefore owns its teardown
-    /// — the app builds an [`crate::daemon::ephemeral_guard::EphemeralDaemonGuard`]
+    /// — the app builds an [`cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard`]
     /// from this. `false` when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
     pub owns_daemon: bool,
@@ -183,7 +183,7 @@ struct AttachRequestContext {
     session_id: Uuid,
     project_root: String,
     no_sandbox: bool,
-    env_snapshot: crate::env_snapshot::EnvSnapshotWire,
+    env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire,
 }
 
 #[derive(Clone)]
@@ -364,7 +364,7 @@ fn try_spawn_inner(
     // use `block_in_place` to run a `block_on` without panicking.
     let attached = tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let mut timer = crate::startup::PhaseTimer::start("agent_runner::try_spawn");
+            let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
             let daemon = probe_or_spawn(mode)
                 .await
                 .map_err(|e| format!("daemon probe: {e}"))?;
@@ -372,7 +372,8 @@ fn try_spawn_inner(
             let owns_daemon = daemon.owns_daemon;
             let socket = daemon.socket.clone();
             let project_root = cwd.to_string_lossy().into_owned();
-            let (env_snapshot, _env_diagnostic) = crate::env_snapshot::capture_tui_shell_env();
+            let (env_snapshot, _env_diagnostic) =
+                cockpit_core::env_snapshot::capture_tui_shell_env();
             let attached = match daemon
                 .client
                 .request(Request::Attach {
@@ -388,9 +389,9 @@ fn try_spawn_inner(
                     // plan-level override is only for the headless plan-run
                     // path (`cockpit run --model`).
                     model_override: None,
-                    client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+                    client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
                     env_snapshot: Some(env_snapshot.to_wire()),
-                    env_policy: crate::env_snapshot::EnvDriftPolicy::Client,
+                    env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
                 })
                 .await
             {
@@ -529,7 +530,8 @@ fn try_spawn_inner(
         daemon_compatible,
     ) = attached;
 
-    let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
+    let (input_tx, mut input_rx) =
+        mpsc::channel::<cockpit_core::engine::message::UserSubmission>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
     let (control_tx, mut control_rx) = mpsc::channel::<ControlRequest>(32);
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel::<AttachedRequest>(32);
@@ -551,7 +553,9 @@ fn try_spawn_inner(
         session_id,
         project_root: cwd.to_string_lossy().into_owned(),
         no_sandbox,
-        env_snapshot: crate::env_snapshot::capture_tui_shell_env().0.to_wire(),
+        env_snapshot: cockpit_core::env_snapshot::capture_tui_shell_env()
+            .0
+            .to_wire(),
     };
     let mut client_tasks = ClientTasks::default();
 
@@ -893,7 +897,7 @@ pub struct GuidanceEstimate {
 /// an already-running daemon's calibrated estimate (no attach, no spawn —
 /// calling it at launch never creates a session); on any miss (no daemon,
 /// connect/request error, or the daemon couldn't answer) it falls back to
-/// a local raw-cl100k computation via [`crate::engine::builtin`]. The two
+/// a local raw-cl100k computation via [`cockpit_core::engine::builtin`]. The two
 /// modes may differ by the calibration factor; each is the best available
 /// for its mode. Best-effort and non-blocking for launch.
 pub async fn fetch_guidance_estimate_with_socket(
@@ -920,7 +924,7 @@ async fn daemon_guidance_estimate_at_socket(
     model: Option<String>,
     socket: &Path,
 ) -> Option<GuidanceEstimate> {
-    let client = crate::daemon::client::DaemonClient::connect(socket)
+    let client = cockpit_core::daemon::client::DaemonClient::connect(socket)
         .await
         .ok()?;
     let resp = client
@@ -948,7 +952,7 @@ async fn daemon_guidance_estimate_at_socket(
 }
 
 /// Daemonless fallback: size the guidance file body and the full composed
-/// system prompt in-process with raw cl100k (`crate::tokens::count`).
+/// system prompt in-process with raw cl100k (`cockpit_core::tokens::count`).
 /// Cheap and synchronous — `load_agent_guidance` only stats/reads one
 /// small file along the cwd→git-root walk — so it never blocks launch.
 fn local_guidance_estimate(
@@ -956,23 +960,23 @@ fn local_guidance_estimate(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> GuidanceEstimate {
-    let file = crate::engine::builtin::load_agent_guidance(cwd).map(|(path, body)| {
+    let file = cockpit_core::engine::builtin::load_agent_guidance(cwd).map(|(path, body)| {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        (name, crate::tokens::count(&body) as u64)
+        (name, cockpit_core::tokens::count(&body) as u64)
     });
     // No session exists yet at the fresh-chat indicator, so the system
     // prompt omits the `Session:` line — matching what the engine sends.
-    let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
-    let system_tokens = crate::tokens::count(&system_prompt) as u64;
+    let system_prompt = cockpit_core::engine::builtin::default_chat_system_prompt(cwd, "");
+    let system_tokens = cockpit_core::tokens::count(&system_prompt) as u64;
     let model_instruction_tokens = provider
         .zip(model)
         .and_then(|(provider, model)| {
-            let cfg = crate::secret_ref::load_effective(cwd);
+            let cfg = cockpit_core::secret_ref::load_effective(cwd);
             cfg.resolve_model_system_prompt(provider, model)
-                .map(|prompt| crate::tokens::count(prompt) as u64)
+                .map(|prompt| cockpit_core::tokens::count(prompt) as u64)
         })
         .unwrap_or(0);
     match file {
@@ -1024,7 +1028,7 @@ pub fn attached_request_tx_blocking(
 /// `block_in_place` pattern so it's callable from the synchronous TUI
 /// key handlers. `Err(String)` for any transport/typed failure.
 pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
-    use crate::daemon::{DaemonStatus, discover};
+    use cockpit_core::daemon::{DaemonStatus, discover};
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
     tokio::task::block_in_place(|| {
@@ -1033,7 +1037,7 @@ pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
             if !matches!(probe.status, DaemonStatus::Running) {
                 return Err("daemon not running".to_string());
             }
-            let client = crate::daemon::client::DaemonClient::connect(&probe.paths.socket)
+            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -1057,7 +1061,7 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
     let socket = socket.to_path_buf();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = crate::daemon::client::DaemonClient::connect(&socket)
+            let client = cockpit_core::daemon::client::DaemonClient::connect(&socket)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -1079,7 +1083,7 @@ fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
     let socket = socket.to_path_buf();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = crate::daemon::client::DaemonClient::connect(&socket)
+            let client = cockpit_core::daemon::client::DaemonClient::connect(&socket)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -1350,9 +1354,9 @@ async fn reconnect_and_attach(
             no_sandbox: attach_context.no_sandbox,
             interactive: true,
             model_override: None,
-            client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+            client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
             env_snapshot: Some(attach_context.env_snapshot.clone()),
-            env_policy: crate::env_snapshot::EnvDriftPolicy::Client,
+            env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
         })
         .await
         .map_err(ReconnectAttachError::Retriable)?;
@@ -1801,7 +1805,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             ..
         } => TurnEvent::Usage {
             agent,
-            usage: crate::tokens::TokenUsage {
+            usage: cockpit_core::tokens::TokenUsage {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
@@ -2045,12 +2049,18 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     })
 }
 
-fn queue_item_from_proto(item: proto::QueueItem) -> crate::engine::message::QueuedUserMessage {
-    crate::engine::message::QueuedUserMessage {
+fn queue_item_from_proto(
+    item: proto::QueueItem,
+) -> cockpit_core::engine::message::QueuedUserMessage {
+    cockpit_core::engine::message::QueuedUserMessage {
         id: item.id,
         status: match item.status {
-            proto::QueueItemStatus::Queued => crate::engine::message::QueueItemStatus::Queued,
-            proto::QueueItemStatus::Folding => crate::engine::message::QueueItemStatus::Folding,
+            proto::QueueItemStatus::Queued => {
+                cockpit_core::engine::message::QueueItemStatus::Queued
+            }
+            proto::QueueItemStatus::Folding => {
+                cockpit_core::engine::message::QueueItemStatus::Folding
+            }
         },
         text: item.text,
         display_text: item.display_text,
@@ -2058,8 +2068,10 @@ fn queue_item_from_proto(item: proto::QueueItem) -> crate::engine::message::Queu
     }
 }
 
-fn queue_target_from_proto(target: proto::QueueTarget) -> crate::engine::message::QueueTarget {
-    crate::engine::message::QueueTarget {
+fn queue_target_from_proto(
+    target: proto::QueueTarget,
+) -> cockpit_core::engine::message::QueueTarget {
+    cockpit_core::engine::message::QueueTarget {
         id: target.id,
         agent: target.agent,
         depth: target.depth,
@@ -2157,7 +2169,7 @@ mod tests {
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id: uuid::Uuid::new_v4(),
             short_id: "abc123".to_string(),
@@ -2250,14 +2262,14 @@ mod tests {
         let event = proto_event_to_turn_event(proto::Event::AgentIdle {
             session_id,
             turn_id: Some("turn-1".to_string()),
-            reason: crate::engine::IdleReason::Completed,
+            reason: cockpit_core::engine::IdleReason::Completed,
         })
         .expect("idle event maps");
         assert!(matches!(
             event,
             TurnEvent::AgentIdle {
                 turn_id: Some(turn_id),
-                reason: crate::engine::IdleReason::Completed,
+                reason: cockpit_core::engine::IdleReason::Completed,
             } if turn_id == "turn-1"
         ));
     }
@@ -2352,13 +2364,13 @@ mod tests {
             Some(TurnEvent::DaemonDraining { forced: true })
         ));
 
-        let meta = crate::env_snapshot::EnvSnapshotMeta {
-            source: crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+        let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
+            source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,
             digest: "digest".into(),
             key_count: 3,
             path_entry_count: 1,
         };
-        let drift = crate::env_snapshot::EnvDiffSummary {
+        let drift = cockpit_core::env_snapshot::EnvDiffSummary {
             baseline_digest: "base".into(),
             candidate_digest: "candidate".into(),
             added_keys: 1,
@@ -2372,7 +2384,7 @@ mod tests {
             baseline: meta.clone(),
             candidate: meta,
             diff: drift,
-            policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            policy: cockpit_core::env_snapshot::EnvDriftPolicy::Daemon,
         };
         assert!(event_session(&warning).is_none());
         assert!(is_global_event(&warning));

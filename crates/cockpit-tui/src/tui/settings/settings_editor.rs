@@ -57,15 +57,15 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use super::descriptor::{FieldKind, SettingDescriptor, SettingStore};
 
-use crate::config::extended::LlmMode;
-use crate::config::providers::{
+use crate::tui::textfield::TextField;
+use cockpit_config::extended::LlmMode;
+use cockpit_config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES, ModelEntry,
     ModelLocation, ModelTrust, ProviderEntry, ShrinkConfig, ShrinkStrategy, ThinkingMode,
     TimeoutConfig, WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url,
     is_xai_grok_provider, model_system_prompt_too_large, normalize_model_system_prompt,
 };
-use crate::tui::textfield::TextField;
 
 /// Which scope the editor is bound to.
 #[derive(Clone)]

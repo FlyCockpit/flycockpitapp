@@ -534,7 +534,7 @@ impl SettingsPage for StringListPage {
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › {}",
-            crate::welcome::display_path(&cx.config_path),
+            cockpit_core::welcome::display_path(&cx.config_path),
             self.crumb()
         )
     }

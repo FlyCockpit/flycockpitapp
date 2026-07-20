@@ -46,7 +46,7 @@ impl TextField {
     }
 
     pub fn split_at_cursor(&self) -> (&str, &str) {
-        let cursor = crate::text::floor_char_boundary(&self.buffer, self.cursor);
+        let cursor = cockpit_core::text::floor_char_boundary(&self.buffer, self.cursor);
         self.buffer.split_at(cursor)
     }
 

@@ -1,6 +1,6 @@
 use super::*;
-use crate::config::providers::{AuthKind, ProvidersConfig};
-use crate::config::providers::{ConfigDoc, ProviderEntry};
+use cockpit_config::providers::{AuthKind, ProvidersConfig};
+use cockpit_config::providers::{ConfigDoc, ProviderEntry};
 use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
@@ -228,7 +228,7 @@ fn grok_oauth_template_materializes_oauth_credential_ref() {
     assert_eq!(entry.auth, Some(AuthKind::OAuth));
     assert_eq!(
         entry.credential_ref.as_deref(),
-        Some(crate::auth::xai_oauth::CREDENTIAL_KEY)
+        Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
     );
     assert!(entry.headers.is_empty());
     assert_eq!(entry.wire_api, WireApi::Responses);
@@ -246,7 +246,7 @@ fn codex_oauth_template_materializes_oauth_credential_ref() {
     assert_eq!(entry.auth, Some(AuthKind::OAuth));
     assert_eq!(
         entry.credential_ref.as_deref(),
-        Some(crate::auth::codex_oauth::CREDENTIAL_KEY)
+        Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY)
     );
     assert!(entry.headers.is_empty());
     assert_eq!(entry.wire_api, WireApi::Responses);
@@ -344,7 +344,7 @@ fn literal_key_entry_writes_secret_ref() {
     assert_eq!(saved.headers[0].value, "$secret:p");
     let provider_raw = std::fs::read_to_string(tmp.path().join("providers/p.json")).unwrap();
     assert!(!provider_raw.contains("sk-provider-secret-abcdefghijklmnopqrstuvwxyz"));
-    let store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     assert_eq!(
         store.named_secret("p"),
         Some("Bearer sk-provider-secret-abcdefghijklmnopqrstuvwxyz")
@@ -447,11 +447,11 @@ fn edit_menu_deepfetch_action_points_to_confirmed_command() {
 fn provider_settings_summary_surfaces_timeout_values() {
     let provider = ProviderEntry {
         url: "https://api.example.com/v1".to_string(),
-        timeout: crate::config::providers::TimeoutConfig {
+        timeout: cockpit_config::providers::TimeoutConfig {
             ttft_secs: 240,
             idle_secs: 180,
         },
-        backup: Some(crate::config::providers::BackupConfig {
+        backup: Some(cockpit_config::providers::BackupConfig {
             provider: "backup".to_string(),
             model: "model".to_string(),
         }),
@@ -881,7 +881,7 @@ fn provider_delete_removes_its_unshared_stored_secret() {
     let (tmp, mut dialog) = dialog_with_config(cfg);
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set_named_secret("p", "sk-provider-secret-value");
     store.save().unwrap();
 
@@ -893,7 +893,7 @@ fn provider_delete_removes_its_unshared_stored_secret() {
     );
     assert!(!dialog.config.providers.contains_key("p"));
     assert!(
-        crate::credentials::CredentialStore::open(store_path)
+        cockpit_core::credentials::CredentialStore::open(store_path)
             .unwrap()
             .named_secret("p")
             .is_none()
@@ -903,77 +903,84 @@ fn provider_delete_removes_its_unshared_stored_secret() {
 #[test]
 fn provider_delete_removes_grok_oauth_credential_record() {
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
     ));
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
         json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
     );
     store.save().unwrap();
 
     assert_eq!(
         dialog
-            .delete_provider_and_stored_secrets(crate::auth::xai_oauth::CREDENTIAL_KEY, true)
+            .delete_provider_and_stored_secrets(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY, true)
             .unwrap(),
         1
     );
 
-    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
-    assert!(store.get(crate::auth::xai_oauth::CREDENTIAL_KEY).is_none());
+    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(
+        store
+            .get(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
+            .is_none()
+    );
 }
 
 #[test]
 fn provider_delete_removes_codex_oauth_credential_record() {
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
-        crate::auth::codex_oauth::CREDENTIAL_KEY,
-        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
     ));
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set(
-        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         json!({"access_token":"codex","refresh_token":"refresh","expires_at":9_999_999_999i64}),
     );
     store.save().unwrap();
 
     assert_eq!(
         dialog
-            .delete_provider_and_stored_secrets(crate::auth::codex_oauth::CREDENTIAL_KEY, true)
+            .delete_provider_and_stored_secrets(
+                cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
+                true
+            )
             .unwrap(),
         1
     );
 
-    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
+    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
     assert!(
         store
-            .get(crate::auth::codex_oauth::CREDENTIAL_KEY)
+            .get(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY)
             .is_none()
     );
 }
 
 #[test]
 fn provider_delete_preserves_shared_oauth_credential_record() {
-    let mut cfg = oauth_provider_config("grok-a", crate::auth::xai_oauth::CREDENTIAL_KEY);
+    let mut cfg = oauth_provider_config("grok-a", cockpit_core::auth::xai_oauth::CREDENTIAL_KEY);
     cfg.providers.insert(
         "grok-b".into(),
         ProviderEntry {
             url: "https://api.example.com/v1".to_string(),
             auth: Some(AuthKind::OAuth),
-            credential_ref: Some(crate::auth::xai_oauth::CREDENTIAL_KEY.to_string()),
+            credential_ref: Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY.to_string()),
             ..Default::default()
         },
     );
     let (tmp, mut dialog) = dialog_with_config(cfg);
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
         json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
     );
     store.save().unwrap();
@@ -985,34 +992,45 @@ fn provider_delete_preserves_shared_oauth_credential_record() {
         0
     );
 
-    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
-    assert!(store.get(crate::auth::xai_oauth::CREDENTIAL_KEY).is_some());
+    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(
+        store
+            .get(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
+            .is_some()
+    );
 }
 
 #[test]
 fn provider_delete_signs_out_oauth_even_when_named_secrets_are_kept() {
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
     ));
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
         json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
     );
     store.save().unwrap();
 
     assert_eq!(
         dialog
-            .delete_provider_and_stored_secrets(crate::auth::xai_oauth::CREDENTIAL_KEY, false)
+            .delete_provider_and_stored_secrets(
+                cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+                false
+            )
             .unwrap(),
         1
     );
 
-    let store = crate::credentials::CredentialStore::open(store_path).unwrap();
-    assert!(store.get(crate::auth::xai_oauth::CREDENTIAL_KEY).is_none());
+    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    assert!(
+        store
+            .get(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
+            .is_none()
+    );
 }
 
 #[test]
@@ -1035,7 +1053,7 @@ fn provider_delete_preserves_a_shared_stored_secret() {
     let (tmp, mut dialog) = dialog_with_config(cfg);
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set_named_secret("shared", "sk-provider-secret-value");
     store.save().unwrap();
 
@@ -1046,7 +1064,7 @@ fn provider_delete_preserves_a_shared_stored_secret() {
         0
     );
     assert_eq!(
-        crate::credentials::CredentialStore::open(store_path)
+        cockpit_core::credentials::CredentialStore::open(store_path)
             .unwrap()
             .named_secret("shared"),
         Some("sk-provider-secret-value")
@@ -1056,26 +1074,28 @@ fn provider_delete_preserves_a_shared_stored_secret() {
 #[test]
 fn provider_edit_oauth_sign_out_updates_login_state_and_row_status() {
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
     ));
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set(
-        crate::auth::xai_oauth::CREDENTIAL_KEY,
+        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
         json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
     );
     store.save().unwrap();
-    let entry = dialog.config.providers[crate::auth::xai_oauth::CREDENTIAL_KEY].clone();
-    let mut state = EditState::new(crate::auth::xai_oauth::CREDENTIAL_KEY.into(), entry);
-    state.cursor = edit_menu_actions(crate::auth::xai_oauth::CREDENTIAL_KEY, &state.entry)
+    let entry = dialog.config.providers[cockpit_core::auth::xai_oauth::CREDENTIAL_KEY].clone();
+    let mut state = EditState::new(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY.into(), entry);
+    state.cursor = edit_menu_actions(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY, &state.entry)
         .iter()
         .position(|action| *action == EditAction::OAuthAuth(OAuthProvider::Grok))
         .unwrap();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(state)));
 
-    assert!(crate::auth::xai_oauth::is_logged_in_at(Some(&store_path)));
+    assert!(cockpit_core::auth::xai_oauth::is_logged_in_at(Some(
+        &store_path
+    )));
     assert_eq!(
         dialog.provider_oauth_status_value(OAuthProvider::Grok),
         "logged in — Enter: Sign out"
@@ -1083,7 +1103,9 @@ fn provider_edit_oauth_sign_out_updates_login_state_and_row_status() {
 
     dialog.handle_key(press(KeyCode::Enter));
 
-    assert!(!crate::auth::xai_oauth::is_logged_in_at(Some(&store_path)));
+    assert!(!cockpit_core::auth::xai_oauth::is_logged_in_at(Some(
+        &store_path
+    )));
     assert_eq!(
         dialog.provider_oauth_status_value(OAuthProvider::Grok),
         "not logged in — Enter: Sign in"
@@ -1109,7 +1131,7 @@ fn provider_delete_offer_can_keep_an_unshared_stored_secret() {
     let (tmp, mut dialog) = dialog_with_config(cfg);
     let store_path = tmp.path().join("credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
-    let mut store = crate::credentials::CredentialStore::open(store_path.clone()).unwrap();
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
     store.set_named_secret("p", "sk-provider-secret-value");
     store.save().unwrap();
     let entry = dialog.config.providers["p"].clone();
@@ -1123,7 +1145,7 @@ fn provider_delete_offer_can_keep_an_unshared_stored_secret() {
 
     assert!(!dialog.config.providers.contains_key("p"));
     assert_eq!(
-        crate::credentials::CredentialStore::open(store_path)
+        cockpit_core::credentials::CredentialStore::open(store_path)
             .unwrap()
             .named_secret("p"),
         Some("sk-provider-secret-value")
@@ -1375,11 +1397,11 @@ fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
     let status = provider.last_model_fetch.as_ref().unwrap();
     assert_eq!(
         status.status,
-        crate::config::providers::ModelFetchStatusKind::Fallback
+        cockpit_config::providers::ModelFetchStatusKind::Fallback
     );
     assert_eq!(
         status.source,
-        crate::config::providers::ModelFetchSource::Fallback
+        cockpit_config::providers::ModelFetchSource::Fallback
     );
     let reason = status.reason.as_ref().unwrap();
     assert!(reason.contains("returned 500"));
@@ -1421,10 +1443,10 @@ fn model_fetch_status_block_renders_redacted_status_details() {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
         ),
-        last_model_fetch: Some(crate::config::providers::ModelFetchStatus {
-            status: crate::config::providers::ModelFetchStatusKind::FailedKeptExisting,
+        last_model_fetch: Some(cockpit_config::providers::ModelFetchStatus {
+            status: cockpit_config::providers::ModelFetchStatusKind::FailedKeptExisting,
             at: now,
-            source: crate::config::providers::ModelFetchSource::Live,
+            source: cockpit_config::providers::ModelFetchSource::Live,
             reason: Some(
                 "GET /models returned 500 Authorization Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
                     .to_string(),
@@ -1559,7 +1581,7 @@ fn fake_is_ssh() -> bool {
 
 fn fake_bind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     OAUTH_EFFECTS_LOG.lock().unwrap().push("bind".to_string());
-    let listener = crate::auth::xai_oauth::bind_callback_listener(port)?;
+    let listener = cockpit_core::auth::xai_oauth::bind_callback_listener(port)?;
     *OAUTH_BOUND_ADDR.lock().unwrap() = Some(listener.local_addr()?);
     Ok(listener)
 }
@@ -1609,7 +1631,7 @@ async fn oauth_grok_binds_before_opening_browser() {
         open: connecting_open,
         ..fake_oauth_effects()
     };
-    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let login = cockpit_core::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
 
     let start = prepare_grok_browser_start(login, effects, 0);
 
@@ -1633,7 +1655,7 @@ async fn oauth_grok_browser_open_failure_still_listens() {
         open: failing_open,
         ..fake_oauth_effects()
     };
-    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let login = cockpit_core::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
     let start = prepare_grok_browser_start(login, effects, 0);
     assert!(start.listener.is_some());
 
@@ -1656,7 +1678,7 @@ async fn oauth_grok_bind_failure_offers_manual_paste() {
         bind: failing_bind,
         ..fake_oauth_effects()
     };
-    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let login = cockpit_core::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
     let start = prepare_grok_browser_start(login, effects, 0);
     assert!(start.listener.is_none());
 
@@ -1685,7 +1707,7 @@ async fn oauth_grok_ssh_begin_binds_no_listener() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_oauth_effects(true);
     let effects = fake_oauth_effects();
-    let login = crate::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
+    let login = cockpit_core::auth::xai_oauth::ManualLogin::for_test("https://example.test/oauth");
     let start = prepare_grok_browser_start(login, effects, 0);
     assert!(start.listener.is_none());
     assert!(oauth_effects_log().is_empty());
@@ -1738,8 +1760,10 @@ fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_oauth_effects(false);
-    let login =
-        crate::auth::codex_oauth::DeviceLogin::for_test("https://example.test/device", "CODE-123");
+    let login = cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+        "https://example.test/device",
+        "CODE-123",
+    );
     let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Codex, fake_oauth_effects());
     let action = state.apply_begin(
         OAuthBeginResult::Device(Ok(login.clone())),
@@ -1768,8 +1792,10 @@ fn codex_copy_keys_are_ssh_aware() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let login =
-        crate::auth::codex_oauth::DeviceLogin::for_test("https://example.test/device", "CODE-123");
+    let login = cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+        "https://example.test/device",
+        "CODE-123",
+    );
 
     reset_oauth_effects(true);
     let mut ssh_state =
@@ -1910,7 +1936,7 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
     assert!(rendered.contains("log in"), "{rendered}");
     assert!(rendered.contains("skip / continue"), "{rendered}");
 
-    state.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
+    state.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "ABCD-EFGH",
     ));
@@ -2064,10 +2090,12 @@ fn standalone_oauth_body_hides_skip_continue_row() {
                 active.pending = true;
             }
             OAuthProvider::Codex => {
-                active.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
-                    "https://example.test/device",
-                    "CODE-123",
-                ));
+                active.set_device_login_for_test(
+                    cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                        "https://example.test/device",
+                        "CODE-123",
+                    ),
+                );
             }
         }
         assert!(
@@ -2089,7 +2117,7 @@ fn add_host_oauth_body_keeps_skip_continue_row() {
     let mut codex = OAuthFlowState::new(OAuthProvider::Codex);
     codex.logged_in = false;
     assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
-    codex.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
+    codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "CODE-123",
     ));
@@ -2129,10 +2157,12 @@ fn oauth_option_count_matches_rendered_rows_per_host() {
         );
 
         let mut codex_device = OAuthFlowState::new(OAuthProvider::Codex);
-        codex_device.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
-            "https://example.test/device",
-            "CODE-123",
-        ));
+        codex_device.set_device_login_for_test(
+            cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                "https://example.test/device",
+                "CODE-123",
+            ),
+        );
         assert_eq!(
             codex_device.option_count(host),
             oauth_option_rows(&codex_device, host)
@@ -2258,10 +2288,12 @@ fn every_visible_oauth_row_acts_on_enter() {
         assert_enter_effect(
             {
                 let mut s = OAuthFlowState::new(OAuthProvider::Codex);
-                s.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
-                    "https://example.test/device",
-                    "CODE-123",
-                ));
+                s.set_device_login_for_test(
+                    cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                        "https://example.test/device",
+                        "CODE-123",
+                    ),
+                );
                 s
             },
             host,
@@ -2271,10 +2303,12 @@ fn every_visible_oauth_row_acts_on_enter() {
         assert_enter_effect(
             {
                 let mut s = OAuthFlowState::new(OAuthProvider::Codex);
-                s.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
-                    "https://example.test/device",
-                    "CODE-123",
-                ));
+                s.set_device_login_for_test(
+                    cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                        "https://example.test/device",
+                        "CODE-123",
+                    ),
+                );
                 s.polling = true;
                 s
             },
@@ -2286,10 +2320,12 @@ fn every_visible_oauth_row_acts_on_enter() {
             assert_enter_effect(
                 {
                     let mut s = OAuthFlowState::new(OAuthProvider::Codex);
-                    s.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
-                        "https://example.test/device",
-                        "CODE-123",
-                    ));
+                    s.set_device_login_for_test(
+                        cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                            "https://example.test/device",
+                            "CODE-123",
+                        ),
+                    );
                     s
                 },
                 host,
@@ -2315,7 +2351,7 @@ fn every_visible_oauth_row_acts_on_enter() {
 async fn codex_skip_row_saves_with_device_code_present() {
     let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut oauth = OAuthFlowState::new(OAuthProvider::Codex);
-    oauth.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
+    oauth.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "CODE-123",
     ));
@@ -2348,7 +2384,7 @@ async fn grok_pending_skip_row_saves_at_rendered_index() {
 fn codex_standalone_dialog() -> SettingsDialog {
     let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut codex = OAuthFlowState::new(OAuthProvider::Codex);
-    codex.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
+    codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/very/long/device/login/path/that/must/be/clipped",
         "ABCD-EFGH",
     ));
@@ -2437,7 +2473,7 @@ fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
                 }
                 OAuthProvider::Codex => {
                     active.set_device_login_for_test(
-                        crate::auth::codex_oauth::DeviceLogin::for_test(
+                        cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
                             "https://example.test/device",
                             "CODE-123",
                         ),

@@ -15,7 +15,7 @@ impl App {
         });
     }
 
-    pub(super) fn apply_idle_reason_status(&mut self, reason: crate::engine::IdleReason) {
+    pub(super) fn apply_idle_reason_status(&mut self, reason: cockpit_core::engine::IdleReason) {
         self.idle_reason_status = idle_reason_status(reason);
     }
 

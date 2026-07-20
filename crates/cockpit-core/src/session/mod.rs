@@ -36,6 +36,7 @@ use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
+pub mod export;
 mod gitignore;
 mod lifecycle;
 mod recording;

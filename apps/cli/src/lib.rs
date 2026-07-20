@@ -17,7 +17,6 @@ pub use cockpit_core::{
     wizard,
 };
 pub use cockpit_db as db;
-pub use cockpit_tui::clipboard;
 mod terminal_host;
 
 use clap::Parser;

@@ -17,7 +17,6 @@ cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-proto = { path = "../cockpit-proto" }
-flycockpit-relay-protocol = { path = "../relay-protocol" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

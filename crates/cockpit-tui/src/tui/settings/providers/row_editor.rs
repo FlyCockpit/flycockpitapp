@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::config::providers::{HeaderSpec, ModelEntry, apply_template_model_defaults};
 use crate::tui::textfield::TextField;
+use cockpit_config::providers::{HeaderSpec, ModelEntry, apply_template_model_defaults};
 
 use super::super::RowDeleteConfirm;
 

@@ -466,9 +466,9 @@ fn skill_dispatcher_is_registered_and_takes_args() {
     );
 }
 
-fn fake_skill(name: &str, description: &str) -> crate::skills::Skill {
-    crate::skills::Skill {
-        frontmatter: crate::skills::SkillFrontmatter {
+fn fake_skill(name: &str, description: &str) -> cockpit_core::skills::Skill {
+    cockpit_core::skills::Skill {
+        frontmatter: cockpit_core::skills::SkillFrontmatter {
             name: name.to_string(),
             description: description.to_string(),
             ..Default::default()
@@ -479,9 +479,9 @@ fn fake_skill(name: &str, description: &str) -> crate::skills::Skill {
 
 /// Like [`fake_skill`] but marked `user-invocable: false` (model-only),
 /// so it should be hidden from the user's bare-`/` slash menu.
-fn fake_model_only_skill(name: &str, description: &str) -> crate::skills::Skill {
-    crate::skills::Skill {
-        frontmatter: crate::skills::SkillFrontmatter {
+fn fake_model_only_skill(name: &str, description: &str) -> cockpit_core::skills::Skill {
+    cockpit_core::skills::Skill {
+        frontmatter: cockpit_core::skills::SkillFrontmatter {
             name: name.to_string(),
             description: description.to_string(),
             user_invocable: false,
@@ -539,7 +539,7 @@ fn bare_skill_inventory_hides_conditionally_incompatible_skill() {
         )
         .unwrap();
     }
-    let mut extended = crate::config::extended::ExtendedConfig::default();
+    let mut extended = cockpit_config::extended::ExtendedConfig::default();
     extended.skills.scan_dirs = vec![scan.to_string_lossy().into_owned()];
 
     let entries =

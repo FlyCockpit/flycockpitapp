@@ -99,10 +99,10 @@ fn auto_prune_notice_renders_muted() {
     use ratatui::style::Color;
 
     use super::App;
-    use crate::config::extended::{DiffStyle, ThinkingDisplay};
-    use crate::engine::agent::TurnEvent;
     use crate::tui::history::{MarkdownOpts, render_entry};
     use crate::tui::theme::MUTED_COLOR_INDEX;
+    use cockpit_config::extended::{DiffStyle, ThinkingDisplay};
+    use cockpit_core::engine::agent::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);

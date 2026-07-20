@@ -6,13 +6,13 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use super::{App, DispatchOutcome, SideConversation};
-use crate::engine::message::UserSubmission;
 use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
 use crate::tui::history::HistoryEntry;
+use cockpit_core::engine::message::UserSubmission;
 
 fn runner_with_sender(
     input_tx: mpsc::Sender<UserSubmission>,
-    events: Arc<Mutex<Vec<crate::engine::TurnEvent>>>,
+    events: Arc<Mutex<Vec<cockpit_core::engine::TurnEvent>>>,
 ) -> AgentRunner {
     let (record_tx, _record_rx) = mpsc::channel(1);
     runner_with_channels(input_tx, record_tx, events)
@@ -20,8 +20,8 @@ fn runner_with_sender(
 
 fn runner_with_channels(
     input_tx: mpsc::Sender<UserSubmission>,
-    record_tx: mpsc::Sender<crate::daemon::proto::Request>,
-    events: Arc<Mutex<Vec<crate::engine::TurnEvent>>>,
+    record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
+    events: Arc<Mutex<Vec<cockpit_core::engine::TurnEvent>>>,
 ) -> AgentRunner {
     let (control_tx, _control_rx) = mpsc::channel(1);
     runner_with_all_channels(input_tx, record_tx, control_tx, events)
@@ -29,9 +29,9 @@ fn runner_with_channels(
 
 fn runner_with_all_channels(
     input_tx: mpsc::Sender<UserSubmission>,
-    record_tx: mpsc::Sender<crate::daemon::proto::Request>,
+    record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
     control_tx: mpsc::Sender<ControlRequest>,
-    events: Arc<Mutex<Vec<crate::engine::TurnEvent>>>,
+    events: Arc<Mutex<Vec<cockpit_core::engine::TurnEvent>>>,
 ) -> AgentRunner {
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     AgentRunner {
@@ -44,7 +44,7 @@ fn runner_with_all_channels(
         active_agent: Arc::new(Mutex::new("Build".to_string())),
         active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
         skill_inventory_names: Arc::new(Mutex::new(None)),
-        foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id: uuid::Uuid::new_v4(),
         short_id: "abc123".to_string(),
@@ -180,8 +180,8 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest>
     app.usage_tags.insert("src/lib.rs".to_string(), 1);
     app.project_id = Some("project-old".to_string());
     app.pending_usage
-        .push(crate::daemon::proto::Request::CancelTurn);
-    app.last_usage = Some(crate::tokens::TokenUsage {
+        .push(cockpit_core::daemon::proto::Request::CancelTurn);
+    app.last_usage = Some(cockpit_core::tokens::TokenUsage {
         input_tokens: 10,
         output_tokens: 2,
         cached_input_tokens: 3,
@@ -273,7 +273,7 @@ fn session_switch_busy_guard_interrupts_only_when_busy() {
     app.cancel_outgoing_turn_if_busy();
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(crate::daemon::proto::Request::CancelTurn)
+        Ok(cockpit_core::daemon::proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
 }
@@ -312,7 +312,7 @@ fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
     assert!(changed, "serviced /new must request a follow-up redraw");
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(crate::daemon::proto::Request::CancelTurn)
+        Ok(cockpit_core::daemon::proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
     assert!(!app.pending_new_session);
@@ -515,7 +515,7 @@ fn failed_fresh_dispatch_removes_unsent_tag_rows() {
     let mut app = App::new(Some(tmp.path()), false);
     app.agent_runner = Some(Err("model missing".to_string()));
     app.begin_working_span();
-    let tags = vec![crate::daemon::proto::TagExpansionMeta {
+    let tags = vec![cockpit_core::daemon::proto::TagExpansionMeta {
         tool: "read".to_string(),
         path: "src/lib.rs".to_string(),
         detail: "10 lines".to_string(),
@@ -603,11 +603,11 @@ fn multireview_kickoff_queue_full_reconciles_user_row_and_ends_span() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(crate::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
     ));
-    app.apply_event(crate::engine::TurnEvent::ControlRequestFinished {
-        request_id: crate::engine::ControlRequestId(1),
-        outcome: crate::engine::ControlRequestOutcome::Applied,
+    app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
+        request_id: cockpit_core::engine::ControlRequestId(1),
+        outcome: cockpit_core::engine::ControlRequestOutcome::Applied,
     });
     assert!(
         app.history.iter().any(|entry| {
@@ -647,11 +647,11 @@ fn multireview_kickoff_closed_reconciles_user_row_and_ends_span() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(crate::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
     ));
-    app.apply_event(crate::engine::TurnEvent::ControlRequestFinished {
-        request_id: crate::engine::ControlRequestId(1),
-        outcome: crate::engine::ControlRequestOutcome::Applied,
+    app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
+        request_id: cockpit_core::engine::ControlRequestId(1),
+        outcome: cockpit_core::engine::ControlRequestOutcome::Applied,
     });
     assert!(newest_user_failed(&app));
     assert!(error_lines(&app).iter().any(
@@ -678,11 +678,11 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(crate::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
     ));
-    app.apply_event(crate::engine::TurnEvent::ControlRequestFinished {
-        request_id: crate::engine::ControlRequestId(1),
-        outcome: crate::engine::ControlRequestOutcome::Applied,
+    app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
+        request_id: cockpit_core::engine::ControlRequestId(1),
+        outcome: cockpit_core::engine::ControlRequestOutcome::Applied,
     });
     let submission = input_rx.try_recv().expect("kickoff submitted");
     assert_eq!(submission.text, "kickoff");

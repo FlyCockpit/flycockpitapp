@@ -1,9 +1,9 @@
 use super::{App, HistoryEntry, Overlay, SLASH_COMMANDS, SideConversation, input};
-use crate::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary,
-};
 use crate::tui::async_action::AsyncActionKind;
 use crate::tui::keys_overlay::KeyContext;
+use cockpit_core::daemon::proto::{
+    InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::fs;
@@ -29,7 +29,7 @@ fn press(code: KeyCode) -> KeyEvent {
 }
 
 fn configured_app(tmp: &tempfile::TempDir) -> App {
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     fs::write(cockpit.join("config.json"), "{}").unwrap();
@@ -276,7 +276,7 @@ fn leader_with_diff_pane_open_shows_diff_context() {
         crate::tui::diff_pane::DiffSource::Last,
         tmp.path(),
         &[],
-        crate::config::extended::DiffStyle::Inline,
+        cockpit_config::extended::DiffStyle::Inline,
     ));
 
     app.handle_key(ctrl('k'));
@@ -328,7 +328,7 @@ fn leader_does_not_open_over_question_dialog() {
 fn orphan_tool_end_renders_standalone_success_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
-    app.apply_event(crate::engine::agent::TurnEvent::ToolEnd {
+    app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolEnd {
         agent: "Build".into(),
         call_id: "orphan-call".into(),
         tool: "read".into(),
@@ -361,13 +361,13 @@ fn read_and_readlock_tool_end_store_captured_output_but_unlock_does_not() {
         ),
         ("unlock-call", "unlock", "src/lib.rs", "SHOULD_NOT_STORE"),
     ] {
-        app.apply_event(crate::engine::agent::TurnEvent::ToolStart {
+        app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolStart {
             agent: "Build".into(),
             call_id: call_id.into(),
             tool: tool.into(),
             args: serde_json::json!({ "path": path }),
         });
-        app.apply_event(crate::engine::agent::TurnEvent::ToolEnd {
+        app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolEnd {
             agent: "Build".into(),
             call_id: call_id.into(),
             tool: tool.into(),

@@ -5,12 +5,12 @@ impl App {
     /// Lines land in `fetch_models_progress`; the event loop drains
     /// them into history.
     pub(super) fn spawn_fetch_models(&mut self) {
-        use crate::commands::fetch_models::persist_provider;
-        use crate::config::providers::{
+        use cockpit_config::providers::{
             ModelMergePolicy, OnUnlistedModelsFetch, merge_fetched_models_with_policy,
             redact_model_fetch_reason,
         };
-        use crate::providers::models_fetch::{self, FetchOutcome};
+        use cockpit_core::providers::models_fetch::persist_provider;
+        use cockpit_core::providers::models_fetch::{self, FetchOutcome};
         use std::time::Duration;
 
         let cwd = self.launch.cwd.clone();
@@ -24,7 +24,7 @@ impl App {
                 }
             };
 
-            let mut cfg = crate::secret_ref::load_effective(&cwd);
+            let mut cfg = cockpit_core::secret_ref::load_effective(&cwd);
             let policy = cfg
                 .on_unlisted_models_fetch
                 .unwrap_or(OnUnlistedModelsFetch::Keep);
@@ -81,7 +81,7 @@ impl App {
                             Ok(_) => {
                                 let suffix = if matches!(
                                     catalog,
-                                    crate::config::providers::ProviderModelCatalog::CodexFallback
+                                    cockpit_config::providers::ProviderModelCatalog::CodexFallback
                                 ) {
                                     " (fallback catalog)"
                                 } else {

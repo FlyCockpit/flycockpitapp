@@ -18,10 +18,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::daemon::proto::{Request, Response, SkillSummary};
 use crate::tui::agent_runner;
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use cockpit_core::daemon::proto::{Request, Response, SkillSummary};
 
 pub struct SkillsPane {
     /// Discovered skills, or an error string if the fetch failed. Loaded

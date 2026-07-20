@@ -2,7 +2,7 @@ use super::{
     App, MAX_SANDBOX_NOTICE_ROWS, sandbox_down_notice_text, sandbox_notice_render_text,
     sandbox_notice_wrapped_rows,
 };
-use crate::engine::TurnEvent;
+use cockpit_core::engine::TurnEvent;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
@@ -76,18 +76,18 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
 
     // `/sandbox off` -> `SandboxState { mode: Off }` clears it.
     app.apply_event(TurnEvent::SandboxState {
-        mode: crate::tools::sandbox_mode::SandboxMode::Off,
+        mode: cockpit_core::tools::sandbox_mode::SandboxMode::Off,
         container_network_enabled: false,
-        container_availability: crate::container::availability_snapshot(),
+        container_availability: cockpit_core::container::availability_snapshot(),
     });
     assert!(app.sandbox_down_notice.is_none());
     assert_eq!(app.sandbox_notice_lines(), 0);
 
     // Re-enabling does not resurrect a stale notice on its own.
     app.apply_event(TurnEvent::SandboxState {
-        mode: crate::tools::sandbox_mode::SandboxMode::Sandbox,
+        mode: cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
         container_network_enabled: false,
-        container_availability: crate::container::availability_snapshot(),
+        container_availability: cockpit_core::container::availability_snapshot(),
     });
     assert!(app.sandbox_down_notice.is_none());
 }

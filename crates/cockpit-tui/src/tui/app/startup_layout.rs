@@ -35,7 +35,7 @@ impl App {
                     ),
                     None => crate::tui::settings::Dialog::open_setup_wizard(
                         &self.launch.cwd,
-                        crate::wizard::MODEL_WIZARD_ID,
+                        cockpit_core::wizard::MODEL_WIZARD_ID,
                     ),
                 };
                 match dialog {
@@ -53,7 +53,7 @@ impl App {
             FirstRunFlow::AwaitModel => {
                 if !self
                     .dialog
-                    .setup_wizard_is_complete(crate::wizard::MODEL_WIZARD_ID)
+                    .setup_wizard_is_complete(cockpit_core::wizard::MODEL_WIZARD_ID)
                 {
                     return false;
                 }
@@ -82,7 +82,7 @@ impl App {
         }
         self.startup_background.started = true;
 
-        tokio::task::spawn_blocking(crate::tokens::warm_cl100k);
+        tokio::task::spawn_blocking(cockpit_core::tokens::warm_cl100k);
 
         let cwd = self.launch.cwd.clone();
         let active_model = self.launch.active_model.clone();
@@ -112,7 +112,7 @@ impl App {
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("container.availability")),
             || {
                 Ok(AsyncActionPayload::ContainerAvailability(
-                    crate::container::availability_snapshot(),
+                    cockpit_core::container::availability_snapshot(),
                 ))
             },
         );
@@ -122,7 +122,8 @@ impl App {
             AsyncActionKind::Internal("startup.remote_disclosures"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
             move || {
-                let Some(credential) = crate::auth::flycockpit::maybe_load_credential() else {
+                let Some(credential) = cockpit_core::auth::flycockpit::maybe_load_credential()
+                else {
                     return Ok(AsyncActionPayload::RemoteDisclosures {
                         org: None,
                         connector: None,
@@ -130,7 +131,7 @@ impl App {
                 };
                 let db = match db {
                     Some(db) => db,
-                    None => crate::db::Db::open_default().map_err(|e| e.to_string())?,
+                    None => cockpit_db::Db::open_default().map_err(|e| e.to_string())?,
                 };
                 let org = db
                     .org_sync_disclosure_for_server(&credential.server_url)
@@ -222,7 +223,7 @@ impl App {
 }
 
 fn first_provider_model_id(cwd: &Path, provider_id: &str) -> Option<String> {
-    crate::secret_ref::load_effective(cwd)
+    cockpit_core::secret_ref::load_effective(cwd)
         .providers
         .get(provider_id)?
         .models

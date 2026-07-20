@@ -1,5 +1,5 @@
 use super::{App, WorkingSpanState};
-use crate::engine::{IdleReason, TurnEvent};
+use cockpit_core::engine::{IdleReason, TurnEvent};
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();

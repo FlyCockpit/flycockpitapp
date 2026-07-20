@@ -7,7 +7,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 <!-- scrub-inventory:start -->
 - Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`
 - Client boundary: `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/reports.rs`
-- Off machine: `apps/cli/src/commands/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
+- Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`
 - Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
 <!-- scrub-inventory:end -->
@@ -29,7 +29,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 
 ## Off Machine
 
-- `apps/cli/src/commands/export/mod.rs`: export payloads scrub session/config/MCP/file content regardless of model trust or principal.
+- `crates/cockpit-core/src/session/export/mod.rs`: export payloads scrub session/config/MCP/file content regardless of model trust or principal.
 - `crates/cockpit-core/src/daemon/org_sync.rs`: organization sync JSON is scrubbed before upload.
 - `crates/cockpit-core/src/daemon/remote_audit_upload.rs`: remote audit metadata paths are scrubbed before upload.
 

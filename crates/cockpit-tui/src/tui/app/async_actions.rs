@@ -155,10 +155,16 @@ impl App {
                         pane.apply_snapshot_result(Ok(snapshot));
                     }
                     let kind = match status {
-                        crate::daemon::proto::ResourcePromoteStatus::Promoted => ToastKind::Success,
-                        crate::daemon::proto::ResourcePromoteStatus::NotQueued
-                        | crate::daemon::proto::ResourcePromoteStatus::NotFound => ToastKind::Info,
-                        crate::daemon::proto::ResourcePromoteStatus::Disabled => ToastKind::Warning,
+                        cockpit_core::daemon::proto::ResourcePromoteStatus::Promoted => {
+                            ToastKind::Success
+                        }
+                        cockpit_core::daemon::proto::ResourcePromoteStatus::NotQueued
+                        | cockpit_core::daemon::proto::ResourcePromoteStatus::NotFound => {
+                            ToastKind::Info
+                        }
+                        cockpit_core::daemon::proto::ResourcePromoteStatus::Disabled => {
+                            ToastKind::Warning
+                        }
                     };
                     self.show_toast(message, kind);
                 }
@@ -300,7 +306,7 @@ impl App {
                             settings::prepare_grok_browser_start(
                                 login,
                                 settings::OAuthEffects::production(),
-                                crate::auth::xai_oauth::CALLBACK_PORT,
+                                cockpit_core::auth::xai_oauth::CALLBACK_PORT,
                             );
                         if let Some(listener) = listener {
                             let listener_login = begin.login.clone();
@@ -308,7 +314,7 @@ impl App {
                                 AsyncActionKind::Internal("oauth.grok.complete"),
                                 AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
                                 async move {
-                                    crate::auth::xai_oauth::complete_local_callback_login(
+                                    cockpit_core::auth::xai_oauth::complete_local_callback_login(
                                         listener_login,
                                         listener,
                                     )
@@ -349,7 +355,7 @@ impl App {
                         AsyncActionKind::Internal("oauth.codex.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
                         async {
-                            crate::auth::codex_oauth::begin_device_code_login()
+                            cockpit_core::auth::codex_oauth::begin_device_code_login()
                                 .await
                                 .map(AsyncActionPayload::OAuthCodexBegin)
                                 .map_err(|e| e.to_string())
@@ -361,7 +367,7 @@ impl App {
                         AsyncActionKind::Internal("oauth.codex.poll"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
                         async move {
-                            crate::auth::codex_oauth::complete_device_code_login(login)
+                            cockpit_core::auth::codex_oauth::complete_device_code_login(login)
                                 .await
                                 .map(|_| AsyncActionPayload::OAuthCodexComplete { logged_in: true })
                                 .map_err(|e| e.to_string())
@@ -377,7 +383,7 @@ impl App {
                         AsyncActionKind::Internal("oauth.grok.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
                         async move {
-                            let login = crate::auth::xai_oauth::begin_manual_login()
+                            let login = cockpit_core::auth::xai_oauth::begin_manual_login()
                                 .await
                                 .map_err(|e| e.to_string())?;
                             Ok(AsyncActionPayload::OAuthGrokBegin { login })
@@ -389,7 +395,7 @@ impl App {
                         AsyncActionKind::Internal("oauth.grok.complete"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
                         async move {
-                            crate::auth::xai_oauth::complete_manual_login(login, &input)
+                            cockpit_core::auth::xai_oauth::complete_manual_login(login, &input)
                                 .await
                                 .map(|_| AsyncActionPayload::OAuthGrokComplete { logged_in: true })
                                 .map_err(|e| e.to_string())
@@ -411,7 +417,7 @@ impl App {
             AsyncActionKind::DaemonRpc("resources.snapshot"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("resources.snapshot")),
             || match crate::tui::agent_runner::resource_snapshot_blocking()? {
-                crate::daemon::proto::Response::ResourceSnapshot { snapshot } => {
+                cockpit_core::daemon::proto::Response::ResourceSnapshot { snapshot } => {
                     Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
                 }
                 other => Err(format!("unexpected resource_snapshot response: {other:?}")),
@@ -429,7 +435,7 @@ impl App {
             move || match crate::tui::agent_runner::promote_resource_blocking(
                 request_id, session_id,
             )? {
-                crate::daemon::proto::Response::PromoteResourceResult {
+                cockpit_core::daemon::proto::Response::PromoteResourceResult {
                     status,
                     message,
                     snapshot,
@@ -532,11 +538,14 @@ impl App {
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                let cfg = crate::secret_ref::load_effective(&cwd);
-                crate::providers::usage::probes::fetch_all_provider_usage(&cfg, filter.as_deref())
-                    .await
-                    .map(AsyncActionPayload::ProviderUsage)
-                    .map_err(|e| e.to_string())
+                let cfg = cockpit_core::secret_ref::load_effective(&cwd);
+                cockpit_core::providers::usage::probes::fetch_all_provider_usage(
+                    &cfg,
+                    filter.as_deref(),
+                )
+                .await
+                .map(AsyncActionPayload::ProviderUsage)
+                .map_err(|e| e.to_string())
             },
         );
     }

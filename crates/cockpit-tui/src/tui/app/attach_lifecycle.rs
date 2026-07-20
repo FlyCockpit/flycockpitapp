@@ -35,13 +35,15 @@ impl App {
             || true,
         );
         if should_probe && self.display_attach_backoff.can_attempt(Instant::now()) {
-            self.start_display_daemon_probe_action(|| crate::daemon::discover_blocking().status);
+            self.start_display_daemon_probe_action(|| {
+                cockpit_core::daemon::discover_blocking().status
+            });
         }
     }
 
     pub(super) fn start_display_daemon_probe_action<F>(&mut self, work: F)
     where
-        F: FnOnce() -> crate::daemon::DaemonStatus + Send + 'static,
+        F: FnOnce() -> cockpit_core::daemon::DaemonStatus + Send + 'static,
     {
         let cwd = self.launch.cwd.clone();
         self.async_actions.start_blocking(
@@ -59,12 +61,12 @@ impl App {
     pub(super) fn apply_display_daemon_probe_result(
         &mut self,
         cwd: PathBuf,
-        status: crate::daemon::DaemonStatus,
+        status: cockpit_core::daemon::DaemonStatus,
     ) {
         if cwd != self.launch.cwd {
             return;
         }
-        if !matches!(status, crate::daemon::DaemonStatus::Running) {
+        if !matches!(status, cockpit_core::daemon::DaemonStatus::Running) {
             return;
         }
         let attach = should_attempt_display_attach(
@@ -83,14 +85,14 @@ impl App {
     /// fresh pid+nonce ephemeral daemon (`AlwaysEphemeral`); otherwise the TUI
     /// attaches to the canonical daemon, auto-promoting a persistent one if
     /// none is running.
-    pub(super) fn lifecycle_mode(&self) -> crate::daemon::client::LifecycleMode {
+    pub(super) fn lifecycle_mode(&self) -> cockpit_core::daemon::client::LifecycleMode {
         if self.daemonless {
             // First attach spawns our owned pid+nonce ephemeral daemon; later
             // re-attaches (`/compact`, `/sessions` resume, `/new`) reconnect
             // to that same daemon instead of spawning a second one.
-            crate::daemon::client::LifecycleMode::AttachOwnEphemeral
+            cockpit_core::daemon::client::LifecycleMode::AttachOwnEphemeral
         } else {
-            crate::daemon::client::LifecycleMode::AttachOrAutoPromote
+            cockpit_core::daemon::client::LifecycleMode::AttachOrAutoPromote
         }
     }
 
@@ -105,9 +107,9 @@ impl App {
             return;
         }
         let guard =
-            crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(runner.socket.clone());
+            cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard::new(runner.socket.clone());
         self.daemon_signal_task =
-            crate::daemon::ephemeral_guard::spawn_signal_shutdown(Some(&guard), false);
+            cockpit_core::daemon::ephemeral_guard::spawn_signal_shutdown(Some(&guard), false);
         self.daemon_guard = Some(guard);
     }
 
@@ -168,8 +170,8 @@ impl App {
             // backfilling tag project ids now that we know the project.
             let pid = self.project_id.clone();
             for mut req in std::mem::take(&mut self.pending_usage) {
-                if let crate::daemon::proto::Request::RecordUsage {
-                    kind: crate::daemon::proto::UsageKind::Tag,
+                if let cockpit_core::daemon::proto::Request::RecordUsage {
+                    kind: cockpit_core::daemon::proto::UsageKind::Tag,
                     project_id,
                     ..
                 } = &mut req
@@ -251,14 +253,14 @@ impl App {
             move || {
                 let resp = agent_runner::daemon_request_at_blocking(
                     &socket,
-                    crate::daemon::proto::Request::GuidanceEstimate {
+                    cockpit_core::daemon::proto::Request::GuidanceEstimate {
                         project_root,
                         provider,
                         model,
                     },
                 )?;
                 match resp {
-                    crate::daemon::proto::Response::GuidanceEstimate {
+                    cockpit_core::daemon::proto::Response::GuidanceEstimate {
                         file,
                         tokens,
                         system_tokens,
@@ -283,18 +285,18 @@ impl App {
     /// runner exists.
     pub(super) fn record_usage(
         &mut self,
-        kind: crate::daemon::proto::UsageKind,
+        kind: cockpit_core::daemon::proto::UsageKind,
         key: String,
         project_id: Option<String>,
     ) {
-        use crate::daemon::proto::UsageKind;
+        use cockpit_core::daemon::proto::UsageKind;
         let map = match kind {
             UsageKind::Model => &mut self.usage_models,
             UsageKind::Slash => &mut self.usage_slash,
             UsageKind::Tag => &mut self.usage_tags,
         };
         *map.entry(key.clone()).or_insert(0) += 1;
-        let req = crate::daemon::proto::Request::RecordUsage {
+        let req = cockpit_core::daemon::proto::Request::RecordUsage {
             kind,
             key,
             project_id,

@@ -271,9 +271,9 @@ pub(super) fn push_label_text_field_row(
     let indent = ROW_MARKER_WIDTH + label_width + 2;
     let value_width = usize::from(width).saturating_sub(indent).max(1);
     let visible = cursor_visible_slice(value, cursor, value_width);
-    let cursor = crate::text::floor_char_boundary(value, cursor);
+    let cursor = cockpit_core::text::floor_char_boundary(value, cursor);
     let rel_cursor = cursor.saturating_sub(visible.start).min(visible.text.len());
-    let rel_cursor = crate::text::floor_char_boundary(&visible.text, rel_cursor);
+    let rel_cursor = cockpit_core::text::floor_char_boundary(&visible.text, rel_cursor);
     let (before, after) = visible.text.split_at(rel_cursor);
     let mut spans = vec![
         Span::raw(marker(selected).to_string()),
@@ -316,7 +316,7 @@ pub(super) fn push_text_field_at_cursor(
             lines.push(Line::from(spans));
             return;
         }
-        let cursor = crate::text::floor_char_boundary(value, cursor);
+        let cursor = cockpit_core::text::floor_char_boundary(value, cursor);
         let (before, after) = value.split_at(cursor);
         spans.push(Span::styled(before.to_string(), focused_field_style()));
         spans.push(cursor_marker_span());
@@ -366,7 +366,7 @@ struct VisibleSlice {
 }
 
 fn cursor_visible_slice(value: &str, cursor: usize, max_width: usize) -> VisibleSlice {
-    let cursor = crate::text::floor_char_boundary(value, cursor);
+    let cursor = cockpit_core::text::floor_char_boundary(value, cursor);
     let before = &value[..cursor];
     let mut start = 0;
     while before[start..].width() >= max_width && start < cursor {
@@ -375,7 +375,7 @@ fn cursor_visible_slice(value: &str, cursor: usize, max_width: usize) -> Visible
         };
         start += idx + ch.len_utf8();
     }
-    let start = crate::text::floor_char_boundary(value, start);
+    let start = cockpit_core::text::floor_char_boundary(value, start);
     let mut end = cursor;
     while end < value.len() && value[start..end].width() < max_width.saturating_sub(1) {
         let Some(ch) = value[end..].chars().next() else {

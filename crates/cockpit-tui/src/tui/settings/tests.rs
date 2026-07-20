@@ -1,6 +1,6 @@
 use super::*;
-use crate::config::providers::{ModelEntry, ProviderEntry};
-use crate::tools::custom_templates::{builtin_tool_names, default_template_for};
+use cockpit_config::providers::{ModelEntry, ProviderEntry};
+use cockpit_core::tools::custom_templates::{builtin_tool_names, default_template_for};
 use providers::{FetchAllState, valid_url};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, TestBackend};
@@ -175,7 +175,7 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
                 provider_metadata: Default::default(),
             },
         ],
-        catalog: crate::config::providers::ProviderModelCatalog::Live,
+        catalog: cockpit_config::providers::ProviderModelCatalog::Live,
     };
     let (unlisted, prompt) =
         fetch_all_unlisted_dialog(&cfg, vec![("p1".into(), Ok(remote_outcome))], None);
@@ -189,7 +189,7 @@ fn fetch_all_unlisted_skips_prompt_when_user_has_chosen() {
     cfg.providers.insert("p1".into(), entry(&["stale"]));
     let remote_outcome = FetchOutcome::Models {
         models: vec![],
-        catalog: crate::config::providers::ProviderModelCatalog::Live,
+        catalog: cockpit_config::providers::ProviderModelCatalog::Live,
     };
     let (_unlisted, prompt) = fetch_all_unlisted_dialog(
         &cfg,
@@ -269,7 +269,7 @@ fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
 
 fn write_provider_file(config_path: &std::path::Path, provider_id: &str, json: &str) {
     let path =
-        crate::config::providers::provider_file_path_for_config(config_path, provider_id).unwrap();
+        cockpit_config::providers::provider_file_path_for_config(config_path, provider_id).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, json).unwrap();
 }
@@ -457,7 +457,7 @@ fn grok_and_codex_oauth_render_register_link_regions() {
     assert_eq!(links.regions().len(), 0);
 
     let mut codex = providers::OAuthFlowState::new(OAuthProvider::Codex);
-    codex.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
+    codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://microsoft.com/devicelogin",
         "ABCD-EFGH",
     ));
@@ -478,10 +478,12 @@ fn grok_and_codex_oauth_render_register_link_regions() {
     );
 
     let mut codex_confirming = providers::OAuthFlowState::new(OAuthProvider::Codex);
-    codex_confirming.set_device_login_for_test(crate::auth::codex_oauth::DeviceLogin::for_test(
-        "https://microsoft.com/devicelogin",
-        "ABCD-EFGH",
-    ));
+    codex_confirming.set_device_login_for_test(
+        cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+            "https://microsoft.com/devicelogin",
+            "ABCD-EFGH",
+        ),
+    );
     codex_confirming.apply_complete(Ok(true));
     d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
         state: Box::new(codex_confirming),
@@ -623,7 +625,10 @@ impl SettingsPage for ProbePage {
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
-        format!("{} › Probe", crate::welcome::display_path(&cx.config_path))
+        format!(
+            "{} › Probe",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
@@ -649,7 +654,10 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
     assert!(!d.apply_nav(Nav::Push(Box::new(ProbePage::default()))));
     assert_eq!(
         d.title(),
-        format!("{} › Probe", crate::welcome::display_path(&d.config_path))
+        format!(
+            "{} › Probe",
+            cockpit_core::welcome::display_path(&d.config_path)
+        )
     );
     assert_eq!(d.help_text(), "probe help");
 
@@ -862,7 +870,7 @@ fn representative_footer_hints_match_tab_and_back_close_behavior() {
 
 #[test]
 fn behavior_command_resource_profile_rows_edit_and_persist() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -928,7 +936,7 @@ fn behavior_command_resource_profile_rows_edit_and_persist() {
 
 #[test]
 fn behavior_llm_mode_row_toggles_and_persists() {
-    use crate::config::extended::{ExtendedConfigDoc, LlmMode};
+    use cockpit_config::extended::{ExtendedConfigDoc, LlmMode};
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
@@ -947,7 +955,7 @@ fn behavior_llm_mode_row_toggles_and_persists() {
 
 #[test]
 fn behavior_default_agent_row_cycles_and_persists() {
-    use crate::config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
+    use cockpit_config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Auto);
@@ -972,7 +980,7 @@ fn behavior_default_agent_row_cycles_and_persists() {
 /// `DefaultPrimaryAgent` cycle never lands on a gated agent.
 #[test]
 fn behavior_experimental_mode_toggle_and_gated_default_cycle() {
-    use crate::config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
+    use cockpit_config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     // Fresh dialog: experimental off by default.
@@ -1008,7 +1016,7 @@ fn behavior_experimental_mode_toggle_and_gated_default_cycle() {
 
 #[test]
 fn category_ctrl_g_focused_prose_setting_round_trips_and_commits() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
 
     let _env = EditorEnv::with(Some("true"));
     let tmp = TempDir::new().unwrap();
@@ -1068,7 +1076,7 @@ fn mcp_add_form_renders_cursor_at_textfield_position() {
         args: TextField::default(),
         base_env: TextField::default(),
         stored_base_env_refs: BTreeMap::new(),
-        transport: crate::mcp::config::Transport::Streamable,
+        transport: cockpit_core::mcp::config::Transport::Streamable,
         auth: mcp_page::AuthKind::None,
         header_name: TextField::default(),
         header_value: TextField::default(),
@@ -1123,7 +1131,7 @@ fn mcp_add_form_renders_cursor_at_textfield_position() {
 
 #[test]
 fn behavior_packages_dir_text_edit_persists() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     open_category_on(&mut d, Category::Behavior, SettingId::PackagesDir);
@@ -1174,8 +1182,8 @@ fn behavior_jobs_max_concurrent_rejects_zero() {
 
 #[test]
 fn privacy_sandbox_rows_cycle_edit_and_persist() {
-    use crate::config::extended::ExtendedConfigDoc;
-    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_config::extended::ExtendedConfigDoc;
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -1219,7 +1227,7 @@ fn privacy_sandbox_rows_cycle_edit_and_persist() {
 
 #[test]
 fn behavior_sandbox_escalation_toggles_persists_and_updates_daemon() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -1244,7 +1252,7 @@ fn behavior_sandbox_escalation_toggles_persists_and_updates_daemon() {
 
 #[test]
 fn privacy_redaction_rows_toggle_and_persist() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     assert!(d.extended.redact.scan_environment);
@@ -1287,7 +1295,7 @@ fn privacy_redact_min_secret_length_rejects_non_numeric() {
 
 #[test]
 fn translation_languages_edit_and_persist() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     open_category_on(
@@ -1305,7 +1313,7 @@ fn translation_languages_edit_and_persist() {
 
 #[test]
 fn profile_name_edit_and_persist() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     open_category_on(&mut d, Category::Profile, SettingId::Name);
@@ -1319,7 +1327,7 @@ fn profile_name_edit_and_persist() {
 
 #[test]
 fn global_name_edit_prompts_to_remove_shadowing_project_value() {
-    use crate::config::extended::ExtendedConfigDoc;
+    use cockpit_config::extended::ExtendedConfigDoc;
     let tmp = TempDir::new().unwrap();
     let global = tmp.path().join(".config/cockpit/config.json");
     let project = tmp.path().join("repo");
@@ -1383,7 +1391,7 @@ fn save_config_preserves_untouched_provider_file_disk_edits() {
         r#"{"url":"https://out-of-band","headers":[]}"#,
     );
 
-    d.config.active_model = Some(crate::config::providers::ActiveModelRef {
+    d.config.active_model = Some(cockpit_config::providers::ActiveModelRef {
         provider: "vendor".into(),
         model: "m1".into(),
         reasoning_effort: None,
@@ -1391,7 +1399,7 @@ fn save_config_preserves_untouched_provider_file_disk_edits() {
     });
     d.save_config().unwrap();
 
-    let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
         .unwrap()
         .providers();
     assert_eq!(reloaded.providers["vendor"].url, "https://out-of-band");
@@ -1440,7 +1448,7 @@ fn pressing_d_twice_deletes_the_provider() {
         "double `d` press must delete"
     );
     // Persisted to disk.
-    let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
         .unwrap()
         .providers();
     assert!(!reloaded.providers.contains_key("vendor"));
@@ -1478,7 +1486,7 @@ fn enter_edit_first_provider(d: &mut SettingsDialog) {
 }
 
 fn disk_url(d: &SettingsDialog, id: &str) -> Option<String> {
-    crate::config::providers::ConfigDoc::load(&d.config_path)
+    cockpit_config::providers::ConfigDoc::load(&d.config_path)
         .unwrap()
         .providers()
         .providers
@@ -1572,7 +1580,7 @@ fn headers_save_accelerator_commits_and_stays() {
     ));
     // Stage a header row directly on the editor, then press `s`.
     if let TestPageMut::Providers(ProvidersPage::Headers { editor, .. }) = d.test_page_mut() {
-        editor.rows.push(crate::config::providers::HeaderSpec {
+        editor.rows.push(cockpit_config::providers::HeaderSpec {
             name: "Authorization".into(),
             value: "Bearer x".into(),
         });
@@ -1588,7 +1596,7 @@ fn headers_save_accelerator_commits_and_stays() {
         ),
         "`s` keeps us on the Headers sub-page"
     );
-    let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
         .unwrap()
         .providers();
     let entry = reloaded.providers.get("vendor").unwrap();
@@ -1610,7 +1618,7 @@ fn headers_esc_persists_edits() {
     }
     d.handle_key(press(KeyCode::Enter));
     if let TestPageMut::Providers(ProvidersPage::Headers { editor, .. }) = d.test_page_mut() {
-        editor.rows.push(crate::config::providers::HeaderSpec {
+        editor.rows.push(cockpit_config::providers::HeaderSpec {
             name: "X-Test".into(),
             value: "1".into(),
         });
@@ -1623,7 +1631,7 @@ fn headers_esc_persists_edits() {
         d.test_page(),
         TestPageRef::Providers(ProvidersPage::Edit(_))
     ));
-    let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
         .unwrap()
         .providers();
     let entry = reloaded.providers.get("vendor").unwrap();
@@ -1644,7 +1652,7 @@ fn models_esc_persists_edits() {
     }
     d.handle_key(press(KeyCode::Enter));
     if let TestPageMut::Providers(ProvidersPage::Models { editor, .. }) = d.test_page_mut() {
-        editor.rows.push(crate::config::providers::ModelEntry {
+        editor.rows.push(cockpit_config::providers::ModelEntry {
             id: "m-new".into(),
             name: None,
             thinking_modes: Vec::new(),
@@ -1685,7 +1693,7 @@ fn models_esc_persists_edits() {
         panic!("not on Models page");
     }
     d.handle_key(press(KeyCode::Esc));
-    let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
         .unwrap()
         .providers();
     let entry = reloaded.providers.get("vendor").unwrap();
@@ -1861,7 +1869,7 @@ fn first_run_completion_copy_points_to_security_and_help() {
 #[test]
 fn security_setup_wizard_tui_edits_redaction_number() {
     let tmp = TempDir::new().unwrap();
-    let mut d = Dialog::open_setup_wizard(tmp.path(), crate::wizard::SECURITY_WIZARD_ID)
+    let mut d = Dialog::open_setup_wizard(tmp.path(), cockpit_core::wizard::SECURITY_WIZARD_ID)
         .expect("security wizard opens");
 
     d.handle_key(press(KeyCode::Enter)); // sandbox default
@@ -1879,7 +1887,7 @@ fn security_setup_wizard_tui_edits_redaction_number() {
     };
     assert_eq!(
         wizard.run.answer("redaction"),
-        Some(&crate::wizard::WizardAnswer::Text("12".to_string()))
+        Some(&cockpit_core::wizard::WizardAnswer::Text("12".to_string()))
     );
 }
 
@@ -1899,15 +1907,18 @@ fn model_wizard_tui_dialog_opens_descriptor() {
         ..Default::default()
     });
     cfg.providers.insert("p".to_string(), provider);
-    let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+    let mut doc = cockpit_config::providers::ConfigDoc::load(&config_path).unwrap();
     doc.write(&cfg).unwrap();
 
-    let d = Dialog::open_setup_wizard(tmp.path(), crate::wizard::MODEL_WIZARD_ID)
+    let d = Dialog::open_setup_wizard(tmp.path(), cockpit_core::wizard::MODEL_WIZARD_ID)
         .expect("model wizard opens");
     let Dialog::SetupWizard(wizard) = d else {
         panic!("expected setup wizard");
     };
-    assert_eq!(wizard.run.descriptor().id, crate::wizard::MODEL_WIZARD_ID);
+    assert_eq!(
+        wizard.run.descriptor().id,
+        cockpit_core::wizard::MODEL_WIZARD_ID
+    );
     assert_eq!(wizard.run.current_step_id(), Some("provider"));
 }
 
@@ -1923,16 +1934,18 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
     };
     provider.models.push(ModelEntry {
         id: "m".to_string(),
-        capabilities: crate::config::providers::ModelCapabilities {
+        capabilities: cockpit_config::providers::ModelCapabilities {
             images: Some(true),
-            reasoning: crate::config::providers::CapabilityStatus::Supported,
+            reasoning: cockpit_config::providers::CapabilityStatus::Supported,
             ..Default::default()
         },
         ..Default::default()
     });
     cfg.providers.insert("p".to_string(), provider);
-    let run = crate::wizard::WizardRun::new(crate::wizard::model_descriptor_for_config(&cfg))
-        .expect("model wizard run");
+    let run = cockpit_core::wizard::WizardRun::new(
+        cockpit_core::wizard::model_descriptor_for_config(&cfg),
+    )
+    .expect("model wizard run");
     let mut cursor = 0;
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
@@ -2014,7 +2027,7 @@ fn lsp_server_rows_queue_daemon_actions() {
 }
 
 fn lsp_snapshot(
-    lsp: &crate::config::extended::LspConfig,
+    lsp: &cockpit_config::extended::LspConfig,
 ) -> (bool, String, bool, usize, usize, u64, u64, u64) {
     (
         lsp.enabled,
@@ -2078,7 +2091,7 @@ fn lsp_reset_r_twice_restores_defaults() {
 
     assert_eq!(
         lsp_snapshot(&d.extended.lsp),
-        lsp_snapshot(&crate::config::extended::LspConfig::default())
+        lsp_snapshot(&cockpit_config::extended::LspConfig::default())
     );
     match d.test_page() {
         TestPageRef::Lsp(p) => {
@@ -2139,7 +2152,7 @@ fn lsp_reset_row_and_accelerator_share_confirm_state() {
     d.handle_key(press(KeyCode::Char('r')));
     assert_eq!(
         lsp_snapshot(&d.extended.lsp),
-        lsp_snapshot(&crate::config::extended::LspConfig::default())
+        lsp_snapshot(&cockpit_config::extended::LspConfig::default())
     );
 
     d.extended.lsp.enabled = false;
@@ -2151,7 +2164,7 @@ fn lsp_reset_row_and_accelerator_share_confirm_state() {
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(
         lsp_snapshot(&d.extended.lsp),
-        lsp_snapshot(&crate::config::extended::LspConfig::default())
+        lsp_snapshot(&cockpit_config::extended::LspConfig::default())
     );
 }
 
@@ -2550,7 +2563,7 @@ fn seeding_never_clobbers_existing_entry() {
     // A user-edited `claude` entry with a custom command that isn't on
     // PATH; seeding must not overwrite it even though we only seed
     // installed presets.
-    let mut custom = crate::config::extended::builtin_harness_presets()
+    let mut custom = cockpit_config::extended::builtin_harness_presets()
         .into_iter()
         .find(|(n, _)| n == "claude")
         .map(|(_, hc)| hc)
@@ -2665,7 +2678,7 @@ fn utility_picker_no_models_falls_back_to_free_text() {
         }
         other => panic!("expected Category, got {other:?}"),
     }
-    let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
+    let reloaded = cockpit_config::extended::ExtendedConfigDoc::load(&d.extended_path)
         .unwrap()
         .config();
     assert_eq!(
@@ -2741,7 +2754,7 @@ fn utility_picker_select_sets_and_saves() {
         }
         other => panic!("expected Ui, got {other:?}"),
     }
-    let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
+    let reloaded = cockpit_config::extended::ExtendedConfigDoc::load(&d.extended_path)
         .unwrap()
         .config();
     assert_eq!(reloaded.utility_model.as_deref(), Some("anthropic:opus"));
@@ -2808,7 +2821,7 @@ fn utility_picker_clear_unsets_value() {
     }
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.utility_model, None, "clear unsets the value");
-    let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
+    let reloaded = cockpit_config::extended::ExtendedConfigDoc::load(&d.extended_path)
         .unwrap()
         .config();
     assert_eq!(reloaded.utility_model, None);
@@ -3696,7 +3709,7 @@ fn tools_reset_row() -> usize {
 
 #[test]
 fn tools_reset_arms_then_restores_builtins_and_drops_custom() {
-    use crate::config::extended::ToolCommandTemplate;
+    use cockpit_config::extended::ToolCommandTemplate;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
@@ -3800,7 +3813,7 @@ fn tools_page_documents_cleared_builtin_description_inherits_default() {
 
 #[test]
 fn tools_page_wraps_long_values_under_value_column() {
-    use crate::config::extended::ToolCommandTemplate;
+    use cockpit_config::extended::ToolCommandTemplate;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -3873,7 +3886,7 @@ fn tools_web_setup_firecrawl_selects_native_provider_without_touching_templates(
 
     assert_eq!(
         d.extended.web.provider,
-        crate::config::extended::WebProvider::Firecrawl
+        cockpit_config::extended::WebProvider::Firecrawl
     );
     assert!(
         d.extended.tools.is_empty(),
@@ -3902,7 +3915,7 @@ fn tools_web_setup_tinyfish_is_gated_until_key_exists() {
 
     assert_eq!(
         d.extended.web.provider,
-        crate::config::extended::WebProvider::Firecrawl,
+        cockpit_config::extended::WebProvider::Firecrawl,
         "TinyFish selection is blocked without a key"
     );
     match d.test_page() {
@@ -3915,15 +3928,16 @@ fn tools_web_setup_tinyfish_is_gated_until_key_exists() {
         other => panic!("expected Tools, got {other:?}"),
     }
 
-    let store = crate::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
-        .unwrap();
+    let store =
+        cockpit_core::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
+            .unwrap();
     store
         .save_record_merged("tinyfish", serde_json::json!({ "api_key": "tf-secret" }))
         .unwrap();
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(
         d.extended.web.provider,
-        crate::config::extended::WebProvider::Tinyfish
+        cockpit_config::extended::WebProvider::Tinyfish
     );
 }
 
@@ -3960,8 +3974,9 @@ fn tools_web_key_entry_persists_and_renders_masked() {
     assert!(!rendered.contains("fc-secret-value"));
 
     d.handle_key(press(KeyCode::Enter));
-    let store = crate::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
-        .unwrap();
+    let store =
+        cockpit_core::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
+            .unwrap();
     assert_eq!(
         store.api_key("firecrawl").as_deref(),
         Some("fc-secret-value")
@@ -4007,7 +4022,7 @@ fn tools_web_setup_custom_presets_fill_templates() {
     d.handle_key(press(KeyCode::Enter)); // curl + ddgr
     assert_eq!(
         d.extended.web.provider,
-        crate::config::extended::WebProvider::Custom
+        cockpit_config::extended::WebProvider::Custom
     );
     assert_eq!(
         d.extended.tools.get("websearch").unwrap().command,
@@ -4038,7 +4053,7 @@ fn move_to_reset_row(d: &mut SettingsDialog) {
 
 #[test]
 fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
-    use crate::config::extended::{ThinkingDisplay, TuiConfig, VimModeSetting};
+    use cockpit_config::extended::{ThinkingDisplay, TuiConfig, VimModeSetting};
     use std::path::PathBuf;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -4117,7 +4132,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
 
 #[test]
 fn privacy_reset_restores_knobs_but_preserves_redaction_content() {
-    use crate::config::extended::{ExtendedConfig, InjectionThreshold};
+    use cockpit_config::extended::{ExtendedConfig, InjectionThreshold};
     use std::path::PathBuf;
 
     let tmp = TempDir::new().unwrap();

@@ -32,6 +32,7 @@ pub mod envref;
 pub mod git;
 pub mod gitignore;
 pub mod harness;
+pub mod init;
 pub mod intel;
 pub mod knowledge;
 pub mod locks;

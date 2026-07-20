@@ -1046,6 +1046,20 @@ mod tests {
         assert_eq!(overlay.title(), "Sessions");
     }
 
+    /// The keybindings doc is user-facing; it lives in this crate alongside the
+    /// overlay it documents, so the jargon guard lives here too rather than
+    /// reaching across crates from `apps/cli`.
+    #[test]
+    fn keybindings_doc_has_no_internal_jargon() {
+        let doc = include_str!("../../docs/keybindings.md");
+        for needle in ["GOALS", "\u{a7}", "design notes", "repair catalog", "ralph"] {
+            assert!(
+                !doc.contains(needle),
+                "keybindings doc contains internal jargon `{needle}`:\n{doc}"
+            );
+        }
+    }
+
     #[test]
     fn keybindings_doc_covers_overlay() {
         let doc = include_str!("../../docs/keybindings.md");

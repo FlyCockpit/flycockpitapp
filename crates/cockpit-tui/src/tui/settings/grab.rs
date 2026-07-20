@@ -53,7 +53,7 @@ pub(super) fn grabbed_row_spans(
     empty_hint: &str,
 ) -> Vec<Span<'static>> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let cursor = crate::text::floor_char_boundary(buf_text, cursor);
+    let cursor = cockpit_core::text::floor_char_boundary(buf_text, cursor);
     let (before, after) = buf_text.split_at(cursor);
     let mut spans = vec![
         Span::raw(GRAB_MARKER),

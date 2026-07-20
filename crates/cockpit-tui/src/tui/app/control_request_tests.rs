@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{App, ControlApplied};
-use crate::daemon::proto::{Request, Response};
-use crate::engine::message::UserSubmission;
-use crate::engine::{
-    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
-};
 use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
 use crate::tui::history::HistoryEntry;
+use cockpit_core::daemon::proto::{Request, Response};
+use cockpit_core::engine::message::UserSubmission;
+use cockpit_core::engine::{
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
+};
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
@@ -37,7 +37,7 @@ fn runner_with_channels(
         active_agent: Arc::new(Mutex::new("Build".to_string())),
         active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
         skill_inventory_names: Arc::new(Mutex::new(None)),
-        foreground_target: Some(crate::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id: uuid::Uuid::new_v4(),
         short_id: "abc123".to_string(),

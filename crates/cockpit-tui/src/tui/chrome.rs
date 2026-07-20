@@ -11,14 +11,14 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::config::extended::LlmMode;
-use crate::db::connector::ConnectorDisclosure;
-use crate::db::org_sync::OrgSyncDisclosure;
-use crate::git::repo_counts;
 use crate::tui::theme::{
     FAVORITE_MODEL, MUTED_COLOR_INDEX, PLAN_YELLOW, STATUS_BRANCH_BADGE, WARNING_TEXT,
 };
-use crate::welcome::LaunchInfo;
+use cockpit_config::extended::LlmMode;
+use cockpit_core::git::repo_counts;
+use cockpit_core::welcome::LaunchInfo;
+use cockpit_db::connector::ConnectorDisclosure;
+use cockpit_db::org_sync::OrgSyncDisclosure;
 
 pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));

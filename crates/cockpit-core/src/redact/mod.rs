@@ -806,7 +806,6 @@ mod scrub_inventory_tests {
     const INVENTORY_START: &str = "<!-- scrub-inventory:start -->";
     const INVENTORY_END: &str = "<!-- scrub-inventory:end -->";
     const EXPECTED_SCRUB_FILES: &[&str] = &[
-        "apps/cli/src/commands/export/mod.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
         "crates/cockpit-core/src/daemon/server/dispatch.rs",
@@ -821,6 +820,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/harness/run.rs",
         "crates/cockpit-core/src/knowledge.rs",
         "crates/cockpit-core/src/redact/mod.rs",
+        "crates/cockpit-core/src/session/export/mod.rs",
     ];
 
     #[test]

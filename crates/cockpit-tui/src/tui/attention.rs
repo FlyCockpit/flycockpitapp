@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-pub use crate::config::extended::tui::AttentionConfig;
+pub use cockpit_config::extended::tui::AttentionConfig;
 
 /// The narrow attention-event vocabulary. The TUI's event handler
 //  classifies the relevant daemon events into exactly these.

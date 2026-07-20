@@ -1146,7 +1146,7 @@ impl App {
         self.paste_registry.clear();
         self.reset_slash_window();
         self.record_usage(
-            crate::daemon::proto::UsageKind::Slash,
+            cockpit_core::daemon::proto::UsageKind::Slash,
             cmd.name.to_string(),
             None,
         );
@@ -1191,13 +1191,15 @@ impl App {
             let a = args.trim();
             if a.is_empty() { None } else { Some(a) }
         };
-        let target = crate::commands::init::resolve_target(&self.launch.cwd, explicit);
-        let display = crate::commands::init::display_target(&self.launch.cwd, &target);
+        let target = cockpit_core::init::resolve_target(&self.launch.cwd, explicit);
+        let display = cockpit_core::init::display_target(&self.launch.cwd, &target);
 
         if target.exists() {
             // Existing target: ask update / overwrite / cancel via the
             // shared question dialog, driven locally (no daemon interrupt).
-            use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+            use cockpit_core::daemon::proto::{
+                InterruptOption, InterruptQuestion, InterruptQuestionSet,
+            };
             let interrupt_id = uuid::Uuid::new_v4();
             let set = InterruptQuestionSet {
                 questions: vec![InterruptQuestion::Single {
@@ -1251,10 +1253,8 @@ impl App {
         }
 
         // Fresh file: dispatch the create turn straight away.
-        let prompt = crate::commands::init::build_init_prompt(
-            &display,
-            crate::commands::init::InitMode::Create,
-        );
+        let prompt =
+            cockpit_core::init::build_init_prompt(&display, cockpit_core::init::InitMode::Create);
         self.dispatch_init_turn(&display, prompt);
     }
 
@@ -1265,8 +1265,8 @@ impl App {
             );
             return;
         }
-        let subject = crate::commands::learn::subject_from_parts(&[args.to_string()]);
-        let prompt = crate::commands::learn::build_learn_prompt(&subject);
+        let subject = cockpit_core::skills::subject_from_parts(&[args.to_string()]);
+        let prompt = cockpit_core::skills::build_learn_prompt(&subject);
         self.chat_scroll_offset = 0;
         self.begin_working_span();
         self.dispatch_optimistic_user_submission(
@@ -1275,7 +1275,7 @@ impl App {
             } else {
                 format!("/learn {}", args.trim())
             },
-            crate::engine::message::UserSubmission::text(prompt),
+            cockpit_core::engine::message::UserSubmission::text(prompt),
             "/learn",
             true,
             &[],
@@ -1284,10 +1284,10 @@ impl App {
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
         let result = (|| -> anyhow::Result<String> {
-            let db = crate::db::Db::open_default()?;
-            let cfg = crate::config::extended::load_for_cwd(&self.launch.cwd).skills;
+            let db = cockpit_db::Db::open_default()?;
+            let cfg = cockpit_config::extended::load_for_cwd(&self.launch.cwd).skills;
             let curator =
-                crate::skills::curator::SkillCurator::new(db, self.launch.cwd.clone(), cfg);
+                cockpit_core::skills::curator::SkillCurator::new(db, self.launch.cwd.clone(), cfg);
             let mut parts = args.split_whitespace();
             match parts.next().unwrap_or("status") {
                 "status" => {
@@ -1299,7 +1299,7 @@ impl App {
                     ))
                 }
                 "run" => {
-                    let mut options = crate::skills::curator::CuratorRunOptions::default();
+                    let mut options = cockpit_core::skills::curator::CuratorRunOptions::default();
                     for part in parts {
                         match part {
                             "--dry-run" => options.dry_run = true,
@@ -1376,17 +1376,21 @@ impl App {
         }
         match trimmed {
             "pause" => {
-                self.set_goal_status(crate::db::session_goals::GoalStatus::Paused, "/goal pause");
+                self.set_goal_status(cockpit_db::session_goals::GoalStatus::Paused, "/goal pause");
             }
             "resume" => {
-                self.set_goal_status(crate::db::session_goals::GoalStatus::Active, "/goal resume");
+                self.set_goal_status(
+                    cockpit_db::session_goals::GoalStatus::Active,
+                    "/goal resume",
+                );
             }
             "clear" => {
                 let Some(session_id) = self.launch.session_id else {
                     self.push_plain("/goal clear: no active session.".to_string());
                     return;
                 };
-                match crate::db::Db::open_default().and_then(|db| db.clear_session_goal(session_id))
+                match cockpit_db::Db::open_default()
+                    .and_then(|db| db.clear_session_goal(session_id))
                 {
                     Ok(true) => self.push_plain("/goal clear: cleared current goal.".to_string()),
                     Ok(false) => self.push_plain("/goal clear: no open goal.".to_string()),
@@ -1450,7 +1454,7 @@ impl App {
             }
             self.send_daemon_request(
                 "/schedule",
-                crate::daemon::proto::Request::CancelSchedule {
+                cockpit_core::daemon::proto::Request::CancelSchedule {
                     job_id: job_id.to_string(),
                 },
                 ControlApplied::ScheduleCancel {
@@ -1559,7 +1563,7 @@ impl App {
         }
         self.send_daemon_request(
             "/llm-mode",
-            crate::daemon::proto::Request::SetLlmMode { mode: requested },
+            cockpit_core::daemon::proto::Request::SetLlmMode { mode: requested },
             ControlApplied::CacheBreakWarning,
         );
         // The `LlmModeChanged` event pushes the "Switched to …" confirmation
@@ -1594,7 +1598,7 @@ impl App {
     /// Bare `/agent` lists the primaries, marking the active one — it does
     /// not switch and does not open a picker.
     pub(super) fn handle_agent_command(&mut self, arg: &str) {
-        let order = crate::agents::chat_ownable_primaries(&self.launch.cwd);
+        let order = cockpit_core::agents::chat_ownable_primaries(&self.launch.cwd);
         match agent_command_outcome(arg, &self.launch.agent_name, &order) {
             // A valid named target: route through the shared swap entry point
             // (its confirmation line + start-a-session-first guard apply).
@@ -1617,19 +1621,19 @@ impl App {
             self.push_plain("Usage: /assistant <name>".to_string());
             return;
         }
-        if let Err(error) = crate::assistants::validate_assistant_name(name) {
+        if let Err(error) = cockpit_core::assistants::validate_assistant_name(name) {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let session = match crate::db::Db::open_default().and_then(|db| {
+        let session = match cockpit_db::Db::open_default().and_then(|db| {
             let row = db
                 .get_assistant(name)?
                 .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
-            crate::assistants::load_from_row(&row)?;
+            cockpit_core::assistants::load_from_row(&row)?;
             if let Some(session) = db.most_recent_session_for_assistant(name)? {
                 return Ok(session);
             }
-            let project_id = crate::session::project_id_for(&self.launch.cwd);
+            let project_id = cockpit_core::session::project_id_for(&self.launch.cwd);
             let project_root = self.launch.cwd.to_string_lossy().into_owned();
             db.create_assistant_session(&project_id, &project_root, name, name)
         }) {
@@ -1729,7 +1733,7 @@ impl App {
         };
         self.send_daemon_request(
             "/sandbox",
-            crate::daemon::proto::Request::SetSandbox {
+            cockpit_core::daemon::proto::Request::SetSandbox {
                 mode,
                 container_network_enabled: network,
             },
@@ -1755,7 +1759,7 @@ impl App {
             Ok(SandboxEscalationCommand::Set(enabled)) => {
                 self.send_daemon_request(
                     "/sandbox-escalate",
-                    crate::daemon::proto::Request::SetSandboxEscalation { enabled },
+                    cockpit_core::daemon::proto::Request::SetSandboxEscalation { enabled },
                     ControlApplied::None,
                 );
             }
@@ -1768,7 +1772,7 @@ impl App {
     }
 
     pub(super) fn handle_doctor_command(&mut self) {
-        let input = crate::diagnostics::DiagnosticsInput {
+        let input = cockpit_core::diagnostics::DiagnosticsInput {
             cwd: self.launch.cwd.clone(),
             session_id: self.launch.session_id,
             session_short_id: self.launch.session_short_id.clone(),
@@ -1776,8 +1780,8 @@ impl App {
             active_model: self.launch.active_model.clone(),
             sandbox_enabled: Some(!self.no_sandbox),
         };
-        match crate::diagnostics::tui_snapshot(input) {
-            Ok(snapshot) => self.push_plain(crate::diagnostics::render(&snapshot)),
+        match cockpit_core::diagnostics::tui_snapshot(input) {
+            Ok(snapshot) => self.push_plain(cockpit_core::diagnostics::render(&snapshot)),
             Err(error) => self.push_plain(format!("/doctor: {error}")),
         }
     }
@@ -1802,7 +1806,7 @@ impl App {
         };
         self.send_daemon_request(
             "/preflight",
-            crate::daemon::proto::Request::SetPreflight { enabled },
+            cockpit_core::daemon::proto::Request::SetPreflight { enabled },
             ControlApplied::None,
         );
     }
@@ -1844,7 +1848,7 @@ impl App {
         }
         self.send_daemon_request(
             "/trusted-only",
-            crate::daemon::proto::Request::SetTrustedOnly { enabled },
+            cockpit_core::daemon::proto::Request::SetTrustedOnly { enabled },
             ControlApplied::None,
         );
     }
@@ -1883,7 +1887,7 @@ impl App {
     /// assertion and broadcasts a `CaffeinateState` event back (→ toast +
     /// ☕ glyph). Bare command toggles.
     pub(super) fn handle_caffeinate_command(&mut self, args: &str) {
-        let mode = match crate::daemon::caffeinate::CaffeinateMode::parse(args) {
+        let mode = match cockpit_core::daemon::caffeinate::CaffeinateMode::parse(args) {
             Ok(m) => m,
             Err(other) => {
                 self.push_plain(format!(
@@ -1894,7 +1898,7 @@ impl App {
         };
         self.send_daemon_request(
             "/caffeinate",
-            crate::daemon::proto::Request::SetCaffeinate { mode },
+            cockpit_core::daemon::proto::Request::SetCaffeinate { mode },
             ControlApplied::None,
         );
     }
@@ -1910,7 +1914,7 @@ impl App {
         }
         self.send_daemon_request(
             "/pin-context",
-            crate::daemon::proto::Request::Pin {
+            cockpit_core::daemon::proto::Request::Pin {
                 text: text.to_string(),
             },
             ControlApplied::PinContext {
@@ -2011,22 +2015,23 @@ impl App {
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let db = crate::db::Db::open_default().map_err(|e| e.to_string())?;
-                    let session = crate::session::Session::resume(db, session_id)
+                    let db = cockpit_db::Db::open_default().map_err(|e| e.to_string())?;
+                    let session = cockpit_core::session::Session::resume(db, session_id)
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| format!("unknown session {session_id}"))?;
                     let cwd = session.project_root.clone();
                     let session = Arc::new(session);
-                    let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
-                    let redactor = crate::redact::RedactionTable::build(&extended.redact, &cwd)
-                        .map_err(|e| e.to_string())?;
-                    let generated = crate::auto_title::generate_session_title_once(
+                    let (extended, providers) = cockpit_core::auto_title::load_configs_for(&cwd);
+                    let redactor =
+                        cockpit_core::redact::RedactionTable::build(&extended.redact, &cwd)
+                            .map_err(|e| e.to_string())?;
+                    let generated = cockpit_core::auto_title::generate_session_title_once(
                         session,
                         extended,
                         providers,
                         Arc::new(redactor),
                         String::new(),
-                        crate::session::TitleAction::Explicit,
+                        cockpit_core::session::TitleAction::Explicit,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -2038,7 +2043,7 @@ impl App {
             );
             return;
         }
-        let req = crate::daemon::proto::Request::RenameSession {
+        let req = cockpit_core::daemon::proto::Request::RenameSession {
             session_id,
             title: title.to_string(),
         };
@@ -2086,11 +2091,11 @@ impl App {
     /// `/version` — render a transcript message with the running cockpit
     /// version (Cargo package version) and the OS/platform string cockpit
     /// already gathers for the cached system block
-    /// ([`crate::sysinfo::os_string`]); no build metadata. One `Plain` line
+    /// ([`cockpit_core::sysinfo::os_string`]); no build metadata. One `Plain` line
     /// per field, matching how other informational commands list output.
     pub(super) fn handle_version_command(&mut self) {
         self.push_plain(format!("cockpit {}", env!("CARGO_PKG_VERSION")));
-        self.push_plain(format!("OS: {}", crate::sysinfo::os_string()));
+        self.push_plain(format!("OS: {}", cockpit_core::sysinfo::os_string()));
     }
 
     /// `/note <text>` — append a session-history note to self. The note is a
@@ -2117,7 +2122,7 @@ impl App {
             self.push_plain("/note: no active session yet — send a message first".to_string());
             return;
         };
-        let req = crate::daemon::proto::Request::RecordSessionNote {
+        let req = cockpit_core::daemon::proto::Request::RecordSessionNote {
             session_id,
             text: text.to_string(),
         };
@@ -2127,7 +2132,7 @@ impl App {
             AsyncActionKind::DaemonRpc("note"),
             AsyncActionPolicy::AllowConcurrent,
             move || match agent_runner::daemon_request_blocking(req) {
-                Ok(crate::daemon::proto::Response::NoteRecorded { .. }) => {
+                Ok(cockpit_core::daemon::proto::Response::NoteRecorded { .. }) => {
                     Ok(AsyncActionPayload::NoteRecorded { text })
                 }
                 Ok(_) => Err("unexpected daemon response".to_string()),
@@ -2151,7 +2156,7 @@ pub(super) fn parse_pane_side(arg: &str) -> PaneSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SandboxCommand {
     Cycle,
-    Set(crate::tools::sandbox_mode::SandboxMode),
+    Set(cockpit_core::tools::sandbox_mode::SandboxMode),
     Network(bool),
 }
 
@@ -2161,16 +2166,16 @@ pub(super) fn parse_sandbox_arg(args: &str) -> Result<SandboxCommand, String> {
     match normalized.as_str() {
         "" => Ok(SandboxCommand::Cycle),
         "on" => Ok(SandboxCommand::Set(
-            crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
         )),
         "off" => Ok(SandboxCommand::Set(
-            crate::tools::sandbox_mode::SandboxMode::Off,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Off,
         )),
         "container" => Ok(SandboxCommand::Set(
-            crate::tools::sandbox_mode::SandboxMode::Container,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Container,
         )),
         "container-readonly" | "container-ro" | "readonly" => Ok(SandboxCommand::Set(
-            crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+            cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly,
         )),
         "network on" => Ok(SandboxCommand::Network(true)),
         "network off" => Ok(SandboxCommand::Network(false)),
@@ -2195,30 +2200,32 @@ pub(super) fn parse_sandbox_escalation_arg(args: &str) -> Result<SandboxEscalati
     }
 }
 
-pub(super) fn sandbox_mode_label(mode: crate::tools::sandbox_mode::SandboxMode) -> &'static str {
+pub(super) fn sandbox_mode_label(
+    mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+) -> &'static str {
     match mode {
-        crate::tools::sandbox_mode::SandboxMode::Off => "off",
-        crate::tools::sandbox_mode::SandboxMode::Sandbox => "on",
-        crate::tools::sandbox_mode::SandboxMode::Container => "container",
-        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+        cockpit_core::tools::sandbox_mode::SandboxMode::Off => "off",
+        cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => "on",
+        cockpit_core::tools::sandbox_mode::SandboxMode::Container => "container",
+        cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
     }
 }
 
 pub(super) fn next_sandbox_mode(
-    current: crate::tools::sandbox_mode::SandboxMode,
-    availability: &crate::container::ContainerAvailability,
-) -> crate::tools::sandbox_mode::SandboxMode {
-    let modes: &[crate::tools::sandbox_mode::SandboxMode] = if availability.available {
+    current: cockpit_core::tools::sandbox_mode::SandboxMode,
+    availability: &cockpit_core::container::ContainerAvailability,
+) -> cockpit_core::tools::sandbox_mode::SandboxMode {
+    let modes: &[cockpit_core::tools::sandbox_mode::SandboxMode] = if availability.available {
         &[
-            crate::tools::sandbox_mode::SandboxMode::Off,
-            crate::tools::sandbox_mode::SandboxMode::Sandbox,
-            crate::tools::sandbox_mode::SandboxMode::Container,
-            crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Container,
+            cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly,
         ]
     } else {
         &[
-            crate::tools::sandbox_mode::SandboxMode::Off,
-            crate::tools::sandbox_mode::SandboxMode::Sandbox,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
         ]
     };
     let idx = modes.iter().position(|mode| *mode == current).unwrap_or(0);
@@ -2226,10 +2233,10 @@ pub(super) fn next_sandbox_mode(
 }
 
 fn container_unavailable_label(
-    availability: &crate::container::ContainerAvailability,
+    availability: &cockpit_core::container::ContainerAvailability,
 ) -> &'static str {
     match availability.reason {
-        Some(crate::container::ContainerUnavailableReason::HarnessInContainer) => {
+        Some(cockpit_core::container::ContainerUnavailableReason::HarnessInContainer) => {
             "Cockpit is running inside a container"
         }
         _ => "No docker/podman runtime found",
@@ -2339,7 +2346,7 @@ pub(super) enum AgentCommandOutcome {
 
 /// Pure resolution of `/agent [arg]` against the chat-ownable cycle `order`
 /// (builtins first, then user primaries alphabetically — see
-/// [`crate::agents::chat_ownable_primaries`]) and the `active` agent name.
+/// [`cockpit_core::agents::chat_ownable_primaries`]) and the `active` agent name.
 /// A blank `arg` yields the listing (active one marked `(active)`); a name in
 /// `order` yields a [`AgentCommandOutcome::Switch`]; anything else yields an
 /// error naming the bad value in backticks plus the valid choices. Subagents
@@ -2445,11 +2452,11 @@ pub(super) fn builtin_slash_name_taken(name: &str) -> bool {
 /// (cheap) and tolerant — a discovery failure yields no skill entries.
 pub(super) fn discover_bare_skill_commands(
     cwd: &Path,
-    extended: &crate::config::extended::ExtendedConfig,
+    extended: &cockpit_config::extended::ExtendedConfig,
     agent_name: &str,
 ) -> Vec<SkillCommand> {
-    let skills =
-        crate::skills::discover_for_agent(cwd, &extended.skills, agent_name).unwrap_or_default();
+    let skills = cockpit_core::skills::discover_for_agent(cwd, &extended.skills, agent_name)
+        .unwrap_or_default();
     bare_skill_commands_from(skills)
 }
 
@@ -2458,7 +2465,9 @@ pub(super) fn discover_bare_skill_commands(
 /// skill stays reachable via `/skill <name>`). Split from
 /// [`discover_bare_skill_commands`] so the collision filter is unit-testable
 /// without touching the host's layered-config discovery.
-pub(super) fn bare_skill_commands_from(skills: Vec<crate::skills::Skill>) -> Vec<SkillCommand> {
+pub(super) fn bare_skill_commands_from(
+    skills: Vec<cockpit_core::skills::Skill>,
+) -> Vec<SkillCommand> {
     let mut out = Vec::with_capacity(skills.len());
     for s in skills {
         // Model-only skills (`user-invocable: false`) are hidden from the

@@ -255,9 +255,61 @@ pub(crate) async fn run_terminal_wizard(
                 };
                 submit(&mut run, WizardAnswer::MultiToggle(values), io)?;
             }
+            StepKind::ToolSurface => {
+                io.write_line(step.prompt)?;
+                io.write_line("Available tools:")?;
+                for item in crate::agents::tool_surface_catalog() {
+                    let tiers = item
+                        .tiers
+                        .iter()
+                        .map(|tier| tier.label())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    io.write_line(&format!("  {} ({}, {})", item.name, item.family, tiers))?;
+                }
+                io.write("Comma-separated tool[:tier] entries (blank for none): ")?;
+                let input = read_input(io)?;
+                if go_back(&mut run, &input, io)? {
+                    continue;
+                }
+                let answer = parse_tool_surface_answer(&input)?;
+                submit(&mut run, WizardAnswer::ToolSurface(answer), io)?;
+            }
         }
     }
     Ok(run)
+}
+
+fn parse_tool_surface_answer(input: &str) -> Result<crate::agents::ToolSurfaceSelection> {
+    let known: std::collections::BTreeSet<&str> =
+        crate::agents::known_tool_names().iter().copied().collect();
+    let mut tools = Vec::new();
+    let mut tool_tiers = std::collections::BTreeMap::new();
+    for raw in input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let (tool, tier) = raw
+            .split_once(':')
+            .map(|(tool, tier)| (tool.trim(), Some(tier.trim())))
+            .unwrap_or((raw, None));
+        if !known.contains(tool) {
+            bail!("unknown tool `{tool}`");
+        }
+        if !tools.iter().any(|existing| existing == tool) {
+            tools.push(tool.to_string());
+        }
+        if let Some(tier) = tier {
+            let parsed = crate::agents::ToolTier::from_label(tier)
+                .ok_or_else(|| anyhow::anyhow!("unknown tool tier `{tier}`"))?;
+            if !crate::agents::legal_tool_tiers(tool).contains(&parsed) {
+                bail!("tool `{tool}` cannot use tier `{tier}`");
+            }
+            tool_tiers.insert(tool.to_string(), parsed);
+        }
+    }
+    Ok(crate::agents::ToolSurfaceSelection { tools, tool_tiers })
 }
 
 fn write_select(

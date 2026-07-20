@@ -124,6 +124,93 @@ pub enum ToolTier {
     Disabled,
 }
 
+impl ToolTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolTier::Builtin => "builtin",
+            ToolTier::Discoverable => "discoverable",
+            ToolTier::Disabled => "disabled",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "builtin" => Some(ToolTier::Builtin),
+            "discoverable" => Some(ToolTier::Discoverable),
+            "disabled" => Some(ToolTier::Disabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolSurfaceSelection {
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(rename = "toolTiers", default)]
+    pub tool_tiers: BTreeMap<String, ToolTier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSurfaceItem {
+    pub name: &'static str,
+    pub family: &'static str,
+    pub tiers: &'static [ToolTier],
+}
+
+const ALL_TOOL_TIERS: &[ToolTier] = &[
+    ToolTier::Builtin,
+    ToolTier::Discoverable,
+    ToolTier::Disabled,
+];
+const NON_DISCOVERABLE_TOOL_TIERS: &[ToolTier] = &[ToolTier::Builtin, ToolTier::Disabled];
+
+pub fn known_tool_names() -> &'static [&'static str] {
+    invariants::known_tool_names()
+}
+
+pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {
+    if invariants::STRUCTURAL_TOOLS.contains(&tool) || invariants::LOCK_WRITE_TOOLS.contains(&tool)
+    {
+        NON_DISCOVERABLE_TOOL_TIERS
+    } else {
+        ALL_TOOL_TIERS
+    }
+}
+
+pub fn tool_surface_catalog() -> Vec<ToolSurfaceItem> {
+    known_tool_names()
+        .iter()
+        .map(|name| ToolSurfaceItem {
+            name,
+            family: tool_family(name),
+            tiers: legal_tool_tiers(name),
+        })
+        .collect()
+}
+
+fn tool_family(name: &str) -> &'static str {
+    match name {
+        "read" | "readlock" | "writeunlock" | "editunlock" | "unlock" => "files",
+        "context_pack" | "tree" | "outline" | "symbol_find" | "word" | "deps" | "hot"
+        | "circular" | "search" | "impact" | "change_impact" | "lsp" => "code intel",
+        "bash" | "escalate" | "harness_list" | "harness_invoke" => "execution",
+        "task"
+        | "spawn"
+        | "handoff"
+        | "return"
+        | "question"
+        | "defer_to_orchestrator"
+        | "schedule"
+        | "start_build" => "coordination",
+        "session_search" | "session_read" | "todo" | "todo_read" | "create_goal" | "get_goal"
+        | "update_goal" => "memory",
+        "skill" | "skill_manage" | "mcp" => "extensions",
+        "grep" | "glob" => "sandbox",
+        _ => "other",
+    }
+}
+
 /// A markdown agent's per-agent description override for one tool (prompt
 /// `per-agent-tool-definitions.md`). Authored in `tool_descriptions:`
 /// frontmatter in either of two forms:

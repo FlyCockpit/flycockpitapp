@@ -132,6 +132,8 @@ pub struct SetupWizardDialog {
     text: TextField,
     multi: std::collections::BTreeSet<String>,
     multi_touched: bool,
+    tool_surface: cockpit_core::agents::ToolSurfaceSelection,
+    tool_surface_touched: bool,
     cwd: PathBuf,
     status: Option<String>,
 }
@@ -154,13 +156,27 @@ fn setup_wizard_dialog(
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
     let mut multi_touched = false;
-    sync_setup_wizard_inputs(&run, &mut cursor, &mut text, &mut multi, &mut multi_touched);
+    let mut tool_surface = cockpit_core::agents::ToolSurfaceSelection::default();
+    let mut tool_surface_touched = false;
+    sync_setup_wizard_inputs(
+        &run,
+        SetupWizardInputs {
+            cursor: &mut cursor,
+            text: &mut text,
+            multi: &mut multi,
+            multi_touched: &mut multi_touched,
+            tool_surface: &mut tool_surface,
+            tool_surface_touched: &mut tool_surface_touched,
+        },
+    );
     Ok(Dialog::SetupWizard(Box::new(SetupWizardDialog {
         run,
         cursor,
         text,
         multi,
         multi_touched,
+        tool_surface,
+        tool_surface_touched,
         cwd: cwd.to_path_buf(),
         status,
     })))
@@ -2071,9 +2087,31 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         text,
         multi,
         multi_touched,
+        tool_surface,
+        tool_surface_touched,
         cwd,
         status,
     } = wizard;
+    macro_rules! submit_answer {
+        ($answer:expr $(,)?) => {
+            let answer = $answer;
+            submit_setup_wizard_answer(
+                SetupWizardSubmit {
+                    run,
+                    inputs: SetupWizardInputs {
+                        cursor,
+                        text,
+                        multi,
+                        multi_touched,
+                        tool_surface,
+                        tool_surface_touched,
+                    },
+                    status,
+                },
+                answer,
+            );
+        };
+    }
     if run.is_complete() {
         return matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'));
     }
@@ -2086,15 +2124,9 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 ListAction::Close => return true,
                 ListAction::Stay => {}
                 ListAction::Select(index) => {
-                    submit_setup_wizard_answer(
-                        run,
-                        cursor,
-                        text,
-                        multi,
-                        multi_touched,
-                        status,
-                        cockpit_core::wizard::WizardAnswer::Select(options[index].id.to_string()),
-                    );
+                    submit_answer!(cockpit_core::wizard::WizardAnswer::Select(
+                        options[index].id.to_string()
+                    ),);
                 }
             }
         }
@@ -2104,40 +2136,22 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 let answer = run
                     .prefill()
                     .unwrap_or(cockpit_core::wizard::WizardAnswer::Confirm(false));
-                submit_setup_wizard_answer(run, cursor, text, multi, multi_touched, status, answer);
+                submit_answer!(answer);
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') => submit_setup_wizard_answer(
-                run,
-                cursor,
-                text,
-                multi,
-                multi_touched,
-                status,
-                cockpit_core::wizard::WizardAnswer::Confirm(true),
-            ),
-            KeyCode::Char('n') | KeyCode::Char('N') => submit_setup_wizard_answer(
-                run,
-                cursor,
-                text,
-                multi,
-                multi_touched,
-                status,
-                cockpit_core::wizard::WizardAnswer::Confirm(false),
-            ),
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                submit_answer!(cockpit_core::wizard::WizardAnswer::Confirm(true));
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                submit_answer!(cockpit_core::wizard::WizardAnswer::Confirm(false));
+            }
             _ => {}
         },
         cockpit_core::wizard::StepKind::Text => match key.code {
             KeyCode::Esc => return true,
             KeyCode::Enter => {
-                submit_setup_wizard_answer(
-                    run,
-                    cursor,
-                    text,
-                    multi,
-                    multi_touched,
-                    status,
-                    cockpit_core::wizard::WizardAnswer::Text(text.text().to_string()),
-                );
+                submit_answer!(cockpit_core::wizard::WizardAnswer::Text(
+                    text.text().to_string()
+                ),);
             }
             _ => {
                 text.handle_key(key);
@@ -2146,15 +2160,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         cockpit_core::wizard::StepKind::Info => match key.code {
             KeyCode::Esc => return true,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                submit_setup_wizard_answer(
-                    run,
-                    cursor,
-                    text,
-                    multi,
-                    multi_touched,
-                    status,
-                    cockpit_core::wizard::WizardAnswer::Acknowledged,
-                );
+                submit_answer!(cockpit_core::wizard::WizardAnswer::Acknowledged);
             }
             _ => {}
         },
@@ -2178,15 +2184,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                     }
                 }
             }
-            submit_setup_wizard_answer(
-                run,
-                cursor,
-                text,
-                multi,
-                multi_touched,
-                status,
-                cockpit_core::wizard::WizardAnswer::Acknowledged,
-            );
+            submit_answer!(cockpit_core::wizard::WizardAnswer::Acknowledged);
         }
         cockpit_core::wizard::StepKind::MultiToggle { options } => match key.code {
             KeyCode::Esc => return true,
@@ -2220,7 +2218,77 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 } else {
                     cockpit_core::wizard::WizardAnswer::MultiToggle(multi.iter().cloned().collect())
                 };
-                submit_setup_wizard_answer(run, cursor, text, multi, multi_touched, status, answer);
+                submit_answer!(answer);
+            }
+            _ => {}
+        },
+        cockpit_core::wizard::StepKind::ToolSurface => match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                *cursor = crate::tui::nav::wrap_prev(
+                    *cursor,
+                    cockpit_core::agents::tool_surface_catalog().len(),
+                );
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                *cursor = crate::tui::nav::wrap_next(
+                    *cursor,
+                    cockpit_core::agents::tool_surface_catalog().len(),
+                );
+            }
+            KeyCode::Char(' ') => {
+                touch_tool_surface(run, tool_surface, tool_surface_touched);
+                if let Some(tool) = cockpit_core::agents::tool_surface_catalog().get(*cursor) {
+                    if tool_surface
+                        .tools
+                        .iter()
+                        .any(|existing| existing == tool.name)
+                    {
+                        tool_surface.tools.retain(|existing| existing != tool.name);
+                    } else {
+                        tool_surface.tools.push(tool.name.to_string());
+                        tool_surface.tools.sort();
+                    }
+                    if !tool_surface
+                        .tools
+                        .iter()
+                        .any(|existing| existing == tool.name)
+                    {
+                        tool_surface.tool_tiers.remove(tool.name);
+                    }
+                }
+            }
+            KeyCode::Char('t') => {
+                touch_tool_surface(run, tool_surface, tool_surface_touched);
+                if let Some(tool) = cockpit_core::agents::tool_surface_catalog().get(*cursor) {
+                    if !tool_surface
+                        .tools
+                        .iter()
+                        .any(|existing| existing == tool.name)
+                    {
+                        tool_surface.tools.push(tool.name.to_string());
+                        tool_surface.tools.sort();
+                    }
+                    let current = tool_surface
+                        .tool_tiers
+                        .get(tool.name)
+                        .copied()
+                        .unwrap_or(cockpit_core::agents::ToolTier::Builtin);
+                    let tiers = cockpit_core::agents::legal_tool_tiers(tool.name);
+                    let index = tiers.iter().position(|tier| *tier == current).unwrap_or(0);
+                    let next = tiers[(index + 1) % tiers.len()];
+                    if next == cockpit_core::agents::ToolTier::Builtin {
+                        tool_surface.tool_tiers.remove(tool.name);
+                    } else {
+                        tool_surface.tool_tiers.insert(tool.name.to_string(), next);
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                touch_tool_surface(run, tool_surface, tool_surface_touched);
+                submit_answer!(cockpit_core::wizard::WizardAnswer::ToolSurface(
+                    tool_surface.clone()
+                ),);
             }
             _ => {}
         },
@@ -2229,31 +2297,50 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
     false
 }
 
+struct SetupWizardInputs<'a> {
+    cursor: &'a mut usize,
+    text: &'a mut TextField,
+    multi: &'a mut std::collections::BTreeSet<String>,
+    multi_touched: &'a mut bool,
+    tool_surface: &'a mut cockpit_core::agents::ToolSurfaceSelection,
+    tool_surface_touched: &'a mut bool,
+}
+
+struct SetupWizardSubmit<'a> {
+    run: &'a mut cockpit_core::wizard::WizardRun,
+    inputs: SetupWizardInputs<'a>,
+    status: &'a mut Option<String>,
+}
+
 fn submit_setup_wizard_answer(
-    run: &mut cockpit_core::wizard::WizardRun,
-    cursor: &mut usize,
-    text: &mut TextField,
-    multi: &mut std::collections::BTreeSet<String>,
-    multi_touched: &mut bool,
-    status: &mut Option<String>,
+    state: SetupWizardSubmit<'_>,
     answer: cockpit_core::wizard::WizardAnswer,
 ) {
+    let SetupWizardSubmit {
+        run,
+        inputs,
+        status,
+    } = state;
     match run.submit(answer) {
-        Ok(()) => sync_setup_wizard_inputs(run, cursor, text, multi, multi_touched),
+        Ok(()) => sync_setup_wizard_inputs(run, inputs),
         Err(error) => *status = Some(error),
     }
 }
 
-fn sync_setup_wizard_inputs(
-    run: &cockpit_core::wizard::WizardRun,
-    cursor: &mut usize,
-    text: &mut TextField,
-    multi: &mut std::collections::BTreeSet<String>,
-    multi_touched: &mut bool,
-) {
+fn sync_setup_wizard_inputs(run: &cockpit_core::wizard::WizardRun, inputs: SetupWizardInputs<'_>) {
+    let SetupWizardInputs {
+        cursor,
+        text,
+        multi,
+        multi_touched,
+        tool_surface,
+        tool_surface_touched,
+    } = inputs;
     *cursor = setup_wizard_cursor_for_current_prefill(run);
     multi.clear();
     *multi_touched = false;
+    *tool_surface = cockpit_core::agents::ToolSurfaceSelection::default();
+    *tool_surface_touched = false;
     let Some(step) = run.current_step() else {
         return;
     };
@@ -2268,6 +2355,11 @@ fn sync_setup_wizard_inputs(
         cockpit_core::wizard::StepKind::MultiToggle { .. } => {
             if let Some(cockpit_core::wizard::WizardAnswer::MultiToggle(values)) = run.prefill() {
                 multi.extend(values);
+            }
+        }
+        cockpit_core::wizard::StepKind::ToolSurface => {
+            if let Some(cockpit_core::wizard::WizardAnswer::ToolSurface(value)) = run.prefill() {
+                *tool_surface = value;
             }
         }
         _ => {}
@@ -2288,6 +2380,20 @@ fn setup_wizard_cursor_for_current_prefill(run: &cockpit_core::wizard::WizardRun
         .iter()
         .position(|option| option.id == value)
         .unwrap_or(0)
+}
+
+fn touch_tool_surface(
+    run: &cockpit_core::wizard::WizardRun,
+    tool_surface: &mut cockpit_core::agents::ToolSurfaceSelection,
+    touched: &mut bool,
+) {
+    if *touched {
+        return;
+    }
+    if let Some(cockpit_core::wizard::WizardAnswer::ToolSurface(value)) = run.prefill() {
+        *tool_surface = value;
+    }
+    *touched = true;
 }
 
 enum WorkspaceTrustAction {
@@ -2516,6 +2622,8 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         text,
         multi,
         multi_touched,
+        tool_surface,
+        tool_surface_touched,
         status,
         ..
     } = wizard;
@@ -2614,6 +2722,54 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     ]));
                 }
             }
+            cockpit_core::wizard::StepKind::ToolSurface => {
+                let surface = if *tool_surface_touched {
+                    tool_surface.clone()
+                } else {
+                    match run.prefill() {
+                        Some(cockpit_core::wizard::WizardAnswer::ToolSurface(value)) => value,
+                        _ => cockpit_core::agents::ToolSurfaceSelection::default(),
+                    }
+                };
+                let mut last_family = "";
+                for (index, item) in cockpit_core::agents::tool_surface_catalog()
+                    .into_iter()
+                    .enumerate()
+                {
+                    if item.family != last_family {
+                        if !last_family.is_empty() {
+                            lines.push(Line::default());
+                        }
+                        lines.push(Line::from(Span::styled(item.family.to_string(), muted)));
+                        last_family = item.family;
+                    }
+                    let marker = if index == *cursor { "▸ " } else { "  " };
+                    let checked = surface.tools.iter().any(|tool| tool == item.name);
+                    let tier = if checked {
+                        surface
+                            .tool_tiers
+                            .get(item.name)
+                            .copied()
+                            .unwrap_or(cockpit_core::agents::ToolTier::Builtin)
+                            .label()
+                    } else {
+                        "-"
+                    };
+                    let style = if index == *cursor {
+                        selected
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled(if checked { "[x]" } else { "[ ]" }.to_string(), style),
+                        Span::raw(" "),
+                        Span::styled(item.name.to_string(), style),
+                        Span::raw("  "),
+                        Span::styled(format!("tier: {tier}"), muted),
+                    ]));
+                }
+            }
             cockpit_core::wizard::StepKind::Secret => {
                 lines.push(Line::from("Unsupported setup step."));
             }
@@ -2625,7 +2781,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(
-        help_line("↑/↓  space: toggle  enter: select/continue  y/n: confirm  esc: close"),
+        help_line("↑/↓  space: toggle  t: tier  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
     );
 }

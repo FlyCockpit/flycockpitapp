@@ -1515,6 +1515,7 @@ mod tests {
                 description: "Helper bot".to_string(),
                 mode: AgentMode::Primary,
                 tools: Some(vec!["read".to_string()]),
+                tool_tiers: std::collections::BTreeMap::new(),
                 model: None,
                 prompt: "You help with scheduled workspace maintenance.".to_string(),
                 home_dir,

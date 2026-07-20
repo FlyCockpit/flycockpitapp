@@ -194,6 +194,7 @@ mod tests {
                 description: "Helps with tests".to_string(),
                 mode: AgentMode::Primary,
                 tools: Some(vec!["read".to_string()]),
+                tool_tiers: std::collections::BTreeMap::new(),
                 model: Some("openai/gpt-5.5".to_string()),
                 prompt: "Stay focused.".to_string(),
                 home_dir: home.clone(),
@@ -222,6 +223,7 @@ mod tests {
                 description: "Helps with tests".to_string(),
                 mode: AgentMode::Primary,
                 tools: Some(vec!["read".to_string()]),
+                tool_tiers: std::collections::BTreeMap::new(),
                 model: Some("openai/gpt-5.5".to_string()),
                 prompt: "Stay focused.".to_string(),
                 home_dir: home.clone(),
@@ -269,13 +271,21 @@ mod tests {
         run.submit(WizardAnswer::Select("all".to_string())).unwrap();
         run.submit(WizardAnswer::Text("openai/gpt-5.5".to_string()))
             .unwrap();
-        run.submit(WizardAnswer::Text("read, write".to_string()))
-            .unwrap();
+        let mut tool_tiers = std::collections::BTreeMap::new();
+        tool_tiers.insert("search".to_string(), crate::agents::ToolTier::Discoverable);
+        run.submit(WizardAnswer::ToolSurface(
+            crate::agents::ToolSurfaceSelection {
+                tools: vec!["read".to_string(), "search".to_string()],
+                tool_tiers: tool_tiers.clone(),
+            },
+        ))
+        .unwrap();
         run.submit(WizardAnswer::Text("Help the user.".to_string()))
             .unwrap();
         let spec =
             spec_from_wizard("helper-bot", std::path::PathBuf::from("/tmp/helper"), &run).unwrap();
         assert_eq!(spec.mode, AgentMode::All);
-        assert_eq!(spec.tools.unwrap(), vec!["read", "write"]);
+        assert_eq!(spec.tools.unwrap(), vec!["read", "search"]);
+        assert_eq!(spec.tool_tiers, tool_tiers);
     }
 }

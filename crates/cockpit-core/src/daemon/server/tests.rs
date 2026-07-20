@@ -5299,6 +5299,7 @@ mod tests {
                 description: "test assistant".to_string(),
                 mode: crate::agents::AgentMode::Primary,
                 tools: None,
+                tool_tiers: std::collections::BTreeMap::new(),
                 model: None,
                 prompt: "You are a test assistant.".to_string(),
                 home_dir: tmp.path().join(name),

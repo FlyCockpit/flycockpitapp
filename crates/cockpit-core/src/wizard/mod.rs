@@ -30,6 +30,7 @@ pub struct SelectOption {
 pub enum StepKind {
     Select { options: Vec<SelectOption> },
     MultiToggle { options: Vec<SelectOption> },
+    ToolSurface,
     Text,
     Secret,
     Info,
@@ -41,6 +42,7 @@ pub enum StepKind {
 pub enum WizardAnswer {
     Select(String),
     MultiToggle(Vec<String>),
+    ToolSurface(crate::agents::ToolSurfaceSelection),
     Text(String),
     Secret(String),
     Confirm(bool),

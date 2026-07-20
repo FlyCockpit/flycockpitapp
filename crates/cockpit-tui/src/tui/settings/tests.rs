@@ -1949,13 +1949,27 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
     let mut multi_touched = false;
-    sync_setup_wizard_inputs(&run, &mut cursor, &mut text, &mut multi, &mut multi_touched);
+    let mut tool_surface = cockpit_core::agents::ToolSurfaceSelection::default();
+    let mut tool_surface_touched = false;
+    sync_setup_wizard_inputs(
+        &run,
+        SetupWizardInputs {
+            cursor: &mut cursor,
+            text: &mut text,
+            multi: &mut multi,
+            multi_touched: &mut multi_touched,
+            tool_surface: &mut tool_surface,
+            tool_surface_touched: &mut tool_surface_touched,
+        },
+    );
     let mut d = Dialog::SetupWizard(Box::new(SetupWizardDialog {
         run,
         cursor,
         text,
         multi,
         multi_touched,
+        tool_surface,
+        tool_surface_touched,
         cwd: tmp.path().to_path_buf(),
         status: None,
     }));

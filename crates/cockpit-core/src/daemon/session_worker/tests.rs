@@ -797,6 +797,7 @@ mod tests {
                 description: "Helper bot".to_string(),
                 mode: AgentMode::Primary,
                 tools: Some(vec!["read".to_string()]),
+                tool_tiers: std::collections::BTreeMap::new(),
                 model: Some("lmstudio/assistant-model".to_string()),
                 prompt: "ASSISTANT_DEFINITION_MARKER".to_string(),
                 home_dir: tmp.path().join("assistants/helper-bot"),
